@@ -21,8 +21,10 @@ This first slice sends one `SIGKILL` to a manually identified local, nonzero mod
 It does not launch TRT-LLM, coordinate survivors, or test recovery.
 
 Run the local CPU targeting tests with
-`python3 tests/integration/defs/wide_ep_ft/test_fault_injector.py`.
-The physical experiment is opt-in and must use an isolated job with a separate log directory.
+`python3 tests/integration/defs/wide_ep_ft/test_fault_injector.py` and
+`python3 tests/integration/defs/wide_ep_ft/test_process_loss_harness.py`. Both are selected in the
+CPU pre-merge test list; the physical experiment is opt-in.
+Use an isolated job with a separate log directory.
 
 1. Start a model job and complete a healthy request. Identify the **model process** for
    world rank 1, not only its Slurm task or launcher process.
@@ -41,3 +43,24 @@ signal request succeeded. A missing result after a recorded intent means the out
 inspect the process and launcher logs. Reusing an output directory is refused to prevent a second
 injection from the same run. A successful signal proves delivery was requested for the chosen
 process; it does not prove TRT-LLM detected the loss or that survivors recovered.
+
+`process_loss_harness.py` automates the between-request observation after an external launcher
+starts the model job. The launcher must put the verified target's `ranks.json` on the victim node,
+save its model configuration and per-rank logs, and run the controller there so the target PID is
+visible. With `RANK0_HOST`, `PORT`, and `RUN_DIR` set by the launcher, run from the victim node
+within an isolated allocation:
+
+```bash
+timeout --kill-after=10s 15m python3 tests/integration/defs/wide_ep_ft/process_loss_harness.py \
+  --base-url "http://${RANK0_HOST}:${PORT}" --rank-map "${RUN_DIR}/ranks.json" \
+  --target-rank 1 --output-dir "${RUN_DIR}/observation"
+```
+
+The launcher also needs its own Slurm time limit and cleanup trap: the controller's socket timeouts
+and readiness deadline do not bound the entire model job. The controller writes
+`healthy_request.json` before injection, then the injector's intent/result records, followed by
+`post_failure_request.json` and `run_summary.json`. A post-failure disconnect, explicit error,
+timeout, or response is an observation; `observation_complete` means evidence was recorded, not
+that inference recovered. `injection_uncertain` requires checking the injector's intent/result
+files and process logs before drawing a conclusion. No signal is sent unless the healthy request
+produced a nonempty completion. That gate checks the serving path, not model-answer correctness.

@@ -12,6 +12,8 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - wide_ep_ft/test_fault_injector.py
+  - wide_ep_ft/test_process_loss_harness.py
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
