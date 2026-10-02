@@ -16,7 +16,7 @@
 import asyncio
 import time
 from queue import Queue
-from threading import Event
+from threading import Event, Lock
 from typing import AsyncGenerator, Optional
 
 from .._utils import nvtx_range_debug
@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse
 
 
 class RpcWorkerMixin:
@@ -49,6 +50,7 @@ class RpcWorkerMixin:
         self.hmac_key = hmac_key
         self.rank = rank
         self.shutdown_event = Event()
+        self._response_error_lock = Lock()
         self._response_queue = Queue()
         self.set_result_queue(self._response_queue)
 
@@ -124,21 +126,18 @@ class RpcWorkerMixin:
                 # produces no further responses for records already handed to
                 # the dead child, so fail this shard's pending requests
                 # explicitly instead of poisoning an unrelated next response.
-                errors = [
-                    ErrorResponse(client_id, f"PostprocWorker process died: {exc}", -1)
-                    for client_id in list(self._results.keys())
-                    if client_id % num == shard
-                ]
-                if errors:
-                    for err in errors:
-                        self._pop_result(err.client_id)
-                    # fetch_responses drains _response_queue list-wise.
-                    self._response_queue.put(errors)
-                else:
-                    # No in-flight request on this shard: park the failure on
-                    # the background-error path so a later submission surfaces
-                    # it instead of hanging on the dead child.
-                    self._error_queue.put(exc)
+                with self._response_error_lock:
+                    errors = [
+                        ErrorResponse(client_id, f"PostprocWorker process died: {exc}", -1)
+                        for client_id in list(self._results.keys())
+                        if client_id % num == shard
+                    ]
+                    if errors:
+                        for err in errors:
+                            self._pop_result(err.client_id)
+                        self._response_queue.put(errors)
+                    else:
+                        self._error_queue.put(exc)
 
             return _on_postproc_worker_done
 
@@ -234,6 +233,20 @@ class RpcWorkerMixin:
             )
             responses = super().await_responses(timeout=actual_timeout)
             responses = self._await_response_helper.process_and_handle_responses(responses)
+            event_loop_error = getattr(getattr(self, "engine", None), "_event_loop_error", None)
+            if event_loop_error is not None:
+                with self._response_error_lock:
+                    pending_client_ids = list(self._results)
+                    if pending_client_ids:
+                        error_responses = [
+                            ErrorResponse(
+                                client_id,
+                                f"Event loop terminated with error: {event_loop_error}",
+                                client_id,
+                            )
+                            for client_id in pending_client_ids
+                        ]
+                        self._await_response_helper.responses_handler(error_responses)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
         qsize = self._response_queue.qsize()
@@ -263,8 +276,7 @@ class RpcWorkerMixin:
                 )
                 yield responses  # batching the responses to opt IPC performance
             else:
-                # Small delay to prevent busy waiting when no responses
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.1 if getattr(self.engine, "is_shutdown", False) else 0)
         logger_debug(
             f"[worker] RpcWorker {self.rank} quitting fetch_responses_loop_async", color="yellow"
         )
