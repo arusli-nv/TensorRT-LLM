@@ -15,10 +15,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# One-rank process failure injector
+# One-rank process failure tests
 
-This first slice sends one `SIGKILL` to a manually identified local, nonzero model world rank.
-It does not launch TRT-LLM, coordinate survivors, or test recovery.
+The injector sends one `SIGKILL` to a manually identified local, nonzero model world rank.
+The observation scripts record the client response before and after injection. They do not
+coordinate recovery or establish survivor agreement.
 
 Run the local CPU targeting tests with
 `python3 tests/integration/defs/wide_ep_ft/test_fault_injector.py` and
@@ -64,3 +65,5 @@ timeout, or response is an observation; `observation_complete` means evidence wa
 that inference recovered. `injection_uncertain` requires checking the injector's intent/result
 files and process logs before drawing a conclusion. No signal is sent unless the healthy request
 produced a nonempty completion. That gate checks the serving path, not model-answer correctness.
+
+For opt-in MPI and Ray process-failure experiments, see [SIGKILL_BASELINE.md](SIGKILL_BASELINE.md).
