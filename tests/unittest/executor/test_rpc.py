@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import concurrent.futures
+import subprocess
+import sys
 import threading
 import time
 
@@ -10,6 +14,20 @@ from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
 from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_rpc_close_with_unreachable_peer() -> None:
+    script = """
+from tensorrt_llm.executor.rpc import RPCClient
+from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
+client = RPCClient(get_unique_ipc_addr(), hmac_key=b'test-key')
+client.no_server().remote(need_response=False)
+client.close()
+"""
+    subprocess.run([sys.executable, "-c", script],
+                   check=True,
+                   capture_output=True,
+                   timeout=60)
 
 
 class RpcServerWrapper(RPCServer):
@@ -114,28 +132,22 @@ class TestRpcBasics:
                     client.hello().remote()
 
     def test_rpc_without_wait_response(self):
+        """Does a receipt acknowledgment permit clean close after a queued send?"""
+        received = threading.Event()
 
         class App:
 
-            def __init__(self):
-                self.task_submitted = False
+            def send_task(self):
+                received.set()
 
-            def send_task(self) -> None:
-                # Just submit the task and return immediately
-                # The result is not important
-                self.task_submitted = True
-                return None
-
-            def get_task_submitted(self) -> bool:
-                return self.task_submitted
+            def acknowledge(self):
+                return received.wait(timeout=5)
 
         with RpcServerWrapper(App()) as server:
             with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
                 client.send_task().remote(need_response=False)
-                time.sleep(
-                    0.1
-                )  # wait for some time to make sure the task is submitted
-                assert client.get_task_submitted().remote()
+                assert client.acknowledge().remote(timeout=6)
+            client.close()
 
 
 class TestRpcCorrectness:
