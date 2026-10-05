@@ -45,6 +45,23 @@ def _request() -> GenerationRequest:
     return GenerationRequest([1], SamplingParams(max_tokens=1))
 
 
+@pytest.mark.parametrize("fatal", [False, True])
+def test_llm_entry_preserves_fatal_cause(fatal: bool) -> None:
+    """Does a new API request preserve a recorded engine failure without changing clean shutdown?"""
+    from tensorrt_llm.llmapi.llm import LLM
+
+    error = RuntimeError("model worker died") if fatal else None
+    executor = SimpleNamespace(_fatal_error=error, is_shutdown=lambda: True)
+    client = SimpleNamespace(_encode_only=False, _executor=executor)
+    expected = EngineDeadError if fatal else RuntimeError
+    with pytest.raises(
+        expected, match="model worker died" if fatal else "LLM is shutting down"
+    ) as captured:
+        LLM.generate_async(client, [1], SamplingParams(max_tokens=1))
+    if fatal:
+        assert captured.value.root_cause is error
+
+
 def test_submit_registers_before_immediate_request_error(executor: _Executor) -> None:
     """Can an immediate RPC response reach its result before submission returns?"""
 

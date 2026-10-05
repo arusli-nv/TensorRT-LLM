@@ -17,6 +17,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def test_rpc_close_with_unreachable_peer() -> None:
+    """Can RPC client close finish with an undelivered send to an unreachable peer?"""
     script = """
 from tensorrt_llm.executor.rpc import RPCClient
 from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr

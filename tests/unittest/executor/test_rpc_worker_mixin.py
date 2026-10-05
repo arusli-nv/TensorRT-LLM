@@ -68,6 +68,7 @@ def test_fetch_responses_processes_and_filters_engine_responses():
 
 
 def test_fetch_responses_surfaces_stored_executor_failure() -> None:
+    """Does response polling surface the stored executor cause before handling more output?"""
     worker = _RpcWorkerStub()
     error = RuntimeError("peer connection closed")
     worker.engine._event_loop_error = error
