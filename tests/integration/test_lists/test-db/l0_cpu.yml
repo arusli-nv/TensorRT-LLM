@@ -27,6 +27,8 @@ l0_cpu:
       orchestrator: mpi
   tests:
   - wide_ep_ft/test_deployment_profile.py
+  - wide_ep_ft/test_process_loss.py
+  - wide_ep_ft/test_slurm_lifecycle.py
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises

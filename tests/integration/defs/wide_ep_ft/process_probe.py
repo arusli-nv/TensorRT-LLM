@@ -134,6 +134,14 @@ def prepare_temporary(directory: Path) -> None:
         raise
 
 
+def resources_clean(snapshot: dict) -> bool:
+    return not any(
+        snapshot[key] for key in ("original_live", "owned_live", "owned_gpu_contexts")
+    ) and all(
+        delta <= snapshot["memory_tolerance_mib"] for delta in snapshot["memory_delta_mib"].values()
+    )
+
+
 def cleanup_temporary(directory: Path, *, rescue: bool = False) -> None:
     """Preserve Ray logs and remove the pinned tree only after independent resource cleanup."""
     from deployment_profile import file_sha256
@@ -147,13 +155,7 @@ def cleanup_temporary(directory: Path, *, rescue: bool = False) -> None:
         or resources_record["run_id"] != directory.name
         or resources_record["hostname"] != host
         or not resources_record["clean"]
-        or resources_record["original_live"]
-        or resources_record["owned_live"]
-        or resources_record["owned_gpu_contexts"]
-        or any(
-            delta > resources_record["memory_tolerance_mib"]
-            for delta in resources_record["memory_delta_mib"].values()
-        )
+        or not resources_clean(resources_record)
     ):
         raise ValueError("Temporary cleanup requires verified process and GPU cleanup")
     path = _temporary_path(run["job_id"])
@@ -262,19 +264,27 @@ def validate_cleanup(directory: Path, *, allow_partial: bool = False, rescue: bo
         raise ValueError("Stale cleanup baseline")
     hosts = {row["hostname"] for row in baseline}
     validate_hardware(baseline, hosts, config, manifest)
+    validate_hardware(resources, hosts, config, manifest)
     for row in resources:
         before = next(report for report in baseline if report["hostname"] == row["hostname"])
+        readings = []
+        for report in (before, row):
+            memory = {
+                fields[1]: int(fields[4])
+                for fields in (line.split(", ") for line in report["gpu_memory_csv"].splitlines())
+            }
+            if memory != report["memory_used_mib"]:
+                raise ValueError("GPU memory summary differs from NVML readings")
+            readings.append(memory)
+        previous, current = readings
+        if set(current) != set(previous) or row["memory_delta_mib"] != {
+            uuid: used - previous[uuid] for uuid, used in current.items()
+        }:
+            raise ValueError("GPU memory delta differs from original readings")
         original_contexts = {(app[0], app[1]) for app in before["compute_apps"]}
         if any((app[0], app[1]) not in original_contexts for app in row["compute_apps"]):
             raise ValueError("A new GPU context remains after cleanup")
-    if any(
-        row["run_id"] != directory.name
-        or row["original_live"]
-        or row["owned_live"]
-        or row["owned_gpu_contexts"]
-        or any(delta > row["memory_tolerance_mib"] for delta in row["memory_delta_mib"].values())
-        for row in resources
-    ):
+    if any(row["run_id"] != directory.name or not resources_clean(row) for row in resources):
         raise ValueError("Raw resource checks contradict cleanup")
     if (
         {row["hostname"] for row in resources} != hosts
@@ -540,18 +550,15 @@ def cleanup_snapshot(
         uuid: used - baseline["memory_used_mib"][uuid]
         for uuid, used in current["memory_used_mib"].items()
     }
-    return {
+    snapshot = {
         **current,
         "original_live": original_live,
         "owned_live": owned_live,
         "owned_gpu_contexts": gpu_live,
         "memory_delta_mib": deltas,
         "memory_tolerance_mib": tolerance_mib,
-        "clean": not original_live
-        and not owned_live
-        and not gpu_live
-        and all(value <= tolerance_mib for value in deltas.values()),
     }
+    return {**snapshot, "clean": resources_clean(snapshot)}
 
 
 def main() -> None:

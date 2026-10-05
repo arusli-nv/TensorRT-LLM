@@ -69,6 +69,7 @@ docs/source/**/*.rst
 
 # Testing
 .coverage.*
+/.wideep-ft-runs/
 results_trt/
 llm-test-workspace/
 ad-test-workspace/
