@@ -14,6 +14,8 @@
 # limitations under the License.
 
 from queue import Queue
+from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +34,7 @@ class _WorkerBaseStub:
 class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
     def __init__(self):
         self.rank = 0
+        self.engine = SimpleNamespace(_event_loop_error=None, _event_loop_error_delivered=Event())
         self._fetch_timeout = 0.1
         self._response_queue = Queue()
         self.enable_postprocess_parallel = False
@@ -62,3 +65,16 @@ def test_fetch_responses_processes_and_filters_engine_responses():
     assert worker.callback_responses == ["forward", "consume", None]
     assert worker.handler_responses == ["processed-forward", "temporary-error"]
     assert responses == ["processed-forward", "temporary-error"]
+
+
+def test_fetch_responses_surfaces_stored_executor_failure() -> None:
+    worker = _RpcWorkerStub()
+    error = RuntimeError("peer connection closed")
+    worker.engine._event_loop_error = error
+
+    with pytest.raises(RuntimeError, match="peer connection closed") as captured:
+        worker.fetch_responses(timeout=0.01)
+
+    assert captured.value.__cause__ is error
+    assert worker.handler_responses is None
+    assert not worker.engine._event_loop_error_delivered.is_set()

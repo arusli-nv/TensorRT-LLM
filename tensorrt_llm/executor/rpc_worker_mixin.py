@@ -233,6 +233,9 @@ class RpcWorkerMixin:
                 timeout if timeout is not None else getattr(self, "_fetch_timeout", 0.1)
             )
             responses = super().await_responses(timeout=actual_timeout)
+            error = getattr(self.engine, "_event_loop_error", None)
+            if error is not None:
+                raise RuntimeError(f"Event loop terminated with error: {error}") from error
             responses = self._await_response_helper.process_and_handle_responses(responses)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
