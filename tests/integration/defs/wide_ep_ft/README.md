@@ -1,25 +1,24 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # WideEP fault injection
 
-[FAILURE_BEHAVIOR.md](FAILURE_BEHAVIOR.md) is the concise findings report.
-This test characterizes one failure and an **explicit fresh restart**; it does
-not implement survivor recovery.
+Inject one fault, check teardown and restart with new workers on the same GPUs.
+The test does not implement survivor recovery. Results are in [FAILURE_BEHAVIOR.md](FAILURE_BEHAVIOR.md).
 
-Supply a dedicated, idle Ray cluster with exactly the profile’s GPU count and
-matching TensorRT-LLM binaries on every node. Run the driver on one of those
-GPU nodes; rank 0 uses local IPC. Containers on that node must share `/tmp`.
-Allocation, image installation and Ray-service lifetime remain outside the test.
-The test owns only its model jobs and CPU resource probes.
+Provide a dedicated, idle Ray cluster with exactly the profile's GPU count and
+matching TensorRT-LLM binaries on every node. Run the driver on a GPU node.
+Rank 0 uses local IPC, so containers on that node must share `/tmp`.
+Supply the allocation, image and Ray services. The test owns model jobs and CPU probes.
 
-Before starting Ray, configure the qualified fence path:
+Set these variables before starting Ray:
 
 ```bash
 export TLLM_DISABLE_MPI=1 TLLM_FAULT_TOLERANCE_MODE=0
 export TRTLLM_FORCE_COMM_METHOD=NVLINK_ONE_SIDED TRTLLM_MOE_A2A_FORCE_CFT=0
 ```
-
-Keep native kernel timeouts unchanged. For `fence_round_mismatch`, pass
-`--client-timeout-s 420`: the steady fence timeout is nominally 300 seconds.
-Captured warmup budgets are not precise phase triggers.
 
 ```bash
 export LLM_MODELS_ROOT=/path/to/models
@@ -29,25 +28,34 @@ python tests/integration/defs/wide_ep_ft/fault_injection.py \
   --scenario worker_sigkill_streaming --output-dir /shared/evidence/attempt-001
 ```
 
-Scenarios: `worker_sigkill_idle`, `worker_sigkill_streaming`,
-`host_collective_abort`, `fence_round_mismatch`; `healthy` measures startup
-and clean restart without a fault. Communication scenarios are synthetic:
-Gloo backend abort and protocol-round mismatch, not hardware loss.
-Static cyclic EPLB preparation supports the documented DeepSeek/Qwen MoE
-layouts; other layouts supply native `initial_global_assignments` explicitly.
+Choose `worker_sigkill_idle`, `worker_sigkill_streaming`, `process_group_destroy`
+or `fence_round_mismatch`. Use `healthy` for startup and clean restart.
+Communication faults destroy local WORLD groups, including registered CPU/CUDA
+groups, or corrupt a fence round. Physical hardware loss remains untested.
+Workers must report non-CFT NVLinkOneSided and matching EP size/rank before inference.
+Static cyclic EPLB supports DeepSeek-V3 and Qwen3 MoE layouts. For other layouts,
+supply native `initial_global_assignments`.
 
-Evidence contains identities, logs, native startup intervals, the verified
-injection, client error, CUDA-probe replies, cleanup checks and restart result.
-Producer clocks are host-local; end-to-end timing uses one parent clock.
-Autotuning and cache state are labeled; phase intervals can overlap.
-Timing starts at model-driver launch after Ray is ready; cluster startup is
-excluded. Allocation queue time is unavailable to this externally provisioned test.
-All attempts get new directories; failed attempts are retained, never retried
-implicitly. A forced cleanup is evidence of harness intervention.
+Keep native kernel timeouts unchanged. For `fence_round_mismatch`, add
+`--client-timeout-s 420`. The nominal 300-second fence timeout uses GPU clock
+cycles, so elapsed time depends on the SM clock. Triggers mark request/client
+boundaries, not exact GPU phases.
 
-CPU checks: `pytest tests/integration/defs/wide_ep_ft/test_fault_injection.py`.
-Physical cases are opt-in with `WIDEEP_FT_RAY_ADDRESS`, `WIDEEP_FT_MODEL`,
-`WIDEEP_FT_CONFIG` and shared `WIDEEP_FT_OUTPUT_DIR`.
-Initial startup/client/shutdown/cleanup bounds are 720/30/180/60 seconds
-(420 seconds for the fence client);
-recalibration requires measured maxima plus a documented margin.
+Evidence includes identities, logs, startup intervals, injection, client errors,
+CUDA probes, cleanup and restart. Use a new output directory for each attempt.
+Failed attempts remain on disk. The test never retries implicitly.
+It records forced cleanup as an intervention.
+
+Timing starts at model-driver launch after Ray is ready. Ray startup is excluded.
+Allocation queue time is unavailable. End-to-end timing uses one parent clock.
+Producer clocks are host-local. Startup intervals overlap.
+Autotuning and cache state are recorded.
+
+CPU checks use `pytest tests/integration/defs/wide_ep_ft/test_fault_injection.py`.
+Physical pytest runs require `WIDEEP_FT_RAY_ADDRESS`, `WIDEEP_FT_MODEL`,
+`WIDEEP_FT_CONFIG` and a shared `WIDEEP_FT_OUTPUT_DIR`.
+Startup/client/shutdown/cleanup defaults are 720/30/180/60 seconds, with 420 for
+the fence client. Measured maxima plus margins are 340.4 + 379.6 = 720 s for
+startup, 10.3 + 19.7 = 30 s for the non-fence client and 291.5 + 128.5 = 420 s
+for the fence client. Shutdown/cleanup retain initial bounds. All bounds are provisional.
+Recalibrate from repeated runs before treating them as service guarantees.

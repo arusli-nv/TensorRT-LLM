@@ -25,10 +25,12 @@ import time
 from pathlib import Path
 
 IDENTITY_KEYS = ("rank", "hostname", "pid", "start_ticks", "boot_id", "uid", "actor_id")
+RUN_ID_ENV = "WIDEEP_FT_RUN_ID"
+IDENTITY_DIR_ENV = "WIDEEP_FT_IDENTITY_DIR"
 SCENARIOS = (
     "worker_sigkill_idle",
     "worker_sigkill_streaming",
-    "host_collective_abort",
+    "process_group_destroy",
     "fence_round_mismatch",
 )
 
@@ -75,6 +77,16 @@ def record(directory: Path, name: str, value: dict) -> None:
             os.close(descriptor)
     finally:
         temporary.unlink()
+
+
+def record_worker_identity() -> None:
+    """Record immutable process identity before Ray constructs the GPU worker."""
+    identity = process_identity(os.getpid())
+    record(
+        Path(os.environ[IDENTITY_DIR_ENV]) / "startup_identities" / identity["hostname"],
+        f"{identity['pid']}-{identity['start_ticks']}",
+        {**identity, "run_id": os.environ[RUN_ID_ENV], "job_id": os.environ["RAY_JOB_ID"]},
+    )
 
 
 def validate_injection(expected: dict, actual: dict, scenario: str, trigger: dict) -> None:
@@ -137,13 +149,18 @@ class WorkerExtension:
         )
         if scenario.startswith("worker_sigkill_"):
             os.kill(os.getpid(), signal.SIGKILL)
-        if scenario == "host_collective_abort":
+        if scenario == "process_group_destroy":
             import torch
 
-            group = self.engine.dist.mapping.tp_group_pg
+            group = torch.distributed.group.WORLD
             backend = group._get_backend(torch.device("cpu"))
-            result = {"backend": type(backend).__name__, "group_size": group.size()}
-            backend.abort()
+            result = {
+                "group": "WORLD",
+                "backend": type(backend).__name__,
+                "group_size": group.size(),
+                "tp_group_is_world": group is self.engine.dist.mapping.tp_group_pg,
+            }
+            torch.distributed.destroy_process_group(group)
         else:
             import torch
 
@@ -188,21 +205,40 @@ class WorkerExtension:
 class NodeProbe:
     """CPU-only accounting; never opens a CUDA context or kills unowned processes."""
 
-    def pin_actor_processes(self, actors: dict) -> list[dict]:
+    def pin_actor_processes(self, actors: dict, directory: str) -> list[dict]:
         import ray
 
         node_id = ray.get_runtime_context().get_node_id()
+        path = Path(directory)
+        job = json.loads((path / "job.json").read_text())
         identities = []
         for actor_id, actor in actors.items():
             if actor["Address"]["NodeID"] != node_id or actor["Pid"] <= 0:
                 continue
             try:
                 identity = process_identity(actor["Pid"])
+                evidence = json.loads(
+                    (
+                        path
+                        / "startup_identities"
+                        / identity["hostname"]
+                        / f"{identity['pid']}-{identity['start_ticks']}.json"
+                    ).read_text()
+                )
+                if (
+                    evidence["run_id"] != job["run_id"]
+                    or evidence["job_id"] != job["job_id"]
+                    or any(
+                        evidence[key] != identity[key]
+                        for key in ("hostname", "pid", "start_ticks", "boot_id", "uid")
+                    )
+                ):
+                    continue
             except (FileNotFoundError, ProcessLookupError):
                 continue
             if identity["uid"] != os.getuid():
                 raise ValueError("Owned Ray actor process has an unexpected UID")
-            identities.append({**identity, "actor_id": actor_id})
+            identities.append({**identity, "actor_id": actor_id, "run_id": job["run_id"]})
         return identities
 
     def read_run_id(self, directory: str) -> str:

@@ -17,6 +17,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -30,7 +31,14 @@ from queue import Empty
 from types import FrameType, ModuleType
 from typing import TYPE_CHECKING
 
-from fault_injector import SCENARIOS, NodeProbe, record, resources_released
+from fault_injector import (
+    IDENTITY_DIR_ENV,
+    RUN_ID_ENV,
+    SCENARIOS,
+    NodeProbe,
+    record,
+    resources_released,
+)
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -91,6 +99,27 @@ def validate_restart(initial: list[dict], restarted: list[dict]) -> None:
             raise ValueError("Restart must use new workers on the same GPUs")
 
 
+def validate_workers(workers: list[dict], ranks: int, graphs_requested: bool) -> None:
+    if (
+        sorted(row["rank"] for row in workers) != list(range(ranks))
+        or len({row["actor_id"] for row in workers}) != ranks
+        or len({row["gpu_uuid"] for row in workers}) != ranks
+    ):
+        raise ValueError("Incomplete model worker identities")
+    for row in workers:
+        if graphs_requested and (not row["graphs_enabled"] or not row["graph_keys"]):
+            raise ValueError("Requested CUDA graphs were not captured")
+        communication = row["communication"].get("NVLinkOneSided", {})
+        if (
+            communication.get("cft_capable") is not False
+            or communication.get("ep_size") != ranks
+            or communication.get("ep_rank") != row["rank"]
+        ):
+            raise ValueError(
+                "Worker communication differs from the requested non-CFT WideEP geometry"
+            )
+
+
 def child(args: argparse.Namespace) -> None:
     # TensorRT-LLM initializes native library paths before torch is imported.
     import tensorrt_llm
@@ -109,10 +138,18 @@ def child(args: argparse.Namespace) -> None:
     ranks = config["moe_expert_parallel_size"]
     ray.init(
         address=args.address,
-        runtime_env={"working_dir": str(Path(__file__).parent)},
+        runtime_env={
+            "working_dir": str(Path(__file__).parent),
+            "env_vars": {RUN_ID_ENV: args.run_id, IDENTITY_DIR_ENV: str(directory)},
+            "worker_process_setup_hook": "fault_injector.record_worker_identity",
+        },
         log_to_driver=True,
     )
-    record(directory, "job", {"job_id": str(ray.get_runtime_context().get_job_id())})
+    record(
+        directory,
+        "job",
+        {"job_id": str(ray.get_runtime_context().get_job_id()), "run_id": args.run_id},
+    )
     nodes = sorted(
         [node for node in ray.nodes() if node["Alive"] and node["Resources"].get("GPU")],
         key=lambda node: (
@@ -148,26 +185,17 @@ def child(args: argparse.Namespace) -> None:
                 ],
                 timeout=30,
             )
-            if (
-                sorted(row["rank"] for row in workers) != list(range(ranks))
-                or len({row["actor_id"] for row in workers}) != ranks
-                or len({row["gpu_uuid"] for row in workers}) != ranks
-            ):
-                raise ValueError("Incomplete model worker identities")
+            validate_workers(workers, ranks, bool(config.get("cuda_graph_config")))
             for row in workers:
                 row["run_id"] = args.run_id
-                if config.get("cuda_graph_config") and (
-                    not row["graphs_enabled"] or not row["graph_keys"]
-                ):
-                    raise ValueError("Requested CUDA graphs were not captured")
-                if "NVLinkOneSided" not in row["communication"]:
-                    raise ValueError("Expected WideEP NVLinkOneSided communication is not active")
             record(
                 directory,
                 "workers",
                 {
                     "workers": workers,
-                    "startup_metrics": llm.startup_metrics,
+                    "startup_metrics": next(
+                        row["startup_metrics"] for row in workers if row["rank"] == 0
+                    ),
                     "runtime": {
                         "tensorrt_llm": tensorrt_llm.__version__,
                         "ray": ray.__version__,
@@ -277,24 +305,25 @@ def observe_fault(llm: "LLM", workers: list[dict], args: argparse.Namespace) -> 
         )
     except Empty as error:
         raise TimeoutError("Client did not report a terminal failure") from error
-    probes = [
-        worker.call_worker_method.remote("fault_cuda_probe")
+    probes = {
+        worker.call_worker_method.remote("fault_cuda_probe"): rank
         for rank, worker in enumerate(llm._executor.workers)
         if rank != target_rank or not args.scenario.startswith("worker_sigkill_")
-    ]
-    ready, pending = ray.wait(probes, num_returns=len(probes), timeout=5)
+    }
+    ready, pending = ray.wait(list(probes), num_returns=len(probes), timeout=5)
     observations = []
     for reply in ready:
         try:
             observations.append(ray.get(reply))
         except ray.exceptions.RayError as error:
-            observations.append({"error": str(error)})
+            observations.append({"rank": probes[reply], "error": str(error)})
     record(
         directory,
         "cuda_probes",
         {
             "replies": observations,
             "unknown": len(pending),
+            "unknown_ranks": [probes[reply] for reply in pending],
             "scope": "successful operation only; no recovery claim",
         },
     )
@@ -321,11 +350,16 @@ def validate_fault_evidence(directory: Path, scenario: str) -> None:
             r"(?:dispatch|combine):.*timed out waiting for completion flag", log
         ):
             raise AssertionError("No native fence timeout evidence for the verified round mismatch")
-    elif "gloo" not in result["backend"].lower() or not re.search(
-        r"(?:Group.*not registered|Invalid process group|Connection (?:closed|reset) by peer|gloo.*(?:Error|error))",
-        log,
+    elif (
+        result.get("group") != "WORLD"
+        or "gloo" not in result["backend"].lower()
+        or not re.search(
+            r"(?:Default process group has not been initialized|Group.*not registered|Invalid process group|"
+            r"Connection (?:closed|reset) by peer|gloo.*(?:Error|error))",
+            log,
+        )
     ):
-        raise AssertionError("No host collective error evidence for the aborted Gloo group")
+        raise AssertionError("No host collective error evidence for the destroyed process group")
 
 
 def owned_actors(ray: ModuleType, job_id: str) -> dict:
@@ -333,7 +367,7 @@ def owned_actors(ray: ModuleType, job_id: str) -> dict:
 
     actors = state.actors(job_id=ray.JobID.from_hex(job_id))
     return {
-        actor_id: row
+        actor_id: {"Address": {"NodeID": row["Address"]["NodeID"]}, "Pid": row["Pid"]}
         for actor_id, row in actors.items()
         if row["JobID"] == job_id and row["State"] != "DEAD"
     }
@@ -348,11 +382,12 @@ def cleanup(
     timeout_s: float,
     forced: bool,
 ) -> None:
-    job_id = (
-        json.loads((directory / "job.json").read_text())["job_id"]
+    job = (
+        json.loads((directory / "job.json").read_text())
         if (directory / "job.json").exists()
-        else None
+        else {}
     )
+    job_id = job.get("job_id")
     deadline = time.monotonic() + timeout_s
     forced_actor_ids = set()
     terminated_pids = set()
@@ -363,8 +398,18 @@ def cleanup(
                 from ray._private.worker import global_worker
 
                 actors = owned_actors(ray, job_id)
+                pinned_actor_ids = {identity["actor_id"] for identity in identities}
+                unpinned = {
+                    actor_id: actor
+                    for actor_id, actor in actors.items()
+                    if actor_id not in pinned_actor_ids
+                }
                 pinned = ray.get(
-                    [probe.pin_actor_processes.remote(actors) for probe in probes], timeout=15
+                    [
+                        probe.pin_actor_processes.remote(unpinned, str(directory))
+                        for probe in probes
+                    ],
+                    timeout=15,
                 )
                 identities.extend(
                     identity for node in pinned for identity in node if identity not in identities
@@ -467,10 +512,6 @@ def run_phase(
         str(args.client_timeout_s),
         "--startup-timeout-s",
         str(args.startup_timeout_s),
-        "--shutdown-timeout-s",
-        str(args.shutdown_timeout_s),
-        "--cleanup-timeout-s",
-        str(args.cleanup_timeout_s),
     ]
     started = time.monotonic()
     received = {}
@@ -512,25 +553,30 @@ def run_phase(
             if scenario != "healthy" and not (directory / "client_error.json").exists():
                 raise AssertionError("Expected EngineDeadError is missing")
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=15)
-            if (directory / "workers.json").exists():
-                identities = json.loads((directory / "workers.json").read_text())["workers"]
             try:
-                cleanup(
-                    ray, probes, baseline, directory, identities, args.cleanup_timeout_s, forced
-                )
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=15)
             finally:
-                record(
-                    directory,
-                    "timing",
-                    {
-                        "seconds_to_received_event": received,
-                        "total_seconds": time.monotonic() - started,
-                        "clock_source": "single parent CLOCK_MONOTONIC; file publication receipt",
-                    },
-                )
+                try:
+                    if (directory / "workers.json").exists():
+                        identities = json.loads((directory / "workers.json").read_text())["workers"]
+                    cleanup(
+                        ray, probes, baseline, directory, identities, args.cleanup_timeout_s, forced
+                    )
+                finally:
+                    record(
+                        directory,
+                        "timing",
+                        {
+                            "seconds_to_received_event": received,
+                            "total_seconds": time.monotonic() - started,
+                            "clock_source": "single parent CLOCK_MONOTONIC; file publication receipt",
+                        },
+                    )
     validate_fault_evidence(directory, scenario)
     return {"workers": identities, "received": received, "parent_started_s": started}
 
@@ -560,52 +606,49 @@ def run(args: argparse.Namespace) -> None:
             "allocation_queue_seconds": None,
             "autotuning_enabled": config.get("enable_autotuner"),
             "cache_state": "uncontrolled filesystem/compiler caches",
+            "time_bounds_s": {
+                phase: getattr(args, f"{phase}_timeout_s")
+                for phase in ("startup", "client", "shutdown", "cleanup")
+            },
         },
     )
+    sigterm_handler = signal.getsignal(signal.SIGTERM)
     ray.init(address=args.address, runtime_env={"working_dir": str(Path(__file__).parent)})
+    signal.signal(signal.SIGTERM, sigterm_handler)
     probes = []
     try:
-        probe_class = ray.remote(num_cpus=0)(NodeProbe)
-        probes = [
-            probe_class.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(node["NodeID"], soft=False)
-            ).remote()
-            for node in ray.nodes()
-            if node["Alive"] and node["Resources"].get("GPU")
-        ]
-        visible = ray.get(
-            [probe.read_run_id.remote(str(args.output_dir)) for probe in probes], timeout=15
-        )
-        if not visible or any(run_id != args.run_id for run_id in visible):
-            raise ValueError("Evidence directory must be shared across all GPU nodes")
-        baseline = ray.get([probe.snapshot.remote([]) for probe in probes], timeout=30)
-        if not baseline or any(row["compute_apps"] for row in baseline):
-            raise ValueError("Dedicated Ray cluster must have no existing GPU compute contexts")
-        record(args.output_dir, "baseline", {"snapshots": baseline})
-        expected_gpus = {gpu[0] for row in baseline for gpu in row["gpus"]}
-        if len(expected_gpus) != config["moe_expert_parallel_size"]:
-            raise ValueError("Dedicated cluster does not match the requested EP size")
-        initial = run_phase(args, ray, probes, baseline, "initial", args.scenario)
-        if {row["gpu_uuid"] for row in initial["workers"]} != expected_gpus:
-            raise ValueError("Model worker GPU identities differ from the independent baseline")
-        restarted = run_phase(args, ray, probes, baseline, "restart", "healthy")
-        validate_restart(initial["workers"], restarted["workers"])
-        record(
-            args.output_dir,
-            "summary",
-            {
-                "state": "PASS",
-                "same_gpu_restart": True,
-                "fault_observed_to_restart_readiness_s": (
-                    restarted["parent_started_s"]
-                    + restarted["received"]["healthy"]
-                    - initial["parent_started_s"]
-                    - initial["received"].get("client_error", initial["received"]["healthy"])
-                ),
-                "initial": initial["received"],
-                "restart": restarted["received"],
-            },
-        )
+        try:
+            probe_class = ray.remote(num_cpus=0)(NodeProbe)
+            probes = [
+                probe_class.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node["NodeID"], soft=False)
+                ).remote()
+                for node in ray.nodes()
+                if node["Alive"] and node["Resources"].get("GPU")
+            ]
+            visible = ray.get(
+                [probe.read_run_id.remote(str(args.output_dir)) for probe in probes], timeout=15
+            )
+            if not visible or any(run_id != args.run_id for run_id in visible):
+                raise ValueError("Evidence directory must be shared across all GPU nodes")
+            baseline = ray.get([probe.snapshot.remote([]) for probe in probes], timeout=30)
+            if not baseline or any(row["compute_apps"] for row in baseline):
+                raise ValueError("Dedicated Ray cluster must have no existing GPU compute contexts")
+            record(args.output_dir, "baseline", {"snapshots": baseline})
+            expected_gpus = {gpu[0] for row in baseline for gpu in row["gpus"]}
+            if len(expected_gpus) != config["moe_expert_parallel_size"]:
+                raise ValueError("Dedicated cluster does not match the requested EP size")
+            initial = run_phase(args, ray, probes, baseline, "initial", args.scenario)
+            if {row["gpu_uuid"] for row in initial["workers"]} != expected_gpus:
+                raise ValueError("Model worker GPU identities differ from the independent baseline")
+            restarted = run_phase(args, ray, probes, baseline, "restart", "healthy")
+            validate_restart(initial["workers"], restarted["workers"])
+        finally:
+            try:
+                for probe in probes:
+                    ray.kill(probe, no_restart=True)
+            finally:
+                ray.shutdown()
     except (Exception, KeyboardInterrupt) as error:
         record(
             args.output_dir,
@@ -613,10 +656,22 @@ def run(args: argparse.Namespace) -> None:
             {"state": "FAIL", "error": repr(error), "traceback": traceback.format_exc()},
         )
         raise
-    finally:
-        for probe in probes:
-            ray.kill(probe, no_restart=True)
-        ray.shutdown()
+    record(
+        args.output_dir,
+        "summary",
+        {
+            "state": "PASS",
+            "same_gpu_restart": True,
+            "fault_observed_to_restart_readiness_s": (
+                restarted["parent_started_s"]
+                + restarted["received"]["healthy"]
+                - initial["parent_started_s"]
+                - initial["received"].get("client_error", initial["received"]["healthy"])
+            ),
+            "initial": initial["received"],
+            "restart": restarted["received"],
+        },
+    )
 
 
 def main() -> None:
@@ -642,7 +697,7 @@ def main() -> None:
 
         signal.signal(signal.SIGTERM, interrupt)
     if any(
-        getattr(args, name) <= 0
+        not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0
         for name in (
             "startup_timeout_s",
             "client_timeout_s",
@@ -650,7 +705,7 @@ def main() -> None:
             "cleanup_timeout_s",
         )
     ):
-        parser.error("Timeouts must be positive")
+        parser.error("Timeouts must be finite and positive")
     (child if args.child else run)(args)
 
 

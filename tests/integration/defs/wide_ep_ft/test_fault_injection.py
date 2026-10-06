@@ -16,12 +16,28 @@
 
 import json
 import os
+import pickle
+import signal
+import struct
+import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
+import fault_injection
 import pytest
-from fault_injection import load_config, validate_fault_evidence, validate_restart
+from fault_injection import (
+    load_config,
+    owned_actors,
+    validate_fault_evidence,
+    validate_restart,
+    validate_workers,
+)
 from fault_injector import (
     IDENTITY_KEYS,
+    NodeProbe,
+    WorkerExtension,
     process_identity,
     record,
     resources_released,
@@ -117,13 +133,9 @@ def test_empty_or_incomplete_cleanup_cannot_pass() -> None:
 
 def test_cleanup_backstop_rechecks_process_identity() -> None:
     """Can cleanup signal a recycled PID, and can it terminate its verified child?"""
-    import signal
-    import subprocess
-    import sys
-
-    from fault_injector import NodeProbe
-
-    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
     try:
         expected = process_identity(process.pid)
         probe = NodeProbe()
@@ -139,15 +151,233 @@ def test_cleanup_backstop_rechecks_process_identity() -> None:
             process.wait(timeout=5)
 
 
+def test_ray_initialization_preserves_interrupt_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Does SIGTERM still record a failed run after Ray installs its own handler?"""
+
+    def interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt("test interruption")
+
+    def ray_interrupt(signum: int, _frame: object) -> None:
+        raise SystemExit(signum)
+
+    def initialize(**_kwargs: object) -> None:
+        signal.signal(signal.SIGTERM, ray_interrupt)
+
+    def create_probe(**_kwargs: object) -> None:
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(init=initialize, remote=create_probe, shutdown=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray.util.scheduling_strategies",
+        SimpleNamespace(NodeAffinitySchedulingStrategy=object),
+    )
+    monkeypatch.setattr(fault_injection, "load_config", lambda *_: {"moe_expert_parallel_size": 1})
+    args = SimpleNamespace(
+        output_dir=tmp_path / "attempt",
+        config=tmp_path,
+        model=tmp_path,
+        run_id="run-a",
+        scenario="healthy",
+        address="external",
+        startup_timeout_s=720,
+        client_timeout_s=30,
+        shutdown_timeout_s=180,
+        cleanup_timeout_s=60,
+    )
+    previous = signal.signal(signal.SIGTERM, interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="test interruption"):
+            fault_injection.run(args)
+        summary = json.loads((args.output_dir / "summary.json").read_text())
+        assert summary["state"] == "FAIL" and "KeyboardInterrupt" in summary["error"]
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@pytest.mark.parametrize("failure", ["exited", "wait_timeout"])
+def test_client_termination_failure_still_cleans_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Can an exiting or unresponsive client skip independent resource cleanup?"""
+    process = Mock(pid=123, poll=Mock(return_value=None))
+    cleanup = Mock()
+    monkeypatch.setattr(fault_injection.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(fault_injection, "cleanup", cleanup)
+    kill = Mock(side_effect=ProcessLookupError() if failure == "exited" else None)
+    monkeypatch.setattr(fault_injection.os, "killpg", kill)
+    if failure == "wait_timeout":
+        process.wait.side_effect = subprocess.TimeoutExpired("client", 15)
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        address="external",
+        model=tmp_path,
+        config=tmp_path,
+        run_id="run-a",
+        startup_timeout_s=1e-9,
+        client_timeout_s=30,
+        shutdown_timeout_s=180,
+        cleanup_timeout_s=60,
+    )
+    expected = TimeoutError if failure == "exited" else subprocess.TimeoutExpired
+    with pytest.raises(expected):
+        fault_injection.run_phase(args, None, [], [], "initial", "healthy")
+    cleanup.assert_called_once()
+    assert cleanup.call_args.args[-1] is True
+    assert (tmp_path / "initial" / "timing.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["kill", "shutdown"])
+def test_finalization_failure_cannot_publish_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Can a failed probe/client finalization leave a contradictory PASS artifact?"""
+    probe = SimpleNamespace(
+        read_run_id=SimpleNamespace(remote=lambda _: "run-a"),
+        snapshot=SimpleNamespace(remote=lambda _: snapshot()),
+    )
+    ray = SimpleNamespace(
+        init=lambda **_: None,
+        remote=lambda **_: lambda _: SimpleNamespace(
+            options=lambda **_: SimpleNamespace(remote=lambda: probe)
+        ),
+        get=lambda value, **_: value,
+        nodes=lambda: [{"Alive": True, "Resources": {"GPU": 1}, "NodeID": "node-a"}],
+        kill=Mock(side_effect=RuntimeError("kill failed") if failure == "kill" else None),
+        shutdown=Mock(
+            side_effect=RuntimeError("shutdown failed") if failure == "shutdown" else None
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray.util.scheduling_strategies",
+        SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *_, **__: None),
+    )
+    monkeypatch.setattr(fault_injection, "load_config", lambda *_: {"moe_expert_parallel_size": 1})
+    first = identity()
+    second = {**first, "actor_id": "actor-b", "pid": first["pid"] + 1}
+    monkeypatch.setattr(
+        fault_injection,
+        "run_phase",
+        Mock(
+            side_effect=[
+                {"workers": [row], "received": {"healthy": 1}, "parent_started_s": 0}
+                for row in (first, second)
+            ]
+        ),
+    )
+    args = SimpleNamespace(
+        output_dir=tmp_path / "attempt",
+        config=tmp_path,
+        model=tmp_path,
+        run_id="run-a",
+        scenario="healthy",
+        address="external",
+        startup_timeout_s=720,
+        client_timeout_s=30,
+        shutdown_timeout_s=180,
+        cleanup_timeout_s=60,
+    )
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        fault_injection.run(args)
+    summary = json.loads((args.output_dir / "summary.json").read_text())
+    assert summary["state"] == "FAIL" and f"{failure} failed" in summary["error"]
+    ray.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "change", [{}, {"cft_capable": True}, {"cft_capable": None}, {"ep_size": 3}, {"ep_rank": 1}]
+)
+def test_worker_runtime_matches_non_cft_profile(change: dict) -> None:
+    """Can CFT or different EP geometry qualify as the requested fence baseline?"""
+    workers = [
+        {
+            "rank": rank,
+            "actor_id": f"actor-{rank}",
+            "gpu_uuid": f"GPU-{rank}",
+            "graphs_enabled": True,
+            "graph_keys": ["1"],
+            "communication": {
+                "NVLinkOneSided": {
+                    "cft_capable": False,
+                    "ep_size": 2,
+                    "ep_rank": rank,
+                }
+            },
+        }
+        for rank in range(2)
+    ]
+    workers[0]["communication"]["NVLinkOneSided"].update(change)
+    if change:
+        with pytest.raises(ValueError, match="communication"):
+            validate_workers(workers, 2, True)
+    else:
+        validate_workers(workers, 2, True)
+
+
+def test_cleanup_preserves_pinned_identity_after_pid_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Can stale actor metadata authorize killing a replacement process?"""
+    original = identity()
+    identities = [original.copy()]
+    calls = []
+    snapshots = 0
+
+    def pin(actors: dict, directory: str) -> list[dict]:
+        assert directory == str(tmp_path)
+        calls.append(actors)
+        return [{**original, "start_ticks": original["start_ticks"] + 1}] if actors else []
+
+    def observe(_identities: list[dict]) -> dict:
+        nonlocal snapshots
+        snapshots += 1
+        return {**snapshot(), "compute_apps": [["GPU-a", "123", "1024"]] if snapshots == 1 else []}
+
+    probe = SimpleNamespace(
+        snapshot=SimpleNamespace(remote=observe),
+        pin_actor_processes=SimpleNamespace(remote=pin),
+        terminate_owned_processes=SimpleNamespace(remote=lambda _: []),
+        collect_logs=SimpleNamespace(remote=lambda *_: []),
+    )
+    ray = SimpleNamespace(
+        get=lambda value, **_: value,
+        ActorID=SimpleNamespace(from_hex=lambda value: value),
+        available_resources=lambda: {"GPU": 1},
+        _private=SimpleNamespace(
+            state=SimpleNamespace(jobs=lambda: [{"JobID": "owned", "IsDead": True}])
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray._private.worker",
+        SimpleNamespace(
+            global_worker=SimpleNamespace(core_worker=SimpleNamespace(kill_actor=Mock()))
+        ),
+    )
+    monkeypatch.setattr(
+        fault_injection,
+        "owned_actors",
+        lambda *_: {original["actor_id"]: {"Pid": original["pid"]}} if snapshots < 2 else {},
+    )
+    monkeypatch.setattr(fault_injection.time, "sleep", lambda _: None)
+    record(tmp_path, "job", {"job_id": "owned", "run_id": "run-a"})
+    fault_injection.cleanup(ray, [probe], [snapshot()], tmp_path, identities, 5, True)
+    assert identities == [original]
+    assert calls == [{}, {}]
+
+
 def test_forced_backstop_does_not_hide_failed_native_teardown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Can successful backstop cleanup turn a native resource leak into a pass?"""
-    import sys
-    from types import SimpleNamespace
-
-    import fault_injection
-
     dirty = {"compute_apps": [["GPU-a", "123", "1024"]]}
 
     def terminate(_identities: list[dict]) -> list:
@@ -156,7 +386,7 @@ def test_forced_backstop_does_not_hide_failed_native_teardown(
 
     probe = SimpleNamespace(
         snapshot=SimpleNamespace(remote=lambda _: {**snapshot(), **dirty}),
-        pin_actor_processes=SimpleNamespace(remote=lambda _: []),
+        pin_actor_processes=SimpleNamespace(remote=lambda *_: []),
         terminate_owned_processes=SimpleNamespace(remote=terminate),
         collect_logs=SimpleNamespace(remote=lambda *_: []),
     )
@@ -171,7 +401,7 @@ def test_forced_backstop_does_not_hide_failed_native_teardown(
     monkeypatch.setattr(fault_injection, "owned_actors", lambda *_: {})
     ticks = iter(range(20))
     monkeypatch.setattr(fault_injection.time, "monotonic", lambda: next(ticks))
-    record(tmp_path, "job", {"job_id": "owned"})
+    record(tmp_path, "job", {"job_id": "owned", "run_id": "run-a"})
     with pytest.raises(TimeoutError, match="Native teardown leaked"):
         fault_injection.cleanup(ray, [probe], [snapshot()], tmp_path, [], 0.1, False)
     assert (tmp_path / "cleanup_failed.json").exists()
@@ -200,6 +430,37 @@ def test_generic_error_does_not_prove_fence_fault(tmp_path: Path) -> None:
         validate_fault_evidence(tmp_path, "fence_round_mismatch")
     (tmp_path / "driver.log").write_text("dispatch: Rank 1 timed out waiting for completion flag")
     validate_fault_evidence(tmp_path, "fence_round_mismatch")
+
+
+def test_fault_targets_request_broadcast_world_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Does injection select WORLD explicitly, regardless of TP-group aliasing?"""
+    active, tp_group = Mock(), Mock()
+    destroy = Mock()
+    group = SimpleNamespace(_get_backend=lambda _: active, size=lambda: 32)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            device=lambda name: name,
+            distributed=SimpleNamespace(
+                group=SimpleNamespace(WORLD=group), destroy_process_group=destroy
+            ),
+        ),
+    )
+    worker = SimpleNamespace(
+        fault_identity=identity,
+        engine=SimpleNamespace(dist=SimpleNamespace(mapping=SimpleNamespace(tp_group_pg=tp_group))),
+    )
+    record(tmp_path, "trigger", {"run_id": "run-a", "event": "between_requests"})
+    result = WorkerExtension.inject_fault(
+        worker, identity(), str(tmp_path), "process_group_destroy"
+    )
+    destroy.assert_called_once_with(group)
+    active.abort.assert_not_called()
+    tp_group._get_backend.assert_not_called()
+    assert result["group"] == "WORLD"
 
 
 @pytest.mark.parametrize("ranks", [2, 7, 16, 32, 72, 128])
@@ -235,7 +496,7 @@ def test_static_placement_is_not_fixed_to_ep32(tmp_path: Path, ranks: int) -> No
     [
         "worker_sigkill_idle",
         "worker_sigkill_streaming",
-        "host_collective_abort",
+        "process_group_destroy",
         "fence_round_mismatch",
     ],
 )
@@ -244,9 +505,6 @@ def test_static_placement_is_not_fixed_to_ep32(tmp_path: Path, ranks: int) -> No
 )
 def test_wideep_fault_and_explicit_restart(scenario: str) -> None:
     """Does this fault report a bounded client error, release resources, and allow a fresh restart?"""
-    import subprocess
-    import sys
-
     output = Path(os.environ["WIDEEP_FT_OUTPUT_DIR"]) / scenario
     command = [
         sys.executable,
@@ -270,10 +528,6 @@ def test_wideep_fault_and_explicit_restart(scenario: str) -> None:
 
 def test_sigkill_publishes_intent_before_terminating_owned_process(tmp_path: Path) -> None:
     """Is one real SIGKILL preceded by durable, matching target evidence?"""
-    import signal
-    import subprocess
-    import sys
-
     code = """
 import os
 from pathlib import Path
@@ -303,19 +557,25 @@ worker.inject_fault(expected, str(path), 'worker_sigkill_idle')
 
 
 def test_actor_cleanup_filters_exact_job_and_live_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Can cleanup select actors belonging to another driver?"""
-    import sys
-    from types import ModuleType, SimpleNamespace
-
-    from fault_injection import owned_actors
-
+    """Does cleanup send only serializable local identity data for this driver's actors?"""
     job = object()
 
     def actors(*, job_id: object) -> dict:
         assert job_id is job
         return {
-            "owned": {"JobID": "job-a", "State": "ALIVE"},
-            "starting": {"JobID": "job-a", "State": "PENDING_CREATION"},
+            "owned": {
+                "JobID": "job-a",
+                "State": "ALIVE",
+                "Pid": 123,
+                "Address": {"NodeID": "node-a"},
+                "DeathCause": struct.Struct("q"),
+            },
+            "starting": {
+                "JobID": "job-a",
+                "State": "PENDING_CREATION",
+                "Pid": 0,
+                "Address": {"NodeID": ""},
+            },
             "foreign": {"JobID": "job-b", "State": "ALIVE"},
             "dead": {"JobID": "job-a", "State": "DEAD"},
         }
@@ -324,25 +584,30 @@ def test_actor_cleanup_filters_exact_job_and_live_state(monkeypatch: pytest.Monk
     private.state = SimpleNamespace(actors=actors)
     monkeypatch.setitem(sys.modules, "ray._private", private)
     ray = SimpleNamespace(JobID=SimpleNamespace(from_hex=lambda value: job))
-    assert list(owned_actors(ray, "job-a")) == ["owned", "starting"]
+    selected = owned_actors(ray, "job-a")
+    assert list(selected) == ["owned", "starting"]
+    pickle.dumps(selected)
 
 
 def test_group_registration_is_not_communication_failure(tmp_path: Path) -> None:
     """Can benign initialization logs falsely establish the communication fault?"""
-    record(tmp_path, "injection_intent", {"scenario": "host_collective_abort"})
-    record(tmp_path, "injection_result", {"backend": "gloo", "group_size": 32})
+    record(tmp_path, "injection_intent", {"scenario": "process_group_destroy"})
+    record(tmp_path, "injection_result", {"group": "WORLD", "backend": "gloo", "group_size": 32})
     (tmp_path / "driver.log").write_text("Group is registered; Group valid")
     with pytest.raises(AssertionError, match="collective error"):
-        validate_fault_evidence(tmp_path, "host_collective_abort")
+        validate_fault_evidence(tmp_path, "process_group_destroy")
+    (tmp_path / "driver.log").write_text("Default process group has not been initialized")
+    validate_fault_evidence(tmp_path, "process_group_destroy")
 
 
-def test_partial_startup_pins_only_local_actor_processes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Can interrupted-startup accounting confuse another node's PID with a local process?"""
-    import sys
-    from types import SimpleNamespace
-
-    from fault_injector import NodeProbe
-
+@pytest.mark.parametrize(
+    "change",
+    [None, {"run_id": "other"}, {"job_id": "other"}, {"start_ticks": 0}, {}],
+)
+def test_partial_startup_pins_only_verified_local_actor_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: dict | None
+) -> None:
+    """Can stale Ray metadata pin a process without matching startup identity?"""
     monkeypatch.setitem(
         sys.modules,
         "ray",
@@ -353,7 +618,17 @@ def test_partial_startup_pins_only_local_actor_processes(monkeypatch: pytest.Mon
         "remote": {"Address": {"NodeID": "node-b"}, "Pid": os.getpid()},
         "pending": {"Address": {"NodeID": ""}, "Pid": 0},
     }
-    pinned = NodeProbe().pin_actor_processes(actors)
-    assert len(pinned) == 1
-    assert pinned[0]["actor_id"] == "local"
-    assert pinned[0]["start_ticks"] == process_identity(os.getpid())["start_ticks"]
+    current = process_identity(os.getpid())
+    record(tmp_path, "job", {"job_id": "owned", "run_id": "run-a"})
+    if change is not None:
+        record(
+            tmp_path / "startup_identities" / current["hostname"],
+            f"{current['pid']}-{current['start_ticks']}",
+            {**current, "job_id": "owned", "run_id": "run-a", **change},
+        )
+    pinned = NodeProbe().pin_actor_processes(actors, str(tmp_path))
+    assert len(pinned) == (1 if change == {} else 0)
+    if pinned:
+        assert pinned[0]["actor_id"] == "local"
+        assert pinned[0]["run_id"] == "run-a"
+        assert pinned[0]["start_ticks"] == current["start_ticks"]
