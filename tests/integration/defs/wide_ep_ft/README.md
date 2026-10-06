@@ -6,7 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # WideEP fault injection
 
 Inject one fault, check teardown and restart with new workers on the same GPUs.
-The test does not implement survivor recovery. Results are in [FAILURE_BEHAVIOR.md](FAILURE_BEHAVIOR.md).
+The test does not implement survivor recovery. MPI baseline and historical Ray
+results are in [FAILURE_BEHAVIOR.md](FAILURE_BEHAVIOR.md). The runner below uses Ray;
+MPI launcher/probe packaging is still in progress.
 
 Provide a dedicated, idle Ray cluster with exactly the profile's GPU count and
 matching TensorRT-LLM binaries on every node. Run the driver on a GPU node.

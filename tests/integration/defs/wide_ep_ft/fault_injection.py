@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Observe one WideEP fault, verify cleanup, and explicitly restart on the same GPUs."""
 
 import argparse
@@ -92,7 +80,10 @@ def validate_restart(initial: list[dict], restarted: list[dict]) -> None:
         if (
             row["gpu_uuid"] != new["gpu_uuid"]
             or row["hostname"] != new["hostname"]
-            or row["actor_id"] == new["actor_id"]
+            or (
+                row.get("actor_id") is not None
+                and (not new.get("actor_id") or row["actor_id"] == new["actor_id"])
+            )
             or (row["pid"], row["start_ticks"], row["boot_id"])
             == (new["pid"], new["start_ticks"], new["boot_id"])
         ):
@@ -100,9 +91,10 @@ def validate_restart(initial: list[dict], restarted: list[dict]) -> None:
 
 
 def validate_workers(workers: list[dict], ranks: int, graphs_requested: bool) -> None:
+    actor_ids = [row.get("actor_id") for row in workers]
     if (
         sorted(row["rank"] for row in workers) != list(range(ranks))
-        or len({row["actor_id"] for row in workers}) != ranks
+        or (any(actor_ids) and (not all(actor_ids) or len(set(actor_ids)) != ranks))
         or len({row["gpu_uuid"] for row in workers}) != ranks
     ):
         raise ValueError("Incomplete model worker identities")

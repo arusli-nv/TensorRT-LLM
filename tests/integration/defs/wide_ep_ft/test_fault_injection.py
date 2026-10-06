@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """CPU safety checks for verified faults and same-GPU explicit restart."""
 
 import json
@@ -55,7 +43,7 @@ def identity(rank: int = 1) -> dict:
     }
 
 
-@pytest.mark.parametrize("key", IDENTITY_KEYS)
+@pytest.mark.parametrize("key", (*IDENTITY_KEYS, "actor_id"))
 def test_identity_drift_prevents_injection(key: str) -> None:
     """Can a reused PID, changed actor or different rank be signaled?"""
     expected = identity()
@@ -89,6 +77,22 @@ def test_streaming_requires_current_nonfinal_output(trigger: dict) -> None:
     """Can stale, empty or completed output authorize the streaming fault?"""
     with pytest.raises(ValueError):
         validate_injection(identity(), identity(), "worker_sigkill_streaming", trigger)
+
+
+def test_mpi_identity_does_not_require_ray_actor() -> None:
+    """Can MPI identities use the same target and fresh-process checks without actor IDs?"""
+    initial = identity()
+    initial.pop("actor_id")
+    validate_injection(
+        initial,
+        initial,
+        "worker_sigkill_idle",
+        {"run_id": "run-a", "event": "between_requests"},
+    )
+    restarted = {**initial, "pid": initial["pid"] + 1}
+    validate_restart([initial], [restarted])
+    with pytest.raises(ValueError, match="new workers"):
+        validate_restart([initial], [initial])
 
 
 def test_evidence_is_published_once(tmp_path: Path) -> None:
@@ -410,7 +414,13 @@ def test_forced_backstop_does_not_hide_failed_native_teardown(
 
 @pytest.mark.parametrize(
     "change",
-    [{"gpu_uuid": "other"}, {"hostname": "other"}, {"actor_id": "actor-a"}, {"pid": os.getpid()}],
+    [
+        {"gpu_uuid": "other"},
+        {"hostname": "other"},
+        {"actor_id": "actor-a"},
+        {"actor_id": None},
+        {"pid": os.getpid()},
+    ],
 )
 def test_restart_requires_fresh_workers_on_same_gpus(change: dict) -> None:
     """Can worker reuse or replacement GPU capacity masquerade as the requested restart?"""

@@ -1,18 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Test-only Ray worker faults and independent resource observations."""
+"""Test-only worker faults and independent resource observations."""
 
 import json
 import os
@@ -24,7 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
-IDENTITY_KEYS = ("rank", "hostname", "pid", "start_ticks", "boot_id", "uid", "actor_id")
+IDENTITY_KEYS = ("rank", "hostname", "pid", "start_ticks", "boot_id", "uid", "pid_namespace")
 RUN_ID_ENV = "WIDEEP_FT_RUN_ID"
 IDENTITY_DIR_ENV = "WIDEEP_FT_IDENTITY_DIR"
 SCENARIOS = (
@@ -45,6 +33,7 @@ def process_identity(pid: int) -> dict:
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "uid": process.stat().st_uid,
         "state": fields[0],
+        "pid_namespace": (process / "ns/pid").stat().st_ino,
     }
 
 
@@ -94,6 +83,8 @@ def validate_injection(expected: dict, actual: dict, scenario: str, trigger: dic
         raise ValueError("Unsupported scenario or target rank")
     if any(expected.get(key) is None or expected[key] != actual.get(key) for key in IDENTITY_KEYS):
         raise ValueError("Target identity changed or incomplete")
+    if expected.get("actor_id") is not None and expected["actor_id"] != actual.get("actor_id"):
+        raise ValueError("Target actor identity changed")
     if trigger.get("run_id") != expected.get("run_id") or not expected.get("run_id"):
         raise ValueError("Trigger belongs to another run")
     if scenario == "worker_sigkill_streaming":
