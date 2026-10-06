@@ -23,13 +23,15 @@ enable_lm_head_tp_in_adp: false
 max_batch_size: 8
 max_num_tokens: 256
 max_seq_len: 512
-cuda_graph_config: null
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8]
+  enable_padding: true
 disable_overlap_scheduler: true
 enable_autotuner: false
 moe_config:
   backend: CUTEDSL
   load_balancer:
     num_slots: 288
-    layer_updates_per_iter: 1
+    layer_updates_per_iter: 0
 kv_cache_config:
   free_gpu_memory_fraction: 0.1
