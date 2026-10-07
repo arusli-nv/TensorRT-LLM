@@ -45,6 +45,18 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+@pytest.mark.cpu_only
+def test_mpi_comm_executor_singleton_bypasses_kv_device_selection(monkeypatch):
+    from mpi4py import MPI
+    from mpi4py.futures import MPICommExecutor
+
+    monkeypatch.setenv("TRTLLM_USE_MPI_KVCACHE", "1")
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    monkeypatch.delenv("OMPI_COMM_WORLD_RANK", raising=False)
+    with MPICommExecutor(MPI.COMM_SELF) as executor:
+        assert executor.submit(abs, -1).result(timeout=10) == 1
+
+
 def rendezvous_environment_probe():
     from mpi4py import MPI
 
