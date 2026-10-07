@@ -64,6 +64,12 @@ The tested image supplies Open MPI 5.0.10rc2; controls used ob1/TCP, not UCX-PML
 These controls do not qualify recovery. ULFM agreement is not a membership commit.
 Arbitrary network-failure recovery is outside the resident-replica MVP. See [supported ULFM launch/components](https://github.com/open-mpi/ompi/blob/v5.0.x/docs/features/ulfm.rst).
 
+An isolated mpi4py 4.0.0 build passed a four-process, single-host CPU SIGKILL test:
+Python revoke/shrink/agree and survivor collectives succeeded without the C bridge;
+all worker PIDs exited. The installed runtime was unchanged. Upgrading requires
+porting TRT-LLM's KV-cache device-selection patch to `futures/_core.py` and updating
+the Cython build pin. Pending futures and full-model compatibility remain unqualified.
+
 ## Optional AlltoAll watchdog
 
 This is the host completion-flag poller, distinct from `RankCrashKillWatchdog`'s fatal escalation.
@@ -130,6 +136,12 @@ healthy workloads and idle free-HBM measurements do not prove recovery headroom.
 | Fence escape/memory | Host masks cannot release running waits. CUDA719 requires a fresh context. Escape before trap while preserving contexts/barriers and suppressing failed outputs. Prove old peer accesses/writes drained or contained before reuse; `trap` → `return` is insufficient. |
 | Commit/graphs | One authority owns admission, coherent installation and resume. Supply replay-visible state and audit captured communication before removing graph guards. |
 
+Graph reuse is a design target, not a demonstrated result. MPI shrink need not change
+GPU contexts or logical EP32. EPLB updates existing device routing tables in place,
+but current kernel masks are captured by value and replay skips Python generation
+checks. FT graphs must support replay-visible membership/generation from startup,
+safe escape/quiescence and unaffected or qualified captured collectives.
+
 Baseline batches: `7764417`, `7764675`, `7765082`, `7765083`, `7765084`.
 Cleanup hardening passed 74 CPU checks, with three physical skips; GPU recheck `7769273`
 passed healthy/restart, streaming kill/restart and controller interruption cleanup in 22.4 seconds.
@@ -141,4 +153,6 @@ resource receipt; those nodes became unavailable, so that attempt remains unqual
 Resident coverage and conditional capacity: `prerequisite-proofs/admission/{findings,capacity-assessment}.json`.
 All attempts, including failures and source manifests, stay uncommitted under
 `.wideep-ft-runs/mpi-characterization/`. CFT and physical device/link loss remain unqualified.
+Latest binding evidence: `prerequisite-proofs/mpi4py4-assessment/`; consolidated
+source/result inventory: `prerequisite-proofs/evidence-index.json`.
 See [README.md](README.md) to run.
