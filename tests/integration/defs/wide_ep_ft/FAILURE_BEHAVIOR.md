@@ -38,9 +38,16 @@ The tested image supplies Open MPI 5.0.10rc2; controls used ob1/TCP, not UCX-PML
 
 - A four-rank/two-node CPU control passed 5/5: failed-peer receive errors → revoke releases
   healthy-peer waits → shrink/agreement → successful survivor collectives on logical `[0,1,3]`.
-- A separate `MPI_THREAD_MULTIPLE` control released an actual failed world `Allreduce`
-  with native `MPI_ERR_PROC_FAILED`/`MPI_ERR_REVOKED`, then shrank, agreed and gathered `[0,1,3]`.
-  Pre-call receipts do not prove exact overlap with death.
+- An eight-rank/two-node `MPI_THREAD_MULTIPLE` control completed two control exchanges while
+  seven native `Allreduce` callers remained unfinished. Rank 2 SIGKILL produced seven MPI
+  failure errors; survivor agreement/collectives completed on `[0,1,3,4,5,6,7]`.
+  Native entry markers precede the underlying MPI call; they do not locate its internal wait.
+  The image's mpi4py 3.1.5 lacks revoke/shrink/agree methods; this control used a test-only C bridge.
+  Separately, control exchanges and rank-0 broadcast progressed during seven GPU fence waits.
+  Releasing the live peer restored exact outputs. Both controls exited and cleaned up normally.
+- Killing that held peer in a separate run left seven GPU operations incomplete while
+  survivor control exchanges and rank-0 broadcast completed. The fixture then exited;
+  it did not drain/replay GPU work or resume inference.
 - In the CPU task control, `mpi4py.futures`' manager thread exited on peer failure without
   failing its three pending task futures. A 30-second timeout and cleanup intervention followed.
 - Real EP32 under ULFM reached healthy graph inference. Rank 2 SIGKILL reached the client as
@@ -79,7 +86,18 @@ Default `on_timeout=None` logs detection; it neither publishes membership nor re
   Timeout/trap/abort still followed without a client-error receipt; that run failed and
   did not restart. This is not unmodified-model qualification.
 
-Detection supplies suspicion. GPU escape, quiescence and authorized resume remain unimplemented.
+Watchdog detection supplies suspicion; it does not implement GPU escape, quiescence or resume.
+
+## Isolated fence proof
+
+An extracted BF16 combine candidate passed 30 cooperative-abort trials with a live held peer,
+producing 90 survivor receipts, plus 24 healthy checks. Dependent outputs were suppressed;
+same-context CUDA probes and teardown passed.
+It covers small eager grids with PDL on/off, not dispatch, graphs or failed-issuer drain.
+Ten live-writer tests corrupted prematurely reused mapped storage: terminal survivor work
+alone cannot authorize reuse. Prior scratch abort-status and teardown failures are retained.
+A separate NVLink atomic-writer SIGKILL left three original survivor contexts usable with
+receiver-owned backing retained. A quiet 192-ms observation window does not prove drain.
 
 ## Baseline measurements and remaining work
 
@@ -97,8 +115,14 @@ SIGKILL trigger-to-exit maximum was 40.9 seconds; reporting clients 0.113 second
 Otherwise the parent enforces the joint 210-second client/teardown deadline.
 
 Targets 16/17 own sole experts and are outside resident-replica recovery.
-Configured coverage survives ranks 1, 2, 29, 30 or 31 across 58 MoE layers;
-resident-weight/capacity admission remains unqualified. Next, review:
+Actual loaded placement preserves expert coverage after loss of ranks 1, 2, 29, 30 or 31
+across all 58 MoE layers.
+Job `7775889` verified loader/backend/native placement and all 1,856 resident replica
+pairs, including transformed weights and quantization scales. Coverage alone is not admission.
+Under fixed logical EP32 and at most 256 inputs per live source, dispatch deduplicates
+destinations: 31 sources need at most 7,936 receiver rows within the allocated 8,192.
+This source-derived bound does not qualify degraded execution, KV capacity or memory safety;
+healthy workloads and idle free-HBM measurements do not prove recovery headroom. Next, review:
 
 | Blocker | Required change or proof |
 |---|---|
@@ -111,6 +135,10 @@ Cleanup hardening passed 74 CPU checks, with three physical skips; GPU recheck `
 passed healthy/restart, streaming kill/restart and controller interruption cleanup in 22.4 seconds.
 Controls: model ULFM `7770276`, CUDA probes `7770613`, host error `7769981`, collective
 `7770517`, futures `7770162`; watchdog results: `watchdog-control/final-assessment.json`.
+Independent control `7777184`, GPU-blocked peer death `7777305`; extracted combine `7777162`.
+Atomic-writer death `7777361`. Earlier failed control `7776519` lacks a final original-node
+resource receipt; those nodes became unavailable, so that attempt remains unqualified.
+Resident coverage and conditional capacity: `prerequisite-proofs/admission/{findings,capacity-assessment}.json`.
 All attempts, including failures and source manifests, stay uncommitted under
 `.wideep-ft-runs/mpi-characterization/`. CFT and physical device/link loss remain unqualified.
 See [README.md](README.md) to run.
