@@ -62,16 +62,30 @@ Without an error receipt, the parent enforces the joint 210 s post-readiness dea
 Targets 16/17 own sole expert copies and must fail closed under this placement.
 Configured expert coverage remains complete after loss of non-root ranks
 1, 2, 29, 30 or 31 across all 58 MoE layers; resident-weight/capacity admission is unqualified.
-Installed HPC-X supports ULFM, disabled by default. A local CPU kill/shrink/agreement/
-all-reduce control passed with component warnings. Next, qualify multi-node launch
-and survivor collectives using [supported ULFM components and launch](https://github.com/open-mpi/ompi/blob/v5.0.x/docs/features/ulfm.rst)
-with `mpirun --with-ft ulfm` inside Slurm; direct `srun` is unsupported. Then address
-TRT-LLM fixed-world broadcasts/ADP collectives and kernel escape/memory safety.
-Local ULFM success does not prove WideEP recovery, healthy survivor contexts or graph reuse.
+A separate four-rank/two-node CPU control passed 5/5, without retries, using
+unmodified image MPI/UCX packages on compatible native Arm64 nodes. Open MPI
+5.0.10rc2 used `mpirun --with-ft ulfm`, PRTE/Slurm `--mpi=none` daemon launch and
+ob1/TCP. After rank 2 SIGKILL, a failed-peer receive returned an error; revoke
+released healthy-peer receives. Shrink, agreement, all-gather and all-reduce
+succeeded on logical ranks `[0,1,3]`; rank processes and launcher steps disappeared.
+This qualifies that single-threaded CPU control, not TRT-LLM, CUDA, UCX-PML or
+in-flight collective failure. ULFM's boolean agreement is not a recovery authority/commit protocol.
+See [ULFM's supported launch/components](https://github.com/open-mpi/ompi/blob/v5.0.x/docs/features/ulfm.rst).
+
+| Remaining recovery blocker | Required change or proof |
+|---|---|
+| `RequestBroadcaster` / `MPIDist` / `ADPRouter` | Replace fixed-world broadcasts and cached TP control groups with survivor membership; translate compact collective positions to fixed logical IDs. Expert TP1 does not make the ADP host group single-rank. |
+| MPI session / crash watchdog | Replace pre/post-task world barriers, fixed worker counts and abort escalation with bounded survivor-safe control. Disabling aborts alone permits hangs. |
+| Fence kernels | Launch masks are copied by value and checked before waits. Updating a host mask cannot release running waits. Cooperative escape must preserve barrier progress, contexts and suppress partial outputs; replacing `trap` with `return` alone is unsafe. |
+| Peer memory | Prove failed-peer writes/accesses are drained or safely contained before reusing payloads/counters. Timeout or membership removal is insufficient. |
+| Graphs | Rank-mask capture is currently rejected. Audit captured communication resources and provide replay-visible state before claiming unchanged-graph recovery. |
+
+Next, review the survivor-control and fence-abort contracts before implementing recovery.
 CFT drain, late-write safety and physical device/link loss remain unqualified.
 
 Earlier failures and before/after tests are retained; final-source interruption cleanup
 passed in 26.5 s. Final batches: `7764417`, `7764675`,
-`7765082`, `7765083`, `7765084`; no hidden retries. Raw attempts stay uncommitted under
+`7765082`, `7765083`, `7765084`; CPU ULFM pilot `7767258`, qualification `7767277`.
+No hidden retries. Raw attempts stay uncommitted under
 `.wideep-ft-runs/mpi-characterization/`; historical Ray evidence is under
 `.wideep-ft-runs/lean-characterization/`. See [README.md](README.md) to run.
