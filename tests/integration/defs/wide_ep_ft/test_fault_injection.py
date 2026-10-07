@@ -1,31 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU safety checks for verified faults and same-GPU explicit restart."""
+"""CPU safety checks and opt-in physical MPI WideEP regressions."""
 
+import argparse
 import json
 import os
-import pickle
 import signal
-import struct
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
 import fault_injection
+import fault_injector
 import pytest
-from fault_injection import (
-    load_config,
-    owned_actors,
-    validate_fault_evidence,
-    validate_restart,
-    validate_workers,
-)
+from fault_injection import load_config, validate_fault_evidence, validate_restart, validate_workers
 from fault_injector import (
     IDENTITY_KEYS,
-    NodeProbe,
-    WorkerExtension,
+    SCENARIOS,
     process_identity,
     record,
     resources_released,
@@ -37,15 +30,72 @@ def identity(rank: int = 1) -> dict:
     return {
         **process_identity(os.getpid()),
         "rank": rank,
-        "actor_id": "actor-a",
         "run_id": "run-a",
         "gpu_uuid": "GPU-a",
     }
 
 
-@pytest.mark.parametrize("key", (*IDENTITY_KEYS, "actor_id"))
+def test_client_waits_for_worker_identity_publication(tmp_path: Path, monkeypatch) -> None:
+    """Can native readiness precede the last test-hook identity receipt?"""
+    args = argparse.Namespace(
+        output_dir=tmp_path,
+        config=tmp_path / "config.yaml",
+        model=tmp_path,
+        client_timeout_s=1,
+        cleanup_timeout_s=1,
+        scenario="healthy",
+    )
+    args.config.write_text("moe_expert_parallel_size: 2\n")
+    llm = Mock()
+    llm.generate_async.side_effect = [
+        Mock(
+            result=Mock(
+                return_value=SimpleNamespace(outputs=[SimpleNamespace(text=text, token_ids=[1])])
+            )
+        )
+        for text in ("Paris", "Rome")
+    ]
+
+    context = MagicMock()
+    context.__enter__.return_value = llm
+    module = SimpleNamespace(
+        LLM=Mock(return_value=context), SamplingParams=Mock(), __version__="test"
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt_llm", module)
+
+    def publish(rank: int) -> None:
+        record(
+            tmp_path / "workers",
+            str(rank),
+            {
+                "rank": rank,
+                "gpu_uuid": f"GPU-{rank}",
+                "communication": {
+                    "NVLinkOneSided": {
+                        "cft_capable": False,
+                        "ep_size": 2,
+                        "ep_rank": rank,
+                    }
+                },
+            },
+        )
+
+    publish(0)
+    record(tmp_path, "proceed", {})
+
+    def delayed_publication(_seconds: float) -> None:
+        assert not (tmp_path / "healthy.json").exists()
+        publish(1)
+
+    monkeypatch.setattr(fault_injection.time, "sleep", delayed_publication)
+    fault_injection.client(args)
+    assert llm.generate_async.call_count == 2
+    assert (tmp_path / "shutdown.json").exists()
+
+
+@pytest.mark.parametrize("key", (*IDENTITY_KEYS, "gpu_uuid"))
 def test_identity_drift_prevents_injection(key: str) -> None:
-    """Can a reused PID, changed actor or different rank be signaled?"""
+    """Can a reused PID, changed namespace or different rank be signaled?"""
     expected = identity()
     actual = {**expected, key: None}
     with pytest.raises(ValueError, match="identity|target"):
@@ -79,22 +129,6 @@ def test_streaming_requires_current_nonfinal_output(trigger: dict) -> None:
         validate_injection(identity(), identity(), "worker_sigkill_streaming", trigger)
 
 
-def test_mpi_identity_does_not_require_ray_actor() -> None:
-    """Can MPI identities use the same target and fresh-process checks without actor IDs?"""
-    initial = identity()
-    initial.pop("actor_id")
-    validate_injection(
-        initial,
-        initial,
-        "worker_sigkill_idle",
-        {"run_id": "run-a", "event": "between_requests"},
-    )
-    restarted = {**initial, "pid": initial["pid"] + 1}
-    validate_restart([initial], [restarted])
-    with pytest.raises(ValueError, match="new workers"):
-        validate_restart([initial], [initial])
-
-
 def test_evidence_is_published_once(tmp_path: Path) -> None:
     """Can a second action overwrite its first injection intent?"""
     record(tmp_path, "injection_intent", {"action": "first"})
@@ -102,6 +136,37 @@ def test_evidence_is_published_once(tmp_path: Path) -> None:
         record(tmp_path, "injection_intent", {"action": "second"})
     assert json.loads((tmp_path / "injection_intent.json").read_text())["action"] == "first"
     assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_worker_gpu_identity_is_independent_of_observer_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Can an injection thread's default device misidentify a worker on another GPU?"""
+    comm = argparse.Namespace(
+        ep_size=4,
+        ep_rank=2,
+        can_use_cft_counted_writes=False,
+        workspace=argparse.Namespace(device="cuda:2"),
+    )
+    worker = argparse.Namespace(
+        rank=2,
+        get_startup_metrics=lambda: {},
+        engine=argparse.Namespace(
+            model_engine=argparse.Namespace(
+                cuda_graph_runner=argparse.Namespace(enabled=True, graphs={1: None})
+            )
+        ),
+    )
+    cuda = argparse.Namespace(
+        current_device=lambda: 0,
+        get_device_properties=lambda device: argparse.Namespace(
+            uuid="worker" if device == "cuda:2" else "other"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", argparse.Namespace(cuda=cuda))
+    monkeypatch.setattr(fault_injector, "_nvlink_communication", lambda _: comm)
+    monkeypatch.setenv(fault_injector.RUN_ID_ENV, "run-a")
+    assert fault_injector.worker_identity(worker)["gpu_uuid"] == "GPU-worker"
 
 
 def snapshot() -> dict:
@@ -135,167 +200,6 @@ def test_empty_or_incomplete_cleanup_cannot_pass() -> None:
     assert resources_released([snapshot()], [snapshot()])
 
 
-def test_cleanup_backstop_rechecks_process_identity() -> None:
-    """Can cleanup signal a recycled PID, and can it terminate its verified child?"""
-    process = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-    )
-    try:
-        expected = process_identity(process.pid)
-        probe = NodeProbe()
-        assert not probe.terminate_owned_processes(
-            [{**expected, "start_ticks": expected["start_ticks"] + 1}]
-        )
-        assert process.poll() is None
-        assert probe.terminate_owned_processes([expected]) == [process.pid]
-        assert process.wait(timeout=5) == -signal.SIGKILL
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
-
-
-def test_ray_initialization_preserves_interrupt_handler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Does SIGTERM still record a failed run after Ray installs its own handler?"""
-
-    def interrupt(_signum: int, _frame: object) -> None:
-        raise KeyboardInterrupt("test interruption")
-
-    def ray_interrupt(signum: int, _frame: object) -> None:
-        raise SystemExit(signum)
-
-    def initialize(**_kwargs: object) -> None:
-        signal.signal(signal.SIGTERM, ray_interrupt)
-
-    def create_probe(**_kwargs: object) -> None:
-        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "ray",
-        SimpleNamespace(init=initialize, remote=create_probe, shutdown=lambda: None),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "ray.util.scheduling_strategies",
-        SimpleNamespace(NodeAffinitySchedulingStrategy=object),
-    )
-    monkeypatch.setattr(fault_injection, "load_config", lambda *_: {"moe_expert_parallel_size": 1})
-    args = SimpleNamespace(
-        output_dir=tmp_path / "attempt",
-        config=tmp_path,
-        model=tmp_path,
-        run_id="run-a",
-        scenario="healthy",
-        address="external",
-        startup_timeout_s=720,
-        client_timeout_s=30,
-        shutdown_timeout_s=180,
-        cleanup_timeout_s=60,
-    )
-    previous = signal.signal(signal.SIGTERM, interrupt)
-    try:
-        with pytest.raises(KeyboardInterrupt, match="test interruption"):
-            fault_injection.run(args)
-        summary = json.loads((args.output_dir / "summary.json").read_text())
-        assert summary["state"] == "FAIL" and "KeyboardInterrupt" in summary["error"]
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-
-
-@pytest.mark.parametrize("failure", ["exited", "wait_timeout"])
-def test_client_termination_failure_still_cleans_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    """Can an exiting or unresponsive client skip independent resource cleanup?"""
-    process = Mock(pid=123, poll=Mock(return_value=None))
-    cleanup = Mock()
-    monkeypatch.setattr(fault_injection.subprocess, "Popen", Mock(return_value=process))
-    monkeypatch.setattr(fault_injection, "cleanup", cleanup)
-    kill = Mock(side_effect=ProcessLookupError() if failure == "exited" else None)
-    monkeypatch.setattr(fault_injection.os, "killpg", kill)
-    if failure == "wait_timeout":
-        process.wait.side_effect = subprocess.TimeoutExpired("client", 15)
-    args = SimpleNamespace(
-        output_dir=tmp_path,
-        address="external",
-        model=tmp_path,
-        config=tmp_path,
-        run_id="run-a",
-        startup_timeout_s=1e-9,
-        client_timeout_s=30,
-        shutdown_timeout_s=180,
-        cleanup_timeout_s=60,
-    )
-    expected = TimeoutError if failure == "exited" else subprocess.TimeoutExpired
-    with pytest.raises(expected):
-        fault_injection.run_phase(args, None, [], [], "initial", "healthy")
-    cleanup.assert_called_once()
-    assert cleanup.call_args.args[-1] is True
-    assert (tmp_path / "initial" / "timing.json").exists()
-
-
-@pytest.mark.parametrize("failure", ["kill", "shutdown"])
-def test_finalization_failure_cannot_publish_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    """Can a failed probe/client finalization leave a contradictory PASS artifact?"""
-    probe = SimpleNamespace(
-        read_run_id=SimpleNamespace(remote=lambda _: "run-a"),
-        snapshot=SimpleNamespace(remote=lambda _: snapshot()),
-    )
-    ray = SimpleNamespace(
-        init=lambda **_: None,
-        remote=lambda **_: lambda _: SimpleNamespace(
-            options=lambda **_: SimpleNamespace(remote=lambda: probe)
-        ),
-        get=lambda value, **_: value,
-        nodes=lambda: [{"Alive": True, "Resources": {"GPU": 1}, "NodeID": "node-a"}],
-        kill=Mock(side_effect=RuntimeError("kill failed") if failure == "kill" else None),
-        shutdown=Mock(
-            side_effect=RuntimeError("shutdown failed") if failure == "shutdown" else None
-        ),
-    )
-    monkeypatch.setitem(sys.modules, "ray", ray)
-    monkeypatch.setitem(
-        sys.modules,
-        "ray.util.scheduling_strategies",
-        SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *_, **__: None),
-    )
-    monkeypatch.setattr(fault_injection, "load_config", lambda *_: {"moe_expert_parallel_size": 1})
-    first = identity()
-    second = {**first, "actor_id": "actor-b", "pid": first["pid"] + 1}
-    monkeypatch.setattr(
-        fault_injection,
-        "run_phase",
-        Mock(
-            side_effect=[
-                {"workers": [row], "received": {"healthy": 1}, "parent_started_s": 0}
-                for row in (first, second)
-            ]
-        ),
-    )
-    args = SimpleNamespace(
-        output_dir=tmp_path / "attempt",
-        config=tmp_path,
-        model=tmp_path,
-        run_id="run-a",
-        scenario="healthy",
-        address="external",
-        startup_timeout_s=720,
-        client_timeout_s=30,
-        shutdown_timeout_s=180,
-        cleanup_timeout_s=60,
-    )
-    with pytest.raises(RuntimeError, match=f"{failure} failed"):
-        fault_injection.run(args)
-    summary = json.loads((args.output_dir / "summary.json").read_text())
-    assert summary["state"] == "FAIL" and f"{failure} failed" in summary["error"]
-    ray.shutdown.assert_called_once()
-
-
 @pytest.mark.parametrize(
     "change", [{}, {"cft_capable": True}, {"cft_capable": None}, {"ep_size": 3}, {"ep_rank": 1}]
 )
@@ -304,7 +208,6 @@ def test_worker_runtime_matches_non_cft_profile(change: dict) -> None:
     workers = [
         {
             "rank": rank,
-            "actor_id": f"actor-{rank}",
             "gpu_uuid": f"GPU-{rank}",
             "graphs_enabled": True,
             "graph_keys": ["1"],
@@ -326,151 +229,21 @@ def test_worker_runtime_matches_non_cft_profile(change: dict) -> None:
         validate_workers(workers, 2, True)
 
 
-def test_cleanup_preserves_pinned_identity_after_pid_reuse(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Can stale actor metadata authorize killing a replacement process?"""
-    original = identity()
-    identities = [original.copy()]
-    calls = []
-    snapshots = 0
-
-    def pin(actors: dict, directory: str) -> list[dict]:
-        assert directory == str(tmp_path)
-        calls.append(actors)
-        return [{**original, "start_ticks": original["start_ticks"] + 1}] if actors else []
-
-    def observe(_identities: list[dict]) -> dict:
-        nonlocal snapshots
-        snapshots += 1
-        return {**snapshot(), "compute_apps": [["GPU-a", "123", "1024"]] if snapshots == 1 else []}
-
-    probe = SimpleNamespace(
-        snapshot=SimpleNamespace(remote=observe),
-        pin_actor_processes=SimpleNamespace(remote=pin),
-        terminate_owned_processes=SimpleNamespace(remote=lambda _: []),
-        collect_logs=SimpleNamespace(remote=lambda *_: []),
-    )
-    ray = SimpleNamespace(
-        get=lambda value, **_: value,
-        ActorID=SimpleNamespace(from_hex=lambda value: value),
-        available_resources=lambda: {"GPU": 1},
-        _private=SimpleNamespace(
-            state=SimpleNamespace(jobs=lambda: [{"JobID": "owned", "IsDead": True}])
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "ray._private.worker",
-        SimpleNamespace(
-            global_worker=SimpleNamespace(core_worker=SimpleNamespace(kill_actor=Mock()))
-        ),
-    )
-    monkeypatch.setattr(
-        fault_injection,
-        "owned_actors",
-        lambda *_: {original["actor_id"]: {"Pid": original["pid"]}} if snapshots < 2 else {},
-    )
-    monkeypatch.setattr(fault_injection.time, "sleep", lambda _: None)
-    record(tmp_path, "job", {"job_id": "owned", "run_id": "run-a"})
-    fault_injection.cleanup(ray, [probe], [snapshot()], tmp_path, identities, 5, True)
-    assert identities == [original]
-    assert calls == [{}, {}]
-
-
-def test_forced_backstop_does_not_hide_failed_native_teardown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Can successful backstop cleanup turn a native resource leak into a pass?"""
-    dirty = {"compute_apps": [["GPU-a", "123", "1024"]]}
-
-    def terminate(_identities: list[dict]) -> list:
-        dirty.clear()
-        return []
-
-    probe = SimpleNamespace(
-        snapshot=SimpleNamespace(remote=lambda _: {**snapshot(), **dirty}),
-        pin_actor_processes=SimpleNamespace(remote=lambda *_: []),
-        terminate_owned_processes=SimpleNamespace(remote=terminate),
-        collect_logs=SimpleNamespace(remote=lambda *_: []),
-    )
-    ray = SimpleNamespace(
-        get=lambda value, **_: value,
-        available_resources=lambda: {"GPU": 1},
-        _private=SimpleNamespace(
-            state=SimpleNamespace(jobs=lambda: [{"JobID": "owned", "IsDead": True}])
-        ),
-    )
-    monkeypatch.setitem(sys.modules, "ray._private.worker", SimpleNamespace(global_worker=None))
-    monkeypatch.setattr(fault_injection, "owned_actors", lambda *_: {})
-    ticks = iter(range(20))
-    monkeypatch.setattr(fault_injection.time, "monotonic", lambda: next(ticks))
-    record(tmp_path, "job", {"job_id": "owned", "run_id": "run-a"})
-    with pytest.raises(TimeoutError, match="Native teardown leaked"):
-        fault_injection.cleanup(ray, [probe], [snapshot()], tmp_path, [], 0.1, False)
-    assert (tmp_path / "cleanup_failed.json").exists()
-    assert json.loads((tmp_path / "cleanup.json").read_text())["forced"]
-
-
 @pytest.mark.parametrize(
     "change",
     [
         {"gpu_uuid": "other"},
         {"hostname": "other"},
-        {"actor_id": "actor-a"},
-        {"actor_id": None},
         {"pid": os.getpid()},
     ],
 )
 def test_restart_requires_fresh_workers_on_same_gpus(change: dict) -> None:
     """Can worker reuse or replacement GPU capacity masquerade as the requested restart?"""
     initial = identity()
-    restarted = {**initial, "actor_id": "actor-b", "pid": initial["pid"] + 1}
+    restarted = {**initial, "pid": initial["pid"] + 1}
     validate_restart([initial], [restarted])
     with pytest.raises(ValueError):
         validate_restart([initial], [{**restarted, **change}])
-
-
-def test_generic_error_does_not_prove_fence_fault(tmp_path: Path) -> None:
-    """Does a generic terminal error falsely qualify the communication reproducer?"""
-    record(tmp_path, "injection_intent", {"scenario": "fence_round_mismatch"})
-    record(tmp_path, "injection_result", {"before": 4, "after": 6})
-    (tmp_path / "driver.log").write_text("EngineDeadError")
-    with pytest.raises(AssertionError, match="fence timeout"):
-        validate_fault_evidence(tmp_path, "fence_round_mismatch")
-    (tmp_path / "driver.log").write_text("dispatch: Rank 1 timed out waiting for completion flag")
-    validate_fault_evidence(tmp_path, "fence_round_mismatch")
-
-
-def test_fault_targets_request_broadcast_world_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Does injection select WORLD explicitly, regardless of TP-group aliasing?"""
-    active, tp_group = Mock(), Mock()
-    destroy = Mock()
-    group = SimpleNamespace(_get_backend=lambda _: active, size=lambda: 32)
-    monkeypatch.setitem(
-        sys.modules,
-        "torch",
-        SimpleNamespace(
-            device=lambda name: name,
-            distributed=SimpleNamespace(
-                group=SimpleNamespace(WORLD=group), destroy_process_group=destroy
-            ),
-        ),
-    )
-    worker = SimpleNamespace(
-        fault_identity=identity,
-        engine=SimpleNamespace(dist=SimpleNamespace(mapping=SimpleNamespace(tp_group_pg=tp_group))),
-    )
-    record(tmp_path, "trigger", {"run_id": "run-a", "event": "between_requests"})
-    result = WorkerExtension.inject_fault(
-        worker, identity(), str(tmp_path), "process_group_destroy"
-    )
-    destroy.assert_called_once_with(group)
-    active.abort.assert_not_called()
-    tp_group._get_backend.assert_not_called()
-    assert result["group"] == "WORLD"
 
 
 @pytest.mark.parametrize("ranks", [2, 7, 16, 32, 72, 128])
@@ -501,144 +274,399 @@ def test_static_placement_is_not_fixed_to_ep32(tmp_path: Path, ranks: int) -> No
     )
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "worker_sigkill_idle",
-        "worker_sigkill_streaming",
-        "process_group_destroy",
-        "fence_round_mismatch",
-    ],
-)
-@pytest.mark.skipif(
-    not os.environ.get("WIDEEP_FT_RAY_ADDRESS"), reason="Opt-in dedicated Ray cluster"
-)
-def test_wideep_fault_and_explicit_restart(scenario: str) -> None:
-    """Does this fault report a bounded client error, release resources, and allow a fresh restart?"""
-    output = Path(os.environ["WIDEEP_FT_OUTPUT_DIR"]) / scenario
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("fault_injection.py")),
-        "--address",
-        os.environ["WIDEEP_FT_RAY_ADDRESS"],
-        "--model",
-        os.environ["WIDEEP_FT_MODEL"],
-        "--config",
-        os.environ["WIDEEP_FT_CONFIG"],
-        "--scenario",
-        scenario,
-        "--output-dir",
-        str(output),
-    ]
-    if scenario == "fence_round_mismatch":
-        command.extend(["--client-timeout-s", "420"])
-    result = subprocess.run(command, check=False)
-    assert result.returncode == 0, f"Fault characterization failed; evidence: {output}"
-
-
-def test_sigkill_publishes_intent_before_terminating_owned_process(tmp_path: Path) -> None:
-    """Is one real SIGKILL preceded by durable, matching target evidence?"""
+def test_sigkill_publishes_intent_before_process_death(tmp_path: Path) -> None:
+    """Is real process death preceded by a durable, identity-checked injection receipt?"""
     code = """
-import os
+import os, sys
 from pathlib import Path
-from fault_injector import WorkerExtension, process_identity, record
-class Worker(WorkerExtension):
-    def fault_identity(self):
-        return {**process_identity(os.getpid()), 'rank': 1, 'actor_id': 'cpu-test'}
-worker = Worker()
-expected = {**worker.fault_identity(), 'run_id': 'run-a'}
-path = Path(__import__('sys').argv[1])
-record(path, 'trigger', {'run_id': 'run-a', 'event': 'between_requests'})
-worker.inject_fault(expected, str(path), 'worker_sigkill_idle')
+import fault_injector
+from fault_injector import process_identity, record
+identity = {**process_identity(os.getpid()), 'rank': 1, 'run_id': 'run-a'}
+fault_injector.worker_identity = lambda _: identity
+root = Path(sys.argv[1])
+record(root, 'trigger', {'run_id': 'run-a', 'event': 'between_requests'})
+fault_injector.inject_fault(None, identity, root, 'worker_sigkill_idle')
 """
-    result = subprocess.run(
+    process = subprocess.run(
         [sys.executable, "-c", code, str(tmp_path)],
         cwd=Path(__file__).parent,
         capture_output=True,
         text=True,
         timeout=5,
     )
-    assert result.returncode == -signal.SIGKILL, result.stderr
-    intent = json.loads((tmp_path / "injection_intent.json").read_text())
-    assert intent["target"]["rank"] == 1
-    assert intent["target"]["actor_id"] == "cpu-test"
-    assert intent["trigger"]["run_id"] == "run-a"
+    assert process.returncode == -signal.SIGKILL, process.stderr
+    receipt = json.loads((tmp_path / "injection_intent.json").read_text())
+    assert receipt["target"]["pid"] > 0
+    assert receipt["trigger"]["run_id"] == "run-a"
     assert not (tmp_path / "injection_result.json").exists()
 
 
-def test_actor_cleanup_filters_exact_job_and_live_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Does cleanup send only serializable local identity data for this driver's actors?"""
-    job = object()
-
-    def actors(*, job_id: object) -> dict:
-        assert job_id is job
-        return {
-            "owned": {
-                "JobID": "job-a",
-                "State": "ALIVE",
-                "Pid": 123,
-                "Address": {"NodeID": "node-a"},
-                "DeathCause": struct.Struct("q"),
-            },
-            "starting": {
-                "JobID": "job-a",
-                "State": "PENDING_CREATION",
-                "Pid": 0,
-                "Address": {"NodeID": ""},
-            },
-            "foreign": {"JobID": "job-b", "State": "ALIVE"},
-            "dead": {"JobID": "job-a", "State": "DEAD"},
-        }
-
-    private = ModuleType("ray._private")
-    private.state = SimpleNamespace(actors=actors)
-    monkeypatch.setitem(sys.modules, "ray._private", private)
-    ray = SimpleNamespace(JobID=SimpleNamespace(from_hex=lambda value: job))
-    selected = owned_actors(ray, "job-a")
-    assert list(selected) == ["owned", "starting"]
-    pickle.dumps(selected)
+def test_host_probe_rejects_invisible_worker() -> None:
+    """Can inaccessible container identities falsely prove host-side cleanup coverage?"""
+    worker = identity()
+    observed = {"hostname": worker["hostname"], "live_processes": [worker]}
+    fault_injection._visible_workers([worker], [observed])
+    fault_injection._visible_workers([{**worker, "uid": 0}], [observed])
+    with pytest.raises(ValueError, match="observe"):
+        fault_injection._visible_workers([worker], [{**observed, "live_processes": []}])
+    with pytest.raises(ValueError, match="observe"):
+        fault_injection._visible_workers([worker, {**worker, "pid": worker["pid"] + 1}], [observed])
 
 
-def test_group_registration_is_not_communication_failure(tmp_path: Path) -> None:
-    """Can benign initialization logs falsely establish the communication fault?"""
-    record(tmp_path, "injection_intent", {"scenario": "process_group_destroy"})
-    record(tmp_path, "injection_result", {"group": "WORLD", "backend": "gloo", "group_size": 32})
-    (tmp_path / "driver.log").write_text("Group is registered; Group valid")
-    with pytest.raises(AssertionError, match="collective error"):
-        validate_fault_evidence(tmp_path, "process_group_destroy")
-    (tmp_path / "driver.log").write_text("Default process group has not been initialized")
-    validate_fault_evidence(tmp_path, "process_group_destroy")
+@pytest.mark.parametrize("reused", [False, True])
+def test_pid_reuse_prevents_cleanup_signal(monkeypatch: pytest.MonkeyPatch, reused: bool) -> None:
+    """Can a stale host-side identity authorize killing a replacement process?"""
+    expected = identity()
+    send = Mock()
+    monkeypatch.setattr(fault_injector, "owned_processes", lambda *_, **__: [expected])
+    monkeypatch.setattr(fault_injector.os, "pidfd_open", lambda _: 10)
+    monkeypatch.setattr(fault_injector.os, "close", lambda _: None)
+    monkeypatch.setattr(fault_injector.signal, "pidfd_send_signal", send)
+    monkeypatch.setattr(
+        fault_injector,
+        "process_identity",
+        lambda _: {**expected, "start_ticks": 0} if reused else expected,
+    )
+    monkeypatch.setattr(Path, "read_bytes", lambda _: b"WIDEEP_FT_RUN_ID=run-a\0")
+    monkeypatch.setattr(
+        fault_injector.subprocess, "run", lambda *_, **__: argparse.Namespace(stdout="")
+    )
+    fault_injector.snapshot("run-a", terminate=True)
+    if reused:
+        send.assert_not_called()
+    else:
+        send.assert_called_once_with(10, signal.SIGKILL)
+
+
+def test_fence_failure_requires_native_timeout_and_client_error(tmp_path: Path) -> None:
+    """Can a generic error or client timeout falsely qualify a fence fault?"""
+    worker = identity()
+    record(tmp_path, "trigger", {"run_id": "run-a", "event": "between_requests"})
+    record(tmp_path, "injection_intent", {"scenario": "fence_round_mismatch", "target": worker})
+    record(tmp_path, "injection_result", {"before": 4, "after": 6})
+    record(tmp_path, "client_error", {"type": "RequestError"})
+    (tmp_path / "launcher.log").write_text("unspecified launch failure")
+    with pytest.raises(AssertionError, match="fence timeout"):
+        validate_fault_evidence(tmp_path, "fence_round_mismatch", [worker])
+    (tmp_path / "launcher.log").write_text("dispatch: Rank 1 timed out waiting for completion flag")
+    validate_fault_evidence(tmp_path, "fence_round_mismatch", [worker])
+
+
+def test_steps_are_filtered_by_owned_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Can cancellation select a sibling job step from the same allocation?"""
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setattr(
+        fault_injection.subprocess,
+        "run",
+        lambda *_, **__: argparse.Namespace(
+            stdout=(
+                "StepId=123.0 Name=foreign\nStepId=123.1 UserId=42 Name=owned\n"
+                "StepId=124.1 Name=owned\nStepId=123.batch Name=batch\n"
+            )
+        ),
+    )
+    assert fault_injection._steps("owned") == ["123.1"]
+
+
+def test_forced_cleanup_never_turns_failure_into_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Does a failed launch remain failed after the cleanup backstop succeeds?"""
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    args = argparse.Namespace(
+        output_dir=tmp_path,
+        target_rank=1,
+        model=tmp_path,
+        launcher=["srun"],
+        python="python3",
+        client_timeout_s=30,
+        cleanup_timeout_s=60,
+        startup_timeout_s=1,
+        shutdown_timeout_s=30,
+        ranks=2,
+        graphs_requested=False,
+    )
+    process = Mock()
+    process.poll.return_value = 1
+    monkeypatch.setattr(fault_injection.subprocess, "Popen", lambda *_, **__: process)
+    monkeypatch.setattr(fault_injection, "_stop", Mock())
+    monkeypatch.setattr(fault_injection, "_probe", lambda *_, **__: [snapshot()])
+    with pytest.raises(AssertionError, match="healthy readiness"):
+        fault_injection.run_phase(args, [snapshot()], "initial", "worker_sigkill_idle")
+    assert (tmp_path / "initial" / "intervention.json").exists()
+    assert not (tmp_path / "summary.json").exists()
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS)
+@pytest.mark.skipif(
+    not os.environ.get("WIDEEP_FT_MPI_LAUNCHER"), reason="Opt-in dedicated MPI allocation"
+)
+def test_wideep_fault_and_explicit_restart(scenario: str) -> None:
+    """Does the qualified MPI fault terminate, release resources, and permit a same-GPU restart?"""
+    output = Path(os.environ["WIDEEP_FT_OUTPUT_DIR"]) / scenario
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("fault_injection.py")),
+            "--launcher",
+            os.environ["WIDEEP_FT_MPI_LAUNCHER"],
+            "--probe-launcher",
+            os.environ["WIDEEP_FT_PROBE_LAUNCHER"],
+            "--model",
+            os.environ["WIDEEP_FT_MODEL"],
+            "--config",
+            os.environ["WIDEEP_FT_CONFIG"],
+            "--scenario",
+            scenario,
+            "--output-dir",
+            str(output),
+        ],
+        check=False,
+    )
+    assert process.returncode == 0, f"Fault characterization failed; evidence: {output}"
+
+
+def test_launcher_exit_race_still_checks_remote_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Does exit between wait timeout and SIGKILL skip remote-step cleanup?"""
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.side_effect = [subprocess.TimeoutExpired("srun", 10), 137]
+
+    def signal_group(*_: object) -> None:
+        raise ProcessLookupError()
+
+    steps = Mock(return_value=[])
+    monkeypatch.setattr(fault_injection.os, "killpg", signal_group)
+    monkeypatch.setattr(fault_injection, "_steps", steps)
+    monkeypatch.setattr(fault_injection.time, "monotonic", lambda: 9.0)
+    fault_injection._stop(process, "owned", 10.0)
+    assert steps.call_count == 2
+    assert process.wait.call_count == 2
+    assert all(call.kwargs["timeout"] == 1 for call in process.wait.call_args_list)
+
+
+def test_control_failure_still_reaps_local_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Does scheduler failure prevent local launcher reaping?"""
+    process = Mock()
+    process.poll.return_value = None
+    monkeypatch.setattr(fault_injection.os, "killpg", Mock())
+    monkeypatch.setattr(fault_injection, "_steps", Mock(side_effect=RuntimeError("scheduler down")))
+    with pytest.raises(RuntimeError, match="scheduler down"):
+        fault_injection._stop(process, "owned", fault_injection.time.monotonic() + 60)
+    process.wait.assert_called_once()
+
+
+@pytest.mark.parametrize("daemon", [True, False])
+def test_unreadable_model_process_is_not_ignored(
+    monkeypatch: pytest.MonkeyPatch, daemon: bool
+) -> None:
+    """Are only identified Slurm step daemons exempt from environment visibility?"""
+    process = Path("/proc/123")
+    monkeypatch.setattr(Path, "iterdir", lambda _: [process])
+    monkeypatch.setattr(Path, "stat", lambda _: argparse.Namespace(st_uid=os.getuid()))
+
+    def read_bytes(path: Path) -> bytes:
+        if path.name == "environ":
+            raise PermissionError("not dumpable")
+        return b"slurmstepd: [123.batch]\0" if daemon else b"python model_worker.py\0"
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(Path, "read_text", lambda _: "slurmstepd" if daemon else "python")
+    if daemon:
+        assert fault_injector.owned_processes("run-a") == []
+    else:
+        with pytest.raises(PermissionError):
+            fault_injector.owned_processes("run-a")
 
 
 @pytest.mark.parametrize(
-    "change",
-    [None, {"run_id": "other"}, {"job_id": "other"}, {"start_ticks": 0}, {}],
+    "observer_job,process_job",
+    [("123", "123"), ("123", "1234"), ("123", None), (None, "1234"), ("999", "1234")],
 )
-def test_partial_startup_pins_only_verified_local_actor_processes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: dict | None
+def test_unreadable_process_requires_allocation_ownership_proof(
+    monkeypatch: pytest.MonkeyPatch, observer_job: str | None, process_job: str | None
 ) -> None:
-    """Can stale Ray metadata pin a process without matching startup identity?"""
-    monkeypatch.setitem(
-        sys.modules,
-        "ray",
-        SimpleNamespace(get_runtime_context=lambda: SimpleNamespace(get_node_id=lambda: "node-a")),
-    )
-    actors = {
-        "local": {"Address": {"NodeID": "node-a"}, "Pid": os.getpid()},
-        "remote": {"Address": {"NodeID": "node-b"}, "Pid": os.getpid()},
-        "pending": {"Address": {"NodeID": ""}, "Pid": 0},
+    """Can a protected process in another Slurm job block this run, or ours be hidden?"""
+    process = Path("/proc") / str(os.getpid() + 1)
+    known = {**identity(), "pid": int(process.name)}
+    with monkeypatch.context() as patch:
+        patch.setenv("SLURM_JOB_ID", "123")
+        patch.setattr(Path, "iterdir", lambda _: [process])
+        patch.setattr(Path, "stat", lambda _: argparse.Namespace(st_uid=os.getuid()))
+        patch.setattr(Path, "read_bytes", Mock(side_effect=PermissionError("not dumpable")))
+
+        def read_text(path: Path) -> str:
+            if path.name == "comm":
+                return "python"
+            job = process_job if path.parent == process else observer_job
+            return (
+                f"0::/system.slice/slurmstepd.scope/job_{job}/step_0/user/task_0\n"
+                if job
+                else "0::/\n"
+            )
+
+        patch.setattr(Path, "read_text", read_text)
+        if observer_job == "123" and process_job == "1234":
+            assert fault_injector.owned_processes("run-a") == []
+        else:
+            with pytest.raises(PermissionError):
+                fault_injector.owned_processes("run-a")
+        patch.setattr(fault_injector, "process_identity", lambda _: known)
+        assert fault_injector.owned_processes("run-a", [known]) == [known]
+
+
+def test_late_step_exit_cannot_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Can a zero exit arriving after the active deadline qualify as bounded shutdown?"""
+    clock = [0.0]
+    worker = {
+        **identity(0),
+        "graphs_enabled": False,
+        "communication": {"NVLinkOneSided": {"cft_capable": False, "ep_size": 1, "ep_rank": 0}},
     }
-    current = process_identity(os.getpid())
-    record(tmp_path, "job", {"job_id": "owned", "run_id": "run-a"})
-    if change is not None:
-        record(
-            tmp_path / "startup_identities" / current["hostname"],
-            f"{current['pid']}-{current['start_ticks']}",
-            {**current, "job_id": "owned", "run_id": "run-a", **change},
-        )
-    pinned = NodeProbe().pin_actor_processes(actors, str(tmp_path))
-    assert len(pinned) == (1 if change == {} else 0)
-    if pinned:
-        assert pinned[0]["actor_id"] == "local"
-        assert pinned[0]["run_id"] == "run-a"
-        assert pinned[0]["start_ticks"] == current["start_ticks"]
+    clean = {**snapshot(), "hostname": worker["hostname"]}
+    live = {**clean, "live_processes": [worker]}
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    args = argparse.Namespace(
+        output_dir=tmp_path,
+        target_rank=1,
+        model=tmp_path,
+        launcher=["srun"],
+        python="python3",
+        client_timeout_s=30,
+        cleanup_timeout_s=60,
+        startup_timeout_s=1,
+        shutdown_timeout_s=30,
+        ranks=1,
+        graphs_requested=False,
+    )
+    process = Mock(returncode=0)
+    process.poll.side_effect = lambda: None if clock[0] == 0 else 0
+
+    def launch(*_: object, **__: object) -> Mock:
+        directory = tmp_path / "initial"
+        (directory / "workers").mkdir()
+        (directory / "workers" / "0.json").write_text(json.dumps(worker))
+        (directory / "healthy.json").write_text("{}")
+        (directory / "shutdown.json").write_text("{}")
+        return process
+
+    monkeypatch.setattr(fault_injection.subprocess, "Popen", launch)
+    monkeypatch.setattr(fault_injection, "_probe", Mock(side_effect=[[live], [clean], [clean]]))
+    monkeypatch.setattr(fault_injection, "_steps", Mock(return_value=["123.1"]))
+    monkeypatch.setattr(fault_injection, "_stop", Mock())
+    monkeypatch.setattr(fault_injection.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        fault_injection.time, "sleep", lambda _: clock.__setitem__(0, clock[0] + 2000.0)
+    )
+    with pytest.raises(TimeoutError):
+        fault_injection.run_phase(args, [clean], "initial", "healthy")
+    assert (tmp_path / "initial" / "intervention.json").exists()
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_known_identity_survives_empty_environment(
+    monkeypatch: pytest.MonkeyPatch, reused: bool
+) -> None:
+    """Can an empty zombie environment hide an unreaped process, or retain a reused PID?"""
+    known = {**identity(), "pid": os.getpid() + 1}
+    actual = {**known, "state": "Z", "start_ticks": 0} if reused else {**known, "state": "Z"}
+    monkeypatch.setattr(Path, "iterdir", lambda _: [Path(f"/proc/{known['pid']}")])
+    monkeypatch.setattr(Path, "stat", lambda _: argparse.Namespace(st_uid=os.getuid()))
+    monkeypatch.setattr(Path, "read_bytes", lambda _: b"")
+    monkeypatch.setattr(fault_injector, "process_identity", lambda _: actual)
+    assert fault_injector.owned_processes("run-a", [known]) == ([] if reused else [actual])
+
+
+@pytest.mark.parametrize("error_type", [None, "RequestError", "TimeoutError"])
+def test_process_loss_client_outcome_is_bounded_native_error_or_step_death(
+    tmp_path: Path, error_type: str | None
+) -> None:
+    """Can a client timeout pass as native MPI error propagation?"""
+    worker = identity()
+    record(tmp_path, "trigger", {"run_id": "run-a", "event": "between_requests"})
+    record(tmp_path, "injection_intent", {"scenario": "worker_sigkill_idle", "target": worker})
+    (tmp_path / "launcher.log").write_text(
+        f"srun: error: task {worker['rank']}: Exited with exit code 137"
+    )
+    if error_type:
+        record(tmp_path, "client_error", {"type": error_type, "message": "MPI_ERR_OTHER"})
+    if error_type == "TimeoutError":
+        with pytest.raises(AssertionError, match="client error"):
+            validate_fault_evidence(tmp_path, "worker_sigkill_idle", [worker])
+    else:
+        validate_fault_evidence(tmp_path, "worker_sigkill_idle", [worker])
+
+
+@pytest.mark.parametrize("manager", ["systemd", "(sd-pam)"])
+@pytest.mark.parametrize(
+    "change",
+    [{}, {"comm": "python"}, {"cgroup": "0::/\n"}, {"cmdline": b"python model_worker.py\0"}],
+)
+def test_user_manager_exemption_requires_full_identity(
+    monkeypatch: pytest.MonkeyPatch, manager: str, change: dict
+) -> None:
+    """Can the host user manager block cleanup, or a model process be mistaken for it?"""
+    process = Path("/proc") / str(os.getpid() + 1)
+    known = {**identity(), "pid": int(process.name)}
+    metadata = {
+        "comm": manager,
+        "cgroup": f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/init.scope\n",
+        "cmdline": b"/usr/lib/systemd/systemd\0--user\0"
+        if manager == "systemd"
+        else b"(sd-pam)\0\0",
+        **change,
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "iterdir", lambda _: [process])
+        patch.setattr(Path, "stat", lambda _: argparse.Namespace(st_uid=os.getuid()))
+        patch.setattr(Path, "read_text", lambda path: metadata[path.name])
+
+        def read_bytes(path: Path) -> bytes:
+            if path.name == "environ":
+                raise PermissionError("not dumpable")
+            return metadata[path.name]
+
+        patch.setattr(Path, "read_bytes", read_bytes)
+        patch.delenv("SLURM_JOB_ID", raising=False)
+        if not change:
+            assert fault_injector.owned_processes("run-a") == []
+        else:
+            with pytest.raises(PermissionError):
+                fault_injector.owned_processes("run-a")
+        patch.setattr(fault_injector, "process_identity", lambda _: known)
+        assert fault_injector.owned_processes("run-a", [known]) == [known]
+
+
+def test_cleanup_backstop_waits_for_owned_step_after_control_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Can clean GPU observations hide a Slurm step still draining after cancellation?"""
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    args = argparse.Namespace(
+        output_dir=tmp_path,
+        target_rank=1,
+        model=tmp_path,
+        launcher=["srun"],
+        python="python3",
+        client_timeout_s=30,
+        cleanup_timeout_s=60,
+        startup_timeout_s=1,
+        shutdown_timeout_s=30,
+        ranks=2,
+        graphs_requested=False,
+    )
+    process = Mock()
+    process.poll.return_value = 1
+    monkeypatch.setattr(fault_injection.subprocess, "Popen", lambda *_, **__: process)
+    monkeypatch.setattr(fault_injection, "_stop", Mock(side_effect=TimeoutError("cancel budget")))
+    monkeypatch.setattr(fault_injection, "_probe", lambda *_, **__: [snapshot()])
+    steps = Mock(side_effect=[["123.0"], []])
+    monkeypatch.setattr(fault_injection, "_steps", steps)
+    monkeypatch.setattr(fault_injection.time, "sleep", Mock())
+    with pytest.raises(AssertionError, match="healthy readiness"):
+        fault_injection.run_phase(args, [snapshot()], "initial", "worker_sigkill_idle")
+    assert steps.call_count == 2
+    assert (tmp_path / "initial" / "cleanup_control_error.json").exists()
+    assert not (tmp_path / "initial" / "cleanup_failed.json").exists()
+    proof = json.loads((tmp_path / "initial" / "forced_cleanup.json").read_text())
+    assert proof["forced"] and proof["owned_steps"] == []

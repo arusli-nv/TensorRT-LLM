@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Observe one WideEP fault, verify cleanup, and explicitly restart on the same GPUs."""
+"""Observe one MPI WideEP fault, verify teardown, and restart on the same GPUs."""
 
 import argparse
 import hashlib
@@ -8,35 +8,30 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
+import socket
 import subprocess
-import sys
 import time
 import traceback
 import uuid
 from pathlib import Path
-from queue import Empty
-from types import FrameType, ModuleType
-from typing import TYPE_CHECKING
+from types import FrameType
 
 from fault_injector import (
     IDENTITY_DIR_ENV,
     RUN_ID_ENV,
     SCENARIOS,
-    NodeProbe,
     record,
     resources_released,
+    snapshot,
 )
-
-if TYPE_CHECKING:
-    from ray.actor import ActorHandle
-
-    from tensorrt_llm import LLM
 
 PROMPTS = ("The capital of France is", "The capital of Italy is")
 
 
 def load_config(path: Path, model: Path) -> dict:
+    """Read native LLM arguments and fill static placement for supported MoE layouts."""
     import yaml
 
     config = yaml.safe_load(path.read_text())
@@ -67,6 +62,7 @@ def load_config(path: Path, model: Path) -> dict:
 
 
 def validate_restart(initial: list[dict], restarted: list[dict]) -> None:
+    """Require fresh process identities with the original rank-to-GPU mapping."""
     before, after = ({row["rank"]: row for row in rows} for rows in (initial, restarted))
     if (
         not before
@@ -80,10 +76,6 @@ def validate_restart(initial: list[dict], restarted: list[dict]) -> None:
         if (
             row["gpu_uuid"] != new["gpu_uuid"]
             or row["hostname"] != new["hostname"]
-            or (
-                row.get("actor_id") is not None
-                and (not new.get("actor_id") or row["actor_id"] == new["actor_id"])
-            )
             or (row["pid"], row["start_ticks"], row["boot_id"])
             == (new["pid"], new["start_ticks"], new["boot_id"])
         ):
@@ -91,10 +83,9 @@ def validate_restart(initial: list[dict], restarted: list[dict]) -> None:
 
 
 def validate_workers(workers: list[dict], ranks: int, graphs_requested: bool) -> None:
-    actor_ids = [row.get("actor_id") for row in workers]
+    """Check complete membership, requested captures, and qualified communication geometry."""
     if (
         sorted(row["rank"] for row in workers) != list(range(ranks))
-        or (any(actor_ids) and (not all(actor_ids) or len(set(actor_ids)) != ranks))
         or len({row["gpu_uuid"] for row in workers}) != ranks
     ):
         raise ValueError("Incomplete model worker identities")
@@ -112,474 +103,453 @@ def validate_workers(workers: list[dict], ranks: int, graphs_requested: bool) ->
             )
 
 
-def child(args: argparse.Namespace) -> None:
-    # TensorRT-LLM initializes native library paths before torch is imported.
-    import tensorrt_llm
+def _read(directory: Path, name: str) -> dict:
+    return json.loads((directory / f"{name}.json").read_text())
 
-    # isort: split
-    import ray
-    import torch
-    import yaml
-    from ray.util.placement_group import placement_group, remove_placement_group
 
-    from tensorrt_llm import LLM, SamplingParams
-    from tensorrt_llm.llmapi.llm_args import RayPlacementConfig
+def _wait_file(directory: Path, name: str, timeout_s: float) -> dict:
+    deadline = time.monotonic() + timeout_s
+    while not (directory / f"{name}.json").exists():
+        if (directory / "injection_failed.json").exists():
+            raise RuntimeError(_read(directory, "injection_failed"))
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Missing {name} receipt: {directory}")
+        time.sleep(0.05)
+    return _read(directory, name)
 
-    directory = args.output_dir
-    config = yaml.safe_load((directory.parent / "config.yaml").read_text())
-    ranks = config["moe_expert_parallel_size"]
-    ray.init(
-        address=args.address,
-        runtime_env={
-            "working_dir": str(Path(__file__).parent),
-            "env_vars": {RUN_ID_ENV: args.run_id, IDENTITY_DIR_ENV: str(directory)},
-            "worker_process_setup_hook": "fault_injector.record_worker_identity",
-        },
-        log_to_driver=True,
-    )
-    record(
-        directory,
-        "job",
-        {"job_id": str(ray.get_runtime_context().get_job_id()), "run_id": args.run_id},
-    )
-    nodes = sorted(
-        [node for node in ray.nodes() if node["Alive"] and node["Resources"].get("GPU")],
-        key=lambda node: (
-            node["NodeManagerAddress"] != ray.util.get_node_ip_address(),
-            node["NodeManagerAddress"],
-        ),
-    )
-    if not nodes or nodes[0]["NodeManagerAddress"] != ray.util.get_node_ip_address():
-        raise ValueError("Driver must run on a reserved GPU node for rank-0 local IPC")
-    bundles = [
-        {"GPU": 1, "CPU": 1, f"node:{node['NodeManagerAddress']}": 0.001}
-        for node in nodes
-        for _ in range(int(node["Resources"]["GPU"]))
+
+def _wait_workers(directory: Path, ranks: int, timeout_s: float) -> list[dict]:
+    deadline = time.monotonic() + timeout_s
+    workers = [
+        _wait_file(directory / "workers", str(rank), _remaining(deadline)) for rank in range(ranks)
     ]
-    if len(bundles) != ranks:
-        raise ValueError("Dedicated Ray cluster GPU count differs from deployment")
-    placement = placement_group(bundles, strategy="PACK")
-    ray.get(placement.ready(), timeout=args.startup_timeout_s)
-    try:
-        with LLM(
-            model=str(args.model),
-            orchestrator_type="ray",
-            ray_worker_extension_cls="fault_injector.WorkerExtension",
-            ray_placement_config=RayPlacementConfig(
-                placement_groups=[placement], placement_bundle_indices=[list(range(ranks))]
-            ),
-            **config,
-        ) as llm:
-            workers = ray.get(
-                [
-                    worker.call_worker_method.remote("fault_identity")
-                    for worker in llm._executor.workers
-                ],
-                timeout=30,
-            )
-            validate_workers(workers, ranks, bool(config.get("cuda_graph_config")))
-            for row in workers:
-                row["run_id"] = args.run_id
-            record(
-                directory,
-                "workers",
-                {
-                    "workers": workers,
-                    "startup_metrics": next(
-                        row["startup_metrics"] for row in workers if row["rank"] == 0
-                    ),
-                    "runtime": {
-                        "tensorrt_llm": tensorrt_llm.__version__,
-                        "ray": ray.__version__,
-                        "torch": torch.__version__,
-                        "cuda": torch.version.cuda,
-                    },
-                },
-            )
-            outputs = [
-                llm.generate_async(
-                    prompt, SamplingParams(temperature=0, seed=2026, max_tokens=32)
-                ).result(timeout=args.client_timeout_s)
-                for prompt in PROMPTS
-            ]
-            texts = [out.outputs[0].text for out in outputs]
-            if not all(word in text for word, text in zip(("Paris", "Rome"), texts)):
-                raise ValueError(f"Healthy inference failed: {texts}")
-            record(directory, "healthy", {"results": texts})
-            if args.scenario != "healthy":
-                observe_fault(llm, workers, args)
-        record(directory, "shutdown", {"state": "complete"})
-    finally:
-        remove_placement_group(placement)
-        ray.shutdown()
+    _remaining(deadline)
+    return workers
 
 
-def observe_fault(llm: "LLM", workers: list[dict], args: argparse.Namespace) -> None:
-    import ray
+def client(args: argparse.Namespace) -> None:
+    # TensorRT-LLM initializes native library paths before importing torch.
+    import yaml
 
-    from tensorrt_llm import SamplingParams
-    from tensorrt_llm.executor import EngineDeadError
+    import tensorrt_llm
+    from tensorrt_llm import LLM, SamplingParams
 
     directory = args.output_dir
-    streaming = args.scenario == "worker_sigkill_streaming"
-    result = None
-    last_output = None
-    if streaming:
-        result = llm.generate_async(
-            PROMPTS[0],
-            SamplingParams(temperature=0, seed=2026, max_tokens=256, ignore_eos=True),
-            streaming=True,
-        )
-        deadline = time.monotonic() + args.client_timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("No nonfinal output reached the streaming trigger")
-            result._result_step(timeout=remaining)
-            last_output = {
-                "token_ids": list(result.outputs[0].token_ids),
-                "text": result.outputs[0].text,
-                "finished": bool(result.finished),
-            }
-            if last_output["finished"]:
-                raise RuntimeError("Stream finished before injection")
-            if last_output["token_ids"]:
-                break
-        trigger = {"event": "first_nonfinal_output", **last_output}
-    else:
-        trigger = {"event": "between_requests"}
-    if llm._executor._fatal_error is not None or llm._executor.is_shutdown():
-        raise RuntimeError("Engine failed before injection")
-    record(directory, "trigger", {"run_id": args.run_id, **trigger})
-    target_rank = len(workers) // 2
-    target = next(row for row in workers if row["rank"] == target_rank)
+    config = yaml.safe_load(args.config.read_text())
     started = time.monotonic()
-    action = llm._executor.workers[target_rank].call_worker_method.remote(
-        "inject_fault", target, str(directory), args.scenario
-    )
-    try:
-        ray.get(action, timeout=min(15, args.client_timeout_s))
-        if args.scenario.startswith("worker_sigkill_"):
-            raise AssertionError("SIGKILL actor unexpectedly replied")
-    except ray.exceptions.ActorDiedError as error:
-        if not args.scenario.startswith("worker_sigkill_") or target["actor_id"] not in str(error):
-            raise
-        record(directory, "actor_death", {"actor_id": target["actor_id"], "error": str(error)})
-    try:
-        if result is None:
-            result = llm.generate_async(
-                PROMPTS[0], SamplingParams(temperature=0, seed=2026, max_tokens=32), streaming=True
-            )
-        deadline = started + args.client_timeout_s
-        while not result.finished:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Client did not report a terminal failure")
-            result._result_step(timeout=remaining)
-            last_output = {
-                "token_ids": list(result.outputs[0].token_ids),
-                "text": result.outputs[0].text,
-                "finished": bool(result.finished),
-            }
-        raise AssertionError("Faulted request completed successfully")
-    except EngineDeadError as error:
-        if time.monotonic() - started > args.client_timeout_s:
-            raise TimeoutError("Terminal error arrived after the client deadline") from error
+    with LLM(model=str(args.model), **config) as llm:
+        loaded = time.monotonic()
+        workers = _wait_workers(
+            directory, config["moe_expert_parallel_size"], args.client_timeout_s
+        )
+        validate_workers(
+            workers, config["moe_expert_parallel_size"], bool(config.get("cuda_graph_config"))
+        )
+        results = [
+            llm.generate_async(
+                prompt, SamplingParams(temperature=0, seed=2026, max_tokens=32)
+            ).result(timeout=args.client_timeout_s)
+            for prompt in PROMPTS
+        ]
+        texts = [result.outputs[0].text for result in results]
+        if not all(word in text for word, text in zip(("Paris", "Rome"), texts)):
+            raise ValueError(f"Healthy inference failed: {texts}")
         record(
             directory,
-            "client_error",
+            "healthy",
             {
-                "type": type(error).__name__,
-                "error": str(error),
-                "seconds_from_injection_rpc": time.monotonic() - started,
-                "last_output": last_output,
+                "constructor_s": loaded - started,
+                "constructor_to_readiness_s": time.monotonic() - started,
+                "results": [
+                    {"text": result.outputs[0].text, "token_ids": list(result.outputs[0].token_ids)}
+                    for result in results
+                ],
+                "tensorrt_llm": tensorrt_llm.__version__,
             },
         )
-    except Empty as error:
-        raise TimeoutError("Client did not report a terminal failure") from error
-    probes = {
-        worker.call_worker_method.remote("fault_cuda_probe"): rank
-        for rank, worker in enumerate(llm._executor.workers)
-        if rank != target_rank or not args.scenario.startswith("worker_sigkill_")
-    }
-    ready, pending = ray.wait(list(probes), num_returns=len(probes), timeout=5)
-    observations = []
-    for reply in ready:
-        try:
-            observations.append(ray.get(reply))
-        except ray.exceptions.RayError as error:
-            observations.append({"rank": probes[reply], "error": str(error)})
-    record(
-        directory,
-        "cuda_probes",
-        {
-            "replies": observations,
-            "unknown": len(pending),
-            "unknown_ranks": [probes[reply] for reply in pending],
-            "scope": "successful operation only; no recovery claim",
-        },
-    )
-
-
-def validate_fault_evidence(directory: Path, scenario: str) -> None:
-    if scenario == "healthy":
-        return
-    intent = json.loads((directory / "injection_intent.json").read_text())
-    if intent["scenario"] != scenario:
-        raise ValueError("Fault evidence belongs to a different scenario")
-    if scenario.startswith("worker_sigkill_"):
-        death = json.loads((directory / "actor_death.json").read_text())
-        if death["actor_id"] != intent["target"]["actor_id"]:
-            raise ValueError("Confirmed death does not match the target")
-        return
-    result = json.loads((directory / "injection_result.json").read_text())
-    log = "\n".join(
-        path.read_text()
-        for path in [directory / "driver.log", *sorted((directory / "ray_logs").glob("*/*"))]
-    )
-    if scenario == "fence_round_mismatch":
-        if result["after"] != result["before"] + 2 or not re.search(
-            r"(?:dispatch|combine):.*timed out waiting for completion flag", log
-        ):
-            raise AssertionError("No native fence timeout evidence for the verified round mismatch")
-    elif (
-        result.get("group") != "WORLD"
-        or "gloo" not in result["backend"].lower()
-        or not re.search(
-            r"(?:Default process group has not been initialized|Group.*not registered|Invalid process group|"
-            r"Connection (?:closed|reset) by peer|gloo.*(?:Error|error))",
-            log,
-        )
-    ):
-        raise AssertionError("No host collective error evidence for the destroyed process group")
-
-
-def owned_actors(ray: ModuleType, job_id: str) -> dict:
-    from ray._private import state
-
-    actors = state.actors(job_id=ray.JobID.from_hex(job_id))
-    return {
-        actor_id: {"Address": {"NodeID": row["Address"]["NodeID"]}, "Pid": row["Pid"]}
-        for actor_id, row in actors.items()
-        if row["JobID"] == job_id and row["State"] != "DEAD"
-    }
-
-
-def cleanup(
-    ray: ModuleType,
-    probes: list["ActorHandle"],
-    baseline: list[dict],
-    directory: Path,
-    identities: list[dict],
-    timeout_s: float,
-    forced: bool,
-) -> None:
-    job = (
-        json.loads((directory / "job.json").read_text())
-        if (directory / "job.json").exists()
-        else {}
-    )
-    job_id = job.get("job_id")
-    deadline = time.monotonic() + timeout_s
-    forced_actor_ids = set()
-    terminated_pids = set()
-    native_cleanup_failed = False
-    try:
-        while True:
-            if forced and job_id is not None:
-                from ray._private.worker import global_worker
-
-                actors = owned_actors(ray, job_id)
-                pinned_actor_ids = {identity["actor_id"] for identity in identities}
-                unpinned = {
-                    actor_id: actor
-                    for actor_id, actor in actors.items()
-                    if actor_id not in pinned_actor_ids
-                }
-                pinned = ray.get(
-                    [
-                        probe.pin_actor_processes.remote(unpinned, str(directory))
-                        for probe in probes
-                    ],
-                    timeout=15,
+        _wait_file(directory, "proceed", args.cleanup_timeout_s)
+        if args.scenario != "healthy":
+            target = next(row for row in workers if row["rank"] == args.target_rank)
+            result = None
+            trigger = {"run_id": args.run_id, "event": "between_requests"}
+            if args.scenario == "worker_sigkill_streaming":
+                result = llm.generate_async(
+                    PROMPTS[0],
+                    SamplingParams(temperature=0, seed=2026, max_tokens=256, ignore_eos=True),
+                    streaming=True,
                 )
-                identities.extend(
-                    identity for node in pinned for identity in node if identity not in identities
+                deadline = time.monotonic() + args.client_timeout_s
+                while not result.outputs[0].token_ids:
+                    result._result_step(timeout=max(0.001, deadline - time.monotonic()))
+                    if result.finished or time.monotonic() >= deadline:
+                        raise TimeoutError("Stream ended or timed out before a nonfinal token")
+                trigger.update(
+                    event="first_nonfinal_output",
+                    token_ids=list(result.outputs[0].token_ids),
+                    finished=result.finished,
                 )
-                for actor_id in actors:
-                    global_worker.core_worker.kill_actor(ray.ActorID.from_hex(actor_id), True)
-                    forced_actor_ids.add(actor_id)
-                terminated = ray.get(
-                    [probe.terminate_owned_processes.remote(identities) for probe in probes],
-                    timeout=15,
-                )
-                terminated_pids.update(pid for node in terminated for pid in node)
-            current = ray.get([probe.snapshot.remote(identities) for probe in probes], timeout=15)
-            if (
-                (job_id is None or not owned_actors(ray, job_id))
-                and (
-                    job_id is None
-                    or any(
-                        row["JobID"] == job_id and row["IsDead"]
-                        for row in ray._private.state.jobs()
-                    )
-                )
-                and resources_released(baseline, current)
-                and ray.available_resources().get("GPU", 0)
-                >= sum(len(row["gpus"]) for row in baseline)
-            ):
-                record(
-                    directory,
-                    "cleanup",
-                    {
-                        "snapshots": current,
-                        "forced": forced,
-                        "forced_actor_ids": sorted(forced_actor_ids),
-                        "terminated_pids": sorted(terminated_pids),
-                    },
-                )
-                break
-            if time.monotonic() >= deadline:
-                record(
-                    directory,
-                    "cleanup_backstop_failed" if native_cleanup_failed else "cleanup_failed",
-                    {
-                        "snapshots": current,
-                        "forced": forced,
-                        "forced_actor_ids": sorted(forced_actor_ids),
-                        "terminated_pids": sorted(terminated_pids),
-                    },
-                )
-                if not forced:
-                    native_cleanup_failed = True
-                    forced = True
-                    deadline = time.monotonic() + timeout_s
-                    continue
-                raise TimeoutError("Model processes or GPU resources remain after teardown")
-            time.sleep(0.1)
-        if native_cleanup_failed:
-            raise TimeoutError("Native teardown leaked resources; forced backstop was required")
-    finally:
-        if job_id is not None:
-            original_failure = sys.exc_info()[0] is not None
+            record(directory, "trigger", trigger)
+            record(directory, "fault_request", {"target": target, "scenario": args.scenario})
+            injected = time.monotonic()
+            _wait_file(
+                directory,
+                "injection_result"
+                if args.scenario == "fence_round_mismatch"
+                else "injection_intent",
+                15,
+            )
             try:
-                logs = ray.get(
-                    [probe.collect_logs.remote(str(directory), job_id) for probe in probes],
-                    timeout=30,
+                if result is None:
+                    result = llm.generate_async(
+                        PROMPTS[0],
+                        SamplingParams(temperature=0, seed=2026, max_tokens=32),
+                        streaming=True,
+                    )
+                result.result(timeout=args.client_timeout_s)
+            except Exception as error:
+                record(
+                    directory,
+                    "client_error",
+                    {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                        "elapsed_s": time.monotonic() - injected,
+                        "traceback": traceback.format_exc(),
+                    },
                 )
-                record(directory, "logs", {"files_by_node": logs})
-            except (OSError, TimeoutError, ray.exceptions.RayError) as error:
-                record(directory, "logs_failed", {"error": str(error)})
-                if not original_failure:
-                    raise
+                raise
+            record(directory, "client_result", {"outcome": "completed"})
+            raise AssertionError("Inference completed after injection")
+    record(directory, "shutdown", {"state": "complete"})
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Deadline exceeded")
+    return remaining
+
+
+def _steps(name: str, timeout_s: float = 10) -> list[str]:
+    job_id = os.environ["SLURM_JOB_ID"]
+    result = subprocess.run(
+        ["scontrol", "--oneliner", "show", "step", job_id],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=timeout_s,
+    )
+    steps = []
+    for line in result.stdout.splitlines():
+        step = re.search(r"(?:^|\s)StepId=(\S+)", line)
+        step_name = re.search(r"(?:^|\s)Name=(\S+)", line)
+        if (
+            step
+            and step_name
+            and step_name[1] == name
+            and re.fullmatch(rf"{re.escape(job_id)}\.\d+", step[1])
+        ):
+            steps.append(step[1])
+    return steps
+
+
+def _stop(process: subprocess.Popen, name: str, deadline: float) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        for step in _steps(name, min(10, _remaining(deadline))):
+            subprocess.run(["scancel", step], check=True, timeout=min(10, _remaining(deadline)))
+    finally:
+        try:
+            process.wait(timeout=max(0, min(10, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=max(0, min(10, deadline - time.monotonic())))
+    while pending := _steps(name, min(10, _remaining(deadline))):
+        for step in pending:
+            subprocess.run(["scancel", step], check=True, timeout=min(10, _remaining(deadline)))
+        time.sleep(min(0.1, _remaining(deadline)))
+
+
+def _probe(
+    args: argparse.Namespace,
+    directory: Path,
+    run_id: str,
+    terminate: bool = False,
+    deadline: float | None = None,
+) -> list[dict]:
+    directory.mkdir()
+    if deadline is None:
+        deadline = time.monotonic() + args.cleanup_timeout_s
+    _remaining(deadline)
+    name = f"weft-{uuid.uuid4().hex}"
+    environment = os.environ.copy()
+    for key in (RUN_ID_ENV, IDENTITY_DIR_ENV):
+        environment.pop(key, None)
+    command = [
+        *args.probe_launcher,
+        f"--job-name={name}",
+        f"--jobid={os.environ['SLURM_JOB_ID']}",
+        args.python,
+        str(Path(__file__).resolve()),
+        "--probe",
+        "--run-id",
+        run_id,
+        "--output-dir",
+        str(directory),
+    ]
+    if terminate:
+        command.append("--terminate")
+    with (directory / "launcher.log").open("x") as stream:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            if process.wait(timeout=_remaining(deadline)):
+                raise RuntimeError(f"CPU resource probe failed: {directory}")
+        finally:
+            _stop(process, name, deadline)
+    _remaining(deadline)
+    return [json.loads(path.read_text()) for path in directory.glob("*.json")]
+
+
+def _visible_workers(workers: list[dict], observed: list[dict]) -> None:
+    # Host probes check ownership; container UID numbers may be remapped.
+    keys = ("hostname", "pid", "start_ticks", "boot_id", "pid_namespace")
+    host_processes = {
+        tuple(process[key] for key in keys) for row in observed for process in row["live_processes"]
+    }
+    if any(tuple(worker[key] for key in keys) not in host_processes for worker in workers):
+        raise ValueError(
+            "Independent probe cannot observe every live model worker; share the host PID namespace"
+        )
+
+
+def validate_fault_evidence(directory: Path, scenario: str, workers: list[dict]) -> None:
+    """Require matching injection receipts and the measured native MPI failure outcome."""
+    if scenario == "healthy":
+        if not (directory / "shutdown.json").exists():
+            raise AssertionError("Clean shutdown receipt missing")
+        return
+    intent = _read(directory, "injection_intent")
+    from fault_injector import validate_injection
+
+    target = intent["target"]
+    expected = next(row for row in workers if row["rank"] == target["rank"])
+    validate_injection(expected, target, scenario, _read(directory, "trigger"))
+    if intent["scenario"] != scenario or (directory / "client_result.json").exists():
+        raise AssertionError("Injection mismatch or completed post-fault inference")
+    logs = "\n".join(path.read_text(errors="replace") for path in directory.glob("*.log"))
+    if scenario.startswith("worker_sigkill_"):
+        if not re.search(rf"task {target['rank']}:.*(?:Killed|137)", logs):
+            raise AssertionError("No native launcher confirmation of target death")
+        if (directory / "client_error.json").exists():
+            error = _read(directory, "client_error")
+            if error["type"] != "RequestError" or "MPI_ERR_" not in error["message"]:
+                raise AssertionError("Unexpected process-loss client error")
+    else:
+        mutation = _read(directory, "injection_result")
+        if mutation["after"] != mutation["before"] + 2:
+            raise AssertionError("Fence mutation missing")
+        error = _read(directory, "client_error")
+        if error["type"] != "RequestError" or not re.search(
+            r"(?:dispatch|combine).*timed out waiting for completion flag", logs
+        ):
+            raise AssertionError("Expected native fence timeout and RequestError missing")
 
 
 def run_phase(
-    args: argparse.Namespace,
-    ray: ModuleType,
-    probes: list["ActorHandle"],
-    baseline: list[dict],
-    name: str,
-    scenario: str,
-) -> dict:
-    directory = args.output_dir / name
+    args: argparse.Namespace, baseline: list[dict], phase: str, scenario: str
+) -> list[dict]:
+    directory = args.output_dir / phase
     directory.mkdir()
+    run_id = uuid.uuid4().hex
+    name = f"weft-{run_id}"
+    environment = {
+        **os.environ,
+        RUN_ID_ENV: run_id,
+        IDENTITY_DIR_ENV: str(directory),
+        "WIDEEP_FT_TARGET_RANK": str(args.target_rank),
+        "TRTLLM_EPLB_SHM_NAME": f"weft_{run_id}",
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")])
+        ),
+    }
     command = [
-        sys.executable,
+        *args.launcher,
+        f"--job-name={name}",
+        f"--jobid={os.environ['SLURM_JOB_ID']}",
+        f"--output={directory}/rank-%t.log",
+        "trtllm-llmapi-launch",
+        args.python,
         str(Path(__file__).resolve()),
-        "--child",
-        "--address",
-        args.address,
+        "--client",
         "--model",
         str(args.model),
         "--config",
-        str(args.config),
-        "--output-dir",
-        str(directory),
+        str(args.output_dir / "config.yaml"),
         "--scenario",
         scenario,
+        "--output-dir",
+        str(directory),
         "--run-id",
-        args.run_id,
+        run_id,
+        "--target-rank",
+        str(args.target_rank),
         "--client-timeout-s",
         str(args.client_timeout_s),
-        "--startup-timeout-s",
-        str(args.startup_timeout_s),
+        "--cleanup-timeout-s",
+        str(args.cleanup_timeout_s),
     ]
+    record(directory, "launch", {"run_id": run_id, "step_name": name, "command": command})
     started = time.monotonic()
     received = {}
-    identities = []
-    forced = True
-    with (directory / "driver.log").open("x") as log:
+    probe_index = 0
+
+    def observe(terminate: bool = False, deadline: float | None = None) -> list[dict]:
+        nonlocal probe_index
+        probe_index += 1
+        return _probe(args, directory / f"probe-{probe_index}", run_id, terminate, deadline)
+
+    with (directory / "launcher.log").open("x") as log:
         process = subprocess.Popen(
-            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            command, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
-        try:
-            deadline = started + args.startup_timeout_s
-            while process.poll() is None:
-                for event in ("healthy", "trigger", "client_error", "shutdown"):
-                    if event not in received and (directory / f"{event}.json").exists():
-                        received[event] = time.monotonic() - started
-                        if event == "healthy":
-                            deadline = time.monotonic() + (
-                                args.shutdown_timeout_s
-                                if scenario == "healthy"
-                                else args.client_timeout_s
-                            )
-                        elif event == "trigger":
-                            deadline = time.monotonic() + args.client_timeout_s
-                        elif event == "client_error":
-                            deadline = time.monotonic() + args.shutdown_timeout_s
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"{name} exceeded its startup or terminal deadline")
-                time.sleep(0.05)
-            if process.returncode:
-                raise AssertionError(
-                    f"{name} exited {process.returncode}; see {directory / 'driver.log'}"
-                )
-            if not (directory / "shutdown.json").exists():
-                raise AssertionError("Native shutdown completion is unverified")
-            for event in ("healthy", "trigger", "client_error", "shutdown"):
-                if event not in received and (directory / f"{event}.json").exists():
-                    received[event] = time.monotonic() - started
-            forced = False
-            if scenario != "healthy" and not (directory / "client_error.json").exists():
-                raise AssertionError("Expected EngineDeadError is missing")
-        finally:
-            try:
-                if process.poll() is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait(timeout=15)
-            finally:
-                try:
-                    if (directory / "workers.json").exists():
-                        identities = json.loads((directory / "workers.json").read_text())["workers"]
-                    cleanup(
-                        ray, probes, baseline, directory, identities, args.cleanup_timeout_s, forced
-                    )
-                finally:
+
+        def wait_for_cleanup(deadline: float, forced: bool = False) -> None:
+            while True:
+                observed = observe(deadline=deadline)
+                pending = _steps(name, min(10, _remaining(deadline)))
+                _remaining(deadline)
+                if (
+                    process.poll() is not None
+                    and not pending
+                    and resources_released(baseline, observed)
+                ):
                     record(
                         directory,
-                        "timing",
+                        "forced_cleanup" if forced else "cleanup",
                         {
-                            "seconds_to_received_event": received,
-                            "total_seconds": time.monotonic() - started,
-                            "clock_source": "single parent CLOCK_MONOTONIC; file publication receipt",
+                            "step_name": name,
+                            "owned_steps": pending,
+                            "snapshots": observed,
+                            "forced": forced,
                         },
                     )
-    validate_fault_evidence(directory, scenario)
-    return {"workers": identities, "received": received, "parent_started_s": started}
+                    return
+                time.sleep(min(0.1, _remaining(deadline)))
+
+        try:
+            deadline = started + args.startup_timeout_s
+            workers = []
+            while process.poll() is None:
+                for event in (
+                    "healthy",
+                    "trigger",
+                    "injection_intent",
+                    "injection_result",
+                    "client_error",
+                    "shutdown",
+                ):
+                    if event in received or not (directory / f"{event}.json").exists():
+                        continue
+                    received[event] = time.monotonic() - started
+                    if event == "healthy":
+                        workers = _wait_workers(directory, args.ranks, _remaining(deadline))
+                        validate_workers(workers, args.ranks, args.graphs_requested)
+                        if {row["gpu_uuid"] for row in workers} != {
+                            gpu[0] for row in baseline for gpu in row["gpus"]
+                        }:
+                            raise ValueError(
+                                "Model GPUs differ from independently observed allocation"
+                            )
+                        _visible_workers(workers, observe(deadline=deadline))
+                        live_steps = _steps(name, min(10, _remaining(deadline)))
+                        if len(live_steps) != 1:
+                            raise AssertionError("Cannot identify the live owned model step")
+                        _remaining(deadline)
+                        record(
+                            directory,
+                            "proceed",
+                            {"live_identity_probe": "complete", "owned_steps": live_steps},
+                        )
+                        deadline = (
+                            time.monotonic() + args.client_timeout_s + args.shutdown_timeout_s
+                        )
+                    elif event == "client_error":
+                        _remaining(deadline)
+                        deadline = time.monotonic() + args.shutdown_timeout_s
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"{phase} exceeded its startup/client/teardown deadline")
+                time.sleep(0.05)
+            _remaining(deadline)
+            received["step_exit"] = time.monotonic() - started
+            for event in (
+                "trigger",
+                "injection_intent",
+                "injection_result",
+                "client_error",
+                "shutdown",
+            ):
+                if event not in received and (directory / f"{event}.json").exists():
+                    received[event] = time.monotonic() - started
+            if "healthy" not in received:
+                raise AssertionError("MPI step ended before healthy readiness")
+            expected_exit = 0 if scenario == "healthy" else 137
+            if process.returncode != expected_exit:
+                raise AssertionError(
+                    f"MPI step exited {process.returncode}, expected {expected_exit}"
+                )
+            wait_for_cleanup(time.monotonic() + args.cleanup_timeout_s)
+            validate_fault_evidence(directory, scenario, workers)
+        except (Exception, KeyboardInterrupt) as error:
+            record(directory, "intervention", {"error": repr(error), "forced_cleanup": True})
+            cleanup_deadline = time.monotonic() + args.cleanup_timeout_s
+            try:
+                _stop(process, name, min(cleanup_deadline, time.monotonic() + 20))
+            except Exception as control_error:
+                record(directory, "cleanup_control_error", {"error": repr(control_error)})
+            try:
+                observe(terminate=True, deadline=cleanup_deadline)
+                wait_for_cleanup(cleanup_deadline, forced=True)
+            except Exception as cleanup_error:
+                record(directory, "cleanup_failed", {"error": repr(cleanup_error)})
+            raise
+        finally:
+            record(
+                directory,
+                "timing",
+                {
+                    "seconds_to_received_event": received,
+                    "total_s": time.monotonic() - started,
+                    "exit_code": process.poll(),
+                    "clock_source": "single parent CLOCK_MONOTONIC; complete file receipt",
+                },
+            )
+    return workers
 
 
 def run(args: argparse.Namespace) -> None:
-    import ray
     import yaml
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    args.output_dir.mkdir(parents=True, exist_ok=False)
+    args.output_dir.mkdir(parents=True)
     config = load_config(args.config, args.model)
+    args.ranks = config["moe_expert_parallel_size"]
+    args.graphs_requested = bool(config.get("cuda_graph_config"))
+    if args.target_rank is None:
+        args.target_rank = args.ranks // 2
+    if not 0 < args.target_rank < args.ranks:
+        raise ValueError("Target must be a nonzero model rank")
     (args.output_dir / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
     record(
         args.output_dir,
@@ -588,13 +558,13 @@ def run(args: argparse.Namespace) -> None:
             "run_id": args.run_id,
             "scenario": args.scenario,
             "model": str(args.model),
+            "launcher": args.launcher,
+            "probe_launcher": args.probe_launcher,
+            "allocation_job_id": os.environ["SLURM_JOB_ID"],
             "source_sha256": {
                 path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in Path(__file__).parent.glob("*.py")
             },
-            "config_sha256": hashlib.sha256(
-                (args.output_dir / "config.yaml").read_bytes()
-            ).hexdigest(),
             "allocation_queue_seconds": None,
             "autotuning_enabled": config.get("enable_autotuner"),
             "cache_state": "uncontrolled filesystem/compiler caches",
@@ -604,43 +574,18 @@ def run(args: argparse.Namespace) -> None:
             },
         },
     )
-    sigterm_handler = signal.getsignal(signal.SIGTERM)
-    ray.init(address=args.address, runtime_env={"working_dir": str(Path(__file__).parent)})
-    signal.signal(signal.SIGTERM, sigterm_handler)
-    probes = []
     try:
-        try:
-            probe_class = ray.remote(num_cpus=0)(NodeProbe)
-            probes = [
-                probe_class.options(
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(node["NodeID"], soft=False)
-                ).remote()
-                for node in ray.nodes()
-                if node["Alive"] and node["Resources"].get("GPU")
-            ]
-            visible = ray.get(
-                [probe.read_run_id.remote(str(args.output_dir)) for probe in probes], timeout=15
-            )
-            if not visible or any(run_id != args.run_id for run_id in visible):
-                raise ValueError("Evidence directory must be shared across all GPU nodes")
-            baseline = ray.get([probe.snapshot.remote([]) for probe in probes], timeout=30)
-            if not baseline or any(row["compute_apps"] for row in baseline):
-                raise ValueError("Dedicated Ray cluster must have no existing GPU compute contexts")
-            record(args.output_dir, "baseline", {"snapshots": baseline})
-            expected_gpus = {gpu[0] for row in baseline for gpu in row["gpus"]}
-            if len(expected_gpus) != config["moe_expert_parallel_size"]:
-                raise ValueError("Dedicated cluster does not match the requested EP size")
-            initial = run_phase(args, ray, probes, baseline, "initial", args.scenario)
-            if {row["gpu_uuid"] for row in initial["workers"]} != expected_gpus:
-                raise ValueError("Model worker GPU identities differ from the independent baseline")
-            restarted = run_phase(args, ray, probes, baseline, "restart", "healthy")
-            validate_restart(initial["workers"], restarted["workers"])
-        finally:
-            try:
-                for probe in probes:
-                    ray.kill(probe, no_restart=True)
-            finally:
-                ray.shutdown()
+        baseline = _probe(args, args.output_dir / "baseline", uuid.uuid4().hex)
+        if (
+            not baseline
+            or any(row["compute_apps"] for row in baseline)
+            or len({row["hostname"] for row in baseline}) != len(baseline)
+            or sum(len(row["gpus"]) for row in baseline) != args.ranks
+        ):
+            raise ValueError("Allocation must be dedicated and contain exactly the requested GPUs")
+        initial = run_phase(args, baseline, "initial", args.scenario)
+        restarted = run_phase(args, baseline, "restart", "healthy")
+        validate_restart(initial, restarted)
     except (Exception, KeyboardInterrupt) as error:
         record(
             args.output_dir,
@@ -654,51 +599,83 @@ def run(args: argparse.Namespace) -> None:
         {
             "state": "PASS",
             "same_gpu_restart": True,
-            "fault_observed_to_restart_readiness_s": (
-                restarted["parent_started_s"]
-                + restarted["received"]["healthy"]
-                - initial["parent_started_s"]
-                - initial["received"].get("client_error", initial["received"]["healthy"])
-            ),
-            "initial": initial["received"],
-            "restart": restarted["received"],
+            "initial": _read(args.output_dir / "initial", "timing"),
+            "restart": _read(args.output_dir / "restart", "timing"),
         },
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--address", required=True)
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--launcher", help="Direct srun prefix for native MPI model workers")
+    parser.add_argument(
+        "--probe-launcher", help="Direct srun --mpi=none prefix, one CPU probe per GPU host"
+    )
+    parser.add_argument(
+        "--python", default="python3", help="Python executable inside launched tasks"
+    )
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--scenario", choices=("healthy", *SCENARIOS), required=True)
+    parser.add_argument("--scenario", choices=("healthy", *SCENARIOS), default="healthy")
+    parser.add_argument("--target-rank", type=int)
     parser.add_argument("--run-id", default=uuid.uuid4().hex)
     parser.add_argument("--startup-timeout-s", type=float, default=720)
-    parser.add_argument("--client-timeout-s", type=float, default=30)
+    parser.add_argument("--client-timeout-s", type=float)
     parser.add_argument("--shutdown-timeout-s", type=float, default=180)
     parser.add_argument("--cleanup-timeout-s", type=float, default=60)
-    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--terminate", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    for name in ("model", "config", "output_dir"):
-        setattr(args, name, getattr(args, name).resolve())
-    if not args.child:
-
-        def interrupt(signum: int, _frame: FrameType | None) -> None:
-            raise KeyboardInterrupt(f"Interrupted by signal {signum}")
-
-        signal.signal(signal.SIGTERM, interrupt)
-    if any(
-        not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0
-        for name in (
-            "startup_timeout_s",
-            "client_timeout_s",
-            "shutdown_timeout_s",
-            "cleanup_timeout_s",
+    args.output_dir = args.output_dir.resolve()
+    if args.probe:
+        # Retain host-observed identities even when dead tasks lose their environment.
+        known_path = args.output_dir.parent / "probe-1" / f"{socket.gethostname()}.json"
+        known = json.loads(known_path.read_text()) if known_path.exists() else None
+        if known is not None and known["run_id"] != args.run_id:
+            raise ValueError("Host identity receipt belongs to another run")
+        record(
+            args.output_dir,
+            socket.gethostname(),
+            snapshot(args.run_id, args.terminate, known["live_processes"] if known else ()),
         )
+        return
+    args.client_timeout_s = (
+        args.client_timeout_s
+        if args.client_timeout_s is not None
+        else (420 if args.scenario == "fence_round_mismatch" else 30)
+    )
+    if any(
+        not math.isfinite(getattr(args, f"{phase}_timeout_s"))
+        or getattr(args, f"{phase}_timeout_s") <= 0
+        for phase in ("startup", "client", "shutdown", "cleanup")
     ):
         parser.error("Timeouts must be finite and positive")
-    (child if args.child else run)(args)
+    if not args.model or not args.config:
+        parser.error("--model and --config are required")
+    args.model, args.config = args.model.resolve(), args.config.resolve()
+    if args.client:
+        client(args)
+        return
+    if "SLURM_JOB_ID" not in os.environ or not args.launcher or not args.probe_launcher:
+        parser.error("Provide --launcher and --probe-launcher inside an existing Slurm allocation")
+    for option in ("launcher", "probe_launcher"):
+        command = shlex.split(getattr(args, option))
+        if (
+            not command
+            or Path(command[0]).name != "srun"
+            or any(token.startswith(("--job-name", "-J", "--jobid")) for token in command)
+        ):
+            parser.error("Launch prefixes must use direct srun; the test owns step names")
+        setattr(args, option, command)
+
+    def interrupt(signum: int, _frame: FrameType | None) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt(f"Interrupted by signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupt)
+    run(args)
 
 
 if __name__ == "__main__":

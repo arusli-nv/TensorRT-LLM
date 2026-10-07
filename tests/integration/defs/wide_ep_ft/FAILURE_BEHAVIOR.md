@@ -7,62 +7,71 @@ SPDX-License-Identifier: Apache-2.0
 
 DeepSeek-R1-0528 NVFP4, EP32/expert TP1/attention DP/PP1, 288 static slots,
 GB200/R580/CUDA 13.4, NVLinkOneSided fence, decode graphs `[1,2,4,8]`.
-CFT, rank-mask FT, the opt-in AlltoAll completion-flag watchdog, overlap and
-autotuning were disabled. Target rank 16 owns sole expert copies; its loss is outside the resident-replica MVP envelope.
-These tests characterize failure and explicit restart, without N−1 recovery.
+CFT, rank-mask FT, AlltoAll watchdog, overlap and autotuning were disabled.
+MPI used Python `cb03225c13`; native build `764bde9d6d` has identical native sources.
+Five changed Python modules were restored and hash-checked, excluding branch fixes.
+Historical Ray results include branch propagation/actor-death fixes.
 
-**MPI baseline:** Python `cb03225c13`; native build `764bde9d6d` has identical
-native sources. Five changed Python modules were restored and hash-checked.
-Test-only instrumentation recorded workers and issued faults; branch fixes were absent.
-Launch: Slurm/PMIx → `trtllm-llmapi-launch` → LLM API + MPI workers.
+| Injection | MPI baseline | Historical Ray | Avoiding teardown would require |
+|---|---|---|---|
+| Middle worker SIGKILL between requests | PMIx cancels the whole step, exit 137; client receives MPI `RequestError` or dies first. | `EngineDeadError`. | Survivor-preserving launch/control, expert coverage and safe peer-memory lifetime. |
+| Middle worker SIGKILL after nonfinal streamed output | Same whole-step cancellation interrupts the pending request; both client outcomes occurred. | `EngineDeadError`. | Idle-kill requirements plus interrupted-transfer and request/KV disposition. |
+| Fence round +2 | Completion-flag timeout → trap/CUDA719 → fatal executor error → `RequestError` and rank-crash escalation → exit 137. | Same timeout/trap → `EngineDeadError`. | Escape before the trap, then prove quiescence. Rebuilding communicators cannot repair a CUDA719 context. |
+| Local PyTorch `WORLD` destruction | Not ported; MPI uses a different control path. | Gloo failure/rank-crash escalation → `EngineDeadError`. | Qualified communication-resource rebuilding; this diagnostic is not physical NCCL failure. |
 
-| Injection | Failure path | Fresh same-GPU restart readiness |
-|---|---|---|
-| SIGKILL between requests | Verified rank-16 death → PMIx error `-61` → whole step canceled, exit 137; client terminated before reporting an error. | 166.3 s |
-| SIGKILL after nonfinal streamed output | Verified rank-16 death → same whole-step cancellation; no client-error receipt. | 165.6 s |
-| Fence round +2 | Dispatch flag timeout → device trap/CUDA failure 719 → `RequestError` at 291.5 s → `RankCrashKillWatchdog` escalation → step exit 137. | 189.2 s |
+`RankCrashKillWatchdog` escalates fatal executor errors; the disabled AlltoAll watchdog
+only detects completion-flag failures. Kernel timeouts remain active. Slurm's installed
+PMIx error handler kills the step independently of `--kill-on-bad-exit=0`.
+A two-task control survived peer death without MPI, but died with MPI/PMIx.
+TRT-LLM crash and session-shutdown paths also invoke MPI abort. No model run showed
+automatic restart, membership agreement or shrink. A SIGKILL victim cannot acknowledge.
+Client triggers do not prove GPU quiescence. Historical Ray CUDA probes passed on
+31 peers after kills; after the fence fault, 31 failed and one was missing.
 
-`--kill-on-bad-exit=0` did not preserve the MPI step. An isolated two-task control
-confirmed the surviving task completed without MPI, but was terminated with MPI/PMIx.
-This establishes behavior of the tested launcher stack, not every MPI implementation.
-All three cases released GPU compute contexts; independent host scans found no
-processes from the failed phases. Restarts used 32 new process identities on the same
-hostname/GPU UUID mapping. One streaming attempt stopped on a probe self-counting bug;
-it was diagnosed and retained, not counted as a complete pass. GPU memory returned
-to 0 MiB after both phases of the completed streaming and fence pairs. These are
-single characterization passes, not repeated qualification.
+Cleanup verifies no owned steps/processes or GPU compute processes remain and memory
+returns within 64 MiB per GPU of baseline. Explicit same-GPU restart follows healthy
+startup: new processes/CUDA contexts → weight loading and communication setup
+→ both warmup/capture passes → inference readiness. Communicators, KV and graph
+executables are new; weights reload, warmup and capture rerun. Static EPLB creates
+no shared host expert-weight segments. Healthy shutdown exits 0 and releases resources,
+but logs UCX disconnect errors; those diagnostics are retained.
 
-**Startup/restart:** workers → weight loading/communication → warmup/capture →
-healthy inference. Explicit restart follows the same construction path: new CUDA
-contexts, communicators, KV and graph executables; weights reload and both warmup/
-capture passes rerun. No automatic restart, communicator shrink, survivor agreement
-or graph reuse occurred. A SIGKILL victim cannot acknowledge its death.
+Five consecutive frozen-source batches passed each of the four scenarios: 20 pairs,
+40 fresh launches; CPU checks passed 68 tests with three opt-in physical skips.
+Readiness measures model-step launch through two greedy, fixed-seed results on one
+parent monotonic clock, including imports/container startup. Seconds across all runs:
 
-MPI initial / clean-restart readiness: 185.5 / 156.9 s; online EPLB also passed (311.3 s).
-Rank-0 phase seconds for the idle-kill deployment / its explicit restart:
-
-| Marker | Initial | Restart |
+| Interval | Initial | Restart |
 |---|---:|---:|
-| Model loading | 69.0 | 58.2 |
-| Initial/final warmup | 87.8 / 7.5 | 86.7 / 6.7 |
-| Initial/final graph capture | 1.92 / 1.98 | 2.01 / 2.00 |
+| Readiness | 197.0 to 284.9 | 197.3 to 255.8 |
+| Model loading, per rank | 46.9 to 125.6 | 46.9 to 90.9 |
+| Initial-engine warmup | 86.1 to 88.3 | 86.1 to 89.7 |
+| Final-engine warmup | 6.3 to 9.2 | 6.3 to 10.0 |
+| Initial-engine graph capture | 1.80 to 2.09 | 1.78 to 2.09 |
+| Final-engine graph capture | 1.80 to 2.71 | 1.83 to 2.04 |
 
-Readiness here measures LLM construction through two greedy, fixed-seed inference
-checks; it excludes imports, container startup and allocation queue time (4 s
-for the healthy MPI job, from Slurm). It uses one client monotonic clock. Phase timers are rank-local and overlap; capture is
-included in warmup. Communicator init has no separate timer. Filesystem/compiler
-caches were uncontrolled; the checks are not an exact-token correctness reference.
+Native intervals overlap; capture is inside warmup. Communicator init is untimed.
+Allocation queue time was 13 to 2691 s, reported separately. Caches are uncontrolled;
+autotuning was off. This measures process startup, not cold caches or degraded correctness.
+SIGKILL trigger-to-step-exit took at most 40.9 s; fence client error took at most 292.3 s.
+Retained bounds/maxima/margins in seconds: startup 720/284.9/435.1, fence client
+420/292.3/127.7, error-to-step-exit 180/48.7/131.3, normal cleanup 60/4.8/55.2.
+Kill clients that reported errors took at most 0.113 s within their 30 s bound.
+Without an error receipt, the parent enforces the joint 210 s post-readiness deadline.
 
-**Historical Ray runs:** `764bde9d6d` included branch fatal-error propagation and
-actor-death monitoring. Kill between requests / after streamed output delivered
-`EngineDeadError` in 0.164 / 0.156 s. Local WORLD destruction reached the rank-crash
-watchdog, peer Gloo failure and `EngineDeadError` (10.3 s). Fence +2 reached kernel
-completion-flag timeouts, CUDA failure and `EngineDeadError` (291.5 s).
-All required explicit fresh restart. CUDA probes passed on 31 peers after kills;
-after the fence fault, 31 failed and one was missing. This did not prove safe drain.
+Targets 16/17 own sole expert copies and must fail closed under this placement.
+Configured expert coverage remains complete after loss of non-root ranks
+1, 2, 29, 30 or 31 across all 58 MoE layers; resident-weight/capacity admission is unqualified.
+Installed HPC-X supports ULFM, disabled by default. A local CPU kill/shrink/agreement/
+all-reduce control passed with component warnings. Next, qualify multi-node launch
+and survivor collectives using [supported ULFM components and launch](https://github.com/open-mpi/ompi/blob/v5.0.x/docs/features/ulfm.rst)
+with `mpirun --with-ft ulfm` inside Slurm; direct `srun` is unsupported. Then address
+TRT-LLM fixed-world broadcasts/ADP collectives and kernel escape/memory safety.
+Local ULFM success does not prove WideEP recovery, healthy survivor contexts or graph reuse.
+CFT drain, late-write safety and physical device/link loss remain unqualified.
 
-Raw evidence is uncommitted under `.wideep-ft-runs/mpi-characterization/`
-(jobs `7759972`, `7760555`, `7760788`, `7760904`, `7761065`) and
-`.wideep-ft-runs/lean-characterization/physical-{7738662,7739144,7740233}/`.
-MPI packaging is in progress; the committed runner still uses Ray. No physical
-link/device loss or survivor-preserving transfer recovery has been qualified.
+Earlier failures and before/after tests are retained; final-source interruption cleanup
+passed in 26.5 s. Final batches: `7764417`, `7764675`,
+`7765082`, `7765083`, `7765084`; no hidden retries. Raw attempts stay uncommitted under
+`.wideep-ft-runs/mpi-characterization/`; historical Ray evidence is under
+`.wideep-ft-runs/lean-characterization/`. See [README.md](README.md) to run.

@@ -1,29 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Test-only worker faults and independent resource observations."""
+"""Test-only worker faults and independent CPU resource observations."""
 
 import json
 import os
-import shutil
+import re
 import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+    from tensorrt_llm.executor.base_worker import BaseWorker
 
 IDENTITY_KEYS = ("rank", "hostname", "pid", "start_ticks", "boot_id", "uid", "pid_namespace")
 RUN_ID_ENV = "WIDEEP_FT_RUN_ID"
 IDENTITY_DIR_ENV = "WIDEEP_FT_IDENTITY_DIR"
-SCENARIOS = (
-    "worker_sigkill_idle",
-    "worker_sigkill_streaming",
-    "process_group_destroy",
-    "fence_round_mismatch",
-)
+SCENARIOS = ("worker_sigkill_idle", "worker_sigkill_streaming", "fence_round_mismatch")
 
 
 def process_identity(pid: int) -> dict:
+    """Read process identity in the caller's PID and UID namespaces."""
     process = Path("/proc") / str(pid)
     fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
     return {
@@ -68,23 +71,14 @@ def record(directory: Path, name: str, value: dict) -> None:
         temporary.unlink()
 
 
-def record_worker_identity() -> None:
-    """Record immutable process identity before Ray constructs the GPU worker."""
-    identity = process_identity(os.getpid())
-    record(
-        Path(os.environ[IDENTITY_DIR_ENV]) / "startup_identities" / identity["hostname"],
-        f"{identity['pid']}-{identity['start_ticks']}",
-        {**identity, "run_id": os.environ[RUN_ID_ENV], "job_id": os.environ["RAY_JOB_ID"]},
-    )
-
-
 def validate_injection(expected: dict, actual: dict, scenario: str, trigger: dict) -> None:
+    """Reject stale identity, root targets, and triggers from another run or boundary."""
     if scenario not in SCENARIOS or type(actual.get("rank")) is not int or actual["rank"] <= 0:
         raise ValueError("Unsupported scenario or target rank")
-    if any(expected.get(key) is None or expected[key] != actual.get(key) for key in IDENTITY_KEYS):
+    if any(
+        expected.get(key) is None or expected[key] != actual.get(key) for key in IDENTITY_KEYS
+    ) or (expected.get("gpu_uuid") != actual.get("gpu_uuid")):
         raise ValueError("Target identity changed or incomplete")
-    if expected.get("actor_id") is not None and expected["actor_id"] != actual.get("actor_id"):
-        raise ValueError("Target actor identity changed")
     if trigger.get("run_id") != expected.get("run_id") or not expected.get("run_id"):
         raise ValueError("Trigger belongs to another run")
     if scenario == "worker_sigkill_streaming":
@@ -98,210 +92,226 @@ def validate_injection(expected: dict, actual: dict, scenario: str, trigger: dic
         raise ValueError("Idle trigger requires completed healthy requests")
 
 
-class WorkerExtension:
-    def fault_identity(self) -> dict:
-        import ray
-        import torch
+def _nvlink_communication(worker: "BaseWorker") -> "NVLinkOneSided":
+    from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 
-        runner = self.engine.model_engine.cuda_graph_runner
-        communication = {}
-        for module in self.engine.model_engine.model.modules():
-            comm = getattr(module, "comm", None)
-            if comm is not None and hasattr(comm, "ep_size"):
-                communication[type(comm).__name__] = {
-                    "ep_size": comm.ep_size,
-                    "ep_rank": comm.ep_rank,
-                    "cft_capable": getattr(comm, "can_use_cft_counted_writes", None),
-                }
-        return {
-            **process_identity(os.getpid()),
-            "rank": self.rank,
-            "actor_id": str(ray.get_runtime_context().get_actor_id()),
-            "gpu_uuid": "GPU-"
-            + str(torch.cuda.get_device_properties(self.device_id).uuid).removeprefix("GPU-"),
-            "graphs_enabled": runner.enabled,
-            "graph_keys": [str(key) for key in runner.graphs],
-            "startup_metrics": self.get_startup_metrics(),
-            "communication": communication,
-            "resolved_config": self.llm_args.model_dump(
-                mode="json", exclude={"ray_placement_config"}
-            )
-            if self.rank == 0
-            else None,
+    for module in worker.engine.model_engine.model.modules():
+        comm = getattr(module, "comm", None)
+        if isinstance(comm, NVLinkOneSided):
+            return comm
+    raise ValueError("This profile requires NVLinkOneSided communication")
+
+
+def worker_identity(worker: "BaseWorker") -> dict:
+    """Record native worker placement, captured graphs, and the faulted communicator."""
+    import torch
+
+    runner = worker.engine.model_engine.cuda_graph_runner
+    comm = _nvlink_communication(worker)
+    communication = {
+        "NVLinkOneSided": {
+            "ep_size": comm.ep_size,
+            "ep_rank": comm.ep_rank,
+            "cft_capable": comm.can_use_cft_counted_writes,
         }
-
-    def inject_fault(self, expected: dict, directory: str, scenario: str) -> dict:
-        path = Path(directory)
-        trigger = json.loads((path / "trigger.json").read_text())
-        actual = self.fault_identity()
-        validate_injection(expected, actual, scenario, trigger)
-        record(
-            path, "injection_intent", {"scenario": scenario, "target": actual, "trigger": trigger}
-        )
-        if scenario.startswith("worker_sigkill_"):
-            os.kill(os.getpid(), signal.SIGKILL)
-        if scenario == "process_group_destroy":
-            import torch
-
-            group = torch.distributed.group.WORLD
-            backend = group._get_backend(torch.device("cpu"))
-            result = {
-                "group": "WORLD",
-                "backend": type(backend).__name__,
-                "group_size": group.size(),
-                "tp_group_is_world": group is self.engine.dist.mapping.tp_group_pg,
-            }
-            torch.distributed.destroy_process_group(group)
-        else:
-            import torch
-
-            from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-                NVLinkOneSided,
-            )
-
-            comm = next(
-                (
-                    module.comm
-                    for module in self.engine.model_engine.model.modules()
-                    if isinstance(getattr(module, "comm", None), NVLinkOneSided)
-                ),
-                None,
-            )
-            if comm is None or comm.can_use_cft_counted_writes:
-                raise ValueError("Fence fault requires a non-CFT NVLinkOneSided workspace")
-            offset = int(comm.moe_a2a_metainfo[comm.FLAG_VAL_OFFSET_INDEX].item())
-            flag = comm.workspace[comm.ep_rank, offset : offset + 4].view(torch.int32)
-            with torch.cuda.stream(self.engine.execution_stream):
-                before = flag.item()
-                flag.add_(2)
-                self.engine.execution_stream.synchronize()
-                result = {
-                    "before": before,
-                    "after": flag.item(),
-                    "offset": offset,
-                    "workspace_address": comm.workspace.data_ptr(),
-                }
-        record(path, "injection_result", {"scenario": scenario, **result})
-        return result
-
-    def fault_cuda_probe(self) -> dict:
-        import torch
-
-        return {
-            "rank": self.rank,
-            "value": torch.ones(1, device=f"cuda:{self.device_id}").sum().item(),
-        }
+    }
+    return {
+        **process_identity(os.getpid()),
+        "rank": worker.rank,
+        "run_id": os.environ[RUN_ID_ENV],
+        "gpu_uuid": "GPU-"
+        + str(torch.cuda.get_device_properties(comm.workspace.device).uuid).removeprefix("GPU-"),
+        "graphs_enabled": runner.enabled,
+        "graph_keys": [str(key) for key in runner.graphs],
+        "communication": communication,
+        "startup_metrics": worker.get_startup_metrics(),
+        "resolved_config": worker.llm_args.model_dump(mode="json") if worker.rank == 0 else None,
+    }
 
 
-class NodeProbe:
-    """CPU-only accounting; never opens a CUDA context or kills unowned processes."""
+def inject_fault(worker: "BaseWorker", expected: dict, directory: Path, scenario: str) -> None:
+    """Revalidate this worker and durably record intent before issuing one action."""
+    trigger = json.loads((directory / "trigger.json").read_text())
+    actual = worker_identity(worker)
+    validate_injection(expected, actual, scenario, trigger)
+    record(
+        directory, "injection_intent", {"scenario": scenario, "target": actual, "trigger": trigger}
+    )
+    if scenario.startswith("worker_sigkill_"):
+        os.kill(os.getpid(), signal.SIGKILL)
+        raise AssertionError("SIGKILL returned")
 
-    def pin_actor_processes(self, actors: dict, directory: str) -> list[dict]:
-        import ray
+    import torch
 
-        node_id = ray.get_runtime_context().get_node_id()
-        path = Path(directory)
-        job = json.loads((path / "job.json").read_text())
-        identities = []
-        for actor_id, actor in actors.items():
-            if actor["Address"]["NodeID"] != node_id or actor["Pid"] <= 0:
-                continue
+    comm = _nvlink_communication(worker)
+    if comm.can_use_cft_counted_writes:
+        raise ValueError("Fence fault requires a non-CFT NVLinkOneSided workspace")
+    with torch.cuda.stream(worker.engine.execution_stream):
+        offset = int(comm.moe_a2a_metainfo[comm.FLAG_VAL_OFFSET_INDEX].item())
+        flag = comm.workspace[comm.ep_rank, offset : offset + 4].view(torch.int32)
+        before = flag.item()
+        flag.add_(2)
+        worker.engine.execution_stream.synchronize()
+        after = flag.item()
+    if after != before + 2:
+        raise ValueError("Fence counter mutation was not verified")
+    record(
+        directory,
+        "injection_result",
+        {
+            "scenario": scenario,
+            "before": before,
+            "after": after,
+            "offset": offset,
+            "workspace_address": comm.workspace.data_ptr(),
+        },
+    )
+
+
+def install_worker_hook() -> None:
+    """Instrument native MGMN worker startup and the single selected fault target."""
+    from tensorrt_llm.executor.base_worker import BaseWorker
+
+    original = BaseWorker.setup_engine
+
+    def setup_engine(worker: BaseWorker) -> None:
+        original(worker)
+        directory = Path(os.environ[IDENTITY_DIR_ENV])
+        identity = worker_identity(worker)
+        record(directory / "workers", str(worker.rank), identity)
+        if worker.rank != int(os.environ["WIDEEP_FT_TARGET_RANK"]):
+            return
+
+        def watch_fault() -> None:
+            command = directory / "fault_request.json"
+            while not command.exists():
+                time.sleep(0.05)
             try:
-                identity = process_identity(actor["Pid"])
-                evidence = json.loads(
-                    (
-                        path
-                        / "startup_identities"
-                        / identity["hostname"]
-                        / f"{identity['pid']}-{identity['start_ticks']}.json"
-                    ).read_text()
-                )
+                payload = json.loads(command.read_text())
+                inject_fault(worker, payload["target"], directory, payload["scenario"])
+            except (ValueError, KeyError, OSError, RuntimeError) as error:
+                record(directory, "injection_failed", {"error": repr(error)})
+
+        threading.Thread(target=watch_fault, daemon=True, name="fault_injection").start()
+
+    BaseWorker.setup_engine = setup_engine
+
+
+def _slurm_job_id(process: Path) -> str | None:
+    jobs = set(
+        re.findall(r"/slurmstepd\.scope/job_(\d+)(?:/|$)", (process / "cgroup").read_text().strip())
+    )
+    return next(iter(jobs)) if len(jobs) == 1 else None
+
+
+def owned_processes(run_id: str, known: Sequence[dict] = ()) -> list[dict]:
+    """Find this run's processes in the observer's PID namespace, including partial startup."""
+    marker = f"{RUN_ID_ENV}={run_id}".encode()
+    pinned = {row["pid"]: row for row in known if row["hostname"] == socket.gethostname()}
+    found = []
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit() or process.name == str(os.getpid()):
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            if expected := pinned.get(int(process.name)):
+                actual = process_identity(int(process.name))
+                if all(
+                    actual[key] == expected[key]
+                    for key in ("start_ticks", "boot_id", "uid", "pid_namespace")
+                ):
+                    found.append(actual)
+                    continue
+            try:
+                environment = (process / "environ").read_bytes()
+            except PermissionError as error:
+                # Nondumpable Slurm step daemons are accounted for through step lifecycle checks.
+                comm = (process / "comm").read_text().strip()
+                if comm == "slurmstepd" and re.fullmatch(
+                    rb"slurmstepd: \[\d+\.(?:batch|extern|\d+)\]\x00*",
+                    (process / "cmdline").read_bytes(),
+                ):
+                    continue
                 if (
-                    evidence["run_id"] != job["run_id"]
-                    or evidence["job_id"] != job["job_id"]
-                    or any(
-                        evidence[key] != identity[key]
-                        for key in ("hostname", "pid", "start_ticks", "boot_id", "uid")
+                    comm in ("systemd", "(sd-pam)")
+                    and (process / "cgroup").read_text().strip()
+                    == f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/init.scope"
+                    and (
+                        (
+                            comm == "systemd"
+                            and (process / "cmdline").read_bytes()
+                            in (
+                                b"/usr/lib/systemd/systemd\0--user\0",
+                                b"/lib/systemd/systemd\0--user\0",
+                            )
+                        )
+                        or (
+                            comm == "(sd-pam)"
+                            and re.fullmatch(
+                                rb"\(sd-pam\)\x00*", (process / "cmdline").read_bytes()
+                            )
+                        )
                     )
                 ):
                     continue
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            if identity["uid"] != os.getuid():
-                raise ValueError("Owned Ray actor process has an unexpected UID")
-            identities.append({**identity, "actor_id": actor_id, "run_id": job["run_id"]})
-        return identities
+                if job_id := os.environ.get("SLURM_JOB_ID"):
+                    observer_job = _slurm_job_id(Path("/proc") / str(os.getpid()))
+                    process_job = _slurm_job_id(process)
+                    if observer_job == job_id and process_job is not None and process_job != job_id:
+                        continue
+                raise PermissionError(
+                    f"Unreadable process {process.name}: comm={comm!r}, "
+                    f"cgroup={(process / 'cgroup').read_text()!r}, "
+                    f"command={(process / 'cmdline').read_bytes() if comm in ('systemd', '(sd-pam)') else None!r}"
+                ) from error
+            if marker in environment.split(b"\0"):
+                found.append(process_identity(int(process.name)))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return found
 
-    def read_run_id(self, directory: str) -> str:
-        return json.loads((Path(directory) / "run.json").read_text())["run_id"]
 
-    def terminate_owned_processes(self, identities: list[dict]) -> list[int]:
-        terminated = []
-        for expected in identities:
-            if expected["hostname"] != socket.gethostname() or expected["pid"] == os.getpid():
-                continue
+def snapshot(run_id: str, terminate: bool = False, known: Sequence[dict] = ()) -> dict:
+    """Never opens CUDA; forced cleanup signals only freshly verified, owned run processes."""
+    if terminate:
+        for expected in owned_processes(run_id, known):
             descriptor = None
             try:
                 descriptor = os.pidfd_open(expected["pid"])
                 actual = process_identity(expected["pid"])
-                if actual["uid"] != os.getuid() or any(
-                    actual[key] != expected[key] for key in ("start_ticks", "boot_id", "uid")
+                if all(
+                    actual[key] == expected[key]
+                    for key in ("start_ticks", "boot_id", "uid", "pid_namespace")
                 ):
-                    continue
-                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-                terminated.append(expected["pid"])
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
             except (FileNotFoundError, ProcessLookupError):
                 continue
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-        return terminated
 
-    def collect_logs(self, directory: str, job_id: str) -> list[str]:
-        from ray._private.worker import global_worker
+    def query(fields: str, kind: str) -> list[list[str]]:
+        output = subprocess.run(
+            ["nvidia-smi", f"--query-{kind}={fields}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+        return [[field.strip() for field in line.split(",")] for line in output.splitlines()]
 
-        logs = Path(global_worker.node.get_logs_dir_path())
-        destination = Path(directory) / "ray_logs" / socket.gethostname()
-        destination.mkdir(parents=True, exist_ok=True)
-        copied = []
-        for path in logs.glob(f"worker-*-{job_id}-*.*"):
-            if path.suffix in (".out", ".err") and path.is_file():
-                shutil.copy2(path, destination / path.name)
-                copied.append(path.name)
-        return copied
-
-    def snapshot(self, identities: list[dict]) -> dict:
-        def query(fields: str, kind: str) -> list[list[str]]:
-            output = subprocess.run(
-                ["nvidia-smi", f"--query-{kind}={fields}", "--format=csv,noheader,nounits"],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=10,
-            ).stdout
-            return [[field.strip() for field in line.split(",")] for line in output.splitlines()]
-
-        gpus = query("uuid,memory.used,driver_version,name", "gpu")
-        apps = query("gpu_uuid,pid,used_gpu_memory", "compute-apps")
-        live = []
-        for expected in identities:
-            if expected["hostname"] != socket.gethostname():
-                continue
-            try:
-                actual = process_identity(expected["pid"])
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            if all(actual[key] == expected[key] for key in ("start_ticks", "boot_id", "uid")):
-                live.append(actual)
-        return {
-            "hostname": socket.gethostname(),
-            "gpus": gpus,
-            "compute_apps": apps,
-            "live_processes": live,
-        }
+    return {
+        "run_id": run_id,
+        "hostname": socket.gethostname(),
+        "gpus": query("uuid,memory.used,driver_version,name", "gpu"),
+        "compute_apps": query("gpu_uuid,pid,used_gpu_memory", "compute-apps"),
+        "live_processes": owned_processes(run_id, known),
+    }
 
 
 def resources_released(baseline: list[dict], current: list[dict], tolerance_mib: int = 64) -> bool:
+    """Require complete host/GPU observations, no owned processes, and bounded memory delta."""
     if not baseline or len(baseline) != len(current):
         return False
     before = {row["hostname"]: row for row in baseline}
