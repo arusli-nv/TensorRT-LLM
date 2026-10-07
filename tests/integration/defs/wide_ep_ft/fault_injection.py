@@ -15,6 +15,7 @@ import subprocess
 import time
 import traceback
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from types import FrameType
 
@@ -513,17 +514,23 @@ def run_phase(
             wait_for_cleanup(time.monotonic() + args.cleanup_timeout_s)
             validate_fault_evidence(directory, scenario, workers)
         except (Exception, KeyboardInterrupt) as error:
-            record(directory, "intervention", {"error": repr(error), "forced_cleanup": True})
+            # Evidence storage may be the failure cause; cleanup must still run.
+            with suppress(OSError):
+                record(directory, "intervention", {"error": repr(error), "forced_cleanup": True})
             cleanup_deadline = time.monotonic() + args.cleanup_timeout_s
             try:
                 _stop(process, name, min(cleanup_deadline, time.monotonic() + 20))
             except Exception as control_error:
-                record(directory, "cleanup_control_error", {"error": repr(control_error)})
+                with suppress(OSError):
+                    record(directory, "cleanup_control_error", {"error": repr(control_error)})
             try:
                 observe(terminate=True, deadline=cleanup_deadline)
                 wait_for_cleanup(cleanup_deadline, forced=True)
             except Exception as cleanup_error:
-                record(directory, "cleanup_failed", {"error": repr(cleanup_error)})
+                with suppress(OSError):
+                    record(directory, "cleanup_failed", {"error": repr(cleanup_error)})
+                with suppress(OSError, subprocess.SubprocessError):
+                    _stop(process, name, cleanup_deadline)
             raise
         finally:
             record(

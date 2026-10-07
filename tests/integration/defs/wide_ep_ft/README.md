@@ -53,6 +53,8 @@ and identities retained from live host probes, including unreaped zombies.
 Unknown unreadable same-UID processes fail preflight; identified host daemons and
 positively foreign Slurm jobs are excluded. Forced cleanup records its final step
 and resource proof. Intervention remains a failure even if cleanup succeeds.
+Failed evidence writes do not block cancellation. Unavailable probe storage prevents
+resource verification; the test retries owned-step cancellation and remains failed.
 Static cyclic placement supports DeepSeek-V3 and Qwen3 MoE; other layouts require
 native `initial_global_assignments`. Every worker must report the requested EP
 geometry, non-CFT NVLinkOneSided, and captured graphs when requested.

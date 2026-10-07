@@ -266,7 +266,18 @@ def owned_processes(run_id: str, known: Sequence[dict] = ()) -> list[dict]:
                     f"command={(process / 'cmdline').read_bytes() if comm in ('systemd', '(sd-pam)') else None!r}"
                 ) from error
             if marker in environment.split(b"\0"):
-                found.append(process_identity(int(process.name)))
+                actual = process_identity(int(process.name))
+                environment = (process / "environ").read_bytes()
+                verified = process_identity(int(process.name))
+                if (
+                    actual["uid"] == os.getuid()
+                    and marker in environment.split(b"\0")
+                    and all(
+                        actual[key] == verified[key]
+                        for key in ("start_ticks", "boot_id", "uid", "pid_namespace")
+                    )
+                ):
+                    found.append(actual)
         except (FileNotFoundError, ProcessLookupError):
             continue
     return found

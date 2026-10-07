@@ -338,6 +338,26 @@ def test_pid_reuse_prevents_cleanup_signal(monkeypatch: pytest.MonkeyPatch, reus
         send.assert_called_once_with(10, signal.SIGKILL)
 
 
+@pytest.mark.parametrize("change", [None, "environment", "identity"])
+def test_cleanup_ownership_survives_process_discovery_races(
+    monkeypatch: pytest.MonkeyPatch, change: str | None
+) -> None:
+    """Can an old environment marker authorize cleanup of a replacement PID?"""
+    expected = {**identity(), "pid": os.getpid() + 1}
+    marker = b"WIDEEP_FT_RUN_ID=run-a\0"
+    environments = Mock(side_effect=[marker, b"" if change == "environment" else marker])
+    identities = Mock(
+        side_effect=[expected, {**expected, "start_ticks": 0} if change == "identity" else expected]
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "iterdir", lambda _: [Path("/proc") / str(expected["pid"])])
+        patch.setattr(Path, "stat", lambda _: argparse.Namespace(st_uid=os.getuid()))
+        patch.setattr(Path, "read_bytes", environments)
+        patch.setattr(fault_injector, "process_identity", identities)
+        found = fault_injector.owned_processes("run-a")
+    assert found == ([] if change else [expected])
+
+
 def test_fence_failure_requires_native_timeout_and_client_error(tmp_path: Path) -> None:
     """Can a generic error or client timeout falsely qualify a fence fault?"""
     worker = identity()
@@ -368,10 +388,13 @@ def test_steps_are_filtered_by_owned_name(monkeypatch: pytest.MonkeyPatch) -> No
     assert fault_injection._steps("owned") == ["123.1"]
 
 
+@pytest.mark.parametrize(
+    "failed_record", [None, "intervention", "cleanup_control_error", "probe_storage"]
+)
 def test_forced_cleanup_never_turns_failure_into_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_record: str | None
 ) -> None:
-    """Does a failed launch remain failed after the cleanup backstop succeeds?"""
+    """Does cleanup run and preserve failure even when evidence writes fail?"""
     monkeypatch.setenv("SLURM_JOB_ID", "123")
     args = argparse.Namespace(
         output_dir=tmp_path,
@@ -388,12 +411,34 @@ def test_forced_cleanup_never_turns_failure_into_pass(
     )
     process = Mock()
     process.poll.return_value = 1
+    stop = Mock(side_effect=subprocess.CalledProcessError(1, "scontrol") if failed_record else None)
+    probe = Mock(
+        return_value=[snapshot()],
+        side_effect=OSError("probe storage unavailable")
+        if failed_record == "probe_storage"
+        else None,
+    )
+
+    def write(directory: Path, name: str, value: dict) -> None:
+        if name == failed_record:
+            raise OSError("evidence filesystem unavailable")
+        record(directory, name, value)
+
+    monkeypatch.setattr(fault_injection, "record", write)
     monkeypatch.setattr(fault_injection.subprocess, "Popen", lambda *_, **__: process)
-    monkeypatch.setattr(fault_injection, "_stop", Mock())
-    monkeypatch.setattr(fault_injection, "_probe", lambda *_, **__: [snapshot()])
+    monkeypatch.setattr(fault_injection, "_stop", stop)
+    monkeypatch.setattr(fault_injection, "_probe", probe)
+    monkeypatch.setattr(fault_injection, "_steps", lambda *_, **__: [])
     with pytest.raises(AssertionError, match="healthy readiness"):
         fault_injection.run_phase(args, [snapshot()], "initial", "worker_sigkill_idle")
-    assert (tmp_path / "initial" / "intervention.json").exists()
+    assert any(call.args[3] for call in probe.call_args_list)
+    if failed_record == "probe_storage":
+        assert stop.call_count == 2
+        assert (tmp_path / "initial" / "cleanup_failed.json").exists()
+        assert not (tmp_path / "initial" / "forced_cleanup.json").exists()
+    else:
+        stop.assert_called_once()
+        assert (tmp_path / "initial" / "forced_cleanup.json").exists()
     assert not (tmp_path / "summary.json").exists()
 
 

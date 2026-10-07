@@ -83,6 +83,8 @@ See [ULFM's supported launch/components](https://github.com/open-mpi/ompi/blob/v
 Next, review the survivor-control and fence-abort contracts before implementing recovery.
 CFT drain, late-write safety and physical device/link loss remain unqualified.
 
+Physical batches qualified the harness at `0420dc9213`. Later cleanup hardening passed
+74 CPU checks; three physical tests skipped, GPU rerun pending.
 Earlier failures and before/after tests are retained; final-source interruption cleanup
 passed in 26.5 s. Final batches: `7764417`, `7764675`,
 `7765082`, `7765083`, `7765084`; CPU ULFM pilot `7767258`, qualification `7767277`.
