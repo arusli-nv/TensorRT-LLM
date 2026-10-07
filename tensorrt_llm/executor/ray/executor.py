@@ -63,7 +63,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         super().__init__(model_world_size, postproc_worker_config,
                          is_llm_executor)
 
-        self._actor_event_subscriber = None
         self.has_start_local_cluser = False
         runtime_env = {
             "env_vars": {
@@ -121,10 +120,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 # inside a coroutine still has to create its workers here.
                 self.init_workers_sync()
                 self.setup_engine_remote()
-                self.setup_mainloop(tasks=[
-                    self._fetch_responses_loop_async,
-                    self._monitor_worker_deaths_async
-                ],
+                self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
                                     thread_name="ray_executor_main_loop")
 
         except Exception as e:
@@ -308,64 +304,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         # Now that engine is set up, start the mainloop for fetching responses
         if hasattr(self, '_mainloop_started') and not self._mainloop_started:
             logger.info("Starting mainloop after engine setup")
-            self.setup_mainloop(tasks=[
-                self._fetch_responses_loop_async,
-                self._monitor_worker_deaths_async
-            ],
+            self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
                                 thread_name="ray_executor_main_loop")
             self._mainloop_started = True
 
         return result
-
-    async def _monitor_worker_deaths_async(self) -> None:
-        """Fail pending requests on confirmed actor death independently of root RPC."""
-        subscriber = None
-        try:
-            from ray._private import state
-            from ray._private.gcs_pubsub import GcsAioActorSubscriber
-            from ray.core.generated.gcs_pb2 import ActorTableData
-
-            if self._shutdown_event.is_set():
-                return
-            context = ray.get_runtime_context()
-            subscriber = GcsAioActorSubscriber(address=context.gcs_address)
-            self._actor_event_subscriber = subscriber
-            owned = {
-                worker._ray_actor_id.binary(): rank
-                for rank, worker in enumerate(self.workers)
-            }
-            # Subscribe first so a death during snapshot retrieval is retained.
-            await subscriber.subscribe()
-            actors = await asyncio.to_thread(state.actors,
-                                             job_id=ray.JobID.from_hex(
-                                                 context.get_job_id()))
-            updates = [(bytes.fromhex(actor_id), info['State'] == 'DEAD')
-                       for actor_id, info in actors.items()]
-            while not self._shutdown_event.is_set(
-            ) and self._fatal_error is None:
-                for actor_id, dead in updates:
-                    if self._shutdown_event.is_set():
-                        return
-                    if dead and actor_id in owned:
-                        self._set_fatal_error(
-                            RuntimeError(
-                                f"Ray model worker rank {owned[actor_id]} "
-                                f"(actor {actor_id.hex()}) died"))
-                        return
-                updates = [(actor_id, info.state == ActorTableData.DEAD)
-                           for actor_id, info in await subscriber.poll(
-                               batch_size=len(owned))]
-                if not updates and not self._shutdown_event.is_set():
-                    raise RuntimeError(
-                        "Ray actor notification channel unavailable")
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001 - terminal actor notification boundary
-            if not self._shutdown_event.is_set():
-                self._set_fatal_error(error)
-        finally:
-            if subscriber is not None:
-                await subscriber.close()
 
     def report_device_ids(self) -> list[str]:
         gpu_ids = self.call_all_ray_workers("report_device_id",
@@ -394,16 +337,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
         if hasattr(self, 'main_loop') and self.main_loop and hasattr(
                 self, 'main_loop_task_obj') and self.main_loop_task_obj:
-            # Wake the actor subscription before cancelling its polling task.
-            # This lets Ray retire its outstanding long-poll and unsubscribe.
-            subscriber = self._actor_event_subscriber
-            if subscriber is not None and self.main_loop.is_running():
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        subscriber.close(), self.main_loop).result(timeout=6)
-                except (RuntimeError, TimeoutError) as error:
-                    logger.warning(
-                        f"Error closing Ray actor subscription: {error}")
             logger_debug("Cancelling main loop task.", color="yellow")
             try:
                 self.main_loop.call_soon_threadsafe(
