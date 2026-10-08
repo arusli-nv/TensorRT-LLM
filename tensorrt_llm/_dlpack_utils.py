@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,11 +75,23 @@ DLManagedTensor._fields_ = [
 ]
 
 
-# A no-op deleter that doesn't perform any operation
+_py_incref = ctypes.pythonapi["Py_IncRef"]
+_py_incref.argtypes = [ctypes.py_object]
+_py_incref.restype = None
+_py_decref = ctypes.pythonapi["Py_DecRef"]
+_py_decref.argtypes = [c_void_p]
+_py_decref.restype = None
+
+
+# GPU allocation ownership remains with the caller.
 @CFUNCTYPE(None, POINTER(DLManagedTensor))
-def no_op_deleter(dmt_ptr):
-    # You can also call cudaFree here if you want to free memory when the tensor's lifecycle ends
-    pass
+def _release_dlpack_metadata(dmt_ptr):
+    # ctypes enters this callback with the GIL held. Decref may free the
+    # descriptor, so clear its context before releasing the owner.
+    context = dmt_ptr.contents.manager_ctx
+    if context:
+        dmt_ptr.contents.manager_ctx = None
+        _py_decref(context)
 
 
 # Wrapper class to prevent Python garbage collection of DLPack-related objects
@@ -158,13 +170,11 @@ def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch
     dltensor.shape = ctypes.cast(shape_array, POINTER(c_int64))
     dltensor.strides = ctypes.cast(stride_array, POINTER(c_int64))
     dltensor.byte_offset = 0
-    # Construct DLManagedTensor and set deleter to no-op (you can also call cudaFree here)
+    # The allocation is borrowed; the deleter only releases consumer-owned metadata.
     managed_tensor = DLManagedTensor()
     managed_tensor.dl_tensor = dltensor
     managed_tensor.manager_ctx = None
-    managed_tensor.deleter = no_op_deleter
-    # Note: Must ensure that shape_array and managed_tensor are not garbage collected by Python,
-    # A simple way is to attach them to the capsule object.
+    managed_tensor.deleter = _release_dlpack_metadata
     # Call PyCapsule_New to create capsule
     PyCapsule_New = ctypes.pythonapi.PyCapsule_New
     PyCapsule_New.restype = c_void_p
@@ -175,7 +185,8 @@ def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch
     capsule_ptr = PyCapsule_New(managed_tensor_ptr, b"dltensor", None)
     # Convert capsule_ptr to Python object
     capsule = ctypes.cast(capsule_ptr, ctypes.py_object).value
-    # To prevent shape_array and managed_tensor from being collected, we attach them as attributes to the capsule
+    _py_decref(capsule_ptr)
+    # The wrapper keeps the capsule and ctypes metadata alive together.
     capsule_wrapper = CapsuleWrapper(capsule, shape_array, managed_tensor)
     return capsule_wrapper
 
@@ -206,5 +217,8 @@ def pack_strided_memory(
         ptr, segment_size, segment_stride, num_segments, dtype, dev_id
     )
     torch_tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
+    # The consumed storage owns metadata until its last alias is released.
+    _py_incref(capsule_wrapper)
+    capsule_wrapper._managed_tensor.manager_ctx = id(capsule_wrapper)
     torch_tensor._capsule_wrapper = capsule_wrapper
     return torch_tensor
