@@ -64,18 +64,28 @@ Graph capture totals 1.9 to 2.3 s per engine, inside warmup. Do not sum overlapp
 intervals. Process/import/communicator phases lack separate trustworthy markers.
 Earlier infrastructure failures remain FAIL. Their artifacts and calibrated test
 deadlines are retained; they are not included as passing qualification trials.
+After cleanup changes, `6f00fb52c7` passed one further trial per scenario, eight launches.
 
 ## What remains for recovery
 
-- Idle kill left 31 survivor contexts usable before abort. ULFM survivor collectives
-  and independent rank-0 control passed isolated tests; neither proves GPU drain/replay.
-- Resident copies cover every expert after losing ranks `[1,2,29,30,31]`. Coverage
-  alone is not capacity/safety admission.
-- Same-graph recovery needs non-trapping escape, proven quiescence, valid mappings,
-  replay-visible membership/generation, repaired host collectives and in-place EPLB.
-  Streaming also needs safe request/KV disposition. Rank-mask graphs are rejected.
-- The optional watchdog did not prevent CUDA719, which requires fresh contexts.
-  Live-peer combine escape passed isolated controls; dispatch/dead-issuer safety remains open.
+- Idle kill left 31 survivor contexts usable before abort. Isolated ULFM survivor
+  collectives and independent rank-0 control passed.
+- Resident copies cover all experts after losing ranks `[1,2,29,30,31]`. This does
+  not establish survivor capacity or transfer safety.
+- After an idle exporter kill, survivors retained and read its imported VMM allocation
+  on this platform. This does not prove outstanding writes have drained.
+- Test-only abort gates let three survivors finish their original graphs after a
+  verified kill, with output suppressed and CUDA contexts usable. The victim was
+  held before combine publication, so arbitrary in-flight writes remain untested.
+- A small captured dispatch → real CUTEDSL → combine chain escaped live-peer holds
+  with PDL off and on. Sticky failure blocked the next MoE call's writes/counter
+  updates. All workers stayed alive; reset after completion restored exact output
+  with the same graph. Device mask/generation updates selected an identical resident
+  replica in another live-peer control; captured host values could not do so.
+- Full recovery still needs non-trapping escape, proven quiescence, stable mappings,
+  replay-visible state, survivor host collectives, in-place EPLB and safe request/KV
+  disposition. Rank-mask graphs remain rejected. The optional watchdog did not
+  prevent CUDA719, which requires fresh contexts.
 
 The separate RPC propagation/socket-cleanup fixes do not prevent MPI abort. MPI KV
 compatibility, CFT and device/link loss remain unqualified. No recovery is implemented.
@@ -83,3 +93,6 @@ compatibility, CFT and device/link loss remain unqualified. No recovery is imple
 Run commands: [README.md](README.md). Raw attempts, including failures, stay outside
 Git under `.wideep-ft-runs/mpi-characterization/`: `prerequisite-proofs/evidence-index.json`
 and `mpi4py4-qualification/{qualification-summary,calibrated-bounds,evidence-index}.json`.
+Graph/backing controls and failed attempts are indexed in
+`.wideep-ft-runs/backend-safety/assessment.json`. The verified archive is
+`.wideep-ft-runs/backend-controls-20261007.tar.gz`; its manifest records source hashes.
