@@ -7948,8 +7948,11 @@ class PyExecutor:
 
     @nvtx_range("_update_requests")
     def _update_requests(self,
-                         sample_state: SampleState,
+                         sample_state: SampleState | None,
                          resource_manager: Optional[ResourceManager] = None):
+        if sample_state is None:
+            return
+
         try:
             self.sampler.update_requests(sample_state, resource_manager)
             self._accumulate_spec_dec_stats(sample_state)

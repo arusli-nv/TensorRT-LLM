@@ -125,6 +125,41 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     torch.testing.assert_close(outputs["logits"], logits if expected_gather else logits[2::3])
 
 
+def test_update_requests_skips_absent_sample_state() -> None:
+    executor = types.SimpleNamespace(
+        sampler=Mock(), _accumulate_spec_dec_stats=Mock(), _handle_errors=Mock()
+    )
+    executor.sampler.update_requests.side_effect = AttributeError(
+        "'NoneType' object has no attribute 'sampler_event'"
+    )
+
+    PyExecutor._update_requests(executor, None)
+
+    executor.sampler.update_requests.assert_not_called()
+    executor._accumulate_spec_dec_stats.assert_not_called()
+    executor._handle_errors.assert_not_called()
+
+
+@pytest.mark.parametrize("update_error", [None, RuntimeError("sampler update failed")])
+def test_update_requests_preserves_valid_state_contract(update_error: RuntimeError | None) -> None:
+    executor = types.SimpleNamespace(
+        sampler=Mock(), _accumulate_spec_dec_stats=Mock(), _handle_errors=Mock()
+    )
+    executor.sampler.update_requests.side_effect = update_error
+    sample_state = object()
+    resources = object()
+
+    PyExecutor._update_requests(executor, sample_state, resources)
+
+    executor.sampler.update_requests.assert_called_once_with(sample_state, resources)
+    if update_error is None:
+        executor._accumulate_spec_dec_stats.assert_called_once_with(sample_state)
+        executor._handle_errors.assert_not_called()
+    else:
+        executor._accumulate_spec_dec_stats.assert_not_called()
+        executor._handle_errors.assert_called_once_with(str(update_error))
+
+
 class _InflightRequestIds:
     def __init__(self):
         self.ids = set()

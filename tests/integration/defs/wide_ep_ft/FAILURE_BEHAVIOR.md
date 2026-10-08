@@ -99,6 +99,9 @@ After cleanup changes, `6f00fb52c7` passed one further trial per scenario, eight
 
 The separate RPC propagation/socket-cleanup fixes do not prevent MPI abort. MPI KV
 compatibility, CFT and device/link loss remain unqualified. No recovery is implemented.
+Request updates now skip absent sampling results after handled forward/sampling errors,
+avoiding a second sampler exception. The targeted regression fails before the fix;
+the existing executor test module passes all 151 cases afterward.
 
 Run commands: [README.md](README.md). Raw attempts, including failures, stay outside
 Git under `.wideep-ft-runs/mpi-characterization/`: `prerequisite-proofs/evidence-index.json`
