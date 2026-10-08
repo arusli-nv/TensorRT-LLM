@@ -722,8 +722,12 @@ def _register_fake():
         top_k: int,
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        use_cft_counted_writes: bool = False,
+        expert_id_payload_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        abort_state: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -754,8 +758,10 @@ def _register_fake():
         combine_payload_offset: int,
         payload_in_workspace: bool,
         use_low_precision: bool = False,
+        use_cft_counted_writes: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        abort_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
@@ -777,6 +783,7 @@ def _register_fake():
         metainfo: torch.Tensor,
         ep_rank: int,
         invalid_expert_id: int,
+        abort_state: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 

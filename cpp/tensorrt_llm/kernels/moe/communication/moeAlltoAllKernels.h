@@ -66,6 +66,25 @@ struct PayloadDescriptor
     int elements_per_token; // Number of elements per token (e.g., hidden_size, top_k)
 };
 
+// Stable local CUDA int32[2] state for fence execution in rank-mask mode.
+// Initialize both fields to zero and share this record across dispatch, sanitize,
+// and combine for the execution.
+// Cancellation is distinct from membership. Kernels preserve the first nonzero status;
+// the caller owns storage lifetime and must not reset or reuse it during execution.
+// Nonzero status invalidates execution outputs. Local completion alone does not permit
+// buffer or state reuse; the caller must establish peer quiescence first.
+struct MoeA2AAbortState
+{
+    static constexpr int32_t kHealthy = 0;
+    static constexpr int32_t kCancelled = 1;
+    static constexpr int32_t kFenceTimeout = 2;
+
+    int32_t requested;
+    int32_t status;
+};
+
+static_assert(sizeof(MoeA2AAbortState) == 2 * sizeof(int32_t));
+
 // Kernel pointers packed into a struct for device access
 // Dispatch kernel pointers - const source data
 struct DispatchKernelPointers
@@ -122,6 +141,8 @@ struct DispatchKernelPointers
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    MoeA2AAbortState* abort_state{nullptr};
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -152,6 +173,8 @@ struct CombineKernelPointers
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    MoeA2AAbortState* abort_state{nullptr};
 };
 
 // Dispatch phase parameters
@@ -224,6 +247,8 @@ struct MoeA2ADispatchParams
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    MoeA2AAbortState* abort_state{nullptr};
 
     // CUDA stream
     cudaStream_t stream;
@@ -315,6 +340,8 @@ struct MoeA2ACombineParams
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
+    MoeA2AAbortState* abort_state{nullptr};
+
     // CUDA stream
     cudaStream_t stream;
 };
@@ -332,7 +359,8 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 // recv_counters: [2, ep_size] (int32), number of valid tokens per source
 // invalid_id: value to fill for invalid tokens' expert ids
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
-    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
+    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream,
+    MoeA2AAbortState* abort_state = nullptr);
 
 } // namespace kernels::moe_comm
 

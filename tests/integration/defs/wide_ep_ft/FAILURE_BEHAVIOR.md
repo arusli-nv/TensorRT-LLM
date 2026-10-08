@@ -73,15 +73,25 @@ After cleanup changes, `6f00fb52c7` passed one further trial per scenario, eight
 - Resident copies cover all experts after losing ranks `[1,2,29,30,31]`. This does
   not establish survivor capacity or transfer safety.
 - After an idle exporter kill, survivors retained and read its imported VMM allocation
-  on this platform. This does not prove outstanding writes have drained.
+  on this platform. Killing an active writer left a partial publication. No further
+  writes were observed after confirmed process exit during an eight-second check;
+  this does not establish a drain guarantee or permission to reuse its targets.
 - Test-only abort gates let three survivors finish their original graphs after a
   verified kill, with output suppressed and CUDA contexts usable. The victim was
-  held before combine publication, so arbitrary in-flight writes remain untested.
-- A small captured dispatch → real CUTEDSL → combine chain escaped live-peer holds
-  with PDL off and on. Sticky failure blocked the next MoE call's writes/counter
-  updates. All workers stayed alive; reset after completion restored exact output
-  with the same graph. Device mask/generation updates selected an identical resident
-  replica in another live-peer control; captured host values could not do so.
+  held before combine publication; this does not cover arbitrary in-flight death.
+- An opt-in native fence abort escaped pending dispatch/combine waits with PDL off
+  and on, including zero-token calls. Sticky status blocked later preparation.
+  In an all-live EP32 model run, every original decode graph and auxiliary stream
+  completed after cancellation, CUDA stayed usable, and failed outputs were withheld
+  before sampling. Cleanup passed. Healthy answer checks passed, but greedy tokens
+  differed from historical runs. This proves cancellation, not recovery or exact parity.
+- Actual TRT-LLM host calls returned MPI peer-failure errors after a middle-rank kill.
+  Shrink and diagnostic handle replacement permitted survivor broadcasts/gathers.
+  Cached communicators, native world-derived groups and logical/compact rank indexing
+  still require integration; changing the global Python communicator alone is insufficient.
+- Small graph controls preserved sticky failure across two MoE calls and read device
+  mask/generation updates. Captured host values remained stale. Reset tests kept every
+  peer alive; they do not authorize reset after death.
 - Full recovery still needs non-trapping escape, proven quiescence, stable mappings,
   replay-visible state, survivor host collectives, in-place EPLB and safe request/KV
   disposition. Rank-mask graphs remain rejected. The optional watchdog did not
