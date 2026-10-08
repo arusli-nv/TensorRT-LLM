@@ -66,46 +66,34 @@ Earlier infrastructure failures remain FAIL. Their artifacts and calibrated test
 deadlines are retained; they are not included as passing qualification trials.
 After cleanup changes, `6f00fb52c7` passed one further trial per scenario, eight launches.
 
-## What remains for recovery
+## Progress toward recovery
 
-- Idle kill left 31 survivor contexts usable before abort. Isolated ULFM survivor
-  collectives and independent rank-0 control passed.
-- Resident copies cover all experts after losing ranks `[1,2,29,30,31]`. This does
-  not establish survivor capacity or transfer safety.
-- After an idle exporter kill, survivors retained and read its imported VMM allocation
-  on this platform. Killing an active writer left a partial publication. No further
-  writes were observed after confirmed process exit during an eight-second check;
-  this does not establish a drain guarantee or permission to reuse its targets.
-- Test-only abort gates let three survivors finish their original graphs after a
-  verified kill, with output suppressed and CUDA contexts usable. The victim was
-  held before combine publication; this does not cover arbitrary in-flight death.
-- An opt-in native fence abort escaped pending dispatch/combine waits with PDL off
-  and on, including zero-token calls. Sticky status blocked later preparation.
-  In an all-live EP32 model run, every original decode graph and auxiliary stream
-  completed after cancellation, CUDA stayed usable, and failed outputs were withheld
-  before sampling. Cleanup passed. Healthy answer checks passed, but greedy tokens
-  differed from historical runs. This proves cancellation, not recovery or exact parity.
-- Actual TRT-LLM host calls returned MPI peer-failure errors after a middle-rank kill.
-  Shrink and diagnostic handle replacement permitted survivor broadcasts/gathers.
-  Cached communicators, native world-derived groups and logical/compact rank indexing
-  still require integration; changing the global Python communicator alone is insufficient.
-- Small graph controls preserved sticky failure across two MoE calls and read device
-  mask/generation updates. Captured host values remained stale. Reset tests kept every
-  peer alive; they do not authorize reset after death.
-- Full recovery still needs non-trapping escape, proven quiescence, stable mappings,
-  replay-visible state, survivor host collectives, in-place EPLB and safe request/KV
-  disposition. Rank-mask graphs remain rejected. The optional watchdog did not
-  prevent CUDA719, which requires fresh contexts.
+No N−1 serving is implemented. The isolated controls establish the following.
 
-The separate RPC propagation/socket-cleanup fixes do not prevent MPI abort. MPI KV
-compatibility, CFT and device/link loss remain unqualified. No recovery is implemented.
-Request updates now skip absent sampling results after handled forward/sampling errors,
-avoiding a second sampler exception. The targeted regression fails before the fix;
-the existing executor test module passes all 151 cases afterward.
+| Area | Proven scope and remaining gap |
+|---|---|
+| Process survival | Idle kill left 31 usable contexts. Rank-0 control and ULFM survivor collectives passed; TRT-LLM still enforces fatal teardown. |
+| Fence escape | Native abort escaped dispatch/combine waits with zero-token calls and PDL on/off. Sticky status blocked later preparation. Each rank's interrupted EP32 replay and auxiliary streams completed with usable CUDA; failed outputs were withheld before sampling. All workers were alive. |
+| Detection | The AlltoAll watchdog triggered native abort. Pinned H2D cancellation progressed against a helper occupying every SM's resident thread slots. Production replay-time arming remains unfinished. |
+| Peer memory | Idle killed-exporter imports remained readable. Active-writer death left a partial publication, with no further stamp changes observed for about 7.7 seconds. No drain or safe-reuse guarantee. |
+| Buffer isolation | A four-GPU pipeline switched the same graph to a second bank and resident replicas while old-bank writes continued. Both PDL settings matched the reference exactly. One controlled transition, without process death or old-bank reuse. |
+| Resident experts | Ranks `[1,2,29,30,31]` preserve coverage; survivor HBM/token capacity and placement publication remain unqualified. |
+| Host communication | After real death, compact survivor votes and fixed logical token metadata passed. Zero-filled votes failed. The futures manager can leave futures pending while healthy tasks continue; proxy/lifecycle continuation needs integration. |
+
+Healthy native EP32 answer checks passed, but greedy tokens differed from historical
+runs. Exact parity and post-failure inference remain unqualified. Rank-mask serving
+graphs remain rejected; CUDA719 requires fresh contexts.
+
+To resume, integrate isolated or provably quiescent storage, a replay-visible
+descriptor, agreed generation installation, survivor host control, quiesced EPLB,
+and request/KV disposition. RPC propagation/socket-cleanup fixes do not prevent
+MPI abort. A separate fix skips absent sampling results after handled execution
+errors. MPI KV compatibility, CFT and device/link loss remain unqualified.
 
 Run commands: [README.md](README.md). Raw attempts, including failures, stay outside
 Git under `.wideep-ft-runs/mpi-characterization/`: `prerequisite-proofs/evidence-index.json`
 and `mpi4py4-qualification/{qualification-summary,calibrated-bounds,evidence-index}.json`.
 Graph/backing controls and failed attempts are indexed in
 `.wideep-ft-runs/backend-safety/assessment.json`. The verified archive is
-`.wideep-ft-runs/backend-controls-20261007.tar.gz`; its manifest records source hashes.
+`.wideep-ft-runs/backend-controls-followup-20261008.tar.gz`; every archived file
+matched its frozen source hash.
