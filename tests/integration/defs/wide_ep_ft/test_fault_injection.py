@@ -15,7 +15,13 @@ from unittest.mock import MagicMock, Mock
 import fault_injection
 import fault_injector
 import pytest
-from fault_injection import load_config, validate_fault_evidence, validate_restart, validate_workers
+from fault_injection import (
+    load_config,
+    restart_benchmark,
+    validate_fault_evidence,
+    validate_restart,
+    validate_workers,
+)
 from fault_injector import (
     IDENTITY_KEYS,
     SCENARIOS,
@@ -186,6 +192,7 @@ def snapshot() -> dict:
         {"gpus": [["GPU-a", "165", "580", "GB200"]]},
         {"gpus": [["GPU-other", "100", "580", "GB200"]]},
         {"hostname": "different-node"},
+        {"observation_scope": "worker_identities"},
     ],
 )
 def test_cleanup_requires_independent_resource_release(change: dict) -> None:
@@ -455,6 +462,8 @@ def test_wideep_fault_and_explicit_restart(scenario: str) -> None:
             str(Path(__file__).with_name("fault_injection.py")),
             "--launcher",
             os.environ["WIDEEP_FT_MPI_LAUNCHER"],
+            "--launcher-mode",
+            os.environ.get("WIDEEP_FT_MPI_LAUNCHER_MODE", "pmix"),
             "--probe-launcher",
             os.environ["WIDEEP_FT_PROBE_LAUNCHER"],
             "--model",
@@ -517,6 +526,7 @@ def test_unreadable_model_process_is_not_ignored(
 
     monkeypatch.setattr(Path, "read_bytes", read_bytes)
     monkeypatch.setattr(Path, "read_text", lambda _: "slurmstepd" if daemon else "python")
+    assert fault_injector.owned_processes("run-a", allow_unreadable=True) == []
     if daemon:
         assert fault_injector.owned_processes("run-a") == []
     else:
@@ -715,3 +725,88 @@ def test_cleanup_backstop_waits_for_owned_step_after_control_timeout(
     assert not (tmp_path / "initial" / "cleanup_failed.json").exists()
     proof = json.loads((tmp_path / "initial" / "forced_cleanup.json").read_text())
     assert proof["forced"] and proof["owned_steps"] == []
+
+
+def test_worker_identity_probe_does_not_inspect_environments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Can a read-only death witness stay independent of unrelated process environments?"""
+    worker = identity()
+    monkeypatch.setattr(Path, "read_bytes", Mock(side_effect=AssertionError("environment read")))
+    assert fault_injector.worker_processes([worker]) == [process_identity(os.getpid())]
+    monkeypatch.setattr(fault_injector, "process_identity", lambda _: {**worker, "start_ticks": 0})
+    assert fault_injector.worker_processes([worker]) == []
+    monkeypatch.setattr(fault_injector, "process_identity", Mock(side_effect=ProcessLookupError))
+    assert fault_injector.worker_processes([worker]) == []
+    monkeypatch.setattr(fault_injector, "process_identity", lambda _: {**worker, "uid": -1})
+    with pytest.raises(PermissionError):
+        fault_injector.worker_processes([worker])
+
+
+@pytest.mark.parametrize("missing", [None, "target_death", "client_error", "native_abort"])
+def test_ulfm_kill_requires_death_error_and_abort_evidence(
+    tmp_path: Path, missing: str | None
+) -> None:
+    """Can launcher exit alone qualify target death or bounded client failure under ULFM?"""
+    worker = identity()
+    record(tmp_path, "trigger", {"run_id": "run-a", "event": "between_requests"})
+    record(tmp_path, "injection_intent", {"scenario": "worker_sigkill_idle", "target": worker})
+    record(tmp_path, "target_death", {"target": worker, "alive": False})
+    record(tmp_path, "client_error", {"type": "RequestError", "message": "MPI_ERR_PROC_FAILED"})
+    (tmp_path / "launcher.log").write_text(
+        f"Rank{worker['rank']} MGMN worker node exit code: 137\n"
+        + ("" if missing == "native_abort" else "MPI_ABORT was invoked")
+    )
+    if missing in ("target_death", "client_error"):
+        (tmp_path / f"{missing}.json").unlink()
+    if missing:
+        with pytest.raises((AssertionError, FileNotFoundError)):
+            validate_fault_evidence(tmp_path, "worker_sigkill_idle", [worker], "ulfm")
+    else:
+        validate_fault_evidence(tmp_path, "worker_sigkill_idle", [worker], "ulfm")
+
+
+@pytest.mark.parametrize("scenario", ["healthy", "worker_sigkill_idle", "fence_round_mismatch"])
+@pytest.mark.parametrize("invalid", [None, "controller", "cleanup"])
+def test_restart_benchmark_uses_one_clock_and_verified_cleanup(
+    scenario: str, invalid: str | None
+) -> None:
+    """Does failure-to-response include cleanup and reject clocks or overlapping restarts?"""
+    initial = dict(
+        producer_host="node-a",
+        controller_pid=1,
+        clock_source="single parent CLOCK_MONOTONIC",
+        started_monotonic_s=1000,
+        seconds_to_received_event=dict(
+            first_result=10,
+            healthy=11,
+            injection_intent=12,
+            injection_result=12,
+            client_error=13,
+            step_exit=14,
+            cleanup=15,
+        ),
+    )
+    restarted = {**initial, "started_monotonic_s": 1016}
+    if invalid == "controller":
+        restarted["controller_pid"] = 2
+    elif invalid == "cleanup":
+        restarted["seconds_to_received_event"] = {
+            **initial["seconds_to_received_event"],
+            "cleanup": 1,
+        }
+    if invalid:
+        with pytest.raises(ValueError):
+            restart_benchmark(initial, restarted, scenario)
+    else:
+        result = restart_benchmark(initial, restarted, scenario)
+        assert result["restart_first_response_s"] == 10
+        if scenario != "healthy":
+            assert result["seconds_from_injection_receipt"] == dict(
+                client_error=1,
+                step_exit=2,
+                cleanup=3,
+                restart_launch=4,
+                restart_first_response=14,
+                restart_ready=15,
+            )

@@ -23,9 +23,11 @@ from fault_injector import (
     IDENTITY_DIR_ENV,
     RUN_ID_ENV,
     SCENARIOS,
+    owned_processes,
     record,
     resources_released,
     snapshot,
+    worker_processes,
 )
 
 PROMPTS = ("The capital of France is", "The capital of Italy is")
@@ -146,12 +148,14 @@ def client(args: argparse.Namespace) -> None:
         validate_workers(
             workers, config["moe_expert_parallel_size"], bool(config.get("cuda_graph_config"))
         )
-        results = [
-            llm.generate_async(
+        results = []
+        for prompt in PROMPTS:
+            result = llm.generate_async(
                 prompt, SamplingParams(temperature=0, seed=2026, max_tokens=32)
             ).result(timeout=args.client_timeout_s)
-            for prompt in PROMPTS
-        ]
+            results.append(result)
+            if len(results) == 1:
+                record(directory, "first_result", {"token_ids": list(result.outputs[0].token_ids)})
         texts = [result.outputs[0].text for result in results]
         if not all(word in text for word, text in zip(("Paris", "Rome"), texts)):
             raise ValueError(f"Healthy inference failed: {texts}")
@@ -284,6 +288,7 @@ def _probe(
     run_id: str,
     terminate: bool = False,
     deadline: float | None = None,
+    worker_identities: bool = False,
 ) -> list[dict]:
     directory.mkdir()
     if deadline is None:
@@ -307,6 +312,10 @@ def _probe(
     ]
     if terminate:
         command.append("--terminate")
+    if worker_identities:
+        if terminate:
+            raise ValueError("Identity-only probes cannot terminate processes")
+        command.append("--worker-identities")
     with (directory / "launcher.log").open("x") as stream:
         process = subprocess.Popen(
             command,
@@ -328,7 +337,10 @@ def _visible_workers(workers: list[dict], observed: list[dict]) -> None:
     # Host probes check ownership; container UID numbers may be remapped.
     keys = ("hostname", "pid", "start_ticks", "boot_id", "pid_namespace")
     host_processes = {
-        tuple(process[key] for key in keys) for row in observed for process in row["live_processes"]
+        tuple(process[key] for key in keys)
+        for row in observed
+        for process in row["live_processes"]
+        if process.get("state") != "Z"
     }
     if any(tuple(worker[key] for key in keys) not in host_processes for worker in workers):
         raise ValueError(
@@ -336,7 +348,9 @@ def _visible_workers(workers: list[dict], observed: list[dict]) -> None:
         )
 
 
-def validate_fault_evidence(directory: Path, scenario: str, workers: list[dict]) -> None:
+def validate_fault_evidence(
+    directory: Path, scenario: str, workers: list[dict], launcher_mode: str = "pmix"
+) -> None:
     """Require matching injection receipts and the measured native MPI failure outcome."""
     if scenario == "healthy":
         if not (directory / "shutdown.json").exists():
@@ -352,9 +366,19 @@ def validate_fault_evidence(directory: Path, scenario: str, workers: list[dict])
         raise AssertionError("Injection mismatch or completed post-fault inference")
     logs = "\n".join(path.read_text(errors="replace") for path in directory.glob("*.log"))
     if scenario.startswith("worker_sigkill_"):
-        if not re.search(rf"task {target['rank']}:.*(?:Killed|137)", logs):
+        death_pattern = (
+            rf"task {target['rank']}:.*(?:Killed|137)"
+            if launcher_mode == "pmix"
+            else rf"Rank{target['rank']} MGMN worker node exit code:\s*137"
+        )
+        if not re.search(death_pattern, logs):
             raise AssertionError("No native launcher confirmation of target death")
-        if (directory / "client_error.json").exists():
+        if launcher_mode == "ulfm":
+            death = _read(directory, "target_death")
+            validate_injection(expected, death["target"], scenario, _read(directory, "trigger"))
+            if death["alive"] or "MPI_ABORT was invoked" not in logs:
+                raise AssertionError("ULFM target death or native abort evidence missing")
+        if launcher_mode == "ulfm" or (directory / "client_error.json").exists():
             error = _read(directory, "client_error")
             if error["type"] != "RequestError" or "MPI_ERR_" not in error["message"]:
                 raise AssertionError("Unexpected process-loss client error")
@@ -416,11 +440,35 @@ def run_phase(
     started = time.monotonic()
     received = {}
     probe_index = 0
+    launcher_mode = getattr(args, "launcher_mode", "pmix")
 
-    def observe(terminate: bool = False, deadline: float | None = None) -> list[dict]:
+    def observe(
+        terminate: bool = False,
+        deadline: float | None = None,
+        worker_identities: bool = False,
+    ) -> list[dict]:
         nonlocal probe_index
         probe_index += 1
-        return _probe(args, directory / f"probe-{probe_index}", run_id, terminate, deadline)
+        return _probe(
+            args, directory / f"probe-{probe_index}", run_id, terminate, deadline, worker_identities
+        )
+
+    def observe_death(deadline: float) -> None:
+        target = next(row for row in workers if row["rank"] == args.target_rank)
+        observed = observe(deadline=deadline, worker_identities=True)
+        hosts = [row for row in observed if row["hostname"] == target["hostname"]]
+        if len(hosts) != 1:
+            raise ValueError("Target host identity observation missing or duplicated")
+        keys = ("hostname", "pid", "start_ticks", "boot_id", "pid_namespace")
+        alive = any(
+            all(process[key] == target[key] for key in keys) and process["state"] != "Z"
+            for process in hosts[0]["live_processes"]
+        )
+        if not alive:
+            record(
+                directory, "target_death", {"target": target, "alive": False, "snapshots": observed}
+            )
+            received["target_death"] = time.monotonic() - started
 
     with (directory / "launcher.log").open("x") as log:
         process = subprocess.Popen(
@@ -447,6 +495,7 @@ def run_phase(
                             "forced": forced,
                         },
                     )
+                    received["cleanup"] = time.monotonic() - started
                     return
                 time.sleep(min(0.1, _remaining(deadline)))
 
@@ -455,6 +504,7 @@ def run_phase(
             workers = []
             while process.poll() is None:
                 for event in (
+                    "first_result",
                     "healthy",
                     "trigger",
                     "injection_intent",
@@ -474,9 +524,18 @@ def run_phase(
                             raise ValueError(
                                 "Model GPUs differ from independently observed allocation"
                             )
-                        _visible_workers(workers, observe(deadline=deadline))
+                        if launcher_mode == "ulfm":
+                            record(
+                                directory,
+                                "worker_identities",
+                                {"run_id": run_id, "workers": workers},
+                            )
+                        _visible_workers(
+                            workers,
+                            observe(deadline=deadline, worker_identities=launcher_mode == "ulfm"),
+                        )
                         live_steps = _steps(name, min(10, _remaining(deadline)))
-                        if len(live_steps) != 1:
+                        if not live_steps or (launcher_mode == "pmix" and len(live_steps) != 1):
                             raise AssertionError("Cannot identify the live owned model step")
                         _remaining(deadline)
                         record(
@@ -490,12 +549,20 @@ def run_phase(
                     elif event == "client_error":
                         _remaining(deadline)
                         deadline = time.monotonic() + args.shutdown_timeout_s
+                if (
+                    launcher_mode == "ulfm"
+                    and scenario.startswith("worker_sigkill_")
+                    and "injection_intent" in received
+                    and "target_death" not in received
+                ):
+                    observe_death(deadline)
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"{phase} exceeded its startup/client/teardown deadline")
                 time.sleep(0.05)
             _remaining(deadline)
             received["step_exit"] = time.monotonic() - started
             for event in (
+                "first_result",
                 "trigger",
                 "injection_intent",
                 "injection_result",
@@ -511,8 +578,14 @@ def run_phase(
                 raise AssertionError(
                     f"MPI step exited {process.returncode}, expected {expected_exit}"
                 )
+            if (
+                launcher_mode == "ulfm"
+                and scenario.startswith("worker_sigkill_")
+                and "target_death" not in received
+            ):
+                observe_death(deadline)
             wait_for_cleanup(time.monotonic() + args.cleanup_timeout_s)
-            validate_fault_evidence(directory, scenario, workers)
+            validate_fault_evidence(directory, scenario, workers, launcher_mode)
         except (Exception, KeyboardInterrupt) as error:
             # Evidence storage may be the failure cause; cleanup must still run.
             with suppress(OSError):
@@ -537,6 +610,8 @@ def run_phase(
                 directory,
                 "timing",
                 {
+                    "started_monotonic_s": started,
+                    "controller_pid": os.getpid(),
                     "seconds_to_received_event": received,
                     "total_s": time.monotonic() - started,
                     "exit_code": process.poll(),
@@ -544,6 +619,52 @@ def run_phase(
                 },
             )
     return workers
+
+
+def restart_benchmark(initial: dict, restarted: dict, scenario: str) -> dict:
+    """Measure receipt-to-response on one controller clock, including observer overhead."""
+    if any(
+        initial[key] != restarted[key]
+        for key in ("producer_host", "controller_pid", "clock_source")
+    ):
+        raise ValueError("Restart timing requires the same controller and clock")
+    initial_events = initial["seconds_to_received_event"]
+    restart_events = restarted["seconds_to_received_event"]
+    for timing, events in ((initial, initial_events), (restarted, restart_events)):
+        milestones = [events[key] for key in ("first_result", "healthy", "step_exit", "cleanup")]
+        if (
+            not math.isfinite(timing["started_monotonic_s"])
+            or not all(math.isfinite(value) and value >= 0 for value in milestones)
+            or milestones != sorted(milestones)
+        ):
+            raise ValueError("Invalid startup/cleanup timing")
+    result = {
+        "clock_source": initial["clock_source"],
+        "initial_first_response_s": initial_events["first_result"],
+        "initial_ready_s": initial_events["healthy"],
+        "restart_first_response_s": restart_events["first_result"],
+        "restart_ready_s": restart_events["healthy"],
+    }
+    if scenario != "healthy":
+        start_event = (
+            "injection_result" if scenario == "fence_round_mismatch" else "injection_intent"
+        )
+        origin = initial["started_monotonic_s"] + initial_events[start_event]
+        restart_start = restarted["started_monotonic_s"] - origin
+        milestones = {
+            name: initial_events[name] - initial_events[start_event]
+            for name in ("client_error", "target_death", "step_exit", "cleanup")
+            if name in initial_events
+        }
+        milestones.update(
+            restart_launch=restart_start,
+            restart_first_response=restart_start + restart_events["first_result"],
+            restart_ready=restart_start + restart_events["healthy"],
+        )
+        if min(milestones.values()) < 0 or restart_start < milestones["cleanup"]:
+            raise ValueError("Restart timeline contradicts verified cleanup")
+        result.update(start_event=start_event, seconds_from_injection_receipt=milestones)
+    return result
 
 
 def run(args: argparse.Namespace) -> None:
@@ -566,6 +687,12 @@ def run(args: argparse.Namespace) -> None:
             "scenario": args.scenario,
             "model": str(args.model),
             "launcher": args.launcher,
+            "launcher_mode": getattr(args, "launcher_mode", "pmix"),
+            "launcher_sha256": (
+                hashlib.sha256(Path(args.launcher[0]).read_bytes()).hexdigest()
+                if getattr(args, "launcher_mode", "pmix") == "ulfm"
+                else None
+            ),
             "probe_launcher": args.probe_launcher,
             "allocation_job_id": os.environ["SLURM_JOB_ID"],
             "source_sha256": {
@@ -593,6 +720,9 @@ def run(args: argparse.Namespace) -> None:
         initial = run_phase(args, baseline, "initial", args.scenario)
         restarted = run_phase(args, baseline, "restart", "healthy")
         validate_restart(initial, restarted)
+        initial_timing = _read(args.output_dir / "initial", "timing")
+        restart_timing = _read(args.output_dir / "restart", "timing")
+        benchmark = restart_benchmark(initial_timing, restart_timing, args.scenario)
     except (Exception, KeyboardInterrupt) as error:
         record(
             args.output_dir,
@@ -606,15 +736,19 @@ def run(args: argparse.Namespace) -> None:
         {
             "state": "PASS",
             "same_gpu_restart": True,
-            "initial": _read(args.output_dir / "initial", "timing"),
-            "restart": _read(args.output_dir / "restart", "timing"),
+            "initial": initial_timing,
+            "restart": restart_timing,
+            "benchmark": benchmark,
         },
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--launcher", help="Direct srun prefix for native MPI model workers")
+    parser.add_argument(
+        "--launcher", help="Model launch prefix: direct srun or an external ULFM wrapper"
+    )
+    parser.add_argument("--launcher-mode", choices=("pmix", "ulfm"), default="pmix")
     parser.add_argument(
         "--probe-launcher", help="Direct srun --mpi=none prefix, one CPU probe per GPU host"
     )
@@ -630,13 +764,33 @@ def main() -> None:
     parser.add_argument("--startup-timeout-s", type=float, default=720)
     parser.add_argument("--client-timeout-s", type=float)
     parser.add_argument("--shutdown-timeout-s", type=float, default=180)
-    parser.add_argument("--cleanup-timeout-s", type=float, default=60)
+    parser.add_argument("--cleanup-timeout-s", type=float, default=180)
     parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--terminate", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-identities", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     if args.probe:
+        if args.worker_identities:
+            if args.terminate:
+                parser.error("Identity-only probes cannot terminate processes")
+            identities = _read(args.output_dir.parent, "worker_identities")
+            if identities["run_id"] != args.run_id:
+                raise ValueError("Worker identities belong to another run")
+            record(
+                args.output_dir,
+                socket.gethostname(),
+                {
+                    "run_id": args.run_id,
+                    "hostname": socket.gethostname(),
+                    "observation_scope": "worker_identities",
+                    "live_processes": owned_processes(
+                        args.run_id, worker_processes(identities["workers"]), allow_unreadable=True
+                    ),
+                },
+            )
+            return
         # Retain host-observed identities even when dead tasks lose their environment.
         known_path = args.output_dir.parent / "probe-1" / f"{socket.gethostname()}.json"
         known = json.loads(known_path.read_text()) if known_path.exists() else None
@@ -669,12 +823,19 @@ def main() -> None:
         parser.error("Provide --launcher and --probe-launcher inside an existing Slurm allocation")
     for option in ("launcher", "probe_launcher"):
         command = shlex.split(getattr(args, option))
+        external_ulfm = option == "launcher" and args.launcher_mode == "ulfm"
         if (
             not command
-            or Path(command[0]).name != "srun"
+            or (
+                not (Path(command[0]).is_file() and os.access(command[0], os.X_OK))
+                if external_ulfm
+                else Path(command[0]).name != "srun"
+            )
             or any(token.startswith(("--job-name", "-J", "--jobid")) for token in command)
         ):
-            parser.error("Launch prefixes must use direct srun; the test owns step names")
+            parser.error("Use direct srun or an executable ULFM wrapper; the test owns step names")
+        if external_ulfm:
+            command[0] = str(Path(command[0]).resolve())
         setattr(args, option, command)
 
     def interrupt(signum: int, _frame: FrameType | None) -> None:

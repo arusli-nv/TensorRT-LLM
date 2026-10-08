@@ -40,6 +40,24 @@ def process_identity(pid: int) -> dict:
     }
 
 
+def worker_processes(workers: Sequence[dict]) -> list[dict]:
+    """Read known worker identities without inspecting unrelated process environments."""
+    processes = []
+    for expected in workers:
+        if expected["hostname"] != socket.gethostname():
+            continue
+        try:
+            actual = process_identity(expected["pid"])
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if actual["uid"] != os.getuid():
+            raise PermissionError(f"Worker PID {expected['pid']} is not owned by this observer")
+        if any(actual[key] != expected[key] for key in ("start_ticks", "boot_id", "pid_namespace")):
+            continue
+        processes.append(actual)
+    return processes
+
+
 def record(directory: Path, name: str, value: dict) -> None:
     """Publish complete evidence once; producer monotonic clocks are host-local."""
     path = directory / f"{name}.json"
@@ -204,7 +222,9 @@ def _slurm_job_id(process: Path) -> str | None:
     return next(iter(jobs)) if len(jobs) == 1 else None
 
 
-def owned_processes(run_id: str, known: Sequence[dict] = ()) -> list[dict]:
+def owned_processes(
+    run_id: str, known: Sequence[dict] = (), *, allow_unreadable: bool = False
+) -> list[dict]:
     """Find this run's processes in the observer's PID namespace, including partial startup."""
     marker = f"{RUN_ID_ENV}={run_id}".encode()
     pinned = {row["pid"]: row for row in known if row["hostname"] == socket.gethostname()}
@@ -226,6 +246,8 @@ def owned_processes(run_id: str, known: Sequence[dict] = ()) -> list[dict]:
             try:
                 environment = (process / "environ").read_bytes()
             except PermissionError as error:
+                if allow_unreadable:
+                    continue
                 # Nondumpable Slurm step daemons are accounted for through step lifecycle checks.
                 comm = (process / "comm").read_text().strip()
                 if comm == "slurmstepd" and re.fullmatch(
@@ -323,7 +345,11 @@ def snapshot(run_id: str, terminate: bool = False, known: Sequence[dict] = ()) -
 
 def resources_released(baseline: list[dict], current: list[dict], tolerance_mib: int = 64) -> bool:
     """Require complete host/GPU observations, no owned processes, and bounded memory delta."""
-    if not baseline or len(baseline) != len(current):
+    if (
+        not baseline
+        or len(baseline) != len(current)
+        or any(row.get("observation_scope", "full") != "full" for row in (*baseline, *current))
+    ):
         return False
     before = {row["hostname"]: row for row in baseline}
     if len(before) != len(baseline) or {row["hostname"] for row in current} != set(before):
