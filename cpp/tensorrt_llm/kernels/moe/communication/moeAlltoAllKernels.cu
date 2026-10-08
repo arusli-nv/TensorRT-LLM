@@ -284,6 +284,104 @@ __device__ __forceinline__ uint32_t round_parity(uint32_t flag_val)
     return ((flag_val - 1U) >> 1U) & 1U;
 }
 
+template <bool ENABLE_DESCRIPTOR>
+__device__ __forceinline__ MoeA2AFenceDescriptor const* moeA2ADescriptor(MoeA2AFenceWorkspace const& workspace)
+{
+    if constexpr (ENABLE_DESCRIPTOR)
+    {
+        if (workspace.executionDescriptor != nullptr)
+        {
+            return *workspace.executionDescriptor;
+        }
+    }
+    return nullptr;
+}
+
+template <bool ENABLE_DESCRIPTOR, typename T>
+__device__ __forceinline__ T* moeA2ADescriptorPointer(T* legacy, MoeA2AFenceWorkspace const& workspace)
+{
+    auto const* descriptor = moeA2ADescriptor<ENABLE_DESCRIPTOR>(workspace);
+    if (descriptor == nullptr || legacy == nullptr)
+    {
+        return legacy;
+    }
+    uintptr_t const displacement = reinterpret_cast<uintptr_t>(legacy) - workspace.legacyBase;
+    return reinterpret_cast<T*>(descriptor->bankBase + displacement);
+}
+
+template <bool ENABLE_DESCRIPTOR>
+__device__ __forceinline__ MoeA2AAbortState* moeA2ADescriptorAbortState(
+    MoeA2AAbortState* legacy, MoeA2AFenceWorkspace const& workspace)
+{
+    auto const* descriptor = moeA2ADescriptor<ENABLE_DESCRIPTOR>(workspace);
+    return descriptor == nullptr ? legacy : descriptor->abortState;
+}
+
+template <bool ENABLE_DESCRIPTOR, typename Pointers>
+__device__ __forceinline__ bool moeA2ADescriptorRankActive(Pointers const& ptrs, int rank)
+{
+    auto const* descriptor = moeA2ADescriptor<ENABLE_DESCRIPTOR>(ptrs.fenceWorkspace);
+    return is_rank_active(descriptor == nullptr ? ptrs.active_rank_mask : descriptor->activeMask, rank);
+}
+
+__global__ void moeA2AFenceLatchDescriptorKernel(uintptr_t const* publishedDescriptor, uintptr_t* execution)
+{
+    *execution = *publishedDescriptor;
+}
+
+void moe_a2a_fence_latch_descriptor_launch(
+    uintptr_t const* publishedDescriptor, uintptr_t* execution, cudaStream_t stream)
+{
+    moeA2AFenceLatchDescriptorKernel<<<1, 1, 0, stream>>>(publishedDescriptor, execution);
+}
+
+// Ordinary stream ordering ensures dispatch's fence wait completed before gathering private tensors.
+template <bool ENABLE_ABORT>
+__device__ __forceinline__ bool moeA2AAbortRequested(MoeA2AAbortState* abortState);
+
+__global__ void moeA2AGatherLocalKernel(MoeA2AGatherParams params)
+{
+    auto const* descriptor = moeA2ADescriptor<true>(params.fenceWorkspace);
+    bool const aborted = moeA2AAbortRequested<true>(descriptor->abortState);
+    int const token = blockIdx.x;
+    if (token < params.epSize * params.maxTokens)
+    {
+        int const sourceRank = token / params.maxTokens;
+        int const sourceToken = token % params.maxTokens;
+        auto const* flags = moeA2ADescriptorPointer<true>(params.flagVal, params.fenceWorkspace);
+        auto const* counters = moeA2ADescriptorPointer<true>(params.recvCounters, params.fenceWorkspace);
+        int const count = aborted ? 0 : counters[round_parity(*flags) * params.epSize + sourceRank];
+        bool const valid = !aborted && is_rank_active(descriptor->activeMask, sourceRank) && count >= 0
+            && count <= params.maxTokens && sourceToken < count;
+        for (int p = 0; p < params.numPayloads; ++p)
+        {
+            auto const* source
+                = static_cast<uint8_t const*>(moeA2ADescriptorPointer<true>(params.source[p], params.fenceWorkspace));
+            auto* destination = static_cast<uint8_t*>(params.destination[p]);
+            uintptr_t const offset = static_cast<uintptr_t>(token) * params.bytesPerToken[p];
+            for (int byte = threadIdx.x; byte < params.bytesPerToken[p]; byte += blockDim.x)
+            {
+                destination[offset + byte] = valid ? source[offset + byte] : 0;
+            }
+        }
+    }
+    int const stat = blockIdx.x * blockDim.x + threadIdx.x;
+    if (stat < params.epSize * params.statsExperts)
+    {
+        auto const* source = moeA2ADescriptorPointer<true>(params.sourceStats, params.fenceWorkspace);
+        bool const valid = !aborted && is_rank_active(descriptor->activeMask, stat / params.statsExperts);
+        params.destinationStats[stat] = valid ? source[stat] : 0;
+    }
+}
+
+void moe_a2a_gather_local_launch(MoeA2AGatherParams const& params, cudaStream_t stream)
+{
+    constexpr int kThreads = 256;
+    int const grid
+        = std::max(params.epSize * params.maxTokens, (params.epSize * params.statsExperts + kThreads - 1) / kThreads);
+    moeA2AGatherLocalKernel<<<grid, kThreads, 0, stream>>>(params);
+}
+
 template <int TOP_K, bool ENABLE_RANK_MASK>
 __device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
@@ -302,14 +400,18 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     bool keep = (__ffs(same_target) - 1) == k;
     if constexpr (ENABLE_RANK_MASK)
     {
-        keep = keep && is_rank_active(ptrs.active_rank_mask, target_rank);
+        keep = keep && moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, target_rank);
     }
 
     int const target_rank_to_store = keep ? target_rank : -1;
-    int const send_index_to_store = keep ? atomicAdd(&ptrs.send_counters[target_rank], 1) : -1;
+    int const send_index_to_store = keep
+        ? atomicAdd(&moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.send_counters, ptrs.fenceWorkspace)[target_rank], 1)
+        : -1;
 
-    ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank_to_store;
-    ptrs.topk_send_indices[local_token_idx * TOP_K + k] = send_index_to_store;
+    moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.topk_target_ranks, ptrs.fenceWorkspace)[local_token_idx * TOP_K + k]
+        = target_rank_to_store;
+    moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.topk_send_indices, ptrs.fenceWorkspace)[local_token_idx * TOP_K + k]
+        = send_index_to_store;
     topk_target_ranks[k] = target_rank_to_store;
     topk_send_indices[k] = send_index_to_store;
 }
@@ -361,7 +463,7 @@ __device__ void vectorized_copy(void* dst, void const* src, int size)
 }
 
 // Vectorized dispatch: load one vec from source and write to up to TOP_K destinations
-template <int VEC_SIZE, int TOP_K>
+template <int VEC_SIZE, int TOP_K, bool ENABLE_RANK_MASK>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
     int max_tokens_per_rank, int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks,
     int const* topk_send_indices)
@@ -380,7 +482,8 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
             dst_base_k[k] = nullptr;
             continue;
         }
-        uint8_t* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank_k][payload_idx]);
+        uint8_t* dst_data = static_cast<uint8_t*>(moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+            ptrs.recv_buffers[target_rank_k][payload_idx], ptrs.fenceWorkspace));
         size_t base_source_rank
             = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx_k);
         size_t base_token = base_source_rank * static_cast<size_t>(bytes_per_token);
@@ -406,34 +509,34 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
     }
 }
 
-template <int TOP_K>
+template <int TOP_K, bool ENABLE_RANK_MASK = false>
 __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token, int rank_id, int max_tokens_per_rank,
     int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks, int const* topk_send_indices)
 {
     if (bytes_per_token % 16 == 0)
     {
-        vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<16, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 8 == 0)
     {
-        vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<8, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 4 == 0)
     {
-        vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<4, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 2 == 0)
     {
-        vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<2, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else
     {
-        vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<1, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
 }
 
@@ -488,11 +591,16 @@ __device__ __forceinline__ void moeA2AAbortComplete()
 
 template <bool ENABLE_ABORT>
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* recv_counters, int* local_token_counter,
-    int ep_size, uint32_t* flag_val_ptr, MoeA2AAbortState* abortState)
+    int ep_size, uint32_t* flag_val_ptr, MoeA2AAbortState* abortState, MoeA2AFenceWorkspace fenceWorkspace)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
+    abortState = moeA2ADescriptorAbortState<ENABLE_ABORT>(abortState, fenceWorkspace);
+    send_counters = moeA2ADescriptorPointer<ENABLE_ABORT>(send_counters, fenceWorkspace);
+    recv_counters = moeA2ADescriptorPointer<ENABLE_ABORT>(recv_counters, fenceWorkspace);
+    local_token_counter = moeA2ADescriptorPointer<ENABLE_ABORT>(local_token_counter, fenceWorkspace);
+    flag_val_ptr = moeA2ADescriptorPointer<ENABLE_ABORT>(flag_val_ptr, fenceWorkspace);
     if (moeA2AAbortCta<ENABLE_ABORT>(abortState))
     {
         moeA2AAbortComplete();
@@ -561,7 +669,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #if TLLM_MOE_A2A_COMPILE_SM90
         cudaGridDependencySynchronize();
 #endif
-        if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+        if (moeA2AAbortCta<ENABLE_RANK_MASK>(
+                moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)))
         {
             moeA2AAbortComplete();
             return;
@@ -591,13 +700,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
             uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-            vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-                topk_target_ranks, topk_send_indices);
+            vectorized_dispatch<TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                payload_idx, ptrs, topk_target_ranks, topk_send_indices);
         }
 
         __syncthreads();
     }
-    if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+    if (moeA2AAbortCta<ENABLE_RANK_MASK>(
+            moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)))
     {
         moeA2AAbortComplete();
         return;
@@ -616,7 +726,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         {
             if (local_num_tokens != 0)
             {
-                int cnt = atomicAdd(ptrs.local_token_counter, 1);
+                int cnt = atomicAdd(
+                    moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.local_token_counter, ptrs.fenceWorkspace), 1);
                 is_last_token = cnt + 1 == local_num_tokens;
             }
             else
@@ -628,8 +739,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         if (is_last_token)
         {
-            uint32_t const parity = round_parity(*ptrs.flag_val);
-            int* const round_recv_counters = ptrs.recv_counters[rank_id] + parity * ep_size;
+            uint32_t const parity
+                = round_parity(*moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.flag_val, ptrs.fenceWorkspace));
+            int* const round_recv_counters
+                = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.recv_counters[rank_id], ptrs.fenceWorkspace)
+                + parity * ep_size;
 // Store send_counters to recv_counters.
 // Skip masked target ranks: their symmetric memory may be inaccessible.
 #pragma unroll 1 // No unroll as one iter is typically enough
@@ -637,11 +751,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    if (!moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, target_rank))
                         continue;
                 }
-                int send_count = ptrs.send_counters[target_rank];
-                ptrs.recv_counters[target_rank][parity * ep_size + rank_id] = send_count;
+                int send_count
+                    = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.send_counters, ptrs.fenceWorkspace)[target_rank];
+                moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                    ptrs.recv_counters[target_rank], ptrs.fenceWorkspace)[parity * ep_size + rank_id]
+                    = send_count;
             }
 
             if constexpr (ENABLE_EPLB)
@@ -653,10 +770,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 {
                     if constexpr (ENABLE_RANK_MASK)
                     {
-                        if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        if (!moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, target_rank))
                             continue;
                     }
-                    int* target_stats = ptrs.eplb_gathered_stats[target_rank];
+                    int* target_stats = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                        ptrs.eplb_gathered_stats[target_rank], ptrs.fenceWorkspace);
                     for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
                     {
                         int stat_val = ptrs.eplb_local_stats[expert_id];
@@ -666,7 +784,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             }
 
 #if !DISABLE_SYNC_FOR_PROFILING
-            uint32_t expected_value = *ptrs.flag_val;
+            uint32_t expected_value = *moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.flag_val, ptrs.fenceWorkspace);
 
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
@@ -681,10 +799,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    if (!moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, target_rank))
                         continue;
                 }
-                uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
+                uint32_t* flag_addr = &moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                    ptrs.completion_flags[target_rank], ptrs.fenceWorkspace)[rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 
 #if ENABLE_DEBUG_PRINT
@@ -700,13 +819,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, peer_rank))
                     {
                         round_recv_counters[peer_rank] = 0;
                         continue;
                     }
                 }
-                if (moeA2AAbortRequested<ENABLE_RANK_MASK>(ptrs.abort_state))
+                if (moeA2AAbortRequested<ENABLE_RANK_MASK>(
+                        moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)))
                 {
                     return;
                 }
@@ -715,7 +835,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 auto s = clock64();
                 do
                 {
-                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+                    uint32_t* flag_ptr = &moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                        ptrs.completion_flags[rank_id], ptrs.fenceWorkspace)[peer_rank];
                     uint32_t flag_value;
                     // Acquire load to ensure visibility of peer's release-store
                     asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
@@ -726,7 +847,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                     flag_set = flag_value == expected_value;
-                    aborted = moeA2AAbortRequested<ENABLE_RANK_MASK>(ptrs.abort_state);
+                    aborted = moeA2AAbortRequested<ENABLE_RANK_MASK>(
+                        moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace));
                 } while (!flag_set && !aborted && !check_timeout(s, ptrs.timeout_cycles));
 
                 if (aborted)
@@ -737,10 +859,13 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 {
                     printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
                         peer_rank);
-                    if (ENABLE_RANK_MASK && ptrs.abort_state != nullptr)
+                    if (ENABLE_RANK_MASK
+                        && moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)
+                            != nullptr)
                     {
-                        atomicCAS(
-                            &ptrs.abort_state->status, MoeA2AAbortState::kHealthy, MoeA2AAbortState::kFenceTimeout);
+                        atomicCAS(&moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)
+                                       ->status,
+                            MoeA2AAbortState::kHealthy, MoeA2AAbortState::kFenceTimeout);
                     }
                     else
                     {
@@ -1240,10 +1365,12 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
     // Cumulative baselines in regular device memory track the expected value.
 
     TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes));
-    SWITCH_BOOL(params.abort_state != nullptr, ENABLE_ABORT, {
+    TLLM_CHECK(params.fenceWorkspace.executionDescriptor == nullptr
+        || (params.enable_rank_mask && !params.use_cft_counted_writes));
+    SWITCH_BOOL(params.abort_state != nullptr || params.fenceWorkspace.executionDescriptor != nullptr, ENABLE_ABORT, {
         launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel<ENABLE_ABORT>, 1,
             params.ep_size, 0, params.stream, params.send_counters, params.recv_counters[params.ep_rank],
-            params.local_token_counter, params.ep_size, params.flag_val, params.abort_state);
+            params.local_token_counter, params.ep_size, params.flag_val, params.abort_state, params.fenceWorkspace);
     });
 }
 
@@ -1254,6 +1381,8 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 {
     TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes));
+    TLLM_CHECK(params.fenceWorkspace.executionDescriptor == nullptr
+        || (params.enable_rank_mask && !params.use_cft_counted_writes));
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -1272,6 +1401,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     DispatchKernelPointers kernel_ptrs = {};
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
     kernel_ptrs.abort_state = params.abort_state;
+    kernel_ptrs.fenceWorkspace = params.fenceWorkspace;
 
     // Fill source data pointers and payload sizes
     for (int i = 0; i < params.num_payloads; i++)
@@ -1407,7 +1537,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 // Unified path: load VEC_SIZE bytes, reinterpret as InputT[elems_per_vec], accumulate as float32,
 // store as OutputT. Works for same-type and FP8-to-payload-type accumulation.
 // sizeof(InputT) must divide VEC_SIZE.
-template <int VEC_SIZE, int TOP_K, typename OutputT, typename InputT = OutputT>
+template <int VEC_SIZE, int TOP_K, typename OutputT, typename InputT = OutputT, bool ENABLE_RANK_MASK = false>
 __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_token, int stride_per_token, int rank_id,
     int max_tokens_per_rank, CombineKernelPointers const& ptrs)
 {
@@ -1434,8 +1564,10 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
 #pragma unroll
         for (int k = 0; k < TOP_K; ++k)
         {
-            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-            int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
+            int target_rank = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                ptrs.topk_target_ranks, ptrs.fenceWorkspace)[local_token_idx * TOP_K + k];
+            int dst_idx = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                ptrs.topk_send_indices, ptrs.fenceWorkspace)[local_token_idx * TOP_K + k];
             if (dst_idx < 0)
             {
                 acc[k].fill(0.0f);
@@ -1443,7 +1575,8 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
             }
 
             // Every contribution uses the same compact receive-buffer layout.
-            uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+            uint8_t const* recv_buffer = static_cast<uint8_t const*>(
+                moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.recv_buffers[target_rank][0], ptrs.fenceWorkspace));
             size_t base_source_rank = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank)
                 + static_cast<size_t>(dst_idx);
             size_t base_token = base_source_rank * static_cast<size_t>(stride_per_token);
@@ -1459,8 +1592,10 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
 #pragma unroll
         for (int k = 0; k < TOP_K; ++k)
         {
-            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-            int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
+            int target_rank = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                ptrs.topk_target_ranks, ptrs.fenceWorkspace)[local_token_idx * TOP_K + k];
+            int dst_idx = moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                ptrs.topk_send_indices, ptrs.fenceWorkspace)[local_token_idx * TOP_K + k];
             if (dst_idx < 0)
             {
                 continue; // acc[k] already holds 0.0f from fill() above
@@ -1656,7 +1791,7 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
 // stride_per_token: byte distance between tokens in the recv buffer (may differ from
 // size_per_token when low-precision in-place data retains its payload-dtype workspace stride).
 // InputT is the input element type in the receive buffer.
-template <int TOP_K, typename OutputT, typename InputT = OutputT>
+template <int TOP_K, typename OutputT, typename InputT = OutputT, bool ENABLE_RANK_MASK = false>
 __device__ void vectorized_combine(OutputT* dst_typed_base, int size_per_token, int stride_per_token, int rank_id,
     int max_tokens_per_rank, CombineKernelPointers const& ptrs)
 {
@@ -1667,31 +1802,31 @@ __device__ void vectorized_combine(OutputT* dst_typed_base, int size_per_token, 
     if (size_per_token % 16 == 0)
     {
         if constexpr (static_cast<int>(sizeof(InputT)) <= 16)
-            vectorized_combine_impl<16, TOP_K, OutputT, InputT>(
+            vectorized_combine_impl<16, TOP_K, OutputT, InputT, ENABLE_RANK_MASK>(
                 dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
     }
     else if (size_per_token % 8 == 0)
     {
         if constexpr (static_cast<int>(sizeof(InputT)) <= 8)
-            vectorized_combine_impl<8, TOP_K, OutputT, InputT>(
+            vectorized_combine_impl<8, TOP_K, OutputT, InputT, ENABLE_RANK_MASK>(
                 dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
     }
     else if (size_per_token % 4 == 0)
     {
         if constexpr (static_cast<int>(sizeof(InputT)) <= 4)
-            vectorized_combine_impl<4, TOP_K, OutputT, InputT>(
+            vectorized_combine_impl<4, TOP_K, OutputT, InputT, ENABLE_RANK_MASK>(
                 dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
     }
     else if (size_per_token % 2 == 0)
     {
         if constexpr (static_cast<int>(sizeof(InputT)) <= 2)
-            vectorized_combine_impl<2, TOP_K, OutputT, InputT>(
+            vectorized_combine_impl<2, TOP_K, OutputT, InputT, ENABLE_RANK_MASK>(
                 dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
     }
     else
     {
         if constexpr (static_cast<int>(sizeof(InputT)) <= 1)
-            vectorized_combine_impl<1, TOP_K, OutputT, InputT>(
+            vectorized_combine_impl<1, TOP_K, OutputT, InputT, ENABLE_RANK_MASK>(
                 dst_typed_base, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
     }
 }
@@ -1791,11 +1926,15 @@ template <bool LOW_PRECISION, typename SrcT, bool ENABLE_ABORT>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
     int source_stride_per_token, int workspace_stride_per_token, int prepare_first_token, int prepare_num_tokens,
-    uint8_t* region_c_base, int ep_rank, MoeA2AAbortState* abortState)
+    uint8_t* region_c_base, int ep_rank, MoeA2AAbortState* abortState, MoeA2AFenceWorkspace fenceWorkspace)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
+    abortState = moeA2ADescriptorAbortState<ENABLE_ABORT>(abortState, fenceWorkspace);
+    recv_buffer_bytes = moeA2ADescriptorPointer<ENABLE_ABORT>(recv_buffer_bytes, fenceWorkspace);
+    flag_val_ptr = moeA2ADescriptorPointer<ENABLE_ABORT>(flag_val_ptr, fenceWorkspace);
+    recv_counters = moeA2ADescriptorPointer<ENABLE_ABORT>(recv_counters, fenceWorkspace);
     if (moeA2AAbortCta<ENABLE_ABORT>(abortState))
     {
         moeA2AAbortComplete();
@@ -1886,7 +2025,8 @@ __global__ void moeA2ACombineKernel(
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
-    if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+    if (moeA2AAbortCta<ENABLE_RANK_MASK>(
+            moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)))
     {
         moeA2AAbortComplete();
         return;
@@ -1900,7 +2040,7 @@ __global__ void moeA2ACombineKernel(
     if (is_first_warp)
     {
         int lane_id = threadIdx.x % warpSize;
-        uint32_t expected_value = *ptrs.flag_val;
+        uint32_t expected_value = *moeA2ADescriptorPointer<ENABLE_RANK_MASK>(ptrs.flag_val, ptrs.fenceWorkspace);
 
         if (blockIdx.x == 0)
         {
@@ -1911,10 +2051,11 @@ __global__ void moeA2ACombineKernel(
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, peer_rank))
                         continue;
                 }
-                uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
+                uint32_t* flag_addr = &moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                    ptrs.completion_flags[peer_rank], ptrs.fenceWorkspace)[rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 #if ENABLE_DEBUG_PRINT
                 printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
@@ -1930,7 +2071,7 @@ __global__ void moeA2ACombineKernel(
         {
             if constexpr (ENABLE_RANK_MASK)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                if (!moeA2ADescriptorRankActive<ENABLE_RANK_MASK>(ptrs, peer_rank))
                     continue;
             }
             bool flag_set = false;
@@ -1938,12 +2079,14 @@ __global__ void moeA2ACombineKernel(
             auto s = clock64();
             do
             {
-                aborted = moeA2AAbortRequested<ENABLE_RANK_MASK>(ptrs.abort_state);
+                aborted = moeA2AAbortRequested<ENABLE_RANK_MASK>(
+                    moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace));
                 if (aborted)
                 {
                     break;
                 }
-                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+                uint32_t* flag_ptr = &moeA2ADescriptorPointer<ENABLE_RANK_MASK>(
+                    ptrs.completion_flags[rank_id], ptrs.fenceWorkspace)[peer_rank];
                 uint32_t flag_value;
                 // Acquire load to ensure visibility of peer's release-store
                 asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
@@ -1960,9 +2103,12 @@ __global__ void moeA2ACombineKernel(
             if (__builtin_expect(!flag_set && !aborted, 0))
             {
                 printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id, peer_rank);
-                if (ENABLE_RANK_MASK && ptrs.abort_state != nullptr)
+                if (ENABLE_RANK_MASK
+                    && moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace) != nullptr)
                 {
-                    atomicCAS(&ptrs.abort_state->status, MoeA2AAbortState::kHealthy, MoeA2AAbortState::kFenceTimeout);
+                    atomicCAS(
+                        &moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)->status,
+                        MoeA2AAbortState::kHealthy, MoeA2AAbortState::kFenceTimeout);
                 }
                 else
                 {
@@ -1981,14 +2127,16 @@ __global__ void moeA2ACombineKernel(
     __syncthreads();
 #endif
 
-    if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+    if (moeA2AAbortCta<ENABLE_RANK_MASK>(
+            moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace)))
     {
         moeA2AAbortComplete();
         return;
     }
     if (local_num_tokens == 0)
     {
-        if (ENABLE_RANK_MASK && ptrs.abort_state != nullptr)
+        if (ENABLE_RANK_MASK
+            && moeA2ADescriptorAbortState<ENABLE_RANK_MASK>(ptrs.abort_state, ptrs.fenceWorkspace) != nullptr)
         {
             moeA2AAbortComplete();
         }
@@ -1996,7 +2144,7 @@ __global__ void moeA2ACombineKernel(
     }
 
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-    vectorized_combine<TOP_K, T, InputT>(
+    vectorized_combine<TOP_K, T, InputT, ENABLE_RANK_MASK>(
         token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
@@ -2271,7 +2419,9 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     // because cudaDeviceSynchronize does NOT wait for fabric engine completion.
 
     TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine));
-    SWITCH_BOOL(params.abort_state != nullptr, ENABLE_ABORT, {
+    TLLM_CHECK(params.fenceWorkspace.executionDescriptor == nullptr
+        || (params.enable_rank_mask && !params.use_cft_for_combine));
+    SWITCH_BOOL(params.abort_state != nullptr || params.fenceWorkspace.executionDescriptor != nullptr, ENABLE_ABORT, {
         SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
             SWITCH_DTYPE(params.dtype, SrcT, {
                 auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT, ENABLE_ABORT>;
@@ -2279,7 +2429,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
                     recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
                     params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
                     params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens,
-                    region_c_base, params.ep_rank, params.abort_state);
+                    region_c_base, params.ep_rank, params.abort_state, params.fenceWorkspace);
             });
         });
     });
@@ -2290,11 +2440,13 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
 // ============================================================================
 
 // One CTA decides once whether to zero the whole tensor. Later cancellation belongs to the next observer.
-__global__ void moeA2AFinalizeAbortOutputKernel(uint8_t* output, int64_t bytes, MoeA2AAbortState* abortState)
+__global__ void moeA2AFinalizeAbortOutputKernel(
+    uint8_t* output, int64_t bytes, MoeA2AAbortState* abortState, MoeA2AFenceWorkspace fenceWorkspace)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
+    abortState = moeA2ADescriptorAbortState<true>(abortState, fenceWorkspace);
     if (moeA2AAbortCta<true>(abortState))
     {
         for (int64_t i = threadIdx.x; i < bytes; i += blockDim.x)
@@ -2308,6 +2460,8 @@ __global__ void moeA2AFinalizeAbortOutputKernel(uint8_t* output, int64_t bytes, 
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 {
     TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine));
+    TLLM_CHECK(params.fenceWorkspace.executionDescriptor == nullptr
+        || (params.enable_rank_mask && !params.use_cft_for_combine));
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -2401,6 +2555,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
     kernel_ptrs.abort_state = params.abort_state;
+    kernel_ptrs.fenceWorkspace = params.fenceWorkspace;
 
     // Set output data pointer in src_data_ptrs[0]
     kernel_ptrs.src_data_ptrs[0] = params.output_data;
@@ -2440,13 +2595,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             });
         });
     });
-    if (params.abort_state != nullptr)
+    if (params.abort_state != nullptr || params.fenceWorkspace.executionDescriptor != nullptr)
     {
         constexpr int kFinalizeThreads = 256;
         int64_t const bytes = static_cast<int64_t>(params.local_num_tokens) * params.elements_per_token
             * tensorrt_llm::common::getDTypeSize(params.dtype);
         launchWithPdlWhenEnabled("moeA2AFinalizeAbortOutputKernel", moeA2AFinalizeAbortOutputKernel, 1,
-            kFinalizeThreads, 0, params.stream, static_cast<uint8_t*>(params.output_data), bytes, params.abort_state);
+            kFinalizeThreads, 0, params.stream, static_cast<uint8_t*>(params.output_data), bytes, params.abort_state,
+            params.fenceWorkspace);
     }
 }
 
@@ -2454,7 +2610,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 template <bool ENABLE_ABORT>
 __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t const* recv_counters_ptr,
     uint32_t const* flag_val, int ep_size, int max_tokens_per_rank, int top_k, int32_t invalid_id,
-    MoeA2AAbortState* abortState)
+    MoeA2AAbortState* abortState, MoeA2AFenceWorkspace fenceWorkspace)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_tokens = ep_size * max_tokens_per_rank;
@@ -2468,6 +2624,9 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+    abortState = moeA2ADescriptorAbortState<ENABLE_ABORT>(abortState, fenceWorkspace);
+    recv_counters_ptr = moeA2ADescriptorPointer<ENABLE_ABORT>(recv_counters_ptr, fenceWorkspace);
+    flag_val = moeA2ADescriptorPointer<ENABLE_ABORT>(flag_val, fenceWorkspace);
     bool const aborted = moeA2AAbortRequested<ENABLE_ABORT>(abortState);
     uint32_t const parity = aborted ? 0 : round_parity(*flag_val);
     if (aborted || token_idx >= recv_counters_ptr[parity * ep_size + source_rank])
@@ -2496,15 +2655,15 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
     int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream,
-    MoeA2AAbortState* abort_state)
+    MoeA2AAbortState* abort_state, MoeA2AFenceWorkspace fenceWorkspace)
 {
     constexpr int kBlockSize = 256;
     int total_tokens = ep_size * max_tokens_per_rank;
     int grid = ceilDiv(total_tokens, kBlockSize);
-    SWITCH_BOOL(abort_state != nullptr, ENABLE_ABORT, {
+    SWITCH_BOOL(abort_state != nullptr || fenceWorkspace.executionDescriptor != nullptr, ENABLE_ABORT, {
         launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel<ENABLE_ABORT>, grid,
             kBlockSize, 0, stream, expert_ids, recv_counters, flag_val, ep_size, max_tokens_per_rank, top_k, invalid_id,
-            abort_state);
+            abort_state, fenceWorkspace);
     });
 }
 

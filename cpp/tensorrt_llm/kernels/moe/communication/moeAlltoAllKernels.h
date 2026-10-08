@@ -85,6 +85,45 @@ struct MoeA2AAbortState
 
 static_assert(sizeof(MoeA2AAbortState) == 2 * sizeof(int32_t));
 
+// Trusted local execution descriptor; neither the table nor its latch is fabric-exported.
+// The owner validates identical rank count, row stride and layout, with disjoint physical banks.
+// Tables and old-bank mappings remain immutable and retained until fenced final shutdown.
+struct MoeA2AFenceDescriptor
+{
+    uintptr_t bankBase;
+    uint64_t activeMask[kRankMaskWords];
+    MoeA2AAbortState* abortState;
+};
+
+static_assert(sizeof(MoeA2AFenceDescriptor) == 6 * sizeof(uint64_t));
+
+struct MoeA2AFenceWorkspace
+{
+    MoeA2AFenceDescriptor const* const* executionDescriptor{nullptr};
+    uintptr_t legacyBase{0};
+};
+
+struct MoeA2AGatherParams
+{
+    void const* source[kMaxPayloads];
+    void* destination[kMaxPayloads];
+    int bytesPerToken[kMaxPayloads];
+    int numPayloads;
+    int epSize;
+    int epRank;
+    int maxTokens;
+    int const* recvCounters;
+    uint32_t const* flagVal;
+    int const* sourceStats;
+    int* destinationStats;
+    int statsExperts;
+    MoeA2AFenceWorkspace fenceWorkspace;
+};
+
+void moe_a2a_fence_latch_descriptor_launch(
+    uintptr_t const* publishedDescriptor, uintptr_t* execution, cudaStream_t stream);
+void moe_a2a_gather_local_launch(MoeA2AGatherParams const& params, cudaStream_t stream);
+
 // Kernel pointers packed into a struct for device access
 // Dispatch kernel pointers - const source data
 struct DispatchKernelPointers
@@ -143,6 +182,7 @@ struct DispatchKernelPointers
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     MoeA2AAbortState* abort_state{nullptr};
+    MoeA2AFenceWorkspace fenceWorkspace{};
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -175,6 +215,7 @@ struct CombineKernelPointers
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     MoeA2AAbortState* abort_state{nullptr};
+    MoeA2AFenceWorkspace fenceWorkspace{};
 };
 
 // Dispatch phase parameters
@@ -249,6 +290,7 @@ struct MoeA2ADispatchParams
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     MoeA2AAbortState* abort_state{nullptr};
+    MoeA2AFenceWorkspace fenceWorkspace{};
 
     // CUDA stream
     cudaStream_t stream;
@@ -341,6 +383,7 @@ struct MoeA2ACombineParams
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     MoeA2AAbortState* abort_state{nullptr};
+    MoeA2AFenceWorkspace fenceWorkspace{};
 
     // CUDA stream
     cudaStream_t stream;
@@ -360,7 +403,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 // invalid_id: value to fill for invalid tokens' expert ids
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
     int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream,
-    MoeA2AAbortState* abort_state = nullptr);
+    MoeA2AAbortState* abort_state = nullptr, MoeA2AFenceWorkspace fenceWorkspace = {});
 
 } // namespace kernels::moe_comm
 
