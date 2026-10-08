@@ -39,7 +39,9 @@ def load_config(path: Path, model: Path) -> dict:
 
     config = yaml.safe_load(path.read_text())
     placement = config.get("moe_config", {}).get("load_balancer")
-    if placement is not None and "initial_global_assignments" not in placement:
+    if placement is not None:
+        placement["layer_updates_per_iter"] = 0
+    if placement is not None and placement.get("initial_global_assignments") is None:
         layout = json.loads((model / "config.json").read_text())
         if layout.get("model_type") == "deepseek_v3" and layout.get("moe_layer_freq", 1) == 1:
             experts, first = layout["n_routed_experts"], layout["first_k_dense_replace"]
@@ -55,7 +57,6 @@ def load_config(path: Path, model: Path) -> dict:
         if experts <= 0 or slots < experts or slots % config["moe_expert_parallel_size"]:
             raise ValueError("Static placement requires expert coverage and equal rank slots")
         placement.update(
-            layer_updates_per_iter=0,
             initial_global_assignments={
                 layer: [slot % experts for slot in range(slots)]
                 for layer in range(first, layout["num_hidden_layers"])
@@ -471,9 +472,6 @@ def run_phase(
             received["target_death"] = time.monotonic() - started
 
     with (directory / "launcher.log").open("x") as log:
-        process = subprocess.Popen(
-            command, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-        )
 
         def wait_for_cleanup(deadline: float, forced: bool = False) -> None:
             while True:
@@ -498,6 +496,10 @@ def run_phase(
                     received["cleanup"] = time.monotonic() - started
                     return
                 time.sleep(min(0.1, _remaining(deadline)))
+
+        process = subprocess.Popen(
+            command, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
 
         try:
             deadline = started + args.startup_timeout_s
@@ -587,23 +589,33 @@ def run_phase(
             wait_for_cleanup(time.monotonic() + args.cleanup_timeout_s)
             validate_fault_evidence(directory, scenario, workers, launcher_mode)
         except (Exception, KeyboardInterrupt) as error:
-            # Evidence storage may be the failure cause; cleanup must still run.
-            with suppress(OSError):
-                record(directory, "intervention", {"error": repr(error), "forced_cleanup": True})
-            cleanup_deadline = time.monotonic() + args.cleanup_timeout_s
+            handlers = {
+                signum: signal.signal(signum, signal.SIG_IGN)
+                for signum in (signal.SIGINT, signal.SIGTERM)
+            }
             try:
-                _stop(process, name, min(cleanup_deadline, time.monotonic() + 20))
-            except Exception as control_error:
+                # Evidence storage may be the failure cause; cleanup must still run.
                 with suppress(OSError):
-                    record(directory, "cleanup_control_error", {"error": repr(control_error)})
-            try:
-                observe(terminate=True, deadline=cleanup_deadline)
-                wait_for_cleanup(cleanup_deadline, forced=True)
-            except Exception as cleanup_error:
-                with suppress(OSError):
-                    record(directory, "cleanup_failed", {"error": repr(cleanup_error)})
-                with suppress(OSError, subprocess.SubprocessError):
-                    _stop(process, name, cleanup_deadline)
+                    record(
+                        directory, "intervention", {"error": repr(error), "forced_cleanup": True}
+                    )
+                cleanup_deadline = time.monotonic() + args.cleanup_timeout_s
+                try:
+                    _stop(process, name, min(cleanup_deadline, time.monotonic() + 20))
+                except Exception as control_error:
+                    with suppress(OSError):
+                        record(directory, "cleanup_control_error", {"error": repr(control_error)})
+                try:
+                    observe(terminate=True, deadline=cleanup_deadline)
+                    wait_for_cleanup(cleanup_deadline, forced=True)
+                except Exception as cleanup_error:
+                    with suppress(OSError):
+                        record(directory, "cleanup_failed", {"error": repr(cleanup_error)})
+                    with suppress(OSError, subprocess.SubprocessError):
+                        _stop(process, name, cleanup_deadline)
+            finally:
+                for signum, handler in handlers.items():
+                    signal.signal(signum, handler)
             raise
         finally:
             record(

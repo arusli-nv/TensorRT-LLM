@@ -281,6 +281,38 @@ def test_static_placement_is_not_fixed_to_ep32(tmp_path: Path, ranks: int) -> No
     )
 
 
+@pytest.mark.parametrize("assignments", [None, {0: [0, 1]}])
+def test_explicit_placement_remains_static(tmp_path: Path, assignments: dict | None) -> None:
+    """Can explicit or null assignments leave dynamic EPLB enabled?"""
+    import yaml
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            dict(
+                model_type="deepseek_v3",
+                n_routed_experts=2,
+                first_k_dense_replace=0,
+                num_hidden_layers=1,
+            )
+        )
+    )
+    config = dict(
+        moe_expert_parallel_size=2,
+        moe_config=dict(
+            load_balancer=dict(
+                num_slots=2,
+                layer_updates_per_iter=1,
+                initial_global_assignments=assignments,
+            )
+        ),
+    )
+    path = tmp_path / "args.yaml"
+    path.write_text(yaml.safe_dump(config))
+    placement = load_config(path, tmp_path)["moe_config"]["load_balancer"]
+    assert placement["layer_updates_per_iter"] == 0
+    assert placement["initial_global_assignments"] == {0: [0, 1]}
+
+
 def test_sigkill_publishes_intent_before_process_death(tmp_path: Path) -> None:
     """Is real process death preceded by a durable, identity-checked injection receipt?"""
     code = """
@@ -692,8 +724,9 @@ def test_user_manager_exemption_requires_full_identity(
         assert fault_injector.owned_processes("run-a", [known]) == [known]
 
 
+@pytest.mark.parametrize("interrupt", [False, True])
 def test_cleanup_backstop_waits_for_owned_step_after_control_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: bool
 ) -> None:
     """Can clean GPU observations hide a Slurm step still draining after cancellation?"""
     monkeypatch.setenv("SLURM_JOB_ID", "123")
@@ -713,13 +746,29 @@ def test_cleanup_backstop_waits_for_owned_step_after_control_timeout(
     process = Mock()
     process.poll.return_value = 1
     monkeypatch.setattr(fault_injection.subprocess, "Popen", lambda *_, **__: process)
-    monkeypatch.setattr(fault_injection, "_stop", Mock(side_effect=TimeoutError("cancel budget")))
+
+    def stop(*_: object) -> None:
+        if interrupt:
+            os.kill(os.getpid(), signal.SIGINT)
+            os.kill(os.getpid(), signal.SIGTERM)
+        raise TimeoutError("cancel budget")
+
+    def interrupted(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt("cleanup interrupted")
+
+    handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
+    monkeypatch.setattr(fault_injection, "_stop", stop)
     monkeypatch.setattr(fault_injection, "_probe", lambda *_, **__: [snapshot()])
     steps = Mock(side_effect=[["123.0"], []])
     monkeypatch.setattr(fault_injection, "_steps", steps)
     monkeypatch.setattr(fault_injection.time, "sleep", Mock())
-    with pytest.raises(AssertionError, match="healthy readiness"):
-        fault_injection.run_phase(args, [snapshot()], "initial", "worker_sigkill_idle")
+    try:
+        with pytest.raises(AssertionError, match="healthy readiness"):
+            fault_injection.run_phase(args, [snapshot()], "initial", "worker_sigkill_idle")
+        assert all(signal.getsignal(sig) == interrupted for sig in handlers)
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
     assert steps.call_count == 2
     assert (tmp_path / "initial" / "cleanup_control_error.json").exists()
     assert not (tmp_path / "initial" / "cleanup_failed.json").exists()

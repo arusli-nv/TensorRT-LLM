@@ -5,85 +5,81 @@ SPDX-License-Identifier: Apache-2.0
 
 # WideEP failure behavior
 
-DeepSeek-R1-0528 NVFP4, GB200/R580, EP32/TP1/attention-DP/PP1, 288 static slots,
-NVLinkOneSided fence, decode graphs `[1,2,4,8]`. CFT, rank-mask FT, optional AlltoAll
-watchdog, overlap and autotuning are off. Native build `ef1b238cff`; Python refreshed
-to main `72688933d5` plus branch fixes. No intervening native changes. CUDA 13.4,
-Open MPI 5.0.10rc2, mpi4py 4.0.0; MPI uses native IPC.
+DeepSeek-R1-0528 NVFP4, GB200/R580, EP32/expert-TP1/attention-DP/PP1, 288 static
+slots, decode graphs `[1,2,4,8]`, NVLinkOneSided fence. CFT, rank-mask FT, optional
+AlltoAll watchdog, overlap and autotuning are off. Open MPI 5.0.10rc2, mpi4py 4.0.0.
+Requests use the local LLM API, not HTTP. Build/source hashes are in the raw evidence.
 
-## Failure and restart paths
+## Scenarios and outcomes
 
-| Rank-2 injection | What happens |
-|---|---|
-| Idle SIGKILL | ULFM reports peer failure → client `RequestError` → rank-crash escalation invokes `MPI_Abort`. Ordinary PMIx launch instead lets Slurm cancel the step, sometimes killing the client before reporting. |
-| SIGKILL after nonfinal streamed output | Same fatal host/process path; GPU work may also wait on the dead peer. Interrupted inference is not resumed. |
-| Fence round incremented by two | Round disagreement → completion wait timeout → device trap/CUDA719 → executor failure/crash escalation → whole-job termination; client `RequestError`. Synthetic kernel-state fault, not device/link loss. |
+Every scenario first completes two healthy requests. Faults target rank 2.
 
-Faulted steps exit 137. The dead worker cannot acknowledge. There is no committed
-survivor agreement or automatic serving restart. `RankCrashKillWatchdog` enforces
-fatal shutdown; it is separate from the optional AlltoAll completion-flag watchdog.
+| Scenario | Injection | Observed failure path |
+|---|---|---|
+| Healthy | No fault; close the model, verify cleanup, start it again | Both launches serve successfully. |
+| Idle kill | SIGKILL between requests; then submit a new request | MPI peer failure → client `RequestError` → rank-crash escalation → `MPI_Abort`. |
+| Streaming kill | SIGKILL after the first nonfinal output of a 256-token stream | Same fatal path; the interrupted stream is not resumed. This targets a client boundary, not an exact GPU phase. |
+| Fence mismatch | Between requests, increment the local fence round by two; then submit a request | Completion wait timeout → trap/CUDA719 → executor failure → whole-job termination and client `RequestError`. This is synthetic, not device/link loss. |
 
-Explicit restart follows the healthy path on the same GPU UUIDs: new workers/CUDA
-contexts → reload weights/setup communication → initial/final warmup and capture →
-serve. Communicators, KV and graphs are recreated; warmup reruns. Faster startup may
-reflect uncontrolled filesystem caches, not graph/state reuse. Before restart,
-cleanup requires no owned steps/processes/zombies or GPU compute processes and
-memory within 64 MiB/GPU of baseline. This does not prove in-place quiescence.
+PRTE daemons use `srun --mpi=none` to avoid Slurm's PMIx cancellation path; ULFM
+reports MPI peer failure. Ordinary PMIx launch can cancel the step before the client
+reports. Faulted steps exit 137. `RankCrashKillWatchdog` enforces shutdown; the AlltoAll flag
+watchdog is separate. Dead workers cannot acknowledge. There is no committed survivor
+agreement or automatic restart.
 
-## Measurements
+## What the times measure
 
-Five consecutive passes per scenario, including healthy restart, total 40 launches.
-Earlier infrastructure failures remain FAIL; affected scenarios restarted
-qualification after investigation. All attempts are retained, with no hidden retries.
+After verified cleanup, the harness starts fresh workers on the same GPU UUIDs.
+Weights reload; communicator setup, warmup and capture rerun. CUDA contexts, KV and
+graphs are recreated. These measure fresh restart, not N−1 recovery.
 
-| Scenario | Client fault request → error | Injection receipt → cleanup | → fresh first response | → fresh readiness |
-|---|---:|---:|---:|---:|
-| Idle kill | 0.064–0.116 s | 44.7–65.8 s | 276.2–305.9 s | 276.8–306.6 s |
-| Streaming kill | 0.057–0.066 s | 45.3–80.0 s | 268.5–311.9 s | 269.3–312.5 s |
-| Fence mismatch | 291.7–293.1 s | 335.6–343.6 s | 569.8–589.3 s | 570.4–590.0 s |
+Baseline `f3bb2c78c1` passed five consecutive trials per scenario, 40 model launches.
+Values below are observed minima and maxima across those five trials.
 
-Healthy initial/restart readiness: 255.2–287.5/222.5–257.1 s. Readiness requires two
-complete greedy, fixed-seed results. Client intervals use a client-local monotonic
-clock; other intervals use one controller's receipt clock, including probe overhead.
-These are not exact GPU failure/detection times. Queue time is separate.
+| Healthy launch | Launch → readiness |
+|---|---:|
+| Initial process start | 255.2 to 287.5 s |
+| New process start after clean shutdown | 222.5 to 257.1 s |
 
-Healthy rank-local initial/restart markers: loading 62.1–69.7/48.6–64.6 s;
-initial-engine warmup 97.7–101.8/93.5–99.4 s; final warmup 6.8–7.6/6.9–7.9 s.
-Capture takes 1.9–2.3 s per pass inside warmup. Do not sum overlapping intervals.
-Process/import/communicator phases lack qualified markers. Result-wait deadlines
-are 30 s for kills and 420 s for fence mismatch, after a separate 15-s injection
-receipt wait. Client intervals above include that wait. Bounds/maxima/margins,
-including valid earlier phases: startup 720/302/418 s; error-to-exit 180/11/169 s;
-clean shutdown-to-exit 180/48.1/131.9 s; exit-to-cleanup 180/81.2/98.8 s.
-Cleanup includes Pyxis deletion.
+| Fault | Client fault request → error | Injection receipt → cleanup | Injection receipt → first restarted result |
+|---|---:|---:|---:|
+| Idle kill | 0.064 to 0.116 s | 44.7 to 65.8 s | 276.2 to 305.9 s |
+| Streaming kill | 0.057 to 0.066 s | 45.3 to 80.0 s | 268.5 to 311.9 s |
+| Fence mismatch | 291.7 to 293.1 s | 335.6 to 343.6 s | 569.8 to 589.3 s |
 
-## Evidence and remaining MVP gates
+Readiness means two complete greedy, fixed-seed requests with checked answers.
+The first result is a complete generation, not a first streamed token. Client error
+times use the client clock. Cleanup/restart times use one controller's file-receipt
+clock. Kill receipts contain intent written before SIGKILL; fence receipts confirm
+completed mutation. Polling and independent probes add delay, so these are not exact
+failure/detection timestamps. Queue time is separate. Filesystem caches are uncontrolled.
 
-- Two-node ULFM revoke/shrink/agree and survivor collectives passed. mpi4py 4.0 exposes
-  them directly. Healthy futures and CUDA-buffer communication passed; full MPI KV
-  transceiver remains unqualified. Death still leaves three futures pending.
-- Idle kill left 31 survivor CUDA contexts usable before abort. Independent rank-0
-  control progressed during MPI/GPU waits. Neither proves drain or graph replay.
-- Loaded replicas cover all 58 MoE layers after loss of ranks `[1,2,29,30,31]`.
-  Rank 16/17 loss removes experts. Coverage alone is not capacity/safety admission.
-- Optional AlltoAll watchdog detected eager held-peer stalls near 5 s; fence mismatch
-  produced downstream stalls without culprit attribution or preventing the trap.
-  Rank-mask graphs remain rejected; EP32 FT startup also hit a deepcopy-lock bug.
-- Live-peer combine-abort controls passed; dispatch, graph replay and dead-issuer
-  safety remain open. Live writers contaminated prematurely reused storage.
-  A synthetic live-worker host `Allgather` error also caused fatal shutdown.
+| Healthy startup phase, rank-local | Initial launch | Clean restart |
+|---|---:|---:|
+| Weight loading | 62.1 to 69.7 s | 48.6 to 64.6 s |
+| Initial-engine warmup | 97.7 to 101.8 s | 93.5 to 99.4 s |
+| Final-engine warmup | 6.8 to 7.6 s | 6.9 to 7.9 s |
 
-Same-graph recovery remains a target. Idle loss needs valid contexts/peer mappings,
-fixed logical ranks/addresses/shapes, repaired host control, replay-visible membership
-and generation, and in-place EPLB routing. Streaming also needs non-trapping escape,
-proven quiescence and safe request/KV handling. Captured masks and affected collectives
-need changes; Python checks do not run during replay. CUDA719 requires fresh contexts.
+Graph capture totals 1.9 to 2.3 s per engine, inside warmup. Do not sum overlapping
+intervals. Process/import/communicator phases lack separate trustworthy markers.
+Earlier infrastructure failures remain FAIL. Their artifacts and calibrated test
+deadlines are retained; they are not included as passing qualification trials.
 
-Two independent PR-ready fixes fail pending RPC requests/preserve fatal causes and
-bound socket close with zero linger. Close may discard undelivered sends. Neither
-repairs MPI communication or suppresses `MPI_Abort`. No recovery is implemented.
+## What remains for recovery
 
-Run commands: [README.md](README.md). Raw evidence stays uncommitted under
-`.wideep-ft-runs/mpi-characterization/`: `prerequisite-proofs/evidence-index.json` and
-`mpi4py4-qualification/{qualification-summary,calibrated-bounds,evidence-index}.json`.
-Runtime/source manifests retain exact hashes. CFT and physical device/link loss are unqualified.
+- Idle kill left 31 survivor contexts usable before abort. ULFM survivor collectives
+  and independent rank-0 control passed isolated tests; neither proves GPU drain/replay.
+- Resident copies cover every expert after losing ranks `[1,2,29,30,31]`. Coverage
+  alone is not capacity/safety admission.
+- Same-graph recovery needs non-trapping escape, proven quiescence, valid mappings,
+  replay-visible membership/generation, repaired host collectives and in-place EPLB.
+  Streaming also needs safe request/KV disposition. Rank-mask graphs are rejected.
+- The optional watchdog did not prevent CUDA719, which requires fresh contexts.
+  Live-peer combine escape passed isolated controls; dispatch/dead-issuer safety remains open.
+
+The separate RPC propagation/socket-cleanup fixes do not prevent MPI abort. MPI KV
+compatibility, CFT and device/link loss remain unqualified. No recovery is implemented.
+
+Run commands: [README.md](README.md). Raw attempts, including failures, stay outside
+Git under `.wideep-ft-runs/mpi-characterization/`: `prerequisite-proofs/evidence-index.json`
+and `mpi4py4-qualification/{qualification-summary,calibrated-bounds,evidence-index}.json`.
