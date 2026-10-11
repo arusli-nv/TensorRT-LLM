@@ -1,19 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import atexit
 import os
 import threading
 from typing import Callable, List, Optional
 
+import zmq
+
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue
+from ..llmapi.utils import AsyncQueue, _SyncQueue
 from ..logger import logger
 from .postproc_worker import PostprocWorker
 from .request import GenerationRequest
 from .result import GenerationResult
-from .rpc import RPCClient
+from .rpc import RPCClient, RPCError
 from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, is_llm_response
+from .utils import EngineDeadError, ErrorResponse, is_llm_response
 
 
 class RpcExecutorMixin:
@@ -82,11 +86,13 @@ class RpcExecutorMixin:
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         request.set_id(self._get_next_client_id())
-        logprob_params = self._get_logprob_params(request)
+        return self._submit_request(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
+    def _submit_request(self, request: GenerationRequest) -> GenerationResult:
+        """Register a result before sending a request with its assigned client ID."""
+        if self._fatal_error is not None:
+            raise EngineDeadError(self._fatal_error)
+        logprob_params = self._get_logprob_params(request)
 
         result = GenerationResult(
             request,
@@ -97,7 +103,37 @@ class RpcExecutorMixin:
         )
         self._results[request.id] = result
 
+        # A stream failure can snapshot pending results during registration.
+        if self._fatal_error is not None:
+            self._results.pop(request.id, None)
+            raise EngineDeadError(self._fatal_error)
+
+        sent = False
+        try:
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
+            sent = True
+        except (RPCError, zmq.ZMQError) as error:
+            self._set_fatal_error(error)
+            raise EngineDeadError(self._fatal_error) from error
+        finally:
+            if not sent:
+                self._results.pop(request.id, None)
+
         return result
+
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Keep the first fatal error and wake every pending RPC result."""
+        already_failed = self._fatal_error is not None
+        super()._set_fatal_error(error)
+        if already_failed:
+            return
+        dead_error = EngineDeadError(self._fatal_error)
+        for result in list(self._results.values()):
+            try:
+                result.queue.put(dead_error)
+            except (AsyncQueue.EventLoopShutdownError, RuntimeError) as queue_error:
+                logger.debug(f"Cannot notify RPC result on closed event loop: {queue_error}")
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
         async_queues = []
@@ -147,7 +183,7 @@ class RpcExecutorMixin:
 
     async def _generic_fetch_loop_async(
         self, fetch_method_name: str, handler_method: Callable, method_name: str
-    ):
+    ) -> None:
         """Generic method for fetching data in a loop from RPC worker.
 
         Args:
@@ -163,16 +199,28 @@ class RpcExecutorMixin:
                 handler_method(data)
         except asyncio.CancelledError:
             logger.debug(f"{method_name} task cancelled")
+            raise
         except Exception as e:
             logger.error(f"Error in {method_name}: {e}")
             raise
 
-    async def _fetch_responses_loop_async(self):
-        await self._generic_fetch_loop_async(
-            fetch_method_name="fetch_responses_loop_async",
-            handler_method=self.handle_responses,
-            method_name="_fetch_responses_loop_async",
-        )
+    async def _fetch_responses_loop_async(self) -> None:
+        try:
+            await self._generic_fetch_loop_async(
+                fetch_method_name="fetch_responses_loop_async",
+                handler_method=self.handle_responses,
+                method_name="_fetch_responses_loop_async",
+            )
+        except asyncio.CancelledError:
+            if not self._shutdown_event.is_set():
+                self._set_fatal_error(RuntimeError("RPC response task cancelled unexpectedly"))
+            return
+        except Exception as error:  # noqa: BLE001 - terminal response-stream boundary
+            if not self._shutdown_event.is_set():
+                self._set_fatal_error(error)
+        else:
+            if not self._shutdown_event.is_set():
+                self._set_fatal_error(RuntimeError("RPC response stream closed unexpectedly"))
 
     # NOTE: _fetch_stats_loop_async and _fetch_kv_cache_events_loop_async have been removed.
     # Stats and kv_events are now fetched on-demand via direct RPC calls
