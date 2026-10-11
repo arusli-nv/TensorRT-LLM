@@ -482,3 +482,33 @@ def test_len_returns_moe_world_size_not_active_count() -> None:
 def test_ep_mask_num_words_constant_default_value() -> None:
     """Lock in the kernel-ABI default. If this changes, kMaxRanks must too."""
     assert EP_MASK_NUM_WORDS == 4
+
+
+# ---------------------------------------------------------------------------
+# Recovery commits
+# ---------------------------------------------------------------------------
+
+
+def test_commit_failed_returns_new_generation() -> None:
+    """A recovery commit excludes the rank and returns the bumped generation."""
+    h = EPGroupHealth(4)
+    assert h.commit_failed(2, expected_generation=0) == 1
+    assert h.snapshot() == EPGroupHealthSnapshot(
+        mask=0b1011, active_count=3, failed_ranks=frozenset({2}), generation=1
+    )
+    assert h.commit_failed(3, expected_generation=1) == 2
+    assert h.get_failed_ranks() == frozenset({2, 3})
+
+
+def test_commit_failed_rejects_stale_generation_and_repeats() -> None:
+    """Commits against another membership or of a failed rank fail without changes."""
+    h = EPGroupHealth(4)
+    h.mark_failed(1)
+    before = h.snapshot()
+    with pytest.raises(RuntimeError, match="generation"):
+        h.commit_failed(2, expected_generation=0)
+    with pytest.raises(RuntimeError, match="already failed"):
+        h.commit_failed(1, expected_generation=1)
+    with pytest.raises(ValueError):
+        h.commit_failed(4, expected_generation=1)
+    assert h.snapshot() == before

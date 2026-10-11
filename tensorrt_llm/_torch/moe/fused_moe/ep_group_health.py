@@ -143,11 +143,46 @@ class EPGroupHealth:
         with self._lock:
             if not self._active_mask & bit:
                 return False
-            self._active_mask &= ~bit
-            self._active_count -= 1
-            self._failed_ranks.add(rank)
-            self._generation += 1
+            self._mark_failed_locked(rank)
             return True
+
+    def commit_failed(self, rank: int, expected_generation: int) -> int:
+        """Commit the exclusion of one active rank against an expected generation.
+
+        Unlike :meth:`mark_failed`, this is a recovery commit: it fails instead
+        of silently succeeding when the membership is not the one the caller
+        agreed on, so concurrent or repeated commits cannot go unnoticed.
+
+        Args:
+            rank: Index of the rank to exclude, in ``[0, moe_world_size)``.
+            expected_generation: The :attr:`generation` the caller's recovery
+                decision was based on.
+
+        Returns:
+            The new generation.
+
+        Raises:
+            ValueError: If ``rank`` is outside ``[0, moe_world_size)``.
+            RuntimeError: If the current generation differs from
+                ``expected_generation`` or ``rank`` is already failed.
+        """
+        self._validate_rank(rank)
+        with self._lock:
+            if self._generation != expected_generation:
+                raise RuntimeError(
+                    f"EP membership generation is {self._generation}, "
+                    f"expected {expected_generation}"
+                )
+            if not self._active_mask & (1 << rank):
+                raise RuntimeError(f"EP rank {rank} is already failed")
+            self._mark_failed_locked(rank)
+            return self._generation
+
+    def _mark_failed_locked(self, rank: int) -> None:
+        self._active_mask &= ~(1 << rank)
+        self._active_count -= 1
+        self._failed_ranks.add(rank)
+        self._generation += 1
 
     def mark_active(self, rank: int) -> bool:
         """Mark ``rank`` as active. Idempotent.

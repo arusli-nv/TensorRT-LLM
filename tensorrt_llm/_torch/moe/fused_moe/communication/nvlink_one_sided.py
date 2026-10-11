@@ -27,7 +27,7 @@ NVLINK One-Sided supports post-quant dispatch.
 import os
 import re
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import pynvml
 import torch
@@ -50,6 +50,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication
+
+if TYPE_CHECKING:
+    from .execution_state import MoeExecutionState
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
@@ -250,6 +253,7 @@ class NVLinkOneSided(Communication):
         eplb_stats_num_experts: Optional[int] = None,
         extra_payload_bytes_per_token: int = 0,
         can_use_cft_counted_writes: bool = False,
+        fixed_source_slots: bool = False,
     ) -> int:
         can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
         element_size = dtype.itemsize
@@ -282,6 +286,9 @@ class NVLinkOneSided(Communication):
         # extra payload bytes per token
         workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
         workspace_size = pad_up(workspace_size, 128)
+        # Descriptor execution aligns every payload of each source slot separately.
+        if fixed_source_slots:
+            workspace_size += ep_size * NVLinkOneSided.MAX_PAYLOADS * 128
 
         return workspace_size
 
@@ -351,7 +358,7 @@ class NVLinkOneSided(Communication):
                 CFT for supported workloads (0 forces the fence path).
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
-                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
+                detection never mutates it. CUDA graphs are rejected unless bound to a ``MoeExecutionState``.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -430,6 +437,7 @@ class NVLinkOneSided(Communication):
                 dtype,
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
                 can_use_cft_counted_writes=self.can_use_cft_counted_writes,
+                fixed_source_slots=ep_group_health is not None,
             )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
@@ -531,6 +539,7 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
+        self._execution_state: "MoeExecutionState | None" = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -592,6 +601,26 @@ class NVLinkOneSided(Communication):
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
+
+    def bind_execution_state(self, state: "MoeExecutionState") -> None:
+        """Run every later dispatch/combine through the state's graph-latched descriptor.
+
+        Descriptor execution uses the fence path with fixed per-source dispatch
+        slots, so CUDA graphs captured afterwards stay valid when the state
+        installs a new rank mask. The state keeps the workspace mapped.
+        """
+        if self._execution_state is state:
+            return
+        if self._execution_state is not None:
+            raise RuntimeError("NVLinkOneSided is already bound to an execution state")
+        if self.can_use_cft_counted_writes:
+            raise ValueError("Descriptor execution requires the fence path; CFT is enabled")
+        if state.health is not self.ep_group_health:
+            raise ValueError("Execution state and communicator track different EP membership")
+        if self._dispatch_state.get("phase") != "idle":
+            raise RuntimeError("Cannot bind an execution state during a dispatch/combine pair")
+        state.retain(self.mnnvl_mem)
+        self._execution_state = state
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
@@ -811,11 +840,23 @@ class NVLinkOneSided(Communication):
     def _check_dispatch_region(self, payloads: List[torch.Tensor], max_tokens: int) -> int:
         if not 0 < max_tokens <= self.max_num_tokens_per_rank:
             raise ValueError("runtime token count exceeds the configured A2A capacity")
-        end = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
-        for payload in payloads:
-            end = pad_up(
-                end + self.ep_size * max_tokens * payload.shape[1] * payload.element_size(), 128
+        start = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
+        if self._execution_state is None:
+            end = start
+            for payload in payloads:
+                end = pad_up(
+                    end + self.ep_size * max_tokens * payload.shape[1] * payload.element_size(),
+                    128,
+                )
+        else:
+            # Must match the native fixed per-source slot layout of descriptor execution.
+            source_stride = sum(
+                pad_up(
+                    self.max_num_tokens_per_rank * payload.shape[1] * payload.element_size(), 128
+                )
+                for payload in payloads
             )
+            end = start + self.ep_size * source_stride
         limit = self._workspace_state.get("combine_storage_offset", self.workspace_size_per_rank)
         # Check before the native dispatch can write into any peer's memory.
         if end > limit:
@@ -855,7 +896,9 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        state = self._execution_state
+        if state is None:
+            reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -911,11 +954,14 @@ class NVLinkOneSided(Communication):
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 active_rank_mask,
+                **(state.dispatch_kwargs() if state is not None else {}),
             )
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "dispatch", active_rank_mask
-        )
+        # Graph replays bypass the host watchdog; bound kernels time out on the device instead.
+        if state is None:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "dispatch", active_rank_mask
+            )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
@@ -950,6 +996,7 @@ class NVLinkOneSided(Communication):
                 self.moe_a2a_metainfo,
                 self.ep_rank,
                 int(self.invalid_token_expert_id),
+                **(state.dispatch_kwargs() if state is not None else {}),
             )
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends
@@ -1002,7 +1049,9 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        state = self._execution_state
+        if state is None:
+            reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1063,10 +1112,12 @@ class NVLinkOneSided(Communication):
             use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
+            **(state.combine_kwargs() if state is not None else {}),
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "combine", active_rank_mask
-        )
+        if state is None:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "combine", active_rank_mask
+            )
 
         # Reset state for next round
         self.reset_state()

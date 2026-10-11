@@ -261,6 +261,7 @@ class _MnnvlAllocationRecord:
     comm_signature: tuple[int, ...] = ()
     state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
     pending_comm: Any = None
+    pin_count: int = 0
 
 
 class MnnvlMemory:
@@ -324,6 +325,23 @@ class MnnvlMemory:
     def mapped(self) -> bool:
         """Whether the allocation is mapped and ready for data-path access."""
         return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
+
+    def pin(self) -> None:
+        """Keep the allocation mapped until the matching :meth:`unpin`.
+
+        Captured CUDA graphs address the mapping directly, so checkpointing and
+        closing do not unmap a pinned allocation.
+        """
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            raise RuntimeError(f"Cannot pin MNNVL allocation in {record.state.value} state")
+        record.pin_count += 1
+
+    def unpin(self) -> None:
+        record = type(self).allocated_map[self.ptr]
+        if record.pin_count == 0:
+            raise RuntimeError("MNNVL allocation is not pinned")
+        record.pin_count -= 1
 
     def as_torch_strided_tensor(self, dtype):
         # Describe the allocation with the layout it was created under, recorded at
@@ -808,6 +826,9 @@ class MnnvlMemory:
                 f"Skipping cleanup of MNNVL allocation in terminal state {record.state.value}"
             )
             return
+        if record.pin_count:
+            logger.warning("Retaining pinned MNNVL allocation")
+            return
         cls.allocated_map.pop(ptr)
         if record.state is _MnnvlAllocationState.MAPPED:
             cls._unmap_and_release_handles(record)
@@ -862,6 +883,8 @@ class MnnvlMemory:
             return
         if record.state is not _MnnvlAllocationState.MAPPED:
             raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
+        if record.pin_count:
+            raise RuntimeError("Cannot checkpoint a pinned MNNVL allocation")
         record.state = _MnnvlAllocationState.PREPARING
         try:
             torch.cuda.synchronize()

@@ -51,6 +51,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
+from .wide_ep_ft import EP_GROUP_HEALTH_KEY
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
 # layer_idx + load balancer) and must be mirrored onto the backend after
@@ -340,7 +341,10 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            backend_model_config = copy.deepcopy(model_config)
+            # The backend copy must share the model's EP membership object.
+            health = model_config.extra_attrs.get(EP_GROUP_HEALTH_KEY)
+            memo = {} if health is None else {id(health): health}
+            backend_model_config = copy.deepcopy(model_config, memo)
             backend_model_config.quant_config = override_quant_config
 
         with self._temporarily_skip_weight_creation(backend_model_config):

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any, Optional
 
@@ -27,18 +28,30 @@ from tensorrt_llm._torch.alltoall_watchdog import (
 from .ep_group_health import EPGroupHealth
 
 _ENABLE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
+_RECOVERY_ENV = "TLLM_WIDEEP_RECOVERY"
 _TIMEOUT_ENV = "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S"
 _POLL_INTERVAL_ENV = "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S"
 
 # This object contains membership committed by higher-layer recovery
 # coordination.  Detection threads must treat it as read-only.
-_HEALTH_KEY = "wide_ep_ft_ep_group_health"
+EP_GROUP_HEALTH_KEY = "wide_ep_ft_ep_group_health"
 _TIMEOUT_KEY = "alltoall_watchdog_timeout_s"
 _POLL_INTERVAL_KEY = "alltoall_watchdog_poll_interval_s"
 
 
 def _env_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV) == "1"
+
+
+@functools.cache
+def recovery_enabled() -> bool:
+    """Whether WideEP worker-loss recovery is enabled for this process.
+
+    Recovery executes NVLinkOneSided through a model-owned
+    ``MoeExecutionState`` whose graph-latched descriptor carries the rank mask,
+    so CUDA graphs stay valid across membership changes.
+    """
+    return bool(os.environ.get(_RECOVERY_ENV))
 
 
 def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) -> float:
@@ -60,21 +73,23 @@ def get_wide_ep_ft_options(
     one process-local membership object shared by all MoE communication layers.
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
-    committed membership directly. Rank-mask mode rejects CUDA graphs until
-    generation-scoped invalidation and recapture are implemented.
+    committed membership directly. Rank-mask mode rejects CUDA graphs unless
+    recovery is enabled, in which case every NVLinkOneSided layer must be bound
+    to a ``MoeExecutionState`` before capture.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
-    health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
-    rank_mask_enabled = health is not None or _env_enabled()
-    if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
+    health = extra_attrs.get(EP_GROUP_HEALTH_KEY)
+    recovery = recovery_enabled()
+    rank_mask_enabled = health is not None or _env_enabled() or recovery
+    if rank_mask_enabled and not recovery and getattr(model_config, "use_cuda_graph", False):
         raise ValueError(
             "WideEP fault tolerance does not support CUDA graphs until generation-scoped "
             "invalidation and recapture are implemented"
         )
     if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)
-        extra_attrs[_HEALTH_KEY] = health
+        extra_attrs[EP_GROUP_HEALTH_KEY] = health
 
     poll_interval_s = _float_option(
         extra_attrs,
