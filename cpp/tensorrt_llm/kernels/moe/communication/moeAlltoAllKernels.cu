@@ -443,11 +443,68 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
     }
 }
 
-__global__ void moeA2APrepareDispatchKernel(
-    int* send_counters, int* recv_counters, int* local_token_counter, int ep_size, uint32_t* flag_val_ptr)
+template <bool ENABLE_ABORT>
+__device__ __forceinline__ bool moeA2AAbortRequested(MoeA2AAbortState* abortState)
+{
+    if constexpr (ENABLE_ABORT)
+    {
+        if (abortState == nullptr)
+        {
+            return false;
+        }
+        int32_t requested;
+        int32_t status;
+        asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(requested) : "l"(&abortState->requested));
+        asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(status) : "l"(&abortState->status));
+        if (requested != 0)
+        {
+            atomicCAS(&abortState->status, MoeA2AAbortState::kHealthy, MoeA2AAbortState::kCancelled);
+        }
+        return requested != 0 || status != 0;
+    }
+    return false;
+}
+
+template <bool ENABLE_ABORT>
+__device__ __forceinline__ bool moeA2AAbortCta(MoeA2AAbortState* abortState)
+{
+    if constexpr (ENABLE_ABORT)
+    {
+        if (abortState == nullptr)
+        {
+            return false;
+        }
+        __shared__ bool aborted;
+        if (threadIdx.x == 0)
+        {
+            aborted = moeA2AAbortRequested<true>(abortState);
+        }
+        __syncthreads();
+        return aborted;
+    }
+    return false;
+}
+
+__device__ __forceinline__ void moeA2AAbortComplete()
+{
+#if TLLM_MOE_A2A_COMPILE_SM90
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <bool ENABLE_ABORT>
+__global__ void moeA2APrepareDispatchKernel(int* send_counters, int* recv_counters, int* local_token_counter,
+    int ep_size, uint32_t* flag_val_ptr, MoeA2AAbortState* abortState)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
+#endif
+    if (moeA2AAbortCta<ENABLE_ABORT>(abortState))
+    {
+        moeA2AAbortComplete();
+        return;
+    }
+#if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -510,6 +567,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #if TLLM_MOE_A2A_COMPILE_SM90
         cudaGridDependencySynchronize();
 #endif
+        if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+        {
+            moeA2AAbortComplete();
+            return;
+        }
         if (thread_idx < TOP_K)
         {
             route_dispatch_token<TOP_K, ENABLE_RANK_MASK>(token_selected_experts, ptrs, local_token_idx, ep_size,
@@ -540,6 +602,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         }
 
         __syncthreads();
+    }
+    if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+    {
+        moeA2AAbortComplete();
+        return;
     }
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
@@ -645,7 +712,12 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         continue;
                     }
                 }
+                if (moeA2AAbortRequested<ENABLE_RANK_MASK>(ptrs.abort_state))
+                {
+                    return;
+                }
                 bool flag_set = false;
+                bool aborted = false;
                 auto s = clock64();
                 do
                 {
@@ -660,13 +732,26 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                     flag_set = flag_value == expected_value;
-                } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
+                    aborted = moeA2AAbortRequested<ENABLE_RANK_MASK>(ptrs.abort_state);
+                } while (!flag_set && !aborted && !check_timeout(s, ptrs.timeout_cycles));
 
+                if (aborted)
+                {
+                    return;
+                }
                 if (__builtin_expect(!flag_set, 0))
                 {
                     printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
                         peer_rank);
-                    asm volatile("trap;");
+                    if (ENABLE_RANK_MASK && ptrs.abort_state != nullptr)
+                    {
+                        atomicCAS(
+                            &ptrs.abort_state->status, MoeA2AAbortState::kHealthy, MoeA2AAbortState::kFenceTimeout);
+                    }
+                    else
+                    {
+                        asm volatile("trap;");
+                    }
                     return;
                 }
             }
@@ -1160,9 +1245,12 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
     // NOTE: LE counters are NOT zeroed between iterations. They grow monotonically.
     // Cumulative baselines in regular device memory track the expected value.
 
-    launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
-        params.stream, params.send_counters, params.recv_counters[params.ep_rank], params.local_token_counter,
-        params.ep_size, params.flag_val);
+    TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes));
+    SWITCH_BOOL(params.abort_state != nullptr, ENABLE_ABORT, {
+        launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel<ENABLE_ABORT>, 1,
+            params.ep_size, 0, params.stream, params.send_counters, params.recv_counters[params.ep_rank],
+            params.local_token_counter, params.ep_size, params.flag_val, params.abort_state);
+    });
 }
 
 // ============================================================================
@@ -1171,6 +1259,7 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 {
+    TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes));
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -1188,6 +1277,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
+    kernel_ptrs.abort_state = params.abort_state;
 
     // Fill source data pointers and payload sizes
     for (int i = 0; i < params.num_payloads; i++)
@@ -1702,14 +1792,21 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 
 // LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
 // LOW_PRECISION=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
-template <bool LOW_PRECISION, typename SrcT>
+template <bool LOW_PRECISION, typename SrcT, bool ENABLE_ABORT>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
     int source_stride_per_token, int workspace_stride_per_token, int prepare_first_token, int prepare_num_tokens,
-    uint8_t* region_c_base, int ep_rank)
+    uint8_t* region_c_base, int ep_rank, MoeA2AAbortState* abortState)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
+#endif
+    if (moeA2AAbortCta<ENABLE_ABORT>(abortState))
+    {
+        moeA2AAbortComplete();
+        return;
+    }
+#if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
@@ -1794,6 +1891,11 @@ __global__ void moeA2ACombineKernel(
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
+    if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+    {
+        moeA2AAbortComplete();
+        return;
+    }
 
 #if !DISABLE_SYNC_FOR_PROFILING
     // In-kernel readiness synchronization at start of combine:
@@ -1837,9 +1939,15 @@ __global__ void moeA2ACombineKernel(
                     continue;
             }
             bool flag_set = false;
+            bool aborted = false;
             auto s = clock64();
             do
             {
+                aborted = moeA2AAbortRequested<ENABLE_RANK_MASK>(ptrs.abort_state);
+                if (aborted)
+                {
+                    break;
+                }
                 uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
                 uint32_t flag_value;
                 // Acquire load to ensure visibility of peer's release-store
@@ -1854,11 +1962,18 @@ __global__ void moeA2ACombineKernel(
                 flag_set = flag_value == expected_value;
             } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
 
-            if (__builtin_expect(!flag_set, 0))
+            if (__builtin_expect(!flag_set && !aborted, 0))
             {
                 printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id, peer_rank);
-                asm volatile("trap;");
-                return;
+                if (ENABLE_RANK_MASK && ptrs.abort_state != nullptr)
+                {
+                    atomicCAS(&ptrs.abort_state->status, MoeA2AAbortState::kHealthy, MoeA2AAbortState::kFenceTimeout);
+                }
+                else
+                {
+                    asm volatile("trap;");
+                    return;
+                }
             }
         }
 #if TLLM_MOE_A2A_COMPILE_SM90
@@ -1871,8 +1986,19 @@ __global__ void moeA2ACombineKernel(
     __syncthreads();
 #endif
 
-    if (local_num_tokens == 0)
+    if (moeA2AAbortCta<ENABLE_RANK_MASK>(ptrs.abort_state))
+    {
+        moeA2AAbortComplete();
         return;
+    }
+    if (local_num_tokens == 0)
+    {
+        if (ENABLE_RANK_MASK && ptrs.abort_state != nullptr)
+        {
+            moeA2AAbortComplete();
+        }
+        return;
+    }
 
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
     vectorized_combine<TOP_K, T, InputT>(
@@ -2149,14 +2275,17 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     // Zeroing them here (after dispatch's fabric puts) corrupts subsequent counter increments
     // because cudaDeviceSynchronize does NOT wait for fabric engine completion.
 
-    SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
-        SWITCH_DTYPE(params.dtype, SrcT, {
-            auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT>;
-            launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
-                recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
-                params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
-                params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens, region_c_base,
-                params.ep_rank);
+    TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine));
+    SWITCH_BOOL(params.abort_state != nullptr, ENABLE_ABORT, {
+        SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
+            SWITCH_DTYPE(params.dtype, SrcT, {
+                auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT, ENABLE_ABORT>;
+                launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+                    recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
+                    params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
+                    params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens,
+                    region_c_base, params.ep_rank, params.abort_state);
+            });
         });
     });
 }
@@ -2165,8 +2294,25 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
 // Combine Launch Function
 // ============================================================================
 
+// One CTA decides once whether to zero the whole tensor. Later cancellation belongs to the next observer.
+__global__ void moeA2AFinalizeAbortOutputKernel(uint8_t* output, int64_t bytes, MoeA2AAbortState* abortState)
+{
+#if TLLM_MOE_A2A_COMPILE_SM90
+    cudaGridDependencySynchronize();
+#endif
+    if (moeA2AAbortCta<true>(abortState))
+    {
+        for (int64_t i = threadIdx.x; i < bytes; i += blockDim.x)
+        {
+            output[i] = 0;
+        }
+    }
+    moeA2AAbortComplete();
+}
+
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 {
+    TLLM_CHECK(params.abort_state == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine));
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -2259,6 +2405,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Prepare kernel pointers struct for combine
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
+    kernel_ptrs.abort_state = params.abort_state;
 
     // Set output data pointer in src_data_ptrs[0]
     kernel_ptrs.src_data_ptrs[0] = params.output_data;
@@ -2298,11 +2445,21 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             });
         });
     });
+    if (params.abort_state != nullptr)
+    {
+        constexpr int kFinalizeThreads = 256;
+        int64_t const bytes = static_cast<int64_t>(params.local_num_tokens) * params.elements_per_token
+            * tensorrt_llm::common::getDTypeSize(params.dtype);
+        launchWithPdlWhenEnabled("moeA2AFinalizeAbortOutputKernel", moeA2AFinalizeAbortOutputKernel, 1,
+            kFinalizeThreads, 0, params.stream, static_cast<uint8_t*>(params.output_data), bytes, params.abort_state);
+    }
 }
 
 // Kernel to sanitize expert ids for invalid tokens
+template <bool ENABLE_ABORT>
 __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t const* recv_counters_ptr,
-    uint32_t const* flag_val, int ep_size, int max_tokens_per_rank, int top_k, int32_t invalid_id)
+    uint32_t const* flag_val, int ep_size, int max_tokens_per_rank, int top_k, int32_t invalid_id,
+    MoeA2AAbortState* abortState)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_tokens = ep_size * max_tokens_per_rank;
@@ -2316,8 +2473,9 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-    uint32_t const parity = round_parity(*flag_val);
-    if (token_idx >= recv_counters_ptr[parity * ep_size + source_rank])
+    bool const aborted = moeA2AAbortRequested<ENABLE_ABORT>(abortState);
+    uint32_t const parity = aborted ? 0 : round_parity(*flag_val);
+    if (aborted || token_idx >= recv_counters_ptr[parity * ep_size + source_rank])
     {
         int32_t* token_expert_ids = expert_ids_ptr + tid * top_k;
         // Vectorized invalid-id fill: 16B (int4) stores when top_k is a multiple of 4
@@ -2342,13 +2500,17 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
 }
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
-    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream)
+    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream,
+    MoeA2AAbortState* abort_state)
 {
     constexpr int kBlockSize = 256;
     int total_tokens = ep_size * max_tokens_per_rank;
     int grid = ceilDiv(total_tokens, kBlockSize);
-    launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
-        stream, expert_ids, recv_counters, flag_val, ep_size, max_tokens_per_rank, top_k, invalid_id);
+    SWITCH_BOOL(abort_state != nullptr, ENABLE_ABORT, {
+        launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel<ENABLE_ABORT>, grid,
+            kBlockSize, 0, stream, expert_ids, recv_counters, flag_val, ep_size, max_tokens_per_rank, top_k, invalid_id,
+            abort_state);
+    });
 }
 
 } // namespace kernels::moe_comm
