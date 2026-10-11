@@ -722,3 +722,101 @@ def test_server_close_is_a_noop_without_a_global_executor(
     MPINodeState._global_comm_executor = None
     # Must not touch MPI at all (no abort callable is even constructed).
     RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
+
+
+class _FakeMPIException(Exception):
+
+    def __init__(self, error_class: int) -> None:
+        super().__init__(f"MPI error class {error_class}")
+        self.error_class = error_class
+
+    def Get_error_class(self) -> int:
+        return self.error_class
+
+
+@pytest.fixture
+def _fake_ulfm_mpi(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    fake_mpi = SimpleNamespace(Exception=_FakeMPIException,
+                               ERR_PROC_FAILED=75,
+                               ERR_PROC_FAILED_PENDING=76,
+                               ERR_REVOKED=77)
+    monkeypatch.setattr(mpi_session, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(mpi_session,
+                        "mpi4py",
+                        SimpleNamespace(MPI=fake_mpi),
+                        raising=False)
+    monkeypatch.setattr(mpi_session, "mpi_rank", lambda: 0)
+    return fake_mpi
+
+
+def _async_failure(exc: BaseException):
+    from concurrent.futures import Future
+
+    future = Future()
+    future.set_exception(exc)
+    return future
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("recovery", [False, True])
+def test_server_async_callback_departed_peer(monkeypatch: pytest.MonkeyPatch,
+                                             _fake_ulfm_mpi, recovery: bool):
+    """Departed peers are not forwarded only when recovery is enabled.
+
+    Any other worker failure is still forwarded to the client.
+    """
+    from concurrent.futures import BrokenExecutor
+
+    if recovery:
+        monkeypatch.setenv("TLLM_WIDEEP_RECOVERY", "tcp://127.0.0.1:1")
+    else:
+        monkeypatch.delenv("TLLM_WIDEEP_RECOVERY", raising=False)
+    server = object.__new__(RemoteMpiCommSessionServer)
+    sent = []
+    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
+
+    departed = [
+        _FakeMPIException(75),
+        _FakeMPIException(77),
+        BrokenExecutor("manager lost a worker")
+    ]
+    for exc in departed:
+        server.mpi_async_error_callback(_async_failure(exc))
+    assert len(sent) == (0 if recovery else len(departed))
+
+    sent.clear()
+    server.mpi_async_error_callback(_async_failure(_FakeMPIException(16)))
+    server.mpi_async_error_callback(_async_failure(RuntimeError("segfault")))
+    assert len(sent) == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("recovery", [False, True])
+def test_task_end_barrier_tolerates_departed_peer_with_recovery(
+        monkeypatch: pytest.MonkeyPatch, _fake_ulfm_mpi,
+        recovery: bool) -> None:
+    from tensorrt_llm.llmapi import mpi_session
+
+    if recovery:
+        monkeypatch.setenv("TLLM_WIDEEP_RECOVERY", "tcp://127.0.0.1:1")
+    else:
+        monkeypatch.delenv("TLLM_WIDEEP_RECOVERY", raising=False)
+    error = _FakeMPIException(75)
+
+    def failing_barrier():
+        raise error
+
+    monkeypatch.setattr(mpi_session, "mpi_barrier", failing_barrier)
+    if recovery:
+        RemoteMpiCommSessionServer._finish_barrier()
+    else:
+        with pytest.raises(_FakeMPIException):
+            RemoteMpiCommSessionServer._finish_barrier()
+
+    error.error_class = 16
+    with pytest.raises(_FakeMPIException):
+        RemoteMpiCommSessionServer._finish_barrier()

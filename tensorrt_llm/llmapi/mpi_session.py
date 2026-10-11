@@ -11,7 +11,8 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import (BrokenExecutor, Future, ThreadPoolExecutor,
+                                as_completed)
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
@@ -30,6 +31,34 @@ if ENABLE_MULTI_DEVICE:
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
+
+# Set when idle worker-loss recovery is enabled; see
+# ``_is_departed_peer_failure``.
+_RECOVERY_ENV = "TLLM_WIDEEP_RECOVERY"
+_PEER_FAILURE_ERROR_NAMES = ("ERR_PROC_FAILED", "ERR_PROC_FAILED_PENDING",
+                             "ERR_REVOKED")
+
+
+def _is_departed_peer_failure(exc: BaseException) -> bool:
+    """Whether *exc* only reports a departed MPI peer while recovery is on.
+
+    Such failures are left to the surviving ranks' recovery path instead of
+    tearing down the session: an MPI error of class ``ERR_PROC_FAILED`` or
+    ``ERR_REVOKED`` (ULFM), or a ``BrokenExecutor`` from the mpi4py futures
+    manager, which breaks once it loses contact with a departed worker.
+    """
+    if not os.environ.get(_RECOVERY_ENV):
+        return False
+    if isinstance(exc, BrokenExecutor):
+        return True
+    if not ENABLE_MULTI_DEVICE or not isinstance(exc, mpi4py.MPI.Exception):
+        return False
+    peer_failure_classes = {
+        getattr(mpi4py.MPI, name, None)
+        for name in _PEER_FAILURE_ERROR_NAMES
+    } - {None}
+    return exc.Get_error_class() in peer_failure_classes
+
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
@@ -919,7 +948,23 @@ class RemoteMpiCommSessionServer():
             logger_debug(
                 f"MpiCommSession rank{mpi_rank()} task [{task}] finished\n",
                 "green")
+            RemoteMpiCommSessionServer._finish_barrier()
+
+    @staticmethod
+    def _finish_barrier() -> None:
+        """Wait for all ranks to finish the task.
+
+        With recovery enabled, a departed rank does not fail the survivors'
+        task.
+        """
+        try:
             mpi_barrier()
+        except mpi4py.MPI.Exception as e:
+            if not _is_departed_peer_failure(e):
+                raise
+            logger.warning(
+                f"MpiCommSession rank{mpi_rank()} skipped the task-end "
+                f"barrier after a peer departed: {e}")
 
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
@@ -1058,6 +1103,11 @@ class RemoteMpiCommSessionServer():
             return
         exc = future.exception()
         if exc is None:
+            return
+        if _is_departed_peer_failure(exc):
+            logger.warning(
+                "RemoteMpiCommSessionServer: MPI worker departed; leaving "
+                f"recovery to the survivors: {type(exc).__name__}: {exc}")
             return
         print_colored(
             f"RemoteMpiCommSessionServer: async MPI worker failed, forwarding "
