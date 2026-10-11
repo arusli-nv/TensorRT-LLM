@@ -161,16 +161,13 @@ def test_registered_combine_preserves_first_status(a2a: _A2ATensors) -> None:
     assert torch.count_nonzero(output) == 0
 
 
-def test_registered_descriptor_snapshot_and_bank_switch(a2a: _A2ATensors) -> None:
+def test_registered_descriptor_snapshot_and_state_switch(a2a: _A2ATensors) -> None:
+    """Does a captured graph read the mask and abort record latched at each replay?"""
     workspace, meta, state, _, payload = a2a
-    bank1 = torch.empty_like(workspace)
-    assert torch.equal(torch.ops.trtllm.moe_a2a_initialize(bank1, 0, 1, 8), meta)
-    state1 = torch.zeros_like(state)
+    fresh_state = torch.zeros_like(state)
     descriptors = [
-        torch.tensor(
-            [bank.data_ptr(), 1, 0, 0, 0, status.data_ptr()], dtype=torch.int64, device="cuda"
-        )
-        for bank, status in ((workspace, state), (bank1, state1))
+        torch.tensor([mask, 0, 0, 0, status.data_ptr()], dtype=torch.int64, device="cuda")
+        for mask, status in ((1, state), (1, fresh_state), (0, fresh_state))
     ]
     published = torch.tensor([descriptors[0].data_ptr()], dtype=torch.int64, device="cuda")
     slot = torch.empty_like(published)
@@ -179,7 +176,6 @@ def test_registered_descriptor_snapshot_and_bank_switch(a2a: _A2ATensors) -> Non
     _, output = _round(a2a, None, slot)
     torch.testing.assert_close(output, payload, rtol=0, atol=0)
     assert slot.item() == descriptors[0].data_ptr()
-    assert _flag((bank1, meta, state1, a2a[3], payload)).item() == 0
 
     published.fill_(descriptors[0].data_ptr())
     torch.cuda.synchronize()
@@ -198,30 +194,37 @@ def test_registered_descriptor_snapshot_and_bank_switch(a2a: _A2ATensors) -> Non
     assert torch.all(ids1 == -1) and torch.all(ids2 == -1)
     assert torch.count_nonzero(output1) == 0 and torch.count_nonzero(output2) == 0
     torch.cuda.synchronize()
-    old_bank = workspace.clone()
-    addresses = [value.data_ptr() for value in (payload, slot, ids1, ids2, output1, output2)]
+    addresses = [
+        value.data_ptr() for value in (workspace, payload, slot, ids1, ids2, output1, output2)
+    ]
 
-    # The local test has no remote issuer; retain both banks through the final graph join.
-    # Distinct input contents make a stale bank-A payload read observable.
+    # A fresh abort record resumes the same graph.
     payload.add_(1)
     published.fill_(descriptors[1].data_ptr())
     graph.replay()
     for value in (output1, output2):
         torch.testing.assert_close(value, payload, rtol=0, atol=0)
+    assert fresh_state.cpu().tolist() == [0, 0] and state.cpu().tolist() == [1, 1]
     assert addresses == [
-        value.data_ptr() for value in (payload, slot, ids1, ids2, output1, output2)
+        value.data_ptr() for value in (workspace, payload, slot, ids1, ids2, output1, output2)
     ]
-    assert state1.cpu().tolist() == [0, 0] and state.cpu().tolist() == [1, 1]
-    assert torch.equal(workspace, old_bank)
 
+    # Excluded sources contribute nothing without aborting the collective.
+    published.fill_(descriptors[2].data_ptr())
+    graph.replay()
+    assert torch.all(ids1 == -1) and torch.all(ids2 == -1)
+    assert torch.count_nonzero(output1) == 0 and torch.count_nonzero(output2) == 0
+    assert fresh_state.cpu().tolist() == [0, 0]
+
+    published.fill_(descriptors[1].data_ptr())
+    torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
     _, offset, _ = _dispatch(a2a, None, slot)
     alias = workspace[0, offset : offset + payload.numel() * payload.element_size()]
     alias = alias.view(payload.dtype).reshape(1, *payload.shape)
-    for shortcut, message in ((False, "must not alias workspace"), (True, "private combine input")):
-        with pytest.raises(RuntimeError, match=message):
-            torch.ops.trtllm.moe_a2a_combine(
-                alias, 8, workspace, meta, 8, 0, 1, 1, offset, shortcut, **_controls(None, slot)
-            )
+    with pytest.raises(RuntimeError, match="must not alias workspace"):
+        torch.ops.trtllm.moe_a2a_combine(
+            alias, 8, workspace, meta, 8, 0, 1, 1, offset, False, **_controls(None, slot)
+        )
     torch.cuda.synchronize()
 
 
@@ -317,6 +320,143 @@ def test_registered_abort_fake_signatures() -> None:
             assert ids.shape == (1, 8, 1)
             assert output.shape == (8, 128)
             assert output.dtype == torch.bfloat16
+
+
+def _offset(meta: torch.Tensor, name: str) -> int:
+    return int(meta[int(getattr(internal.thop, f"MOE_A2A_{name}_OFFSET_INDEX"))])
+
+
+@pytest.mark.parametrize("row_bytes", [16, 3])
+def test_registered_source_slots_preserve_excluded_state(a2a: _A2ATensors, row_bytes: int) -> None:
+    """Do graphs of different batch sizes share fixed source slots and leave excluded ones untouched?"""
+    _, _, state, experts, payload = a2a
+    # Both logical peers live in one allocation; this checks native layout and masking only.
+    ep_size, capacity, hidden = 2, 8, payload.size(1)
+    workspace = torch.zeros((ep_size, 1 << 20), dtype=torch.uint8, device="cuda")
+    meta = torch.ops.trtllm.moe_a2a_initialize(workspace, 0, ep_size, capacity, ep_size)
+    byte_payload = torch.arange(capacity * row_bytes, dtype=torch.uint8, device="cuda")
+    byte_payload = byte_payload.reshape(capacity, row_bytes)
+    descriptor = torch.tensor([1, 0, 0, 0, state.data_ptr()], dtype=torch.int64, device="cuda")
+    published = torch.tensor([descriptor.data_ptr()], dtype=torch.int64, device="cuda")
+    slot = torch.empty_like(published)
+    controls = _controls(None, slot)
+
+    def padded(size: int) -> int:
+        return (size + 127) // 128 * 128
+
+    start = _offset(meta, "PAYLOAD_DATA")
+    source_stride = sum(padded(capacity * width) for width in (hidden * 2, 4, row_bytes))
+    tail = (workspace.size(1) - ep_size * capacity * hidden * payload.element_size()) // 128 * 128
+    assert start + ep_size * source_stride <= tail
+    fixed = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+        workspace, 0, ep_size, capacity, tail, payload.dtype, hidden
+    ).view(-1, hidden)
+
+    # Poison everything source rank 1 owns in rank 0's workspace.
+    counters = _offset(meta, "RECV_COUNTERS")
+    tombstones = [workspace[0, start + source_stride : start + 2 * source_stride]]
+    tombstones.extend(
+        workspace[0, counters + 4 * (parity * ep_size + 1) :][:4].view(torch.int32)
+        for parity in (0, 1)
+    )
+    for name in ("DISPATCH_COMPLETION_FLAGS", "COMBINE_COMPLETION_FLAGS"):
+        tombstones.append(workspace[0, _offset(meta, name) + 4 :][:4].view(torch.int32))
+    stats = _offset(meta, "EPLB_GATHERED_STATS") + ep_size * 4
+    tombstones.append(workspace[0, stats : stats + ep_size * 4].view(torch.int32))
+    tombstones[0].fill_(0xA5)
+    for value in tombstones[1:]:
+        value.fill_(2**31 - 1)
+
+    local_stats = {
+        bucket: torch.tensor([bucket, 0], dtype=torch.int32, device="cuda") for bucket in (4, 8)
+    }
+
+    def transfer(bucket: int) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        ids = experts[:bucket]
+        torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
+        received, combine_offset, gathered = torch.ops.trtllm.moe_a2a_dispatch(
+            ids,
+            [payload[:bucket], ids, byte_payload[:bucket]],
+            workspace,
+            meta,
+            bucket,
+            0,
+            ep_size,
+            1,
+            ep_size,
+            local_stats[bucket],
+            **controls,
+        )
+        assert combine_offset == start + ep_size * source_stride
+        torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
+            received[1], workspace, meta, 0, -1, execution_descriptor=slot
+        )
+        expert_output = fixed[: ep_size * bucket]
+        expert_output.copy_(received[0].view(-1, hidden))
+        output = torch.ops.trtllm.moe_a2a_combine(
+            expert_output.view(ep_size, bucket, hidden),
+            bucket,
+            workspace,
+            meta,
+            bucket,
+            0,
+            ep_size,
+            1,
+            tail,
+            True,
+            **controls,
+        )
+        return received, gathered, output
+
+    captures = {}
+    for bucket in (4, 8):
+        transfer(bucket)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = transfer(bucket)
+        captures[bucket] = graph, *outputs
+
+    for bucket in (8, 4, 8, 4):
+        graph, received, gathered, output = captures[bucket]
+        graph.replay()
+        expected = payload[:bucket]
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        order = received[0][0][:, 0].argsort()
+        torch.testing.assert_close(received[0][0][order], expected, rtol=0, atol=0)
+        torch.testing.assert_close(received[2][0][order], byte_payload[:bucket], rtol=0, atol=0)
+        assert torch.count_nonzero(received[0][1]) == 0
+        assert torch.count_nonzero(received[2][1]) == 0
+        assert torch.all(received[1][0] == 0) and torch.all(received[1][1] == -1)
+        assert gathered.cpu().tolist() == [[bucket, 0], [0, 0]]
+        assert slot.item() == descriptor.data_ptr()
+        assert torch.all(tombstones[0] == 0xA5)
+        assert all(torch.all(value == 2**31 - 1) for value in tombstones[1:])
+        assert state.cpu().tolist() == [0, 0]
+
+
+def test_registered_source_slots_reject_runtime_over_capacity(a2a: _A2ATensors) -> None:
+    workspace, meta, _, _, payload = a2a
+    slot = torch.empty(1, dtype=torch.int64, device="cuda")
+    experts = torch.zeros((9, 1), dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="static workspace capacity"):
+        torch.ops.trtllm.moe_a2a_dispatch(
+            experts, [experts], workspace, meta, 9, 0, 1, 1, 1, **_controls(None, slot)
+        )
+    with pytest.raises(RuntimeError, match="static workspace capacity"):
+        torch.ops.trtllm.moe_a2a_combine(
+            payload.new_zeros((1, 9, 128)),
+            9,
+            workspace,
+            meta,
+            9,
+            0,
+            1,
+            1,
+            0,
+            False,
+            **_controls(None, slot),
+        )
 
 
 def _pending_fence_wait(phase: str, action: str, tokens: int) -> None:

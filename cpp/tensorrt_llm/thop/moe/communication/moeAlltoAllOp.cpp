@@ -181,8 +181,21 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AFenceWorkspace resolveExecutionDes
         "execution_descriptor must be contiguous CUDA int64[1]");
     TORCH_CHECK(workspace.dim() == 2 && workspace.stride(0) > 0 && workspace.stride(1) == 1,
         "execution_descriptor requires byte-addressable workspace rows");
-    return {reinterpret_cast<MoeA2AFenceDescriptor const* const*>(slot.data_ptr<int64_t>()),
-        reinterpret_cast<uintptr_t>(workspace.data_ptr())};
+    return {reinterpret_cast<MoeA2AFenceDescriptor const* const*>(slot.data_ptr<int64_t>())};
+}
+
+// Descriptor mode gives every source rank a fixed dispatch slot sized for the static token capacity, so
+// graph-captured addresses stay valid for any runtime batch. Returns that static capacity.
+inline int64_t validateFixedSlotWorkspace(
+    torch::Tensor const& workspace, MoeA2ADataOffsets const& offsets, int64_t runtimeMaxTokensPerRank)
+{
+    TORCH_CHECK(workspace.dim() == 2 && workspace.stride(1) == 1 && workspace.stride(0) >= workspace.size(1)
+            && workspace.stride(0) % static_cast<int64_t>(CACHELINE_ALIGNMENT) == 0,
+        "execution_descriptor requires disjoint cacheline-aligned workspace rows");
+    auto const staticMaxTokens = static_cast<int64_t>(offsets[MAX_NUM_TOKENS_INDEX]);
+    TORCH_CHECK(runtimeMaxTokensPerRank <= staticMaxTokens, "runtime_max_tokens_per_rank (", runtimeMaxTokensPerRank,
+        ") exceeds the static workspace capacity (", staticMaxTokens, ")");
+    return staticMaxTokens;
 }
 
 void moeA2AFenceLatchDescriptorOp(torch::Tensor const& publishedDescriptor, torch::Tensor& execution)
@@ -601,8 +614,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::vector<int> payloadElementsPerToken;
     std::vector<size_t> payloadRecvBufferOffsets;
 
-    // Start offset for the first payload
-    size_t currentOffset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    // Dense layout: payload p holds [epSize, runtimeMaxTokensPerRank] tokens. Descriptor mode: the payloads of
+    // one source rank occupy a fixed slot of staticMaxTokens tokens each, repeated with stride sourceStrideBytes.
+    size_t const payloadStart = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    int64_t const slotTokens = executionDescriptor.has_value()
+        ? validateFixedSlotWorkspace(workspace, offsets, runtimeMaxTokensPerRank)
+        : epSize * runtimeMaxTokensPerRank;
+    size_t currentOffset = payloadStart;
     for (auto const& payload : inputPayloads)
     {
         CHECK_CONTIGUOUS(payload);
@@ -617,8 +635,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
         int elementsPerToken = static_cast<int>(payload.size(1));
         int elementSize = static_cast<int>(payload.dtype().itemsize());
-        // Each payload buffer stores data from ALL ranks
-        int64_t bytesPerPayload = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+        int64_t bytesPerPayload = slotTokens * elementsPerToken * elementSize;
 
         payloadElementSizes.push_back(elementSize);
         payloadElementsPerToken.push_back(elementsPerToken);
@@ -628,6 +645,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         // Update offset and align to cacheline boundary for the next payload recv buffer.
         currentOffset += bytesPerPayload;
         currentOffset = alignOffset(currentOffset, CACHELINE_ALIGNMENT);
+    }
+    int64_t sourceStrideBytes = 0;
+    if (executionDescriptor.has_value())
+    {
+        sourceStrideBytes = static_cast<int64_t>(currentOffset - payloadStart);
+        currentOffset = payloadStart + static_cast<size_t>(epSize * sourceStrideBytes);
     }
 
     int expertIdPayloadIdx = -1;
@@ -685,6 +708,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.num_experts = static_cast<int>(numExperts);
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
+    params.sourceStrideBytes = sourceStrideBytes;
     params.top_k = static_cast<int>(topK);
     params.enable_eplb = enableEplb;
     params.eplb_stats_num_experts = static_cast<int>(eplbStatsNumExperts);
@@ -811,6 +835,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     gather.epSize = params.ep_size;
     gather.epRank = params.ep_rank;
     gather.maxTokens = params.max_tokens_per_rank;
+    gather.sourceStrideBytes = sourceStrideBytes;
     gather.recvCounters = params.recv_counters[params.ep_rank];
     gather.flagVal = params.flag_val;
     gather.fenceWorkspace = params.fenceWorkspace;
@@ -942,10 +967,12 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
     TORCH_CHECK(combinePayloadOffset >= 0, "combinePayloadOffset must be non-negative");
     uint8_t* combinePayloadPtr = rankWorkSpacePtr + combinePayloadOffset;
+    if (executionDescriptor.has_value())
+    {
+        validateFixedSlotWorkspace(workspace, offsets, runtimeMaxTokensPerRank);
+    }
     // If the caller claims the payload is in the workspace, ensure it really is: a mismatch would
     // otherwise silently fall back to staging and lose the zero-copy path the caller asked for.
-    TORCH_CHECK(!executionDescriptor.has_value() || !payloadInWorkspace,
-        "execution_descriptor requires private combine input staging");
     if (payloadInWorkspace)
     {
         TORCH_CHECK(payload.data_ptr() == combinePayloadPtr,
@@ -953,7 +980,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     }
 
     int64_t payloadSize = payload.numel() * payload.element_size();
-    if (executionDescriptor.has_value())
+    if (executionDescriptor.has_value() && !payloadInWorkspace)
     {
         auto const address = reinterpret_cast<uintptr_t>(payload.data_ptr());
         auto const payloadEnd = address + static_cast<uintptr_t>(payloadSize);
