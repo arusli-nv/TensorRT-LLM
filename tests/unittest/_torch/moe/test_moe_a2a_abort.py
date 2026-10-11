@@ -39,31 +39,56 @@ def a2a() -> _A2ATensors:
     return workspace, meta, state, experts, payload
 
 
-def _controls(state: torch.Tensor | None) -> dict[str, bool | torch.Tensor]:
-    if state is None:
+def _controls(
+    state: torch.Tensor | None, execution_descriptor: torch.Tensor | None = None
+) -> dict[str, bool | torch.Tensor]:
+    if state is None and execution_descriptor is None:
         return {}
-    return {
+    controls = {
         "enable_rank_mask": True,
         "active_rank_mask": torch.tensor([2**64 - 1] * 4, dtype=torch.uint64),
-        "abort_state": state,
     }
+    if state is not None:
+        controls["abort_state"] = state
+    if execution_descriptor is not None:
+        controls["execution_descriptor"] = execution_descriptor
+    return controls
 
 
 def _dispatch(
-    a2a: _A2ATensors, state: torch.Tensor | None
+    a2a: _A2ATensors,
+    state: torch.Tensor | None,
+    execution_descriptor: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], int, torch.Tensor]:
     workspace, meta, _, experts, payload = a2a
     ep_size = workspace.size(0)
     return torch.ops.trtllm.moe_a2a_dispatch(
-        experts, [payload, experts], workspace, meta, 8, 0, ep_size, 1, ep_size, **_controls(state)
+        experts,
+        [payload, experts],
+        workspace,
+        meta,
+        8,
+        0,
+        ep_size,
+        1,
+        ep_size,
+        **_controls(state, execution_descriptor),
     )
 
 
-def _round(a2a: _A2ATensors, state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+def _round(
+    a2a: _A2ATensors, state: torch.Tensor | None, execution_descriptor: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     workspace, meta, _, experts, _ = a2a
-    received, offset, _ = _dispatch(a2a, state)
+    received, offset, _ = _dispatch(a2a, state, execution_descriptor)
     torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
-        received[1], workspace, meta, 0, -1, abort_state=state
+        received[1],
+        workspace,
+        meta,
+        0,
+        -1,
+        abort_state=state,
+        execution_descriptor=execution_descriptor,
     )
     output = torch.ops.trtllm.moe_a2a_combine(
         received[0],
@@ -76,7 +101,7 @@ def _round(a2a: _A2ATensors, state: torch.Tensor | None) -> tuple[torch.Tensor, 
         1,
         offset,
         False,
-        **_controls(state),
+        **_controls(state, execution_descriptor),
     )
     return received[1], output
 
@@ -136,6 +161,103 @@ def test_registered_combine_preserves_first_status(a2a: _A2ATensors) -> None:
     assert torch.count_nonzero(output) == 0
 
 
+def test_registered_descriptor_snapshot_and_bank_switch(a2a: _A2ATensors) -> None:
+    workspace, meta, state, _, payload = a2a
+    bank1 = torch.empty_like(workspace)
+    assert torch.equal(torch.ops.trtllm.moe_a2a_initialize(bank1, 0, 1, 8), meta)
+    state1 = torch.zeros_like(state)
+    descriptors = [
+        torch.tensor(
+            [bank.data_ptr(), 1, 0, 0, 0, status.data_ptr()], dtype=torch.int64, device="cuda"
+        )
+        for bank, status in ((workspace, state), (bank1, state1))
+    ]
+    published = torch.tensor([descriptors[0].data_ptr()], dtype=torch.int64, device="cuda")
+    slot = torch.empty_like(published)
+    torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
+    published.fill_(descriptors[1].data_ptr())
+    _, output = _round(a2a, None, slot)
+    torch.testing.assert_close(output, payload, rtol=0, atol=0)
+    assert slot.item() == descriptors[0].data_ptr()
+    assert _flag((bank1, meta, state1, a2a[3], payload)).item() == 0
+
+    published.fill_(descriptors[0].data_ptr())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
+        ids1, output1 = _round(a2a, None, slot)
+        ids2, output2 = _round(a2a, None, slot)
+    graph.replay()
+    for value in (output1, output2):
+        torch.testing.assert_close(value, payload, rtol=0, atol=0)
+    flag = _flag(a2a).clone()
+    state[0] = 1
+    graph.replay()
+    assert state.cpu().tolist() == [1, 1] and torch.equal(_flag(a2a), flag)
+    assert torch.all(ids1 == -1) and torch.all(ids2 == -1)
+    assert torch.count_nonzero(output1) == 0 and torch.count_nonzero(output2) == 0
+    torch.cuda.synchronize()
+    old_bank = workspace.clone()
+    addresses = [value.data_ptr() for value in (payload, slot, ids1, ids2, output1, output2)]
+
+    # The local test has no remote issuer; retain both banks through the final graph join.
+    # Distinct input contents make a stale bank-A payload read observable.
+    payload.add_(1)
+    published.fill_(descriptors[1].data_ptr())
+    graph.replay()
+    for value in (output1, output2):
+        torch.testing.assert_close(value, payload, rtol=0, atol=0)
+    assert addresses == [
+        value.data_ptr() for value in (payload, slot, ids1, ids2, output1, output2)
+    ]
+    assert state1.cpu().tolist() == [0, 0] and state.cpu().tolist() == [1, 1]
+    assert torch.equal(workspace, old_bank)
+
+    _, offset, _ = _dispatch(a2a, None, slot)
+    alias = workspace[0, offset : offset + payload.numel() * payload.element_size()]
+    alias = alias.view(payload.dtype).reshape(1, *payload.shape)
+    for shortcut, message in ((False, "must not alias workspace"), (True, "private combine input")):
+        with pytest.raises(RuntimeError, match=message):
+            torch.ops.trtllm.moe_a2a_combine(
+                alias, 8, workspace, meta, 8, 0, 1, 1, offset, shortcut, **_controls(None, slot)
+            )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "slot",
+    [
+        lambda: torch.empty(1, dtype=torch.int64),
+        lambda: torch.empty(1, dtype=torch.int32, device="cuda"),
+        lambda: torch.empty(2, dtype=torch.int64, device="cuda"),
+    ],
+)
+def test_registered_descriptor_slot_validation(
+    a2a: _A2ATensors, slot: Callable[[], torch.Tensor]
+) -> None:
+    with pytest.raises(RuntimeError, match="execution_descriptor"):
+        _dispatch(a2a, None, slot())
+
+
+@pytest.mark.parametrize(
+    "cft,rank_mask,separate_state",
+    [(True, True, False), (False, False, False), (False, True, True)],
+)
+def test_registered_descriptor_admission(
+    a2a: _A2ATensors, cft: bool, rank_mask: bool, separate_state: bool
+) -> None:
+    workspace, meta, state, experts, payload = a2a
+    controls = _controls(None, torch.empty(1, dtype=torch.int64, device="cuda"))
+    controls.update(use_cft_counted_writes=cft, enable_rank_mask=rank_mask)
+    if separate_state:
+        controls["abort_state"] = state
+    with pytest.raises(RuntimeError, match="fence rank-mask mode and descriptor-owned abort state"):
+        torch.ops.trtllm.moe_a2a_dispatch(
+            experts, [payload, experts], workspace, meta, 8, 0, 1, 1, 1, **controls
+        )
+
+
 @pytest.mark.parametrize(
     "state,message",
     [
@@ -188,8 +310,10 @@ def test_registered_abort_fake_signatures() -> None:
         experts = torch.empty((8, 1), dtype=torch.int32, device="cuda")
         payload = torch.empty((8, 128), dtype=torch.bfloat16, device="cuda")
         a2a = workspace, meta, state, experts, payload
-        for control in (None, state):
-            ids, output = _round(a2a, control)
+        slot = torch.empty(1, dtype=torch.int64, device="cuda")
+        torch.ops.trtllm.moe_a2a_fence_latch_descriptor(torch.empty_like(slot), slot)
+        for control, descriptor in ((None, None), (state, None), (None, slot)):
+            ids, output = _round(a2a, control, descriptor)
             assert ids.shape == (1, 8, 1)
             assert output.shape == (8, 128)
             assert output.dtype == torch.bfloat16

@@ -731,6 +731,7 @@ def _register_fake():
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
         abort_state: Optional[torch.Tensor] = None,
+        execution_descriptor: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -765,6 +766,7 @@ def _register_fake():
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
         abort_state: Optional[torch.Tensor] = None,
+        execution_descriptor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
@@ -787,6 +789,7 @@ def _register_fake():
         ep_rank: int,
         invalid_expert_id: int,
         abort_state: Optional[torch.Tensor] = None,
+        execution_descriptor: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 
@@ -1858,3 +1861,9 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind, 0
+
+    @torch.library.register_fake("trtllm::moe_a2a_fence_latch_descriptor")
+    def moe_a2a_fence_latch_descriptor_fake(
+            published_descriptor: torch.Tensor,
+            execution_slot: torch.Tensor) -> None:
+        return None
