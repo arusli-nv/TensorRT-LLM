@@ -41,6 +41,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .recovery import ROLE_FRONTEND, FrontendAdmission, RecoveryClient
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .result import GenerationResult, IterationResult
@@ -102,6 +103,8 @@ def _check_collective_rpc_guard(
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
+    # Set when worker-loss recovery is enabled (``TLLM_WIDEEP_RECOVERY``).
+    _recovery_admission: Optional[FrontendAdmission] = None
 
     def __init__(
         self,
@@ -220,6 +223,17 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Create RPC client after workers are started (worker starts RPC server)
         self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
 
+        recovery_client = RecoveryClient.from_env(ROLE_FRONTEND, 0)
+        if recovery_client is not None:
+            if self._num_frontends != 1:
+                recovery_client.close()
+                raise ValueError(
+                    "Worker-loss recovery requires a single serving frontend")
+            self._recovery_admission = FrontendAdmission(
+                recovery_client,
+                is_idle=lambda: not self._results,
+                on_failure=self._handle_worker_death)
+
         # Event used to wake the error monitor thread for a clean shutdown
         # instead of polling with sleep loops.
         self._shutdown_event = threading.Event()
@@ -330,6 +344,7 @@ class GenerationExecutorProxy(GenerationExecutor):
     def check_health(self) -> bool:
         """Check executor health including MPI worker liveness.
 
+        Recovering from a worker loss (admission closed) counts as healthy.
         Inlines the base ``check_health()`` logic instead of calling
         ``super().check_health()`` so that fatal queue items trigger
         ``pre_shutdown()`` (non-blocking) rather than ``shutdown()``
@@ -1022,6 +1037,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.doing_shutdown = True
 
         self._worker_process_monitor.close()
+        if self._recovery_admission is not None:
+            self._recovery_admission.close()
 
         # Wake the error monitor thread immediately so it exits cleanly
         if hasattr(self, '_shutdown_event'):
@@ -1163,6 +1180,17 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._engine_dead or self._fatal_error is not None:
             raise EngineDeadError(self._fatal_error)
 
+        admission = self._recovery_admission
+        if admission is None:
+            return self._submit(request)
+        with admission.lock:
+            if admission.closed:
+                raise RequestError(
+                    "Request admission is paused while the engine recovers "
+                    "from a worker loss; retry the request")
+            return self._submit(request)
+
+    def _submit(self, request: GenerationRequest) -> GenerationResult:
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
