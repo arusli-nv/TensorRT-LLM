@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import gc
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 from weakref import WeakSet
@@ -71,7 +72,13 @@ class _FakeComm:
 
 def _make_lifecycle() -> tuple[_MnnvlAlltoAllWorkspaceLifecycle, Mock, torch.Tensor]:
     workspace_state = {}
-    memory = Mock(mapped=True)
+    class _Memory(Mock):
+        @staticmethod
+        def _locked_record(ptr: int) -> nullcontext[None]:
+            return nullcontext()
+
+    memory = _Memory(mapped=True)
+    memory.mutable_backing.side_effect = nullcontext
     memory.comm = _FakeComm()
     workspace = torch.zeros(1, dtype=torch.uint8)
     metainfo = torch.tensor([1])
@@ -102,6 +109,29 @@ def _register_without_watchdog(
         watchdog_poll_interval_s=0.1,
         watchdog_on_timeout=None,
     )
+
+
+@pytest.mark.parametrize("restore", [False, True], ids=["prepare", "restore"])
+def test_retained_mapping_rejects_workspace_checkpoint_before_collectives(restore: bool) -> None:
+    lifecycle, memory, _ = _make_lifecycle()
+    memory.mutable_backing.side_effect = RuntimeError(
+        "MNNVL backing is retained by a model execution state"
+    )
+    stop_watchdog = Mock()
+    lifecycle._stop_watchdog = stop_watchdog
+    initialize_frontend = Mock()
+
+    with pytest.raises(RuntimeError, match="retained by a model"):
+        if restore:
+            lifecycle.checkpoint_restore(memory.comm, initialize_frontend)
+        else:
+            lifecycle.checkpoint_prepare()
+
+    assert memory.comm.allgather_count == 0
+    memory.checkpoint_prepare.assert_not_called()
+    memory.checkpoint_restore.assert_not_called()
+    stop_watchdog.assert_not_called()
+    initialize_frontend.assert_not_called()
 
 
 def test_checkpoint_prepare_rejects_any_active_shared_client() -> None:
@@ -658,7 +688,6 @@ def test_two_sided_checkpoint_restore_noop_preserves_shared_owner_state(
     assert first._dispatch_state
     assert second._dispatch_state
 
-
 @pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
 def test_frontend_checkpoint_delegates_to_shared_lifecycle(
     wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
@@ -666,6 +695,7 @@ def test_frontend_checkpoint_delegates_to_shared_lifecycle(
     wrapper = wrapper_type.__new__(wrapper_type)
     wrapper.can_use_cft_counted_writes = False
     wrapper._workspace_lifecycle = Mock()
+    wrapper._workspace_lifecycle.mutable_clients.side_effect = nullcontext
     comm = Mock()
 
     wrapper.checkpoint_prepare()
@@ -674,7 +704,6 @@ def test_frontend_checkpoint_delegates_to_shared_lifecycle(
     wrapper._workspace_lifecycle.checkpoint_prepare.assert_called_once_with()
     wrapper._workspace_lifecycle.checkpoint_restore.assert_called_once()
     assert wrapper._workspace_lifecycle.checkpoint_restore.call_args.args[0] is comm
-
 
 @pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
 def test_frontend_destroy_unregisters_from_shared_lifecycle(
@@ -685,6 +714,7 @@ def test_frontend_destroy_unregisters_from_shared_lifecycle(
     wrapper._workspace_registered = True
     lifecycle = Mock()
     wrapper._workspace_lifecycle = lifecycle
+    lifecycle.mutable_clients = Mock(side_effect=nullcontext)
     if wrapper_type is NVLinkOneSided:
         wrapper._workspace_key = None
 
@@ -751,6 +781,7 @@ def test_one_sided_checkpoint_rejects_destroyed_workspace(
     wrapper._destroyed = False
     wrapper.can_use_cft_counted_writes = False
     wrapper._workspace_lifecycle = Mock()
+    wrapper._workspace_lifecycle.mutable_clients.side_effect = nullcontext
     wrapper._workspace_key = ("test",)
     wrapper._workspace_registered = True
     wrapper.destroy()
@@ -771,6 +802,7 @@ def test_one_sided_finalizer_unregisters_from_shared_lifecycle() -> None:
     wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._destroyed = False
     wrapper._workspace_lifecycle = lifecycle
+    lifecycle.mutable_clients = Mock(side_effect=nullcontext)
     wrapper._workspace_key = None
     wrapper._workspace_registered = True
 
@@ -790,6 +822,7 @@ def test_one_sided_finalizer_preserves_collective_workspace_cache(
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
     wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._workspace_lifecycle = Mock()
+    wrapper._workspace_lifecycle.mutable_clients.side_effect = nullcontext
     wrapper._workspace_key = workspace_key
     wrapper._workspace_registered = True
 
@@ -813,6 +846,7 @@ def test_one_sided_aborted_construction_does_not_release_sibling_workspace(
     wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._destroyed = False
     wrapper._workspace_lifecycle = Mock()
+    wrapper._workspace_lifecycle.mutable_clients.side_effect = nullcontext
     wrapper._workspace_key = workspace_key
     wrapper._workspace_registered = False
 

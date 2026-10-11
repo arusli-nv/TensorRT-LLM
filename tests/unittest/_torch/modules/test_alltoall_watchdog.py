@@ -213,6 +213,41 @@ def test_wide_ep_ft_options_reject_cuda_graphs(
     assert model_config.extra_attrs == {}
 
 
+def test_pending_descriptor_binding_requires_actual_serving_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+    monkeypatch.setattr(MPINodeState, "_serving_task_context", None, raising=False)
+    monkeypatch.setattr(MPINodeState, "_serving_task_control", None, raising=False)
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    config = SimpleNamespace(extra_attrs={}, mapping=SimpleNamespace(moe_ep_size=4), use_cuda_graph=True)
+    with pytest.raises(ValueError, match="does not support CUDA graphs"):
+        get_wide_ep_ft_options(config, allow_pending_descriptor_binding=True)
+    assert config.extra_attrs == {}
+
+
+def test_pending_descriptor_binding_uses_original_task_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.executor.recovery import ServingTaskContext, ServingTaskControl, WorkerTaskIdentity
+    from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
+    from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+    context = ServingTaskContext(17, 0, ("tcp://component", b"private"))
+    control = object.__new__(ServingTaskControl)
+    control.context = context
+    control.identity = WorkerTaskIdentity(17, 0, 2, WorkerProcessIdentity(2, 100, 1, "host", 1))
+    monkeypatch.setattr(MPINodeState, "_serving_task_context", (context, 2), raising=False)
+    monkeypatch.setattr(MPINodeState, "_serving_task_control", control, raising=False)
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    config = SimpleNamespace(extra_attrs={}, mapping=SimpleNamespace(moe_ep_size=4), use_cuda_graph=True)
+    health, _, _ = get_wide_ep_ft_options(config, allow_pending_descriptor_binding=True)
+    assert isinstance(health, EPGroupHealth)
+    assert get_wide_ep_ft_options(config, allow_pending_descriptor_binding=True)[0] is health
+    with pytest.raises(ValueError, match="does not support CUDA graphs"):
+        get_wide_ep_ft_options(config)
+    monkeypatch.setattr(MPINodeState, "_serving_task_context", (context, 3))
+    with pytest.raises(RuntimeError, match="mismatched serving-task"):
+        get_wide_ep_ft_options(config, allow_pending_descriptor_binding=True)
+
+
 def test_rank_mask_mode_rejects_direct_cuda_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

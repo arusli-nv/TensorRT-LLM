@@ -20,6 +20,7 @@ races as required by the WideEP FT implementation plan section 8.
 """
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -136,6 +137,190 @@ def test_mark_active_idempotent_on_already_active() -> None:
     assert h.mark_active(0) is False
     assert h.generation == 0
     assert h.get_active_count() == 8
+
+
+def test_commit_owner_blocks_competing_claim_and_public_mutations() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+
+    with pytest.raises(RuntimeError, match="already has a commit owner"):
+        health._claim_commit_owner()
+    with pytest.raises(RuntimeError, match="mutations require its commit owner"):
+        health.mark_failed(2)
+    with pytest.raises(RuntimeError, match="mutations require its commit owner"):
+        health.mark_active(2)
+
+    assert health.snapshot() == original
+    committed = health._commit_failed_rank(2, owner=owner, expected=original)
+    assert committed == EPGroupHealthSnapshot(0b1011, 3, frozenset({2}), 1)
+    assert health.snapshot() == committed
+
+
+def test_commit_owner_requires_exact_token_for_commit_and_release() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+    impostor = object()
+
+    with pytest.raises(RuntimeError, match="commit owner does not match"):
+        health._commit_failed_rank(2, owner=impostor, expected=original)
+    with pytest.raises(RuntimeError, match="commit owner does not match"):
+        health._release_commit_owner(impostor)
+
+    assert health.snapshot() == original
+    health._release_commit_owner(owner)
+    assert health.mark_failed(2)
+    assert health.mark_active(2)
+    replacement = health._claim_commit_owner()
+    assert replacement is not owner
+    with pytest.raises(RuntimeError, match="commit owner does not match"):
+        health._commit_failed_rank(2, owner=owner, expected=health.snapshot())
+    with pytest.raises(RuntimeError, match="commit owner does not match"):
+        health._release_commit_owner(owner)
+    health._release_commit_owner(replacement)
+    with pytest.raises(RuntimeError, match="commit owner does not match"):
+        health._release_commit_owner(replacement)
+
+
+def test_losing_commit_token_does_not_release_claim() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+    del owner
+
+    with pytest.raises(RuntimeError, match="already has a commit owner"):
+        health._claim_commit_owner()
+    with pytest.raises(RuntimeError, match="mutations require its commit owner"):
+        health.mark_failed(2)
+    with pytest.raises(RuntimeError, match="commit owner does not match"):
+        health._release_commit_owner(object())
+    assert health.snapshot() == original
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"mask": 0b1011},
+        {"active_count": 3},
+        {"failed_ranks": frozenset({2})},
+        {"generation": 1},
+    ],
+)
+def test_commit_compares_every_snapshot_field(changes: dict) -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+
+    with pytest.raises(RuntimeError, match="differs from the expected snapshot"):
+        health._commit_failed_rank(2, owner=owner, expected=original._replace(**changes))
+    assert health.snapshot() == original
+
+
+def test_commit_rejects_same_mask_after_fail_reactivate() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    health.mark_failed(2)
+    health.mark_active(2)
+    current = health.snapshot()
+    assert current.mask == original.mask
+    assert current.generation == 2
+    owner = health._claim_commit_owner()
+
+    with pytest.raises(RuntimeError, match="differs from the expected snapshot"):
+        health._commit_failed_rank(2, owner=owner, expected=original)
+    assert health.snapshot() == current
+
+
+def test_commit_rejects_repeated_proposal_and_already_failed_rank() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+    committed = health._commit_failed_rank(2, owner=owner, expected=original)
+
+    with pytest.raises(RuntimeError, match="differs from the expected snapshot"):
+        health._commit_failed_rank(2, owner=owner, expected=original)
+    with pytest.raises(RuntimeError, match="already-failed EP rank"):
+        health._commit_failed_rank(2, owner=owner, expected=committed)
+    assert health.snapshot() == committed
+
+
+@pytest.mark.parametrize("rank", [-1, 4])
+def test_commit_rejects_invalid_rank(rank: int) -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+
+    with pytest.raises(ValueError, match="rank must be"):
+        health._commit_failed_rank(rank, owner=owner, expected=original)
+    assert health.snapshot() == original
+
+
+def test_commit_rejects_untyped_snapshot_tuple() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+
+    with pytest.raises(TypeError, match="EPGroupHealthSnapshot"):
+        health._commit_failed_rank(2, owner=owner, expected=tuple(original))
+    assert health.snapshot() == original
+
+
+def test_concurrent_commit_writers_cannot_apply_the_same_base_twice() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    owner = health._claim_commit_owner()
+    barrier = threading.Barrier(2)
+
+    def commit(rank: int) -> EPGroupHealthSnapshot | str:
+        barrier.wait(timeout=5)
+        try:
+            return health._commit_failed_rank(rank, owner=owner, expected=original)
+        except RuntimeError as error:
+            return str(error)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(commit, rank) for rank in (1, 2)]
+        results = [future.result(timeout=5) for future in futures]
+
+    successes = [result for result in results if isinstance(result, EPGroupHealthSnapshot)]
+    failures = [result for result in results if isinstance(result, str)]
+    assert successes == [health.snapshot()]
+    assert failures == ["Committed EP membership differs from the expected snapshot"]
+    assert health.generation == 1
+    assert health.get_active_count() == 3
+    assert health.get_failed_ranks() in (frozenset({1}), frozenset({2}))
+
+
+def test_claim_serializes_with_existing_public_writer() -> None:
+    health = EPGroupHealth(4)
+    original = health.snapshot()
+    barrier = threading.Barrier(2)
+
+    def claim() -> object:
+        barrier.wait(timeout=5)
+        return health._claim_commit_owner()
+
+    def mutate() -> bool:
+        barrier.wait(timeout=5)
+        try:
+            return health.mark_failed(3)
+        except RuntimeError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claim_future = pool.submit(claim)
+        mutation_future = pool.submit(mutate)
+        owner = claim_future.result(timeout=5)
+        changed = mutation_future.result(timeout=5)
+
+    if changed:
+        with pytest.raises(RuntimeError, match="differs from the expected snapshot"):
+            health._commit_failed_rank(2, owner=owner, expected=original)
+        assert health.snapshot() == EPGroupHealthSnapshot(0b0111, 3, frozenset({3}), 1)
+    else:
+        committed = health._commit_failed_rank(2, owner=owner, expected=original)
+        assert committed == EPGroupHealthSnapshot(0b1011, 3, frozenset({2}), 1)
 
 
 def test_multiple_failures_accumulate() -> None:

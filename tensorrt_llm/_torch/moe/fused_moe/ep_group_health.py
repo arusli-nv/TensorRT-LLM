@@ -99,6 +99,7 @@ class EPGroupHealth:
         self._failed_ranks: set[int] = set()
         self._generation: int = 0
         self._lock = threading.Lock()
+        self._commit_owner: object | None = None
 
     @property
     def moe_world_size(self) -> int:
@@ -125,6 +126,52 @@ class EPGroupHealth:
         if not 0 <= rank < self._moe_world_size:
             raise ValueError(f"rank must be in [0, {self._moe_world_size}), got {rank}")
 
+    def _claim_commit_owner(self) -> object:
+        """Claim exclusive membership mutation until explicit token release."""
+        with self._lock:
+            if self._commit_owner is not None:
+                raise RuntimeError("EP membership already has a commit owner")
+            owner = object()
+            self._commit_owner = owner
+            return owner
+
+    def _require_commit_owner_locked(self, owner: object) -> None:
+        if self._commit_owner is None or self._commit_owner is not owner:
+            raise RuntimeError("EP membership commit owner does not match")
+
+    def _release_commit_owner(self, owner: object) -> None:
+        """Release a claim explicitly; its caller owns the teardown boundary."""
+        with self._lock:
+            self._require_commit_owner_locked(owner)
+            self._commit_owner = None
+
+    def _commit_failed_rank(
+        self, rank: int, *, owner: object, expected: EPGroupHealthSnapshot
+    ) -> EPGroupHealthSnapshot:
+        """Commit one active rank's exclusion against an exact base snapshot.
+
+        The caller must stop execution and join placement/device installation
+        before committing. This operation publishes membership only; it does
+        not establish that boundary or authorize request admission.
+        """
+        self._validate_rank(rank)
+        with self._lock:
+            self._require_commit_owner_locked(owner)
+            if not isinstance(expected, EPGroupHealthSnapshot):
+                raise TypeError("expected must be an EPGroupHealthSnapshot")
+            if self._snapshot_locked() != expected:
+                raise RuntimeError("Committed EP membership differs from the expected snapshot")
+            if not self._active_mask & (1 << rank):
+                raise RuntimeError("Cannot commit an already-failed EP rank")
+            self._mark_failed_locked(rank)
+            return self._snapshot_locked()
+
+    def _mark_failed_locked(self, rank: int) -> None:
+        self._active_mask &= ~(1 << rank)
+        self._active_count -= 1
+        self._failed_ranks.add(rank)
+        self._generation += 1
+
     def mark_failed(self, rank: int) -> bool:
         """Mark ``rank`` as failed. Idempotent.
 
@@ -137,16 +184,16 @@ class EPGroupHealth:
 
         Raises:
             ValueError: If ``rank`` is outside ``[0, moe_world_size)``.
+            RuntimeError: If an execution owner has claimed membership commits.
         """
         self._validate_rank(rank)
         bit = 1 << rank
         with self._lock:
+            if self._commit_owner is not None:
+                raise RuntimeError("EP membership mutations require its commit owner")
             if not self._active_mask & bit:
                 return False
-            self._active_mask &= ~bit
-            self._active_count -= 1
-            self._failed_ranks.add(rank)
-            self._generation += 1
+            self._mark_failed_locked(rank)
             return True
 
     def mark_active(self, rank: int) -> bool:
@@ -166,10 +213,13 @@ class EPGroupHealth:
 
         Raises:
             ValueError: If ``rank`` is outside ``[0, moe_world_size)``.
+            RuntimeError: If an execution owner has claimed membership commits.
         """
         self._validate_rank(rank)
         bit = 1 << rank
         with self._lock:
+            if self._commit_owner is not None:
+                raise RuntimeError("EP membership mutations require its commit owner")
             if self._active_mask & bit:
                 return False
             self._active_mask |= bit
@@ -250,12 +300,15 @@ class EPGroupHealth:
         consumer needs a coherent multi-field view.
         """
         with self._lock:
-            return EPGroupHealthSnapshot(
-                mask=self._active_mask,
-                active_count=self._active_count,
-                failed_ranks=frozenset(self._failed_ranks),
-                generation=self._generation,
-            )
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> EPGroupHealthSnapshot:
+        return EPGroupHealthSnapshot(
+            mask=self._active_mask,
+            active_count=self._active_count,
+            failed_ranks=frozenset(self._failed_ranks),
+            generation=self._generation,
+        )
 
     def __len__(self) -> int:
         """Return the MoE world size (``moe_world_size``), not the active count.

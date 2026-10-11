@@ -24,7 +24,10 @@ Run with mpirun:
 """
 
 import pickle
-from unittest.mock import patch
+import threading
+from contextlib import nullcontext
+from dataclasses import replace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -703,3 +706,138 @@ class TestInt64Exchange:
         ]
         assert dist.tp_cp_broadcast_int64([3 if self.rank == 0 else 0]).tolist() == [3]
         assert dist.broadcast_int64([9 if self.rank == 0 else 0]).tolist() == [9]
+
+
+@pytest.fixture
+def prepared_host(monkeypatch):
+    from tensorrt_llm.executor.recovery import (
+        RecoveryProposal,
+        SchedulerStopReceipt,
+        ServingTaskContext,
+        ServingTaskControl,
+        TaskRegistration,
+        WorkerStopCommand,
+        WorkerTaskIdentity,
+        WorkerTaskRegistered,
+    )
+    from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
+    from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+    world, tp, survivor = Mock(), Mock(), Mock()
+    monkeypatch.setattr(communicator, "mpi_comm", lambda: world)
+    workers = tuple(WorkerProcessIdentity(rank, 100 + rank, 10, "node", 20) for rank in range(4))
+    context = ServingTaskContext(1, 7, ("tcp://authority", b"key"))
+    identity = WorkerTaskIdentity(1, 7, 11, workers[3])
+    control = ServingTaskControl(context, identity)
+    monkeypatch.setattr(MPINodeState, "_serving_task_context", (context, 11), raising=False)
+    monkeypatch.setattr(MPINodeState, "_serving_task_control", control, raising=False)
+    dist = communicator.MPIDist(
+        mapping.Mapping(
+            world_size=4, rank=3, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True
+        )
+    )
+    dist._tp_comm = tp
+    dist._bind_serving_task(control)
+    queue = Mock()
+    queue.scheduler_stop_publication.return_value = nullcontext()
+    control.executor_constructed(queue)
+    registration = TaskRegistration(1, 7, workers, "original", "authority", 30)
+    control._accept_registration(WorkerTaskRegistered(identity, registration))
+    control._accept_stop(WorkerStopCommand(identity, "loss", 30))
+    counts = (
+        ("graphs", 4),
+        ("registered_streams", 2),
+        ("native_kv_owners", 1),
+        ("pending_requests", 0),
+        ("live_requests", 0),
+        ("pending_responses", 0),
+    )
+    stopped = SchedulerStopReceipt(
+        identity, "loss", threading.get_ident(), 3, counts, 7, 2, True, True, True, "original"
+    )
+    control.publish_stopped(stopped)
+    proposal = RecoveryProposal(
+        1,
+        "authority",
+        "loss",
+        7,
+        8,
+        (workers[0], workers[1], workers[3]),
+        workers[2],
+        "a" * 64,
+        "b" * 64,
+    )
+    control._accept_proposal(proposal)
+    survivor.Get_size.return_value = 3
+    survivor.Get_rank.return_value = 2
+    survivor.allgather.return_value = [0, 1, 3]
+    return dist, survivor, proposal, stopped, control, world, tp
+
+
+def test_prepared_host_keeps_original_membership(prepared_host) -> None:
+    """Does preparation preserve all normal host and logical GPU ownership?"""
+    dist, comm, proposal, stopped, _, world, tp = prepared_host
+    original_mapping = dist.mapping
+    view = dist._prepare_survivor_host(comm, proposal, stopped)
+    assert dist.mapping is original_mapping
+    assert dist.tp_comm is tp
+    assert view.original_world is world
+    assert view.logical_members == (0, 1, 3)
+    assert view.compact_rank(3) == 2
+    with pytest.raises(ValueError, match="not in survivor"):
+        view.compact_rank(2)
+    dist._discard_survivor_host(view)
+    comm.Free.assert_not_called()
+    world.Free.assert_not_called()
+    tp.Free.assert_not_called()
+    with pytest.raises(RuntimeError, match="owner is unavailable"):
+        dist._prepared_host_int64_rows(view, [1])
+
+
+def test_prepared_host_compact_and_fixed_count_rows(prepared_host) -> None:
+    """Are control rows compact while every fused token-count column stays fixed-N?"""
+    dist, comm, proposal, stopped, *_ = prepared_host
+    view = dist._prepare_survivor_host(comm, proposal, stopped)
+    rows = np.asarray([[4, 3, 2, 1], [8, 7, 6, 5], [12, 11, 10, 9]], dtype=np.int64)
+    with patch.object(dist, "_allgather_int64_comm", return_value=rows):
+        assert dist._prepared_host_int64_rows(view, [12, 11, 10, 9]).shape == (3, 4)
+        logical = dist._prepared_host_logical_counts(view, [12, 11, 10, 9])
+    assert logical.tolist() == [rows[0].tolist(), rows[1].tolist(), [0, 0, 0, 0], rows[2].tolist()]
+    with patch.object(dist, "_allgather_int64_comm") as gather:
+        with pytest.raises(ValueError, match="nonnegative int64"):
+            dist._prepared_host_logical_counts(view, [1, -1])
+        gather.assert_not_called()
+
+
+def test_prepared_host_rejects_stale_owner_and_proposal(prepared_host) -> None:
+    dist, comm, proposal, stopped, control, *_ = prepared_host
+    with pytest.raises(ValueError, match="original accepted proposal"):
+        dist._prepare_survivor_host(comm, replace(proposal), stopped)
+    view = dist._prepare_survivor_host(comm, proposal, stopped)
+    control.task_body_ended("")
+    with pytest.raises(RuntimeError):
+        dist._prepared_host_int64_rows(view, [1])
+
+
+def test_prepared_host_rejects_wrong_actual_rank_rows(prepared_host) -> None:
+    dist, comm, proposal, stopped, *_ = prepared_host
+    comm.allgather.return_value = [0, 1, 2]
+    with pytest.raises(ValueError, match="original logical ranks"):
+        dist._prepare_survivor_host(comm, proposal, stopped)
+    assert dist._prepared_survivor_host is None
+    comm.Free.assert_not_called()
+
+
+def test_prepared_host_rechecks_deadline_after_membership_gather(prepared_host) -> None:
+    """Does a collective returning after STOP expiry leave no prepared host view?"""
+    dist, comm, proposal, stopped, control, *_ = prepared_host
+
+    def expire_stop(rank):
+        control._stop_deadline = 0.0
+        return [0, 1, 3]
+
+    comm.allgather.side_effect = expire_stop
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        dist._prepare_survivor_host(comm, proposal, stopped)
+    assert dist._prepared_survivor_host is None
+    comm.Free.assert_not_called()

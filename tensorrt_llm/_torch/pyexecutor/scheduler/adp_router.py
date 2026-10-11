@@ -313,7 +313,7 @@ class ADPRouter(ABC):
     def _assign_explicit_dp_ranks(
         requests: List["RequestQueueItem"],
         all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
-        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_requests: list[int] | dict[int, int],
         max_num_active_requests: int,
     ) -> List["RequestQueueItem"]:
         """Place requests carrying an explicit ``attention_dp_rank`` on that rank
@@ -327,6 +327,12 @@ class ADPRouter(ABC):
             target_dp_rank = (
                 scheduling_params.attention_dp_rank if scheduling_params is not None else None
             )
+            if isinstance(all_ranks_num_active_requests, dict) and target_dp_rank is not None:
+                if target_dp_rank not in all_ranks_num_active_requests:
+                    if not scheduling_params.attention_dp_relax:
+                        raise ValueError(f"Attention DP rank {target_dp_rank} is not serving")
+                    remaining.append(req_item)
+                    continue
             if (
                 target_dp_rank is not None
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
@@ -339,7 +345,7 @@ class ADPRouter(ABC):
 
     @staticmethod
     def _expected_num_active_requests(
-        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_requests: list[int] | dict[int, int],
         num_new_requests: int,
         tp_size: int,
         *,
@@ -352,12 +358,15 @@ class ADPRouter(ABC):
         assignment so no rank exceeds the returned value -- the ADP padding
         invariant asserted in py_executor._pad_attention_dp_dummy_request.
         """
-        fair_share = (
-            sum(all_ranks_num_active_requests) + num_new_requests + tp_size - 1
-        ) // tp_size
+        loads = (
+            all_ranks_num_active_requests.values()
+            if isinstance(all_ranks_num_active_requests, dict)
+            else all_ranks_num_active_requests
+        )
+        fair_share = (sum(loads) + num_new_requests + tp_size - 1) // tp_size
         expected = max(
             math.ceil(multiplier * fair_share),
-            max(all_ranks_num_active_requests),
+            max(loads),
         )
         return min(expected, hard_cap) if hard_cap is not None else expected
 
@@ -427,6 +436,15 @@ class DefaultADPRouter(ADPRouter):
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+        if any(state.rank != row for row, state in enumerate(all_rank_states)):
+            if len({state.rank for state in all_rank_states}) != tp_size:
+                raise ValueError("Attention DP rank states contain duplicate logical ranks")
+            all_ranks_num_active_requests = {
+                state.rank: state.num_active_requests for state in all_rank_states
+            }
+            all_ranks_num_active_tokens = {
+                state.rank: state.num_active_tokens for state in all_rank_states
+            }
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
@@ -468,8 +486,8 @@ class DefaultADPRouter(ADPRouter):
         self,
         new_requests: List,
         all_ranks_new_requests: Dict[int, List],
-        all_ranks_num_active_requests: List[int],
-        all_ranks_num_active_tokens: List[int],
+        all_ranks_num_active_requests: list[int] | dict[int, int],
+        all_ranks_num_active_tokens: list[int] | dict[int, int],
         expected_num_active_requests: int,
     ) -> Dict[int, List]:
         """Balance requests across ranks for attention DP.
@@ -493,7 +511,11 @@ class DefaultADPRouter(ADPRouter):
 
         all_ranks_new_requests_heap = [
             HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
-            for tp_rank, val in enumerate(all_ranks_num_active_requests)
+            for tp_rank, val in (
+                all_ranks_num_active_requests.items()
+                if isinstance(all_ranks_num_active_requests, dict)
+                else enumerate(all_ranks_num_active_requests)
+            )
         ]
 
         all_ranks_new_requests_heap = [
@@ -698,6 +720,8 @@ class KVCacheAwareADPRouter(ADPRouter):
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        if any(state.rank != row for row, state in enumerate(all_rank_states)):
+            raise ValueError("Sparse attention DP membership requires DefaultADPRouter")
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
@@ -956,6 +980,8 @@ class ConversationAwareADPRouter(ADPRouter):
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        if any(state.rank != row for row, state in enumerate(all_rank_states)):
+            raise ValueError("Sparse attention DP membership requires DefaultADPRouter")
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states

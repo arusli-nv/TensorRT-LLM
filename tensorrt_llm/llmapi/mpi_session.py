@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import abc
 import itertools
 import math
@@ -10,10 +12,13 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
+from queue import Empty, SimpleQueue
+from typing import (TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple,
+                    TypeVar)
 
 import zmq
 
@@ -28,6 +33,15 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
+
+if TYPE_CHECKING:
+    from ..executor.recovery import (AuthorityLease, ServingTaskContext,
+                                     ServingTaskControl, SessionTaskBodyEnded,
+                                     SessionTransportFailure,
+                                     SessionWorkerProgress, TaskRegistration,
+                                     TaskRetentionAck, TaskRetentionRequest,
+                                     TaskStarted, WorkerTaskIdentity)
+    from ..executor.worker_process_monitor import WorkerProcessIdentity
 
 T = TypeVar("T")
 
@@ -179,9 +193,7 @@ class MPINodeState:
 
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
-    """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
-    e.g. mpirun -np 4 python script.py
-    """
+    """Return whether an externally launched MPI group can serve this model."""
     if ENABLE_MULTI_DEVICE:
         return (get_mpi_world_size() == model_world_size
                 and model_world_size > 1) or (global_mpi_size()
@@ -700,6 +712,7 @@ class RemoteTask(NamedTuple):
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     sync: bool = False  # if True, the result will be sent back to the client
+    serving_context: Optional[ServingTaskContext] = None
 
 
 class RemoteWorkerDeath(NamedTuple):
@@ -766,7 +779,16 @@ class RemoteMpiCommSessionClient(MpiSession):
         # Non-error messages consumed by check_worker_error() while scanning
         # for RemoteWorkerDeath are buffered here for poll() (submit_sync).
         self._pending_responses: list = []
+        self._serving_context: Optional[ServingTaskContext] = None
         self._initialized = True
+
+    def _configure_serving_task(self, context: ServingTaskContext) -> None:
+        """Select the internal original-task STOP path before constructing an executor."""
+        if self._is_shutdown or self._serving_context is not None:
+            raise RuntimeError(
+                "Serving task must be configured exactly once before construction"
+            )
+        self._serving_context = context
 
     def submit(self,
                task: Callable[..., T],
@@ -782,6 +804,14 @@ class RemoteMpiCommSessionClient(MpiSession):
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
         self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
+        return []
+
+    def _submit_serving_task(self, context: ServingTaskContext,
+                             task: Callable[..., T], *args, **kwargs) -> list:
+        if self._is_shutdown:
+            raise RuntimeError(
+                "Remote session cannot start a serving task after shutdown")
+        self.queue.put(RemoteTask(task, args, kwargs, serving_context=context))
         return []
 
     SYNC_IDLE_INTERVAL = 8
@@ -854,9 +884,8 @@ class RemoteMpiCommSessionClient(MpiSession):
         self.shutdown()
 
 
-class RemoteMpiCommSessionServer():
-    """RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.
-    """
+class RemoteMpiCommSessionServer:
+    """Remote task dispatch and bounded retention of original MPI invocations."""
 
     def __init__(self,
                  hmac_key: bytes,
@@ -873,6 +902,23 @@ class RemoteMpiCommSessionServer():
                                  use_hmac_encryption=True)
         self.comm = comm
         self.results = []  # the results may arrive in any order
+        self._session_events = SimpleQueue()
+        self._active_task_id = 0
+        self._active_futures: list[Future] = []
+        self._completed_futures: set[Future] = set()
+        self._serving_workers = None
+        self._serving_context: Optional[ServingTaskContext] = None
+        self._retention: Optional[TaskRetentionRequest] = None
+        self._retention_deadline: Optional[float] = None
+        self._invocation_workers: tuple["WorkerProcessIdentity", ...] = ()
+        self._retention_acknowledged = False
+        self._worker_progress = {}
+        self._task_body_ended = {}
+        self._transport_failures = {}
+        self._transport_deadline = None
+        self._authority_registration = None
+        self._authority_deadline = None
+        self._lease_sequence = 0
 
         if self.comm is not None:
             self.session = MpiCommSession(n_workers=self.comm.Get_size(),
@@ -908,72 +954,409 @@ class RemoteMpiCommSessionServer():
                 "green")
             mpi_barrier()
 
-    def serve(self):
+    @staticmethod
+    def serving_task_wrapper(context: ServingTaskContext, invocation_id: int,
+                             task: Callable[..., T], *args, **kwargs) -> T:
+        from ..executor.recovery import ServingTaskControl, WorkerTaskIdentity
+        from ..executor.worker_process_monitor import \
+            capture_worker_process_identity
+
+        identity = WorkerTaskIdentity(
+            context.task_id, context.expected_generation, invocation_id,
+            capture_worker_process_identity(mpi_rank()))
+        control = ServingTaskControl(context, identity)
+        MPINodeState._serving_task_context = (context, invocation_id)
+        MPINodeState._serving_task_control = control
+        try:
+            control.start()
+            mpi_barrier()
+            error_type = ""
+            try:
+                return task(*args, **kwargs)
+            except BaseException as error:
+                # Preserve the task outcome; the independent channel reports it before the final barrier.
+                error_type = type(error).__name__
+                raise
+            finally:
+                control.task_body_ended(error_type)
+                if not control.stop_requested:
+                    mpi_barrier()
+        finally:
+            try:
+                control.close()
+            finally:
+                MPINodeState._serving_task_control = None
+                MPINodeState._serving_task_context = None
+
+    def _submit_serving_task(self, message: RemoteTask) -> list[Future]:
+        from ..executor.recovery import TaskStarted
+
+        context = message.serving_context
+        if not isinstance(self.session, MpiCommSession):
+            raise ValueError(
+                "Serving-task retention requires a qualified external MPI session"
+            )
+        if (context.task_id <= self._active_task_id or message.sync
+                or context.expected_generation < 0):
+            raise ValueError("Invalid original serving-task context")
+        self._active_task_id = context.task_id
+        self._serving_context = context
+        if getattr(self, "recovery_queue", None) is None:
+            from ..executor.ipc import ZeroMqQueue
+
+            self.recovery_queue = ZeroMqQueue(context.authority_address,
+                                              is_server=False,
+                                              socket_type=zmq.DEALER,
+                                              use_hmac_encryption=True)
+        self.recovery_queue.put_nowait(
+            TaskStarted(context.task_id, context.expected_generation,
+                        self.session.n_workers, "session"))
+        worker_futures = [
+            self.session.mpi_pool.submit(self.serving_task_wrapper, context,
+                                         invocation_id, message.task,
+                                         *message.args, **message.kwargs)
+            for invocation_id in range(1, self.session.n_workers)
+        ]
+        leader = self.session.thread_pool.submit(self.serving_task_wrapper,
+                                                 context, 0, message.task,
+                                                 *message.args,
+                                                 **message.kwargs)
+        return [leader] + worker_futures
+
+    def _register_serving_workers(self,
+                                  task_id: int,
+                                  generation: int,
+                                  invocation_workers: tuple[
+                                      "WorkerProcessIdentity", ...],
+                                  registration_reference: str = "",
+                                  authority_id: str = "",
+                                  authority_lease_seconds: float = 5.0) -> None:
+        """Bind original births to per-submission invocation IDs from worker registration."""
+        from ..executor.recovery import TaskRegistration
+
+        if authority_id or registration_reference:
+            if (not authority_id or not registration_reference
+                    or not math.isfinite(authority_lease_seconds)
+                    or not 0 < authority_lease_seconds <= 60):
+                raise ValueError("Server authority registration is incomplete")
+            self._authority_registration = TaskRegistration(
+                task_id, generation, tuple(invocation_workers),
+                registration_reference, authority_id, authority_lease_seconds)
+            self._authority_deadline = time.monotonic(
+            ) + authority_lease_seconds
+        self._session_events.put(
+            ("workers", (task_id, generation, tuple(invocation_workers))))
+
+    def _accept_authority_lease(self, lease: AuthorityLease) -> None:
+        registration = self._authority_registration
+        if (registration is None or lease.task_id != registration.task_id
+                or lease.generation != registration.generation
+                or lease.authority_id != registration.authority_id
+                or lease.registration_reference
+                != registration.registration_reference
+                or lease.timeout_seconds != registration.authority_lease_seconds
+                or type(lease.sequence) is not int
+                or lease.sequence <= self._lease_sequence
+                or time.monotonic() >= self._authority_deadline):
+            raise ValueError("Server authority lease conflicts or expired")
+        self._lease_sequence = lease.sequence
+        self._authority_deadline = time.monotonic() + lease.timeout_seconds
+
+    @staticmethod
+    def _is_native_transport_failure(error: BaseException) -> bool:
+        mpi = getattr(mpi4py, "MPI", None)
+        exception_type = getattr(mpi, "Exception", ())
+        codes = tuple(code for code in (getattr(mpi, "ERR_PROC_FAILED", None),
+                                        getattr(mpi, "ERR_REVOKED", None))
+                      if code is not None)
+        return isinstance(error,
+                          exception_type) and error.Get_error_class() in codes
+
+    def _accept_task_progress(self, progress: SessionWorkerProgress) -> None:
+        from ..executor.recovery import SessionWorkerProgress
+
+        request = self._retention
+        identity = progress.identity
+        if (request is None or not isinstance(progress, SessionWorkerProgress)
+                or identity.task_id != request.task_id
+                or identity.generation != request.expected_generation or
+                not 0 <= identity.invocation_id < len(self._invocation_workers)
+                or self._invocation_workers[identity.invocation_id]
+                != identity.worker or identity.worker == request.failed_worker
+                or progress.transaction_id != request.transaction_id
+                or not math.isfinite(progress.timeout_seconds)
+                or not 0 < progress.timeout_seconds <= 60
+                or identity.invocation_id in self._task_body_ended or
+            (progress.stopped is not None and
+             (progress.stopped.identity != identity
+              or progress.stopped.transaction_id != request.transaction_id))):
+            raise ValueError(
+                "Worker lifetime progress conflicts with the retained original task"
+            )
+        previous = self._worker_progress.get(identity.invocation_id)
+        stopped = progress.stopped or (previous[1]
+                                       if previous is not None else None)
+        self._worker_progress[identity.invocation_id] = (
+            time.monotonic() + progress.timeout_seconds, stopped)
+
+    def _accept_task_body_ended(self, ended: SessionTaskBodyEnded) -> None:
+        status = ended.status
+        identity = status.identity
+        if (status.kind != "TASK_BODY_END"
+                or identity.task_id != self._active_task_id or
+                not 0 <= identity.invocation_id < len(self._invocation_workers)
+                or self._invocation_workers[identity.invocation_id]
+                != identity.worker):
+            raise ValueError(
+                "Task END does not bind an original serving invocation")
+        self._task_body_ended[identity.invocation_id] = status
+        if self._retention is not None and identity.worker != self._retention.failed_worker:
+            raise RuntimeError(
+                "Original surviving serving task body ended during retention")
+
+    def _check_retained_tasks(self) -> bool:
+        request = self._retention
+        if request is None:
+            return False
+        complete = True
+        for invocation, (worker, future) in enumerate(
+                zip(self._invocation_workers, self._active_futures)):
+            if worker == request.failed_worker:
+                continue
+            if invocation in self._task_body_ended:
+                raise RuntimeError(
+                    "Original surviving serving task body ended during retention"
+                )
+            if future.done():
+                if future.cancelled():
+                    raise RuntimeError(
+                        "Original serving task future was canceled")
+                error = future.exception()
+                if error is None or not self._is_native_transport_failure(
+                        error):
+                    raise RuntimeError(
+                        "Unexpected surviving task result or application error"
+                    ) from error
+            progress = self._worker_progress.get(invocation)
+            if progress is None:
+                complete = False
+            elif time.monotonic() >= progress[0]:
+                raise TimeoutError("Original survivor task progress expired")
+            elif progress[1] is None:
+                complete = False
+        return complete
+
+    def _begin_task_retention(self, request: TaskRetentionRequest) -> None:
+        if request == self._retention:
+            return
+        binding = (request.task_id, request.expected_generation,
+                   request.workers)
+        if (self._retention is not None or not self._active_futures
+                or binding != self._serving_workers
+                or not request.transaction_id or not request.evidence_reference
+                or request.failed_worker not in request.workers
+                or request.failed_worker.rank == 0
+                or type(request.timeout_seconds) not in (int, float)
+                or not math.isfinite(request.timeout_seconds)
+                or not 0 < request.timeout_seconds <= 60):
+            raise ValueError("Invalid or conflicting serving-task retention")
+        self._retention = request
+        self._retention_deadline = time.monotonic() + request.timeout_seconds
+        self._check_retained_tasks()
+
+    def _drain_session_events(self) -> None:
+        from ..executor.recovery import SessionTransportFailure
+
+        while True:
+            try:
+                kind, event = self._session_events.get_nowait()
+            except Empty:
+                break
+            if kind == "workers":
+                task_id, generation, workers = event
+                if (task_id != self._active_task_id or not self._active_futures
+                        or self._serving_workers is not None
+                        or type(generation) is not int or generation < 0
+                        or (self._serving_context is not None and generation
+                            != self._serving_context.expected_generation)
+                        or len(workers) != self.session.n_workers
+                        or {worker.rank
+                            for worker in workers} != set(range(len(workers)))
+                        or len({(worker.hostname, worker.pid_namespace,
+                                 worker.pid, worker.start_time)
+                                for worker in workers}) != len(workers)
+                        or any(worker.start_time is None or worker.pid_namespace
+                               is None or worker.pid <= 0 or not worker.hostname
+                               for worker in workers)):
+                    raise ValueError(
+                        "Invalid original serving-worker registration")
+                self._invocation_workers = workers
+                self._serving_workers = (task_id, generation, workers)
+            else:
+                if event not in self._active_futures:
+                    raise ValueError("Completion belongs to another MPI task")
+                if event in self._completed_futures:
+                    continue
+                if self._serving_context is not None and not event.cancelled():
+                    error = event.exception()
+                    if error is not None and self._is_native_transport_failure(
+                            error):
+                        self._transport_failures[event] = error
+                        if self._transport_deadline is None:
+                            self._transport_deadline = time.monotonic() + 60.
+                        self.recovery_queue.put_nowait(
+                            SessionTransportFailure(self._active_task_id,
+                                                    type(error).__name__,
+                                                    str(error)))
+                        self._completed_futures.add(event)
+                        continue
+                if self._retention is not None:
+                    self._check_retained_tasks()
+                    if event.cancelled() or event.exception() is not None:
+                        raise RuntimeError(
+                            "Unclassified task error during retention"
+                        ) from event.exception()
+                if kind == "sync":
+                    self._publish_sync_result(event)
+                elif kind == "async":
+                    self._publish_async_error(event)
+                else:
+                    raise ValueError("Unknown MPI session event")
+                self._completed_futures.add(event)
+
+    def _acknowledge_task_retention(self) -> None:
+        from ..executor.recovery import TaskRetentionAck
+
+        request = self._retention
+        if request is None or self._retention_acknowledged:
+            return
+        survivors = tuple(worker for worker in request.workers
+                          if worker != request.failed_worker)
+        if not self._check_retained_tasks():
+            return
+        self.recovery_queue.put_nowait(TaskRetentionAck(request, survivors))
+        self._retention_acknowledged = True
+
+    def serve(self) -> None:
+        try:
+            self._serve()
+        finally:
+            queue = getattr(self, "recovery_queue", None)
+            if queue is not None:
+                queue.socket.setsockopt(zmq.LINGER, 0)
+                queue.close()
+
+    def _serve(self) -> None:
+        from ..executor.recovery import (AuthorityLease, SessionTaskBodyEnded,
+                                         SessionWorkerProgress,
+                                         TaskRegistration, TaskRetentionRequest)
+
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
-        pending_futures = []
+        waiting = deque()
         while True:
-            # Wait for any pending futures from previous tasks to complete
-            # This ensures all ranks are ready before accepting the next task
-            if pending_futures:
-                logger_debug(
-                    f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
-                    "grey")
-                n_failed = 0
-                first_exc = None
-                # Use as_completed so that failures are logged as soon as
-                # they occur rather than blocking behind a stuck future.
-                for future in as_completed(pending_futures):
-                    try:
-                        future.result()  # Wait for completion
-                    except Exception as e:
-                        n_failed += 1
-                        if first_exc is None:
-                            first_exc = e
-                        print_colored(
-                            f"RemoteMpiCommSessionServer: MPI worker future "
-                            f"failed: {type(e).__name__}: {e}\n", "red")
-                        if n_failed == len(pending_futures):
-                            # All workers failed — no point waiting further.
-                            break
-                if n_failed:
-                    logger.error(
-                        f"RemoteMpiCommSessionServer: {n_failed}/"
-                        f"{len(pending_futures)} MPI worker(s) failed. "
-                        f"First error: {first_exc}")
-                pending_futures.clear()
-                logger_debug(
-                    "RemoteMpiCommSessionServer all pending futures completed\n",
-                    "grey")
-
-            message: Optional[RemoteTask] = self.queue.get()
-            if message is None:
-                logger_debug(
-                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
-                    "green")
-                self.session.shutdown_abort()
-                self._close_global_comm_executor()
-                break
-            else:
-                logger_debug(
-                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",
-                    "green")
-                futures = self.session.submit(
-                    RemoteMpiCommSessionServer.task_wrapper, message.task,
-                    *message.args, **message.kwargs)
+            try:
+                self._drain_session_events()
+                if (self._authority_deadline is not None
+                        and time.monotonic() >= self._authority_deadline):
+                    raise TimeoutError(
+                        "Session recovery authority lease expired")
+                if (self._transport_deadline is not None
+                        and self._retention is None
+                        and time.monotonic() >= self._transport_deadline):
+                    raise TimeoutError(
+                        "Native MPI transport suspicion lacks authorized task retention"
+                    )
+                if (self._retention_deadline is not None
+                        and time.monotonic() >= self._retention_deadline):
+                    raise TimeoutError(
+                        "Serving-task retention deadline expired")
+                self._check_retained_tasks()
+                self._acknowledge_task_retention()
+                if (
+                        self._serving_context is None
+                        or not self._transport_failures
+                ) and self._retention is None and self._active_futures and len(
+                        self._completed_futures) == len(self._active_futures):
+                    self._active_futures.clear()
+                    self._completed_futures.clear()
+                    self.results.clear()
+                    self._serving_workers = None
+                    self._serving_context = None
+                    self._invocation_workers = ()
+                if getattr(self, "recovery_queue",
+                           None) is not None and self.recovery_queue.poll(0):
+                    request = self.recovery_queue.get()
+                    self._drain_session_events()
+                    if isinstance(request, TaskRegistration):
+                        self._register_serving_workers(
+                            request.task_id, request.generation,
+                            request.workers, request.registration_reference,
+                            request.authority_id,
+                            request.authority_lease_seconds)
+                        continue
+                    if isinstance(request, AuthorityLease):
+                        self._accept_authority_lease(request)
+                        continue
+                    if isinstance(request, SessionWorkerProgress):
+                        self._accept_task_progress(request)
+                        continue
+                    if isinstance(request, SessionTaskBodyEnded):
+                        self._accept_task_body_ended(request)
+                        continue
+                    if not isinstance(request, TaskRetentionRequest):
+                        raise ValueError(
+                            "Unexpected recovery authority message")
+                    self._begin_task_retention(request)
+                    continue
+                if waiting and not self._active_futures:
+                    message = waiting.popleft()
+                elif self.queue.poll(0.01):
+                    message = self.queue.get()
+                else:
+                    continue
+                self._drain_session_events()
+                if self._retention is not None and message is not None:
+                    raise RuntimeError(
+                        "MPI task submission rejected after worker loss")
+                if self._active_futures and self._retention is None:
+                    waiting.append(message)
+                    continue
+                if message is None:
+                    self.session.shutdown_abort()
+                    self._close_global_comm_executor()
+                    return
+                if not isinstance(message, RemoteTask):
+                    raise ValueError("Unexpected MPI session message")
+                if message.serving_context is not None:
+                    futures = self._submit_serving_task(message)
+                else:
+                    futures = self.session.submit(self.task_wrapper,
+                                                  message.task, *message.args,
+                                                  **message.kwargs)
                 self.num_results = self.session.n_workers
-                assert len(futures) == self.num_results == mpi_world_size()
-                # Store futures to wait for them before the next task
-                pending_futures = list(futures)
+                if len(
+                        futures
+                ) != self.num_results or self.num_results != mpi_world_size():
+                    raise RuntimeError(
+                        "MPI task did not start on the original worker group")
+                if message.serving_context is None:
+                    self._active_task_id += 1
+                self._active_futures = list(futures)
+                callback = self.mpi_future_callback if message.sync else self.mpi_async_error_callback
                 for future in futures:
-                    if message.sync:
-                        future.add_done_callback(self.mpi_future_callback)
-                    else:
-                        # Fire-and-forget tasks have no result channel, but a
-                        # crashed worker must still reach the client (the
-                        # client-side session has no futures to watch); see
-                        # RemoteWorkerDeath.
-                        future.add_done_callback(self.mpi_async_error_callback)
+                    future.add_done_callback(callback)
+            except (RuntimeError, ValueError, TimeoutError,
+                    zmq.ZMQError) as error:
+                # An invalid lifecycle handoff retains no permission to keep serving.
+                try:
+                    self.queue.put_nowait(
+                        RemoteWorkerDeath.from_exception(error))
+                except zmq.ZMQError:
+                    pass
+                self.session.shutdown_abort(reason=error)
+                self._close_global_comm_executor()
+                return
 
     @staticmethod
     def _close_global_comm_executor(
@@ -1034,13 +1417,14 @@ class RemoteMpiCommSessionServer():
                 "free stuck ranks...")
             abort()
 
-    def mpi_async_error_callback(self, future):
-        """Forward a worker exception to the client for async tasks.
+    def mpi_async_error_callback(self, future: Future) -> None:
+        self._session_events.put(("async", future))
 
-        Runs on the executor's callback thread, like the existing sync-path
-        mpi_future_callback (same pre-existing cross-thread ZMQ-put pattern).
-        Best-effort: the socket may already be closed at shutdown.
-        """
+    def mpi_future_callback(self, future: Future) -> None:
+        self._session_events.put(("sync", future))
+
+    def _publish_async_error(self, future: Future) -> None:
+        """Forward an async task exception from the socket-owner loop."""
         if future.cancelled():
             return
         exc = future.exception()
@@ -1050,18 +1434,20 @@ class RemoteMpiCommSessionServer():
             f"RemoteMpiCommSessionServer: async MPI worker failed, forwarding "
             f"to client: {type(exc).__name__}: {exc}\n", "red")
         try:
-            self.queue.put(RemoteWorkerDeath.from_exception(exc))
+            self.queue.put_nowait(RemoteWorkerDeath.from_exception(exc))
         except Exception as e:
             logger_debug(f"Failed to forward worker death to client: {e}\n",
                          "red")
 
-    def mpi_future_callback(self, future):
+    def _publish_sync_result(self, future: Future) -> None:
         logger_debug(f"rank{global_mpi_rank()} got future: {future}\n", "red")
+        if future.cancelled():
+            return
         if future.exception() is not None:
             logger_debug(
                 f"mpi_future got exception: {future.exception()}, quitting\n",
                 "red")
-            self.queue.put(future.exception())
+            self.queue.put_nowait(future.exception())
             return
 
         result = future.result()

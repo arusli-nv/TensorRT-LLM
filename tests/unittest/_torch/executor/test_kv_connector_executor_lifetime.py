@@ -37,6 +37,7 @@ def _executor() -> PyExecutor:
     executor.kv_cache_transceiver = None
     executor.active_requests = []
     executor.canceled_req_ids = []
+    executor._fetch_request_envelope = None
     executor.dist = SimpleNamespace(rank=0)
     executor._disagg_pp_termination_handler = None
     executor._do_terminate_request = Mock()

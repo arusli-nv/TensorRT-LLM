@@ -105,7 +105,9 @@ def derive_attention_dp_per_rank_request_cap(
 
 
 def can_process_attention_dp_request(
-    req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
+    req_item,
+    all_ranks_num_active_requests: list[int] | dict[int, int],
+    max_num_active_requests: int,
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
@@ -125,6 +127,12 @@ def can_process_attention_dp_request(
     if target_dp_rank is None or scheduling_params.attention_dp_relax:
         return True
 
+    if (
+        isinstance(all_ranks_num_active_requests, dict)
+        and target_dp_rank not in all_ranks_num_active_requests
+    ):
+        raise ValueError(f"Attention DP rank {target_dp_rank} is not serving")
+
     if all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests:
         all_ranks_num_active_requests[target_dp_rank] += 1
         return True
@@ -137,7 +145,7 @@ def get_from_waiting_queue(
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
-    all_ranks_num_active_requests: Optional[List[int]] = None,
+    all_ranks_num_active_requests: list[int] | dict[int, int] | None = None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -168,7 +176,6 @@ def get_from_waiting_queue(
         num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
-        req_item = waiting_queue.pop_request()
 
         can_process = (
             can_process_attention_dp_request(
@@ -177,6 +184,7 @@ def get_from_waiting_queue(
             if enable_attention_dp
             else True
         )
+        req_item = waiting_queue.pop_request()
 
         if can_process:
             items.append(req_item)

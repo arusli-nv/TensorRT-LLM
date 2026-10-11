@@ -31,7 +31,9 @@ from tensorrt_llm._torch.disaggregation.orchestration.interfaces import Executor
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    CONTROL_REQUEST_ID,
     SHUTDOWN_REQUEST_ID,
+    ExecutorRequestQueue,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -60,6 +62,120 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _make_request_fetch_executor() -> PyExecutor:
+    executor = object.__new__(PyExecutor)
+    executor._fetch_request_envelope = None
+    executor.dist = types.SimpleNamespace(rank=0, tp_size=1, has_pp=False, cp_size=1)
+    executor.kv_connector_manager = None
+    executor.control_requests = []
+    executor.canceled_req_ids = []
+    executor.request_accumulated = []
+    executor.is_shutdown = False
+    executor._disable_mpi = False
+    executor.hang_detector = types.SimpleNamespace(pause=nullcontext)
+    executor.executor_request_queue = ExecutorRequestQueue(
+        executor.dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0
+    )
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.side_effect = lambda items: (items, None)
+    return executor
+
+
+def test_request_fetch_releases_envelope_after_success() -> None:
+    executor = _make_request_fetch_executor()
+    waiting = FCFSWaitingQueue()
+    for request_id in (8, 9):
+        item = RequestQueueItem(request_id, Mock())
+        executor.executor_request_queue.request_queue.put(item)
+        executor._fetch_and_enqueue_requests(waiting, total_num_live_requests=1)
+        assert waiting[-1] is item
+        assert executor._fetch_request_envelope is None
+    assert len(waiting) == 2
+
+
+@pytest.mark.parametrize("with_request", [False, True])
+def test_request_fetch_failure_preserves_consumed_items_and_later_arrival(with_request: bool) -> None:
+    executor = _make_request_fetch_executor()
+    waiting = FCFSWaitingQueue()
+    consumed = RequestQueueItem(8, Mock())
+    later = RequestQueueItem(9, Mock())
+    if with_request:
+        executor.executor_request_queue.request_queue.put(consumed)
+    original_error = ConnectionError("Request broadcast failed")
+    observed = []
+
+    def fail_broadcast(items: list) -> None:
+        observed.append(items)
+        executor.executor_request_queue.request_queue.put(later)
+        raise original_error
+
+    executor.request_broadcaster.broadcast.side_effect = fail_broadcast
+    with pytest.raises(ConnectionError) as raised:
+        executor._fetch_and_enqueue_requests(waiting, total_num_live_requests=1)
+    assert raised.value is original_error
+    assert executor._fetch_request_envelope is observed[0]
+    assert observed[0] == ([consumed] if with_request else [])
+    assert not waiting
+
+    executor.enable_attention_dp = True
+    executor.adp_router = Mock()
+    with pytest.raises(RuntimeError, match="consumed request envelope"):
+        executor._fetch_new_requests(waiting, [])
+    with pytest.raises(RuntimeError, match="consumed request envelope"):
+        executor._fetch_and_enqueue_requests(waiting, total_num_live_requests=1)
+    executor.adp_router.gather_all_rank_states.assert_not_called()
+    executor.request_broadcaster.broadcast.assert_called_once()
+    assert executor.executor_request_queue.request_queue.get_nowait() is later
+    assert executor._fetch_request_envelope is observed[0]
+
+
+def test_request_fetch_failure_keeps_received_envelope() -> None:
+    executor = _make_request_fetch_executor()
+    waiting = FCFSWaitingQueue()
+    received = [RequestQueueItem(8, Mock())]
+    executor.request_broadcaster.broadcast.side_effect = lambda items: (received, None)
+    original_error = ValueError("Request handler failed")
+    executor._handle_special_queue_items = Mock(side_effect=original_error)
+    with pytest.raises(ValueError) as raised:
+        executor._fetch_and_enqueue_requests(waiting, total_num_live_requests=1)
+    assert raised.value is original_error
+    assert executor._fetch_request_envelope is received
+    assert not waiting
+
+
+def test_request_fetch_partial_transfer_cannot_be_replayed() -> None:
+    executor = _make_request_fetch_executor()
+    waiting = FCFSWaitingQueue()
+    request = RequestQueueItem(8, Mock())
+    cancel = RequestQueueItem(10, is_canceled_request=True)
+    control = RequestQueueItem(CONTROL_REQUEST_ID, control_id="checkpoint")
+    trailing = RequestQueueItem(9, Mock())
+    items = [request, cancel, control, trailing]
+    for item in items:
+        executor.executor_request_queue.request_queue.put(item)
+    original_error = RuntimeError("Waiting queue failed after accepting an item")
+
+    def transfer_then_fail(accepted: list) -> None:
+        waiting.extend(accepted)
+        raise original_error
+
+    with patch.object(waiting, "add_requests", side_effect=transfer_then_fail):
+        with pytest.raises(RuntimeError) as raised:
+            executor._fetch_and_enqueue_requests(waiting, total_num_live_requests=1)
+    assert raised.value is original_error
+    assert executor._fetch_request_envelope == items
+    assert list(waiting) == [request]
+    assert executor.canceled_req_ids == [cancel.id]
+    assert executor.control_requests == [control]
+    assert executor.request_accumulated == [trailing]
+    with pytest.raises(RuntimeError, match="consumed request envelope"):
+        executor._fetch_and_enqueue_requests(waiting, total_num_live_requests=1)
+    assert list(waiting) == [request]
+    assert executor.canceled_req_ids == [cancel.id]
+    assert executor.control_requests == [control]
+    assert executor.request_accumulated == [trailing]
 
 
 @pytest.mark.parametrize(

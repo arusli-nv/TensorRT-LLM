@@ -18,10 +18,13 @@ import functools
 import os
 import platform
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from _thread import RLock
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, List, Optional, Protocol, Union
+from typing import Any, Iterator, List, Optional, Protocol, Union
 
 import pynvml
 import torch
@@ -261,6 +264,12 @@ class _MnnvlAllocationRecord:
     comm_signature: tuple[int, ...] = ()
     state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
     pending_comm: Any = None
+    retained_backing: object | None = None
+    backing_lock: RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+
+    def require_mutable_backing(self) -> None:
+        if self.retained_backing is not None:
+            raise RuntimeError("MNNVL backing is retained by a model execution state")
 
 
 class MnnvlMemory:
@@ -324,6 +333,43 @@ class MnnvlMemory:
     def mapped(self) -> bool:
         """Whether the allocation is mapped and ready for data-path access."""
         return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
+
+    @classmethod
+    @contextmanager
+    def _locked_record(cls, ptr: int) -> Iterator[_MnnvlAllocationRecord]:
+        record = cls.allocated_map[ptr]
+        with record.backing_lock:
+            if cls.allocated_map.get(ptr) is not record:
+                raise RuntimeError("MNNVL allocation changed while waiting for backing access")
+            yield record
+
+    @contextmanager
+    def mutable_backing(self) -> Iterator[None]:
+        """Serialize backing changes and reject them while a model retains the mapping."""
+        with type(self)._locked_record(self.ptr) as record:
+            record.require_mutable_backing()
+            yield
+
+    def retain_mapped_backing(self) -> object:
+        """Prevent unmapping until the owner releases the returned identity token.
+
+        The owner must retain this memory object and release only after its GPU
+        work and captured graphs can no longer access the allocation.
+        """
+        with type(self)._locked_record(self.ptr) as record:
+            record.require_mutable_backing()
+            if record.state is not _MnnvlAllocationState.MAPPED:
+                raise RuntimeError("Cannot retain unmapped MNNVL backing")
+            token = object()
+            record.retained_backing = token
+            return token
+
+    def release_mapped_backing(self, token: object) -> None:
+        """Release a mapping claim after the owner has retired every GPU user."""
+        with type(self)._locked_record(self.ptr) as record:
+            if record.retained_backing is None or record.retained_backing is not token:
+                raise RuntimeError("MNNVL retained-backing owner does not match")
+            record.retained_backing = None
 
     def as_torch_strided_tensor(self, dtype):
         # Describe the allocation with the layout it was created under, recorded at
@@ -799,55 +845,58 @@ class MnnvlMemory:
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
-        record = cls.allocated_map[ptr]
-        if record.state not in (
-            _MnnvlAllocationState.MAPPED,
-            _MnnvlAllocationState.UNMAPPED,
-        ):
-            logger.warning(
-                f"Skipping cleanup of MNNVL allocation in terminal state {record.state.value}"
-            )
-            return
-        cls.allocated_map.pop(ptr)
-        if record.state is _MnnvlAllocationState.MAPPED:
-            cls._unmap_and_release_handles(record)
-        cls.address_refcnt[record.start_address] -= 1
+        with cls._locked_record(ptr) as record:
+            record.require_mutable_backing()
+            if record.state not in (
+                _MnnvlAllocationState.MAPPED,
+                _MnnvlAllocationState.UNMAPPED,
+            ):
+                logger.warning(
+                    f"Skipping cleanup of MNNVL allocation in terminal state {record.state.value}"
+                )
+                return
+            cls.allocated_map.pop(ptr)
+            if record.state is _MnnvlAllocationState.MAPPED:
+                cls._unmap_and_release_handles(record)
+            cls.address_refcnt[record.start_address] -= 1
 
-        if cls.address_refcnt[record.start_address] == 0:
-            cls.address_refcnt.pop(record.start_address)
-            device_ptr = cuda.CUdeviceptr(record.start_address)
-            # cuMemAddressFree wants the exact length that was reserved. Taking it from this
-            # record is sound because _address_window_fits() only lets allocations share a
-            # range when their communicators agree on size.
-            _check_cu_result(
-                cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
-            )
-            if record.start_address == cls.current_start_address:
-                cls.current_start_address = 0
-                cls.current_rank_stride = 0
-                cls.current_mem_offset = 0
-                cls.current_address_comm_size = 0
+            if cls.address_refcnt[record.start_address] == 0:
+                cls.address_refcnt.pop(record.start_address)
+                device_ptr = cuda.CUdeviceptr(record.start_address)
+                # cuMemAddressFree wants the exact length that was reserved. Taking it from this
+                # record is sound because _address_window_fits() only lets allocations share a
+                # range when their communicators agree on size.
+                _check_cu_result(
+                    cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
+                )
+                if record.start_address == cls.current_start_address:
+                    cls.current_start_address = 0
+                    cls.current_rank_stride = 0
+                    cls.current_mem_offset = 0
+                    cls.current_address_comm_size = 0
 
     @classmethod
     def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
-        first_error = None
-        for rank in range(record.comm_size):
-            rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
-            try:
-                _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
-            except RuntimeError as error:
-                if first_error is None:
-                    first_error = error
-                continue
-            try:
-                _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
-            except RuntimeError as error:
-                if first_error is None:
-                    first_error = error
-            else:
-                record.mem_handles[rank] = None
-        if first_error is not None:
-            raise first_error
+        with record.backing_lock:
+            record.require_mutable_backing()
+            first_error = None
+            for rank in range(record.comm_size):
+                rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+                except RuntimeError as error:
+                    if first_error is None:
+                        first_error = error
+                    continue
+                try:
+                    _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
+                except RuntimeError as error:
+                    if first_error is None:
+                        first_error = error
+                else:
+                    record.mem_handles[rank] = None
+            if first_error is not None:
+                raise first_error
 
     def checkpoint_prepare(self) -> None:
         """Detach local backing handles while retaining graph-visible VA.
@@ -856,21 +905,22 @@ class MnnvlMemory:
         invoking this operation on every rank. No collective follows the CUDA
         mutation, so a local failure cannot strand peers in a trailing barrier.
         """
-        cls = type(self)
-        record = cls.allocated_map[self.ptr]
-        if record.state is _MnnvlAllocationState.UNMAPPED:
-            return
-        if record.state is not _MnnvlAllocationState.MAPPED:
-            raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
-        record.state = _MnnvlAllocationState.PREPARING
-        try:
-            torch.cuda.synchronize()
-            cls._unmap_and_release_handles(record)
-            record.mem_handles = [None] * record.comm_size
-        except Exception:
-            record.state = _MnnvlAllocationState.BROKEN
-            raise
-        record.state = _MnnvlAllocationState.UNMAPPED
+        with self.mutable_backing():
+            cls = type(self)
+            record = cls.allocated_map[self.ptr]
+            if record.state is _MnnvlAllocationState.UNMAPPED:
+                return
+            if record.state is not _MnnvlAllocationState.MAPPED:
+                raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
+            record.state = _MnnvlAllocationState.PREPARING
+            try:
+                torch.cuda.synchronize()
+                cls._unmap_and_release_handles(record)
+                record.mem_handles = [None] * record.comm_size
+            except Exception:
+                record.state = _MnnvlAllocationState.BROKEN
+                raise
+            record.state = _MnnvlAllocationState.UNMAPPED
 
     def checkpoint_fail_closed(self) -> None:
         """Make a timed-out checkpoint allocation terminal.
@@ -878,131 +928,135 @@ class MnnvlMemory:
         A timeout means ranks may have reached different checkpoint phases.
         The allocation must not be reused by a later checkpoint attempt.
         """
-        record = type(self).allocated_map[self.ptr]
-        record.state = _MnnvlAllocationState.BROKEN
-        record.pending_comm = None
+        with self.mutable_backing():
+            record = type(self).allocated_map[self.ptr]
+            record.state = _MnnvlAllocationState.BROKEN
+            record.pending_comm = None
 
     def checkpoint_restore(self, comm: MnnvlCheckpointCommunicator) -> bool:
         """Remap fresh handles while keeping data-path access disabled."""
-        cls = type(self)
-        record = cls.allocated_map[self.ptr]
-        if record.state is _MnnvlAllocationState.MAPPED:
-            return False
-        if record.state is not _MnnvlAllocationState.UNMAPPED:
-            raise RuntimeError(f"Cannot restore MNNVL allocation in {record.state.value} state")
-        comm_size = comm.Get_size()
-        comm_rank = comm.Get_rank()
-        if comm_size != record.comm_size or comm_rank != record.comm_rank:
-            raise RuntimeError(
-                "Cannot restore MNNVL memory with a communicator that differs from "
-                "the graph-visible allocation layout: "
-                f"rank/size {comm_rank}/{comm_size} != "
-                f"{record.comm_rank}/{record.comm_size}"
-            )
-        try:
-            comm_membership = tuple(
-                int(rank)
-                for rank in _checkpoint_allgather(
-                    comm,
-                    self.mapping.rank,
-                    operation="communicator membership",
+        with self.mutable_backing():
+            cls = type(self)
+            record = cls.allocated_map[self.ptr]
+            if record.state is _MnnvlAllocationState.MAPPED:
+                return False
+            if record.state is not _MnnvlAllocationState.UNMAPPED:
+                raise RuntimeError(f"Cannot restore MNNVL allocation in {record.state.value} state")
+            comm_size = comm.Get_size()
+            comm_rank = comm.Get_rank()
+            if comm_size != record.comm_size or comm_rank != record.comm_rank:
+                raise RuntimeError(
+                    "Cannot restore MNNVL memory with a communicator that differs from "
+                    "the graph-visible allocation layout: "
+                    f"rank/size {comm_rank}/{comm_size} != "
+                    f"{record.comm_rank}/{record.comm_size}"
                 )
-            )
-        except Exception:
-            self.checkpoint_fail_closed()
-            raise
-        if comm_membership != record.comm_membership:
-            raise RuntimeError(
-                "Cannot restore MNNVL memory with a communicator whose ordered "
-                "membership differs from the graph-visible allocation layout: "
-                f"{comm_membership} != {record.comm_membership}"
-            )
-        record.state = _MnnvlAllocationState.RESTORING
-        local_error = None
-        try:
-            torch.cuda.synchronize()
-            record.mem_handles = cls._create_and_map_handles(
-                comm,
-                record.aligned_size,
-                record.start_address,
-                record.rank_stride,
-                record.address_offset,
-            )
-        except TimeoutError:
-            record.state = _MnnvlAllocationState.BROKEN
-            raise
-        except Exception as error:
-            local_error = f"{type(error).__name__}: {error}"
+            try:
+                comm_membership = tuple(
+                    int(rank)
+                    for rank in _checkpoint_allgather(
+                        comm,
+                        self.mapping.rank,
+                        operation="communicator membership",
+                    )
+                )
+            except Exception:
+                self.checkpoint_fail_closed()
+                raise
+            if comm_membership != record.comm_membership:
+                raise RuntimeError(
+                    "Cannot restore MNNVL memory with a communicator whose ordered "
+                    "membership differs from the graph-visible allocation layout: "
+                    f"{comm_membership} != {record.comm_membership}"
+                )
+            record.state = _MnnvlAllocationState.RESTORING
+            local_error = None
+            try:
+                torch.cuda.synchronize()
+                record.mem_handles = cls._create_and_map_handles(
+                    comm,
+                    record.aligned_size,
+                    record.start_address,
+                    record.rank_stride,
+                    record.address_offset,
+                )
+            except TimeoutError:
+                record.state = _MnnvlAllocationState.BROKEN
+                raise
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
 
-        try:
-            restore_errors = _checkpoint_allgather(
-                comm,
-                local_error,
-                operation="mapping readiness",
-            )
-        except Exception:
-            self._checkpoint_restore_failed()
-            raise
-        failed_ranks = [
-            f"rank {rank}: {error}"
-            for rank, error in enumerate(restore_errors)
-            if error is not None
-        ]
-        if failed_ranks:
-            self._checkpoint_restore_failed()
-            raise RuntimeError(
-                "MNNVL checkpoint restore failed on one or more ranks:\n" + "\n".join(failed_ranks)
-            )
-        record.pending_comm = comm
-        return True
+            try:
+                restore_errors = _checkpoint_allgather(
+                    comm,
+                    local_error,
+                    operation="mapping readiness",
+                )
+            except Exception:
+                self._checkpoint_restore_failed()
+                raise
+            failed_ranks = [
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(restore_errors)
+                if error is not None
+            ]
+            if failed_ranks:
+                self._checkpoint_restore_failed()
+                raise RuntimeError(
+                    "MNNVL checkpoint restore failed on one or more ranks:\n" + "\n".join(failed_ranks)
+                )
+            record.pending_comm = comm
+            return True
 
     def _checkpoint_restore_complete(self) -> None:
         """Publish a restored allocation after frontend protocol readiness."""
-        record = type(self).allocated_map[self.ptr]
-        if record.state is not _MnnvlAllocationState.RESTORING:
-            raise RuntimeError(f"Cannot complete MNNVL restore in {record.state.value} state")
-        if record.pending_comm is None:
-            raise RuntimeError("Cannot complete MNNVL restore without a replacement communicator")
-        record.comm = record.pending_comm
-        # Publish the replacement communicator together with the layout it serves.
-        # checkpoint_restore() validates the incoming communicator against this record
-        # alone (same size, rank and ordered membership), never against the class cache,
-        # which may since have been rebuilt for a different layout; setting comm while
-        # comm_signature still described that other layout would make get_comm() report a
-        # hit for it and hand this communicator out instead. An empty record signature
-        # clears the cache signature so the next get_comm() splits again rather than
-        # matching anything. The displaced communicator is dropped without Free(),
-        # because MPI_Comm_free is collective and this path is per-allocation.
-        type(self).comm = record.comm
-        type(self).comm_signature = record.comm_signature or None
-        record.pending_comm = None
-        record.state = _MnnvlAllocationState.MAPPED
+        with self.mutable_backing():
+            record = type(self).allocated_map[self.ptr]
+            if record.state is not _MnnvlAllocationState.RESTORING:
+                raise RuntimeError(f"Cannot complete MNNVL restore in {record.state.value} state")
+            if record.pending_comm is None:
+                raise RuntimeError("Cannot complete MNNVL restore without a replacement communicator")
+            record.comm = record.pending_comm
+            # Publish the replacement communicator together with the layout it serves.
+            # checkpoint_restore() validates the incoming communicator against this record
+            # alone (same size, rank and ordered membership), never against the class cache,
+            # which may since have been rebuilt for a different layout; setting comm while
+            # comm_signature still described that other layout would make get_comm() report a
+            # hit for it and hand this communicator out instead. An empty record signature
+            # clears the cache signature so the next get_comm() splits again rather than
+            # matching anything. The displaced communicator is dropped without Free(),
+            # because MPI_Comm_free is collective and this path is per-allocation.
+            type(self).comm = record.comm
+            type(self).comm_signature = record.comm_signature or None
+            record.pending_comm = None
+            record.state = _MnnvlAllocationState.MAPPED
 
     def _checkpoint_restore_failed(self) -> None:
         """Make a failed frontend restore terminal and fail closed."""
-        record = type(self).allocated_map[self.ptr]
-        if record.state is _MnnvlAllocationState.RESTORING:
-            for rank, handle in enumerate(record.mem_handles):
-                if handle is None:
-                    continue
-                rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
-                try:
-                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
-                except RuntimeError as error:
-                    logger.warning(
-                        f"Failed to unmap unpublished MNNVL restore for rank {rank}: {error}"
-                    )
-                try:
-                    _check_cu_result(cuda.cuMemRelease(handle))
-                except RuntimeError as error:
-                    logger.warning(
-                        "Failed to release unpublished MNNVL restore handle "
-                        f"for rank {rank}: {error}"
-                    )
-                else:
-                    record.mem_handles[rank] = None
-            record.state = _MnnvlAllocationState.BROKEN
-            record.pending_comm = None
+        with self.mutable_backing():
+            record = type(self).allocated_map[self.ptr]
+            if record.state is _MnnvlAllocationState.RESTORING:
+                for rank, handle in enumerate(record.mem_handles):
+                    if handle is None:
+                        continue
+                    rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+                    try:
+                        _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+                    except RuntimeError as error:
+                        logger.warning(
+                            f"Failed to unmap unpublished MNNVL restore for rank {rank}: {error}"
+                        )
+                    try:
+                        _check_cu_result(cuda.cuMemRelease(handle))
+                    except RuntimeError as error:
+                        logger.warning(
+                            "Failed to release unpublished MNNVL restore handle "
+                            f"for rank {rank}: {error}"
+                        )
+                    else:
+                        record.mem_handles[rank] = None
+                record.state = _MnnvlAllocationState.BROKEN
+                record.pending_comm = None
 
     @staticmethod
     @functools.cache

@@ -6,8 +6,10 @@ import subprocess  # nosec B404
 import sys
 import threading
 from pathlib import Path
+from queue import SimpleQueue
 from subprocess import PIPE, Popen
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,6 +17,7 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
+                                             RemoteMpiCommSessionServer,
                                              _identity_barrier_timeout,
                                              split_mpi_env)
 
@@ -29,6 +32,40 @@ def task0():
 @pytest.fixture(autouse=True)
 def _enable_mpi(monkeypatch):
     monkeypatch.delenv("TLLM_DISABLE_MPI", raising=False)
+
+
+@pytest.mark.cpu_only
+def test_task_retention_preserves_invocation_order() -> None:
+    """Can task retention bind original submissions assigned out of rank order?"""
+    from tensorrt_llm.executor.recovery import TaskRetentionRequest
+    from tensorrt_llm.executor.worker_process_monitor import \
+        WorkerProcessIdentity
+
+    workers = tuple(
+        WorkerProcessIdentity(rank, 100 + rank, 200 + rank, "host", 1)
+        for rank in (0, 2, 1))
+    server = RemoteMpiCommSessionServer.__new__(RemoteMpiCommSessionServer)
+    server.session = Mock(n_workers=3)
+    server._active_task_id = 1
+    server._active_futures = [Mock() for _ in workers]
+    server._serving_workers = None
+    server._serving_context = None
+    server._session_events = SimpleQueue()
+    server._retention = None
+    server._check_retained_tasks = Mock(return_value=False)
+    server._register_serving_workers(1, 0, workers)
+    server._drain_session_events()
+
+    request = TaskRetentionRequest(task_id=1,
+                                   transaction_id="loss",
+                                   expected_generation=0,
+                                   workers=workers,
+                                   failed_worker=workers[1],
+                                   timeout_seconds=30.0,
+                                   evidence_reference="departure")
+    server._begin_task_retention(request)
+    assert server._invocation_workers == workers
+    assert server._retention is request
 
 
 @pytest.mark.cpu_only

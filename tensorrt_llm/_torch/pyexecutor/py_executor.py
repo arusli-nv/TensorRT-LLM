@@ -41,6 +41,10 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
+
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.recovery import ServingTaskControl
+
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -65,7 +69,7 @@ from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
-from ..distributed.communicator import ReduceOp
+from ..distributed.communicator import ReduceOp, _HostCollectiveInterrupted
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -116,12 +120,22 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, count_retiring_requests
+from .scheduler.adp_router import (ADPRouter, DefaultADPRouter,
+                                   count_retiring_requests)
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+    from tensorrt_llm.executor.recovery import (IdleBoundaryCommand,
+                                                RecoveryProposal,
+                                                SchedulerStopReceipt,
+                                                WorkerStopCommand)
+
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from ..moe.fused_moe.communication.execution_state import LocalExecutionJoin
+    from .cuda_graph_runner import CUDAGraphRunner
+    from .model_engine import PreparedPlacement
+    from .resource_manager import KVCacheManager
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -389,6 +403,27 @@ class PendingEncoderStep:
     requests: List[LlmRequest]
     future: Future[EncoderStepResult]
     result: Optional[EncoderStepResult] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _IdleKVSnapshot:
+    fingerprint: tuple
+    native_owner: object
+    stream: torch.cuda.Stream
+    retained_owners: tuple
+    kv_manager: Optional["KVCacheManager"] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _SchedulerJoin:
+    request: RequestQueueItem
+    previous_batch: Optional[BatchState]
+    native_before: Optional[_IdleKVSnapshot] = None
+    native_after: Optional[_IdleKVSnapshot] = None
+    sampler_owners: tuple = ()
+    execution: Optional["LocalExecutionJoin"] = None
+    scheduler_thread_id: int = 0
+    request_capacity: int = 0
 
 
 class PyExecutor:
@@ -771,6 +806,9 @@ class PyExecutor:
             async_transfer_manager=self.async_transfer_manager,
         )
 
+        if getattr(self.model_engine, "execution_state", None) is not None:
+            self._qualify_recovery_router()
+
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -950,6 +988,7 @@ class PyExecutor:
 
         # Request processing state (managed by executor)
         self.canceled_req_ids: List[int] = []
+        self._fetch_request_envelope: list[RequestQueueItem] | None = None
         self.control_requests: List[RequestQueueItem] = []
         self.request_accumulated: List[RequestQueueItem] = []
         self.new_active_requests_queue_latency_ms = 0.0
@@ -963,6 +1002,10 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        self._serving_task_control = None
+        self._scheduler_stop_receipt = None
+        self._scheduler_join_owners = None
+        self._scheduler_stop_terminal = threading.Event()
         self._active_control_id: Optional[str] = None
         self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
         self._sleep_wakeup_pending_abort_lock = threading.Lock()
@@ -1760,6 +1803,8 @@ class PyExecutor:
         Signals the server to shutdown.
         """
         self.executor_request_queue.enqueue_shutdown_request()
+        if self._serving_task_control is not None:
+            self._scheduler_stop_terminal.set()
         self.shutdown_event.wait()
         # Tear down any profile window an HTTP caller left open (i.e.
         # /start_profile without a matching /stop_profile).  Runs before the
@@ -4762,6 +4807,30 @@ class PyExecutor:
         )
 
         pending = self.control_requests[0]
+        if pending.idle_boundary_timeout_s is not None:
+            self._serving_task_control.wait_for_idle_boundary(
+                pending.idle_boundary_timeout_s)
+            original, deadline = self.executor_request_queue.consume_idle_boundary(
+                pending.control_id)
+            self.control_requests.pop(0)
+            self._hold_scheduler_idle(
+                original,
+                deadline_monotonic=min(
+                    deadline,
+                    self._serving_task_control.idle_boundary_deadline))
+            return
+        if pending.scheduler_stop_timeout_s is not None:
+            self._serving_task_control.wait_for_scheduler_stop(
+                pending.scheduler_stop_timeout_s)
+            original, deadline = self.executor_request_queue.consume_scheduler_stop(
+                pending.control_id)
+            self.control_requests.pop(0)
+            self._hold_scheduler_stop(
+                original,
+                deadline_monotonic=min(
+                    deadline,
+                    self._serving_task_control.scheduler_stop_deadline))
+            return
 
         if pending.control_requires_drain and (
                 len(self.active_requests) != 0 or len(self.waiting_queue) != 0
@@ -4795,6 +4864,432 @@ class PyExecutor:
         self.control_action_done.clear()
         self._active_control_id = None
         logger.debug("[control_action] control request finished")
+
+    def bind_serving_control(self, control: "ServingTaskControl") -> None:
+        """Bind the final constructed executor to its original worker task once."""
+        if self._serving_task_control is not None:
+            raise RuntimeError("Serving control is already bound")
+        bind = getattr(self.dist, "_bind_serving_task", None)
+        if not callable(bind):
+            raise RuntimeError(
+                "Serving control requires a qualified MPI adapter")
+        bind(control)
+        self._serving_task_control = control
+        control.executor_constructed(self.executor_request_queue)
+
+    def _qualify_recovery_router(self) -> None:
+        if type(self.adp_router) is not DefaultADPRouter:
+            raise RuntimeError("Recovery requires the original DefaultADPRouter")
+
+    def _inspect_idle_v1_kv_layout(
+            self, manager: "KVCacheManager", pool: torch.Tensor,
+            runner: "CUDAGraphRunner") -> tuple[tuple, tuple]:
+        from tensorrt_llm._utils import binding_to_torch_dtype
+
+        if (manager.num_pools != 1 or manager.impl.num_pools != 1
+                or manager.blocks_in_secondary_pool != 0
+                or manager.enable_indexer_k_cache or manager.is_linear_attention
+                or manager.is_vswa or len(set(manager.num_kv_heads_per_layer)) != 1):
+            raise RuntimeError("Idle KV layout requires one unshared uniform primary pool")
+        pointers, mapping = manager.kv_cache_pool_pointers, manager.kv_cache_pool_mapping
+        for table, shape, dtype in ((pointers, (1, 2), torch.int64),
+                                    (mapping, (manager.num_local_layers, 2), torch.int32)):
+            if (table.device.type != "cpu" or table.dtype != dtype
+                    or tuple(table.shape) != shape or not table.is_contiguous()):
+                raise RuntimeError("Idle KV host pointer/mapping layout is invalid")
+        pointer_values = tuple(tuple(row) for row in pointers.tolist())
+        mapping_values = tuple(tuple(row) for row in mapping.tolist())
+        if (pointer_values != ((pool.data_ptr(), 0),)
+                or mapping_values != tuple((0, offset)
+                                           for offset in range(manager.num_local_layers))):
+            raise RuntimeError("Idle KV host tables do not name the original full pool")
+        expected_shape = (manager.blocks_in_primary_pool, manager.num_local_layers,
+                          manager.kv_factor, manager.num_kv_heads_per_layer[0]
+                          * manager.tokens_per_block * manager.head_dim)
+        if (pool.device.type != "cuda" or pool.device != manager._stream.device
+                or pool.dtype != binding_to_torch_dtype(manager.dtype)
+                or tuple(pool.shape) != expected_shape or not pool.is_contiguous()
+                or tuple(pool.stride()) != tuple(math.prod(expected_shape[index + 1:])
+                                                for index in range(len(expected_shape)))
+                or pool.storage_offset() != 0):
+            raise RuntimeError("Idle KV full primary pool ownership/layout is invalid")
+        if set(runner.graph_metadata) != set(runner.graphs):
+            raise RuntimeError("Idle KV graph metadata differs from original graphs")
+        state = self.model_engine.execution_state
+        peer_ranges = tuple((geometry[6] + rank * geometry[7], geometry[8])
+                            for geometry in (client.execution_geometry()
+                                             for client in state._clients)
+                            for rank in range(geometry[0]))
+        def describe(tensor: torch.Tensor) -> tuple:
+            if (tensor.device != pool.device or not tensor.is_contiguous()
+                    or tensor.storage_offset() != 0 or tensor.numel() <= 0):
+                raise RuntimeError("Idle captured KV tensor ownership/layout is invalid")
+            start, size = tensor.data_ptr(), tensor.numel() * tensor.element_size()
+            if start <= 0 or size <= 0:
+                raise RuntimeError("Idle captured KV allocation is not live")
+            if any(start < base + length and base < start + size
+                   for base, length in peer_ranges):
+                raise RuntimeError("Idle KV owner aliases remote-writable MoE storage")
+            return (start, size, tuple(tensor.shape), tuple(tensor.stride()),
+                    str(tensor.dtype), str(tensor.device))
+
+        captured, roots = [], []
+        for key, metadata in runner.graph_metadata.items():
+            attention = metadata["attn_metadata"]
+            offsets = attention.kv_cache_block_offsets
+            if (attention.kv_cache_manager is not manager
+                    or offsets.dtype != torch.int32
+                    or tuple(offsets.shape) != (1, attention.max_num_sequences,
+                                                2, manager.max_blocks_per_seq)):
+                raise RuntimeError("Captured KV offsets differ from their original manager")
+            captured.append((str(key), describe(offsets)))
+            roots.extend((attention, offsets))
+        if not captured:
+            raise RuntimeError("Idle KV has no original captured offset inventory")
+        return ((pointer_values, mapping_values, describe(pool), tuple(sorted(captured))),
+                tuple(roots))
+
+    def _snapshot_idle_v1_kv(self) -> _IdleKVSnapshot:
+        from .resource_manager import KVCacheManager, KVCacheManagerCpp
+        from .seq_slot_manager import SeqSlotManager
+
+        state = self.model_engine.execution_state
+        if state is None:
+            raise RuntimeError("Idle native-KV inspection has no model owner")
+        raw = self.executor_request_queue
+        if (self.worker_thread.ident != threading.get_ident()
+                or not self.disable_overlap_scheduler or self.dist.pp_size != 1
+                or self.dist.cp_size != 1 or self._is_kv_manager_v2
+                or self.enable_kv_cache_reuse or self.max_beam_width != 1 or
+                self.llm_args.kv_cache_config.host_cache_size not in (None, 0)
+                or self.llm_args.kv_cache_config.disk_cache_size
+                not in (None, 0) or self.is_warmup or self.is_shutdown
+                or self.kv_cache_transceiver is not None
+                or self.kv_connector_manager is not None
+                or self.model_engine.spec_config is not None
+                or self.draft_model_engine is not None
+                or self.drafter is not None or self.is_encoder_decoder
+                or self._resource_governor_enabled
+                or self.llm_args.sleep_config is not None or self.waiting_queue
+                or self.inflight_req_ids
+                or self._pending_adp_dummy_request is not None
+                or self.pending_encoder_steps or self._prefetched_request_ids
+                or self._pending_recompute_pause_ids
+                or self._pending_transfer_responses
+                or self._pending_response_terminations
+                or self.async_transfer_manager.requests_in_transfer()):
+            raise RuntimeError("V1 STOP ownership profile is not idle")
+        managers = self.resource_manager.resource_managers
+        if set(managers) != {
+                ResourceManagerType.KV_CACHE_MANAGER,
+                ResourceManagerType.SEQ_SLOT_MANAGER
+        }:
+            raise RuntimeError("V1 STOP has an unqualified resource owner")
+        manager = managers[ResourceManagerType.KV_CACHE_MANAGER]
+        slots = managers[ResourceManagerType.SEQ_SLOT_MANAGER]
+        if (type(manager) is not KVCacheManager
+                or manager is not self.kv_cache_manager
+                or type(manager.impl) is not KVCacheManagerCpp
+                or type(slots) is not SeqSlotManager
+                or manager.enable_block_reuse or manager.impl.enable_block_reuse
+                or manager.is_estimating_kv_cache
+                or manager.mapping is not self.dist.mapping
+                or manager._stream.cuda_stream
+                != self.execution_stream.cuda_stream):
+            raise RuntimeError(
+                "V1 STOP does not bind the original native/stream owner")
+        runner = self.model_engine.cuda_graph_runner
+        dummies = tuple(sorted(runner.padding_dummy_requests.items()))
+        ids = {request.py_request_id for _, request in dummies}
+        if any(not request.is_dummy_request or not request.is_cuda_graph_dummy
+               for _, request in dummies):
+            raise RuntimeError(
+                "V1 STOP padding inventory contains a real request")
+        native_ids = tuple(sorted(manager.impl._get_active_sequence_ids()))
+        if (len(native_ids) != len(ids) or set(native_ids) != ids
+                or manager._preprepared_dummy_request_ids != ids
+                or any(request.py_request_id not in ids
+                       for request in self.active_requests)):
+            raise RuntimeError(
+                "V1 native sequences still contain unresolved owners")
+        slot_owner = slots.slot_manager
+        slot_items = tuple(sorted(slot_owner.slot_mapping.items()))
+        slot_values = {slot for _, slot in slot_items}
+        if (not set(slot_owner.slot_mapping) <= ids
+                or len(slot_values) != len(slot_items) or slot_owner.free_slots
+                != set(range(slot_owner.max_num_requests)) - slot_values
+                or any(request.seq_slot != slot_owner.slot_mapping[
+                    request.py_request_id] for _, request in dummies
+                       if request.py_request_id in slot_owner.slot_mapping)):
+            raise RuntimeError(
+                "V1 STOP sequence slots contain an unresolved owner")
+        windows = tuple(sorted(set(manager.max_attention_window_vec)))
+        blocks = tuple((request_id, window,
+                        tuple(
+                            tuple(beam)
+                            for beam in manager.impl.get_cache_block_ids(
+                                request_id, window)))
+                       for request_id in native_ids for window in windows)
+        pool = manager.impl.get_unique_primary_pool()
+        kv_layout, captured_owners = self._inspect_idle_v1_kv_layout(manager, pool, runner)
+        tensors = (manager.kv_cache_pool_pointers,
+                   manager.kv_cache_pool_mapping,
+                   manager.host_kv_cache_block_offsets, pool)
+        fingerprint = (id(self.model_engine), id(self.resource_manager),
+                       id(manager), id(manager.impl), id(runner),
+                       id(slot_owner), manager.mapping.rank,
+                       tuple((length, id(request), request.py_request_id)
+                             for length, request in dummies), native_ids,
+                       blocks, slot_items, tuple(sorted(slot_owner.free_slots)),
+                       manager._stream.cuda_stream,
+                       tuple((tensor.data_ptr(), tensor.numel(),
+                              tensor.element_size()) for tensor in tensors), kv_layout)
+        return _IdleKVSnapshot(fingerprint, manager.impl, manager._stream,
+                               (self.model_engine, self.resource_manager,
+                                manager, runner, dummies, slot_owner, tensors,
+                                captured_owners), manager)
+
+    def _stop_after_host_interruption(self, interrupted) -> None:
+        control = self._serving_task_control
+        if (control is None or self.model_engine.execution_state is None
+                or interrupted.task_identity != control.identity
+                or interrupted.mapping is not self.dist.mapping
+                or interrupted.logical_rank != self.dist.rank
+                or interrupted.logical_world_size != self.dist.world_size):
+            return
+        command = control.wait_for_scheduler_stop(60)
+        pending, deadline = self.executor_request_queue.consume_scheduler_stop(
+            command.transaction_id)
+        envelope = self._fetch_request_envelope
+        if envelope is not None and len(
+                envelope) == 1 and envelope[0] is pending:
+            # The original authenticated STOP is not an unfinished client request.
+            self._fetch_request_envelope = None
+        self._hold_scheduler_stop(pending,
+                                  deadline_monotonic=min(
+                                      deadline,
+                                      control.scheduler_stop_deadline))
+
+    def _require_idle_request_owners(self, pending: RequestQueueItem) -> None:
+        raw = self.executor_request_queue
+        with raw.enqueue_lock, raw.request_queue.mutex:
+            original = (raw._idle_boundary_item
+                        if pending.idle_boundary_timeout_s is not None else
+                        raw._scheduler_stop_item)
+            if (original is not pending or raw.request_queue.queue
+                    or self._fetch_request_envelope or self.request_accumulated
+                    or self.control_requests or self.canceled_req_ids):
+                raise RuntimeError("Idle STOP has unresolved request owners")
+        with self.response_cv:
+            if self.responses or self.result_wait_queues:
+                raise RuntimeError("Idle STOP has unconsumed response owners")
+        previous = self.previous_batch
+        if previous is not None and any(
+                not request.is_dummy_request
+                and request.state != LlmRequestState.GENERATION_COMPLETE
+                for request in previous.scheduled_requests.all_requests()):
+            raise RuntimeError("Idle STOP has an unfinished previous batch")
+
+    def _retain_scheduler_join(self, owner: _SchedulerJoin) -> None:
+        self.model_engine.retain_scheduler_join(owner)
+        self._scheduler_join_owners = owner
+
+    def _join_scheduler_idle(
+            self, pending: RequestQueueItem, *, deadline_monotonic: float,
+            stop: bool) -> tuple[_IdleKVSnapshot, "LocalExecutionJoin"]:
+        """Join scheduler, native KV and model issuers under one monotonic deadline."""
+        self._require_idle_request_owners(pending)
+        state, previous = self.model_engine.execution_state, self.previous_batch
+        self._retain_scheduler_join(_SchedulerJoin(
+            pending, previous, scheduler_thread_id=threading.get_ident(),
+            request_capacity=self.max_num_active_requests))
+        before = self._snapshot_idle_v1_kv()
+        self._retain_scheduler_join(dataclasses.replace(
+            self._scheduler_join_owners, native_before=before))
+        self._join_idle_sampler(deadline_monotonic)
+        scheduler_streams = (self.execution_stream, self.encoder_stream,
+                             self.sample_stream, before.stream)
+        side_stream = getattr(self.sampler, "_d2h_side_stream", None)
+        if side_stream is not None:
+            scheduler_streams += (side_stream, )
+        joined = self.model_engine.join_execution(
+            scheduler_streams=scheduler_streams,
+            deadline_monotonic=deadline_monotonic,
+            stop=stop)
+        # The admitted GPU-only KV owner has no separate transfer stream.
+        before.native_owner.refresh_blocks()
+        if stop:
+            joined = self.model_engine.finish_execution_stop(
+                joined, deadline_monotonic=deadline_monotonic)
+        else:
+            joined = self.model_engine.join_execution(
+                scheduler_streams=scheduler_streams,
+                deadline_monotonic=deadline_monotonic,
+                stop=False)
+        after = self._snapshot_idle_v1_kv()
+        self._retain_scheduler_join(dataclasses.replace(
+            self._scheduler_join_owners, native_after=after, execution=joined))
+        if (before.fingerprint != after.fingerprint or joined.stopped != stop
+                or not joined.ticket_retired
+                or (stop and not joined.watchdog_retired)):
+            raise RuntimeError("Idle local ownership changed during its joins")
+        state.validate_join(joined)
+        self._require_idle_request_owners(pending)
+        if self.previous_batch is not previous:
+            raise RuntimeError("Idle previous batch ownership changed")
+        return after, joined
+
+    def _scheduler_join_receipt(
+            self, command: "WorkerStopCommand | IdleBoundaryCommand",
+            native: _IdleKVSnapshot,
+            joined: "LocalExecutionJoin") -> "SchedulerStopReceipt":
+        from tensorrt_llm.executor.recovery import SchedulerStopReceipt
+
+        state = self.model_engine.execution_state
+        return SchedulerStopReceipt(
+            identity=command.identity,
+            transaction_id=command.transaction_id,
+            scheduler_thread_id=threading.get_ident(),
+            iteration=self.iter_counter,
+            owner_counts=(("graphs", len(state._graphs)), ("registered_streams",
+                                                           len(joined.events)),
+                          ("native_kv_owners", len(native.retained_owners)),
+                          ("pending_requests",
+                           0), ("live_requests", 0), ("pending_responses", 0)),
+            model_generation=joined.generation,
+            registered_stream_events_completed=len(joined.events),
+            ticket_retired=joined.ticket_retired,
+            local_issuer_join_complete=True,
+            native_kv_inventory_complete=True,
+            owner_reference=f"scheduler-join:{id(self._scheduler_join_owners)}",
+            execution_identity=self.model_engine.captured_execution_identity(
+                self._scheduler_join_owners))
+
+    def _hold_scheduler_idle(self, pending: RequestQueueItem, *,
+                             deadline_monotonic: float) -> None:
+        """Seal GPU issuance, then keep the original scheduler's host calls progressing."""
+        from tensorrt_llm.executor.recovery import SchedulerIdleReceipt
+
+        control, state = self._serving_task_control, self.model_engine.execution_state
+        if (control is None or state is None
+                or self.worker_thread.ident != threading.get_ident()
+                or time.monotonic() >= deadline_monotonic):
+            raise RuntimeError("Idle boundary has no live original scheduler")
+        command = control.wait_for_idle_boundary(
+            max(0.001, deadline_monotonic - time.monotonic()))
+        if (command.transaction_id != pending.control_id
+                or command.identity.worker.rank != self.dist.rank
+                or command.identity.generation != state.generation):
+            raise RuntimeError(
+                "Idle boundary does not bind the original generation")
+        epoch = self.executor_request_queue.idle_boundary_epoch
+        published = False
+        try:
+            native, joined = self._join_scheduler_idle(
+                pending, deadline_monotonic=deadline_monotonic, stop=False)
+            admission = self.model_engine.summarize_resident_admission(
+                self._scheduler_join_owners)
+            self.model_engine.hold_execution_idle(joined)
+            receipt = SchedulerIdleReceipt(
+                local_receipt=self._scheduler_join_receipt(
+                    command, native, joined),
+                execution_sequence=joined.execution_sequence,
+                queue_ingress_epoch=epoch,
+                frontend_request_epoch=command.frontend_request_epoch,
+                model_admission=admission)
+            control.publish_idle(receipt)
+            published = True
+        finally:
+            if not published:
+                state.retain_failed_stop()
+        while not self.is_shutdown:
+            new = self._fetch_new_requests(self.waiting_queue,
+                                           self.active_requests)
+            if new or self.waiting_queue:
+                raise RuntimeError(
+                    "Sealed idle scheduler received inference work")
+            self._handle_control_request()
+        raise RuntimeError("Idle boundary ended by terminal shutdown")
+
+    def _join_idle_sampler(self, deadline_monotonic: float) -> tuple:
+        from ..moe.fused_moe.communication.execution_ticket import \
+            wait_cuda_event
+
+        previous = self.previous_batch
+        event = (getattr(previous.sample_state, "sampler_event", None)
+                 if previous is not None else None)
+        futures = tuple(getattr(self.sampler, "_async_worker_futures", ()))
+        if event is not None:
+            futures += tuple(event.worker_futures or ())
+        # The original scheduler is the sole producer of sampler work here.
+        # Futures complete only after the worker's blocking D2H copy returns.
+        owners = (self.sampler, previous, event, futures)
+        self._retain_scheduler_join(dataclasses.replace(
+            self._scheduler_join_owners, sampler_owners=owners))
+        for future in futures:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Sampler copy exceeded STOP deadline")
+            future.result(timeout=remaining)
+        if event is not None:
+            for cuda_event in (event.cuda_event, event.side_stream_event):
+                if cuda_event is not None:
+                    remaining = deadline_monotonic - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "Sampler event exceeded STOP deadline")
+                    wait_cuda_event(cuda_event, remaining)
+        return owners
+
+    def _inspect_recovery_placement(
+            self, proposal: "RecoveryProposal") -> "PreparedPlacement":
+        """Inspect accepted preparation on the stopped scheduler; grant no publication."""
+        control, stopped = self._serving_task_control, self._scheduler_stop_receipt
+        if (control is None or stopped is None
+                or self.worker_thread.ident != threading.get_ident()):
+            raise RuntimeError(
+                "Recovery inspection requires the original scheduler STOP")
+        control.validate_preparation(proposal, stopped)
+        prepared = self.model_engine.prepare_resident_placement(
+            proposal.failed_worker.rank, stopped, self._scheduler_join_owners)
+        if (prepared.placement_digest != proposal.placement_digest
+                or prepared.base_generation != proposal.base_generation
+                or prepared.next_generation != proposal.next_generation):
+            raise RuntimeError(
+                "Recovery proposal differs from prepared resident placement")
+        return prepared
+
+    def _hold_scheduler_stop(self, pending: RequestQueueItem, *,
+                             deadline_monotonic: float) -> None:
+        """Seal the original idle scheduler and wait for terminal disposition only."""
+        control = self._serving_task_control
+        if (control is None
+                or self.worker_thread.ident != threading.get_ident()
+                or self._scheduler_stop_receipt is not None
+                or time.monotonic() >= deadline_monotonic):
+            raise RuntimeError("Scheduler STOP has no live original owner")
+        command = control.wait_for_scheduler_stop(
+            max(0.001, deadline_monotonic - time.monotonic()))
+        state = self.model_engine.execution_state
+        if (command.transaction_id != pending.control_id
+                or command.identity.worker.rank != self.dist.rank
+                or state is None
+                or command.identity.generation != state.generation):
+            raise RuntimeError(
+                "Scheduler STOP does not bind the original generation")
+        try:
+            native, joined = self._join_scheduler_idle(
+                pending, deadline_monotonic=deadline_monotonic, stop=True)
+            receipt = self._scheduler_join_receipt(command, native, joined)
+            control.publish_stopped(receipt)
+            self._scheduler_stop_receipt = receipt
+        finally:
+            if self._scheduler_stop_receipt is None:
+                state.retain_failed_stop()
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0 or not self._scheduler_stop_terminal.wait(remaining):
+            raise TimeoutError("Scheduler STOP terminal disposition timed out")
+        raise RuntimeError("Scheduler STOP reached terminal disposition")
 
     def _sync_and_process_resource_governor_queue(self):
         """Synchronize and process resource governor requests across all ranks.
@@ -5915,6 +6410,9 @@ class PyExecutor:
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
+        if self._fetch_request_envelope is not None:
+            raise RuntimeError(
+                "A consumed request envelope still belongs to the scheduler")
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # A draining control request must still receive transfer completions.
@@ -5965,8 +6463,17 @@ class PyExecutor:
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
         # empty iterations.
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests)
+        # Keep the consumed items if broadcast or enqueue fails. Handlers may
+        # also transfer items to cancellation/control/waiting owners, so this
+        # reference must not be used to replay a partially handled envelope.
+        self._fetch_request_envelope = new_requests
+        try:
+            new_requests, py_request_objects = self.request_broadcaster.broadcast(
+                new_requests)
+        except _HostCollectiveInterrupted as interrupted:
+            self._stop_after_host_interruption(interrupted)
+            raise
+        self._fetch_request_envelope = new_requests
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -5978,6 +6485,7 @@ class PyExecutor:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
         waiting_queue.add_requests(new_requests)
+        self._fetch_request_envelope = None
 
     def _get_request_admission_capacity(self) -> int:
         """Return the maximum number of distinct requests admitted at once."""
@@ -6114,6 +6622,9 @@ class PyExecutor:
             self, waiting_queue: WaitingQueue,
             active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
+        if self._fetch_request_envelope is not None:
+            raise RuntimeError(
+                "A consumed request envelope still belongs to the scheduler")
         # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
@@ -6129,8 +6640,12 @@ class PyExecutor:
             # clear stats once every rank is aligned.
             iter_stats_payload = (self._adp_iter_stats.next_payload()
                                   if self.enable_iter_perf_stats else None)
-            all_rank_states = self.adp_router.gather_all_rank_states(
-                active_requests, iter_stats_payload=iter_stats_payload)
+            try:
+                all_rank_states = self.adp_router.gather_all_rank_states(
+                    active_requests, iter_stats_payload=iter_stats_payload)
+            except _HostCollectiveInterrupted as interrupted:
+                self._stop_after_host_interruption(interrupted)
+                raise
             if self.enable_iter_perf_stats:
                 for record in self._adp_iter_stats.finalize(
                         all_rank_states, is_rank0=self.dist.rank == 0):

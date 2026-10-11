@@ -26,6 +26,7 @@
 #include <atomic>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <limits>
 #include <memory>
 #include <torch/extension.h>
 #include <torch/types.h>
@@ -181,8 +182,7 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AFenceWorkspace resolveExecutionDes
         "execution_descriptor must be contiguous CUDA int64[1]");
     TORCH_CHECK(workspace.dim() == 2 && workspace.stride(0) > 0 && workspace.stride(1) == 1,
         "execution_descriptor requires byte-addressable workspace rows");
-    return {reinterpret_cast<MoeA2AFenceDescriptor const* const*>(slot.data_ptr<int64_t>()),
-        reinterpret_cast<uintptr_t>(workspace.data_ptr())};
+    return {reinterpret_cast<MoeA2AFenceDescriptor const* const*>(slot.data_ptr<int64_t>())};
 }
 
 void moeA2AFenceLatchDescriptorOp(torch::Tensor const& publishedDescriptor, torch::Tensor& execution)
@@ -485,7 +485,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
     torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
-    torch::optional<torch::Tensor> abortState, torch::optional<torch::Tensor> executionDescriptor)
+    torch::optional<torch::Tensor> abortState, torch::optional<torch::Tensor> executionDescriptor,
+    torch::optional<int64_t> dispatchPayloadLimit)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -554,8 +555,43 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::vector<int> payloadElementsPerToken;
     std::vector<size_t> payloadRecvBufferOffsets;
 
-    // Start offset for the first payload
-    size_t currentOffset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    int64_t sourceStrideBytes = 0;
+    int64_t staticMaxTokens = 0;
+    int64_t const payloadStart = offsets[PAYLOAD_DATA_OFFSET_INDEX];
+    if (dispatchPayloadLimit.has_value())
+    {
+        TORCH_CHECK(executionDescriptor.has_value() && enableRankMask && !useCftCountedWrites,
+            "dispatch_payload_limit requires fence execution_descriptor mode");
+        CHECK_TH_CUDA(workspace);
+        CHECK_TYPE(workspace, torch::kUInt8);
+        TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) == epSize && workspace.stride(1) == 1
+                && workspace.stride(0) >= workspace.size(1) && workspace.stride(0) % CACHELINE_ALIGNMENT == 0
+                && workspace.stride(0) <= std::numeric_limits<int64_t>::max() / epSize,
+            "source-slot dispatch requires disjoint byte workspace rows");
+        TORCH_CHECK(tokenSelectedExperts.device() == workspace.device(), "source-slot token device mismatch");
+        auto const workspaceSpan = static_cast<uintptr_t>((epSize - 1) * workspace.stride(0) + workspace.size(1));
+        TORCH_CHECK(
+            reinterpret_cast<uintptr_t>(workspace.data_ptr()) <= std::numeric_limits<uintptr_t>::max() - workspaceSpan,
+            "source-slot workspace address overflow");
+        TORCH_CHECK(offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] == 0
+                && offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] == 0
+                && offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX] == 0
+                && offsets[COMBINE_COUNTER_BASELINE_OFFSET_INDEX] == 0,
+            "source-slot dispatch requires fence-only workspace metadata");
+        int64_t const limit = *dispatchPayloadLimit;
+        TORCH_CHECK(
+            payloadStart >= 0 && limit > payloadStart && limit <= workspace.size(1) && limit % CACHELINE_ALIGNMENT == 0,
+            "dispatch_payload_limit must be an aligned workspace boundary");
+        staticMaxTokens = offsets[MAX_NUM_TOKENS_INDEX];
+        TORCH_CHECK(staticMaxTokens > 0 && staticMaxTokens <= std::numeric_limits<int>::max() / epSize
+                && localNumTokens <= runtimeMaxTokensPerRank && runtimeMaxTokensPerRank <= staticMaxTokens,
+            "source-slot dispatch runtime exceeds static token capacity");
+        sourceStrideBytes = ((limit - payloadStart) / epSize) / CACHELINE_ALIGNMENT * CACHELINE_ALIGNMENT;
+        TORCH_CHECK(sourceStrideBytes > 0, "dispatch_payload_limit leaves no source-slot capacity");
+    }
+
+    // Start offset for the first payload.
+    size_t currentOffset = static_cast<size_t>(payloadStart);
     for (auto const& payload : inputPayloads)
     {
         CHECK_CONTIGUOUS(payload);
@@ -568,10 +604,27 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         // dynamically determined based on bytes per token of this payload.
         TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
 
-        int elementsPerToken = static_cast<int>(payload.size(1));
-        int elementSize = static_cast<int>(payload.dtype().itemsize());
-        // Each payload buffer stores data from ALL ranks
-        int64_t bytesPerPayload = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+        TORCH_CHECK(
+            sourceStrideBytes == 0 || payload.device() == workspace.device(), "source-slot payload device mismatch");
+        int const elementSize = static_cast<int>(payload.dtype().itemsize());
+        TORCH_CHECK(sourceStrideBytes == 0
+                || (payload.size(1) > 0 && payload.size(1) <= std::numeric_limits<int>::max() / elementSize),
+            "source-slot payload width exceeds native byte count");
+        int const elementsPerToken = static_cast<int>(payload.size(1));
+        int64_t bytesPerPayload;
+        if (sourceStrideBytes != 0)
+        {
+            int64_t const bytesPerToken = payload.size(1) * elementSize;
+            int64_t const reservedBytes = static_cast<int64_t>(currentOffset) - payloadStart;
+            TORCH_CHECK(reservedBytes <= sourceStrideBytes
+                    && staticMaxTokens <= (sourceStrideBytes - reservedBytes) / bytesPerToken,
+                "source-slot dispatch payloads exceed their reserved slot");
+            bytesPerPayload = staticMaxTokens * bytesPerToken;
+        }
+        else
+        {
+            bytesPerPayload = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+        }
 
         payloadElementSizes.push_back(elementSize);
         payloadElementsPerToken.push_back(elementsPerToken);
@@ -581,6 +634,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         // Update offset and align to cacheline boundary for the next payload recv buffer.
         currentOffset += bytesPerPayload;
         currentOffset = alignOffset(currentOffset, CACHELINE_ALIGNMENT);
+        TORCH_CHECK(sourceStrideBytes == 0
+                || currentOffset - static_cast<size_t>(payloadStart) <= static_cast<size_t>(sourceStrideBytes),
+            "source-slot dispatch payload alignment exceeds its reserved slot");
+    }
+    if (sourceStrideBytes != 0)
+    {
+        currentOffset = static_cast<size_t>(*dispatchPayloadLimit);
     }
 
     int expertIdPayloadIdx = -1;
@@ -638,6 +698,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.num_experts = static_cast<int>(numExperts);
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
+    params.sourceStrideBytes = sourceStrideBytes;
     params.top_k = static_cast<int>(topK);
     params.enable_eplb = enableEplb;
     params.eplb_stats_num_experts = static_cast<int>(eplbStatsNumExperts);
@@ -764,6 +825,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     gather.epSize = params.ep_size;
     gather.epRank = params.ep_rank;
     gather.maxTokens = params.max_tokens_per_rank;
+    gather.sourceStrideBytes = sourceStrideBytes;
     gather.recvCounters = params.recv_counters[params.ep_rank];
     gather.flagVal = params.flag_val;
     gather.fenceWorkspace = params.fenceWorkspace;
@@ -892,13 +954,45 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) == epSize, "workspace must be [ep_size, size_per_rank]");
     uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
     int64_t sizePerRank = workspace.size(1);
-    uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
     TORCH_CHECK(combinePayloadOffset >= 0, "combinePayloadOffset must be non-negative");
+    if (executionDescriptor.has_value() && payloadInWorkspace)
+    {
+        TORCH_CHECK(!useLowPrecision, "fixed combine payload does not support low-precision conversion");
+        TORCH_CHECK(payload.device() == workspace.device(), "fixed combine payload device mismatch");
+        TORCH_CHECK(sizePerRank > 0 && workspace.stride(1) == 1 && workspace.stride(0) >= sizePerRank
+                && workspace.stride(0) % CACHELINE_ALIGNMENT == 0
+                && workspace.stride(0) <= std::numeric_limits<int64_t>::max() / epSize,
+            "fixed combine payload requires disjoint byte-addressable workspace rows");
+        auto const workspaceSpan = static_cast<uintptr_t>((epSize - 1) * workspace.stride(0) + sizePerRank);
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(workspacePtr) <= std::numeric_limits<uintptr_t>::max() - workspaceSpan,
+            "fixed combine payload workspace address overflow");
+        TORCH_CHECK(!useCftCountedWrites && offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] == 0
+                && offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] == 0
+                && offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX] == 0
+                && offsets[COMBINE_COUNTER_BASELINE_OFFSET_INDEX] == 0,
+            "fixed combine payload requires fence-only workspace metadata");
+        int64_t const staticMaxTokens = offsets[MAX_NUM_TOKENS_INDEX];
+        TORCH_CHECK(staticMaxTokens > 0 && runtimeMaxTokensPerRank <= staticMaxTokens
+                && staticMaxTokens <= std::numeric_limits<int>::max() / epSize,
+            "fixed combine payload token capacity is invalid");
+        TORCH_CHECK(elementsPerToken <= std::numeric_limits<int>::max() / payload.element_size(),
+            "fixed combine payload token width is too large");
+        int64_t const bytesPerToken = elementsPerToken * payload.element_size();
+        TORCH_CHECK(staticMaxTokens <= sizePerRank / epSize / bytesPerToken,
+            "fixed combine payload capacity exceeds workspace row size");
+        int64_t const capacityBytes = epSize * staticMaxTokens * bytesPerToken;
+        size_t const regionBytes = alignOffset(static_cast<size_t>(capacityBytes), CACHELINE_ALIGNMENT);
+        TORCH_CHECK(regionBytes <= static_cast<size_t>(sizePerRank),
+            "fixed combine payload aligned capacity exceeds workspace row size");
+        int64_t const expectedOffset
+            = (sizePerRank - static_cast<int64_t>(regionBytes)) / CACHELINE_ALIGNMENT * CACHELINE_ALIGNMENT;
+        TORCH_CHECK(offsets[PAYLOAD_DATA_OFFSET_INDEX] >= 0 && expectedOffset >= offsets[PAYLOAD_DATA_OFFSET_INDEX]
+                && combinePayloadOffset == expectedOffset,
+            "fixed combine payload must use the full-capacity reserved tail region");
+    }
+    uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
     uint8_t* combinePayloadPtr = rankWorkSpacePtr + combinePayloadOffset;
-    // If the caller claims the payload is in the workspace, ensure it really is: a mismatch would
-    // otherwise silently fall back to staging and lose the zero-copy path the caller asked for.
-    TORCH_CHECK(!executionDescriptor.has_value() || !payloadInWorkspace,
-        "execution_descriptor requires private combine input staging");
+    // Workspace payloads must start at the local rank's validated combine region.
     if (payloadInWorkspace)
     {
         TORCH_CHECK(payload.data_ptr() == combinePayloadPtr,
@@ -906,7 +1000,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     }
 
     int64_t payloadSize = payload.numel() * payload.element_size();
-    if (executionDescriptor.has_value())
+    if (executionDescriptor.has_value() && !payloadInWorkspace)
     {
         auto const address = reinterpret_cast<uintptr_t>(payload.data_ptr());
         auto const payloadEnd = address + static_cast<uintptr_t>(payloadSize);
@@ -1155,7 +1249,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int? invalid_token_expert_id=None, "
         "bool enable_rank_mask=False, "
         "Tensor? active_rank_mask=None, "
-        "Tensor(b!)? abort_state=None, Tensor? execution_descriptor=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor(b!)? abort_state=None, Tensor? execution_descriptor=None, int? dispatch_payload_limit=None) -> "
+        "(Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "

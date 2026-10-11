@@ -49,8 +49,34 @@ def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) ->
     return default
 
 
+def _descriptor_execution_requested() -> bool:
+    from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+    binding = getattr(MPINodeState, "_serving_task_context", None)
+    control = getattr(MPINodeState, "_serving_task_control", None)
+    if binding is None and control is None:
+        return False
+    from tensorrt_llm.executor.recovery import ServingTaskContext, ServingTaskControl
+
+    if not isinstance(binding, tuple) or len(binding) != 2:
+        raise RuntimeError("Descriptor execution requires the original serving-task owner")
+    context, invocation_id = binding
+    if (
+        not isinstance(context, ServingTaskContext)
+        or not isinstance(control, ServingTaskControl)
+        or control.context is not context
+        or control.identity.task_id != context.task_id
+        or control.identity.generation != context.expected_generation
+        or control.identity.invocation_id != invocation_id
+    ):
+        raise RuntimeError("Descriptor execution has mismatched serving-task ownership")
+    return True
+
+
 def get_wide_ep_ft_options(
     model_config: Any,
+    *,
+    allow_pending_descriptor_binding: bool = False,
 ) -> tuple[Optional[EPGroupHealth], Optional[float], float]:
     """Return committed EP membership and watchdog timing for a model.
 
@@ -60,14 +86,19 @@ def get_wide_ep_ft_options(
     one process-local membership object shared by all MoE communication layers.
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
-    committed membership directly. Rank-mask mode rejects CUDA graphs until
-    generation-scoped invalidation and recapture are implemented.
+    committed membership directly. Captured rank masks require the original
+    serving-task owner and subsequent model-owned descriptor binding.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
     health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
-    rank_mask_enabled = health is not None or _env_enabled()
-    if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
+    descriptor_requested = _descriptor_execution_requested()
+    rank_mask_enabled = health is not None or _env_enabled() or descriptor_requested
+    if (
+        rank_mask_enabled
+        and getattr(model_config, "use_cuda_graph", False)
+        and not (allow_pending_descriptor_binding and descriptor_requested)
+    ):
         raise ValueError(
             "WideEP fault tolerance does not support CUDA graphs until generation-scoped "
             "invalidation and recapture are implemented"

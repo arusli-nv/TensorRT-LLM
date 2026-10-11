@@ -211,6 +211,10 @@ class BaseWorker(GenerationExecutor):
 
         assert self.llm_args is not None, "llm_args is required to set up the worker engine"
         self.engine = _create_py_executor()
+        from tensorrt_llm.llmapi.mpi_session import MPINodeState
+        serving_control = getattr(MPINodeState, "_serving_task_control", None)
+        if serving_control is not None:
+            self.engine.bind_serving_control(serving_control)
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None

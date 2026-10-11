@@ -1,17 +1,127 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner,
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
+    KeyType,
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("owned,instantiate_fails", [(False, False), (True, False), (True, True)])
+def test_owned_capture_retains_template_before_publication(
+    monkeypatch: pytest.MonkeyPatch, owned: bool, instantiate_fails: bool
+) -> None:
+    """Can the owner publish a graph before its original executable exists?"""
+    from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as module
+
+    events = []
+
+    class Graph:
+        def __init__(self, *, keep_graph: bool = False) -> None:
+            self.template_live = keep_graph
+            self.executable = None
+            self.keep_graph = keep_graph
+            events.append("created")
+
+        def instantiate(self) -> None:
+            events.append("instantiated")
+            if instantiate_fails:
+                raise RuntimeError("Instantiation failed")
+            assert self.executable is None
+            self.executable = object()
+
+        def pool(self) -> object:
+            return pool
+
+        def reset(self) -> None:
+            events.append("reset")
+            self.template_live = False
+            self.executable = None
+
+    @contextlib.contextmanager
+    def capture_context(graph: Graph, *, pool: object) -> Iterator[None]:
+        events.append("capture_started")
+        yield
+        events.append("capture_finished")
+        if not graph.keep_graph:
+            graph.instantiate()
+
+    monkeypatch.setattr(module.torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(module.torch.cuda, "graph", capture_context)
+    monkeypatch.setattr(module.torch.cuda, "empty_cache", Mock())
+    monkeypatch.setattr(module, "with_multi_stream", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(module, "piecewise_cuda_graph", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(module, "make_weak_ref", lambda output: lambda: output)
+
+    pool = object()
+    owner = SimpleNamespace(
+        capture_started=Mock(side_effect=lambda *args, **kwargs: events.append("owner_started")),
+        capture_finished=Mock(side_effect=lambda *args, **kwargs: events.append("owner_finished")),
+        before_graph_reset=Mock(side_effect=lambda: events.append("before_reset")),
+        graphs_reset=Mock(side_effect=lambda graphs: events.append("owner_reset")),
+        _phase="ready",
+    )
+    runner = CUDAGraphRunner.__new__(CUDAGraphRunner)
+    runner.execution_state = owner if owned else None
+    runner.config = SimpleNamespace(use_mrope=False)
+    runner.max_beam_width = 1
+    runner.WARMUP_STEPS = 0
+    runner.is_warmup_only = False
+    runner.memory_pool = pool
+    runner.shared_static_tensors = {
+        "input_ids": torch.ones(1, dtype=torch.int32),
+        "position_ids": torch.zeros((1, 1), dtype=torch.int32),
+    }
+    runner.graph_metadata = {}
+    runner.graphs = {}
+    runner.graph_outputs = {}
+    runner._record_strict_buffer_snapshot = Mock()
+    key = KeyType(1, 0, False)
+    output = object()
+    forward = Mock(return_value=output)
+
+    if instantiate_fails:
+        with pytest.raises(RuntimeError, match="Instantiation failed"):
+            runner.capture(key, forward, {"attn_metadata": object()})
+        owner.capture_started.assert_called_once()
+        owner.capture_finished.assert_not_called()
+        assert not runner.graphs
+        assert not runner.graph_outputs
+        return
+
+    assert runner.capture(key, forward, {"attn_metadata": object()})() is output
+    graph = runner.graphs[key]
+    assert graph.template_live is owned
+    assert graph.executable is not None
+    assert events.count("instantiated") == 1
+    assert events.index("capture_finished") < events.index("instantiated")
+    if owned:
+        owner.capture_started.assert_called_once_with(
+            graph, pool, graph_key=key, resource_owner=runner
+        )
+        owner.capture_finished.assert_called_once_with(graph, pool, graph_key=key)
+        assert events.index("instantiated") < events.index("owner_finished")
+    else:
+        owner.capture_started.assert_not_called()
+        owner.capture_finished.assert_not_called()
+
+    runner.clear()
+    assert not graph.template_live
+    assert graph.executable is None
+    if owned:
+        assert events.index("before_reset") < events.index("reset") < events.index("owner_reset")
 
 
 def _feature_encoder_runner(

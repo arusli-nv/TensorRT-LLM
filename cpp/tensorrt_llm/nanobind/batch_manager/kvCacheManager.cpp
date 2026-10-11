@@ -705,6 +705,20 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("num_required"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); })
+        .def(
+            "_get_active_sequence_ids",
+            [](tbk::KVCacheManager const& self)
+            {
+                std::scoped_lock lock(self.mSequencesMtx);
+                std::vector<tb::LlmRequest::RequestIdType> requestIds;
+                requestIds.reserve(self.mSequences.size());
+                for (auto const& [requestId, sequence] : self.mSequences)
+                {
+                    requestIds.push_back(requestId);
+                }
+                return requestIds;
+            },
+            nb::call_guard<nb::gil_scoped_release>())
         // Per-pool introspection: lets Python discover (windowSize, sizePerHead, dtype) per
         // hosted pool so a single KVCacheManager can host mixed-shape pools without a
         // Python-side wrapper duplicating the layer->pool routing.

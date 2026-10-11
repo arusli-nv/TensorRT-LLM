@@ -27,7 +27,8 @@ NVLINK One-Sided supports post-quant dispatch.
 import os
 import re
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import pynvml
 import torch
@@ -50,6 +51,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication
+
+if TYPE_CHECKING:
+    from .execution_state import CapturedTensorSpan, ExecutionState
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
@@ -323,6 +327,7 @@ class NVLinkOneSided(Communication):
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+        require_execution_state: bool = False,
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -358,6 +363,8 @@ class NVLinkOneSided(Communication):
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
         super().__init__(mapping)
+        self.requires_execution_state = require_execution_state
+        self._execution_state = None
         if mapping.has_cp_helix():
             raise ValueError(
                 "NVLinkOneSided does not support Helix context parallelism because "
@@ -566,6 +573,7 @@ class NVLinkOneSided(Communication):
             watchdog_timeout_s=alltoall_watchdog_timeout_s,
             watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
             watchdog_on_timeout=alltoall_watchdog_on_timeout,
+            defer_watchdog_start=require_execution_state,
         )
         if workspace_created:
             NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
@@ -592,6 +600,149 @@ class NVLinkOneSided(Communication):
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
+
+    def execution_watchdog(self) -> AlltoAllWatchdog | None:
+        return self._alltoall_watchdog
+
+    def execution_geometry(self) -> tuple[int, int, int, int, torch.dtype, int, int, int, int]:
+        self._require_mapped()
+        if self.can_use_cft_counted_writes:
+            raise RuntimeError("Descriptor execution requires fence communication; CFT is enabled")
+        if self.use_low_precision_combine:
+            raise RuntimeError(
+                "Descriptor execution requires BF16 combine; low precision is enabled"
+            )
+        memory = self.execution_lifecycle().memory
+        state = self._workspace_state
+        hidden_size, dtype = state["hidden_size"], state["dtype"]
+        offset = state["combine_storage_offset"]
+        if (
+            dtype is not torch.bfloat16
+            or self.workspace.size(0) != self.ep_size
+            or self.workspace.stride(0) != memory.rank_stride
+            or not 0 < self.workspace.size(1) <= memory.segment_size <= memory.rank_stride
+            or offset + self.ep_size * self.max_num_tokens_per_rank * hidden_size * dtype.itemsize
+            > self.workspace.size(1)
+        ):
+            raise RuntimeError("Invalid immutable workspace or canonical combine tail")
+        return (
+            self.ep_size,
+            self.ep_rank,
+            self.max_num_tokens_per_rank,
+            hidden_size,
+            dtype,
+            offset,
+            self.workspace.data_ptr(),
+            self.workspace.stride(0),
+            self.workspace.size(1),
+        )
+
+    def execution_dispatch_kwargs(
+        self, slot: torch.Tensor, payloads: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor | int]:
+        geometry = self.execution_geometry()
+        limit = geometry[5]
+        payload_start = int(self.moe_a2a_metainfo[self.PAYLOAD_DATA_OFFSET_INDEX])
+        source_bytes = ((limit - payload_start) // self.ep_size) // 128 * 128
+        required = 0
+        for payload in payloads:
+            if payload.dim() != 2:
+                raise RuntimeError("Unqualified dispatch payload schema")
+            size = self.max_num_tokens_per_rank * payload.size(1) * payload.element_size()
+            required += (size + 127) // 128 * 128
+        if not 0 < required <= source_bytes:
+            raise RuntimeError("Dispatch exceeds fixed logical source stride")
+        return dict(execution_descriptor=slot, dispatch_payload_limit=limit)
+
+    def execution_combine_kwargs(
+        self, slot: torch.Tensor, output: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        if not self.payload_in_workspace:
+            raise RuntimeError(
+                "Descriptor combine requires the current scheduler plan's workspace output"
+            )
+        geometry = self.execution_geometry()
+        expected = self.workspace.data_ptr() + self.ep_rank * self.workspace.stride(0) + geometry[5]
+        if (
+            output.data_ptr() != expected
+            or output.dtype is not torch.bfloat16
+            or not output.is_contiguous()
+            or output.size(-1) != geometry[3]
+            or output.numel() * output.element_size() > self.workspace.size(1) - geometry[5]
+        ):
+            raise RuntimeError("FC2 must write the canonical mapped tail")
+        return dict(execution_descriptor=slot)
+
+    def execution_lifecycle(self) -> _MnnvlAlltoAllWorkspaceLifecycle:
+        return self._require_workspace_lifecycle()
+
+    def bind_execution_state(self, state: "ExecutionState") -> None:
+        if not self.requires_execution_state:
+            raise RuntimeError("Frontend did not request descriptor binding")
+        if self._execution_state is not None and self._execution_state is not state:
+            raise RuntimeError("Frontend already belongs to another execution state")
+        if (
+            state.lifecycle is not self.execution_lifecycle()
+            or state.ep_group_health is not self.ep_group_health
+        ):
+            raise RuntimeError("Execution state health or workspace differs from frontend")
+        state.validate_frontend(self)
+        self._execution_state = state
+        self._capture_allocation_spans = {}
+
+    def _record_capture_spans(
+        self, phase: str, tensors: tuple[tuple[str, torch.Tensor, str], ...]
+    ) -> None:
+        if not torch.cuda.is_current_stream_capturing():
+            return
+        from .execution_state import CapturedTensorSpan
+
+        state = self._execution_state
+        state.validate_frontend_epoch(self)
+        geometry = self.execution_geometry()
+        spans = []
+        for role, tensor, origin in tensors:
+            if not tensor.is_contiguous() or tensor.device != self.workspace.device:
+                raise RuntimeError("Captured native allocation layout or device differs")
+            pointer, size = int(tensor.data_ptr()), tensor.numel() * tensor.element_size()
+            if origin == "native_torch_empty":
+                for peer in range(geometry[0]):
+                    begin = geometry[6] + peer * geometry[7]
+                    if max(pointer, begin) < min(pointer + size, begin + geometry[8]):
+                        raise RuntimeError("Captured private allocation aliases a peer workspace")
+            elif origin == "canonical_workspace_tail":
+                if pointer != geometry[6] + geometry[1] * geometry[7] + geometry[5]:
+                    raise RuntimeError("Captured expert output is not the canonical local tail")
+                if size > geometry[8] - geometry[5]:
+                    raise RuntimeError("Captured expert output exceeds the canonical local tail")
+            else:
+                raise RuntimeError("Captured allocation origin is unqualified")
+            spans.append(
+                CapturedTensorSpan(
+                    role, pointer, size, tuple(tensor.shape), str(tensor.dtype), origin
+                )
+            )
+        self._capture_allocation_spans[phase] = (state.execution_sequence, tuple(spans))
+
+    def captured_allocation_spans(self, phase: str) -> tuple[int, tuple["CapturedTensorSpan", ...]]:
+        if phase not in self._capture_allocation_spans:
+            raise RuntimeError("Native capture produced no allocation spans for the phase")
+        return self._capture_allocation_spans[phase]
+
+    def _require_execution_binding(self, kwargs: dict[str, object]) -> "ExecutionState | None":
+        state = self._execution_state
+        if self.requires_execution_state and state is None:
+            raise RuntimeError("Model execution state must bind before warmup or capture")
+        if state is not None:
+            if any(
+                name in kwargs
+                for name in ("active_rank_mask", "execution_descriptor", "dispatch_payload_limit")
+            ):
+                raise ValueError("Bound execution forbids mask or descriptor overrides")
+            state.validate_frontend_epoch(self)
+        else:
+            reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        return state
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
@@ -625,10 +776,18 @@ class NVLinkOneSided(Communication):
         return True
 
     def destroy(self):
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        with lifecycle.mutable_clients() if lifecycle is not None else nullcontext():
+            self._destroy_impl()
+
+    def _destroy_impl(self) -> None:
         """Release shared state during explicit, rank-coordinated teardown."""
         if getattr(self, "_destroyed", False):
             return
 
+        state = getattr(self, "_execution_state", None)
+        if state is not None:
+            state.before_frontend_destroy(self)
         self._destroyed = True
         lifecycle = getattr(self, "_workspace_lifecycle", None)
         if lifecycle is not None and getattr(self, "_workspace_registered", False):
@@ -662,6 +821,22 @@ class NVLinkOneSided(Communication):
     def __del__(self) -> None:
         if sys.is_finalizing():
             return
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        try:
+            with lifecycle.mutable_clients() if lifecycle is not None else nullcontext():
+                self._finalize_impl()
+        except RuntimeError:
+            return
+
+    def _finalize_impl(self) -> None:
+        if sys.is_finalizing():
+            return
+        state = getattr(self, "_execution_state", None)
+        if state is not None:
+            try:
+                state.before_frontend_destroy(self)
+            except RuntimeError:
+                return
         # Finalizers cannot safely perform collective cache eviction because
         # their order is nondeterministic across ranks.
         lifecycle = getattr(self, "_workspace_lifecycle", None)
@@ -829,11 +1004,13 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        state = self._require_execution_binding(kwargs)
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
         can_use_cft_for_dispatch = self.use_cft_for_dispatch(runtime_max_tokens_per_rank)
+        if state is not None and can_use_cft_for_dispatch:
+            raise RuntimeError("Bound descriptor execution requires fence communication")
 
         # Build payloads list - match TRTLLMGen baseline order for optimal performance
         # Order: [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
@@ -885,16 +1062,38 @@ class NVLinkOneSided(Communication):
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 active_rank_mask,
+                **(state.dispatch_kwargs(self, payloads) if state is not None else {}),
             )
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "dispatch", active_rank_mask
-        )
+        if state is not None:
+            if torch.cuda.is_current_stream_capturing():
+                self._record_capture_spans(
+                    "dispatch",
+                    tuple(
+                        (f"gather_payload_{index}", tensor, "native_torch_empty")
+                        for index, tensor in enumerate(recv_buffers)
+                    )
+                    + (("gather_stats", eplb_gathered_stats, "native_torch_empty"),),
+                )
+            state.watch_collective(self, "dispatch", active_rank_mask)
+        else:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "dispatch", active_rank_mask
+            )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
-        if int(combine_payload_offset) != dispatch_payload_end:
-            raise RuntimeError("native A2A dispatch layout disagrees with the reserved layout")
+        expected_end = (
+            self._workspace_state["combine_storage_offset"]
+            if state is not None
+            else dispatch_payload_end
+        )
+        if int(combine_payload_offset) != expected_end:
+            raise RuntimeError(
+                f"native A2A dispatch layout disagrees with the reserved layout: "
+                f"returned={combine_payload_offset}, expected={expected_end}, "
+                f"descriptor_mode={state is not None}"
+            )
         self._dispatch_state["dispatch_payload_end"] = dispatch_payload_end
         self._dispatch_state["combine_payload_offset"] = self._workspace_state.get(
             "combine_storage_offset", dispatch_payload_end
@@ -924,6 +1123,7 @@ class NVLinkOneSided(Communication):
                 self.moe_a2a_metainfo,
                 self.ep_rank,
                 int(self.invalid_token_expert_id),
+                **(dict(execution_descriptor=state.slot) if state is not None else {}),
             )
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends
@@ -976,7 +1176,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        state = self._require_execution_binding(kwargs)
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1019,6 +1219,8 @@ class NVLinkOneSided(Communication):
             final_hidden_states,
             self.use_low_precision_combine,
         )
+        if state is not None and use_cft_for_combine:
+            raise RuntimeError("Bound descriptor execution requires fence communication")
         combine_payload_offset = self._reserve_combine_region(
             final_hidden_states.shape[-1], final_hidden_states.dtype
         )
@@ -1037,10 +1239,22 @@ class NVLinkOneSided(Communication):
             use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
+            **(state.combine_kwargs(self, final_hidden_states) if state is not None else {}),
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "combine", active_rank_mask
-        )
+        if state is not None:
+            if torch.cuda.is_current_stream_capturing():
+                self._record_capture_spans(
+                    "combine",
+                    (
+                        ("expert_output", final_hidden_states, "canonical_workspace_tail"),
+                        ("combined_output", output, "native_torch_empty"),
+                    ),
+                )
+            state.watch_collective(self, "combine", active_rank_mask)
+        else:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "combine", active_rank_mask
+            )
 
         # Reset state for next round
         self.reset_state()

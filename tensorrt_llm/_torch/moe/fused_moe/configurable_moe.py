@@ -318,7 +318,13 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            backend_model_config = copy.deepcopy(model_config)
+            # Backend copies retain the model's canonical membership owner.
+            health_owners = (
+                model_config.extra_attrs.get("wide_ep_ft_ep_group_health"),
+                model_config.extra_attrs.get("ep_group_health"),
+            )
+            memo = {id(health): health for health in health_owners if health is not None}
+            backend_model_config = copy.deepcopy(model_config, memo)
             backend_model_config.quant_config = override_quant_config
 
         with self._temporarily_skip_weight_creation(backend_model_config):

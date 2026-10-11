@@ -4,14 +4,18 @@
 import contextlib
 import functools
 import gc
+import hashlib
 import inspect
+import json
 import math
 import os
+import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
-                    Tuple, Type, Union)
+from dataclasses import dataclass
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                    Optional, Sequence, Tuple, Type, Union)
 
 import torch
 import torch._dynamo.config
@@ -63,6 +67,17 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
+
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.recovery import (
+        CapturedExecutionIdentity,
+        ModelAdmissionSummary,
+        SchedulerStopReceipt,
+    )
+
+    from ..moe.fused_moe.communication.execution_state import LocalExecutionJoin
+    from .py_executor import _SchedulerJoin
+
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
@@ -119,6 +134,63 @@ from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 from .workspace import EagerWorkspaceReclaimer
+
+
+@dataclass(frozen=True)
+class ResidentPlacementInspection:
+    """Host loader provenance and capacity; never installation or replay permission."""
+
+    placement_digest: str
+    admitted_ranks: tuple[int, ...]
+    layers: tuple[tuple[int, int, tuple[tuple[int, ...], ...]], ...]
+    fixed_slots: tuple[tuple[int, int, int], ...]
+    max_tokens_per_logical_rank: int
+    available_kv_tokens: int
+    max_active_requests: int
+    request_sequence_length: int
+    owners: tuple[object, ...]
+
+    def masked_layers(
+        self, failed_rank: int
+    ) -> tuple[tuple[int, int, tuple[tuple[int, ...], ...]], ...]:
+        if type(failed_rank
+                ) is not int or failed_rank not in self.admitted_ranks:
+            raise RuntimeError("Failed rank is outside resident admission")
+        layers = tuple((layer_id, experts,
+                        tuple((-1, ) * len(row) if rank == failed_rank else row
+                              for rank, row in enumerate(rows)))
+                       for layer_id, experts, rows in self.layers)
+        if any(not any(expert in row for row in rows)
+               for _, experts, rows in layers for expert in range(experts)):
+            raise RuntimeError(
+                "Masked resident placement leaves an expert uncovered")
+        return layers
+
+    @property
+    def masked_placement_digests(self) -> tuple[tuple[int, str], ...]:
+        return tuple(
+            (rank, _resident_placement_digest(self.masked_layers(rank)))
+            for rank in self.admitted_ranks)
+
+
+def _resident_placement_digest(
+        layers: tuple[tuple[int, int, tuple[tuple[int, ...], ...]],
+                      ...]) -> str:
+    encoded = json.dumps(sorted(layers), separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class PreparedPlacement:
+    """Host-only fixed-slot candidate; no device installation or memory-safety proof."""
+
+    source: ResidentPlacementInspection
+    stopped: "SchedulerStopReceipt"
+    failed_rank: int
+    base_generation: int
+    next_generation: int
+    layers: tuple[tuple[int, int, tuple[tuple[int, ...], ...]], ...]
+    placement_digest: str
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,
@@ -384,6 +456,7 @@ class PyTorchModelEngine(ModelEngine):
         self._metrics: dict[str, float] = defaultdict(float)
         self.forward_pass_callable = None
         self._cleanup_done = False
+        self.execution_state = None
         self._model_caller: Optional[ModelCaller] = None
         self._runner: Optional[ModelRunner] = None
         # Transitional snapshot for decoder capture and encoder scheduling.
@@ -516,6 +589,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        self._initialize_execution_state()
         self._validate_breakable_cuda_graph_compatibility()
         # In-graph sampling needs the full vocabulary: top-k / top-p over a
         # tensor-parallel shard would rank against a slice of the logits and
@@ -886,6 +960,374 @@ class PyTorchModelEngine(ModelEngine):
         self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
         )
 
+    def _initialize_execution_state(self) -> None:
+        from ..moe.fused_moe import ConfigurableMoE
+        from ..moe.fused_moe.communication.nvlink_one_sided import \
+            NVLinkOneSided
+        from ..moe.fused_moe.ep_group_health import EPGroupHealth
+
+        modules = tuple(module for module in self.model.modules()
+                        if isinstance(module, ConfigurableMoE))
+        clients = tuple(module.comm for module in modules
+                        if isinstance(module.comm, NVLinkOneSided))
+        if not any(client.requires_execution_state for client in clients):
+            return
+        if not clients or any(not client.requires_execution_state
+                              for client in clients):
+            raise RuntimeError("Mixed pending and ordinary OneSided frontends")
+        if any(module.comm not in clients for module in modules):
+            raise RuntimeError(
+                "Execution state requires one qualified communication layout")
+        if any(not module.backend.supports_moe_output_in_alltoall_workspace()
+               for module in modules):
+            raise RuntimeError(
+                "Descriptor execution backend cannot populate the canonical workspace output"
+            )
+        health = clients[0].ep_group_health
+        lifecycle = clients[0].execution_lifecycle()
+        if not isinstance(health, EPGroupHealth):
+            raise RuntimeError(
+                "Execution state requires canonical EPGroupHealth")
+        if any(client.ep_group_health is not health
+               or client.execution_lifecycle() is not lifecycle
+               for client in clients):
+            raise RuntimeError(
+                "Execution state requires one health and workspace lifecycle")
+        from ..moe.fused_moe.communication.execution_state import ExecutionState
+        self.execution_state = ExecutionState(
+            lifecycle,
+            ep_group_health=health,
+            logical_rank=clients[0].ep_rank,
+            clients=clients,
+            streams=self._qualify_execution_owners(modules),
+            model_owner=self)
+
+    def _qualify_execution_owners(self, modules: tuple) -> tuple:
+        if self.mapping.enable_lm_head_tp_in_adp:
+            raise RuntimeError(
+                "Captured LM-head tensor parallelism in attention DP is not qualified"
+            )
+        if (self.mapping.attn_tp_size != 1 or self.mapping.moe_tp_size != 1
+                or self.mapping.pp_size != 1 or self.mapping.attn_cp_size != 1):
+            raise RuntimeError("Required attention/MoE/PP/CP shard loss is not qualified")
+        if any(module.enable_dummy_allreduce or module.backend.enable_dummy_allreduce
+               for module in modules):
+            raise RuntimeError("Captured dummy world allreduce is not qualified")
+        load_format = getattr(self.llm_args.load_format, "name", self.llm_args.load_format)
+        if load_format == "GMS" or self.llm_args.sleep_config is not None:
+            raise RuntimeError("Shared-weight or sleep allocator ownership is not qualified")
+        from tensorrt_llm._utils import get_sm_version
+
+        from ..moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                raise RuntimeError(message)
+
+        llm_args, model = self.llm_args, self.model
+        clients = tuple(module.comm for module in modules)
+        streams = []
+        require(get_sm_version() in (100, 103),
+                'Qualified Blackwell NVFP4 path required')
+        require(
+            llm_args.disable_overlap_scheduler
+            and llm_args.speculative_config is None
+            and llm_args.lora_config is None
+            and llm_args.torch_compile_config is None
+            and not llm_args.enable_in_graph_sampling,
+            'Overlap/speculation/LoRA/compile/in-graph sampling are not qualified'
+        )
+        prefill_backend = getattr(llm_args.prefill_cuda_graph_backend, 'value',
+                                  llm_args.prefill_cuda_graph_backend)
+        require(prefill_backend in (None, 'disabled'),
+                'Other capture owners are not qualified')
+        require(
+            model is not None and all(
+                any(m is owned for owned in model.modules()) for m in modules),
+            'Model does not own the qualified modules')
+        require({id(m.comm)
+                 for m in modules} == {id(c)
+                                       for c in clients},
+                'Model frontend set differs')
+        for module in modules:
+            backend = module.backend
+            require(
+                type(backend) is CuteDslFusedMoE and backend.has_nvfp4
+                and not module.enable_dwdp and module.dwdp_manager is None
+                and backend._locality_domain_runtime is None,
+                'Qualified NVFP4 backend without DWDP/locality required')
+            lb = module.model_config.moe_load_balancer
+            require(lb is not None and lb.layer_updates_per_iter == 0,
+                    'Static placement required')
+            for stream_map in (module.aux_stream_dict, backend.aux_stream_dict):
+                for stream in (stream_map or {}).values():
+                    streams.append(stream)
+            if module.aux_stream is not None:
+                streams.append(module.aux_stream)
+        return tuple(streams)
+
+    def join_execution(self, *, scheduler_streams: tuple,
+                       deadline_monotonic: float,
+                       stop: bool) -> "LocalExecutionJoin":
+        """Join owned local issuers; scheduler owns request and native-KV validation."""
+        state = self.execution_state
+        if state is None or getattr(self, "backend_num_streams", None):
+            raise RuntimeError("Execution join has no qualified model owner")
+        runner = self.cuda_graph_runner
+        if runner is None or {id(graph)
+                              for graph in runner.graphs.values()} != set(
+                                  state._graphs):
+            raise RuntimeError("Original model graph inventory differs")
+        streams = list(scheduler_streams)
+        for module in self.model.modules():
+            for owner in (module, getattr(module, "backend", None)):
+                if owner is None:
+                    continue
+                streams.extend((getattr(owner, "aux_stream_dict", None)
+                                or {}).values())
+                stream = getattr(owner, "aux_stream", None)
+                if stream is not None:
+                    streams.append(stream)
+        join = state.stop if stop else state.join_idle
+        receipt = join(streams=tuple(streams),
+                       deadline_monotonic=deadline_monotonic)
+        if {id(graph)
+                for graph in runner.graphs.values()} != set(state._graphs):
+            raise RuntimeError("Model graphs changed during local issuer join")
+        return receipt
+
+    def finish_execution_stop(
+            self, receipt: "LocalExecutionJoin", *,
+            deadline_monotonic: float) -> "LocalExecutionJoin":
+        state = self.execution_state
+        runner = self.cuda_graph_runner
+        if state is None or runner is None or receipt.owner is not state:
+            raise RuntimeError("Final STOP join has no original model owner")
+        final = state.finish_stop(receipt,
+                                  deadline_monotonic=deadline_monotonic)
+        if {id(graph)
+                for graph in runner.graphs.values()} != set(state._graphs):
+            raise RuntimeError("Model graphs changed during final STOP join")
+        return final
+
+    def retain_scheduler_join(self, owner: "_SchedulerJoin") -> None:
+        """Root the original scheduler's auxiliary resources through model containment."""
+        state = self.execution_state
+        if state is None:
+            raise RuntimeError("Scheduler join has no qualified model owner")
+        self._scheduler_join_owner = owner
+        state.begin_local_join()
+
+    def inspect_resident_placement(
+            self, owner: "_SchedulerJoin") -> ResidentPlacementInspection:
+        """Read static loader provenance after the original scheduler's local joins."""
+        from ..moe.fused_moe import ConfigurableMoE
+
+        state = self.execution_state
+        if (state is None or self._scheduler_join_owner is not owner
+                or owner.scheduler_thread_id != threading.get_ident()
+                or owner.execution is None or owner.native_after is None
+                or owner.native_after.kv_manager is None
+                or state.generation != owner.execution.generation):
+            raise RuntimeError("Placement inspection has no original scheduler join owner")
+        state.validate_join(owner.execution)
+        world = self.mapping.world_size
+        admitted = set(range(1, world))
+        modules = tuple(module for module in self.model.modules()
+                        if isinstance(module, ConfigurableMoE))
+        self._qualify_execution_owners(modules)
+        layers, fixed_slots, owners, limits = [], [], [], []
+        for module in modules:
+            balancer = module.model_config.moe_load_balancer
+            layer = module.layer_load_balancer
+            backend = module.backend
+            slots = module.expert_size_per_partition
+            if (balancer.in_iter or not layer.is_static_routing()
+                    or layer not in balancer.single_layer_load_balancers
+                    or backend.layer_load_balancer is not layer
+                    or module.ep_size != world or module.ep_rank != self.mapping.rank
+                    or module.num_slots != world * slots):
+                raise RuntimeError("Placement inspection has changed EPLB ownership")
+            rows = tuple(tuple(row) for row in layer.get_old_rank_expert_ids())
+            loaded = tuple(module.initial_global_assignments)
+            if (len(rows) != world or any(len(row) != slots for row in rows)
+                    or tuple(expert for row in rows for expert in row) != loaded
+                    or rows[self.mapping.rank] != tuple(module.initial_local_expert_ids)
+                    or tuple(backend.initial_local_expert_ids) != rows[self.mapping.rank]
+                    or tuple(backend.initial_global_assignments) != loaded
+                    or backend.expert_size_per_partition != slots
+                    or backend.w3_w1_weight.shape[0] != slots
+                    or backend.w2_weight.shape[0] != slots
+                    or backend.w3_w1_weight.device.type != "cuda"
+                    or backend.w2_weight.device.type != "cuda"):
+                raise RuntimeError("Host EPLB assignments differ from resident loader slots")
+            if any(type(expert) is not int or not 0 <= expert < module.num_experts
+                   for row in rows for expert in row):
+                raise RuntimeError("Invalid host expert assignment")
+            total = tuple(sum(row.count(expert) for row in rows)
+                          for expert in range(module.num_experts))
+            if not all(total):
+                raise RuntimeError("Resident slots do not cover every expert")
+            admitted.intersection_update(
+                rank for rank in range(1, world)
+                if all(total[expert] > rows[rank].count(expert)
+                       for expert in range(module.num_experts)))
+            geometry = module.comm.execution_geometry()
+            if geometry[:2] != (world, self.mapping.rank):
+                raise RuntimeError("Placement logical geometry differs from communication")
+            layers.append((layer.get_layer_idx(), module.num_experts, rows))
+            fixed_slots.append((layer.get_layer_idx(), module.num_experts, slots))
+            limits.append(geometry[2])
+            owners.extend((module, backend, balancer, layer,
+                           backend.w3_w1_weight, backend.w2_weight))
+        if not layers or len({layer[0] for layer in layers}) != len(layers):
+            raise RuntimeError("Placement inspection has no complete unique layer inventory")
+        manager = owner.native_after.kv_manager
+        if type(self.max_seq_len) is not int or self.max_seq_len <= 0:
+            raise RuntimeError("Admission has no declared request sequence bound")
+        request_capacity = owner.request_capacity
+        if (type(request_capacity) is not int
+                or not 0 < request_capacity <= self.batch_size):
+            raise RuntimeError("Admission has no original scheduler request capacity")
+        required_tokens = (request_capacity *
+                           manager.get_num_kv_blocks(self.max_seq_len) *
+                           manager.tokens_per_block)
+        available = manager.get_num_available_tokens(required_tokens)
+        if type(available) is not int or available < 0:
+            raise RuntimeError("Invalid native KV token capacity")
+        if available < required_tokens:
+            admitted.clear()
+        if any(type(limit) is not int or limit <= 0 for limit in limits):
+            raise RuntimeError("Invalid fixed communication token capacity")
+        if request_capacity > min(limits):
+            admitted.clear()
+        result = ResidentPlacementInspection(
+            _resident_placement_digest(tuple(layers)), tuple(sorted(admitted)),
+            tuple(sorted(layers)), tuple(sorted(fixed_slots)), min(limits),
+            available, request_capacity, self.max_seq_len,
+            tuple(owners) + (owner, manager))
+        state.validate_join(owner.execution)
+        return result
+
+    def captured_execution_identity(
+            self, owner: "_SchedulerJoin") -> "CapturedExecutionIdentity":
+        """Identify retained executables and spans without asserting remote-write safety."""
+        from tensorrt_llm.executor.recovery import CapturedExecutionIdentity
+
+        state = self.execution_state
+        if (state is None or self._scheduler_join_owner is not owner
+                or owner.scheduler_thread_id != threading.get_ident()
+                or owner.execution is None or owner.native_after is None):
+            raise RuntimeError(
+                "Capture identity has no original joined scheduler owner")
+        state.validate_join(owner.execution)
+        graph_rows, address_rows = [], []
+        for footprint in state.captured_footprints:
+            graph_rows.append(
+                (str(footprint.graph_key), footprint.graph_owner_id,
+                 footprint.raw_graph, footprint.executable,
+                 footprint.capture_generation))
+            geometry = tuple(
+                str(value) if isinstance(value, torch.dtype) else value
+                for value in footprint.workspace_geometry)
+            spans = tuple(
+                tuple((span.role, span.pointer, span.byte_size, span.shape,
+                       span.dtype, span.origin) for span in phase)
+                for phase in footprint.spans)
+            address_rows.append((footprint.graph_owner_id, geometry,
+                                 id(footprint.mapping_token),
+                                 footprint.descriptor_addresses, spans))
+        if not graph_rows:
+            raise RuntimeError("Original capture identity inventory is empty")
+        address_rows.append(("native_kv", owner.native_after.fingerprint))
+
+        def digest(rows: list) -> str:
+            return hashlib.sha256(
+                json.dumps(rows,
+                           separators=(",", ":")).encode("utf-8")).hexdigest()
+
+        return CapturedExecutionIdentity(digest(sorted(graph_rows)),
+                                         digest(address_rows))
+
+    def summarize_resident_admission(
+            self, owner: "_SchedulerJoin") -> "ModelAdmissionSummary":
+        from tensorrt_llm.executor.recovery import ModelAdmissionSummary
+
+        inspected = self.inspect_resident_placement(owner)
+        geometries = {(experts, slots)
+                      for _, experts, slots in inspected.fixed_slots}
+        if len(geometries) != 1:
+            raise RuntimeError(
+                "Recovery requires uniform fixed expert slot geometry")
+        experts, slots = geometries.pop()
+        self._resident_placement_inspection = inspected
+        return ModelAdmissionSummary(
+            placement_digest=inspected.placement_digest,
+            admitted_ranks=inspected.admitted_ranks,
+            logical_capacity=self.mapping.world_size,
+            layer_count=len(inspected.layers),
+            expert_count=experts,
+            slots_per_rank=slots,
+            token_capacity=inspected.max_tokens_per_logical_rank,
+            request_capacity=inspected.max_active_requests,
+            request_sequence_length=inspected.request_sequence_length,
+            kv_token_capacity=inspected.available_kv_tokens,
+            masked_placement_digests=inspected.masked_placement_digests)
+
+    def prepare_resident_placement(
+            self, failed_rank: int, stopped: "SchedulerStopReceipt",
+            scheduler_join: "_SchedulerJoin") -> PreparedPlacement:
+        """Prepare fixed logical rows on the original stopped scheduler without publishing them."""
+        from tensorrt_llm.executor.recovery import SchedulerStopReceipt
+
+        state = self.execution_state
+        original = getattr(self, "_resident_placement_inspection", None)
+        if (not isinstance(stopped, SchedulerStopReceipt) or state is None
+                or original is None
+                or self._scheduler_join_owner is not scheduler_join
+                or scheduler_join.execution is None
+                or not scheduler_join.execution.stopped
+                or scheduler_join.execution.owner is not state
+                or scheduler_join.scheduler_thread_id != threading.get_ident()
+                or stopped.scheduler_thread_id != threading.get_ident()
+                or stopped.transaction_id != scheduler_join.request.control_id
+                or stopped.model_generation != state.generation
+                or stopped.identity.generation != state.generation
+                or stopped.identity.worker.rank != self.mapping.rank
+                or not stopped.local_issuer_join_complete
+                or not stopped.native_kv_inventory_complete
+                or not stopped.ticket_retired):
+            raise RuntimeError(
+                "Placement preparation requires the original scheduler STOP owners"
+            )
+        if type(failed_rank
+                ) is not int or failed_rank not in original.admitted_ranks:
+            raise RuntimeError(
+                "Failed rank is outside original resident admission")
+        current = self.inspect_resident_placement(scheduler_join)
+        if (current.layers != original.layers
+                or current.fixed_slots != original.fixed_slots
+                or len(current.owners) != len(original.owners)
+                or any(left is not right for left, right in zip(
+                    current.owners[:-2], original.owners[:-2]))
+                or current.owners[-1] is not original.owners[-1]):
+            raise RuntimeError(
+                "Resident placement owners changed after idle admission")
+        layers = current.masked_layers(failed_rank)
+        return PreparedPlacement(current, stopped, failed_rank,
+                                 state.generation, state.generation + 1, layers,
+                                 _resident_placement_digest(layers))
+
+    def hold_execution_idle(self, receipt: "LocalExecutionJoin") -> None:
+        """Keep original graphs and mapped resources while local issuance is paused."""
+        state, runner = self.execution_state, self.cuda_graph_runner
+        if (state is None or runner is None or receipt.owner is not state
+                or {id(graph)
+                    for graph in runner.graphs.values()} != set(state._graphs)):
+            raise RuntimeError(
+                "Idle boundary has no original model graph owner")
+        state.hold_idle(receipt)
+
     def _initialize_cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
         if not self._fallback_to_engine:
             return None
@@ -922,7 +1364,7 @@ class PyTorchModelEngine(ModelEngine):
                 enable_encoder_decoder_mixed_cuda_graph),
             enable_in_graph_sampling=self.enable_in_graph_sampling,
         )
-        return CUDAGraphRunner(config)
+        return CUDAGraphRunner(config, execution_state=self.execution_state)
 
     def _initialize_breakable_cuda_graph_runner(
             self) -> Optional[BreakableCUDAGraphRunner]:
@@ -1449,6 +1891,11 @@ class PyTorchModelEngine(ModelEngine):
             return
         assert resource_manager is not None, (
             "scheduled warmup requires a resource manager")
+        if self.execution_state is not None:
+            self.execution_state.bind_resource_manager(
+                resource_manager,
+                resource_manager.get_resource_manager(
+                    self.kv_cache_manager_key))
         if not self._fallback_to_engine:
             assert isinstance(self._runner, ScheduledModelRunner)
             self._runner.warmup(resource_manager)
@@ -3788,14 +4235,17 @@ class PyTorchModelEngine(ModelEngine):
         # rolled back.  Keep each handle live until its own release succeeds,
         # so a failed cleanup can be retried without double-freeing resources
         # that were already released.
+        if self.execution_state is not None:
+            self._release_cuda_graphs()
+            self.execution_state.close()
+
         model_loader = self.model_loader
         if model_loader is not None:
             model_loader.cleanup()
             self.model_loader = None
 
-        # Release runner-owned graphs before dropping the runner. Keep the
-        # handle available if graph release fails and cleanup is retried.
-        self._release_cuda_graphs()
+        if self.execution_state is None:
+            self._release_cuda_graphs()
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
@@ -6155,6 +6605,11 @@ class PyTorchModelEngine(ModelEngine):
         gather_context_logits = forward_inputs.gather_context_logits
         enable_spec_decode = forward_inputs.enable_spec_decode
         runtime_draft_len = forward_inputs.runtime_draft_len
+        if self.execution_state is not None:
+            self.execution_state.bind_resource_manager(
+                resource_manager,
+                resource_manager.get_resource_manager(
+                    self.kv_cache_manager_key))
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         assert kv_cache_manager is not None, (
@@ -6439,6 +6894,30 @@ class PyTorchModelEngine(ModelEngine):
                       is_dummy: bool,
                       gather_ids: Optional[torch.Tensor] = None,
                       gather_context_logits: bool = False) -> Dict[str, Any]:
+        state = self.execution_state
+        if state is not None:
+            state.begin_forward()
+            state.latch_descriptor()
+        output = self._forward_step_impl(
+            inputs,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            is_dummy=is_dummy,
+            gather_ids=gather_ids,
+            gather_context_logits=gather_context_logits)
+        if state is not None:
+            state.end_forward()
+        return output
+
+    def _forward_step_impl(
+            self,
+            inputs: Dict[str, Any],
+            *,
+            enable_spec_decode: bool,
+            runtime_draft_len: int,
+            is_dummy: bool,
+            gather_ids: Optional[torch.Tensor] = None,
+            gather_context_logits: bool = False) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs,
                                          enable_spec_decode=enable_spec_decode,
                                          runtime_draft_len=runtime_draft_len)

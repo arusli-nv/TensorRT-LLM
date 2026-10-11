@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache, wraps
-from typing import Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,6 +31,14 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.recovery import (RecoveryProposal,
+                                                SchedulerStopReceipt,
+                                                ServingTaskControl,
+                                                WorkerTaskIdentity)
+    from tensorrt_llm.executor.worker_process_monitor import \
+        WorkerProcessIdentity
 
 try:
     import ray
@@ -268,6 +280,14 @@ class Distributed(ABC):
         if self.tp_size > 1:
             vec = self.tp_allgather_int64(vec).reshape(-1)
         return vec.reshape(-1, n)
+
+    def tp_allgather_logical_counts(self, values: ArrayLike) -> np.ndarray:
+        """Gather count columns indexed by original logical rank."""
+        return self.tp_allgather_int64(values)
+
+    def tp_cp_allgather_logical_counts(self, values: ArrayLike) -> np.ndarray:
+        """Gather fixed logical count rows across TP and CP."""
+        return self.tp_cp_allgather_int64(values)
 
     def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
         """Broadcast a fixed-size int64 vector from *root* to every rank.
@@ -692,6 +712,50 @@ def safe_allgather(
     return _deserialize_recvbuf(recvbuf, lengths, displs, size)
 
 
+class _HostCollectiveInterrupted(RuntimeError):
+    """A native host operation failed in the original serving task.
+
+    This carries local interruption evidence, not a failed-rank diagnosis or
+    permission to replace communicators or resume execution.
+    """
+
+    def __init__(self, native_error: MPI.Exception, *, operation: str,
+                 communicator: MPI.Comm, mapping: Mapping,
+                 task_identity: object) -> None:
+        super().__init__(f"MPI host operation interrupted: {operation}")
+        self.native_error = native_error
+        self.error_code = native_error.Get_error_code()
+        self.error_class = native_error.Get_error_class()
+        self.operation = operation
+        self.communicator = communicator
+        self.communicator_identity = id(communicator)
+        self.mapping = mapping
+        self.logical_rank = mapping.rank
+        self.logical_world_size = mapping.world_size
+        self.failed_rank = None
+        self.task_identity = task_identity
+
+
+@dataclass(frozen=True)
+class _SurvivorHostView:
+    """Borrowed host communicator; its creating adapter owns terminal cleanup."""
+
+    owner: "MPIDist"
+    communicator: MPI.Comm
+    mapping: Mapping
+    task_identity: "WorkerTaskIdentity"
+    proposal: "RecoveryProposal"
+    logical_members: tuple[int, ...]
+    original_world: MPI.Comm
+    original_tp: MPI.Comm
+
+    def compact_rank(self, logical_rank: int) -> int:
+        if type(logical_rank
+                ) is not int or logical_rank not in self.logical_members:
+            raise ValueError("Host root is not in survivor membership")
+        return self.logical_members.index(logical_rank)
+
+
 class MPIDist(Distributed):
     tp_comm: MPI.Comm
 
@@ -700,6 +764,213 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        self._serving_task_binding = None
+        self._prepared_survivor_host: Optional[_SurvivorHostView] = None
+
+    def _prepare_survivor_host(
+            self, comm: MPI.Comm, proposal: "RecoveryProposal",
+            stopped: "SchedulerStopReceipt") -> _SurvivorHostView:
+        """Validate compact host rows without installing or changing GPU ranks."""
+        binding = self._serving_task_binding
+        if binding is None:
+            raise RuntimeError(
+                "Survivor preparation requires the original serving task")
+        control, _, identity, mapping, rank, size, tp_group, world, tp = binding
+        control.validate_preparation(proposal, stopped)
+        logical_members = tuple(worker.rank for worker in proposal.survivors)
+        if (not mapping.enable_attention_dp or mapping.cp_size != 1
+                or mapping.pp_size != 1 or mapping.tp_size != size
+                or mapping.moe_ep_size != size or mapping.moe_tp_size != 1
+                or mapping.enable_lm_head_tp_in_adp
+                or tp_group != tuple(range(size))):
+            raise ValueError(
+                "This topology has no qualified survivor host path")
+        if logical_members != tuple(member for member in range(size)
+                                    if member != proposal.failed_worker.rank):
+            raise ValueError(
+                "Survivor membership conflicts with original logical ranks")
+        if comm is world or comm is tp or comm.Get_size() != len(
+                logical_members):
+            raise ValueError("A distinct survivor communicator is required")
+        compact_rank = comm.Get_rank()
+        if (compact_rank < 0 or compact_rank >= len(logical_members)
+                or logical_members[compact_rank] != rank):
+            raise ValueError(
+                "MPI membership does not match original logical ranks")
+        view = _SurvivorHostView(self, comm, mapping, identity, proposal,
+                                 logical_members, world, tp)
+        if self._prepared_survivor_host is not None:
+            previous = self._prepared_survivor_host
+            if (previous.communicator is not comm
+                    or previous.proposal is not proposal):
+                raise RuntimeError(
+                    "A conflicting survivor host view is already prepared")
+            self._validate_survivor_host(previous)
+            return previous
+        self._prepared_survivor_host = view
+        try:
+            self._validate_survivor_host(view)
+            if tuple(comm.allgather(rank)) != logical_members:
+                raise ValueError(
+                    "MPI membership does not match original logical ranks")
+            self._validate_survivor_host(view)
+        except (MPI.Exception, RuntimeError, ValueError, TimeoutError):
+            self._prepared_survivor_host = None
+            raise
+        return view
+
+    def _discard_survivor_host(self, view: _SurvivorHostView) -> None:
+        """Release a borrowed preparation before its creating adapter frees it."""
+        if view is not self._prepared_survivor_host:
+            raise ValueError(
+                "Survivor host view does not belong to this preparation")
+        self._prepared_survivor_host = None
+
+    def _validate_survivor_host(
+            self, view: _SurvivorHostView) -> "ServingTaskControl":
+        from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+        binding = self._serving_task_binding
+        if binding is None or view is not self._prepared_survivor_host:
+            raise RuntimeError(
+                "The original survivor host owner is unavailable")
+        control, context, identity, mapping, rank, size, tp_group, world, tp = binding
+        control.validate_preparation(view.proposal, control._stopped)
+        compact_rank = view.communicator.Get_rank()
+        current = getattr(MPINodeState, "_serving_task_context", None)
+        if (view.owner is not self or view.mapping is not mapping
+                or self.mapping is not mapping or mapping.rank != rank
+                or mapping.world_size != size
+                or tuple(mapping.tp_group) != tp_group
+                or view.task_identity is not identity
+                or view.original_world is not world
+                or view.original_tp is not tp or mpi_comm() is not world
+                or self._tp_comm is not tp or getattr(
+                    MPINodeState, "_serving_task_control", None) is not control
+                or type(current) is not tuple or len(current) != 2
+                or current[0] is not context
+                or current[1] != identity.invocation_id
+                or control.identity is not identity
+                or control.context is not context or control._body_ended
+                or control._error is not None or control._registration is None
+                or control._stop_queue is None
+                or view.communicator.Get_size() != len(view.logical_members)
+                or compact_rank < 0 or compact_rank >= len(view.logical_members)
+                or view.logical_members[compact_rank] != rank):
+            raise RuntimeError(
+                "Survivor host view no longer binds the original task")
+        return control
+
+    def _prepared_host_int64_rows(self, view: _SurvivorHostView,
+                                  values: ArrayLike) -> np.ndarray:
+        """Gather compact control rows over the supplied survivor group."""
+        self._validate_survivor_host(view)
+        return self._allgather_int64_comm(view.communicator, values)
+
+    def _prepared_host_logical_counts(self, view: _SurvivorHostView,
+                                      values: ArrayLike) -> np.ndarray:
+        """Expand nonnegative count columns into fixed original logical rows."""
+        vector = np.asarray(values)
+        if (vector.ndim != 1 or vector.size == 0
+                or not np.issubdtype(vector.dtype, np.integer)
+                or np.any(vector < 0)
+                or np.any(vector > np.iinfo(np.int64).max)):
+            raise ValueError("Logical counts require nonnegative int64 columns")
+        rows = self._prepared_host_int64_rows(view, vector)
+        if np.any(rows < 0):
+            raise ValueError("A survivor supplied negative logical counts")
+        logical = np.zeros((view.mapping.world_size, vector.size),
+                           dtype=np.int64)
+        logical[list(view.logical_members)] = rows
+        return logical
+
+    def _bind_serving_task(self, control: object) -> None:
+        """Pin the original groups before acknowledging executor construction."""
+        from tensorrt_llm.executor.recovery import (ServingTaskContext,
+                                                    ServingTaskControl,
+                                                    WorkerTaskIdentity)
+        from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+        if type(control) is not ServingTaskControl:
+            raise TypeError("An original serving-task control is required")
+        with control._lock:
+            context = control.context
+            identity = control.identity
+            binding = getattr(MPINodeState, "_serving_task_context", None)
+            if (type(context) is not ServingTaskContext
+                    or type(identity) is not WorkerTaskIdentity
+                    or type(binding) is not tuple or len(binding) != 2
+                    or binding[0] is not context
+                    or binding[1] != identity.invocation_id
+                    or getattr(MPINodeState, "_serving_task_control", None)
+                    is not control or identity.task_id != context.task_id
+                    or identity.generation != context.expected_generation
+                    or identity.worker.rank != self.mapping.rank):
+                raise ValueError(
+                    "Serving task does not bind this original mapping")
+            control._check_live()
+            if self._serving_task_binding is not None:
+                previous = self._serving_task_binding
+                if (previous[0] is not control or previous[1] is not context
+                        or previous[2] is not identity
+                        or previous[3] is not self.mapping
+                        or previous[4] != self.mapping.rank
+                        or previous[5] != self.mapping.world_size
+                        or previous[6] != tuple(self.mapping.tp_group)
+                        or previous[7] is not mpi_comm()
+                        or previous[8] is not self._tp_comm):
+                    raise RuntimeError(
+                        "Original MPI serving task is already bound")
+                return
+            self._serving_task_binding = (control, context, identity,
+                                          self.mapping, self.mapping.rank,
+                                          self.mapping.world_size,
+                                          tuple(self.mapping.tp_group),
+                                          mpi_comm(), self.tp_comm)
+
+    def _classify_host_interruption(
+            self, error: MPI.Exception, operation: str,
+            comm: MPI.Comm) -> Optional[_HostCollectiveInterrupted]:
+        supported = tuple(value for name in ("ERR_PROC_FAILED", "ERR_REVOKED")
+                          if (value := getattr(MPI, name, None)) is not None)
+        binding = self._serving_task_binding
+        if binding is None or error.Get_error_class() not in supported:
+            return None
+        from tensorrt_llm.llmapi.mpi_session import MPINodeState
+
+        (control, context, identity, mapping, rank, world_size, tp_group,
+         world_comm, tp_comm) = binding
+        expected_comm = world_comm if operation in (
+            "broadcast", "broadcast_int64") else tp_comm
+        if (operation not in ("broadcast", "broadcast_int64", "tp_allgather",
+                              "tp_allgather_int64") or comm is not expected_comm
+                or self.mapping is not mapping or mapping.rank != rank
+                or mapping.world_size != world_size
+                or tuple(mapping.tp_group) != tp_group
+                or mpi_comm() is not world_comm
+                or self._tp_comm is not tp_comm):
+            return None
+        with control._lock:
+            current = getattr(MPINodeState, "_serving_task_context", None)
+            if (getattr(MPINodeState, "_serving_task_control",
+                        None) is not control or type(current) is not tuple
+                    or len(current) != 2 or current[0] is not context
+                    or current[1] != identity.invocation_id
+                    or control.context is not context
+                    or control.identity is not identity or control._body_ended
+                    or control._error is not None
+                    or control._registration is None
+                    or control._stop_queue is None):
+                return None
+            try:
+                control._check_live()
+            except (RuntimeError, TimeoutError):
+                return None
+            return _HostCollectiveInterrupted(error,
+                                              operation=operation,
+                                              communicator=comm,
+                                              mapping=mapping,
+                                              task_identity=identity)
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -716,7 +987,14 @@ class MPIDist(Distributed):
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+        try:
+            return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+        except MPI.Exception as error:
+            interrupted = self._classify_host_interruption(
+                error, "broadcast", comm)
+            if interrupted is not None:
+                raise interrupted from error
+            raise
 
     def allgather(self, obj):
         return mpi_allgather(obj)
@@ -804,9 +1082,16 @@ class MPIDist(Distributed):
                      *,
                      small_payload: bool = False):
         comm = self.tp_comm
-        if small_payload:
-            return comm.allgather(obj)
-        return safe_allgather(comm, obj, chunk_size=chunk_size)
+        try:
+            if small_payload:
+                return comm.allgather(obj)
+            return safe_allgather(comm, obj, chunk_size=chunk_size)
+        except MPI.Exception as error:
+            interrupted = self._classify_host_interruption(
+                error, "tp_allgather", comm)
+            if interrupted is not None:
+                raise interrupted from error
+            raise
 
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
@@ -856,13 +1141,29 @@ class MPIDist(Distributed):
         return buf
 
     def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
-        return self._allgather_int64_comm(self.tp_comm, values)
+        comm = self.tp_comm
+        try:
+            return self._allgather_int64_comm(comm, values)
+        except MPI.Exception as error:
+            interrupted = self._classify_host_interruption(
+                error, "tp_allgather_int64", comm)
+            if interrupted is not None:
+                raise interrupted from error
+            raise
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.cp_comm, values)
 
     def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
-        return self._broadcast_int64_comm(mpi_comm(), values, root)
+        comm = mpi_comm()
+        try:
+            return self._broadcast_int64_comm(comm, values, root)
+        except MPI.Exception as error:
+            interrupted = self._classify_host_interruption(
+                error, "broadcast_int64", comm)
+            if interrupted is not None:
+                raise interrupted from error
+            raise
 
     def tp_cp_broadcast_int64(self,
                               values: ArrayLike,

@@ -29,6 +29,7 @@ placement are ready for the same generation.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -240,6 +241,30 @@ class _TorchCompletionFlagReader:
             time.sleep(min(remaining_s, 0.001))
 
         return tuple(int(v) for v in host_flags.tolist())
+
+    def retire_copies(self, *, timeout_s: float | None) -> None:
+        """Retain flag-copy buffers until their actual CUDA events complete.
+
+        The polling thread must already be joined. This retires local D2H
+        copies; it does not prove completion of peer-issued fabric writes.
+        """
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        events = [event for _, event in self._retired_copies]
+        if self._copy_event is not None:
+            events.append(self._copy_event)
+        while True:
+            events = [event for event in events if not event.query()]
+            # An event-record failure can follow a successfully submitted copy.
+            stream_ready = self._copy_stream is None or self._copy_stream.query()
+            if not events and stream_ready:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise CompletionFlagReadTimeout("timed out retiring AlltoAll flag-copy DMA")
+            time.sleep(0.001)
+        self._retired_copies.clear()
+        self._host_flags = None
+        self._copy_event = None
+        self._copy_stream = None
 
     def read_completion_flags(self, phase: str) -> tuple[int, ...]:
         offset = self._offsets[phase]
@@ -606,6 +631,25 @@ class AlltoAllWatchdog:
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=timeout_s)
+
+    def stop_and_retire(self, timeout_s: float | None = None) -> None:
+        """Join callbacks and retire built-in reader DMA, retaining owners on failure."""
+        if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s < 0):
+            raise ValueError("AlltoAll watchdog retirement timeout must be finite and nonnegative")
+        with self._cv:
+            thread = self._thread
+            if thread is threading.current_thread():
+                raise RuntimeError("AlltoAll watchdog cannot retire from its polling callback")
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        self.stop(timeout_s=timeout_s)
+        with self._cv:
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            raise TimeoutError("timed out joining AlltoAll watchdog polling thread")
+        reader = self._completion_reader
+        if isinstance(reader, _TorchCompletionFlagReader):
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            reader.retire_copies(timeout_s=remaining)
 
     def watch(
         self,

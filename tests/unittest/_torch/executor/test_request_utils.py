@@ -539,6 +539,34 @@ def test_can_process_attention_dp_request(attention_dp_config):
     )
 
 
+def test_waiting_request_uses_logical_rank_counts() -> None:
+    """Does queue admission use logical targets rather than compact row positions?"""
+    counts = {0: 0, 3: 1}
+    request = RequestQueueItem(1, create_mock_request_with_py_schedule_params(attention_dp_rank=3))
+    assert can_process_attention_dp_request(request, counts, 2)
+    assert counts == {0: 0, 3: 2}
+    assert not can_process_attention_dp_request(request, counts, 2)
+
+
+def test_waiting_request_rejects_missing_strict_target() -> None:
+    request = RequestQueueItem(1, create_mock_request_with_py_schedule_params(attention_dp_rank=1))
+    with pytest.raises(ValueError, match="rank 1 is not serving"):
+        can_process_attention_dp_request(request, {0: 0, 3: 0}, 2)
+    request.request.py_scheduling_params.attention_dp_relax = True
+    assert can_process_attention_dp_request(request, {0: 0, 3: 0}, 2)
+
+
+def test_missing_target_preserves_waiting_request() -> None:
+    """Does rejecting a departed strict target retain the original request owner?"""
+    request = RequestQueueItem(1, create_mock_request_with_py_schedule_params(attention_dp_rank=1))
+    queue = FCFSWaitingQueue()
+    queue.append(request)
+    with pytest.raises(ValueError, match="rank 1 is not serving"):
+        get_from_waiting_queue(queue, 1, True, 2, {0: 0, 3: 0})
+    assert queue.peek_request() is request
+    assert len(queue) == 1
+
+
 # --------------------------------------------------------------------------
 # nvbug-6133201: per-rank gen-phase step-token cap via tightened
 # per-rank request cap.

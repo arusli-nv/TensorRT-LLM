@@ -4,10 +4,12 @@
 import dataclasses
 import datetime
 import enum
+import math
 import queue
 import threading
 import time
-from typing import Iterable, List, Optional
+from contextlib import contextmanager
+from typing import Iterable, Iterator, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -33,6 +35,8 @@ class RequestAdmissionState(enum.Enum):
     PARKED = "parked"
     WAKING = "waking"
     FAILED = "failed"
+    RECOVERING = "recovering"
+    QUIESCING = "quiescing"
 
 
 @dataclasses.dataclass
@@ -54,6 +58,8 @@ class RequestQueueItem:
     # applies when the broadcast reaches them.
     profile_config: Optional[dict] = None
     finished_prefix_load_ids: Optional[list[int]] = None
+    scheduler_stop_timeout_s: Optional[float] = None
+    idle_boundary_timeout_s: Optional[float] = None
 
     @property
     def is_shutdown_request(self):
@@ -106,6 +112,147 @@ class ExecutorRequestQueue:
         self._parked_tags: frozenset[str] = frozenset()
         self._pending_wakeup_tags: frozenset[str] = frozenset()
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self._scheduler_stop_item: RequestQueueItem | None = None
+        self._scheduler_stop_deadline: float | None = None
+        self._idle_boundary_item: RequestQueueItem | None = None
+        self._idle_boundary_deadline: float | None = None
+        self._idle_boundary_epoch = 0
+
+    def enqueue_idle_boundary(self, control_id: str,
+                              timeout_seconds: float) -> None:
+        """Align an authenticated idle boundary through the normal request broadcast."""
+        if (not control_id or not math.isfinite(timeout_seconds)
+                or not 0 < timeout_seconds <= 60):
+            raise ValueError("Idle boundary requires a bounded transaction")
+        with self.enqueue_lock:
+            previous = self._idle_boundary_item
+            if previous is not None:
+                if (previous.control_id != control_id
+                        or previous.idle_boundary_timeout_s != timeout_seconds):
+                    raise RuntimeError("Conflicting idle boundary")
+                return
+            if not self.active or self.admission_state is not RequestAdmissionState.RUNNING:
+                raise RuntimeError(
+                    "Executor admission cannot enter an idle boundary")
+            item = RequestQueueItem(CONTROL_REQUEST_ID,
+                                    control_requires_drain=False,
+                                    control_id=control_id,
+                                    idle_boundary_timeout_s=timeout_seconds)
+            self.admission_state = RequestAdmissionState.QUIESCING
+            self._idle_boundary_item = item
+            self._idle_boundary_deadline = time.monotonic() + timeout_seconds
+            self._idle_boundary_epoch += 1
+            self.request_queue.put(item)
+
+    def consume_idle_boundary(
+            self, control_id: str) -> tuple[RequestQueueItem, float]:
+        with self.enqueue_lock:
+            item, deadline = self._idle_boundary_item, self._idle_boundary_deadline
+            if (item is None or item.control_id != control_id
+                    or deadline is None or time.monotonic() >= deadline
+                    or not self.active or self.admission_state
+                    is not RequestAdmissionState.QUIESCING):
+                raise RuntimeError(
+                    "Idle boundary is absent, conflicting or expired")
+            with self.request_queue.mutex:
+                for index, queued in enumerate(self.request_queue.queue):
+                    if queued is item:
+                        del self.request_queue.queue[index]
+                        self.request_queue.not_full.notify_all()
+                        break
+            return item, deadline
+
+    @property
+    def idle_boundary_epoch(self) -> int:
+        with self.enqueue_lock:
+            return self._idle_boundary_epoch
+
+    @contextmanager
+    def idle_boundary_publication(self, control_id: str,
+                                  expected_epoch: int) -> Iterator[None]:
+        """Hold the sealed ingress boundary while its original receipt is published."""
+        with self.enqueue_lock, self.request_queue.mutex:
+            item = self._idle_boundary_item
+            if (not self.active or item is None or item.control_id != control_id
+                    or type(expected_epoch) is not int
+                    or self._idle_boundary_epoch != expected_epoch or
+                    self.admission_state is not RequestAdmissionState.QUIESCING
+                    or self.request_queue.queue):
+                raise RuntimeError(
+                    "Idle boundary has changed or has unresolved ingress")
+            yield
+
+    def validate_idle_boundary(self, control_id: str,
+                               expected_epoch: int) -> None:
+        with self.idle_boundary_publication(control_id, expected_epoch):
+            pass
+
+    def enqueue_scheduler_stop(self, control_id: str,
+                               timeout_seconds: float) -> None:
+        """Close admission and enqueue one original authenticated STOP item."""
+        if (not control_id or not math.isfinite(timeout_seconds)
+                or not 0 < timeout_seconds <= 60):
+            raise ValueError("STOP requires a bounded transaction")
+        with self.enqueue_lock:
+            previous = self._scheduler_stop_item
+            if previous is not None:
+                if (previous.control_id != control_id or
+                        previous.scheduler_stop_timeout_s != timeout_seconds):
+                    raise RuntimeError("Conflicting scheduler STOP")
+                return
+            idle = self._idle_boundary_item
+            if (not self.active or self.admission_state
+                    not in (RequestAdmissionState.RUNNING,
+                            RequestAdmissionState.QUIESCING)
+                    or (idle is not None and idle.control_id != control_id)):
+                raise RuntimeError("Executor admission cannot enter STOP")
+            item = RequestQueueItem(CONTROL_REQUEST_ID,
+                                    control_requires_drain=False,
+                                    control_id=control_id,
+                                    scheduler_stop_timeout_s=timeout_seconds)
+            self.admission_state = RequestAdmissionState.RECOVERING
+            self._scheduler_stop_item = item
+            self._scheduler_stop_deadline = time.monotonic() + timeout_seconds
+            self._idle_boundary_epoch += 1
+            self.request_queue.put(item)
+
+    def consume_scheduler_stop(
+            self, control_id: str) -> tuple[RequestQueueItem, float]:
+        """Return the original STOP while retaining all unrelated queued owners."""
+        with self.enqueue_lock:
+            item, deadline = self._scheduler_stop_item, self._scheduler_stop_deadline
+            if (item is None or item.control_id != control_id
+                    or deadline is None or time.monotonic() >= deadline
+                    or self.admission_state
+                    is not RequestAdmissionState.RECOVERING):
+                raise RuntimeError(
+                    "Scheduler STOP is absent, conflicting or expired")
+            with self.request_queue.mutex:
+                for index, queued in enumerate(self.request_queue.queue):
+                    if queued is item:
+                        del self.request_queue.queue[index]
+                        self.request_queue.not_full.notify_all()
+                        break
+            return item, deadline
+
+    @contextmanager
+    def scheduler_stop_publication(self, control_id: str):
+        """Serialize STOP publication with terminal shutdown and ingress."""
+        with self.enqueue_lock, self.request_queue.mutex:
+            item = self._scheduler_stop_item
+            if (not self.active or item is None or item.control_id != control_id
+                    or self.admission_state
+                    is not RequestAdmissionState.RECOVERING
+                    or self.request_queue.queue):
+                raise RuntimeError(
+                    "Scheduler STOP publication has unresolved or terminal ingress"
+                )
+            yield
+
+    def _require_control_admission(self) -> None:
+        if self._scheduler_stop_item is not None or self._idle_boundary_item is not None:
+            raise RuntimeError(
+                "Executor control admission is closed for recovery")
 
     def _transition_admission_state(
         self,
@@ -254,6 +401,7 @@ class ExecutorRequestQueue:
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
+            self._require_control_admission()
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
@@ -262,6 +410,7 @@ class ExecutorRequestQueue:
                                 control_id: Optional[str] = None):
         """Enqueue a control-action sentinel. See ``PyExecutor.control_action``."""
         with self.enqueue_lock:
+            self._require_control_admission()
             self.request_queue.put(
                 RequestQueueItem(id=CONTROL_REQUEST_ID,
                                  control_requires_drain=drain,
@@ -272,6 +421,7 @@ class ExecutorRequestQueue:
         every TP/PP rank via ``RequestBroadcaster`` so all PyExecutor
         instances apply the window in lockstep (not just the leader)."""
         with self.enqueue_lock:
+            self._require_control_admission()
             self.request_queue.put(
                 RequestQueueItem(id=PROFILE_START_REQUEST_ID,
                                  profile_config=profile_config))
@@ -279,10 +429,12 @@ class ExecutorRequestQueue:
     def enqueue_profile_stop_request(self):
         """Enqueue a profile-stop control item. Broadcasted to every rank."""
         with self.enqueue_lock:
+            self._require_control_admission()
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
+            self._idle_boundary_epoch += 1
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
             self.active = False
 
@@ -294,7 +446,7 @@ class ExecutorRequestQueue:
     def can_enqueue_control_request(self) -> bool:
         """Return whether rank zero can enqueue shutdown/control sentinels."""
         with self.enqueue_lock:
-            return self.active and self.dist.rank == 0
+            return self.active and self.dist.rank == 0 and self._scheduler_stop_item is None
 
     def get_from_request_queue(
             self,

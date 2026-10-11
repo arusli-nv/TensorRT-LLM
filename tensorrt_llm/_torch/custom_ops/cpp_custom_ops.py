@@ -729,6 +729,7 @@ def _register_fake():
         active_rank_mask: Optional[torch.Tensor] = None,
         abort_state: Optional[torch.Tensor] = None,
         execution_descriptor: Optional[torch.Tensor] = None,
+        dispatch_payload_limit: Optional[int] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -743,7 +744,8 @@ def _register_fake():
             eplb_gathered_stats = workspace.new_empty(
                 (ep_size, eplb_local_stats.shape[0]), dtype=torch.int32)
 
-        combine_payload_offset = 0
+        combine_payload_offset = (dispatch_payload_limit
+                                  if dispatch_payload_limit is not None else 0)
         return recv_tensors, combine_payload_offset, eplb_gathered_stats
 
     @torch.library.register_fake("trtllm::moe_a2a_combine")

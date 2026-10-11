@@ -59,6 +59,7 @@ def _dispatch(
     a2a: _A2ATensors,
     state: torch.Tensor | None,
     execution_descriptor: torch.Tensor | None = None,
+    dispatch_payload_limit: int | None = None,
 ) -> tuple[list[torch.Tensor], int, torch.Tensor]:
     workspace, meta, _, experts, payload = a2a
     ep_size = workspace.size(0)
@@ -72,6 +73,7 @@ def _dispatch(
         ep_size,
         1,
         ep_size,
+        dispatch_payload_limit=dispatch_payload_limit,
         **_controls(state, execution_descriptor),
     )
 
@@ -161,25 +163,23 @@ def test_registered_combine_preserves_first_status(a2a: _A2ATensors) -> None:
     assert torch.count_nonzero(output) == 0
 
 
-def test_registered_descriptor_snapshot_and_bank_switch(a2a: _A2ATensors) -> None:
-    workspace, meta, state, _, payload = a2a
-    bank1 = torch.empty_like(workspace)
-    assert torch.equal(torch.ops.trtllm.moe_a2a_initialize(bank1, 0, 1, 8), meta)
-    state1 = torch.zeros_like(state)
+def test_registered_descriptor_snapshot_and_state_switch(a2a: _A2ATensors) -> None:
+    """Can one captured workspace latch a mask and use a fresh abort record?"""
+    workspace, _, state, _, payload = a2a
+    fresh_state = torch.zeros_like(state)
+    excluded_state = torch.zeros_like(state)
     descriptors = [
-        torch.tensor(
-            [bank.data_ptr(), 1, 0, 0, 0, status.data_ptr()], dtype=torch.int64, device="cuda"
-        )
-        for bank, status in ((workspace, state), (bank1, state1))
+        torch.tensor([mask, 0, 0, 0, status.data_ptr()], dtype=torch.int64, device="cuda")
+        for mask, status in ((1, state), (1, fresh_state), (0, excluded_state))
     ]
     published = torch.tensor([descriptors[0].data_ptr()], dtype=torch.int64, device="cuda")
     slot = torch.empty_like(published)
     torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
-    published.fill_(descriptors[1].data_ptr())
+    published.fill_(descriptors[2].data_ptr())
     _, output = _round(a2a, None, slot)
     torch.testing.assert_close(output, payload, rtol=0, atol=0)
     assert slot.item() == descriptors[0].data_ptr()
-    assert _flag((bank1, meta, state1, a2a[3], payload)).item() == 0
+    assert excluded_state.cpu().tolist() == [0, 0]
 
     published.fill_(descriptors[0].data_ptr())
     torch.cuda.synchronize()
@@ -198,29 +198,40 @@ def test_registered_descriptor_snapshot_and_bank_switch(a2a: _A2ATensors) -> Non
     assert torch.all(ids1 == -1) and torch.all(ids2 == -1)
     assert torch.count_nonzero(output1) == 0 and torch.count_nonzero(output2) == 0
     torch.cuda.synchronize()
-    old_bank = workspace.clone()
-    addresses = [value.data_ptr() for value in (payload, slot, ids1, ids2, output1, output2)]
+    addresses = [
+        value.data_ptr() for value in (workspace, payload, slot, ids1, ids2, output1, output2)
+    ]
 
-    # The local test has no remote issuer; retain both banks through the final graph join.
-    # Distinct input contents make a stale bank-A payload read observable.
+    # This singleton test has no remote issuer; the preceding join completes every old writer.
     payload.add_(1)
     published.fill_(descriptors[1].data_ptr())
     graph.replay()
     for value in (output1, output2):
         torch.testing.assert_close(value, payload, rtol=0, atol=0)
+    assert fresh_state.cpu().tolist() == [0, 0] and state.cpu().tolist() == [1, 1]
     assert addresses == [
-        value.data_ptr() for value in (payload, slot, ids1, ids2, output1, output2)
+        value.data_ptr() for value in (workspace, payload, slot, ids1, ids2, output1, output2)
     ]
-    assert state1.cpu().tolist() == [0, 0] and state.cpu().tolist() == [1, 1]
-    assert torch.equal(workspace, old_bank)
 
+    published.fill_(descriptors[2].data_ptr())
+    graph.replay()
+    assert excluded_state[1].item() == 1
+    assert torch.all(ids1 == -1) and torch.all(ids2 == -1)
+    assert torch.count_nonzero(output1) == 0 and torch.count_nonzero(output2) == 0
+    torch.cuda.synchronize()
+
+    published.fill_(descriptors[1].data_ptr())
+    torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
     _, offset, _ = _dispatch(a2a, None, slot)
     alias = workspace[0, offset : offset + payload.numel() * payload.element_size()]
     alias = alias.view(payload.dtype).reshape(1, *payload.shape)
-    for shortcut, message in ((False, "must not alias workspace"), (True, "private combine input")):
+    for shortcut, message in (
+        (False, "must not alias workspace"),
+        (True, "full-capacity reserved tail region"),
+    ):
         with pytest.raises(RuntimeError, match=message):
             torch.ops.trtllm.moe_a2a_combine(
-                alias, 8, workspace, meta, 8, 0, 1, 1, offset, shortcut, **_controls(None, slot)
+                alias, 8, workspace, a2a[1], 8, 0, 1, 1, offset, shortcut, **_controls(None, slot)
             )
     torch.cuda.synchronize()
 
@@ -317,6 +328,171 @@ def test_registered_abort_fake_signatures() -> None:
             assert ids.shape == (1, 8, 1)
             assert output.shape == (8, 128)
             assert output.dtype == torch.bfloat16
+        limit = workspace.size(1) - 2048
+        received, combine_offset, _ = _dispatch(a2a, None, slot, limit)
+        assert combine_offset == limit
+        assert received[0].shape == (1, 8, 128)
+        assert received[1].shape == (1, 8, 1)
+
+
+@pytest.mark.parametrize("row_bytes", [16, 8, 4, 2, 1, 3])
+def test_registered_source_slots_preserve_tombstones_and_fixed_tail(
+    a2a: _A2ATensors, row_bytes: int
+) -> None:
+    """Can captured buckets share a fixed tail while excluded source bytes remain poisoned?"""
+    original_workspace, _, state, experts, payload = a2a
+    # Both logical peers are on one GPU; this checks native layout/masking, not peer transport.
+    ep_size, capacity, hidden = 2, 8, payload.size(1)
+    byte_payload = torch.arange(capacity * row_bytes, dtype=torch.uint8, device="cuda").reshape(
+        capacity, row_bytes
+    )
+    workspace = torch.empty(
+        (ep_size, original_workspace.size(1) + 128), dtype=torch.uint8, device="cuda"
+    )
+    meta = torch.ops.trtllm.moe_a2a_initialize(workspace, 0, ep_size, capacity, ep_size)
+    descriptor = torch.tensor([1, 0, 0, 0, state.data_ptr()], dtype=torch.int64, device="cuda")
+    published = torch.tensor([descriptor.data_ptr()], dtype=torch.int64, device="cuda")
+    slot = torch.empty_like(published)
+    controls = _controls(None, slot)
+    tail_bytes = ep_size * capacity * hidden * payload.element_size()
+    limit = (workspace.size(1) - tail_bytes) // 128 * 128
+    fixed = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+        workspace, 0, ep_size, capacity, limit, payload.dtype, hidden
+    ).view(-1, hidden)
+    fixed_pointer = fixed.data_ptr()
+
+    def offset(name: str) -> int:
+        return int(meta[int(getattr(internal.thop, f"MOE_A2A_{name}_OFFSET_INDEX"))])
+
+    start = offset("PAYLOAD_DATA")
+    source_stride = (limit - start) // ep_size // 128 * 128
+    assert limit - (start + ep_size * source_stride) == 128
+    counters = workspace[0, offset("RECV_COUNTERS") : offset("RECV_COUNTERS") + 16].view(2, 2, 4)
+    tombstones = [workspace[0, start + source_stride : start + 2 * source_stride]]
+    tombstones.extend(counters[parity, 1].view(torch.int32) for parity in (0, 1))
+    for name in ("DISPATCH_COMPLETION_FLAGS", "COMBINE_COMPLETION_FLAGS"):
+        tombstones.append(workspace[0, offset(name) + 4 : offset(name) + 8].view(torch.int32))
+    start_stats = offset("EPLB_GATHERED_STATS") + ep_size * 4
+    tombstones.append(workspace[0, start_stats : start_stats + ep_size * 4].view(torch.int32))
+    tombstones[0].fill_(0xA5)
+    for value in tombstones[1:]:
+        value.fill_(2**31 - 1)
+
+    inputs = {
+        bucket: (
+            experts[:bucket],
+            payload[:bucket],
+            torch.tensor([bucket, 0], dtype=torch.int32, device="cuda"),
+        )
+        for bucket in (4, 8)
+    }
+
+    def transfer(bucket: int) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        ids, source, stats = inputs[bucket]
+        torch.ops.trtllm.moe_a2a_fence_latch_descriptor(published, slot)
+        received, combine_offset, gathered = torch.ops.trtllm.moe_a2a_dispatch(
+            ids,
+            [source, ids, byte_payload[:bucket]],
+            workspace,
+            meta,
+            bucket,
+            0,
+            ep_size,
+            1,
+            ep_size,
+            stats,
+            dispatch_payload_limit=limit,
+            **controls,
+        )
+        assert combine_offset == limit
+        torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
+            received[1], workspace, meta, 0, -1, execution_descriptor=slot
+        )
+        fixed[: ep_size * bucket].copy_(received[0].view(-1, hidden))
+        output = torch.ops.trtllm.moe_a2a_combine(
+            fixed[: ep_size * bucket].view(ep_size, bucket, hidden),
+            bucket,
+            workspace,
+            meta,
+            bucket,
+            0,
+            ep_size,
+            1,
+            combine_offset,
+            True,
+            **controls,
+        )
+        return received, gathered, output
+
+    captures = {}
+    for bucket in (4, 8):
+        transfer(bucket)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            received, gathered, output = transfer(bucket)
+        captures[bucket] = graph, received, gathered, output
+
+    for bucket in (8, 4, 8, 4):
+        graph, received, gathered, output = captures[bucket]
+        graph.replay()
+        torch.testing.assert_close(output, payload[:bucket], rtol=0, atol=0)
+        actual, expected = received[0][0], payload[:bucket]
+        assert torch.unique(expected[:, 0]).numel() == bucket
+        torch.testing.assert_close(
+            actual[actual[:, 0].argsort()], expected[expected[:, 0].argsort()], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            received[2][0][actual[:, 0].argsort()], byte_payload[:bucket], rtol=0, atol=0
+        )
+        assert torch.count_nonzero(received[0][1]) == 0
+        assert torch.count_nonzero(received[2][1]) == 0
+        assert torch.all(received[1][0] == 0) and torch.all(received[1][1] == -1)
+        assert gathered.cpu().tolist() == [[bucket, 0], [0, 0]]
+        assert fixed.data_ptr() == fixed_pointer and slot.item() == descriptor.data_ptr()
+        assert torch.all(tombstones[0] == 0xA5)
+        assert all(torch.all(value == 2**31 - 1) for value in tombstones[1:])
+        assert state.cpu().tolist() == [0, 0]
+
+    # Nonnegative routes to an excluded peer or outside the expert range must cancel.
+    rejected_records = []
+    for invalid_expert in (1, 2):
+        failed_state = torch.zeros_like(state)
+        failed_descriptor = descriptor.clone()
+        failed_descriptor[-1] = failed_state.data_ptr()
+        rejected_records.append((failed_state, failed_descriptor))
+        published.fill_(failed_descriptor.data_ptr())
+        experts.fill_(invalid_expert)
+        graph, received, gathered, output = captures[4]
+        graph.replay()
+        assert failed_state.cpu().tolist() == [0, 1]
+        assert slot.item() == failed_descriptor.data_ptr()
+        assert torch.count_nonzero(output) == 0 and torch.count_nonzero(gathered) == 0
+        assert torch.count_nonzero(received[0]) == torch.count_nonzero(received[2]) == 0
+        assert torch.all(received[1] == -1)
+        assert torch.all(tombstones[0] == 0xA5)
+        assert all(torch.all(value == 2**31 - 1) for value in tombstones[1:])
+    assert torch.equal(torch.ones(8, device="cuda") + 1, torch.full((8,), 2, device="cuda"))
+    torch.cuda.synchronize()
+
+
+def test_registered_source_slot_admission(a2a: _A2ATensors) -> None:
+    """Does source-slot dispatch reject missing descriptor, unaligned limits and insufficient capacity?"""
+    workspace, meta, state, *_ = a2a
+    limit = workspace.size(1) - 2048
+    before, state_before = workspace.clone(), state.clone()
+    with pytest.raises(RuntimeError, match="requires fence execution_descriptor mode"):
+        _dispatch(a2a, state, dispatch_payload_limit=limit)
+    assert torch.equal(workspace, before) and torch.equal(state, state_before)
+    descriptor = torch.tensor([1, 0, 0, 0, state.data_ptr()], dtype=torch.int64, device="cuda")
+    slot = torch.tensor([descriptor.data_ptr()], dtype=torch.int64, device="cuda")
+    with pytest.raises(RuntimeError, match="aligned workspace boundary"):
+        _dispatch(a2a, None, slot, limit - 1)
+    assert torch.equal(workspace, before) and torch.equal(state, state_before)
+    payload_start = int(meta[int(internal.thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)])
+    with pytest.raises(RuntimeError, match="payloads exceed their reserved slot"):
+        _dispatch(a2a, None, slot, payload_start + 128)
+    assert torch.equal(workspace, before) and torch.equal(state, state_before)
 
 
 def _pending_fence_wait(phase: str, action: str, tokens: int) -> None:

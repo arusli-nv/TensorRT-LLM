@@ -16,8 +16,10 @@
 import ctypes
 import gc
 import sys
+import threading
 import weakref
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import Mock
 
 import pytest
@@ -194,6 +196,133 @@ def memory(monkeypatch):
     _TestMnnvlMemory.address_refcnt = {}
     if hasattr(obj, "ptr"):
         del obj.ptr
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda obj, record: obj.checkpoint_prepare(),
+        lambda obj, record: obj.checkpoint_restore(_FakeComm()),
+        lambda obj, record: obj.checkpoint_fail_closed(),
+        lambda obj, record: obj._checkpoint_restore_complete(),
+        lambda obj, record: obj._checkpoint_restore_failed(),
+        lambda obj, record: type(obj).close_mnnvl_memory(obj.ptr),
+        lambda obj, record: type(obj)._unmap_and_release_handles(record),
+    ],
+    ids=["prepare", "restore", "fail_closed", "publish", "discard", "close", "unmap"],
+)
+def test_retained_mapping_rejects_backing_mutation(
+    memory: tuple[_TestMnnvlMemory, mnnvl._MnnvlAllocationRecord],
+    operation: Callable[[_TestMnnvlMemory, mnnvl._MnnvlAllocationRecord], None],
+) -> None:
+    obj, record = memory
+    token = obj.retain_mapped_backing()
+
+    with pytest.raises(RuntimeError, match="retained by a model"):
+        operation(obj, record)
+
+    assert record.state is mnnvl._MnnvlAllocationState.MAPPED
+    assert record.mem_handles == [11, 22]
+    assert record.retained_backing is token
+    assert type(obj).allocated_map[obj.ptr] is record
+    mnnvl.cuda.cuMemUnmap.assert_not_called()
+    mnnvl.cuda.cuMemRelease.assert_not_called()
+    obj.release_mapped_backing(token)
+
+
+def test_retained_mapping_requires_matching_owner_and_supports_cross_thread_release(
+    memory: tuple[_TestMnnvlMemory, mnnvl._MnnvlAllocationRecord],
+) -> None:
+    obj, record = memory
+    token = obj.retain_mapped_backing()
+    with pytest.raises(RuntimeError, match="retained by a model"):
+        obj.retain_mapped_backing()
+    with pytest.raises(RuntimeError, match="owner does not match"):
+        obj.release_mapped_backing(object())
+    assert record.retained_backing is token
+
+    errors = []
+
+    def release() -> None:
+        try:
+            obj.release_mapped_backing(token)
+        except RuntimeError as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=release)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert record.retained_backing is None
+    with pytest.raises(RuntimeError, match="owner does not match"):
+        obj.release_mapped_backing(token)
+    obj.checkpoint_prepare()
+    assert not obj.mapped
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        state
+        for state in mnnvl._MnnvlAllocationState
+        if state is not mnnvl._MnnvlAllocationState.MAPPED
+    ],
+)
+def test_retained_mapping_requires_mapped_backing(
+    memory: tuple[_TestMnnvlMemory, mnnvl._MnnvlAllocationRecord],
+    state: mnnvl._MnnvlAllocationState,
+) -> None:
+    obj, record = memory
+    record.state = state
+    with pytest.raises(RuntimeError, match="unmapped"):
+        obj.retain_mapped_backing()
+    assert record.retained_backing is None
+
+@pytest.mark.parametrize("remove_record", [False, True], ids=["unmapped", "removed"])
+def test_mapping_claim_rechecks_allocation_after_waiting_for_mutation(
+    memory: tuple[_TestMnnvlMemory, mnnvl._MnnvlAllocationRecord],
+    remove_record: bool,
+) -> None:
+    obj, record = memory
+    attempted = threading.Event()
+    completed = threading.Event()
+    original_lock = record.backing_lock
+
+    class ObservedLock:
+        def __enter__(self) -> None:
+            attempted.set()
+            original_lock.acquire()
+
+        def __exit__(self, *args: object) -> None:
+            original_lock.release()
+
+    record.backing_lock = ObservedLock()
+    errors = []
+
+    def claim() -> None:
+        try:
+            obj.retain_mapped_backing()
+        except RuntimeError as error:
+            errors.append(str(error))
+        finally:
+            completed.set()
+
+    with original_lock:
+        record.state = mnnvl._MnnvlAllocationState.PREPARING
+        thread = threading.Thread(target=claim)
+        thread.start()
+        assert attempted.wait(timeout=5)
+        assert not completed.is_set()
+        if remove_record:
+            type(obj).allocated_map.pop(obj.ptr)
+        else:
+            record.state = mnnvl._MnnvlAllocationState.UNMAPPED
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    expected = "allocation changed" if remove_record else "unmapped"
+    assert len(errors) == 1
+    assert expected in errors[0]
+    assert record.retained_backing is None
 
 
 def test_checkpoint_prepare_preserves_va_and_is_idempotent(memory):
@@ -614,7 +743,6 @@ def test_create_and_map_handles_releases_local_handle_on_export_failure(monkeypa
 
     release_memory.assert_called_once_with(11)
 
-
 @pytest.mark.parametrize(
     ("errno_value", "expected_hint"),
     [(mnnvl.errno.EPERM, "--cap-add=SYS_PTRACE"), (mnnvl.errno.ENOSYS, "requires Linux 5.6+")],
@@ -995,7 +1123,6 @@ def cpu_dlpack(monkeypatch):
 
     monkeypatch.setattr(dlpack, "create_dlpack_capsule", create_cpu_capsule)
     return dlpack
-
 
 @pytest.mark.parametrize("inference_mode", [False, True])
 @pytest.mark.parametrize("alias_kind", ["shape", "detach", "dtype", "slice_dtype"])

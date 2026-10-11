@@ -86,21 +86,19 @@ struct MoeA2AAbortState
 static_assert(sizeof(MoeA2AAbortState) == 2 * sizeof(int32_t));
 
 // Trusted local execution descriptor; neither the table nor its latch is fabric-exported.
-// The owner validates identical rank count, row stride and layout, with disjoint physical banks.
-// Tables and old-bank mappings remain immutable and retained until fenced final shutdown.
+// Captured workspace addresses and logical source slots remain fixed. The owner retains
+// descriptors, abort records and all imported workspace mappings through final completion.
 struct MoeA2AFenceDescriptor
 {
-    uintptr_t bankBase;
     uint64_t activeMask[kRankMaskWords];
     MoeA2AAbortState* abortState;
 };
 
-static_assert(sizeof(MoeA2AFenceDescriptor) == 6 * sizeof(uint64_t));
+static_assert(sizeof(MoeA2AFenceDescriptor) == 5 * sizeof(uint64_t));
 
 struct MoeA2AFenceWorkspace
 {
     MoeA2AFenceDescriptor const* const* executionDescriptor{nullptr};
-    uintptr_t legacyBase{0};
 };
 
 struct MoeA2AGatherParams
@@ -112,6 +110,7 @@ struct MoeA2AGatherParams
     int epSize;
     int epRank;
     int maxTokens;
+    int64_t sourceStrideBytes{0};
     int const* recvCounters;
     uint32_t const* flagVal;
     int const* sourceStats;
@@ -132,6 +131,7 @@ struct DispatchKernelPointers
     void const* src_data_ptrs[kMaxPayloads];     // Array of source data pointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
+    int64_t sourceStrideBytes{0};                // Zero retains the runtime-dense payload layout.
     // Completion flags for synchronization (fence-based path)
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
@@ -229,6 +229,7 @@ struct MoeA2ADispatchParams
     // Token configuration
     int local_num_tokens;    // Number of tokens on this rank
     int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation TODO: Rename to runtime_max_tokens_per_rank
+    int64_t sourceStrideBytes{0};
     int top_k;               // Number of experts per token
 
     // Expert routing information

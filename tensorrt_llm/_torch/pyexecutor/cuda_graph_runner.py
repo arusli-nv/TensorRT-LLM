@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import bisect
 import contextlib
 import os
@@ -160,8 +162,9 @@ class CUDAGraphRunner:
     """
     WARMUP_STEPS = 1
 
-    def __init__(self, config: CUDAGraphRunnerConfig):
+    def __init__(self, config: CUDAGraphRunnerConfig, *, execution_state=None):
         self.config = config
+        self.execution_state = execution_state
 
         # High-level configuration from the config object
         self.enabled = config.use_cuda_graph
@@ -740,12 +743,22 @@ class CUDAGraphRunner:
             if self.is_warmup_only:
                 return output
 
-            graph = torch.cuda.CUDAGraph()
+            # The execution owner retains the original template for admission audits.
+            graph = (torch.cuda.CUDAGraph(
+                keep_graph=True) if self.execution_state is not None else
+                     torch.cuda.CUDAGraph())
+            if self.execution_state is not None:
+                self.execution_state.capture_started(graph,
+                                                     self.memory_pool,
+                                                     graph_key=key,
+                                                     resource_owner=self)
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
+            if self.execution_state is not None:
+                graph.instantiate()
             # Snapshot before postprocessing so the check compares against
             # the addresses the graph actually baked in.
             self._record_strict_buffer_snapshot(key)
@@ -758,12 +771,18 @@ class CUDAGraphRunner:
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
+        if self.execution_state is not None:
+            self.execution_state.capture_finished(graph,
+                                                  self.memory_pool,
+                                                  graph_key=key)
         return graph_output
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         key = KeyType(*key)
+        if self.execution_state is not None:
+            self.execution_state.before_replay(self.graphs[key], graph_key=key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:
@@ -853,6 +872,8 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
         self.graphs[key].replay()
+        if self.execution_state is not None:
+            self.execution_state.replay_finished()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -1279,8 +1300,15 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
-        for graph in self.graphs.values():
+        graphs = tuple(self.graphs.values())
+        if self.execution_state is not None and (
+                graphs or self.execution_state._phase != "closed"):
+            self.execution_state.before_graph_reset()
+        for graph in graphs:
             graph.reset()
+        if self.execution_state is not None and (
+                graphs or self.execution_state._phase != "closed"):
+            self.execution_state.graphs_reset(graphs)
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()

@@ -269,6 +269,47 @@ class TestDefaultADPRouter:
         router = DefaultADPRouter(dist=_mock_dist())
         assert isinstance(router, ADPRouter)
 
+    @pytest.mark.parametrize("ranks", [(0, 1, 3), (0, 2, 5)])
+    def test_sparse_membership_preserves_logical_targets(self, ranks) -> None:
+        """Can compact state rows route to their original logical rank IDs?"""
+        router = DefaultADPRouter(dist=_mock_dist())
+        states = [RankState(rank=rank) for rank in ranks]
+        target = _make_request_item(1, target_dp_rank=ranks[-1], attention_dp_relax=False)
+        requests = [target] + [_make_request_item(i) for i in range(2, 6)]
+
+        routed, expected = router.route_requests(states, requests, max_num_active_requests=2)
+
+        assert set(routed) == set(ranks)
+        assert target in routed[ranks[-1]]
+        assert sum(map(len, routed.values())) == len(requests)
+        assert expected == 2
+        assert all(len(items) <= expected for items in routed.values())
+
+    @pytest.mark.parametrize("relaxed", [False, True])
+    def test_sparse_membership_missing_target(self, relaxed) -> None:
+        """Does a missing strict target fail while a relaxed target uses live ranks?"""
+        router = DefaultADPRouter(dist=_mock_dist())
+        states = [RankState(rank=0), RankState(rank=2)]
+        request = _make_request_item(1, target_dp_rank=1, attention_dp_relax=relaxed)
+        if not relaxed:
+            with pytest.raises(ValueError, match="rank 1 is not serving"):
+                router.route_requests(states, [request], max_num_active_requests=2)
+        else:
+            routed, _ = router.route_requests(states, [request], max_num_active_requests=2)
+            assert set(routed) == {0, 2}
+            assert sum(map(len, routed.values())) == 1
+
+    def test_sparse_membership_rejects_duplicate_ids(self) -> None:
+        router = DefaultADPRouter(dist=_mock_dist())
+        with pytest.raises(ValueError, match="duplicate logical ranks"):
+            router.route_requests([RankState(rank=0), RankState(rank=0)], [], 2)
+
+    @pytest.mark.parametrize("router_type", [KVCacheAwareADPRouter, ConversationAwareADPRouter])
+    def test_sparse_membership_rejects_unqualified_router(self, router_type) -> None:
+        router = object.__new__(router_type)
+        with pytest.raises(ValueError, match="requires DefaultADPRouter"):
+            router.route_requests([RankState(rank=0), RankState(rank=2)], [], 2)
+
     def test_empty_requests(self):
         router = DefaultADPRouter(dist=_mock_dist())
         states = [

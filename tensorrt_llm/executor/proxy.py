@@ -41,6 +41,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .recovery import AdmissionClose, AdmissionClosed, FrontendTaskControl
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .result import GenerationResult, IterationResult
@@ -159,6 +160,12 @@ class GenerationExecutorProxy(GenerationExecutor):
                 "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
+        self._serving_control: Optional[FrontendTaskControl] = None
+        self._admission_lock = threading.Lock()
+        self._admission_closed: Optional[AdmissionClosed] = None
+        self._unconsumed_results: Dict[int, GenerationResult] = {}
+        self._request_epoch = 0
+        self._auxiliary_requests_issued = False
         # Sticky engine-dead flag: once a worker death is recorded, pending and
         # new requests fail fast with EngineDeadError instead of blocking on a
         # response queue whose producer is gone.
@@ -212,7 +219,23 @@ class GenerationExecutorProxy(GenerationExecutor):
             f"[startup][pid={os.getpid()}] executor_proxy/pre_worker_setup: "
             f"done in {time.perf_counter() - proxy_start:.3f}s (includes mpi_session_setup)"
         )
-        self._start_executor_workers(worker_kwargs)
+        context = getattr(self.mpi_session, "_serving_context", None)
+        if context is not None:
+            if (not isinstance(self.mpi_session, RemoteMpiCommSessionClient)
+                    or not self._is_pytorch_backend or self._num_frontends != 1
+                    or self._enable_resource_governor):
+                raise ValueError(
+                    "Serving-task STOP requires one PyTorch frontend and external MPI"
+                )
+            self._serving_control = FrontendTaskControl(
+                context, model_world_size, self._close_idle_admission)
+            self._serving_control.start()
+        try:
+            self._start_executor_workers(worker_kwargs)
+        except BaseException:
+            if self._serving_control is not None:
+                self._serving_control.close()
+            raise
         logger.info(
             f"[startup][pid={os.getpid()}] executor_proxy/workers_ready: "
             f"elapsed={time.perf_counter() - proxy_start:.3f}s")
@@ -268,6 +291,48 @@ class GenerationExecutorProxy(GenerationExecutor):
         except AttributeError:
             atexit.register(self.pre_shutdown)
 
+    def _close_idle_admission(self, command: AdmissionClose) -> AdmissionClosed:
+        """Certify the original frontend ledger while holding new admission closed."""
+        if not self._admission_lock.acquire(
+                timeout=min(command.timeout_seconds, 5.0)):
+            raise TimeoutError(
+                "Frontend admission lock exceeded the STOP budget")
+        try:
+            if (self._serving_control is None
+                    or self._admission_closed is not None or self.doing_shutdown
+                    or self._engine_dead or self._fatal_error is not None
+                    or command.task_id != self._serving_control.context.task_id
+                    or command.generation
+                    != self._serving_control.context.expected_generation):
+                raise RuntimeError(
+                    "Original frontend cannot certify idle admission")
+            self._prune_consumed_results()
+            if (self._results or self._unconsumed_results
+                    or self._auxiliary_requests_issued or self._engine_dead
+                    or self._fatal_error is not None):
+                raise ValueError(
+                    "Idle STOP requires consumed results and no auxiliary worker requests"
+                )
+            receipt = AdmissionClosed(
+                command, self._request_epoch,
+                f"frontend-ledger:{id(self)}:{self._request_epoch}")
+            self._admission_closed = receipt
+            return receipt
+        finally:
+            self._admission_lock.release()
+
+    def _prune_consumed_results(self) -> None:
+        for client_id, result in tuple(self._unconsumed_results.items()):
+            if result.finished and result.queue.empty():
+                self._unconsumed_results.pop(client_id)
+
+    def _check_serving_admission(self) -> None:
+        if self._serving_control is not None:
+            self._serving_control.check_error()
+        if self._admission_closed is not None:
+            raise RequestError(
+                "Executor admission is closed for worker-loss handling")
+
     def _check_mpi_futures(self) -> bool:
         """Check if any MPI worker future has completed (crashed/exited).
 
@@ -291,6 +356,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _check_mpi_workers(self) -> bool:
         """Check OS process handles and MPI futures for worker death."""
+        control = getattr(self, "_serving_control", None)
+        if control is not None:
+            try:
+                control.check_error()
+            except (RuntimeError, ValueError, TimeoutError) as error:
+                self._set_fatal_error(error)
+                if not self.doing_shutdown:
+                    self.pre_shutdown()
+                return True
         dead_worker = self._worker_process_monitor.find_dead_worker()
         if dead_worker is not None:
             self._set_fatal_error(
@@ -347,7 +421,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._check_mpi_workers():
             return False
 
-        return True
+        return getattr(self, "_admission_closed", None) is None
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record the fatal error, then unblock every pending request.
@@ -579,6 +653,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         Args:
             request_id (int): The id of the request to abort.
         """
+        if getattr(self, "_serving_control", None) is not None:
+            with self._admission_lock:
+                self._check_serving_admission()
+                self._auxiliary_requests_issued = True
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
@@ -681,6 +759,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         would otherwise block for the whole ack timeout waiting on workers
         that are already exiting.
         """
+        if getattr(self, "_serving_control", None) is not None:
+            with self._admission_lock:
+                self._check_serving_admission()
+                self._auxiliary_requests_issued = True
         if self.doing_shutdown:
             raise RuntimeError(
                 f"{kind}_profile: the executor proxy is shutting down; "
@@ -745,7 +827,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         async_queues = []
         event_loop = None
 
-        def process_res(res):
+        def process_res_unlocked(res):
             client_id = res.client_id
             nonlocal event_loop
             nonlocal async_queues
@@ -773,6 +855,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
                 self._results.pop(client_id, None)
+
+        def process_res(res):
+            if getattr(self, "_serving_control", None) is None:
+                process_res_unlocked(res)
+            else:
+                with self._admission_lock:
+                    process_res_unlocked(res)
 
         res = res if isinstance(res, list) else [res]
 
@@ -913,7 +1002,11 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         with _StartupTimer("worker_submit_to_ready") as startup_timer:
             with startup_timer.phase("worker_submit"):
-                self.mpi_futures = self.mpi_session.submit(
+                context = getattr(self.mpi_session, "_serving_context", None)
+                submit = (self.mpi_session.submit if context is None else
+                          lambda task, **kwargs: self.mpi_session.
+                          _submit_serving_task(context, task, **kwargs))
+                self.mpi_futures = submit(
                     worker_main,
                     **mpi_worker_kwargs,
                     worker_cls=self.worker_cls,
@@ -1021,6 +1114,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
+        control = getattr(self, "_serving_control", None)
+        if control is not None:
+            control.close()
         self._worker_process_monitor.close()
 
         # Wake the error monitor thread immediately so it exits cleanly
@@ -1153,12 +1249,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
+        if getattr(self, "_serving_control", None) is None:
+            return self._submit_request(request)
+        with self._admission_lock:
+            self._check_serving_admission()
+            self._prune_consumed_results()
+            return self._submit_request(request)
+
+    def _submit_request(self, request: GenerationRequest) -> GenerationResult:
         """Low-level API to the executor.
 
         Returns a "future" GenerationResult which can be waited.
         Forwards the request to the workers through the request queue.
         """
-
         # Sticky fast-fail: don't accept new work once the engine is known dead.
         if self._engine_dead or self._fatal_error is not None:
             raise EngineDeadError(self._fatal_error)
@@ -1175,6 +1278,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
         self._results[request.id] = result
+        if getattr(self, "_serving_control", None) is not None:
+            self._unconsumed_results[request.id] = result
+            self._request_epoch += 1
 
         # Close the submit-vs-death race: _mark_engine_dead() runs on the
         # error-monitor thread and its one-shot sweep snapshots _results, so a
@@ -1235,6 +1341,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "RPC client is not initialised — collective_rpc() cannot be "
                 "called before the executor workers have started.")
+        if getattr(self, "_serving_control", None) is not None:
+            with self._admission_lock:
+                self._check_serving_admission()
+                self._auxiliary_requests_issued = True
         _check_collective_rpc_guard(self.model_world_size,
                                     unique_reply_rank,
                                     target_ranks,

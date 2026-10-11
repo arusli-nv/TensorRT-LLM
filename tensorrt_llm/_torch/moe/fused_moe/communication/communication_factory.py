@@ -29,7 +29,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
 from ..nccl_ep_utils import nccl_ep_supports_version
-from ..wide_ep_ft import get_wide_ep_ft_options
+from ..wide_ep_ft import _descriptor_execution_requested, get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
@@ -145,11 +145,15 @@ class CommunicationFactory:
 
         # If attention does not use data parallelism (either uses TP or single card), no MoE communication is needed
         if (not mapping.enable_attention_dp) or mapping.dp_size == 1:
+            if model_config.use_cuda_graph:
+                get_wide_ep_ft_options(model_config)
             return None
 
         # If no attention DP, or if MoE TP is enabled, use AllGather + ReduceScatter
         # AlltoAll cannot support MoE TP
         if mapping.moe_tp_size != 1:
+            if model_config.use_cuda_graph:
+                get_wide_ep_ft_options(model_config)
             return AllGatherReduceScatter(mapping)
 
         # A forced method comes either from the environment, which wins, or from the
@@ -183,10 +187,11 @@ class CommunicationFactory:
         # Auto-selection: Try strategies in priority order using try-catch
         # Priority: NVLinkOneSided > NVLinkTwoSided > NcclEP > DeepEP > DeepEPLowLatency > AllGather
 
+        pending_binding = _descriptor_execution_requested()
         try:
             enable_eplb = model_config.moe_load_balancer is not None
             ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
-                model_config
+                model_config, allow_pending_descriptor_binding=True
             )
             strategy = NVLinkOneSided(
                 mapping,
@@ -201,10 +206,15 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                require_execution_state=pending_binding,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
         except Exception as e:
+            if pending_binding:
+                raise RuntimeError(
+                    "Pending descriptor binding cannot fall back to another backend"
+                ) from e
             logger.info(f"NVLinkOneSided not available: {e}")
 
         # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
@@ -348,6 +358,8 @@ class CommunicationFactory:
         use_low_precision_combine = model_config.use_low_precision_moe_combine
 
         method = method.upper()
+        if method != "NVLINK_ONE_SIDED" and model_config.use_cuda_graph:
+            get_wide_ep_ft_options(model_config)
 
         # Whitelist check: non-divisible EP only supports NVLinkOneSided and AllGather.
         _NONDIVISIBLE_EP_ALLOWED = {"NVLINK_ONE_SIDED", "ALLGATHER"}
@@ -381,8 +393,9 @@ class CommunicationFactory:
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
             ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
-                model_config
+                model_config, allow_pending_descriptor_binding=True
             )
+            pending_binding = _descriptor_execution_requested()
             return NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -396,6 +409,7 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                require_execution_state=pending_binding,
             )
         elif method == "DEEPEP":
             return DeepEP(

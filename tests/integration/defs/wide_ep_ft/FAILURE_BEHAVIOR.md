@@ -72,42 +72,57 @@ A separate CPU diagnostic step failed; it remains recorded as FAIL.
 
 ## Progress toward recovery
 
-No N−1 serving is implemented. The isolated controls establish the following.
+Correct N−1 full-model serving is not yet proven. Components and healthy runs establish:
 
 | Area | Proven scope and remaining gap |
 |---|---|
 | Process survival | Idle kill left 31 usable contexts. Rank-0 control and ULFM survivor collectives passed; TRT-LLM still enforces fatal teardown. |
-| Fence escape | Native abort escaped dispatch/combine waits with zero-token calls and PDL on/off. Sticky status blocked later preparation. Each rank's interrupted EP32 replay and auxiliary streams completed with usable CUDA; failed outputs were withheld before sampling. All workers were alive. |
-| Detection | The shared AlltoAll coordinator armed a fixed two-call graph across healthy replays, detected the held rank and triggered native abort. Pinned H2D cancellation progressed against a helper occupying every SM's resident thread slots. Four CPU callback-close race cases passed. Serving-loop and DMA-completion integration remain unfinished. |
-| Peer memory | A two-second SM-read operation over retained exporter memory remained pending after verified process death, finished with exact data, and left CUDA usable. This was one GB200 trial, separate from native combine. Active-writer observations establish neither drain nor safe reuse. |
-| Buffer isolation | The 40-byte descriptor passed EP4 NVFP4 rank-2 loss, then idle rank-1 loss, in both PDL modes; 60 exact survivor replay receipts with original graphs, workspace and addresses. Lost-source payload/counter/flag/stats bytes stayed unchanged. The first kill followed completed dispatch. Routing exercised templates 0/1, not full-model coverage. Native combine during death remains unqualified. |
-| Resident experts | Ranks `[1,2,29,30,31]` preserve coverage; survivor capacity and placement publication remain unqualified. Static EPLB skips its iteration guard, so that guard cannot establish GPU quiescence. |
-| Host communication | After real death, an actual TRT-LLM allgather returned peer-failure errors before revoke. Survivor broadcasts and a local request-queue wake passed with logical ranks preserved. A separate CPU cleanup prototype settled three futures. Persistent task/futures lifecycle and serving continuation remain unqualified. |
+| Fence escape | Cooperative abort escaped native waits and interrupted EP32 replays, retained usable contexts and withheld failed outputs. Workers stayed alive; real in-flight death is unproven. |
+| Detection | The AlltoAll flag watchdog detected a held peer and triggered abort in graph controls. Cancellation progressed with occupied SMs. Job `7853768` separately passed real abort publication, same-graph cancellation and watchdog thread/copy retirement on one GPU. Serving-loop integration remains unqualified. |
+| Peer memory | Retained exporter reads completed after real process death. This does not prove failed-issuer drain or safe reuse. |
+| Buffer isolation | EP4 exporter-loss controls retained mappings and graphs. Job `7861416` then passed exact survivor outputs during live remote writes into quarantined source lanes, with original graphs. Stale combine routing still read a masked peer's output. Component evidence only; no drain or full-model recovery proof. |
+| Resident experts | All 32 placement snapshots agree across 58 layers; ranks `[1,2,29,30,31]` preserve coverage. Recovery admission remains empty until capacity, GPU safety and placement installation are qualified. Static EPLB skips its iteration guard, so that guard cannot establish GPU quiescence. |
+| Host communication | Real death released an actual TRT-LLM allgather with peer-failure errors. Survivor broadcasts preserved logical ranks. Persistent tasks survived a separate kill, but the stock pool manager died with futures pending. Actual serving-process retention is unproven. |
+| Healthy full model | Normal-owner EP32 job `7857880` passed matched ordinary/descriptor batches `[1,2,4,8]`, token parity, graph/address stability and cleanup. Earlier job `7849756` also matched paired logits; its 128 serving graphs passed the dependency inventory with no captured conventional NCCL collective. Neither run proves recovery. |
 
-Healthy native EP32 answer checks passed, but greedy tokens differed from historical
-runs. Full-model exact parity and post-failure inference remain unqualified.
-Rank-mask serving graphs remain rejected; CUDA719 requires fresh contexts.
+The fused comparison `7849213` failed token parity; ordinary repeats also had logit
+variation. The cause is unresolved. Unfused finalization is the current qualification
+choice, with about 952 MiB more reserved memory per rank in these runs. That comparison
+used different allocations; serving overhead is not measured. Rank-mask graphs in the
+stock path remain rejected, and CUDA719 requires fresh contexts.
 
-The current candidate retains the original allocation and permanently retires lost
-source slots. Allocation layout, logical N and imported mappings stay fixed. Stop
-issuance and require every live issuer's full CUDA join and acknowledgment before
-reusing live slots. The compiled candidate removes bank rebasing and uses a 40-byte
-mask/abort descriptor. It passed the two-loss component control above; registered
-unit tests and serving integration remain unfinished.
-Matched component runs saved 4.55 to 4.79 µs with a 13-net-line gather-copy change.
-The workspace stayed 30 MiB/GPU, versus 60 MiB for two banks; two captured buckets
-used about 194 KiB of private gather storage. These are component costs, not serving performance.
+The candidate keeps logical N, allocation layout, mappings and expert-output addresses
+fixed. It uses private contiguous gather and a 40-byte mask/abort descriptor, permanently
+retiring lost-source slots. All live issuers must stop and join before live slots are
+reused. The 48 native unit cases passed across both PDL modes. EP4 component overhead
+was 13.2–15.3 µs, or 15.5–19.0%, with the same 30 MiB workspace and about 194 KiB extra
+Torch allocation. These are component costs, not serving costs.
 
-To resume, integrate isolated or provably quiescent storage, a replay-visible
-descriptor, agreed generation installation, survivor host control, quiesced EPLB,
-and request/KV disposition. RPC propagation/socket-cleanup fixes do not prevent
-MPI abort. A separate fix skips absent sampling results after handled execution
-errors. MPI KV compatibility, CFT and device/link loss remain unqualified.
+Next is the actual idle-kill test with V1 KV, no prefix reuse and one fresh request.
+Job `7851671` passed all-peer access across 32 GPUs and ran two healthy requests.
+A resource probe failed on unreadable launcher-process metadata before injection;
+strict cleanup passed. No worker kill or survivor request has passed this test.
+
+Production integration must put session loss handling, consumed requests and model
+state under their existing owners. An external CPU authority grants resume only after
+all survivor readiness and installation acknowledgments. Retained mappings also need
+a lifecycle guard against explicit checkpoint/unmap operations; strong references alone
+do not prevent them. Job `7853102` passed 80 focused ownership tests through real ARM
+imports, with strict cleanup. Model-owner and recovery-control integration remain
+unqualified. Three normal-owner attempts exposed config copying, startup/per-forward
+buffer selection, and source-slot return-layout errors; their failures remain recorded.
+The corrected run `7857880` passed. It also exposed duplicate stream wrappers causing
+redundant join events; the stream-identity correction is not yet qualified. Job `7858396`
+passed actual native V1 sequence inventory, ordinary release and transfer-stream joins
+with a separately built binding. Full-model scheduler STOP remains unproven.
+Experimental file polling, frame inspection and import hooks are not
+production interfaces. In-flight death, failed-issuer safety, CFT and device/link
+loss remain unqualified. RPC propagation/cleanup fixes do not prevent MPI abort.
 
 Run commands: [README.md](README.md). Raw attempts, including failures, stay outside
 Git under `.wideep-ft-runs/mpi-characterization/`: `prerequisite-proofs/evidence-index.json`
 and `mpi4py4-qualification/{qualification-summary,calibrated-bounds,evidence-index}.json`.
 Graph/backing controls and failed attempts are indexed in
 `.wideep-ft-runs/backend-safety/assessment.json`. The latest verified append archive is
-`.wideep-ft-runs/backend-immutable-workspace-followup-20261009.tar.gz`; earlier archives
+`.wideep-ft-runs/backend-component-checkpoint-20261009.tar.gz`; earlier archives
 and all failed attempts remain intact. Every archived file matched its frozen hash.
