@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
@@ -32,6 +35,70 @@ try:
     import ray
 except ModuleNotFoundError:
     from tensorrt_llm.executor.ray import stub as ray
+
+_PEER_FAILURE_ERROR_NAMES = ("ERR_PROC_FAILED", "ERR_PROC_FAILED_PENDING",
+                             "ERR_REVOKED")
+_GENERIC_ERROR_NAMES = ("ERR_UNKNOWN", "ERR_OTHER", "ERR_INTERN",
+                        "ERR_LASTCODE")
+
+
+@lru_cache(maxsize=1)
+def _peer_failure_error_classes() -> frozenset[int]:
+    """MPI error classes that report a failed peer or a revoked communicator.
+
+    Empty when the MPI library has no ULFM support. Classes that alias a
+    generic error class are excluded so ordinary MPI errors stay unclassified.
+    """
+    if MPI is None:
+        return frozenset()
+    generic = {getattr(MPI, name, None) for name in _GENERIC_ERROR_NAMES}
+    classes = {getattr(MPI, name, None) for name in _PEER_FAILURE_ERROR_NAMES}
+    return frozenset(classes - generic - {None})
+
+
+class HostCollectiveInterrupted(Exception):
+    """A host collective failed because a peer process died or the
+    communicator was revoked.
+
+    The original MPI exception is chained as ``__cause__``.
+
+    Attributes:
+        operation: Name of the interrupted ``Distributed`` method.
+        failed_ranks: Logical (world) ranks this process knows to have
+            failed when the error was raised. May be empty when the MPI
+            library cannot report them.
+    """
+
+    def __init__(self, operation: str, failed_ranks: frozenset[int]) -> None:
+        detail = sorted(failed_ranks) if failed_ranks else "unknown"
+        super().__init__(f"Host collective {operation} interrupted by peer "
+                         f"failure (failed ranks: {detail})")
+        self.operation = operation
+        self.failed_ranks = failed_ranks
+
+    def __reduce__(self):
+        return type(self), (self.operation, self.failed_ranks)
+
+
+def _interruptible(operation: str) -> Callable[[Callable], Callable]:
+    """Convert peer-failure MPI errors raised by an ``MPIDist`` method into
+    :class:`HostCollectiveInterrupted`."""
+
+    def decorator(func: Callable) -> Callable:
+
+        @wraps(func)
+        def wrapper(self: "MPIDist", *args, **kwargs):
+            try:
+                return func(self, *args, **kwargs)
+            except MPI.Exception as error:
+                if error.Get_error_class() not in _peer_failure_error_classes():
+                    raise
+                raise HostCollectiveInterrupted(
+                    operation, self._known_failed_ranks()) from error
+
+        return wrapper
+
+    return decorator
 
 
 class ReduceOp(IntEnum):
@@ -164,6 +231,26 @@ class Distributed(ABC):
     def local_world_size(self):
         """Number of ranks co-located on this physical node."""
 
+    @property
+    def live_ranks(self) -> tuple[int, ...]:
+        """Logical TP ranks whose processes take part in host collectives."""
+        return tuple(range(self.tp_size))
+
+    def revoke(self) -> None:
+        """Interrupt host collectives blocked on this rank's peers."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support communicator revocation")
+
+    def shrink(self) -> frozenset[int]:
+        """Agree with the other survivors on the failed ranks."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support survivor communicators")
+
+    def install_survivors(self, failed: frozenset[int]) -> None:
+        """Continue host collectives over the ranks not in *failed*."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support survivor communicators")
+
     @abstractmethod
     def barrier(self):
         pass
@@ -235,17 +322,27 @@ class Distributed(ABC):
             obj = [obj]  # Wrap to match tp_allgather output format.
 
         # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
-        return [entry for tp_group in obj for entry in tp_group]
+        # A failed TP rank (``None``) contributes ``None`` for each CP rank.
+        return [
+            entry for tp_group in obj
+            for entry in (tp_group if tp_group is not None else [None] *
+                          self.cp_size)
+        ]
 
     # Fixed-size int64 exchanges. MPIDist does each as one buffer collective
     # (no pickle); the defaults below reuse the object paths, sending plain
     # int lists so the pickled payload stays small on every backend.
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           fill_value: ArrayLike = 0) -> np.ndarray:
         """All-gather a fixed-size int64 vector across the TP group.
 
         Returns an int64 array of shape ``[tp_size, len(values)]`` whose row
-        *i* is rank *i*'s vector. Every rank must pass the same length.
+        *i* is rank *i*'s vector. Every rank must pass the same length. Rows
+        of ranks outside :attr:`live_ranks` are set to *fill_value* (a scalar
+        or a per-column vector).
         """
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
         gathered = self.tp_allgather(vec.tolist(), small_payload=True)
@@ -258,15 +355,22 @@ class Distributed(ABC):
         gathered = self.cp_allgather(vec.tolist(), small_payload=True)
         return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
 
-    def tp_cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_cp_allgather_int64(self,
+                              values: ArrayLike,
+                              *,
+                              fill_value: ArrayLike = 0) -> np.ndarray:
         """Fixed-size int64 all-gather across TP x CP; rows are ordered like
-        :meth:`tp_cp_allgather` (tp-major, cp-minor)."""
+        :meth:`tp_cp_allgather` (tp-major, cp-minor). Rows of failed TP ranks
+        are set to *fill_value* as in :meth:`tp_allgather_int64`."""
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
         n = vec.size
         if self.cp_size > 1:
             vec = self.cp_allgather_int64(vec).reshape(-1)
+            if np.ndim(fill_value) > 0:
+                fill_value = np.tile(fill_value, self.cp_size)
         if self.tp_size > 1:
-            vec = self.tp_allgather_int64(vec).reshape(-1)
+            vec = self.tp_allgather_int64(vec,
+                                          fill_value=fill_value).reshape(-1)
         return vec.reshape(-1, n)
 
     def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
@@ -700,6 +804,132 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        # Set by install_survivors(): the active survivor communicator and,
+        # indexed by its (compact) rank, the logical rank of each member.
+        self._survivor_comm: Optional[MPI.Comm] = None
+        self._live_ranks: Optional[tuple[int, ...]] = None
+        self._compact_ranks: Optional[dict[int, int]] = None
+        # Set by shrink(): the survivor communicator and its logical ranks,
+        # held until install_survivors() activates them.
+        self._shrunk: Optional[tuple[MPI.Comm, tuple[int, ...]]] = None
+
+    @property
+    def live_ranks(self) -> tuple[int, ...]:
+        if self._live_ranks is None:
+            return super().live_ranks
+        return self._live_ranks
+
+    def revoke(self) -> None:
+        """Revoke the communicators host collectives run on so that every
+        rank blocked in one of them raises :class:`HostCollectiveInterrupted`.
+
+        Idempotent. Requires an MPI library with ULFM support.
+        """
+        comms = [self._world_comm()]
+        if self._survivor_comm is None and self._tp_comm is not None:
+            comms.append(self._tp_comm)
+        for comm in comms:
+            if not comm.Is_revoked():
+                comm.Revoke()
+
+    def shrink(self) -> frozenset[int]:
+        """Agree with the other survivors on the failed ranks.
+
+        Collective over all surviving ranks; call after :meth:`revoke`. Builds
+        the survivor communicator without using it yet, and returns the same
+        failed set on every survivor. Only pure attention-DP layouts
+        (``tp_size == moe_ep_size == world_size``, no PP or CP) are supported;
+        there the TP communicator spans the world.
+
+        Raises:
+            ValueError: The layout is unsupported.
+            RuntimeError: A survivor communicator already exists.
+        """
+        mapping = self.mapping
+        if not (mapping.enable_attention_dp and mapping.pp_size == 1
+                and mapping.cp_size == 1 and
+                mapping.tp_size == mapping.moe_ep_size == mapping.world_size):
+            raise ValueError(
+                "Survivor communicators require pure attention DP "
+                "(tp_size == moe_ep_size == world_size, pp_size == cp_size == 1)"
+            )
+        if self._survivor_comm is not None or self._shrunk is not None:
+            raise RuntimeError("Survivor communicator already exists")
+        comm = self._tp_comm if self._tp_comm is not None else mpi_comm()
+        survivor_comm = comm.Shrink()
+        live_ranks = self._world_ranks(survivor_comm.Get_group())
+        self._shrunk = (survivor_comm, live_ranks)
+        return frozenset(range(mapping.world_size)) - frozenset(live_ranks)
+
+    def install_survivors(self, failed: frozenset[int]) -> None:
+        """Switch host collectives to the communicator built by :meth:`shrink`.
+
+        Logical ranks keep their meaning afterwards: ``tp_rank``/``tp_size``
+        are unchanged, roots are logical ranks, and gathers return one entry
+        per logical rank with ``None`` (or a fill value for int64 gathers)
+        for failed ranks.
+
+        Args:
+            failed: The committed failed ranks; must equal what :meth:`shrink`
+                agreed on.
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run, or *failed* differs from
+                its result.
+        """
+        if self._shrunk is None:
+            raise RuntimeError("install_survivors requires a prior shrink()")
+        survivor_comm, live_ranks = self._shrunk
+        agreed = frozenset(range(
+            self.mapping.world_size)) - frozenset(live_ranks)
+        if failed != agreed:
+            raise RuntimeError(
+                f"Committed failed ranks {sorted(failed)} differ "
+                f"from the shrunk membership {sorted(agreed)}")
+        self._live_ranks = live_ranks
+        self._compact_ranks = {
+            rank: compact
+            for compact, rank in enumerate(live_ranks)
+        }
+        self._survivor_comm = survivor_comm
+        self._shrunk = None
+
+    def _world_comm(self) -> MPI.Comm:
+        if self._survivor_comm is None:
+            return mpi_comm()
+        return self._survivor_comm
+
+    @staticmethod
+    def _world_ranks(group: MPI.Group) -> tuple[int, ...]:
+        """Translate every member of *group* to its rank in ``mpi_comm()``."""
+        world_group = mpi_comm().Get_group()
+        try:
+            ranks = group.Translate_ranks(list(range(group.Get_size())),
+                                          world_group)
+        finally:
+            world_group.Free()
+            group.Free()
+        return tuple(rank for rank in ranks if rank != MPI.UNDEFINED)
+
+    def _known_failed_ranks(self) -> frozenset[int]:
+        try:
+            failed_group = self._world_comm().Get_failed()
+        except (AttributeError, NotImplementedError, MPI.Exception):
+            return frozenset()
+        return frozenset(self._world_ranks(failed_group))
+
+    def _compact_root(self, root: int) -> int:
+        if self._compact_ranks is None:
+            return root
+        if root not in self._compact_ranks:
+            raise ValueError(f"Root rank {root} has failed")
+        return self._compact_ranks[root]
+
+    def _to_logical(self, gathered: list) -> list:
+        logical = [None] * self.mapping.tp_size
+        for rank, entry in zip(self._live_ranks, gathered):
+            logical[rank] = entry
+        return logical
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -714,20 +944,31 @@ class MPIDist(Distributed):
                     f"(tp_size={self.mapping.tp_size} * pp_size={self.mapping.pp_size} * cp_size={self.mapping.cp_size}), "
                     f"but MPI world size is only {actual_world_size}. ")
 
+    @_interruptible("broadcast")
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-        comm = mpi_comm()
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+        return safe_broadcast(self._world_comm(),
+                              obj,
+                              root=self._compact_root(root),
+                              chunk_size=chunk_size)
 
+    @_interruptible("allgather")
     def allgather(self, obj):
-        return mpi_allgather(obj)
+        if self._survivor_comm is None:
+            return mpi_allgather(obj)
+        return self._to_logical(self._survivor_comm.allgather(obj))
 
     @property
     def local_world_size(self):
         return local_mpi_size()
 
+    @_interruptible("barrier")
     def barrier(self):
-        mpi_barrier()
+        if self._survivor_comm is None:
+            mpi_barrier()
+        else:
+            self._survivor_comm.Barrier()
 
+    @_interruptible("tp_barrier")
     def tp_barrier(self):
         self.tp_comm.Barrier()
 
@@ -754,6 +995,8 @@ class MPIDist(Distributed):
 
     @property
     def tp_comm(self):
+        if self._survivor_comm is not None:
+            return self._survivor_comm
         if self._tp_comm is None:
             self._validate_world_size()
             mapping = self.mapping
@@ -798,6 +1041,7 @@ class MPIDist(Distributed):
         comm = self.cp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
+    @_interruptible("tp_allgather")
     def tp_allgather(self,
                      obj,
                      chunk_size: int = 4 * 1024 * 1024,
@@ -805,20 +1049,35 @@ class MPIDist(Distributed):
                      small_payload: bool = False):
         comm = self.tp_comm
         if small_payload:
-            return comm.allgather(obj)
-        return safe_allgather(comm, obj, chunk_size=chunk_size)
+            gathered = comm.allgather(obj)
+        else:
+            gathered = safe_allgather(comm, obj, chunk_size=chunk_size)
+        if self._live_ranks is None:
+            return gathered
+        return self._to_logical(gathered)
 
+    @_interruptible("tp_gather")
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
-        return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
+        gathered = safe_gather(comm,
+                               obj,
+                               root=self._compact_root(root),
+                               chunk_size=chunk_size)
+        if self._live_ranks is None or gathered is None:
+            return gathered
+        return self._to_logical(gathered)
 
+    @_interruptible("tp_broadcast")
     def tp_broadcast(self,
                      obj,
                      root=0,
                      chunk_size: int = 4 * 1024 * 1024,
                      **kwargs):
         comm = self.tp_comm
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+        return safe_broadcast(comm,
+                              obj,
+                              root=self._compact_root(root),
+                              chunk_size=chunk_size)
 
     def pp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
         comm = self.pp_comm
@@ -831,10 +1090,12 @@ class MPIDist(Distributed):
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
 
+    @_interruptible("allreduce")
     def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         reduce_op = reduce_op_to_mpi(op)
-        return mpi_comm().allreduce(obj, reduce_op)
+        return self._world_comm().allreduce(obj, reduce_op)
 
+    @_interruptible("tp_allreduce")
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         reduce_op = reduce_op_to_mpi(op)
         return self.tp_comm.allreduce(obj, reduce_op)
@@ -855,21 +1116,36 @@ class MPIDist(Distributed):
         comm.Bcast([buf, MPI.INT64_T], root=root)
         return buf
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
-        return self._allgather_int64_comm(self.tp_comm, values)
+    @_interruptible("tp_allgather_int64")
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           fill_value: ArrayLike = 0) -> np.ndarray:
+        rows = self._allgather_int64_comm(self.tp_comm, values)
+        if self._live_ranks is None:
+            return rows
+        logical = np.empty((self.mapping.tp_size, rows.shape[1]),
+                           dtype=np.int64)
+        logical[:] = fill_value
+        logical[list(self._live_ranks)] = rows
+        return logical
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.cp_comm, values)
 
+    @_interruptible("broadcast_int64")
     def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
-        return self._broadcast_int64_comm(mpi_comm(), values, root)
+        return self._broadcast_int64_comm(self._world_comm(), values,
+                                          self._compact_root(root))
 
+    @_interruptible("tp_cp_broadcast_int64")
     def tp_cp_broadcast_int64(self,
                               values: ArrayLike,
                               root: int = 0) -> np.ndarray:
         buf = np.asarray(values, dtype=np.int64).reshape(-1)
         if self.tp_size > 1:
-            buf = self._broadcast_int64_comm(self.tp_comm, buf, root)
+            buf = self._broadcast_int64_comm(self.tp_comm, buf,
+                                             self._compact_root(root))
         if self.cp_size > 1:
             buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
         return buf
