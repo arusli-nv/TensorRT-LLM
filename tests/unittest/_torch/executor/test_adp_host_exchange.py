@@ -213,7 +213,7 @@ def test_can_queue_gathers_only_the_batch_size():
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
 
-    executor.dist.tp_allgather_int64.assert_called_once_with([2])
+    executor.dist.tp_allgather_int64.assert_called_once_with([2], fill_value=1)
     assert can_queue is False and this_rank is True
 
 

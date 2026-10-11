@@ -27,6 +27,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -249,6 +250,9 @@ class DecoderRunner(ScheduledModelRunner):
     # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
     # the longest one; None keeps the cache manager's default.
     _dummy_request_tokens: int | None = None
+    # WideEP recovery: the scheduler installs committed rank masks through this
+    # state while idle; None when recovery is disabled.
+    moe_execution_state: MoeExecutionState | None = None
 
     def __init__(
         self,
@@ -315,6 +319,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
+        self.moe_execution_state = MoeExecutionState.for_model(model)
 
     @property
     def max_beam_width(self) -> int:
@@ -2938,7 +2943,7 @@ class DecoderRunner(ScheduledModelRunner):
         if not (self.mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
+        all_flags = self.dist.tp_allgather_int64([local_flag], fill_value=1)[:, 0]
         spec_metadata.group_all_greedy_sample = bool(all_flags.all())
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
@@ -4874,6 +4879,9 @@ class DecoderRunner(ScheduledModelRunner):
         gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
+        if self.moe_execution_state is not None:
+            # Enqueued inside every captured graph so replays observe the installed mask.
+            self.moe_execution_state.latch()
         inputs = self._preprocess_inputs(
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
@@ -5114,7 +5122,9 @@ class DecoderRunner(ScheduledModelRunner):
         self, attn_metadata: AttentionMetadata, can_run_graph: bool
     ) -> list[int]:
         """Require captured decode on every rank in the normal token-count vote."""
-        gathered = self.dist.tp_allgather_int64([attn_metadata.num_tokens, int(can_run_graph)])
+        gathered = self.dist.tp_allgather_int64(
+            [attn_metadata.num_tokens, int(can_run_graph)], fill_value=[0, 1]
+        )
         if not gathered[:, 1].all():
             raise RuntimeError(
                 "Conditional attention-DP decode requires a captured CUDA "

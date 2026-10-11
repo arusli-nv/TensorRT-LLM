@@ -4,6 +4,7 @@
 import functools
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
@@ -39,6 +40,7 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
+from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
@@ -822,6 +824,13 @@ class PyTorchModelEngine(ModelEngine):
             self._spec_metadata = value
 
     @property
+    def moe_execution_state(self) -> Optional[MoeExecutionState]:
+        """MoE execution state of the decoder runner; None without recovery."""
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner.moe_execution_state
+        return None
+
+    @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):
@@ -931,6 +940,45 @@ class PyTorchModelEngine(ModelEngine):
         if moe_load_balancer is not None:
             moe_load_balancer.set_iter_info(enable_statistic=value[0],
                                             enable_update_weights=value[1])
+
+    def prepare_resident_placement(self, failed_ranks: frozenset[int]) -> str:
+        """Return the digest of the expert placement without ``failed_ranks``.
+
+        Raises:
+            ValueError: Resident replicas on the surviving ranks do not cover
+                every expert.
+        """
+        return self.moe_load_balancer.masked_placement_digest(failed_ranks)
+
+    def install_resident_placement(self, failed_ranks: frozenset[int],
+                                   placement_digest: str,
+                                   deadline: float) -> None:
+        """Route MoE traffic around ``failed_ranks`` using resident replicas.
+
+        Must run while the engine is idle. Masks the failed ranks' slots out of
+        EPLB routing, commits them as failed in the EP membership, and installs
+        the new rank mask into the MoE execution state captured by the CUDA
+        graphs.
+
+        Args:
+            failed_ranks: Logical EP ranks that left the group.
+            placement_digest: Digest from :meth:`prepare_resident_placement`
+                that every survivor agreed on.
+            deadline: Absolute ``time.monotonic()`` bound for the install.
+        """
+        load_balancer = self.moe_load_balancer
+        load_balancer.reconfigure_mask_only_with_timeout(
+            sorted(failed_ranks), deadline - time.monotonic())
+        if load_balancer.masked_placement_digest(
+                failed_ranks) != placement_digest:
+            raise RuntimeError(
+                "Installed EPLB placement differs from the agreed placement")
+        execution_state = self.moe_execution_state
+        health = execution_state.health
+        generation = health.generation
+        for rank in sorted(failed_ranks):
+            generation = health.commit_failed(rank, generation)
+        execution_state.install_mask(health.get_mask_words())
 
     @contextmanager
     def set_warmup_flag(self):
@@ -1153,6 +1201,10 @@ class PyTorchModelEngine(ModelEngine):
         # Release runner-owned graphs before dropping the runner. Keep the
         # handle available if graph release fails and cleanup is retried.
         self._release_cuda_graphs()
+        # No captured graph can replay against the MoE workspaces any more.
+        execution_state = self.moe_execution_state
+        if execution_state is not None:
+            execution_state.close()
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights

@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import hashlib
 import os
 import threading
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -927,6 +928,68 @@ class MoeLoadBalancer:
             raise RuntimeError(
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
+
+    def reconfigure_mask_only_with_timeout(self, dead_ranks: list[int],
+                                           timeout_s: float) -> None:
+        """Run :meth:`reconfigure_mask_only`, giving up after ``timeout_s``.
+
+        The native call ends in an unbounded ``cudaEventSynchronize``, so it
+        runs on a helper thread and the caller regains control at the
+        deadline. After a timeout the load balancer must not be used again.
+
+        Raises:
+            TimeoutError: The reconfiguration did not finish in time.
+        """
+        device = torch.cuda.current_device()
+        errors: list[Exception] = []
+
+        def reconfigure():
+            try:
+                torch.cuda.set_device(device)
+                self.reconfigure_mask_only(dead_ranks)
+            except Exception as error:  # noqa: BLE001 - re-raised by the caller
+                errors.append(error)
+
+        thread = threading.Thread(target=reconfigure,
+                                  name="eplb_mask_reconfigure",
+                                  daemon=True)
+        thread.start()
+        thread.join(max(timeout_s, 0.0))
+        if thread.is_alive():
+            raise TimeoutError(
+                f"EPLB mask reconfiguration did not finish in {timeout_s:.1f}s")
+        if errors:
+            raise errors[0]
+
+    def masked_placement_digest(self, dead_ranks: Iterable[int]) -> str:
+        """Return a digest of the current placement with ``dead_ranks`` masked.
+
+        The digest covers every layer's slot table with the slots of
+        ``dead_ranks`` cleared, so ranks that agree on it route identically.
+
+        Raises:
+            ValueError: A rank is out of range, or an expert would be left
+                without a replica outside ``dead_ranks``.
+        """
+        dead = sorted(set(dead_ranks))
+        if any(rank < 0 or rank >= self.ep_size for rank in dead):
+            raise ValueError(
+                f"Dead ranks {dead} out of range for EP size {self.ep_size}")
+        digest = hashlib.sha256(np.asarray(dead, dtype=np.int64).tobytes())
+        for layer in self.single_layer_load_balancers:
+            placement = np.asarray(layer.get_old_rank_expert_ids(),
+                                   dtype=np.int32)
+            placement[dead] = -1
+            resident = np.unique(placement[placement >= 0])
+            if not np.array_equal(resident, np.arange(layer.expert_count)):
+                missing = sorted(
+                    set(range(layer.expert_count)) - set(resident.tolist()))
+                raise ValueError(
+                    f"MoE layer {layer.get_layer_idx()} has no surviving "
+                    f"replica for experts {missing}")
+            digest.update(np.asarray(placement.shape, dtype=np.int64).tobytes())
+            digest.update(placement.tobytes())
+        return digest.hexdigest()
 
     def start_iter(self):
         """
