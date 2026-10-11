@@ -13,12 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
+import gc
+import sys
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+import tensorrt_llm._dlpack_utils as dlpack
 import tensorrt_llm._mnnvl_utils as mnnvl
 from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
@@ -977,3 +982,95 @@ def test_reserved_address_range_is_not_shared_across_communicator_sizes(
     assert not comm_cache_cls._address_window_fits(quarter, 1)
     # A matching rank count does not excuse an allocation that overruns the slot.
     assert not comm_cache_cls._address_window_fits(stride, 2)
+
+
+@pytest.fixture
+def cpu_dlpack(monkeypatch):
+    create_capsule = dlpack.create_dlpack_capsule
+
+    def create_cpu_capsule(*args, **kwargs):
+        wrapper = create_capsule(*args, **kwargs)
+        wrapper._managed_tensor.dl_tensor.device.device_type = 1
+        return wrapper
+
+    monkeypatch.setattr(dlpack, "create_dlpack_capsule", create_cpu_capsule)
+    return dlpack
+
+
+@pytest.mark.parametrize("inference_mode", [False, True])
+@pytest.mark.parametrize("alias_kind", ["shape", "detach", "dtype", "slice_dtype"])
+def test_dlpack_metadata_lives_until_last_storage_alias(cpu_dlpack, inference_mode, alias_kind):
+    allocation = torch.empty(128, dtype=torch.uint8)
+    with torch.inference_mode(inference_mode):
+        root = cpu_dlpack.pack_strided_memory(allocation.data_ptr(), 128, 128, 1, torch.uint8, 0)
+        wrapper = root._capsule_wrapper
+        wrapper_ref = weakref.ref(wrapper)
+        managed_ref = weakref.ref(wrapper._managed_tensor)
+        # Keep native metadata valid even if the retention assertion fails.
+        metadata = (wrapper.capsule, wrapper._shape_array, wrapper._managed_tensor)
+        del wrapper
+        if alias_kind == "shape":
+            alias = root.view(-1)
+        elif alias_kind == "detach":
+            alias = root.detach()
+        elif alias_kind == "dtype":
+            alias = root.view(torch.int32)
+        else:
+            alias = root[0].view(torch.int32)
+        assert alias.untyped_storage()._cdata == root.untyped_storage()._cdata
+        del root
+        gc.collect()
+        retained_with_alias = wrapper_ref() is not None
+        del alias
+        gc.collect()
+        released_after_alias = wrapper_ref() is None
+        del metadata
+        gc.collect()
+        assert retained_with_alias
+        assert released_after_alias
+        assert managed_ref() is None
+
+
+def test_dlpack_standalone_capsule_has_balanced_reference(cpu_dlpack):
+    allocation = torch.empty(128, dtype=torch.uint8)
+    wrapper = cpu_dlpack.create_dlpack_capsule(allocation.data_ptr(), 128, 128, 1, torch.uint8, 0)
+    capsule_refcount = sys.getrefcount(wrapper.capsule)
+    assert capsule_refcount == 2
+    assert wrapper._managed_tensor.manager_ctx is None
+
+
+def test_dlpack_refcount_helper_is_independent_of_shared_prototype(cpu_dlpack, monkeypatch):
+    monkeypatch.setattr(ctypes.pythonapi.Py_DecRef, "argtypes", [ctypes.py_object])
+    assert cpu_dlpack._py_decref.argtypes == [ctypes.c_void_p]
+    allocation = torch.empty(128, dtype=torch.uint8)
+    root = cpu_dlpack.pack_strided_memory(allocation.data_ptr(), 128, 128, 1, torch.uint8, 0)
+    wrapper_ref = weakref.ref(root._capsule_wrapper)
+    alias = root.detach()
+    del root
+    gc.collect()
+    assert wrapper_ref() is not None
+    del alias
+    gc.collect()
+    assert wrapper_ref() is None
+
+
+def test_dlpack_failed_conversion_releases_metadata(cpu_dlpack, monkeypatch):
+    allocation = torch.empty(128, dtype=torch.uint8)
+    wrapper_refs = []
+    create_capsule = cpu_dlpack.create_dlpack_capsule
+
+    def observe_capsule(*args, **kwargs):
+        wrapper = create_capsule(*args, **kwargs)
+        wrapper_refs.append(weakref.ref(wrapper))
+        return wrapper
+
+    def fail_conversion(capsule):
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(cpu_dlpack, "create_dlpack_capsule", observe_capsule)
+    monkeypatch.setattr(torch.utils.dlpack, "from_dlpack", fail_conversion)
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        cpu_dlpack.pack_strided_memory(allocation.data_ptr(), 128, 128, 1, torch.uint8, 0)
+    gc.collect()
+    assert len(wrapper_refs) == 1
+    assert wrapper_refs[0]() is None
