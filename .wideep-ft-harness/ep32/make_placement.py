@@ -1,29 +1,35 @@
-"""Write a 288-slot EPLB placement in which every expert of the protected ranks has a replica elsewhere.
+"""Write an EPLB placement with one spare slot per rank that covers the loss of each protected rank.
 
-Rank r holds its 8 primary experts 8r..8r+7 plus one spare slot. The 32 spare slots replicate the
-32 experts of 4 protected ranks, never on the expert's own rank, so any single protected rank can
-be lost with full coverage. Usage: make_placement.py BASE_CONFIG OUT_CONFIG RANK,RANK,RANK,RANK [SPARE_SHIFT]
+Rank r holds its primary experts plus one spare slot. The spares replicate every expert of the
+protected ranks (never on the expert's own rank); leftover spares replicate other experts.
+Usage: make_placement.py BASE_CONFIG OUT_CONFIG RANKS EXPERTS FIRST_MOE_LAYER NUM_LAYERS [SHIFT]
+(SHIFT rotates the spares; by default the first valid one from 16 is used.)
+  e.g. DeepSeek-R1: ... 1,2,30,31 256 3 61     Kimi-K2: ... 1,2 384 1 61
 """
 import sys
 
 import yaml
 
-EXPERTS, EP, SLOTS_PER_RANK, MOE_LAYERS = 256, 32, 9, range(3, 61)
-base, out, protected = sys.argv[1], sys.argv[2], [int(r) for r in sys.argv[3].split(",")]
-shift = int(sys.argv[4]) if len(sys.argv) > 4 else EP // 2
-per_rank = EXPERTS // EP
-assert len(protected) * per_rank == EP, "spare slots must exactly cover the protected ranks"
-spares = [e for r in protected for e in range(r * per_rank, (r + 1) * per_rank)]
+EP = 32
+base, out = sys.argv[1], sys.argv[2]
+protected = [int(r) for r in sys.argv[3].split(",")]
+experts, first_layer, num_layers = (int(a) for a in sys.argv[4:7])
+per_rank = experts // EP
+assert per_rank * EP == experts and len(protected) * per_rank <= EP
+covered = [e for r in protected for e in range(r * per_rank, (r + 1) * per_rank)]
+filler = [e for e in range(experts) if e // per_rank not in protected]
+spares = covered + filler[: EP - len(covered)]
+shifts = [int(sys.argv[7])] if len(sys.argv) > 7 else [EP // 2, *range(1, EP)]
+shift = next(s for s in shifts if all(spares[(r + s) % EP] // per_rank != r for r in range(EP)))
 placement = []
 for rank in range(EP):
-    spare = spares[(rank + shift) % EP]
-    assert spare // per_rank != rank
-    placement += list(range(rank * per_rank, (rank + 1) * per_rank)) + [spare]
-assert len(placement) == EP * SLOTS_PER_RANK and set(placement) == set(range(EXPERTS))
+    placement += list(range(rank * per_rank, (rank + 1) * per_rank)) + [spares[(rank + shift) % EP]]
 for dead in protected:
-    alive = {e for i, e in enumerate(placement) if i // SLOTS_PER_RANK != dead}
-    assert alive == set(range(EXPERTS)), dead
+    alive = {e for i, e in enumerate(placement) if i // (per_rank + 1) != dead}
+    assert alive == set(range(experts)), dead
 config = yaml.safe_load(open(base))
 config["moe_config"]["load_balancer"]["initial_global_assignments"] = {
-    layer: placement for layer in MOE_LAYERS}
+    layer: placement for layer in range(first_layer, num_layers)
+}
+config["moe_config"]["load_balancer"]["num_slots"] = len(placement)
 yaml.safe_dump(config, open(out, "w"), default_flow_style=None, width=1000)

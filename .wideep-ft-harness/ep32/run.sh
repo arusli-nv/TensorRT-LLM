@@ -13,7 +13,7 @@ if [[ -n "${TLLM_TEST_ORACLE_EXCLUDE_RANK:-}${TLLM_TEST_TRACE_CAPTURE:-}${TLLM_T
     cp "$E/oracle/wideep_eplb_oracle.py" "$site/"
     echo "import wideep_eplb_oracle" > "$site/wideep_eplb_oracle.pth"
 fi
-export LLM_MODELS_ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common
+export LLM_MODELS_ROOT=${LLM_MODELS_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common}
 export TRTLLM_ENABLE_PDL=1 TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=0 TRTLLM_MOE_A2A_FORCE_CFT=0
 export PYTHONUNBUFFERED=1 TLLM_LOG_LEVEL=${TLLM_LOG_LEVEL:-warning}
 node=$SLURM_NODEID
@@ -27,6 +27,6 @@ if [[ "$node" == 0 && -z "${WIDEEP_NO_RECOVERY:-}" ]]; then
         --endpoint "tcp://*:${WIDEEP_AUTHORITY_PORT:-24680}" --world-size 32 \
         > "$run/authority.log" 2>&1 &
 fi
-model=$LLM_MODELS_ROOT/DeepSeek-R1-0528-FP4-V2
+model=$LLM_MODELS_ROOT/${WIDEEP_MODEL:-DeepSeek-R1-0528-FP4-V2}
 exec bash "$L/task.sh" "$run" 4 bash "$E/rank.sh" "$run" \
     trtllm-llmapi-launch python3 "$E/frontend.py" --model "$model" --config "$E/${WIDEEP_CONFIG:-config-recover.yaml}" --output "$run" "$@"

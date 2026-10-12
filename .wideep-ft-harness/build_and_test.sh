@@ -21,7 +21,7 @@ pip install "pytest>=8.4,<9.1" pytest-asyncio pytest-timeout pytest-mock pytest-
     > "$out/pytest-install.log" 2>&1 || echo PYTEST_INSTALL_FAILED
 cd /tmp
 export PYTHONPATH=/checkout/tests/unittest
-run() { name=$1; shift; echo "=== $name"; python3 -m pytest -q -p no:cacheprovider --timeout=300 "$@" > "$out/test-$name.log" 2>&1; rc=$?; tail -3 "$out/test-$name.log"; echo "rc=$rc"; }
+run() { name=$1; shift; [[ -n "${GROUPS_ONLY:-}" && " $GROUPS_ONLY " != *" $name "* ]] && return; echo "=== $name"; python3 -m pytest -q -p no:cacheprovider --timeout=300 "$@" > "$out/test-$name.log" 2>&1; rc=$?; tail -3 "$out/test-$name.log"; echo "rc=$rc"; }
 T=/checkout/tests/unittest
 run cpu $T/executor/test_recovery_authority.py \
     $T/_torch/distributed/test_mpi_survivors.py $T/_torch/distributed/test_mpi_survivors_ulfm.py \
@@ -31,8 +31,8 @@ run cpu $T/executor/test_recovery_authority.py \
     $T/_torch/moe/test_ep_group_health.py $T/executor/test_rpc.py $T/executor/test_rpc_executor_mixin.py \
     $T/executor/test_rpc_worker_mixin.py
 # The rest of test_mpi_session.py spawns MPI processes, which the Slurm container cannot; run ours.
-run session $T/llmapi/test_mpi_session.py -k "departed or departure"
+run session $T/llmapi/test_mpi_session.py -k "departed or departure or degraded"
 run executor $T/_torch/executor/test_py_executor.py $T/_torch/test_mnnvl_memory_lifecycle.py
-[[ -n "${SKIP_GPU_MOE:-}" ]] || run gpu_moe $T/_torch/moe/test_moe_a2a_abort.py $T/_torch/moe/test_moe_execution_state.py \
+[[ -n "${SKIP_GPU_MOE:-}" ]] || run gpu_moe -v $T/_torch/moe/test_moe_a2a_abort.py $T/_torch/moe/test_moe_execution_state.py \
     $T/_torch/modules/test_alltoall_watchdog.py $T/_torch/test_mnnvl_alltoall_workspace.py
 echo ALL_DONE

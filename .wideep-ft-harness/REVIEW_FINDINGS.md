@@ -1,62 +1,55 @@
-# Pre-PR review findings (2026-10-11) — tracking
+# Pre-PR review findings — tracking
 
 Legend: [ ] open, [x] done, [~] documented/deferred with reason.
+Round 1 (2026-10-11): all items done except those carried into round 2 below.
+Round 2 reports: review-r2/{design,kernels,python}.md.
 
-## Kernels / descriptor (delegated to kernel agent)
-- [ ] K1 timeout in FT mode must fail-stop (trap), only `requested` cancels
-- [ ] K2 remove test-only `abort_state` op arg and legacy mode
-- [ ] K3 drop latch/published/slot; one fixed descriptor with inline abort record
-- [ ] K4 gather: PDL, no zero-fill, fold sanitize, bound count; params only in FT branch
-- [ ] K5 remove finalize-abort-output kernel
-- [ ] K6 unused template param, ENABLE_DESCRIPTOR naming, redundant triggers, naming conventions
-- [ ] K7 fixed-slot sizing keyed on recovery_enabled
-- [ ] K8 tests lean (~250 lines), timeout regression, count bound
-- [ ] K9 callers outside kernel files (runner.py latch call, ...)
+## Blockers
+- [x] B1 recovery waits unbounded (Shrink before Stopped; rearm syncs) -> recovery runs under the executor HangDetector
+- [x] B2 PeerFailureWatch.stop() not idempotent (masks RecoveryError)
+- [x] B3 ULFM test must skip without real ULFM (distro Open MPI 4.1)
+- [x] B4 authority/mpi_survivors/a2a tests missing from CI lists (l0_cpu.yml, GPU list)
 
-## MPI adapter / session
-- [ ] M-B1 `_interruptible` converts only when recovery enabled (`_host_world`); guard defer_terminations
-- [ ] M-B2 mpi4py version: align with security scanning (>=4.1.2), re-port patch; image rebuild is an [infra] PR; ULFM capability gate
-- [ ] M-S1 watcher handle with own stop + Cancel/Free; stop old watcher at recovery start
-- [ ] M-S2 free revoked comms / watcher dup+request
-- [ ] M-S3 assert MPI_THREAD_MULTIPLE
-- [ ] M-S4 watcher non-peer error -> log + fail closed
-- [ ] M-S5 one shared peer-failure classifier (torch-free)
-- [ ] M-S6 BrokenExecutor counts as departure only if a rank failed
-- [ ] M-S7 `_num_failed_ranks` guarded (returns 0 without ULFM)
-- [ ] M-S8 grace starts at shutdown; no error logs for departed futures; flush before Abort; document
-- [ ] M-S9 EPLB shared comm barriers tolerate departed rank (no /dev/shm leak)
-- [ ] M-S10 real ULFM CPU test with mpirun (skip if unavailable)
-- [ ] M-S11 gather fill_value audit / explicit
-- [ ] M-N1..N9 nits (one dead-rank pattern, Dict-only, second-failure message, header year, weak test, test hygiene, MPI None, poll contention, env validated once)
+## Kernels
+- [x] K-S1 op requires expert-id sanitization with a descriptor
+- [x] K-S2 gather zeroes invalid non-expert-id rows
+- [x] K-S3 aborted combine withholds readiness
+- [x] K-S4 gather reads the abort request once per block, no status write
+- [x] K-S5 abort copy vs CUDA_DEVICE_MAX_CONNECTIONS=1 -> reject in create()
+- [x] FT-off SASS parity: 150 kernels opcode-identical to main (sass-diff/opcode-parity.txt)
+- [ ] K-S6 healthy-path gather copy (~1 ms/step EP64 decode): measure; payload-major alias alternative
+- [x] ep_group_health extra_attrs fallback restored
+- [x] K-N watchdog comment, MOE_DEVELOPER_GUIDE section
+- [x] K-N alias annotation comment, combine capacity check dropped, status documented diagnostic-only
+- [~] K-N snake_case locals match the file; reset_local_workspace mirrors init without its barrier
 
-## Authority
-- [x] A-B1 Registered handshake; startup fails without it
-- [x] A-B2 stable ROUTING_ID + ROUTER_HANDOVER
-- [ ] A-B3 CI list (l0_cpu.yml)
-- [x] A-S4 drop torch-free claim (test imports normally)
-- [x] A-S5 single recovery deadline < worker deadline
-- [x] A-S6 duplicates are violations
-- [x] A-S7 drop role/generation param/dead code
-- [x] A-S8 type-driven decode + __all__
-- [x] A-S9 client errors one family (RecoveryTimeout)
-- [x] A-S10 load_key with min length
-- [x] A-S11 threat model documented
-- [x] A-S12 MAXMSGSIZE, debug-level drop log
-- [ ] A-S13 client cached per process (rank only)
-- [x] A-S14 warn on empty admission
-- [ ] A-S15 tests: ipc endpoint, daemon threads
-- [ ] A-S16 tests: wrong key drop, malformed abort, Installed wrong gen, timeout, out-of-range rank, rank 0 never admitted, client rejects unauthenticated; split combined test
+## MPI / session
+- [x] S1 ULFM capability gate always true with mpi4py 4 -> real check
+- [x] S4 sync tasks to a degraded session loop forever -> fail them
+- [x] S5 Abort(0) path: flush TRT-LLM logger, exit code, doc, test
+- [~] S6 free revoked communicators (two comms leaked once per recovery; freeing revoked comms is implementation-defined)
+- [x] FT-off: _shared_barrier tolerance gated on recovery
 
 ## Executor
-- [ ] E-B1 create() rejects spec decode/MTP, block reuse, guided decoding, KV connector, beam>1, gather_all_responses; document sampler features
-- [ ] E-B2 ADP dummy rollback via `_finalize_adp_dummy_allocation(False)` first; test loss in `_can_queue`
-- [ ] E-S3 numbered gathers; resend all unacknowledged contributions
-- [ ] E-S4 terminations deferred in every gather path (central)
-- [ ] E-S5 broad handlers re-raise as interruption when peer failed
-- [ ] E-S6 gather_all_responses; cache client per process
-- [ ] E-S7 commit gate bound documented
-- [ ] E-S8 narrower executor boundary (adapter methods; unbroadcast hook)
-- [ ] E-S9 owner map n>1 children
-- [ ] E-S10 split unrelated rpc/llm/_update_requests changes into separate PRs
-- [ ] E-N nits: unused imports, import order, stale comment, blank lines, perf events, redundant check, TypeAlias, create() tests, KV round-trip GPU test, gate-in-loop test, dead test side_effect
-- [ ] X request_abort() at start of recovery (from kernel review)
+- [~] H1 interrupted post-commit response gather skips rest of iteration (no-op tail for supported profile; documented; recheck with V2)
+- [x] S3 create() rejects: lm_head_tp_in_adp, hybrid/Mamba managers, PEFT, CUDA_DEVICE_MAX_CONNECTIONS=1
+- [x] S7 nvtx_range moved onto _publish_responses
+- [~] S8 gather_all_responses: only KV-cache estimation sets it; documented terminal
+- [~] S2 n>1: is_final is all-sequences; one error ends the client request — comment only
+- [ ] stats/perf events of a discarded step; penalties/seed/stop-word state (document per-request limits)
+- [x] remove unused installed_generation; registration logs its wait
+- [~] client env helpers in leaf module (zmq is a core dependency; imports are lazy)
+- [ ] device timeout vs ULFM detection documented
+- [ ] create() validation before model load (UX) — consider
+- [ ] tests: stop idempotent + RecoveryAborted surfaces; stuck shrink bounded; loop-level hook placement; real ULFM revoke unblocks; KV revert GPU round trip; serve() errors after departure
+
+## Series / PRs
+- [ ] drop 44eded2a5c (admission) from the series
+- [ ] split: ADP-absent-ranks refactor, ConfigurableMoE memo fix, unrelated fixes
+- [ ] KV manager V2 rollback (DeepSeek/Kimi default to V2)
+- [ ] user doc + integration test + experimental label
+- [ ] verify the documented trtllm-serve launch (docs example) on EP32
+- [x] single-node EP4 integration test (idle + in-flight) passes; added to l0_gb200_multi_gpus post_merge
+- [ ] mpi4py.futures threads print MPI_ERR_PROC_FAILED tracebacks at the loss and at shutdown (cosmetic; part of the futures/ULFM gap)
+- [ ] test_rpc.py::test_incremental_task_async hung once (7 s before) — rerun to classify
+- [ ] gpu_moe: failures + PMIx step kill from the trapping child (child env now isolated) — rerun verbose
