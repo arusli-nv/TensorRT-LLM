@@ -1,7 +1,7 @@
 """Write results.svg: time to serve again after a rank loss, and throughput (DeepSeek-R1, 32 GPUs)."""
 import math
 
-W, H = 860, 330
+W, H = 860, 360
 LEFT, RIGHT = 250, 150
 GREEN, RED, GRAY, BLUE = "#2e7d32", "#c62828", "#9e9e9e", "#1565c0"
 out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="Helvetica, Arial, sans-serif" font-size="14">',
@@ -29,11 +29,12 @@ for t in (0.1, 1, 10, 100):
 bar(64, "With fault tolerance", xt(0.1), xt(0.34), GREEN, "0.16 – 0.34 s")
 bar(98, "Without (restart)", xt(0.1), xt(173), RED, "81 – 173 s")
 
-# Throughput.
-title(186, "Generation throughput (output tokens/s)", "8 requests per GPU")
-xs = lambda v: LEFT + v / 20000 * (W - LEFT - RIGHT)
-bar(216, "FT off, 32 GPUs", LEFT, xs(14689), GRAY, "14,689")
-bar(250, "FT on, 32 GPUs", LEFT, xs(14488), BLUE, "14,488  (−1.4%)")
-bar(284, "FT on, 31 GPUs after a loss", LEFT, xs(13960), "#64b5f6", "13,960  (99.4% per GPU)")
+# Throughput at production shape: 64 requests per GPU, 9k-token sequences, fp8 KV cache.
+title(186, "Generation throughput (output tokens/s), 64 requests per GPU", "medians of three runs; the last bar uses the overlap scheduler and MTP, which FT does not support yet")
+xs = lambda v: LEFT + v / 200000 * (W - LEFT - RIGHT)
+bar(216, "FT off, 32 GPUs", LEFT, xs(82661), GRAY, "82.7k")
+bar(250, "FT on, 32 GPUs", LEFT, xs(79636), BLUE, "79.6k  (−3.7%)")
+bar(284, "FT on, 31 GPUs after a loss", LEFT, xs(75750), "#64b5f6", "75.8k  (98% per GPU)")
+bar(318, "Production config, FT off", LEFT, xs(157183), "#616161", "157.2k")
 out.append("</svg>")
 open("results.svg", "w").write("\n".join(out))

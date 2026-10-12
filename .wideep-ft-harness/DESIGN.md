@@ -11,7 +11,8 @@
 ![Recovery time and throughput](evidence/results.svg)
 
 DeepSeek-R1 NVFP4, 32 GB200 GPUs (EP32, attention DP). Kimi-K2 and 16 and 64 GPUs show similar
-results.
+results. FT currently needs the overlap scheduler and MTP off, which halves throughput versus
+the production config (section 7).
 
 ## 1. Today's failover (without FT)
 
@@ -52,9 +53,13 @@ rank dies
 | new prompts are processed, full load | 248 of 248 finish within 4.6 s |
 
 - Times include generating each request's remaining tokens.
-- Tokens match a reference run that never used the lost rank (also with prefix caching on).
-- Throughput: −1.4% with FT on; after a loss, 99.4% per remaining GPU. FT built in but off: no
-  change (the kernels used are instruction-identical to main).
+- Tokens match a reference run that never used the lost rank (also with prefix caching on). At
+  64 requests per GPU, greedy tokens are not reproducible even between two runs without a kill,
+  so there only completion and coherence are checked.
+- Throughput with FT on: −2.4% at 8 requests per GPU, −3.7% at 64 (chart). After a loss: 98% per
+  remaining GPU. FT built in but off: no change (kernels instruction-identical to main).
+- At 64 requests per GPU, the same kills pass: new requests served after 0.31 s, in-flight
+  requests done within 4.6 s (5.5 s at full load).
 
 ## 4. When we keep the captured CUDA graphs, and how
 
@@ -141,13 +146,14 @@ FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     max_num_tokens_per_rank = 4 (fix
 
 ## 7. Limits and next steps
 
+- **Biggest gap: FT runs at about half of production throughput.** It does not support the
+  overlap scheduler or MTP yet; with both, the same 32 GPUs reach 157k tokens/s versus 80k
+  (chart).
 - **Not supported yet** (rejected at startup): overlap scheduler, MTP and guided decoding, online
   EPLB, disaggregated serving, LM-head TP in ADP, beam search, PEFT, PP/CP, encoder-decoder,
   hybrid/Mamba, the CFT all-to-all mode, Ray and RPC executors.
 - **Other limits:** one loss per job; rank 0 must survive; the lost rank's requests fail rather than
   move; the server keeps reporting "healthy".
-- **Open item:** in one 64-GPU run, one test request drifted from the reference at its third
-  token (coherent text); likely floating-point rounding from changed expert batch sizes.
 - **Next:** overlap scheduler and MTP (production WideEP uses both), online EPLB, then restoring the
   job to full size with a replacement rank.
 
@@ -200,7 +206,7 @@ with the commit that implements it and the main code.
 | 1c.4c | Request disposition | [13][c13], [3][c3] | [recovery], [kv] | done |
 | 1d.1 | Poisoned lifecycle and public admission policy | [12][c12], [1][c1], [2][c2], [13][c13] | [session], [recovery] | done; env-var gate, not `LlmArgs` |
 | 1d.4a | Physical acceptance | [13][c13] | [ci] | done: EP32 R1/Kimi-K2, EP16, EP64 |
-| 1d.5 | Performance gate | [8][c8], [13][c13] | [docs] | done: −1.4% all-active, 99.4% degraded |
+| 1d.5 | Performance gate | [8][c8], [13][c13] | [docs] | done: −2.4% / −3.7% all-active, 98% degraded |
 
 Supporting commits without their own item: [1][c1] and [2][c2] (RPC fatal errors and teardown,
 under 1d.1), [3][c3] (absent sample state, under 1c.4c), [4][c4] (shared EPGroupHealth, under 1a.8).
