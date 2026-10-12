@@ -100,6 +100,10 @@ class EPGroupHealth:
         self._generation: int = 0
         self._lock = threading.Lock()
 
+    def __deepcopy__(self, memo: dict) -> "EPGroupHealth":
+        """Return ``self``: this is shared membership, not per-copy state."""
+        return self
+
     @property
     def moe_world_size(self) -> int:
         """Total number of ranks in the MoE world (immutable)."""
