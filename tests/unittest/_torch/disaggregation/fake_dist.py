@@ -133,7 +133,7 @@ class FakeDistRank:
     def tp_allgather(self, obj, *, small_payload: bool = False) -> list:
         return self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather", obj)
 
-    def tp_allgather_int64(self, values) -> np.ndarray:
+    def tp_allgather_int64(self, values, *, fill_value=0) -> np.ndarray:
         gathered = self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather_int64", values)
         rows = [np.asarray(row, dtype=np.int64).reshape(-1) for row in gathered]
         if len({row.size for row in rows}) > 1:
