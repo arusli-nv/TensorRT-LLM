@@ -104,22 +104,24 @@ The all-to-all workspace is symmetric memory: each GPU allocates a buffer that e
 over NVLink. **Dispatch** pushes tokens into the receiving GPU's buffer; **combine** pulls expert
 outputs from peers' buffers. Completion flags live in the same buffers.
 
-**Dispatch layout on each receiving GPU** (R = this step's largest token count per rank,
-C = `max_num_tokens`, fixed):
+**Who owns which rows of one GPU's dispatch buffer** (one payload shown; each digit is the
+source rank that writes that row):
 
 ```text
-Main:  | payload 0                  | payload 1                  | ...
-       | src0 R | src1 R | src2 R … | src0 R | src1 R | src2 R … |
-         src k starts at k·R, so every source's rows move when R changes
+row                0 1 2 3 4 5 6 7 8 9 10 11
 
-FT:    | src0                        | src1                        | src2  ...
-       | payload 0 C | payload 1 C … | payload 0 C | payload 1 C … |
-         src k's region is fixed: a late write from a dead src stays in its own region
+Main, step n       0 0 0 0 1 1 1 1 2 2 2  2     R = 4: rows move with R,
+Main, step n+1     0 0 1 1 2 2 3 3 4 4 5  5     R = 2: the step's max tokens per rank
+                                   ^
+                                   late write from dead rank 2, aimed at row 8 in step n,
+                                   lands in rank 4's rows in step n+1
 
-Example: step n has R = 4, step n+1 has R = 2. A dead src 2 still writing for step n
-         writes at 2·4 = 8 → in main, that is src 4's rows in step n+1.
+FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     C = max_num_tokens: rows never move,
+                                                so rank 2's late writes stay in rank 2's rows
 ```
 
+- FT also stores each source's payloads together (`[source][payload][C]`, versus main's
+  `[payload][source][R]`).
 - Same workspace size, plus a small alignment pad per source slot: main already reserves room for
   R up to C.
 - **New gather kernel (FT only):** the fixed slots are not contiguous per payload, so it packs the
