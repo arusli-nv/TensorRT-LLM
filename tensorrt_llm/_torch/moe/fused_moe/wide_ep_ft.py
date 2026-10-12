@@ -80,7 +80,7 @@ def get_wide_ep_ft_options(
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
-    health = extra_attrs.get(EP_GROUP_HEALTH_KEY)
+    health = extra_attrs.get(EP_GROUP_HEALTH_KEY) or extra_attrs.get("ep_group_health")
     recovery = recovery_enabled()
     rank_mask_enabled = health is not None or _env_enabled() or recovery
     if rank_mask_enabled and not recovery and getattr(model_config, "use_cuda_graph", False):

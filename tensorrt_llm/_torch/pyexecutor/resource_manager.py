@@ -50,7 +50,8 @@ from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+                          rewind_context_after_cache_drop)
 from .scheduler import ScheduledRequests
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
@@ -1241,9 +1242,11 @@ class KVCacheManager(BaseResourceManager):
                                  scheduled_batch: ScheduledRequests) -> None:
         """Undo :meth:`prepare_resources` for a step whose forward is discarded.
 
-        First context chunks release the sequences added for them; generation
-        requests give back the tokens added for the step. The KV contents the
-        discarded forward wrote are overwritten when the step runs again.
+        First context chunks release the sequences added for them without
+        storing their blocks for reuse, since the discarded forward may have
+        written invalid KV; generation requests give back the tokens added for
+        the step. The KV contents the discarded forward wrote are overwritten
+        when the step runs again.
         """
         if (self.kv_cache_type == CacheTypeCpp.CROSS
                 or self.mapping.has_cp_helix()):
@@ -1253,7 +1256,10 @@ class KVCacheManager(BaseResourceManager):
         _, added = self._collect_context_sequences(scheduled_batch,
                                                    is_cross=False)
         for req in added:
-            self.free_resources(req)
+            self.impl.remove_sequence(req.py_request_id, None, False)
+            self._preprepared_dummy_request_ids.discard(req.py_request_id)
+            # The re-run may match a shorter reusable prefix than this step did.
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
         for req in scheduled_batch.generation_requests:
             draft_len = get_draft_token_length(req)
             self.impl.rewind_kv_cache(

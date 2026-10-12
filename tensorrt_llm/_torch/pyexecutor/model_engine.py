@@ -4,7 +4,6 @@
 import functools
 import math
 import os
-import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
@@ -951,8 +950,7 @@ class PyTorchModelEngine(ModelEngine):
         return self.moe_load_balancer.masked_placement_digest(failed_ranks)
 
     def install_resident_placement(self, failed_ranks: frozenset[int],
-                                   placement_digest: str,
-                                   deadline: float) -> None:
+                                   placement_digest: str) -> None:
         """Route MoE traffic around ``failed_ranks`` using resident replicas.
 
         Must run while the engine is idle. Masks the failed ranks' slots out of
@@ -966,11 +964,9 @@ class PyTorchModelEngine(ModelEngine):
             failed_ranks: Logical EP ranks that left the group.
             placement_digest: Digest from :meth:`prepare_resident_placement`
                 that every survivor agreed on.
-            deadline: Absolute ``time.monotonic()`` bound for the install.
         """
         load_balancer = self.moe_load_balancer
-        load_balancer.reconfigure_mask_only_with_timeout(
-            sorted(failed_ranks), deadline - time.monotonic())
+        load_balancer.reconfigure_mask_only(sorted(failed_ranks))
         if load_balancer.masked_placement_digest(
                 failed_ranks) != placement_digest:
             raise RuntimeError(

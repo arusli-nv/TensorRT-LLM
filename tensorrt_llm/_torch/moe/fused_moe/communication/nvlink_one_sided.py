@@ -970,7 +970,7 @@ class NVLinkOneSided(Communication):
                 **(state.dispatch_kwargs() if state is not None else {}),
             )
         )
-        # Graph replays bypass the host watchdog; bound kernels time out on the device instead.
+        # Execution bound to a state relies on the device timeout instead of the host watchdog.
         if state is None:
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "dispatch", active_rank_mask

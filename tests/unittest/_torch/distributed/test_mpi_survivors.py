@@ -78,6 +78,7 @@ class FakeComm:
         self.barriers = 0
         self.shrink_members = None
         self.freed = False
+        self.free_count = 0
 
     def _check(self) -> None:
         if self.error is not None:
@@ -136,6 +137,7 @@ class FakeComm:
 
     def Free(self) -> None:
         self.freed = True
+        self.free_count += 1
 
     def Irecv(self, buf, source):
         return self.pending
@@ -203,6 +205,7 @@ def fake_mpi(monkeypatch):
         Comm=SimpleNamespace(Revoke=None, Shrink=None, Get_failed=None),
     )
     monkeypatch.setattr(communicator, "MPI", fake)
+    monkeypatch.setenv("OMPI_MCA_mpi_ft_enable", "1")
     monkeypatch.setattr(
         communicator,
         "is_mpi_peer_failure",
@@ -436,6 +439,14 @@ def test_stopped_watch_reports_nothing_and_releases_resources(dist, world):
     assert calls == [] and world.pending.cancelled and world.freed
 
 
+def test_stopping_a_watch_twice_is_a_no_op(dist, world):
+    world.pending = FakeRequest(FakeMPIException(ERR_PROC_FAILED), fail_after=10**9)
+    watch = dist.watch_peer_failures(lambda: None)
+    watch.stop()
+    watch.stop()
+    assert world.free_count == 1
+
+
 def test_peer_failures_stay_mpi_errors_without_recovery(world):
     dist = MPIDist(_mapping())
     dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
@@ -444,11 +455,14 @@ def test_peer_failures_stay_mpi_errors_without_recovery(world):
         dist.broadcast_int64([0])
 
 
-def test_recovery_requires_ulfm_and_thread_multiple(world, fake_mpi, monkeypatch):
+def test_recovery_requires_mpi4py_ulfm_launch_and_thread_multiple(world, fake_mpi, monkeypatch):
     dist = MPIDist(_mapping())
     monkeypatch.setattr(fake_mpi, "Query_thread", lambda: 1)
     with pytest.raises(RuntimeError, match="THREAD_MULTIPLE"):
         dist.enable_peer_loss_recovery()
+    monkeypatch.delenv("OMPI_MCA_mpi_ft_enable")
+    with pytest.raises(RuntimeError, match="--with-ft ulfm"):
+        dist.enable_peer_loss_recovery()
     monkeypatch.setattr(fake_mpi, "Comm", SimpleNamespace())
-    with pytest.raises(RuntimeError, match="ULFM"):
+    with pytest.raises(RuntimeError, match="mpi4py>=4"):
         dist.enable_peer_loss_recovery()

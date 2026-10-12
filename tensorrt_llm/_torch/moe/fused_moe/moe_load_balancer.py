@@ -18,6 +18,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import recovery_enabled
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm._utils import is_mpi_peer_failure
 from tensorrt_llm.logger import logger
@@ -933,38 +934,6 @@ class MoeLoadBalancer:
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
 
-    def reconfigure_mask_only_with_timeout(self, dead_ranks: list[int],
-                                           timeout_s: float) -> None:
-        """Run :meth:`reconfigure_mask_only`, giving up after ``timeout_s``.
-
-        The native call ends in an unbounded ``cudaEventSynchronize``, so it
-        runs on a helper thread and the caller regains control at the
-        deadline. After a timeout the load balancer must not be used again.
-
-        Raises:
-            TimeoutError: The reconfiguration did not finish in time.
-        """
-        device = torch.cuda.current_device()
-        errors: list[Exception] = []
-
-        def reconfigure():
-            try:
-                torch.cuda.set_device(device)
-                self.reconfigure_mask_only(dead_ranks)
-            except Exception as error:  # noqa: BLE001 - re-raised by the caller
-                errors.append(error)
-
-        thread = threading.Thread(target=reconfigure,
-                                  name="eplb_mask_reconfigure",
-                                  daemon=True)
-        thread.start()
-        thread.join(max(timeout_s, 0.0))
-        if thread.is_alive():
-            raise TimeoutError(
-                f"EPLB mask reconfiguration did not finish in {timeout_s:.1f}s")
-        if errors:
-            raise errors[0]
-
     def check_routing_excludes(self, dead_ranks: Iterable[int]) -> None:
         """Check that the live device routing never selects a slot on ``dead_ranks``.
 
@@ -1065,12 +1034,15 @@ class MoeLoadBalancer:
         self.is_shutdown = True
 
     def _shared_barrier(self) -> None:
-        """Wait for the node's other ranks; a rank that died no longer uses the
-        shared memory."""
+        """Wait for the node's other ranks.
+
+        With peer-loss recovery, a rank that died no longer uses the shared
+        memory, so its absence is tolerated.
+        """
         try:
             self.shared_mpi_comm.barrier()
         except MPI.Exception as error:
-            if not is_mpi_peer_failure(error):
+            if not (recovery_enabled() and is_mpi_peer_failure(error)):
                 raise
 
     def __repr__(self):

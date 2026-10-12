@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import pickle  # nosec B403
 import threading
 import time
@@ -828,7 +829,12 @@ class PeerFailureWatch:
             time.sleep(self._poll_interval)
 
     def stop(self) -> None:
-        """Stop watching and release the receive and the communicator."""
+        """Stop watching and release the receive and the communicator.
+
+        Idempotent.
+        """
+        if self._stop.is_set():
+            return
         self._stop.set()
         self._thread.join()
         try:
@@ -874,15 +880,17 @@ class MPIDist(Distributed):
         recovery may need to interrupt.
 
         Raises:
-            RuntimeError: The MPI library lacks ULFM, or MPI was not
-                initialized with ``MPI_THREAD_MULTIPLE``.
+            RuntimeError: The job was not launched with ULFM fault tolerance,
+                or MPI was not initialized with ``MPI_THREAD_MULTIPLE``.
         """
-        if not all(
-                hasattr(MPI.Comm, name)
-                for name in ("Revoke", "Shrink", "Get_failed")):
+        if not hasattr(MPI.Comm, "Shrink"):
+            raise RuntimeError("Peer-loss recovery requires mpi4py>=4")
+        # Without fault tolerance enabled at launch, a lost process ends the
+        # job even though the library exposes the ULFM calls.
+        if os.environ.get("OMPI_MCA_mpi_ft_enable") not in ("1", "true"):
             raise RuntimeError(
-                "Peer-loss recovery requires mpi4py>=4 on an MPI library "
-                "with ULFM support")
+                "Peer-loss recovery requires Open MPI with ULFM fault "
+                "tolerance; launch with `mpirun --with-ft ulfm`")
         if MPI.Query_thread() != MPI.THREAD_MULTIPLE:
             raise RuntimeError(
                 "Peer-loss recovery requires MPI_THREAD_MULTIPLE")

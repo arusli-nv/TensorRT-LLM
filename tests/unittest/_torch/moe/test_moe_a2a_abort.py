@@ -135,9 +135,9 @@ def test_registered_source_slots_preserve_excluded_state(row_bytes: int) -> None
     ).view(-1, _HIDDEN)
 
     # Poison everything source rank 1 owns in rank 0's workspace.
-    counters = _offset(meta, "RECV_COUNTERS")
+    # Rank 0 itself resets its receive counters for source 1 each round and never reads them while
+    # source 1 is masked, so they are not part of the quarantined state.
     tombstones = [workspace[0, start + source_stride : start + 2 * source_stride]]
-    tombstones.extend(_word(workspace, counters + 4 * (parity * ep_size + 1)) for parity in (0, 1))
     for name in ("DISPATCH_COMPLETION_FLAGS", "COMBINE_COMPLETION_FLAGS"):
         tombstones.append(_word(workspace, _offset(meta, name) + 4))
     stats = _offset(meta, "EPLB_GATHERED_STATS") + ep_size * 4
@@ -145,6 +145,7 @@ def test_registered_source_slots_preserve_excluded_state(row_bytes: int) -> None
     tombstones[0].fill_(0xA5)
     for value in tombstones[1:]:
         value.fill_(2**31 - 1)
+    tombstone_values = [torch.full_like(value, 2**31 - 1) for value in tombstones[1:]]
 
     local_stats = {
         bucket: torch.tensor([bucket, 0], dtype=torch.int32, device="cuda") for bucket in (4, 8)
@@ -184,7 +185,9 @@ def test_registered_source_slots_preserve_excluded_state(row_bytes: int) -> None
         assert torch.all(received[1][0] == 0) and torch.all(received[1][1] == -1)
         assert gathered.tolist() == [[bucket, 0], [0, 0]]
         assert torch.all(tombstones[0] == 0xA5)
-        assert all(torch.all(value == 2**31 - 1) for value in tombstones[1:])
+        assert [value.tolist() for value in tombstones[1:]] == [
+            value.tolist() for value in tombstone_values
+        ]
         assert abort.tolist() == [0, 0]
 
 
@@ -229,12 +232,17 @@ def test_descriptor_validation(
     make: Callable[[], torch.Tensor], controls: dict, message: str
 ) -> None:
     workspace, meta, experts, payload = _setup(1)
-    kwargs = {**_controls(make()), **controls}
+    kwargs = {
+        **_controls(make()),
+        "expert_id_payload_index": 1,
+        "invalid_token_expert_id": -1,
+        **controls,
+    }
     if not kwargs["enable_rank_mask"]:
         del kwargs["active_rank_mask"]
     with pytest.raises(RuntimeError, match=message):
         torch.ops.trtllm.moe_a2a_dispatch(
-            experts, [payload], workspace, meta, _CAPACITY, 0, 1, 1, 1, **kwargs
+            experts, [payload, experts], workspace, meta, _CAPACITY, 0, 1, 1, 1, **kwargs
         )
 
 
@@ -276,8 +284,10 @@ def _pending_wait(phase: str, tokens: int) -> None:
         done.record(execution)
     time.sleep(0.5)
     assert not done.query(), f"{question}: completed before the silent peer signaled"
+    # Request the abort with a copy, as production does: kernels may occupy every SM.
+    request = torch.ones(1, dtype=torch.int32).pin_memory()
     with torch.cuda.stream(control):
-        abort[:1].fill_(1)
+        abort[:1].copy_(request, non_blocking=True)
     deadline = time.monotonic() + 10
     while not done.query():
         assert time.monotonic() < deadline, f"{question}: wait ignored the abort request"
@@ -305,8 +315,10 @@ def _fence_timeout() -> None:
 @pytest.mark.parametrize("mode,timeout_s", [("cancel", 60), ("timeout", 1)])
 def test_pending_fence_waits(mode: str, timeout_s: int) -> None:
     # The native timeout budget is cached on first use, so each mode needs a fresh interpreter.
+    # The child traps on purpose; keep it off the enclosing launcher's process-management interface.
+    launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)},
         "TRTLLM_MOE_A2A_TIMEOUT_SEC": str(timeout_s),
         "TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC": str(timeout_s),
     }

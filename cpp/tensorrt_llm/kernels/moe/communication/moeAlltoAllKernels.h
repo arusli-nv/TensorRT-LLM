@@ -74,8 +74,8 @@ struct MoeA2AAbortState
     static constexpr int32_t kHealthy = 0;
     static constexpr int32_t kCancelled = 1;
 
-    int32_t requested;
-    int32_t status;
+    int32_t requested; // Set by the host to release kernels waiting on lost peers
+    int32_t status;    // Diagnostic: kCancelled once a dispatch or combine returned early
 };
 
 // Local device descriptor read by fence rank-mask kernels at execution time. Its address is fixed, so captured CUDA
@@ -92,7 +92,7 @@ static_assert(sizeof(MoeA2AFenceDescriptor) == (kRankMaskWords + 1) * sizeof(uin
 
 // Compacts this rank's fixed per-source receive slots into dense [ep_size, maxTokens] tensors. Rows of inactive
 // sources, rows past a source's received count, and all rows of an aborted execution are invalid: their expert ids
-// are set to invalidExpertId and their other payload rows are left untouched.
+// are set to invalidExpertId and their other payload rows are zeroed.
 struct MoeA2AGatherParams
 {
     void const* source[kMaxPayloads]; // Slot of source rank 0 per payload

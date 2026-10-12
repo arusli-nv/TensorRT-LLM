@@ -26,13 +26,16 @@ from tensorrt_llm.logger import logger
 
 from ..distributed.communicator import HostCollectiveInterrupted, PeerFailureWatch
 from ..moe.fused_moe.wide_ep_ft import recovery_enabled
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .llm_request import LlmRequest, LlmResponse
+from .resource_manager import KVCacheManager, ResourceManagerType
 from .scheduler import ScheduledRequests
 from .scheduler.adp_router import DefaultADPRouter
 
 if TYPE_CHECKING:
     from tensorrt_llm.executor.recovery.client import RecoveryClient
 
+    from .executor_request_queue import RequestQueueItem
     from .py_executor import PyExecutor
     from .sampler import SampleState
 
@@ -43,7 +46,11 @@ _REGISTRATION_TIMEOUT_S = 600.0
 
 Responses = List[Tuple[int, LlmResponse]]
 
-_registration: Optional[Tuple[int, "RecoveryClient", frozenset]] = None
+_registration: Optional[Tuple["RecoveryClient", frozenset]] = None
+
+
+def _recovery_timeout_s() -> float:
+    return float(os.environ.get(RECOVERY_TIMEOUT_ENV, _RECOVERY_TIMEOUT_DEFAULT_S))
 
 
 def _register(rank: int, recoverable_ranks: Tuple[int, ...]) -> Tuple["RecoveryClient", frozenset]:
@@ -60,12 +67,13 @@ def _register(rank: int, recoverable_ranks: Tuple[int, ...]) -> Tuple["RecoveryC
         from tensorrt_llm.executor.recovery.client import RecoveryClient
 
         client = RecoveryClient.from_env(rank)
+        logger.info(
+            f"Rank {rank}: registering with the WideEP recovery authority; "
+            f"waiting up to {_REGISTRATION_TIMEOUT_S:.0f} s for every rank"
+        )
         admitted = client.register(recoverable_ranks, time.monotonic() + _REGISTRATION_TIMEOUT_S)
-        _registration = (rank, client, admitted)
-    registered_rank, client, admitted = _registration
-    if registered_rank != rank:
-        raise RuntimeError(f"Rank {rank} registered as rank {registered_rank}")
-    return client, admitted
+        _registration = (client, admitted)
+    return _registration
 
 
 class PeerLossRecovery:
@@ -83,13 +91,18 @@ class PeerLossRecovery:
     resources and :meth:`commit_step` before applying its results; a step in
     between is discarded when a peer fails. Response gathers report through
     :meth:`gathering_responses` and :meth:`responses_gathered` so that the
-    responses of an interrupted gather are delivered after recovery.
+    responses of an interrupted gather are delivered after recovery. The rest of
+    that iteration is skipped. For the supported configuration it holds no
+    request state: statistics are dropped, KV cache manager V1 stores the
+    step's context blocks for reuse when the request is released instead, and
+    V2 records each generation request's KV history length again on the
+    request's next step.
     """
 
     def __init__(self, executor: "PyExecutor", client: "RecoveryClient") -> None:
         self._executor = executor
         self._client = client
-        self._timeout_s = float(os.environ.get(RECOVERY_TIMEOUT_ENV, _RECOVERY_TIMEOUT_DEFAULT_S))
+        self._timeout_s = _recovery_timeout_s()
         self._uncommitted_step: Optional[ScheduledRequests] = None
         self._peer_failed = threading.Event()
         self._watch: Optional[PeerFailureWatch] = None
@@ -101,9 +114,9 @@ class PeerLossRecovery:
         self._last_processed_gather = 0
         # Finished requests whose termination waits for their responses.
         self._undelivered_terminations: List[LlmRequest] = []
-        # On rank 0: request id -> (attention-DP rank, client id) of every
+        # On rank 0: request id -> (attention-DP rank, routed item) of every
         # routed request that has not finished.
-        self._request_owners: Optional[Dict[int, Tuple[int, Optional[int]]]] = None
+        self._request_owners: Optional[Dict[int, Tuple[int, "RequestQueueItem"]]] = None
         if executor.dist.rank == 0:
             self._request_owners = {}
 
@@ -112,10 +125,10 @@ class PeerLossRecovery:
         """Return the recovery of ``executor``, or None when it is disabled.
 
         The configuration must make a discarded step re-runnable: no
-        speculative decoding, guided decoding, beam search, KV cache block
-        reuse or KV connector. Requests are expected to sample greedily;
-        penalties, seeded sampling and multi-token stop words are not rolled
-        back with a discarded step.
+        speculative decoding, guided decoding, beam search, KV connector or
+        PEFT. Requests are expected to sample greedily; penalties, seeded
+        sampling and multi-token stop words are not rolled back with a
+        discarded step.
 
         Raises:
             ValueError: Recovery is enabled for a configuration it does not
@@ -126,12 +139,18 @@ class PeerLossRecovery:
         if not recovery_enabled():
             return None
         engine = executor.model_engine
+        mapping = executor.dist.mapping
         load_balancer = getattr(engine, "moe_load_balancer", None)
         kv_cache_manager = executor.kv_cache_manager
         requirements = {
             "attention DP": executor.enable_attention_dp,
             "MPI executor": not executor._disable_mpi,
             "PP=CP=1": executor.dist.pp_size == 1 and executor.dist.cp_size == 1,
+            "pure attention DP (TP = EP = world size, expert TP 1)": mapping.tp_size
+            == mapping.moe_ep_size
+            == mapping.world_size
+            and mapping.moe_tp_size == 1,
+            "no attention DP balancing": not executor.attention_dp_enable_balance,
             "DefaultADPRouter": type(executor.adp_router) is DefaultADPRouter,
             "no speculative decoding": executor.drafter is None
             and executor.draft_model_engine is None
@@ -140,9 +159,23 @@ class PeerLossRecovery:
             "no beam search": executor.max_beam_width == 1,
             "no KV cache transceiver": executor.kv_cache_transceiver is None,
             "no KV connector": executor.kv_connector_manager is None,
-            "no KV cache block reuse": not getattr(kv_cache_manager, "enable_block_reuse", False),
-            "KV cache manager v1": not executor._is_kv_manager_v2,
+            "KV cache manager V1 or V2": type(kv_cache_manager)
+            in (KVCacheManager, KVCacheManagerV2),
+            "no SWA scratch reuse": not getattr(
+                kv_cache_manager, "enable_swa_scratch_reuse", False
+            ),
+            "no PEFT": executor.resource_manager.get_resource_manager(
+                ResourceManagerType.PEFT_CACHE_MANAGER
+            )
+            is None,
+            "no LM head TP in attention DP": not executor.dist.mapping.enable_lm_head_tp_in_adp,
+            # An abort request must not queue behind the kernels it stops.
+            "CUDA_DEVICE_MAX_CONNECTIONS > 1": os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") != "1",
             "no overlap scheduler": executor.disable_overlap_scheduler,
+            "no conversation manager": getattr(kv_cache_manager, "conversation_manager", None)
+            is None,
+            "hang detection timeout above the recovery timeout": executor.hang_detector.timeout
+            > _recovery_timeout_s(),
             "no sleep/wakeup": getattr(executor.llm_args, "sleep_config", None) is None,
             "static EPLB": load_balancer is not None and load_balancer.is_static_routing(),
             "MoE execution state": getattr(engine, "moe_execution_state", None) is not None,
@@ -186,9 +219,13 @@ class PeerLossRecovery:
                     event_loop()
                     return
                 except HostCollectiveInterrupted as error:
-                    self._executor._discard_uncommitted_step(self._uncommitted_step)
-                    self._uncommitted_step = None
-                    self._recover(error)
+                    # The hang detector bounds recovery: a survivor that stops
+                    # making progress, for example in Shrink, hard-kills the job.
+                    with self._executor.hang_detector as hang_detector:
+                        hang_detector.checkpoint()
+                        self._executor._discard_uncommitted_step(self._uncommitted_step)
+                        self._uncommitted_step = None
+                        self._recover(error)
         finally:
             self._watch.stop()
 
@@ -196,19 +233,27 @@ class PeerLossRecovery:
         """Stop the in-flight step; runs on the peer-failure watcher thread.
 
         The flag is set before the abort request, so a step whose device work
-        finished with the flag clear never observed the abort.
+        finished with the flag clear never observed the abort. Revoking the
+        host communicators releases every survivor blocked in a host collective.
         """
         self._peer_failed.set()
         logger.warning(
             f"Rank {self._executor.dist.rank}: a peer failed; aborting in-flight MoE collectives"
         )
-        self._executor.model_engine.moe_execution_state.request_abort()
+        try:
+            self._executor.model_engine.moe_execution_state.request_abort()
+        finally:
+            self._executor.dist.revoke()
 
     # Step hooks
 
     def step_prepared(self, batch: ScheduledRequests) -> None:
         """Record that ``batch`` holds resources but has no results yet."""
         self._uncommitted_step = batch
+
+    def step_released(self) -> None:
+        """Record that the prepared step returned its resources without running."""
+        self._uncommitted_step = None
 
     def commit_step(self, sample_state: Optional["SampleState"]) -> None:
         """Accept the prepared step unless a peer failed while it ran.
@@ -238,7 +283,7 @@ class PeerLossRecovery:
             return
         for rank, items in routed.items():
             for item in items:
-                self._request_owners[item.id] = (rank, getattr(item.request, "client_id", None))
+                self._request_owners[item.id] = (rank, item)
 
     def gathering_responses(self, responses: Responses) -> None:
         """Keep this rank's part of a response gather for redelivery."""
@@ -246,7 +291,11 @@ class PeerLossRecovery:
         self._gathers.append((self._gather_count, responses))
 
     def responses_gathered(self, responses: Iterable[Tuple[int, LlmResponse]]) -> None:
-        """Note that rank 0 processed the last gather; forget finished requests."""
+        """Note that rank 0 processed the last gather; forget finished requests.
+
+        A result is final once every sequence of the request finished, and an
+        error ends the whole request, so ``n > 1`` requests leave together.
+        """
         self._last_processed_gather = self._gather_count
         if self._request_owners is None:
             return
@@ -312,12 +361,13 @@ class PeerLossRecovery:
         _expect_generation(client.wait(Install, deadline), generation)
 
         dist.install_survivors(failed)
-        engine.install_resident_placement(failed, placement_digest, deadline)
+        engine.install_resident_placement(failed, placement_digest)
         client.send(Installed(rank=rank, generation=generation))
         _expect_generation(client.wait(Commit, deadline), generation)
 
         executor._requeue_unscheduled_requests()
         self._deliver_responses(failed)
+        self._readmit_undelivered_requests(failed)
         self._peer_failed.clear()
         self._watch = dist.watch_peer_failures(self._on_peer_failure)
         logger.warning(
@@ -354,7 +404,7 @@ class PeerLossRecovery:
         ]
         self._gathers.clear()
         if self._request_owners is not None:
-            for request_id, (owner, client_id) in list(self._request_owners.items()):
+            for request_id, (owner, item) in list(self._request_owners.items()):
                 if owner in failed:
                     del self._request_owners[request_id]
                     responses.append(
@@ -366,12 +416,34 @@ class PeerLossRecovery:
                                     f"Attention DP rank {owner} failed while "
                                     "serving this request; retry it"
                                 ),
-                                client_id=client_id,
+                                client_id=getattr(item.request, "client_id", None),
                             ),
                         )
                     )
         terminations, self._undelivered_terminations = self._undelivered_terminations, []
         self._executor._publish_responses(responses, terminations)
+
+    def _readmit_undelivered_requests(self, failed: frozenset) -> None:
+        """Re-admit requests that rank 0 routed to a survivor which never received them.
+
+        Collective over the survivors. A loss can interrupt the broadcast of new
+        requests after rank 0 completed its part, so rank 0 can route a request
+        that its owner never received. The owner never started it, so rank 0
+        admits it again. Runs after redelivery, which retires finished requests.
+        """
+        held = self._executor.dist.allgather(self._executor._held_request_ids())
+        if self._request_owners is None:
+            return
+        missing = [
+            item
+            for request_id, (owner, item) in self._request_owners.items()
+            if owner not in failed and request_id not in held[owner]
+        ]
+        for item in missing:
+            del self._request_owners[item.id]
+        if missing:
+            logger.warning(f"Re-admitting {len(missing)} requests that never reached their rank")
+            self._executor.request_accumulated[:0] = missing
 
 
 def _expect_generation(message, generation: int) -> None:

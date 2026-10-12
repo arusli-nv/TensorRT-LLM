@@ -61,8 +61,8 @@ def _register_all(authority, recoverable=lambda rank: RECOVERABLE):
 
 
 def _registered(timeout: float = 10.0) -> RecoveryAuthority:
-    authority = RecoveryAuthority(WORLD, frozenset({1, FAILED}), recovery_timeout=timeout)
-    out = _register_all(authority)
+    authority = RecoveryAuthority(WORLD, recovery_timeout=timeout)
+    out = _register_all(authority, lambda rank: (1, FAILED))
     assert authority.phase is Phase.SERVING
     assert out == [(_route(rank), Registered((1, FAILED))) for rank in range(WORLD)]
     return authority
@@ -93,13 +93,6 @@ def test_admission_is_what_every_worker_can_recover_and_never_rank0():
     out = _register_all(authority, lambda rank: (0, 1, 2, 3) if rank != 3 else (0, 2, 3))
     assert authority.admitted_ranks == frozenset({2, 3})
     assert all(message == Registered((2, 3)) for _, message in out)
-
-
-def test_admitting_an_uncovered_rank_aborts_registration():
-    authority = RecoveryAuthority(WORLD, frozenset({1, FAILED}))
-    out = _register_all(authority, lambda rank: (FAILED, 3))
-    _assert_aborted(out, authority)
-    assert "[1]" in authority.abort_reason
 
 
 def test_idle_loss_recovers():
@@ -182,7 +175,7 @@ def test_duplicate_registrations_abort():
 
 
 def test_messages_before_registration_completes_abort():
-    authority = RecoveryAuthority(WORLD, frozenset({FAILED}))
+    authority = RecoveryAuthority(WORLD)
     authority.handle(_route(0), Register(0, 1, RECOVERABLE), 0.0)
     _assert_aborted(authority.handle(_route(0), Stopped(0, FAILED), 0.0), authority)
 
@@ -214,8 +207,6 @@ def test_second_loss_after_recovery_aborts():
     "kwargs",
     [
         dict(world_size=1),
-        dict(world_size=WORLD, admitted_ranks=frozenset({0})),
-        dict(world_size=WORLD, admitted_ranks=frozenset({WORLD})),
         dict(world_size=WORLD, recovery_timeout=0),
     ],
 )
@@ -285,7 +276,7 @@ def test_client_from_env(monkeypatch):
 
 @pytest.fixture
 def served(tmp_path):
-    authority = RecoveryAuthority(WORLD, frozenset({FAILED}), recovery_timeout=10.0)
+    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
     endpoint = f"ipc://{tmp_path}/authority"
     context = zmq.Context()
     socket = authority_module.router_socket(context, endpoint)
@@ -309,7 +300,7 @@ def _register_clients(clients):
     admitted = {}
 
     def register(rank):
-        admitted[rank] = clients[rank].register(RECOVERABLE, time.monotonic() + 10.0)
+        admitted[rank] = clients[rank].register((FAILED,), time.monotonic() + 10.0)
 
     threads = [threading.Thread(target=register, args=(rank,)) for rank in clients]
     for thread in threads:

@@ -1043,20 +1043,24 @@ class RemoteMpiCommSessionServer():
                 self.session.shutdown_abort()
                 if _num_failed_ranks():
                     # mpi4py.futures cannot release a world that lost a rank:
-                    # its workers wait for the departed peer forever.
+                    # its workers wait for the departed peer forever. Abort
+                    # skips the survivors' exit handlers.
                     logger.warning(
                         "RemoteMpiCommSessionServer: ending the MPI world, "
                         "which lost a rank")
-                    for handler in logging.getLogger().handlers:
-                        handler.flush()
+                    logging.shutdown()
                     sys.stdout.flush()
                     sys.stderr.flush()
                     mpi4py.MPI.COMM_WORLD.Abort(0)
                 self._close_global_comm_executor()
                 break
             elif _num_failed_ranks():
-                logger.error("RemoteMpiCommSessionServer: dropped a task; an "
-                             "MPI world that lost a rank cannot run tasks")
+                error = RuntimeError(
+                    "An MPI world that lost a rank cannot run tasks")
+                logger.error(
+                    f"RemoteMpiCommSessionServer: dropped a task: {error}")
+                if message.sync:
+                    self.queue.put(error)
             else:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",

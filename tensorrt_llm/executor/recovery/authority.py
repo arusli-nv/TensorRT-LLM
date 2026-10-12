@@ -82,10 +82,8 @@ class RecoveryAuthority:
     phase and broadcasts ``Abort``. Its attributes are read-only for callers.
 
     Args:
-        world_size: Number of worker ranks that must register.
-        admitted_ranks: Ranks whose loss may be recovered, or None for every rank
-            that all workers report as recoverable. Rank 0 is never admitted.
-            Registration aborts if a listed rank is not recoverable.
+        world_size: Number of worker ranks that must register. The loss of a rank is
+            recovered when every worker reports it recoverable; never rank 0.
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
     """
@@ -93,20 +91,14 @@ class RecoveryAuthority:
     def __init__(
         self,
         world_size: int,
-        admitted_ranks: frozenset[int] | None = None,
         recovery_timeout: float = 60.0,
     ) -> None:
         if world_size < 2:
             raise ValueError(f"world_size must be at least 2, got {world_size}")
-        if admitted_ranks is not None and (
-            not admitted_ranks or not all(0 < rank < world_size for rank in admitted_ranks)
-        ):
-            raise ValueError(f"admitted ranks must lie in [1, {world_size}): {admitted_ranks}")
         if recovery_timeout <= 0:
             raise ValueError(f"recovery_timeout must be positive, got {recovery_timeout}")
         self.world_size = world_size
         self.recovery_timeout = recovery_timeout
-        self._requested_admitted = admitted_ranks
         self.admitted_ranks: frozenset[int] = frozenset()
         self.generation = 0
         self.phase = Phase.REGISTERING
@@ -189,14 +181,7 @@ class RecoveryAuthority:
         recoverable = frozenset(range(1, self.world_size))
         for registration in self._workers.values():
             recoverable &= frozenset(registration.recoverable_ranks)
-        if self._requested_admitted is None:
-            self.admitted_ranks = recoverable
-        elif uncovered := self._requested_admitted - recoverable:
-            raise _Violation(
-                f"admitted ranks {sorted(uncovered)} lack resident replicas of all their experts"
-            )
-        else:
-            self.admitted_ranks = self._requested_admitted
+        self.admitted_ranks = recoverable
         if self.admitted_ranks:
             logger.info(
                 f"Recovery authority: {self.world_size} workers registered; "
@@ -318,11 +303,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--endpoint", required=True, help="ROUTER bind address, e.g. tcp://*:5555")
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument(
-        "--admitted-ranks",
-        help="comma-separated ranks whose loss may be recovered (default: every rank the "
-        "workers' expert placement can recover from)",
-    )
-    parser.add_argument(
         "--recovery-timeout",
         type=float,
         default=60.0,
@@ -332,12 +312,7 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     key = load_key()
-    admitted = (
-        None
-        if args.admitted_ranks is None
-        else frozenset(int(rank) for rank in args.admitted_ranks.split(","))
-    )
-    authority = RecoveryAuthority(args.world_size, admitted, args.recovery_timeout)
+    authority = RecoveryAuthority(args.world_size, args.recovery_timeout)
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())

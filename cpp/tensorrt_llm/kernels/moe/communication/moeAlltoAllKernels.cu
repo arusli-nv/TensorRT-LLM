@@ -299,15 +299,22 @@ __device__ __forceinline__ bool is_rank_active(Pointers const& ptrs, MoeA2AFence
 }
 
 // Returns whether the host requested an abort, recording the cancellation once observed.
-__device__ __forceinline__ bool abort_requested(MoeA2AAbortState* abort)
+__device__ __forceinline__ bool load_abort_request(MoeA2AAbortState const* abort)
 {
     int32_t requested;
     asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(requested) : "l"(&abort->requested));
-    if (requested != 0)
+    return requested != 0;
+}
+
+// Returns whether an abort was requested and, if so, records that this kernel cancelled.
+__device__ __forceinline__ bool abort_requested(MoeA2AAbortState* abort)
+{
+    bool const requested = load_abort_request(abort);
+    if (requested)
     {
         atomicExch(&abort->status, MoeA2AAbortState::kCancelled);
     }
-    return requested != 0;
+    return requested;
 }
 
 template <int TOP_K, bool ENABLE_RANK_MASK>
@@ -1356,9 +1363,14 @@ __global__ void moeA2AGatherLocalKernel(MoeA2AGatherParams const params)
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
-    MoeA2AFenceDescriptor* const descriptor = params.descriptor;
+    MoeA2AFenceDescriptor const* const descriptor = params.descriptor;
     // Counts of an aborted dispatch do not imply that the counted rows arrived.
-    bool const aborted = abort_requested(&descriptor->abort);
+    __shared__ bool aborted;
+    if (threadIdx.x == 0)
+    {
+        aborted = load_abort_request(&descriptor->abort);
+    }
+    __syncthreads();
     int const token = blockIdx.x;
     if (token < params.epSize * params.maxTokens)
     {
@@ -1387,6 +1399,22 @@ __global__ void moeA2AGatherLocalKernel(MoeA2AGatherParams const params)
                 for (int i = threadIdx.x; i < bytes / static_cast<int>(sizeof(int32_t)); i += blockDim.x)
                 {
                     expert_ids[i] = params.invalidExpertId;
+                }
+            }
+            else if (bytes % static_cast<int>(sizeof(int4)) == 0)
+            {
+                // Zeros keep invalid rows finite for kernels that read every row.
+                int4* const row = reinterpret_cast<int4*>(dst);
+                for (int i = threadIdx.x; i < bytes / static_cast<int>(sizeof(int4)); i += blockDim.x)
+                {
+                    row[i] = make_int4(0, 0, 0, 0);
+                }
+            }
+            else
+            {
+                for (int i = threadIdx.x; i < bytes; i += blockDim.x)
+                {
+                    dst[i] = 0;
                 }
             }
         }
@@ -1906,7 +1934,9 @@ __global__ void moeA2ACombineKernel(
         int lane_id = threadIdx.x % warpSize;
         uint32_t expected_value = *ptrs.flag_val;
 
-        if (blockIdx.x == 0)
+        // An aborted execution withholds readiness so that no peer pulls its expert outputs; the peers wait
+        // until their own abort request arrives.
+        if (blockIdx.x == 0 && !(descriptor != nullptr && load_abort_request(&descriptor->abort)))
         {
             // Signal readiness to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).

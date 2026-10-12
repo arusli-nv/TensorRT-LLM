@@ -1494,10 +1494,9 @@ class PyExecutor:
     def _run_event_loop(self) -> None:
         """Run the event loop, resuming it after each recovered peer loss.
 
-        The loop's own context managers (profiler, hang detector) exit before
-        recovery runs, so the hang detector is stopped for the bounded recovery
-        and restarted when the loop is re-entered. A failed recovery raises out
-        of here into the existing terminal path of ``_event_loop_wrapper``.
+        Recovery runs between loop entries under the hang detector. A failed
+        recovery raises out of here into the terminal path of
+        ``_event_loop_wrapper``.
         """
         if self._peer_loss_recovery is None:
             self.event_loop()
@@ -4709,6 +4708,9 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
                     self._pause_recompute_paused_requests(scheduled_batch)
+                    if self._peer_loss_recovery is not None:
+                        # The V2 scheduler allocates KV cache with the batch.
+                        self._peer_loss_recovery.step_prepared(scheduled_batch)
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
@@ -4751,6 +4753,8 @@ class PyExecutor:
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                    if self._peer_loss_recovery is not None:
+                        self._peer_loss_recovery.step_released()
                 self._finalize_adp_dummy_allocation(can_queue)
 
                 if not can_queue and scheduled_batch.encoder_requests:
@@ -8352,6 +8356,15 @@ class PyExecutor:
         if self.dist.rank == 0:
             self.request_accumulated[:0] = unscheduled
 
+    def _held_request_ids(self) -> set[int]:
+        """Ids of the client requests this rank serves."""
+        return {
+            request.parent_request_id
+            if request.is_child else request.py_request_id
+            for request in self.active_requests
+            if not request.is_attention_dp_dummy
+        }
+
     def _raise_if_peer_failed(self, operation: str, error: Exception) -> None:
         """Report an error of a step that a peer loss interrupted as such."""
         recovery = self._peer_loss_recovery
@@ -8886,7 +8899,6 @@ class PyExecutor:
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
-    @nvtx_range("_enqueue_responses")
     def _publish_responses(self, responses: Iterable[Tuple[int, LlmResponse]],
                            terminations: Iterable[LlmRequest]) -> None:
         """Enqueue ``responses``, then terminate the requests they finish.
@@ -8904,6 +8916,7 @@ class PyExecutor:
         for request in terminations:
             self._terminate_request(request)
 
+    @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         self._maybe_record_hang_diagnostic_phase("enqueueing_responses")
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:

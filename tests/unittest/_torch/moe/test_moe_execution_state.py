@@ -124,7 +124,6 @@ def test_descriptor_layout_and_install_mask() -> None:
         state.install_mask((1, 0, 0))
     state.install_mask(health.get_mask_words())
     assert state.descriptor.cpu().tolist() == [1, 0, 0, 0, 0]
-    assert state.installed_generation == 1
 
 
 def test_install_mask_rejects_aborted_record() -> None:

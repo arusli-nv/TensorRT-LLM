@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 
@@ -869,3 +870,51 @@ def test_broken_executor_counts_as_departure_only_after_a_failure(
     assert not mpi_session._is_departed_peer_failure(BrokenExecutor())
     monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
     assert mpi_session._is_departed_peer_failure(BrokenExecutor())
+
+
+@pytest.mark.cpu_only
+def test_degraded_server_fails_sync_tasks_and_ends_the_world_on_shutdown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+    from tensorrt_llm.llmapi.mpi_session import RemoteTask
+
+    class _Queue:
+
+        def __init__(self, messages):
+            self.messages = list(messages)
+            self.sent = []
+
+        def get(self):
+            return self.messages.pop(0)
+
+        def put(self, obj):
+            self.sent.append(obj)
+
+    aborted = []
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    monkeypatch.setattr(mpi_session, "logging",
+                        SimpleNamespace(shutdown=lambda: None))
+    monkeypatch.setattr(
+        mpi_session, "mpi4py",
+        SimpleNamespace(MPI=SimpleNamespace(COMM_WORLD=SimpleNamespace(
+            Abort=aborted.append))))
+    monkeypatch.setattr(RemoteMpiCommSessionServer,
+                        "_close_global_comm_executor",
+                        staticmethod(lambda: None))
+    server = RemoteMpiCommSessionServer.__new__(RemoteMpiCommSessionServer)
+    server.addr = "test"
+    server.session = Mock()
+    server.queue = _Queue([
+        RemoteTask(task=print, args=(), kwargs={}, sync=True),
+        RemoteTask(task=print, args=(), kwargs={}, sync=False),
+        None,
+    ])
+
+    server.serve()
+
+    assert len(server.queue.sent) == 1
+    assert isinstance(server.queue.sent[0], RuntimeError)
+    server.session.submit.assert_not_called()
+    assert aborted == [0]

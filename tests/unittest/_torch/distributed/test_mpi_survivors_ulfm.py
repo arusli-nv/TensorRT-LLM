@@ -35,13 +35,16 @@ _OK = "ULFM_SURVIVOR_OK"
 
 
 def _ulfm_available() -> bool:
-    """Whether mpirun exists and mpi4py has the ULFM bindings (mpi4py>=4)."""
-    if shutil.which("mpirun") is None:
+    """Whether Open MPI has the ULFM extension and mpi4py binds it (mpi4py>=4)."""
+    if shutil.which("ompi_info") is None or shutil.which("mpirun") is None:
         return False
-    return int(importlib.metadata.version("mpi4py").split(".")[0]) >= 4
+    if int(importlib.metadata.version("mpi4py").split(".")[0]) < 4:
+        return False
+    info = subprocess.run(["ompi_info"], capture_output=True, text=True, timeout=60)
+    return "ftmpi" in info.stdout
 
 
-@pytest.mark.skipif(not _ulfm_available(), reason="requires mpirun and mpi4py>=4")
+@pytest.mark.skipif(not _ulfm_available(), reason="requires Open MPI with ULFM and mpi4py>=4")
 def test_survivors_recover_from_a_departed_rank():
     command = [
         "mpirun",

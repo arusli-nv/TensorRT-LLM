@@ -59,7 +59,6 @@ class MoeExecutionState:
             [*_mask_words(snapshot.mask), 0], dtype=torch.int64, device=device
         )
         self.abort = self.descriptor[EP_MASK_NUM_WORDS:].view(torch.int32)
-        self.installed_generation = snapshot.generation
         self._memories: dict[int, MnnvlMemory] = {}
         self._workspace_resets: dict[int, Callable[[], None]] = {}
         # The abort request travels on its own stream so it does not queue
@@ -154,7 +153,6 @@ class MoeExecutionState:
         host = torch.tensor(_mask_words(committed), dtype=torch.int64)
         self.descriptor[:EP_MASK_NUM_WORDS].copy_(host)
         torch.cuda.synchronize(self.descriptor.device)
-        self.installed_generation = snapshot.generation
 
     def close(self) -> None:
         """Release the workspace pins. Only call after the last forward has completed."""

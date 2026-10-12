@@ -548,6 +548,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     bool const sanitizeExpertIds = expertIdPayloadIndex.has_value() || invalidTokenExpertId.has_value();
     TORCH_CHECK(expertIdPayloadIndex.has_value() == invalidTokenExpertId.has_value(),
         "expert_id_payload_index and invalid_token_expert_id must be provided together");
+    // Rows of masked or aborted sources hold no received tokens; the gather marks their expert ids invalid.
+    TORCH_CHECK(!executionDescriptor.has_value() || sanitizeExpertIds,
+        "execution_descriptor requires expert_id_payload_index and invalid_token_expert_id");
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
     if (enableEplb)
@@ -943,10 +946,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
     TORCH_CHECK(combinePayloadOffset >= 0, "combinePayloadOffset must be non-negative");
     uint8_t* combinePayloadPtr = rankWorkSpacePtr + combinePayloadOffset;
-    if (executionDescriptor.has_value())
-    {
-        validateFixedSlotWorkspace(workspace, offsets, runtimeMaxTokensPerRank);
-    }
     // If the caller claims the payload is in the workspace, ensure it really is: a mismatch would
     // otherwise silently fall back to staging and lose the zero-copy path the caller asked for.
     if (payloadInWorkspace)
@@ -1177,6 +1176,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     // Note that we returns recv_tensors as a list of views into workspace, we need to upcast its alias
     // group to wildcard (a!->*). See
     // https://github.com/pytorch/pytorch/blob/b1eb6dede556136f9fdcee28415b0358d58ad877/aten/src/ATen/native/README.md#annotations
+    // The (a!) outputs alias the workspace; with an execution_descriptor they are fresh tensors filled by the gather.
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, "
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
