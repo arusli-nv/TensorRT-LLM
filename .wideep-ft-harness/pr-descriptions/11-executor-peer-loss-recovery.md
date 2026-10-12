@@ -2,7 +2,7 @@
 
 ## Description
 
-When one worker process of a WideEP deployment dies, idle or mid-step, the other ranks now keep serving on the CUDA graphs captured at startup. Nothing reloads, recompiles, recaptures or retunes. Requests on surviving ranks continue with the same tokens, and requests of the dead rank's attention-DP shard fail with a retryable error. This PR ties the series together in the executor. It is PR 11 of the series and depends on PRs 2 to 10.
+When one worker process of a WideEP deployment dies, idle or mid-step, the other ranks now keep serving on the CUDA graphs captured at startup. Nothing reloads, recompiles, recaptures or retunes. Requests on surviving ranks continue with the same tokens, and requests of the dead rank's attention-DP shard, whose KV cache was lost, fail with an explicit error asking the client to retry. This PR ties the series together in the executor. It is PR 11 of the series and depends on PRs 2 to 10.
 
 `peer_loss_recovery.py` adds `PeerLossRecovery`, and `py_executor.py` calls it. On each survivor:
 
