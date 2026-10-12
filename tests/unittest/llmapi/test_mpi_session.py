@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 
@@ -718,3 +719,171 @@ def test_server_close_is_a_noop_without_a_global_executor(
     MPINodeState._global_comm_executor = None
     # Must not touch MPI at all (no abort callable is even constructed).
     RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
+
+
+class _FakeMPIException(Exception):
+
+    def __init__(self, error_class: int) -> None:
+        super().__init__(f"MPI error class {error_class}")
+        self.error_class = error_class
+
+
+@pytest.fixture(params=[False, True], ids=["no_recovery", "recovery"])
+def _fake_ulfm_mpi(request, monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Fake ULFM MPI with one departed rank; the param enables recovery."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    monkeypatch.setattr(
+        mpi_session,
+        "mpi4py",
+        SimpleNamespace(MPI=SimpleNamespace(Exception=_FakeMPIException)),
+        raising=False)
+    monkeypatch.setattr(mpi_session, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpi_session, "is_mpi_peer_failure", lambda error: isinstance(
+            error, _FakeMPIException) and error.error_class in (75, 76, 77))
+    monkeypatch.setattr(mpi_session, "_recovery_enabled", lambda: request.param)
+    # A departed peer has been reported once a peer-failure error surfaced.
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    return request.param
+
+
+def _async_failure(exc: BaseException):
+    from concurrent.futures import Future
+
+    future = Future()
+    future.set_exception(exc)
+    return future
+
+
+@pytest.mark.cpu_only
+def test_server_async_callback_departed_peer(monkeypatch: pytest.MonkeyPatch,
+                                             _fake_ulfm_mpi: bool):
+    """Departed peers are not forwarded only when recovery is enabled.
+
+    Any other worker failure is still forwarded to the client, and so is a
+    broken executor before ULFM reports a failed rank.
+    """
+    from concurrent.futures import BrokenExecutor
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    recovery = _fake_ulfm_mpi
+    server = object.__new__(RemoteMpiCommSessionServer)
+    sent = []
+    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
+
+    departed = [
+        _FakeMPIException(75),
+        _FakeMPIException(77),
+        BrokenExecutor("manager lost a worker")
+    ]
+    for exc in departed:
+        server.mpi_async_error_callback(_async_failure(exc))
+    assert len(sent) == (0 if recovery else len(departed))
+
+    sent.clear()
+    server.mpi_async_error_callback(_async_failure(_FakeMPIException(16)))
+    server.mpi_async_error_callback(_async_failure(RuntimeError("segfault")))
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 0)
+    server.mpi_async_error_callback(_async_failure(BrokenExecutor()))
+    assert len(sent) == 3
+
+
+@pytest.mark.cpu_only
+def test_task_end_barrier_tolerates_departed_peer_with_recovery(
+        monkeypatch: pytest.MonkeyPatch, _fake_ulfm_mpi: bool) -> None:
+    from tensorrt_llm.llmapi import mpi_session
+
+    recovery = _fake_ulfm_mpi
+    error = _FakeMPIException(75)
+
+    def failing_barrier():
+        raise error
+
+    monkeypatch.setattr(mpi_session, "mpi_barrier", failing_barrier)
+    if recovery:
+        RemoteMpiCommSessionServer._finish_barrier()
+    else:
+        with pytest.raises(_FakeMPIException):
+            RemoteMpiCommSessionServer._finish_barrier()
+
+    error.error_class = 16
+    with pytest.raises(_FakeMPIException):
+        RemoteMpiCommSessionServer._finish_barrier()
+
+
+@pytest.mark.cpu_only
+def test_server_stops_waiting_for_tasks_after_a_rank_departed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """After ULFM reports a failed rank, the server stops waiting for task results.
+
+    No result arrives any more, so the server only accepts shutdown.
+    """
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    done = Future()
+    done.set_result(None)
+    never = Future()
+    monkeypatch.setattr(mpi_session, "_recovery_enabled", lambda: True)
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    assert RemoteMpiCommSessionServer._live_worker_futures([done, never]) == []
+
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 0)
+    assert RemoteMpiCommSessionServer._live_worker_futures([done]) == [done]
+
+    monkeypatch.setattr(mpi_session, "_recovery_enabled", lambda: False)
+    futures = [done, never]
+    assert RemoteMpiCommSessionServer._live_worker_futures(futures) is futures
+
+
+@pytest.mark.cpu_only
+def test_degraded_server_fails_sync_tasks_and_ends_the_world_on_shutdown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+    from tensorrt_llm.llmapi.mpi_session import RemoteTask
+
+    class _Queue:
+
+        def __init__(self, messages):
+            self.messages = list(messages)
+            self.sent = []
+
+        def get(self):
+            return self.messages.pop(0)
+
+        def put(self, obj):
+            self.sent.append(obj)
+
+    aborted = []
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    monkeypatch.setattr(mpi_session, "logging",
+                        SimpleNamespace(shutdown=lambda: None))
+    monkeypatch.setattr(
+        mpi_session, "mpi4py",
+        SimpleNamespace(MPI=SimpleNamespace(COMM_WORLD=SimpleNamespace(
+            Abort=aborted.append))))
+    monkeypatch.setattr(RemoteMpiCommSessionServer,
+                        "_close_global_comm_executor",
+                        staticmethod(lambda: None))
+    server = RemoteMpiCommSessionServer.__new__(RemoteMpiCommSessionServer)
+    server.addr = "test"
+    server.session = Mock()
+    server.queue = _Queue([
+        RemoteTask(task=print, args=(), kwargs={}, sync=True),
+        RemoteTask(task=print, args=(), kwargs={}, sync=False),
+        None,
+    ])
+
+    server.serve()
+
+    assert len(server.queue.sent) == 1
+    assert isinstance(server.queue.sent[0], RuntimeError)
+    server.session.submit.assert_not_called()
+    assert aborted == [0]

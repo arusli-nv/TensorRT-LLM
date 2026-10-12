@@ -18,7 +18,9 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import recovery_enabled
 from tensorrt_llm._torch.utils import EventType
+from tensorrt_llm._utils import is_mpi_peer_failure
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -996,11 +998,23 @@ class MoeLoadBalancer:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
         self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
-        self.shared_mpi_comm.barrier()
+        self._shared_barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_post_shutdown_cleanup()
-        self.shared_mpi_comm.barrier()
+        self._shared_barrier()
         self.is_shutdown = True
+
+    def _shared_barrier(self) -> None:
+        """Wait for the node's other ranks.
+
+        With peer-loss recovery, a rank that died no longer uses the shared
+        memory, so its absence is tolerated.
+        """
+        try:
+            self.shared_mpi_comm.barrier()
+        except MPI.Exception as error:
+            if not (recovery_enabled() and is_mpi_peer_failure(error)):
+                raise
 
     def __repr__(self):
         """
