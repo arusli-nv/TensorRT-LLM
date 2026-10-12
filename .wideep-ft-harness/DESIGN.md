@@ -144,7 +144,7 @@ FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     max_num_tokens_per_rank = 4 (fix
 - strided expert inputs: would change every MoE backend;
 - recapturing graphs after a loss: slow, and graphs captured with fewer ranks would not match.
 
-## 7. Limits and next steps
+## 7. Limits
 
 - **Biggest gap: FT runs at about half of production throughput.** It does not support the
   overlap scheduler or MTP yet; with both, the same 32 GPUs reach 157k tokens/s versus 80k
@@ -154,8 +154,6 @@ FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     max_num_tokens_per_rank = 4 (fix
   hybrid/Mamba, the CFT all-to-all mode, Ray and RPC executors.
 - **Other limits:** one loss per job; rank 0 must survive; the lost rank's requests fail rather than
   move; the server keeps reporting "healthy".
-- **Next:** overlap scheduler and MTP (production WideEP uses both), online EPLB, then restoring the
-  job to full size with a replacement rank.
 
 Launch and configuration: `docs/source/features/wide-ep-fault-tolerance.md`.
 
@@ -163,67 +161,80 @@ Launch and configuration: `docs/source/features/wide-ep-fault-tolerance.md`.
 
 One commit per PR, in merge order. The first four are standalone fixes.
 
-| # | Commit | PR | Tests and evidence |
-|---|---|---|---|
-| 1 | [bf3791cb9c](https://github.com/arusli-nv/TensorRT-LLM/commit/bf3791cb9c) | `[fix]` propagate fatal RPC worker errors | unit tests |
-| 2 | [b0bb2786ad](https://github.com/arusli-nv/TensorRT-LLM/commit/b0bb2786ad) | `[fix]` bound RPC socket teardown with unreachable peers | unit tests |
-| 3 | [6f7331dc5e](https://github.com/arusli-nv/TensorRT-LLM/commit/6f7331dc5e) | `[fix]` skip request updates without a sampling result | unit tests |
-| 4 | [82e568a236](https://github.com/arusli-nv/TensorRT-LLM/commit/82e568a236) | `[fix]` keep EPGroupHealth identity across ConfigurableMoE deepcopy | unit test |
-| 5 | [200602863d](https://github.com/arusli-nv/TensorRT-LLM/commit/200602863d) | `[infra]` upgrade mpi4py to 4.1.2 | ULFM bindings test; image build |
-| 6 | [c989b2bc8a](https://github.com/arusli-nv/TensorRT-LLM/commit/c989b2bc8a) | `[feat]` WideEP recovery authority | fault injection at every protocol step; end-to-end over ZeroMQ |
-| 7 | [7de2a38e53](https://github.com/arusli-nv/TensorRT-LLM/commit/7de2a38e53) | `[feat]` ULFM survivor communicators for host collectives | real 4-rank ULFM run; losing rank 1, 2 or 30 |
-| 8 | [bf6ff93509](https://github.com/arusli-nv/TensorRT-LLM/commit/bf6ff93509) | `[feat]` fault-tolerant execution descriptor for the NVLinkOneSided all-to-all | abort inside graphs; timeout still traps; FT-off kernels instruction-identical |
-| 9 | [948efcc0e9](https://github.com/arusli-nv/TensorRT-LLM/commit/948efcc0e9) | `[feat]` MoE execution state for WideEP recovery | abort with and without CUDA graphs; 2-process SIGKILL late-write test |
-| 10 | [c4354a62f5](https://github.com/arusli-nv/TensorRT-LLM/commit/c4354a62f5) | `[feat]` resident-replica EPLB placement after a rank loss | coverage tests; uncovered loss fails closed |
-| 11 | [7abbf48a36](https://github.com/arusli-nv/TensorRT-LLM/commit/7abbf48a36) | `[feat]` let attention-DP routing skip absent ranks | unit tests; kill under full load |
-| 12 | [68524ed0c1](https://github.com/arusli-nv/TensorRT-LLM/commit/68524ed0c1) | `[feat]` keep the MPI session serving after a peer loss | bounded teardown tests |
-| 13 | [80f188e1c7](https://github.com/arusli-nv/TensorRT-LLM/commit/80f188e1c7) | `[feat]` recover the executor from a WideEP peer loss, with the docs page | rollback tests (V1, V2, reuse); 4-GPU CI test; multi-node runs |
-
-The multi-node runs compare tokens with a reference run whose EPLB excludes the killed rank from the
-start, because greedy tokens depend on which rank serves each expert.
-
-## Appendix: mapping to the internal design document (v7)
-
-Each row is one work item of the internal design "WideEP Fault Tolerance in TensorRT-LLM" (v7),
-with the commit that implements it and the main code.
-
-### Implemented
-
-
-| v7 item | Title | Commit | Code | Status |
-|---|---|---|---|---|
-| 1a.8 | Recoverable execution abort | [8][c8], [4][c4] | [kernels], [op] | done |
-| 1a.8a | Backend-mode safety qualification (late writes) | [8][c8], [9][c9] | [kernels], [nvlink] | done, non-CFT |
-| 1a.8b | Backend-mode abort/quiescence integration | [9][c9] | [state], [nvlink] | done, non-CFT |
-| 1a.11 | Fixed-capacity graph execution | [8][c8] | [kernels], [op] | done |
-| 1b.2a | Replica/capacity admission | [10][c10], [6][c6] | [eplb], [authority] | done |
-| 1b.4a | Logical/physical mapping foundation | [10][c10] | [eplb] | done for static EPLB |
-| 1c.3 | MPI evidence transport | [5][c5], [7][c7] | [communicator] | done (ULFM) |
-| 1c.3a | Runtime adapter and survivor-authority contract | [7][c7], [6][c6] | [communicator], [authority] | done |
-| 1c.4 | Engine hook | [13][c13], [3][c3] | [recovery], [executor] | done |
-| 1c.4a | Survivor-aware management collectives | [7][c7], [11][c11] | [communicator], [adp] | done |
-| 1c.4b | Sole recovery coordinator and backend interface | [6][c6] | [authority] | done |
-| 1c.4c | Request disposition | [13][c13], [3][c3] | [recovery], [kv] | done |
-| 1d.1 | Poisoned lifecycle and public admission policy | [12][c12], [1][c1], [2][c2], [13][c13] | [session], [recovery] | done; env-var gate, not `LlmArgs` |
-| 1d.4a | Physical acceptance | [13][c13] | [ci] | done: EP32 R1/Kimi-K2, EP16, EP64 |
-| 1d.5 | Performance gate | [8][c8], [13][c13] | [docs] | done: −2.4% / −3.7% all-active, 98% degraded |
-
-Supporting commits without their own item: [1][c1] and [2][c2] (RPC fatal errors and teardown,
-under 1d.1), [3][c3] (absent sample state, under 1c.4c), [4][c4] (shared EPGroupHealth, under 1a.8).
-
-### Not implemented yet
-| v7 item | Title | Why |
+| # | Commit | PR |
 |---|---|---|
-| 1a.6 | TwoSided kernel/binding coverage | MVP uses NVLinkOneSided |
-| 1a.7 | NCCL recovery primitives | MVP uses MPI/ULFM |
-| 1b.3 | Quiesced EPLB integration | online EPLB rejected at startup |
-| 1b.7 | N−K placement and missing experts | uncovered losses fail closed |
-| 1c.2 | Per-rank evidence budgets | later |
-| 1c.6 | Multi-failure agreement | one loss per job |
-| 1d.3 | Health and passive metrics | server keeps reporting healthy |
-| 1d.7 | v1 qualification | later |
+| 1 | [bf3791cb9c](https://github.com/arusli-nv/TensorRT-LLM/commit/bf3791cb9c) | `[fix]` propagate fatal RPC worker errors |
+| 2 | [b0bb2786ad](https://github.com/arusli-nv/TensorRT-LLM/commit/b0bb2786ad) | `[fix]` bound RPC socket teardown with unreachable peers |
+| 3 | [6f7331dc5e](https://github.com/arusli-nv/TensorRT-LLM/commit/6f7331dc5e) | `[fix]` skip request updates without a sampling result |
+| 4 | [82e568a236](https://github.com/arusli-nv/TensorRT-LLM/commit/82e568a236) | `[fix]` keep EPGroupHealth identity across ConfigurableMoE deepcopy |
+| 5 | [200602863d](https://github.com/arusli-nv/TensorRT-LLM/commit/200602863d) | `[infra]` upgrade mpi4py to 4.1.2 |
+| 6 | [c989b2bc8a](https://github.com/arusli-nv/TensorRT-LLM/commit/c989b2bc8a) | `[feat]` WideEP recovery authority |
+| 7 | [7de2a38e53](https://github.com/arusli-nv/TensorRT-LLM/commit/7de2a38e53) | `[feat]` ULFM survivor communicators for host collectives |
+| 8 | [bf6ff93509](https://github.com/arusli-nv/TensorRT-LLM/commit/bf6ff93509) | `[feat]` fault-tolerant execution descriptor for the NVLinkOneSided all-to-all |
+| 9 | [948efcc0e9](https://github.com/arusli-nv/TensorRT-LLM/commit/948efcc0e9) | `[feat]` MoE execution state for WideEP recovery |
+| 10 | [c4354a62f5](https://github.com/arusli-nv/TensorRT-LLM/commit/c4354a62f5) | `[feat]` resident-replica EPLB placement after a rank loss |
+| 11 | [7abbf48a36](https://github.com/arusli-nv/TensorRT-LLM/commit/7abbf48a36) | `[feat]` let attention-DP routing skip absent ranks |
+| 12 | [68524ed0c1](https://github.com/arusli-nv/TensorRT-LLM/commit/68524ed0c1) | `[feat]` keep the MPI session serving after a peer loss |
+| 13 | [80f188e1c7](https://github.com/arusli-nv/TensorRT-LLM/commit/80f188e1c7) | `[feat]` recover the executor from a WideEP peer loss, with the docs page |
 
-Merged upstream before this work: 1a.1, 1a.2, 1a.4, 1b.2, 1c.1, 1d.0.
+## 9. Status against the Phase 1 work items
+
+### Reused merged foundations
+
+| ID | Already on main | Used for |
+|---|---|---|
+| 1a.1 (#13302) | process-local rank-health mask and generation | source of the live-rank mask |
+| 1a.2 (#13404) | rank masking in the all-to-all kernels, at launch time | extended to run-time masking inside CUDA graphs |
+| 1a.3, 1a.4 (#15524) | Python binding, detection-only watchdog | kept |
+| 1b.1, 1b.2 (#15525) | mask-only EPLB API; rejects zero-replica outcomes | routing around the lost rank |
+| 1c.1 (#15677) | EP error classification | kept |
+| 1d.0 (#14160) | no abort or parent kill from signal handlers | survivors stay alive |
+
+### New in this work
+
+| ID | Delivered | Commits |
+|---|---|---|
+| 1a.8 | recoverable abort: run-time descriptor, host-memory abort flag | [8][c8], [4][c4] |
+| 1a.8a | late-write safety (non-CFT): fixed per-source slots, gather kernel | [8][c8], [9][c9] |
+| 1a.8b | abort, rearm and mask install for the bound workspaces | [9][c9] |
+| 1a.11 | rank-mask execution inside CUDA graphs (main rejected it) | [8][c8] |
+| 1b.2a | coverage check at startup and at loss time; authority admission | [10][c10], [6][c6] |
+| 1b.4a | fixed-N logical/physical mapping; fixed-size gathers | [10][c10], [7][c7], [11][c11] |
+| 1c.3 | MPI failure transport via ULFM (mpi4py 4.1.2) | [5][c5], [7][c7] |
+| 1c.3a | ULFM runtime adapter; survivor–authority protocol | [7][c7], [6][c6] |
+| 1c.4, 1c.4c | engine hook: commit gate, KV rollback, response resend, retryable errors | [13][c13], [3][c3] |
+| 1c.4a | survivor communicator; attention-DP routing over survivors | [7][c7], [11][c11] |
+| 1c.4b | external recovery authority as sole coordinator | [6][c6] |
+| 1d.1 | degraded MPI session, bounded teardown, startup config checks | [12][c12], [1][c1], [2][c2], [13][c13] |
+| 1d.4a | multi-node kill qualification; 4-GPU CI test | [13][c13] |
+| 1d.5 | overhead and degraded throughput measured (section 3) | — |
+
+### Validated configurations
+
+- **Models and scale:** DeepSeek-R1 NVFP4 on 16, 32 and 64 GB200 GPUs; Kimi-K2 NVFP4 on 32.
+- **Serving config:** attention DP, expert TP 1, static EPLB with spare slots, NVLinkOneSided
+  (non-CFT), CUTEDSL MoE backend, decode CUDA graphs, non-overlap scheduler, KV cache managers V1
+  and V2, chunked prefill, prefix caching on and off, fp8 KV cache and low-precision combine at 64
+  requests per GPU.
+- **Failures:** SIGKILL of one rank (1, 2, 30 or 62, including other nodes) while idle, while
+  generating, during the MoE all-to-all, during prefill, and under full load. An uncovered loss
+  fails closed.
+- **Tests:** unit tests in the CPU and GPU pre-merge stages; a 4-GPU GB200 integration test
+  post-merge.
+
+### Remaining Phase 1 qualification
+
+- **CI image:** needs Open MPI with ULFM and mpi4py 4.1.2; until then the ULFM tests skip.
+- **Production config:** overlap scheduler and MTP (FT halves throughput without them), online
+  EPLB (1b.3).
+- **1d.3:** health reporting (the server reports "healthy" while degraded).
+- **1d.7:** v1 qualification, including other MoE and attention backends and long soak runs.
+- **Not started:** 1a.6 (TwoSided), 1a.7 (NCCL), 1b.7 (N−K placement with missing experts),
+  1c.2 (per-rank evidence budgets).
+
+### Follow-ups beyond Phase 1
+
+CFT, Ray, disaggregated serving, repeated failures (1c.6), restore to N ranks.
 
 [c1]: https://github.com/arusli-nv/TensorRT-LLM/commit/bf3791cb9c
 [c2]: https://github.com/arusli-nv/TensorRT-LLM/commit/b0bb2786ad
