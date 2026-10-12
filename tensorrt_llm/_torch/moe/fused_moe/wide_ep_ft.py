@@ -41,6 +41,13 @@ def _env_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV) == "1"
 
 
+def recovery_enabled() -> bool:
+    """Whether WideEP worker-loss recovery is enabled for this process."""
+    from tensorrt_llm.executor.recovery.client import recovery_requested
+
+    return recovery_requested()
+
+
 def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) -> float:
     if key in extra_attrs:
         return float(extra_attrs[key])
@@ -60,14 +67,16 @@ def get_wide_ep_ft_options(
     one process-local membership object shared by all MoE communication layers.
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
-    committed membership directly. Rank-mask mode rejects CUDA graphs until
-    generation-scoped invalidation and recapture are implemented.
+    committed membership directly. Rank-mask mode rejects CUDA graphs unless
+    recovery is enabled, in which case every NVLinkOneSided layer must be bound
+    to a ``MoeExecutionState`` before capture.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
     health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
+    recovery = recovery_enabled()
     rank_mask_enabled = health is not None or _env_enabled()
-    if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
+    if rank_mask_enabled and not recovery and getattr(model_config, "use_cuda_graph", False):
         raise ValueError(
             "WideEP fault tolerance does not support CUDA graphs until generation-scoped "
             "invalidation and recapture are implemented"
