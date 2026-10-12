@@ -1,4 +1,4 @@
-[None][feat] resident-replica EPLB placement after a rank loss
+[None][feat] resident-replica EPLB placement after a peer loss
 
 ## Description
 
@@ -8,9 +8,8 @@ After a rank loss, routing must stop selecting the dead rank's slots without mov
 
 - `masked_placement_digest(dead_ranks)`, a SHA-256 over every layer's slot table with the dead ranks cleared. It raises when an expert would lose its last replica. Survivors compare digests through the authority, so ranks that agree route identically.
 - `covers_loss_of(rank)`, which decides at startup which ranks are recoverable.
-- `check_routing_excludes(dead_ranks)`, which routes every expert through each layer's device routing table once per slot, so the round-robin replica choice visits each replica, and fails if any route reaches a dead rank.
 
-`ModelEngine.install_resident_placement` runs while the engine is idle, in this order: install the masked placement, compare its digest with the agreed one, check device routing, mark the failed ranks in `EPGroupHealth` (a rank that is already failed is an error), rearm the workspace, then install the mask. Routing must exclude a rank before the mask does, because masked kernels drop routes to it silently.
+`ModelEngine.install_resident_placement` runs while the engine is idle, in this order: install the masked placement through main's mask-only EPLB API, mark the failed ranks in `EPGroupHealth` (a rank that is already failed is an error), rearm the workspace, then install the mask. Routing must exclude a rank before the mask does, because masked kernels drop routes to it silently.
 
 The node-local shared-memory barrier in `MoeLoadBalancer` tolerates a dead peer only with recovery on.
 
@@ -22,11 +21,10 @@ This PR does not stand alone: its methods get their first caller in PR 11.
 
 ## Test Coverage
 
-New file `tests/unittest/_torch/executor/test_resident_placement.py`. The pre-merge stages that collect `unittest/_torch/executor` run it: `l0_cpu` runs the `cpu_only` tests, and the GPU stages (`l0_h100`, `l0_b300`) run the rest.
+New file `tests/unittest/_torch/executor/test_resident_placement.py`. The pre-merge stages that collect `unittest/_torch/executor` run it: `l0_cpu` runs them.
 
 - `test_masked_placement_digest_is_deterministic_and_mask_sensitive` and `test_masked_placement_digest_rejects_lost_expert_and_bad_rank`.
-- `test_install_resident_placement_commits_mask` and `test_install_resident_placement_rejects_divergent_placement`.
-- `test_check_routing_excludes_accepts_routing_around_departed_rank` and `test_check_routing_excludes_rejects_route_to_departed_rank` need a CUDA device. They use a layer stub whose round-robin routing mirrors the device routing, so they check the checker, not the routing kernel.
+- `test_install_resident_placement_commits_mask`, which also checks that routing is updated before the mask.
 
 ## PR Checklist
 

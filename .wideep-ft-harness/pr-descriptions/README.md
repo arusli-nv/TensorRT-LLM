@@ -11,7 +11,7 @@ commits on branch `wideep-ft` and the deliverables table in `../DESIGN.md`. Merg
 | 4 | 04-ulfm-survivor-communicators.md | `[None][feat] ULFM survivor communicators for host collectives` | 2 (image) for the ULFM test |
 | 5 | 05-a2a-execution-descriptor.md | `[None][feat] fault-tolerant execution descriptor for the NVLinkOneSided all-to-all` | none |
 | 6 | 06-moe-execution-state.md | `[None][feat] MoE execution state for WideEP recovery` | 1, 3, 5 |
-| 7 | 07-resident-replica-eplb.md | `[None][feat] resident-replica EPLB placement after a rank loss` | 4, 6 |
+| 7 | 07-resident-replica-eplb.md | `[None][feat] resident-replica EPLB placement after a peer loss` | 4, 6 |
 | 8 | 08-adp-absent-ranks.md | `[None][feat] let attention-DP routing skip absent ranks` | 4 |
 | 9 | 09-mpi-session-peer-loss.md | `[None][feat] keep the MPI session serving after a peer loss` | 3, 4 |
 | 10 | 10-kv-cache-revert.md | `[None][feat] revert the KV cache allocations of a discarded step` | none |

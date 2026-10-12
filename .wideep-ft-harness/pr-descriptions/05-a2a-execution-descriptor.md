@@ -25,7 +25,7 @@ PR 6 binds the descriptor to the model. It also carries the two-process late-wri
 
 - `test_cancel_and_exclusion_on_replay` checks that one captured graph observes the abort record and the mask written before each replay: a pending abort releases both waits, and the same graph completes once the silent peer is masked.
 - `test_registered_source_slots_preserve_excluded_state` checks that graphs of different batch sizes share the fixed source slots and leave an excluded source's storage untouched.
-- `test_gather_bounds_received_count`, `test_source_slots_reject_runtime_over_capacity` and `test_descriptor_validation`.
+- `test_gather_bounds_received_count`, `test_source_slots_reject_runtime_over_capacity` and `test_descriptor_rejects_cft_counted_writes`.
 - `test_descriptor_schema_and_fake_signatures` checks that the fake ops match the schema.
 - `test_fence_timeout_still_traps` checks in a fresh interpreter that a wait on a silent peer without an abort request still traps at the timeout.
 

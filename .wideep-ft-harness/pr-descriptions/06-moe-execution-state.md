@@ -8,7 +8,7 @@ This PR binds the execution descriptor of PR 5 to the model, so survivors can ab
 - `nvlink_one_sided.py` adds `bind_execution_state`, workspace sizing for fixed source slots and a private workspace reset that `rearm` calls, and passes the descriptor to dispatch and combine. Bound execution requires the fence path and relies on the device timeout instead of the host watchdog, which bound layers never start.
 - `wide_ep_ft.py` adds `recovery_enabled()`, which delegates to the cached `recovery_requested()` of PR 3, and allows CUDA graphs in rank-mask mode only when recovery binds the layers.
 - `_mnnvl_utils.py` adds `MnnvlMemory.pin` and `unpin`. Captured graphs address the workspace directly, so close and checkpoint leave a pinned allocation mapped.
-- `DecoderRunner` creates the state, `ModelEngine.moe_execution_state` exposes it, and engine cleanup closes it after it releases the CUDA graphs. `MOE_DEVELOPER_GUIDE.md` gets a section on descriptor execution.
+- `DecoderRunner` creates the state, `ModelEngine.moe_execution_state` exposes it, and engine cleanup closes it after it releases the CUDA graphs.
 
 FT-off impact: `for_model()` returns `None`, no layer is bound, the workspace keeps its size, the watchdog path is unchanged, and rank-mask mode still rejects CUDA graphs.
 

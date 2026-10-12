@@ -7,7 +7,7 @@ When one worker of a WideEP job dies, host collectives that include it hang or a
 `MPIDist` in `communicator.py` gains:
 
 - `enable_peer_loss_recovery()`. It requires a pure attention-DP layout (`tp_size == moe_ep_size == world_size`, no PP or CP), mpi4py 4 or later, a ULFM launch and `MPI_THREAD_MULTIPLE`, so an unsupported job fails at startup. It checks `OMPI_MCA_mpi_ft_enable`, because the library exposes the ULFM calls even when the launch did not enable them. It moves host collectives to a private duplicate of `COMM_WORLD`, so revoking it leaves the MPI session usable.
-- `revoke()`, `shrink()` and `install_survivors()`. `Shrink` gives every survivor the same failed set, and installation keeps logical ranks. `install_survivors()` rejects a committed failed set that differs from the shrink result.
+- `revoke()`, `shrink()` and `install_survivors()`. `Shrink` gives every survivor the same failed set, and installation keeps logical ranks.
 - `watch_peer_failures()`, which returns a `PeerFailureWatch`. Its thread posts an `Irecv(ANY_SOURCE)` that no rank matches on a private communicator, and ULFM completes it with an error when a member dies. It calls back once and stops idempotently.
 - With recovery on, peer-failure MPI errors from collectives become `HostCollectiveInterrupted`, which carries the known failed ranks. Other errors propagate unchanged.
 - After installation, gathers keep each result at its logical rank. Object gathers return `None` for the departed rank, `tp_allgather_int64` takes a `fill_value`, and `live_ranks` lists the ranks still present.
