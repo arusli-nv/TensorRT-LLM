@@ -50,7 +50,8 @@ from ...logger import logger
 from ...mapping import Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+                          rewind_context_after_cache_drop)
 from .scheduler import ScheduledRequests
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
@@ -1236,6 +1237,33 @@ class KVCacheManager(BaseResourceManager):
         # `context_requests_last_chunk` in `add_sequence` due to KV cache
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
+
+    def revert_prepare_resources(self,
+                                 scheduled_batch: ScheduledRequests) -> None:
+        """Undo :meth:`prepare_resources` for a step whose forward is discarded.
+
+        First context chunks release the sequences added for them without
+        storing their blocks for reuse, since the discarded forward may have
+        written invalid KV; generation requests give back the tokens added for
+        the step. The KV contents the discarded forward wrote are overwritten
+        when the step runs again.
+        """
+        if (self.kv_cache_type == CacheTypeCpp.CROSS
+                or self.mapping.has_cp_helix()):
+            raise NotImplementedError(
+                "Reverting prepared KV cache resources supports only "
+                "self-attention caches without helix context parallelism")
+        _, added = self._collect_context_sequences(scheduled_batch,
+                                                   is_cross=False)
+        for req in added:
+            self.impl.remove_sequence(req.py_request_id, None, False)
+            # The re-run may match a shorter reusable prefix than this step did.
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
+        for req in scheduled_batch.generation_requests:
+            draft_len = get_draft_token_length(req)
+            self.impl.rewind_kv_cache(
+                req.py_request_id,
+                1 + max(draft_len, self._kv_reserve_draft_tokens))
 
     def _maybe_apply_spec_recompute_tail(
             self, batch_llm_requests: List[LlmRequest]) -> None:
