@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import hashlib
 import os
 import threading
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,7 +18,9 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import recovery_enabled
 from tensorrt_llm._torch.utils import EventType
+from tensorrt_llm._utils import is_mpi_peer_failure
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -793,6 +796,8 @@ class MoeLoadBalancer:
                                                        layer_updates_per_iter)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
+        # (top_k, slot_count_per_rank) of each layer, for routing checks.
+        self._layer_routing_shapes: List[Tuple[int, int]] = []
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(
             'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
         self._setup_mpi_comm()
@@ -876,6 +881,7 @@ class MoeLoadBalancer:
         single_layer_load_balancer.set_shared_memory_base_name(
             self.shared_memory_base_name)
         self.single_layer_load_balancers.append(single_layer_load_balancer)
+        self._layer_routing_shapes.append((top_k, slot_count_per_rank))
         return single_layer_load_balancer
 
     def register_weight_slots_after_to_cuda(self):
@@ -928,6 +934,70 @@ class MoeLoadBalancer:
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
 
+    def check_routing_excludes(self, dead_ranks: Iterable[int]) -> None:
+        """Check that the live device routing never selects a slot on ``dead_ranks``.
+
+        Routes every expert through each layer's device routing table once per
+        slot, so the round-robin replica choice visits each of its replicas.
+
+        Raises:
+            RuntimeError: A layer still routes an expert to a dead rank.
+        """
+        dead = torch.tensor(sorted(set(dead_ranks)), dtype=torch.int32)
+        for layer, (top_k,
+                    slots_per_rank) in zip(self.single_layer_load_balancers,
+                                           self._layer_routing_shapes):
+            experts = torch.arange(layer.expert_count,
+                                   dtype=torch.int32,
+                                   device="cuda").repeat_interleave(
+                                       self.ep_size * slots_per_rank * top_k)
+            slots = layer.route(experts.view(-1, top_k)).cpu()
+            reaches_dead = torch.isin(slots // slots_per_rank, dead)
+            if reaches_dead.any():
+                stranded = sorted(
+                    set(experts.cpu()[reaches_dead.view(-1)].tolist()))
+                raise RuntimeError(
+                    f"MoE layer {layer.get_layer_idx()} still routes experts "
+                    f"{stranded} to departed ranks {dead.tolist()}")
+
+    def covers_loss_of(self, rank: int) -> bool:
+        """Whether every expert keeps a replica outside ``rank``."""
+        try:
+            self.masked_placement_digest([rank])
+        except ValueError:
+            return False
+        return True
+
+    def masked_placement_digest(self, dead_ranks: Iterable[int]) -> str:
+        """Return a digest of the current placement with ``dead_ranks`` masked.
+
+        The digest covers every layer's slot table with the slots of
+        ``dead_ranks`` cleared, so ranks that agree on it route identically.
+
+        Raises:
+            ValueError: A rank is out of range, or an expert would be left
+                without a replica outside ``dead_ranks``.
+        """
+        dead = sorted(set(dead_ranks))
+        if any(rank < 0 or rank >= self.ep_size for rank in dead):
+            raise ValueError(
+                f"Dead ranks {dead} out of range for EP size {self.ep_size}")
+        digest = hashlib.sha256(np.asarray(dead, dtype=np.int64).tobytes())
+        for layer in self.single_layer_load_balancers:
+            placement = np.asarray(layer.get_old_rank_expert_ids(),
+                                   dtype=np.int32)
+            placement[dead] = -1
+            resident = np.unique(placement[placement >= 0])
+            if not np.array_equal(resident, np.arange(layer.expert_count)):
+                missing = sorted(
+                    set(range(layer.expert_count)) - set(resident.tolist()))
+                raise ValueError(
+                    f"MoE layer {layer.get_layer_idx()} has no surviving "
+                    f"replica for experts {missing}")
+            digest.update(np.asarray(placement.shape, dtype=np.int64).tobytes())
+            digest.update(placement.tobytes())
+        return digest.hexdigest()
+
     def start_iter(self):
         """
         Start a new iteration.
@@ -957,11 +1027,23 @@ class MoeLoadBalancer:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
         self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
-        self.shared_mpi_comm.barrier()
+        self._shared_barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_post_shutdown_cleanup()
-        self.shared_mpi_comm.barrier()
+        self._shared_barrier()
         self.is_shutdown = True
+
+    def _shared_barrier(self) -> None:
+        """Wait for the node's other ranks.
+
+        With peer-loss recovery, a rank that died no longer uses the shared
+        memory, so its absence is tolerated.
+        """
+        try:
+            self.shared_mpi_comm.barrier()
+        except MPI.Exception as error:
+            if not (recovery_enabled() and is_mpi_peer_failure(error)):
+                raise
 
     def __repr__(self):
         """

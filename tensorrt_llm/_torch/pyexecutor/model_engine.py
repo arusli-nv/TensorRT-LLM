@@ -940,6 +940,33 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer.set_iter_info(enable_statistic=value[0],
                                             enable_update_weights=value[1])
 
+    def install_resident_placement(self, failed_ranks: frozenset[int],
+                                   placement_digest: str) -> None:
+        """Route MoE traffic around ``failed_ranks`` using resident replicas.
+
+        Must run while the engine is idle. Routing must exclude the failed
+        ranks before their mask is installed, because the MoE kernels silently
+        skip routes to a masked rank.
+
+        Args:
+            failed_ranks: Logical EP ranks that left the group.
+            placement_digest: ``MoeLoadBalancer.masked_placement_digest`` that
+                every survivor agreed on.
+        """
+        load_balancer = self.moe_load_balancer
+        load_balancer.reconfigure_mask_only(sorted(failed_ranks))
+        if load_balancer.masked_placement_digest(
+                failed_ranks) != placement_digest:
+            raise RuntimeError(
+                "Installed EPLB placement differs from the agreed placement")
+        load_balancer.check_routing_excludes(failed_ranks)
+        execution_state = self.moe_execution_state
+        for rank in sorted(failed_ranks):
+            if not execution_state.health.mark_failed(rank):
+                raise RuntimeError(f"EP rank {rank} is already failed")
+        execution_state.rearm()
+        execution_state.install_mask()
+
     @contextmanager
     def set_warmup_flag(self):
         prev_is_warmup = self.is_warmup
