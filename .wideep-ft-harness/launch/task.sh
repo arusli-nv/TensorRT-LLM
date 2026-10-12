@@ -27,18 +27,22 @@ np=$((nnodes * ppn))
 forward=()
 for var in $(compgen -e | grep -E '^(TLLM_|TRTLLM_|LLM_MODELS_ROOT$|PYTHONUNBUFFERED$|HOME$)'); do forward+=(-x "$var"); done
 set +e
-# A degraded ULFM world can leave mpirun waiting after every rank has exited; give up on it
-# two minutes after the frontend finished.
-(
-    while [[ ! -e "$run/frontend.done" ]]; do sleep 5; done
-    sleep 120
-    pkill -TERM -f "mpirun --with-ft ulfm" && echo "MPIRUN_RC=launcher-timeout"
-) &
-guard=$!
 mpirun --with-ft ulfm --prtemca plm ssh --prtemca plm_ssh_agent "python3 $L/remote_exec.py" \
     --prtemca plm_ssh_no_tree_spawn 1 --mca pml ob1 --mca btl self,tcp --mca coll '^hcoll,ucc' \
     -x WIDEEP_AGENT_PORT -x WIDEEP_AGENT_KEY_FILE -x PATH -x LD_LIBRARY_PATH "${forward[@]}" \
-    --host "${hosts%,}" -np "$np" --map-by ppr:$ppn:node --bind-to none "$@"
+    --host "${hosts%,}" -np "$np" --map-by ppr:$ppn:node --bind-to none "$@" &
+launcher=$!
+# After a rank loss, mpirun can outlive every rank even after MPI_Abort. Stop it
+# WIDEEP_LAUNCHER_GRACE_S (default 60) after the frontend finished, escalating to SIGKILL, so the
+# allocation never idles. Profiled runs need longer to write their reports.
+(
+    while [[ ! -e "$run/frontend.done" ]] && kill -0 $launcher 2>/dev/null; do sleep 5; done
+    for _ in $(seq "${WIDEEP_LAUNCHER_GRACE_S:-60}"); do kill -0 $launcher 2>/dev/null || exit 0; sleep 1; done
+    echo "MPIRUN_RC=launcher-timeout"
+    kill -TERM $launcher; sleep 10; kill -KILL $launcher 2>/dev/null
+) &
+guard=$!
+wait $launcher
 rc=$?
 kill $guard 2>/dev/null
 touch "$run/done"

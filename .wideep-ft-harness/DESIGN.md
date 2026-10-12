@@ -87,8 +87,9 @@ cleanly.
    The watcher thread posts an `Irecv(ANY_SOURCE)` that no rank matches, on a private
    communicator. ULFM completes it with an error when any member dies. The watcher then sets the
    step-abort flag, requests a device abort, and revokes the host communicators so every blocked
-   survivor wakes. The abort request is a pinned host-to-device copy on a side stream. It needs no
-   SM, so it reaches kernels that occupy the whole GPU.
+   survivor wakes. The abort record lives in pinned host memory that kernels read through its
+   mapped address, so the request is a plain CPU store. It needs no CUDA work to make progress,
+   so it reaches kernels that occupy the whole GPU, eager or graph-replayed.
 2. **Discard.** The commit gate sits before `_update_request_states`. It syncs the step and raises
    if the flag is set. Rollback then runs `revert_prepare_resources`. V1 releases first-chunk
    sequences without storing their blocks for reuse and rewinds generation tokens. V2 undoes the
@@ -104,6 +105,9 @@ cleanly.
    installs the mask. It replies `Installed`.
 6. **Commit.** On `Commit`, survivors resend the responses rank 0 did not process, fail the dead
    rank's requests, restart the watcher, and resume the same active requests.
+
+A rank whose own event loop crashes while recovery could replace it exits alone with SIGKILL, so
+the survivors recover from its loss as from any other.
 
 Recovery runs under the executor's `HangDetector`, which hard-kills the job if a step stalls.
 Workers wait at most 120 s for the authority, whose own deadline is 60 s. At EP32, survivors'
@@ -158,8 +162,9 @@ owning rank, which it uses to fail the dead rank's requests. It keeps numbered r
 so it can resend an interrupted one, and it defers request terminations until delivery.
 
 **MPI session.** `mpi_session.py`. After a loss, new tasks fail fast. Shutdown flushes the logs
-and ends with `MPI_Abort(0)`, which bounds teardown as v7 1d.1 asks. mpi4py's threads print
-`MPI_ERR_PROC_FAILED` tracebacks, which are harmless.
+and ends with `MPI_Abort(0)`, which bounds teardown as v7 1d.1 asks. Every rank exits, but on
+multiple nodes `mpirun` can outlive them after the abort, so the launcher must stop it once the
+server exits. mpi4py's threads print `MPI_ERR_PROC_FAILED` tracebacks, which are harmless.
 
 **Launch.** Run `mpirun --with-ft ulfm --mca pml ob1 --mca btl self,tcp --mca coll ^hcoll,ucc`.
 ULFM needs these components. MPI carries only host control traffic, and MoE data uses NVLink.

@@ -8,6 +8,8 @@
 - TLLM_TEST_KILL_IN_REPLAY=path (with TLLM_TEST_KILL_RANK=r): once ``path`` exists, rank r
   SIGKILLs itself at a decode graph replay, after the step's host collectives and before
   launching its GPU work, so the survivors' MoE collectives of that step wait for it.
+- TLLM_TEST_KILL_IN_PREFILL=path (with TLLM_TEST_KILL_RANK=r): the same, but at a forward with
+  context requests, which runs eagerly on every attention-DP rank.
 
 - TLLM_TEST_NO_COMMIT_SYNC=1: the executor's commit gate checks the peer-failure flag without
   waiting for the step's device work (performance attribution only; unsafe).
@@ -27,12 +29,22 @@ import time
 EPLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 GRAPHS = "tensorrt_llm._torch.pyexecutor.cuda_graph_runner"
 EXECUTOR = "tensorrt_llm._torch.pyexecutor.py_executor"
+ENGINE = "tensorrt_llm._torch.pyexecutor.model_engine"
 COMMUNICATOR = "tensorrt_llm._torch.distributed.communicator"
 exclude_rank = os.environ.get("TLLM_TEST_ORACLE_EXCLUDE_RANK")
 trace_capture = os.environ.get("TLLM_TEST_TRACE_CAPTURE") == "1"
 mpi_rank = os.environ.get("OMPI_COMM_WORLD_RANK")
-kill_trigger = os.environ.get("TLLM_TEST_KILL_IN_REPLAY")
+kill_in_prefill = os.environ.get("TLLM_TEST_KILL_IN_PREFILL")
+kill_trigger = os.environ.get("TLLM_TEST_KILL_IN_REPLAY") or kill_in_prefill
 kill_here = kill_trigger is not None and os.environ.get("TLLM_TEST_KILL_RANK") == mpi_rank
+
+
+def _self_kill_if_triggered():
+    if os.path.exists(kill_trigger):
+        import signal
+
+        print(f"WIDEEP_SELF_KILL rank {mpi_rank} t={time.time():.3f}", flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def _patch_eplb(module):
@@ -57,18 +69,25 @@ def _patch_graphs(module):
             return original_capture(self, key, *args, **kwargs)
 
         module.CUDAGraphRunner.capture = capture
-    if kill_here:
-        import signal
-
+    if kill_here and not kill_in_prefill:
         original_replay = module.CUDAGraphRunner.replay
 
         def replay(self, *args, **kwargs):
-            if os.path.exists(kill_trigger):
-                print(f"WIDEEP_SELF_KILL rank {mpi_rank} t={time.time():.3f}", flush=True)
-                os.kill(os.getpid(), signal.SIGKILL)
+            _self_kill_if_triggered()
             return original_replay(self, *args, **kwargs)
 
         module.CUDAGraphRunner.replay = replay
+
+
+def _patch_engine(module):
+    original_forward = module.PyTorchModelEngine.forward
+
+    def forward(self, batch, *args, **kwargs):
+        if getattr(batch, "num_context_requests", 0) > 0:
+            _self_kill_if_triggered()
+        return original_forward(self, batch, *args, **kwargs)
+
+    module.PyTorchModelEngine.forward = forward
 
 
 def _patch_executor(module):
@@ -91,8 +110,10 @@ if os.environ.get("TLLM_TEST_NO_COMMIT_SYNC") == "1":
     PATCHES[EXECUTOR] = _patch_executor
 if exclude_rank is not None:
     PATCHES[EPLB] = _patch_eplb
-if trace_capture or kill_here:
+if trace_capture or (kill_here and not kill_in_prefill):
     PATCHES[GRAPHS] = _patch_graphs
+if kill_here and kill_in_prefill:
+    PATCHES[ENGINE] = _patch_engine
 
 
 class _Finder(importlib.abc.MetaPathFinder):

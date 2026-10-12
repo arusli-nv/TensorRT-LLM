@@ -33,6 +33,6 @@ run cpu $T/executor/test_recovery_authority.py \
 # The rest of test_mpi_session.py spawns MPI processes, which the Slurm container cannot; run ours.
 run session $T/llmapi/test_mpi_session.py -k "departed or departure or degraded"
 run executor $T/_torch/executor/test_py_executor.py $T/_torch/test_mnnvl_memory_lifecycle.py
-[[ -n "${SKIP_GPU_MOE:-}" ]] || run gpu_moe -v $T/_torch/moe/test_moe_a2a_abort.py $T/_torch/moe/test_moe_execution_state.py \
+[[ -n "${SKIP_GPU_MOE:-}" ]] || run gpu_moe -v $T/_torch/moe/test_moe_a2a_abort.py $T/_torch/moe/test_moe_execution_state.py $T/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py $T/_torch/executor/test_kv_cache_revert.py \
     $T/_torch/modules/test_alltoall_watchdog.py $T/_torch/test_mnnvl_alltoall_workspace.py
 echo ALL_DONE

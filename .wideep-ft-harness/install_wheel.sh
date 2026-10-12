@@ -4,6 +4,8 @@
 # Usage: install_wheel.sh DIST_DIR LOG
 set -uo pipefail
 dist=$1; log=$2
+# The harness directory: fixed, so a private /tmp copy of these scripts still finds it.
+harness=${WIDEEP_HARNESS:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude}
 pip install --no-deps --force-reinstall "$dist"/*.whl > "$log" 2>&1 || { echo INSTALL_FAILED; tail -20 "$log"; exit 1; }
 missing=$(python3 - <<'PY'
 from importlib.metadata import PackageNotFoundError, requires, version
@@ -25,10 +27,10 @@ if [[ -n "$missing" ]]; then
         -r "$log.req" >> "$log" 2>&1 || { echo DEPS_INSTALL_FAILED; tail -20 "$log"; exit 1; }
 fi
 # mpi4py through TRT-LLM's own build script (the branch bumps it to 4.0 for ULFM).
-mpi4py_script=${MPI4PY_SCRIPT:-$(dirname "$(realpath "$0")")/wt/docker/common/install_mpi4py.sh}
+mpi4py_script=${MPI4PY_SCRIPT:-$harness/wt/docker/common/install_mpi4py.sh}
 # The script compiles mpi4py; reuse the package it installed when the script is unchanged.
 site=$(cd / && python3 -c "import site; print(site.getsitepackages()[0])")
-cache=$(dirname "$(realpath "$0")")/cache/mpi4py-$(sha256sum "$mpi4py_script" | cut -c1-16).tar
+cache=$harness/cache/mpi4py-$(sha256sum "$mpi4py_script" | cut -c1-16).tar
 if [[ -s "$cache" ]]; then
     rm -rf "$site"/mpi4py "$site"/mpi4py-*.dist-info
     tar -xf "$cache" -C "$site" >> "$log" 2>&1 || { echo MPI4PY_CACHE_FAILED; exit 1; }

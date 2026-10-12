@@ -23,8 +23,10 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 # (prompt, expected substring, attention-DP rank that serves it)
-REQUESTS = [("The capital of France is", "Paris", 0), ("The capital of Italy is", "Rome", 17),
-            ("The capital of Japan is", "Tokyo", 31)]
+WORLD = int(os.environ.get("WIDEEP_WORLD", "32"))
+REQUESTS = [("The capital of France is", "Paris", 0),
+            ("The capital of Italy is", "Rome", WORLD // 2 + 1),
+            ("The capital of Japan is", "Tokyo", WORLD - 1)]
 
 
 def find_worker(rank: int) -> int:
@@ -67,10 +69,10 @@ def collect(requests, pending: list, deadline: float) -> list[dict]:
     return rows
 
 
-def bench(llm: LLM, per_rank: int, max_tokens: int, ranks: int = 32) -> dict:
-    """Full decode batches on every attention-DP rank; returns throughput and latency."""
+def bench(llm: LLM, per_rank: int, max_tokens: int, ranks=range(WORLD)) -> dict:
+    """Full decode batches on the given attention-DP ranks; returns throughput and latency."""
     requests = [(f"Request {i} on rank {rank}: the capital of France is", "", rank)
-                for rank in range(ranks) for i in range(per_rank)]
+                for rank in ranks for i in range(per_rank)]
     start = time.monotonic()
     pending = submit(llm, requests, max_tokens)
     latencies = []
@@ -99,6 +101,11 @@ def main() -> None:
     parser.add_argument("--inflight-after", type=float,
                         help="kill this many seconds into a decode instead of while idle")
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--bench-tokens", type=int, default=480)
+    parser.add_argument("--load-kill", type=float, metavar="S",
+                        help="kill S seconds into a full load of long, chunk-prefilled prompts")
+    parser.add_argument("--degraded-bench", type=int, metavar="PER_RANK",
+                        help="after an idle-mode recovery, benchmark the survivors")
     parser.add_argument("--bench", type=int, metavar="PER_RANK",
                         help="measure decode throughput with PER_RANK requests on every "
                         "attention-DP rank; no kill")
@@ -113,17 +120,21 @@ def main() -> None:
         (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
 
     def kill_victim() -> float:
-        pid = find_worker(args.victim)
-        result["victim_pid"] = pid
         if args.trigger is None:
+            pid = find_worker(args.victim)
+            result["victim_pid"] = pid
             os.kill(pid, signal.SIGKILL)
+            result["kill_wall_s"] = time.time()
             return time.monotonic()
+        # The victim may run on another node; it logs a line right before killing itself.
         args.trigger.touch()
+        log = args.output / f"rank-{args.victim}.log"
         deadline = time.monotonic() + 60
-        while Path(f"/proc/{pid}").exists():
+        while b"WIDEEP_SELF_KILL" not in log.read_bytes():
             if time.monotonic() > deadline:
                 raise TimeoutError("victim did not kill itself after the trigger")
             time.sleep(0.001)
+        result["kill_wall_s"] = time.time()
         return time.monotonic()
 
     llm = None
@@ -143,6 +154,31 @@ def main() -> None:
             return
         if args.no_kill:
             result["state"] = "PASS_HEALTHY" if result["deterministic"] else "FAIL_NONDETERMINISTIC"
+            return
+
+        if args.load_kill is not None:
+            # About 400 prompt tokens, so prefill spans several chunks of max_num_tokens.
+            filler = " ".join(f"item{i}" for i in range(130))
+            requests = [(f"Request {i} on rank {rank}. {filler}. The capital of France is", "", rank)
+                        for rank in range(WORLD) for i in range(args.bench or 8)]
+            pending = submit(llm, requests, 64)
+            time.sleep(args.load_kill)
+            killed = kill_victim()
+            rows = collect(requests, pending, time.monotonic() + 600)
+            result["recovered_requests_done_s"] = time.monotonic() - killed
+            survivors = [row for row in rows if row["adp_rank"] != args.victim]
+            victims = [row for row in rows if row["adp_rank"] == args.victim]
+            result["survivor_requests"] = len(survivors)
+            result["survivor_failures"] = sum("error" in row or len(row["token_ids"]) != 64
+                                              for row in survivors)
+            result["victim_requests_failed"] = sum("error" in row for row in victims)
+            result["victim_requests"] = len(victims)
+            # A victim request may have finished before the kill; any other outcome must be the
+            # retry error, and at least one must show the kill landed mid-load.
+            victims_ok = all("error" in row or len(row["token_ids"]) == 64 for row in victims)
+            ok = (result["survivor_failures"] == 0 and victims_ok
+                  and result["victim_requests_failed"] > 0)
+            result["state"] = "PASS" if ok else "FAIL"
             return
 
         if args.inflight_after is not None:
@@ -165,6 +201,12 @@ def main() -> None:
         # after the kill, so they race the survivors' detection of the loss.
         time.sleep(2)
         killed = kill_victim()
+        prompt, _, adp_rank = REQUESTS[0]
+        probe = llm.generate_async(
+            prompt, SamplingParams(temperature=0, max_tokens=4, ignore_eos=True), streaming=True,
+            scheduling_params=SchedulingParams(attention_dp_rank=adp_rank, attention_dp_relax=False))
+        next(iter(probe))
+        result["first_token_after_kill_s"] = time.monotonic() - killed
         result["recovered"] = collect(REQUESTS, submit(llm, REQUESTS, args.max_tokens),
                                       time.monotonic() + 300)
         result["recovered_requests_done_s"] = time.monotonic() - killed
@@ -172,6 +214,10 @@ def main() -> None:
         same = tokens(expected) == tokens(result["recovered"])
         result["exact_tokens_after_loss"] = same
         result["state"] = "PASS" if same else "FAIL_TOKENS_DIFFER"
+        if args.degraded_bench:
+            survivors = [rank for rank in range(WORLD) if rank != args.victim]
+            result["degraded_bench"] = [bench(llm, args.degraded_bench, args.bench_tokens, survivors)
+                                        for _ in range(3)]
     except BaseException as error:
         result["error"] = repr(error)
         raise
