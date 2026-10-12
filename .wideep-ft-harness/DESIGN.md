@@ -2,163 +2,153 @@
 
 ## Summary
 
-A wide expert-parallel (WideEP) deployment spreads one model over 16 to 64 GPUs, one worker
-process (rank) per GPU. Today, if one rank dies, the whole job dies: a restart takes minutes and
-every in-flight request is lost.
-
-With fault tolerance (FT) on, the surviving ranks keep serving on the CUDA graphs they captured at
-startup. Nothing reloads, recompiles or recaptures. Requests on surviving ranks continue with the
-same tokens; only the requests the lost rank was serving fail, with a retryable error.
+- Today, losing one worker process (rank) of a WideEP job kills the whole job.
+- With fault tolerance (FT), the surviving ranks keep serving **on the CUDA graphs captured at
+  startup**: no reload, recompile or recapture.
+- Survivors' requests continue with the same tokens. Only the lost rank's requests fail, with a
+  retryable error.
 
 ![Recovery time and throughput](evidence/results.svg)
 
-Measured on DeepSeek-R1 NVFP4 on 32 GB200 GPUs. With FT built in but turned off, nothing changes:
-the kernels used are instruction-identical to main. No CUDA graph is recaptured after a loss.
+DeepSeek-R1 NVFP4, 32 GB200 GPUs (EP32, attention DP). Kimi-K2 and 16 and 64 GPUs show similar
+results.
 
-Tested by killing ranks at every stage of a step, on several models and scales (section 4). The
-current scope is one loss, of any rank but rank 0, with attention data parallelism and static
-expert placement; section 5 lists what is not supported yet.
+## 1. Today's failover (without FT)
 
-## 1. Background
+- A rank dies → its peers' MoE all-to-all kernels spin on flags it never sets, until a device
+  timeout traps and kills their CUDA contexts. Host collectives that include it hang or abort.
+- The whole job exits. All in-flight requests are lost.
+- The job must be torn down, rescheduled and started again: model load and warmup alone take
+  81–173 s for R1 on 32 GPUs.
 
-**WideEP.** Attention runs data-parallel: each GPU serves its own requests. MoE experts are spread
-across GPUs. Each MoE layer runs two NVLinkOneSided all-to-all kernels: **dispatch** pushes each
-token into the buffers of the GPUs that own its experts, and **combine** pulls the expert outputs
-back. Kernels signal each other with flags over NVLink and spin until they see their peers'
-flags, so a dead peer leaves the survivors spinning until a device timeout kills their CUDA
-context.
+## 2. Failover with FT
 
-**CUDA graphs** bake in kernel arguments and memory addresses, not memory contents. Anything that
-changes after a loss must therefore be data the kernels read at run time.
-
-**Expert placement (EPLB)** maps each expert to physical slots. With static placement and spare
-slots, other ranks can hold copies of a rank's experts, so routing can avoid a dead rank without
-moving weights.
-
-**ULFM** (User-Level Failure Mitigation) is MPI's fault-tolerance extension, in Open MPI 5 and
-mpi4py 4. Without it, MPI aborts the whole job when one process dies. With it:
-- a call that involves a dead process returns an error instead of hanging or aborting;
-- `Comm.Revoke()` makes a communicator fail on every member, which wakes ranks blocked in it;
-- `Comm.Shrink()` agrees on the live members and returns a communicator without the dead ones,
-  identical on every survivor;
-- `Comm.Get_failed()` names the dead processes.
-
-MPI carries only host control traffic; MoE data goes over NVLink.
-
-## 2. Design
-
-```mermaid
-flowchart LR
-    K[Rank dies] --> D[Survivors detect<br/>MPI error or watcher]
-    D --> A[Abort waits<br/>host: Revoke<br/>GPU: abort flag]
-    A --> R[Discard the step<br/>roll back KV]
-    R --> S[Shrink to survivors<br/>report to authority]
-    S --> I[Install on all survivors<br/>placement, routing, mask]
-    I --> C[Authority commits<br/>serve on N-1]
+```text
+rank dies
+  → detect      a host collective fails with a ULFM error, or a watcher thread sees it
+  → unblock     revoke host communicators; set the abort flag that spinning MoE kernels poll
+  → discard     the interrupted step reaches no request; its KV reservations are undone
+  → agree       ULFM Shrink gives every survivor the same membership; each reports to the
+                external recovery authority
+  → install     route the lost rank's experts to their copies; mask the rank in the kernels
+  → commit      the authority commits once every survivor has installed; serving resumes
 ```
 
-Principles: nothing a captured graph depends on changes; a dead rank's in-flight writes cannot
-corrupt live data; no partial output reaches users; all survivors switch together; every wait is
-bounded, and any failure falls back to today's behavior, ending the job.
+**ULFM** (MPI fault tolerance, Open MPI 5 + mpi4py 4):
+- calls involving a dead process return an error instead of hanging or aborting the job;
+- `Revoke` makes a communicator fail on every member, which wakes blocked ranks;
+- `Shrink` returns a communicator without the dead ranks, identical on every survivor.
 
-### 2.1 MoE all-to-all kernels
+## 3. How long until serving resumes
 
-- **Execution descriptor.** With FT on, dispatch and combine read one small tensor at a fixed
-  address: a mask of live ranks and a pointer to an abort flag. Kernels skip masked ranks. After a
-  loss only this tensor and the routing tables are rewritten, in place, so the graphs keep
-  running.
-- **Abort flag in pinned host memory.** The host sets it with a plain CPU write, which reaches
-  spinning kernels even when they occupy the whole GPU. Spin loops then exit, and an aborted
-  combine never marks its outputs ready. A real timeout still traps.
-- **Fixed slots against late writes.** A process can die with NVLink writes still in flight. Main
-  places each source rank's rows by this step's largest token count, so the rows move from step to
-  step and a late write could land on a live rank's rows. FT gives each source a fixed slot sized
-  by `max_num_tokens`, so late writes only hit the dead rank's own slot. The workspace size is the
-  same.
-- **One extra copy.** Fixed slots are not contiguous, so an FT-only gather kernel packs the valid
-  rows into the dense layout the expert GEMMs expect, overlapped with dispatch. Combine needs no
-  copy because it pulls.
+- **New requests:** served 0.16–0.34 s after the kill (vs. a restart of minutes), per the chart.
+- **Recovery itself:** kill → all survivors resumed in 0.14 s.
+- **Requests already running when the rank is killed:**
 
-### 2.2 Membership and coordination
-
-- **Host collectives** run on a private copy of `COMM_WORLD`. After a loss, survivors revoke it,
-  shrink to a survivor communicator, and keep each gather result at its original rank index.
-- **A watcher thread** detects a loss even while no collective is running.
-- **The recovery authority** is a small CPU process outside the workers, because survivors
-  agreeing over MPI does not prove they can all make progress. Over HMAC-signed ZeroMQ it admits
-  the recoverable ranks at startup and runs each recovery as Stopped → Propose → Ready (placement
-  digests must match) → Install → Installed → Commit. Anything unexpected, or its 60 s deadline,
-  aborts the job; if the authority itself dies, workers time out and the job ends.
-- **Routing.** A mask-only EPLB update points the dead rank's experts at their copies, and
-  attention-DP routing sends new requests only to survivors.
-
-Launch and configuration are in the user docs, `docs/source/features/wide-ep-fault-tolerance.md`.
-
-### 2.3 Requests and KV cache
-
-- **Commit gate.** Before a step updates any request, the executor checks the abort flag. An
-  aborted step is discarded and run again, so no partial tokens reach users.
-- **Rollback.** After the step's GPU work finishes, its KV cache reservations are undone (KV cache
-  managers V1 and V2).
-- **Prefix caching.** Blocks of a discarded step are never offered for reuse. Blocks finished
-  before the loss stay valid, and the dead rank's cache disappears with it.
-- **Responses.** A response gather interrupted by the loss is resent, so nothing is lost or
-  duplicated. The dead rank's requests fail with a retryable error.
-- **Own crash.** A rank whose own event loop crashes while the others can recover exits alone.
-
-## 3. Decisions and rejected alternatives
-
-- **Process loss only.** Link or device failures can leave sticky CUDA errors, and an alive but
-  unreachable rank must first be fenced.
-- **Discard and rerun the step**, rather than salvaging it. Penalties and seeded sampling are not
-  rolled back.
-- **Fixed slots plus a gather**, rather than a pull-based dispatch (a round trip per MoE layer and
-  a rewrite of main's hot kernel) or strided expert inputs (a change to every MoE backend).
-- **A run-time descriptor rather than recapturing graphs**, so graphs stay valid by construction.
-- **A host-memory abort flag**, because a host-to-device copy never completed while a kernel
-  launched outside a graph occupied the whole GPU.
-- **Environment variables, not `LlmArgs`**, while the feature is experimental.
-
-FT off costs nothing: the kernels it uses compile to the same instructions as main. FT on adds the
-gather per MoE layer, one sync per step at the commit gate, and a watcher thread.
-
-## 4. Results
-
-DeepSeek-R1 on 32 GPUs. The summary chart shows how soon new requests are served. This table
-shows what happens to requests already running: each run kills one rank at the moment in the
-first column, and times run from the kill until the requests have generated all their remaining
-tokens.
-
-| When the rank is killed | Result |
+| Killed while… | Result |
 |---|---|
-| While requests generate tokens | all in-flight requests finish within 1.4 to 3.1 s |
-| During the MoE all-to-all (7 runs) | all in-flight requests finish within 2.6 to 3.2 s |
-| While new prompts are processed, full load | 248 of 248 requests finish within 4.6 s |
-| Rank whose experts have no copy elsewhere | every request fails with an explicit error within 0.04 s |
+| requests generate tokens | all finish within 1.4–3.1 s |
+| GPUs run the MoE all-to-all (7 runs) | all finish within 2.6–3.2 s |
+| new prompts are processed, full load | 248 of 248 finish within 4.6 s |
 
-- Tokens match a reference run that never used the lost rank, including with prefix caching on.
-- Recovery itself, from the kill until every survivor resumed, took 0.14 s.
-- An nsys trace shows every decode all-to-all still running inside the original graphs.
-- Kimi-K2 on 32 GPUs and R1 on 16 and 64 GPUs gave similar results, including kills of ranks on
-  other nodes. One open item: in one 64-GPU run, one of three test requests drifted from the
-  reference at its third token (still coherent text). The likely cause is floating-point
-  rounding, since the expert GEMMs see slightly different batch sizes without the lost rank.
+- Times include generating each request's remaining tokens.
+- Tokens match a reference run that never used the lost rank (also with prefix caching on).
+- Throughput: −1.4% with FT on; after a loss, 99.4% per remaining GPU. FT built in but off: no
+  change (the kernels used are instruction-identical to main).
 
-## 5. Limits and next steps
+## 4. When we keep the captured CUDA graphs, and how
 
-**Not supported yet** (rejected at startup): the overlap scheduler, MTP and guided decoding,
-online EPLB, disaggregated serving and KV connectors, LM-head TP in attention DP, beam search,
-PEFT, pipeline or context parallelism, encoder-decoder, hybrid and Mamba models, the CFT
-all-to-all mode, and the Ray and RPC executors. Production WideEP uses the overlap scheduler and
-MTP, so those come first.
+**When:**
+- a process is lost (not a GPU, link or driver failure);
+- every expert of the lost rank has a copy on another rank (static EPLB with spare slots; at
+  EP32, R1 has 8 experts + 1 spare slot per GPU);
+- it is the first loss, and not rank 0;
+- the configuration is supported (section 7).
 
-**Other limits:** one loss per job; rank 0 must survive; every expert needs a copy on another
-rank; the dead rank's requests fail rather than move; the server keeps reporting "healthy".
+Otherwise the job ends as today, with an explicit error on every request.
 
-**Next:** lift the scheduler, MTP and online-EPLB restrictions, then restore the job to full size
-by admitting a replacement rank into the same slot.
+**How:** a graph bakes in kernel arguments and addresses, not memory contents.
+- **Fixed:** EP size, rank ids, graph shapes, buffer layout, all addresses. The lost rank keeps its
+  seat; its slots just stay empty.
+- **Rewritten in place, between steps:**
+  - EPLB routing tables → the lost rank's experts point at their copies;
+  - the live-rank mask, read by dispatch and combine;
+  - the abort flag and each rank's workspace counters, reset.
+- **Host side** (outside graphs): collectives move to the survivor communicator; the lost rank's
+  entry in each gather is filled with a neutral value.
+- nsys confirms every decode all-to-all still runs inside the original graphs.
 
-## 6. PRs
+## 5. What makes it safe
+
+- **Late writes.** A rank can die with NVLink writes still in flight into peers' buffers. Main's
+  buffer layout moves every step, so such a write could land on a live rank's rows. FT gives each
+  source rank a fixed slot (section 6).
+- **Spinning kernels.** The abort flag lives in pinned host memory and is set by a plain CPU
+  write, so it reaches kernels that occupy the whole GPU, graph-launched or not. A real timeout
+  still traps.
+- **Garbage data.** An aborted combine never marks its output ready. Rows from masked ranks, or of
+  an aborted step, reach the expert GEMMs as expert id −1 with zero data.
+- **No partial output.** A commit gate checks the abort flag before a step updates any request;
+  an aborted step is discarded and run again.
+- **KV cache and prefix caching.** The discarded step's KV reservations are undone after its GPU
+  work finishes (KV cache managers V1 and V2). Its blocks are never offered for reuse.
+- **No lost or duplicated responses.** An interrupted response gather is resent.
+- **All-or-nothing switch.** Only the authority's Commit changes membership, after every survivor
+  reports the same expert placement.
+- **Bounded.** Every wait has a deadline; any failure ends the job as today. A rank whose own loop
+  crashes while the others can recover exits alone.
+
+## 6. Symmetric memory and kernel changes
+
+The all-to-all workspace is symmetric memory: each GPU allocates a buffer that every peer maps
+over NVLink. **Dispatch** pushes tokens into the receiving GPU's buffer; **combine** pulls expert
+outputs from peers' buffers. Completion flags live in the same buffers.
+
+**Dispatch layout on each receiving GPU** (R = this step's largest token count per rank,
+C = `max_num_tokens`, fixed):
+
+```text
+Main:  | payload 0                  | payload 1                  | ...
+       | src0 R | src1 R | src2 R … | src0 R | src1 R | src2 R … |
+         src k starts at k·R, so every source's rows move when R changes
+
+FT:    | src0                        | src1                        | src2  ...
+       | payload 0 C | payload 1 C … | payload 0 C | payload 1 C … |
+         src k's region is fixed: a late write from a dead src stays in its own region
+
+Example: step n has R = 4, step n+1 has R = 2. A dead src 2 still writing for step n
+         writes at 2·4 = 8 → in main, that is src 4's rows in step n+1.
+```
+
+- Same workspace size, plus a small alignment pad per source slot: main already reserves room for
+  R up to C.
+- **New gather kernel (FT only):** the fixed slots are not contiguous per payload, so it packs the
+  valid rows into the dense `[source][R]` input the expert GEMMs expect. It overlaps with dispatch
+  (programmatic dependent launch). Combine needs no copy because it pulls.
+- **Dispatch and combine (FT path):** read the descriptor (live-rank mask + abort-flag pointer)
+  at a fixed address; skip masked ranks in every wait and load; exit spin loops on abort.
+- **FT off:** the same kernels without the descriptor, instruction-identical to main.
+
+**Alternatives considered:**
+- pull-based dispatch: a round trip per MoE layer and a rewrite of main's hot kernel;
+- strided expert inputs: would change every MoE backend;
+- recapturing graphs after a loss: slow, and graphs captured with fewer ranks would not match.
+
+## 7. Limits and next steps
+
+- **Not supported yet** (rejected at startup): overlap scheduler, MTP and guided decoding, online
+  EPLB, disaggregated serving, LM-head TP in ADP, beam search, PEFT, PP/CP, encoder-decoder,
+  hybrid/Mamba, the CFT all-to-all mode, Ray and RPC executors.
+- **Other limits:** one loss per job; rank 0 must survive; the lost rank's requests fail rather than
+  move; the server keeps reporting "healthy".
+- **Open item:** in one 64-GPU run, one test request drifted from the reference at its third
+  token (coherent text); likely floating-point rounding from changed expert batch sizes.
+- **Next:** overlap scheduler and MTP (production WideEP uses both), online EPLB, then restoring the
+  job to full size with a replacement rank.
+
+Launch and configuration: `docs/source/features/wide-ep-fault-tolerance.md`.
+
+## 8. PRs
 
 One commit per PR, in merge order. The first four are standalone fixes.
 
