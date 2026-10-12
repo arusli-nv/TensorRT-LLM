@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import concurrent.futures
 import os
@@ -111,6 +113,8 @@ class RPCClient:
                                           use_hmac_encryption=True,
                                           socket_type=socket_type,
                                           name="rpc_client")
+        # A dead server cannot drain pending sends during client teardown.
+        self._client_socket.socket.setsockopt(zmq.LINGER, 0)
         self._pending_futures = {}
         # map request_id to the queue for streaming responses
         self._streaming_queues: Dict[str, AsyncQueue] = {}
@@ -155,7 +159,7 @@ class RPCClient:
         self._server_stopped = True
 
     def close(self):
-        """Gracefully close the client, cleaning up background tasks."""
+        """Close the client, cancel consumers and discard undelivered sends."""
 
         if self._closed:
             return
