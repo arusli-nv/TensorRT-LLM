@@ -12,28 +12,56 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Messages exchanged between the recovery authority, workers, and the frontend.
+"""Messages exchanged between the recovery authority and the workers.
 
-Messages travel as two ZeroMQ frames: a JSON payload and its HMAC-SHA256 tag.
+Messages travel as two ZeroMQ frames: a JSON payload and its HMAC-SHA256 tag. The
+key authenticates peers on a trusted network; it is shared by the authority and every
+worker, and messages carry no replay protection.
 """
 
 import dataclasses
 import hashlib
 import hmac
 import json
+import typing
 from dataclasses import dataclass
 
-ROLE_WORKER = "worker"
-ROLE_FRONTEND = "frontend"
+__all__ = [
+    "Abort",
+    "Commit",
+    "Install",
+    "Installed",
+    "Message",
+    "Propose",
+    "ProtocolError",
+    "Ready",
+    "Register",
+    "Registered",
+    "Stopped",
+    "authenticate",
+    "decode",
+    "encode",
+]
 
 
 @dataclass(frozen=True)
 class Register:
-    """Peer -> authority: announce a worker rank or the frontend."""
+    """Worker -> authority: announce a rank and the ranks whose loss it can recover from.
 
-    role: str
+    ``recoverable_ranks`` are the ranks whose experts all have a resident replica
+    elsewhere in this worker's placement. ``pid`` identifies the process in logs.
+    """
+
     rank: int
     pid: int
+    recoverable_ranks: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Registered:
+    """Authority -> workers: every rank registered; losses of ``admitted_ranks`` recover."""
+
+    admitted_ranks: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -86,58 +114,14 @@ class Commit:
 
 @dataclass(frozen=True)
 class Abort:
-    """Authority -> all peers: recovery failed; take the terminal path."""
+    """Authority -> workers: recovery failed; take the terminal path."""
 
     reason: str
 
 
-@dataclass(frozen=True)
-class CloseAdmission:
-    """Authority -> frontend: stop admitting requests."""
+Message = Register | Registered | Stopped | Ready | Installed | Propose | Install | Commit | Abort
 
-
-@dataclass(frozen=True)
-class AdmissionClosed:
-    """Frontend -> authority: admission is closed and no request is in flight."""
-
-
-@dataclass(frozen=True)
-class ReopenAdmission:
-    """Authority -> frontend: recovery to ``generation`` committed; admit requests again."""
-
-    generation: int
-
-
-Message = (
-    Register
-    | Stopped
-    | Ready
-    | Installed
-    | Propose
-    | Install
-    | Commit
-    | Abort
-    | CloseAdmission
-    | AdmissionClosed
-    | ReopenAdmission
-)
-
-_MESSAGE_TYPES: dict[str, type] = {
-    cls.__name__: cls
-    for cls in (
-        Register,
-        Stopped,
-        Ready,
-        Installed,
-        Propose,
-        Install,
-        Commit,
-        Abort,
-        CloseAdmission,
-        AdmissionClosed,
-        ReopenAdmission,
-    )
-}
+_MESSAGE_TYPES: dict[str, type] = {cls.__name__: cls for cls in typing.get_args(Message)}
 
 
 class ProtocolError(ValueError):
@@ -160,21 +144,29 @@ def authenticate(frames: list[bytes], key: bytes) -> bool:
     return hmac.compare_digest(expected, frames[1])
 
 
+def _field_value(field: dataclasses.Field, value):
+    """Check a decoded JSON value against the field type; sequences become tuples."""
+    if typing.get_origin(field.type) is tuple:
+        (item_type, _) = typing.get_args(field.type)
+        if isinstance(value, list) and all(type(item) is item_type for item in value):
+            return tuple(value)
+    elif type(value) is field.type:
+        return value
+    raise ProtocolError(f"field {field.name} has invalid value {value!r}")
+
+
 def decode(payload: bytes) -> Message:
-    """Deserialize an authenticated payload; raises ``ProtocolError`` when malformed."""
+    """Deserialize an authenticated payload.
+
+    Raises:
+        ProtocolError: The payload is not a well-formed message.
+    """
     try:
         body = json.loads(payload)
         cls = _MESSAGE_TYPES[body.pop("type")]
-        fields = {field.name: field.type for field in dataclasses.fields(cls)}
-        if body.keys() != fields.keys():
-            raise ProtocolError(f"{cls.__name__} fields mismatch: {sorted(body)}")
-        if "survivors" in body:
-            body["survivors"] = tuple(body["survivors"])
-        for name, value in body.items():
-            expected = str if fields[name] is str else int
-            items = value if name == "survivors" else (value,)
-            if not all(type(item) is expected for item in items):
-                raise ProtocolError(f"{cls.__name__}.{name} has invalid value {value!r}")
-        return cls(**body)
     except (KeyError, TypeError, AttributeError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ProtocolError(f"malformed recovery message: {error!r}") from error
+    fields = {field.name: field for field in dataclasses.fields(cls)}
+    if body.keys() != fields.keys():
+        raise ProtocolError(f"{cls.__name__} fields mismatch: {sorted(body)}")
+    return cls(**{name: _field_value(fields[name], value) for name, value in body.items()})

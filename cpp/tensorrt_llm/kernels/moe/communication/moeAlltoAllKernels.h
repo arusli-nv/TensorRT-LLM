@@ -66,61 +66,52 @@ struct PayloadDescriptor
     int elements_per_token; // Number of elements per token (e.g., hidden_size, top_k)
 };
 
-// Stable local CUDA int32[2] state for fence execution in rank-mask mode.
-// Initialize both fields to zero and share this record across dispatch, sanitize,
-// and combine for the execution.
-// Cancellation is distinct from membership. Kernels preserve the first nonzero status;
-// the caller owns storage lifetime and must not reset or reuse it during execution.
-// Nonzero status invalidates execution outputs. Local completion alone does not permit
-// buffer or state reuse; the caller must establish peer quiescence first.
+// Abort record of a fence execution descriptor. The host sets `requested` to make kernels that wait for peers
+// return; a kernel that observes the request records `status = kCancelled`. While the record is nonzero the
+// outputs of every collective using the descriptor are invalid.
 struct MoeA2AAbortState
 {
     static constexpr int32_t kHealthy = 0;
     static constexpr int32_t kCancelled = 1;
-    static constexpr int32_t kFenceTimeout = 2;
 
     int32_t requested;
     int32_t status;
 };
 
-static_assert(sizeof(MoeA2AAbortState) == 2 * sizeof(int32_t));
-
-// Trusted local execution descriptor; neither the table nor its latch is fabric-exported.
-// Captured workspace addresses and logical source slots remain fixed. The owner retains
-// descriptors, abort records and all imported workspace mappings through final completion.
+// Local device descriptor read by fence rank-mask kernels at execution time. Its address is fixed, so captured CUDA
+// graphs observe a mask rewritten in place while no collective runs. A dispatch bound to a descriptor places each
+// source rank's payloads in a fixed slot of the receiver's workspace (see DispatchKernelPointers), so late writes
+// from an excluded rank only reach its own slot.
 struct MoeA2AFenceDescriptor
 {
     uint64_t activeMask[kRankMaskWords];
-    MoeA2AAbortState* abortState;
+    MoeA2AAbortState abort;
 };
 
-static_assert(sizeof(MoeA2AFenceDescriptor) == 5 * sizeof(uint64_t));
+static_assert(sizeof(MoeA2AFenceDescriptor) == (kRankMaskWords + 1) * sizeof(uint64_t));
 
-struct MoeA2AFenceWorkspace
-{
-    MoeA2AFenceDescriptor const* const* executionDescriptor{nullptr};
-};
-
+// Compacts this rank's fixed per-source receive slots into dense [ep_size, maxTokens] tensors. Rows of inactive
+// sources, rows past a source's received count, and all rows of an aborted execution are invalid: their expert ids
+// are set to invalidExpertId and their other payload rows are left untouched.
 struct MoeA2AGatherParams
 {
-    void const* source[kMaxPayloads];
-    void* destination[kMaxPayloads];
+    void const* source[kMaxPayloads]; // Slot of source rank 0 per payload
+    void* destination[kMaxPayloads];  // [epSize, maxTokens, bytesPerToken] per payload
     int bytesPerToken[kMaxPayloads];
     int numPayloads;
+    int expertIdPayloadIndex; // -1 if no payload holds int32 expert ids
+    int32_t invalidExpertId;
     int epSize;
-    int epRank;
-    int maxTokens;
-    int64_t sourceStrideBytes{0};
-    int const* recvCounters;
+    int maxTokens;             // Runtime tokens per source rank
+    int64_t sourceStrideBytes; // Byte distance between consecutive source slots
+    int const* recvCounters;   // [2, epSize]
     uint32_t const* flagVal;
-    int const* sourceStats;
-    int* destinationStats;
+    int const* sourceStats;    // [epSize, statsExperts] or nullptr
+    int* destinationStats;     // [epSize, statsExperts] or nullptr
     int statsExperts;
-    MoeA2AFenceWorkspace fenceWorkspace;
+    MoeA2AFenceDescriptor* descriptor;
 };
 
-void moe_a2a_fence_latch_descriptor_launch(
-    uintptr_t const* publishedDescriptor, uintptr_t* execution, cudaStream_t stream);
 void moe_a2a_gather_local_launch(MoeA2AGatherParams const& params, cudaStream_t stream);
 
 // Kernel pointers packed into a struct for device access
@@ -131,7 +122,6 @@ struct DispatchKernelPointers
     void const* src_data_ptrs[kMaxPayloads];     // Array of source data pointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
-    int64_t sourceStrideBytes{0};                // Fixed per-source slot stride (descriptor mode only)
     // Completion flags for synchronization (fence-based path)
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
@@ -181,8 +171,11 @@ struct DispatchKernelPointers
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
-    MoeA2AAbortState* abort_state{nullptr};
-    MoeA2AFenceWorkspace fenceWorkspace{};
+    // Optional fence rank-mask execution descriptor. When set, its mask replaces active_rank_mask, an abort request
+    // releases the completion-flag wait, and source rank r writes token t of payload p at
+    // recv_buffers[target][p] + r * source_stride_bytes + t * payload_bytes_per_token[p].
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
+    int64_t source_stride_bytes{0};
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -214,8 +207,9 @@ struct CombineKernelPointers
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
-    MoeA2AAbortState* abort_state{nullptr};
-    MoeA2AFenceWorkspace fenceWorkspace{};
+    // Optional fence rank-mask execution descriptor. When set, its mask replaces active_rank_mask and an abort
+    // request releases the completion-flag wait; aborted blocks zero their output token.
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
 };
 
 // Dispatch phase parameters
@@ -229,8 +223,7 @@ struct MoeA2ADispatchParams
     // Token configuration
     int local_num_tokens;    // Number of tokens on this rank
     int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation TODO: Rename to runtime_max_tokens_per_rank
-    int64_t sourceStrideBytes{0}; // Fixed per-source slot stride (descriptor mode only)
-    int top_k;                    // Number of experts per token
+    int top_k;               // Number of experts per token
 
     // Expert routing information
     int32_t const* token_selected_experts; // [local_num_tokens, top_k]
@@ -283,15 +276,16 @@ struct MoeA2ADispatchParams
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
     // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
+    // The mask is copied by value into kernel arguments, so CUDA graphs captured in rank-mask
+    // mode must read membership from execution_descriptor instead.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
-    MoeA2AAbortState* abort_state{nullptr};
-    MoeA2AFenceWorkspace fenceWorkspace{};
+    // Optional fence rank-mask execution descriptor; see DispatchKernelPointers::execution_descriptor.
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
+    int64_t source_stride_bytes{0};
 
     // CUDA stream
     cudaStream_t stream;
@@ -376,15 +370,15 @@ struct MoeA2ACombineParams
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
     // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
+    // The mask is copied by value into kernel arguments, so CUDA graphs captured in rank-mask
+    // mode must read membership from execution_descriptor instead.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
-    MoeA2AAbortState* abort_state{nullptr};
-    MoeA2AFenceWorkspace fenceWorkspace{};
+    // Optional fence rank-mask execution descriptor; see CombineKernelPointers::execution_descriptor.
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
 
     // CUDA stream
     cudaStream_t stream;
@@ -403,8 +397,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 // recv_counters: [2, ep_size] (int32), number of valid tokens per source
 // invalid_id: value to fill for invalid tokens' expert ids
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
-    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream,
-    MoeA2AAbortState* abort_state = nullptr, MoeA2AFenceWorkspace fenceWorkspace = {});
+    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
 } // namespace kernels::moe_comm
 

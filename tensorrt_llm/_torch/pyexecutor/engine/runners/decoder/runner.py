@@ -2943,7 +2943,7 @@ class DecoderRunner(ScheduledModelRunner):
         if not (self.mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather_int64([local_flag], fill_value=1)[:, 0]
+        all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
         spec_metadata.group_all_greedy_sample = bool(all_flags.all())
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
@@ -4879,9 +4879,6 @@ class DecoderRunner(ScheduledModelRunner):
         gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
-        if self.moe_execution_state is not None:
-            # Enqueued inside every captured graph so replays observe the installed mask.
-            self.moe_execution_state.latch()
         inputs = self._preprocess_inputs(
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
@@ -5122,9 +5119,7 @@ class DecoderRunner(ScheduledModelRunner):
         self, attn_metadata: AttentionMetadata, can_run_graph: bool
     ) -> list[int]:
         """Require captured decode on every rank in the normal token-count vote."""
-        gathered = self.dist.tp_allgather_int64(
-            [attn_metadata.num_tokens, int(can_run_graph)], fill_value=[0, 1]
-        )
+        gathered = self.dist.tp_allgather_int64([attn_metadata.num_tokens, int(can_run_graph)])
         if not gathered[:, 1].all():
             raise RuntimeError(
                 "Conditional attention-DP decode requires a captured CUDA "

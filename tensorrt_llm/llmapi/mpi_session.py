@@ -3,6 +3,7 @@
 
 import abc
 import itertools
+import logging
 import math
 import os
 import socket
@@ -21,7 +22,7 @@ import zmq
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
-from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
+from .._utils import global_mpi_rank, is_mpi_peer_failure, mpi_barrier, mpi_rank
 from .utils import logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
@@ -32,32 +33,41 @@ if ENABLE_MULTI_DEVICE:
 
 T = TypeVar("T")
 
-# Set when idle worker-loss recovery is enabled; see
-# ``_is_departed_peer_failure``.
-_RECOVERY_ENV = "TLLM_WIDEEP_RECOVERY"
-_PEER_FAILURE_ERROR_NAMES = ("ERR_PROC_FAILED", "ERR_PROC_FAILED_PENDING",
-                             "ERR_REVOKED")
+
+def _recovery_enabled() -> bool:
+    from tensorrt_llm.executor.recovery.client import recovery_requested
+    return ENABLE_MULTI_DEVICE and recovery_requested()
+
+
+def _num_failed_ranks() -> int:
+    """Number of processes ULFM reports failed in the world.
+
+    Zero when recovery is disabled or the MPI library cannot report failures.
+    """
+    if not _recovery_enabled():
+        return 0
+    try:
+        group = mpi4py.MPI.COMM_WORLD.Get_failed()
+    except (AttributeError, NotImplementedError, mpi4py.MPI.Exception):
+        return 0
+    try:
+        return group.Get_size()
+    finally:
+        group.Free()
 
 
 def _is_departed_peer_failure(exc: BaseException) -> bool:
     """Whether *exc* only reports a departed MPI peer while recovery is on.
 
     Such failures are left to the surviving ranks' recovery path instead of
-    tearing down the session: an MPI error of class ``ERR_PROC_FAILED`` or
-    ``ERR_REVOKED`` (ULFM), or a ``BrokenExecutor`` from the mpi4py futures
-    manager, which breaks once it loses contact with a departed worker.
+    tearing down the session: a ULFM peer-failure error, or a
+    ``BrokenExecutor`` from the mpi4py futures manager once a rank has failed.
     """
-    if not os.environ.get(_RECOVERY_ENV):
+    if not _recovery_enabled():
         return False
     if isinstance(exc, BrokenExecutor):
-        return True
-    if not ENABLE_MULTI_DEVICE or not isinstance(exc, mpi4py.MPI.Exception):
-        return False
-    peer_failure_classes = {
-        getattr(mpi4py.MPI, name, None)
-        for name in _PEER_FAILURE_ERROR_NAMES
-    } - {None}
-    return exc.Get_error_class() in peer_failure_classes
+        return _num_failed_ranks() > 0
+    return is_mpi_peer_failure(exc)
 
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
@@ -966,6 +976,26 @@ class RemoteMpiCommSessionServer():
                 f"MpiCommSession rank{mpi_rank()} skipped the task-end "
                 f"barrier after a peer departed: {e}")
 
+    @staticmethod
+    def _live_worker_futures(futures: List[Future]) -> List[Future]:
+        """The task futures to collect before accepting the next task.
+
+        None once a rank has departed while recovery is enabled: its task
+        never reports back, and ULFM stops matching mpi4py.futures'
+        any-source receives, so no further result arrives. The degraded world
+        then only accepts shutdown.
+        """
+        if not _recovery_enabled():
+            return futures
+        while True:
+            _, not_done = futures_wait(futures, timeout=0.5)
+            if not not_done:
+                return futures
+            if _num_failed_ranks():
+                logger.info("RemoteMpiCommSessionServer: a rank departed; "
+                            "only shutdown is accepted from now on")
+                return []
+
     def serve(self):
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
@@ -981,7 +1011,8 @@ class RemoteMpiCommSessionServer():
                 first_exc = None
                 # Use as_completed so that failures are logged as soon as
                 # they occur rather than blocking behind a stuck future.
-                for future in as_completed(pending_futures):
+                for future in as_completed(
+                        self._live_worker_futures(pending_futures)):
                     try:
                         future.result()  # Wait for completion
                     except Exception as e:
@@ -1010,8 +1041,22 @@ class RemoteMpiCommSessionServer():
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
                 self.session.shutdown_abort()
+                if _num_failed_ranks():
+                    # mpi4py.futures cannot release a world that lost a rank:
+                    # its workers wait for the departed peer forever.
+                    logger.warning(
+                        "RemoteMpiCommSessionServer: ending the MPI world, "
+                        "which lost a rank")
+                    for handler in logging.getLogger().handlers:
+                        handler.flush()
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    mpi4py.MPI.COMM_WORLD.Abort(0)
                 self._close_global_comm_executor()
                 break
+            elif _num_failed_ranks():
+                logger.error("RemoteMpiCommSessionServer: dropped a task; an "
+                             "MPI world that lost a rank cannot run tasks")
             else:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task [{message.task}] from {self.addr}\n",

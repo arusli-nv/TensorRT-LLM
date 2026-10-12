@@ -28,7 +28,6 @@ from tensorrt_llm._torch.alltoall_watchdog import (
 from .ep_group_health import EPGroupHealth
 
 _ENABLE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
-_RECOVERY_ENV = "TLLM_WIDEEP_RECOVERY"
 _TIMEOUT_ENV = "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S"
 _POLL_INTERVAL_ENV = "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S"
 
@@ -48,10 +47,12 @@ def recovery_enabled() -> bool:
     """Whether WideEP worker-loss recovery is enabled for this process.
 
     Recovery executes NVLinkOneSided through a model-owned
-    ``MoeExecutionState`` whose graph-latched descriptor carries the rank mask,
+    ``MoeExecutionState`` whose execution descriptor carries the rank mask,
     so CUDA graphs stay valid across membership changes.
     """
-    return bool(os.environ.get(_RECOVERY_ENV))
+    from tensorrt_llm.executor.recovery.client import recovery_requested
+
+    return recovery_requested()
 
 
 def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) -> float:

@@ -12,16 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Control plane for recovering a wide-EP deployment from an idle worker loss."""
+"""Control plane for recovering a wide-EP deployment from a worker process loss."""
 
-from .admission import FrontendAdmission
-from .client import RecoveryAborted, RecoveryClient, RecoveryError
+from .client import RecoveryAborted, RecoveryClient, RecoveryError, RecoveryTimeout
 from .protocol import (
-    ROLE_FRONTEND,
-    ROLE_WORKER,
     Abort,
-    AdmissionClosed,
-    CloseAdmission,
     Commit,
     Install,
     Installed,
@@ -30,18 +25,13 @@ from .protocol import (
     ProtocolError,
     Ready,
     Register,
-    ReopenAdmission,
+    Registered,
     Stopped,
 )
 
 __all__ = [
-    "ROLE_FRONTEND",
-    "ROLE_WORKER",
     "Abort",
-    "AdmissionClosed",
-    "CloseAdmission",
     "Commit",
-    "FrontendAdmission",
     "Install",
     "Installed",
     "Message",
@@ -51,7 +41,8 @@ __all__ = [
     "RecoveryAborted",
     "RecoveryClient",
     "RecoveryError",
+    "RecoveryTimeout",
     "Register",
-    "ReopenAdmission",
+    "Registered",
     "Stopped",
 ]

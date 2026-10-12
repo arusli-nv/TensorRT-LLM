@@ -12,13 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Graph-latched MoE All-to-All execution descriptor shared by one model."""
+"""Execution descriptor of the MoE All-to-All collectives of one model."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._utils import maybe_pin_memory
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
 from ..wide_ep_ft import recovery_enabled
@@ -34,17 +37,15 @@ def _mask_words(mask: int) -> tuple[int, ...]:
 class MoeExecutionState:
     """Own the device descriptor that NVLinkOneSided kernels read at execution time.
 
-    The native descriptor holds the active-rank mask words and the address of an
-    ``int32[2]`` abort record (``MoeA2AFenceDescriptor``). ``published`` holds
-    the descriptor address; :meth:`latch` copies it into ``slot`` on the current
-    stream, and the dispatch/combine kernels read the descriptor through
-    ``slot``. All tensor addresses are fixed for the lifetime of the state, so
-    CUDA graphs captured once keep running after :meth:`install_mask` changes
-    the membership they observe.
+    ``descriptor`` is the native ``MoeA2AFenceDescriptor``: ``EP_MASK_NUM_WORDS``
+    active-rank mask words followed by the ``int32[2]`` abort record
+    ``(requested, status)``, which ``abort`` views. The dispatch/combine ops
+    validate this size against the native mask width. The descriptor is only
+    edited in place, so CUDA graphs captured once keep running after
+    :meth:`install_mask` changes the membership they observe.
 
-    :meth:`latch` must be enqueued at the start of every forward so that it is
-    part of every captured graph. :meth:`install_mask` is only valid while the
-    model is idle; it is the only method that synchronizes with the device.
+    :meth:`install_mask` and :meth:`rearm` are only valid while the model is
+    idle. :meth:`request_abort` may be called from any thread while kernels run.
     """
 
     def __init__(self, ep_group_health: EPGroupHealth, device: torch.device) -> None:
@@ -54,18 +55,17 @@ class MoeExecutionState:
         if ep_group_health.moe_world_size > 64 * EP_MASK_NUM_WORDS:
             raise ValueError("EP size exceeds the native rank-mask width")
         self.health = ep_group_health
-        self.abort = torch.zeros(2, dtype=torch.int32, device=device)
         self.descriptor = torch.tensor(
-            [*_mask_words(snapshot.mask), self.abort.data_ptr()],
-            dtype=torch.int64,
-            device=device,
+            [*_mask_words(snapshot.mask), 0], dtype=torch.int64, device=device
         )
-        self.published = torch.tensor(
-            [self.descriptor.data_ptr()], dtype=torch.int64, device=device
-        )
-        self.slot = torch.zeros_like(self.published)
+        self.abort = self.descriptor[EP_MASK_NUM_WORDS:].view(torch.int32)
         self.installed_generation = snapshot.generation
         self._memories: dict[int, MnnvlMemory] = {}
+        self._workspace_resets: dict[int, Callable[[], None]] = {}
+        # The abort request travels on its own stream so it does not queue
+        # behind the kernels it has to stop.
+        self._abort_stream = torch.cuda.Stream(device)
+        self._abort_request = maybe_pin_memory(torch.ones(1, dtype=torch.int32))
 
     @classmethod
     def for_model(cls, model: torch.nn.Module) -> MoeExecutionState | None:
@@ -90,21 +90,48 @@ class MoeExecutionState:
             comm.bind_execution_state(state)
         return state
 
-    def retain(self, memory: MnnvlMemory) -> None:
-        """Keep a bound layer's workspace mapped until :meth:`close`."""
+    def retain(self, memory: MnnvlMemory, reset_workspace: Callable[[], None]) -> None:
+        """Keep a bound layer's workspace mapped until :meth:`close`.
+
+        ``reset_workspace`` returns this rank's part of the workspace to its
+        initial state; layers sharing one workspace register it once.
+        """
         if id(memory) not in self._memories:
             memory.pin()
             self._memories[id(memory)] = memory
+            self._workspace_resets[id(memory)] = reset_workspace
 
-    def latch(self) -> None:
-        """Snapshot the published descriptor for the kernels of this forward."""
-        torch.ops.trtllm.moe_a2a_fence_latch_descriptor(self.published, self.slot)
+    def rearm(self) -> None:
+        """Clear the abort record and reset every bound workspace to its first round.
+
+        After an abort, ranks may have stopped in different collective rounds.
+        Every surviving rank must rearm while all of them are quiescent and
+        before any of them runs another collective.
+        """
+        torch.cuda.synchronize(self.abort.device)
+        for reset in self._workspace_resets.values():
+            reset()
+        self.abort.zero_()
+        torch.cuda.synchronize(self.abort.device)
 
     def dispatch_kwargs(self) -> dict[str, torch.Tensor]:
-        return {"execution_descriptor": self.slot}
+        """Keyword arguments that run ``moe_a2a_dispatch`` under this state."""
+        return {"execution_descriptor": self.descriptor}
 
     def combine_kwargs(self) -> dict[str, torch.Tensor]:
-        return {"execution_descriptor": self.slot}
+        """Keyword arguments that run ``moe_a2a_combine`` under this state."""
+        return {"execution_descriptor": self.descriptor}
+
+    def request_abort(self) -> None:
+        """Make running and future collectives of this state return without peers.
+
+        Kernels poll the request while they wait, so collectives stuck on a lost
+        peer finish and record a cancelled status; their outputs are invalid.
+        Returns once the request is visible in device memory.
+        """
+        with torch.cuda.device(self.abort.device), torch.cuda.stream(self._abort_stream):
+            self.abort[:1].copy_(self._abort_request, non_blocking=True)
+        self._abort_stream.synchronize()
 
     def install_mask(self, words: tuple[int, ...]) -> None:
         """Publish committed mask words to the descriptor. Only call while the model is idle.
@@ -114,8 +141,8 @@ class MoeExecutionState:
 
         Raises:
             ValueError: If ``words`` differ from the committed membership.
-            RuntimeError: If a collective of this state has aborted; its
-                workspace rounds may differ across ranks and cannot resume.
+            RuntimeError: If a collective of this state has aborted since the
+                last :meth:`rearm`.
         """
         snapshot = self.health.snapshot()
         committed = sum(word << (64 * index) for index, word in enumerate(words))
@@ -134,3 +161,4 @@ class MoeExecutionState:
         for memory in self._memories.values():
             memory.unpin()
         self._memories.clear()
+        self._workspace_resets.clear()

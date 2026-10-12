@@ -33,7 +33,6 @@ class RequestAdmissionState(enum.Enum):
     PARKED = "parked"
     WAKING = "waking"
     FAILED = "failed"
-    RECOVERING = "recovering"
 
 
 @dataclasses.dataclass
@@ -188,22 +187,6 @@ class ExecutorRequestQueue:
         """Permanently close admission after sleep/wakeup may have mutated state."""
         with self.enqueue_lock:
             self.admission_state = RequestAdmissionState.FAILED
-
-    def begin_recovery(self) -> None:
-        """Close admission while survivors recover from a peer loss."""
-        with self.enqueue_lock:
-            self._transition_admission_state(
-                RequestAdmissionState.RUNNING,
-                RequestAdmissionState.RECOVERING,
-            )
-
-    def complete_recovery(self) -> None:
-        """Reopen admission once the survivor membership is committed."""
-        with self.enqueue_lock:
-            self._transition_admission_state(
-                RequestAdmissionState.RECOVERING,
-                RequestAdmissionState.RUNNING,
-            )
 
     def get_admission_state(self) -> RequestAdmissionState:
         with self.enqueue_lock:

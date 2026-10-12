@@ -12,77 +12,67 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Recovery authority state machine, wire protocol, client, and frontend admission."""
+"""Recovery authority state machine, wire protocol, and client."""
 
-# The recovery package has no torch dependency; load it from source so these tests do
-# not import the heavy ``tensorrt_llm`` package.
-import importlib
-import importlib.util
-import pathlib
-import socket
-import sys
+import hmac
 import threading
 import time
 
 import pytest
+import zmq
+
+from tensorrt_llm.executor import recovery
+from tensorrt_llm.executor.recovery import (
+    Abort,
+    Commit,
+    Install,
+    Installed,
+    Propose,
+    Ready,
+    Register,
+    Registered,
+    Stopped,
+    protocol,
+)
+from tensorrt_llm.executor.recovery import authority as authority_module
 
 pytestmark = pytest.mark.cpu_only
 
-_PACKAGE_DIR = (
-    pathlib.Path(__file__).resolve().parents[3] / "tensorrt_llm" / "executor" / "recovery"
-)
-_spec = importlib.util.spec_from_file_location(
-    "_recovery_under_test",
-    _PACKAGE_DIR / "__init__.py",
-    submodule_search_locations=[str(_PACKAGE_DIR)],
-)
-recovery = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = recovery
-_spec.loader.exec_module(recovery)
-authority_module = importlib.import_module(f"{_spec.name}.authority")
-protocol = importlib.import_module(f"{_spec.name}.protocol")
-
 Phase = authority_module.Phase
 RecoveryAuthority = authority_module.RecoveryAuthority
-Abort = recovery.Abort
-AdmissionClosed = recovery.AdmissionClosed
-CloseAdmission = recovery.CloseAdmission
-Commit = recovery.Commit
-Install = recovery.Install
-Installed = recovery.Installed
-Propose = recovery.Propose
-Ready = recovery.Ready
-Register = recovery.Register
-ReopenAdmission = recovery.ReopenAdmission
-Stopped = recovery.Stopped
 
 WORLD = 4
 FAILED = 2
 SURVIVORS = (0, 1, 3)
-FRONTEND = b"frontend"
+RECOVERABLE = (1, 2, 3)
 KEY = b"k" * 32
 
 
 def _route(rank: int) -> bytes:
-    return f"worker-{rank}".encode()
+    return f"rank-{rank}".encode()
+
+
+def _register_all(authority, recoverable=lambda rank: RECOVERABLE):
+    out = []
+    for rank in range(WORLD):
+        assert authority.phase is Phase.REGISTERING
+        out = authority.handle(_route(rank), Register(rank, 100 + rank, recoverable(rank)), 0.0)
+    return out
 
 
 def _registered(timeout: float = 10.0) -> RecoveryAuthority:
-    authority = RecoveryAuthority(WORLD, frozenset({1, FAILED}), phase_timeout=timeout)
-    for rank in range(WORLD):
-        assert authority.handle(_route(rank), Register("worker", rank, 100 + rank), 0.0) == []
-    assert authority.phase is Phase.REGISTERING
-    authority.handle(FRONTEND, Register("frontend", 0, 99), 0.0)
+    authority = RecoveryAuthority(WORLD, frozenset({1, FAILED}), recovery_timeout=timeout)
+    out = _register_all(authority)
     assert authority.phase is Phase.SERVING
+    assert out == [(_route(rank), Registered((1, FAILED))) for rank in range(WORLD)]
     return authority
 
 
-def _stopped(authority: RecoveryAuthority, now: float = 1.0) -> None:
-    out = authority.handle(_route(0), Stopped(0, FAILED), now)
-    assert out == [(FRONTEND, CloseAdmission())]
-    for rank in SURVIVORS[1:]:
-        assert authority.handle(_route(rank), Stopped(rank, FAILED), now) == []
-    assert authority.phase is Phase.STOPPING
+def _report(authority, message_type, ranks=SURVIVORS, now=1.0, **fields):
+    out = []
+    for rank in ranks:
+        out = authority.handle(_route(rank), message_type(rank, **fields), now)
+    return out
 
 
 def _assert_aborted(out, authority: RecoveryAuthority) -> None:
@@ -91,50 +81,49 @@ def _assert_aborted(out, authority: RecoveryAuthority) -> None:
     assert out and all(isinstance(message, Abort) for _, message in out)
 
 
-def test_idle_loss_recovers_and_reopens_admission():
+def test_registration_completes_only_when_every_rank_registered():
+    authority = RecoveryAuthority(WORLD)
+    for rank in range(WORLD - 1):
+        assert authority.handle(_route(rank), Register(rank, rank, RECOVERABLE), 0.0) == []
+    assert authority.phase is Phase.REGISTERING
+
+
+def test_admission_is_what_every_worker_can_recover_and_never_rank0():
+    authority = RecoveryAuthority(WORLD)
+    out = _register_all(authority, lambda rank: (0, 1, 2, 3) if rank != 3 else (0, 2, 3))
+    assert authority.admitted_ranks == frozenset({2, 3})
+    assert all(message == Registered((2, 3)) for _, message in out)
+
+
+def test_admitting_an_uncovered_rank_aborts_registration():
+    authority = RecoveryAuthority(WORLD, frozenset({1, FAILED}))
+    out = _register_all(authority, lambda rank: (FAILED, 3))
+    _assert_aborted(out, authority)
+    assert "[1]" in authority.abort_reason
+
+
+def test_idle_loss_recovers():
     authority = _registered()
-    _stopped(authority)
+    authority.handle(_route(0), Stopped(0, FAILED), 1.0)
+    assert authority.phase is Phase.STOPPING
     assert authority.deadline == pytest.approx(11.0)
 
-    out = authority.handle(FRONTEND, AdmissionClosed(), 2.0)
+    out = _report(authority, Stopped, SURVIVORS[1:], failed_rank=FAILED)
     assert out == [(_route(rank), Propose(1, FAILED, SURVIVORS)) for rank in SURVIVORS]
-    assert authority.phase is Phase.PREPARING
-    assert authority.deadline == pytest.approx(12.0)
-
-    for rank in SURVIVORS:
-        out = authority.handle(_route(rank), Ready(rank, 1, "digest"), 3.0)
+    out = _report(authority, Ready, generation=1, placement_digest="digest")
     assert out == [(_route(rank), Install(1)) for rank in SURVIVORS]
-    assert authority.phase is Phase.INSTALLING
-
-    for rank in SURVIVORS:
-        out = authority.handle(_route(rank), Installed(rank, 1), 4.0)
-    assert out == [(_route(rank), Commit(1)) for rank in SURVIVORS] + [
-        (FRONTEND, ReopenAdmission(1))
-    ]
-    assert authority.phase is Phase.RECOVERED
-    assert authority.generation == 1
-    # Deadlines are cleared once recovery commits.
-    assert authority.deadline is None
-    assert authority.expire(1e9) == []
-
-
-def test_identical_retransmissions_are_ignored():
-    authority = _registered()
-    _stopped(authority)
-    assert authority.handle(_route(1), Stopped(1, FAILED), 1.5) == []
-    authority.handle(FRONTEND, AdmissionClosed(), 2.0)
-    assert authority.handle(FRONTEND, AdmissionClosed(), 2.0) == []
-    authority.handle(_route(0), Ready(0, 1, "digest"), 3.0)
-    assert authority.handle(_route(0), Ready(0, 1, "digest"), 3.0) == []
-    assert authority.phase is Phase.PREPARING
+    out = _report(authority, Installed, generation=1)
+    assert out == [(_route(rank), Commit(1)) for rank in SURVIVORS]
+    assert authority.phase is Phase.RECOVERED and authority.generation == 1
+    assert authority.deadline is None and authority.expire(1e9) == []
 
 
 @pytest.mark.parametrize("failed", [0, 3])
-def test_unadmitted_loss_aborts_every_peer(failed):
+def test_unadmitted_loss_aborts_every_worker(failed):
     authority = _registered()
     out = authority.handle(_route(1), Stopped(1, failed), 1.0)
     _assert_aborted(out, authority)
-    assert {route for route, _ in out} == {FRONTEND, *(_route(rank) for rank in range(WORLD))}
+    assert {route for route, _ in out} == {_route(rank) for rank in range(WORLD)}
 
 
 @pytest.mark.parametrize(
@@ -142,123 +131,195 @@ def test_unadmitted_loss_aborts_every_peer(failed):
     [
         (_route(3), Stopped(3, 1)),  # second distinct failure
         (_route(FAILED), Stopped(FAILED, FAILED)),  # departed rank still talking
-        (_route(FAILED), Ready(FAILED, 1, "digest")),  # departed rank still talking
         (_route(1), Stopped(3, FAILED)),  # rank spoofing
+        (_route(1), Stopped(1, FAILED)),  # duplicate report
         (_route(1), Ready(1, 1, "digest")),  # Ready before Propose
-        (_route(1), AdmissionClosed()),  # AdmissionClosed from a worker
-        (FRONTEND, Commit(1)),  # authority-only message from a peer
+        (_route(1), Commit(1)),  # authority-only message from a worker
+        (_route(1), Register(1, 101, RECOVERABLE)),  # registration after it completed
         (b"stranger", Stopped(1, FAILED)),  # unregistered peer
     ],
 )
 def test_protocol_violations_abort(route, message):
     authority = _registered()
-    authority.handle(_route(0), Stopped(0, FAILED), 1.0)
+    authority.handle(_route(1), Stopped(1, FAILED), 1.0)
     out = authority.handle(route, message, 1.0)
     _assert_aborted(out, authority)
     assert (route, Abort(authority.abort_reason)) in out
 
 
-def test_conflicting_duplicate_and_digest_mismatch_abort():
+def test_placement_digests_must_agree():
     authority = _registered()
-    _stopped(authority)
-    authority.handle(FRONTEND, AdmissionClosed(), 2.0)
-    authority.handle(_route(0), Ready(0, 1, "a"), 3.0)
-    _assert_aborted(authority.handle(_route(1), Ready(1, 1, "b"), 3.0), authority)
+    _report(authority, Stopped, failed_rank=FAILED)
+    authority.handle(_route(0), Ready(0, 1, "a"), 2.0)
+    _assert_aborted(authority.handle(_route(1), Ready(1, 1, "b"), 2.0), authority)
 
+
+@pytest.mark.parametrize("message_type", [Ready, Installed])
+def test_reports_for_another_generation_abort(message_type):
     authority = _registered()
-    _stopped(authority)
-    authority.handle(FRONTEND, AdmissionClosed(), 2.0)
-    _assert_aborted(authority.handle(_route(0), Ready(0, 2, "a"), 3.0), authority)
+    _report(authority, Stopped, failed_rank=FAILED)
+    if message_type is Installed:
+        _report(authority, Ready, generation=1, placement_digest="digest")
+    fields = {"placement_digest": "digest"} if message_type is Ready else {}
+    out = authority.handle(_route(0), message_type(0, generation=2, **fields), 2.0)
+    _assert_aborted(out, authority)
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [Register(WORLD, 1, RECOVERABLE), Register(-1, 1, RECOVERABLE)],
+    ids=["above_world", "negative"],
+)
+def test_invalid_registrations_abort(registration):
+    authority = RecoveryAuthority(WORLD)
+    _assert_aborted(authority.handle(_route(0), registration, 0.0), authority)
+
+
+def test_duplicate_registrations_abort():
+    authority = RecoveryAuthority(WORLD)
+    authority.handle(_route(0), Register(0, 1, RECOVERABLE), 0.0)
+    _assert_aborted(authority.handle(_route(1), Register(0, 2, RECOVERABLE), 0.0), authority)
 
 
 def test_messages_before_registration_completes_abort():
     authority = RecoveryAuthority(WORLD, frozenset({FAILED}))
-    authority.handle(_route(0), Register("worker", 0, 1), 0.0)
+    authority.handle(_route(0), Register(0, 1, RECOVERABLE), 0.0)
     _assert_aborted(authority.handle(_route(0), Stopped(0, FAILED), 0.0), authority)
 
-    authority = RecoveryAuthority(WORLD, frozenset({FAILED}))
-    authority.handle(_route(0), Register("worker", 0, 1), 0.0)
-    _assert_aborted(authority.handle(_route(1), Register("worker", 0, 2), 0.0), authority)
 
-
-def test_phase_deadline_aborts_and_aborted_is_terminal():
+@pytest.mark.parametrize("phase_reports", [1, 2, 3], ids=["stopping", "preparing", "installing"])
+def test_recovery_deadline_aborts_and_aborted_is_terminal(phase_reports):
     authority = _registered(timeout=5.0)
-    _stopped(authority, now=1.0)
+    authority.handle(_route(0), Stopped(0, FAILED), 1.0)
+    if phase_reports >= 2:
+        _report(authority, Stopped, SURVIVORS[1:], failed_rank=FAILED)
+    if phase_reports >= 3:
+        _report(authority, Ready, generation=1, placement_digest="digest")
     assert authority.expire(5.9) == []
     _assert_aborted(authority.expire(6.0), authority)
-    reply = authority.handle(FRONTEND, AdmissionClosed(), 7.0)
-    assert reply == [(FRONTEND, Abort(authority.abort_reason))]
+    reply = authority.handle(_route(1), Stopped(1, FAILED), 7.0)
+    assert reply == [(_route(1), Abort(authority.abort_reason))]
     assert authority.expire(1e9) == []
 
 
 def test_second_loss_after_recovery_aborts():
     authority = _registered()
-    _stopped(authority)
-    authority.handle(FRONTEND, AdmissionClosed(), 2.0)
-    for rank in SURVIVORS:
-        authority.handle(_route(rank), Ready(rank, 1, "digest"), 3.0)
-    for rank in SURVIVORS:
-        authority.handle(_route(rank), Installed(rank, 1), 4.0)
+    _report(authority, Stopped, failed_rank=FAILED)
+    _report(authority, Ready, generation=1, placement_digest="digest")
+    _report(authority, Installed, generation=1)
     _assert_aborted(authority.handle(_route(0), Stopped(0, 1), 5.0), authority)
 
 
-def test_invalid_construction():
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(world_size=1),
+        dict(world_size=WORLD, admitted_ranks=frozenset({0})),
+        dict(world_size=WORLD, admitted_ranks=frozenset({WORLD})),
+        dict(world_size=WORLD, recovery_timeout=0),
+    ],
+)
+def test_invalid_construction(kwargs):
     with pytest.raises(ValueError):
-        RecoveryAuthority(WORLD, frozenset({0}))
-    with pytest.raises(ValueError):
-        RecoveryAuthority(WORLD, frozenset({WORLD}))
+        RecoveryAuthority(**kwargs)
 
 
 def test_wire_roundtrip_and_authentication():
-    message = Propose(3, 2, (0, 1, 3))
-    frames = protocol.encode(message, KEY)
-    assert protocol.authenticate(frames, KEY)
-    assert protocol.decode(frames[0]) == message
-    assert protocol.decode(protocol.encode(CloseAdmission(), KEY)[0]) == CloseAdmission()
+    for message in (Propose(3, 2, (0, 1, 3)), Registered((1, 2)), Abort("lost")):
+        frames = protocol.encode(message, KEY)
+        assert protocol.authenticate(frames, KEY)
+        assert protocol.decode(frames[0]) == message
+    frames = protocol.encode(Install(1), KEY)
     assert not protocol.authenticate(frames, b"x" * 32)
     assert not protocol.authenticate([frames[0] + b" ", frames[1]], KEY)
-    for payload in (
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         b"not json",
+        b"[]",
         b'{"type": "Nope"}',
         b'{"type": "Install"}',
         b'{"type": "Install", "generation": "1"}',
         b'{"type": "Install", "generation": true}',
         b'{"type": "Install", "generation": 1, "extra": 0}',
-        b"[]",
-    ):
-        with pytest.raises(protocol.ProtocolError):
-            protocol.decode(payload)
+        b'{"type": "Propose", "generation": 1, "failed_rank": 2, "survivors": [0, "1"]}',
+    ],
+)
+def test_malformed_payloads_are_rejected(payload):
+    with pytest.raises(protocol.ProtocolError):
+        protocol.decode(payload)
+
+
+def test_load_key_validates_the_environment(monkeypatch):
+    env = recovery.client.AUTHORITY_KEY_ENV
+    monkeypatch.delenv(env, raising=False)
+    with pytest.raises(ValueError, match="not set"):
+        recovery.client.load_key()
+    monkeypatch.setenv(env, "zz")
+    with pytest.raises(ValueError, match="hex"):
+        recovery.client.load_key()
+    monkeypatch.setenv(env, "00" * 8)
+    with pytest.raises(ValueError, match="16 bytes"):
+        recovery.client.load_key()
+    monkeypatch.setenv(env, KEY.hex())
+    assert recovery.client.load_key() == KEY
 
 
 def test_client_from_env(monkeypatch):
-    monkeypatch.delenv("TLLM_WIDEEP_RECOVERY", raising=False)
-    assert recovery.RecoveryClient.from_env("worker", 0) is None
-    monkeypatch.setenv("TLLM_WIDEEP_RECOVERY", "tcp://127.0.0.1:1")
-    monkeypatch.delenv("TLLM_WIDEEP_RECOVERY_KEY", raising=False)
-    with pytest.raises(ValueError):
-        recovery.RecoveryClient.from_env("worker", 0)
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
+    assert recovery.RecoveryClient.from_env(0) is None  # detection-only mode
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", "tcp://127.0.0.1:1")
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY_KEY", raising=False)
+    with pytest.raises(ValueError, match="KEY"):
+        recovery.RecoveryClient.from_env(0)
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE")
+    with pytest.raises(ValueError, match="TLLM_FAULT_TOLERANCE_MODE=1"):
+        recovery.RecoveryClient.from_env(0)
+
+
+# End to end over ZeroMQ.
 
 
 @pytest.fixture
-def served():
-    """Run ``authority.serve`` on a loopback port; yield ``(authority, endpoint)``."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    authority = RecoveryAuthority(WORLD, frozenset({FAILED}), phase_timeout=10.0)
+def served(tmp_path):
+    authority = RecoveryAuthority(WORLD, frozenset({FAILED}), recovery_timeout=10.0)
+    endpoint = f"ipc://{tmp_path}/authority"
+    context = zmq.Context()
+    socket = authority_module.router_socket(context, endpoint)
     stop = threading.Event()
     thread = threading.Thread(
-        target=authority_module.serve,
-        args=(authority, f"tcp://127.0.0.1:{port}", KEY, stop, 0.01),
+        target=authority_module.serve, args=(authority, socket, KEY, stop, 0.01), daemon=True
     )
     thread.start()
-    yield authority, f"tcp://127.0.0.1:{port}"
+    yield authority, endpoint
     stop.set()
-    thread.join()
+    thread.join(timeout=5)
+    socket.close()
+    context.term()
 
 
-def _worker_recovery(client, rank: int, results: dict) -> None:
-    """The sequence a surviving scheduler runs after observing the loss."""
+def _clients(endpoint):
+    return {rank: recovery.RecoveryClient(endpoint, KEY, rank) for rank in range(WORLD)}
+
+
+def _register_clients(clients):
+    admitted = {}
+
+    def register(rank):
+        admitted[rank] = clients[rank].register(RECOVERABLE, time.monotonic() + 10.0)
+
+    threads = [threading.Thread(target=register, args=(rank,)) for rank in clients]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return admitted
+
+
+def _worker_recovery(client, rank, results) -> None:
     deadline = time.monotonic() + 10.0
     try:
         client.send(Stopped(rank, FAILED))
@@ -267,25 +328,14 @@ def _worker_recovery(client, rank: int, results: dict) -> None:
         client.wait(Install, deadline)
         client.send(Installed(rank, proposal.generation))
         results[rank] = client.wait(Commit, deadline)
-    except (recovery.RecoveryError, TimeoutError) as error:
+    except recovery.RecoveryError as error:
         results[rank] = error
 
 
 def test_end_to_end_over_zmq(served):
     authority, endpoint = served
-    clients = {
-        rank: recovery.RecoveryClient(endpoint, KEY, "worker", rank) for rank in range(WORLD)
-    }
-    in_flight = threading.Event()
-    in_flight.set()
-    failures = []
-    admission = recovery.FrontendAdmission(
-        recovery.RecoveryClient(endpoint, KEY, "frontend", 0),
-        is_idle=lambda: not in_flight.is_set(),
-        on_failure=failures.append,
-        poll_interval=0.01,
-    )
-    _wait_for(lambda: authority.phase is Phase.SERVING)
+    clients = _clients(endpoint)
+    assert _register_clients(clients) == {rank: frozenset({FAILED}) for rank in range(WORLD)}
 
     results = {}
     workers = [
@@ -294,51 +344,66 @@ def test_end_to_end_over_zmq(served):
     ]
     for worker in workers:
         worker.start()
-    _wait_for(lambda: admission.closed)
-    # The frontend withholds AdmissionClosed while a request is in flight.
-    time.sleep(0.2)
-    assert authority.phase is Phase.STOPPING
-    in_flight.clear()
     for worker in workers:
         worker.join()
 
     assert results == {rank: Commit(1) for rank in SURVIVORS}
-    _wait_for(lambda: not admission.closed)
     assert authority.phase is Phase.RECOVERED
-    assert failures == []
-    admission.close()
     for client in clients.values():
         client.close()
 
 
-def test_abort_reaches_workers_and_frontend(served):
+def test_abort_reaches_every_worker(served):
     authority, endpoint = served
-    clients = {
-        rank: recovery.RecoveryClient(endpoint, KEY, "worker", rank) for rank in range(WORLD)
-    }
-    failures = []
-    admission = recovery.FrontendAdmission(
-        recovery.RecoveryClient(endpoint, KEY, "frontend", 0),
-        is_idle=lambda: True,
-        on_failure=failures.append,
-        poll_interval=0.01,
-    )
-    _wait_for(lambda: authority.phase is Phase.SERVING)
-
+    clients = _clients(endpoint)
+    _register_clients(clients)
     clients[1].send(Stopped(1, 3))  # rank 3 is not admitted
-    with pytest.raises(recovery.RecoveryAborted):
-        clients[0].wait(Propose, time.monotonic() + 5.0)
-    _wait_for(lambda: failures)
-    assert isinstance(failures[0], recovery.RecoveryAborted)
-    with pytest.raises(TimeoutError):
+    for rank in (0, 3):
+        with pytest.raises(recovery.RecoveryAborted):
+            clients[rank].wait(Propose, time.monotonic() + 5.0)
+    with pytest.raises(recovery.RecoveryTimeout):
         clients[0].wait(Propose, time.monotonic() + 0.05)
-    admission.close()
     for client in clients.values():
         client.close()
 
 
-def _wait_for(predicate, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not predicate():
-        assert time.monotonic() < deadline, "condition not reached"
+def test_frames_signed_with_another_key_are_dropped(served):
+    authority, endpoint = served
+    intruder = recovery.RecoveryClient(endpoint, b"x" * 32, 0)
+    intruder.send(Register(0, 1, RECOVERABLE))
+    time.sleep(0.2)
+    assert authority.phase is Phase.REGISTERING and not authority.admitted_ranks
+    intruder.close()
+
+
+def test_authenticated_malformed_frames_abort(served):
+    authority, endpoint = served
+    context = zmq.Context()
+    socket = context.socket(zmq.DEALER)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.connect(endpoint)
+    payload = b'{"type": "Nope"}'
+    socket.send_multipart([payload, protocol.encode(Install(1), KEY)[1]])
+    socket.send_multipart([payload, hmac.new(KEY, payload, "sha256").digest()])
+    deadline = time.monotonic() + 5.0
+    while authority.phase is not Phase.ABORTED:
+        assert time.monotonic() < deadline
         time.sleep(0.01)
+    socket.close()
+    context.term()
+
+
+def test_client_rejects_unauthenticated_frames(tmp_path):
+    endpoint = f"ipc://{tmp_path}/fake"
+    context = zmq.Context()
+    router = context.socket(zmq.ROUTER)
+    router.bind(endpoint)
+    client = recovery.RecoveryClient(endpoint, KEY, 0)
+    client.send(Stopped(0, FAILED))
+    route, *_ = router.recv_multipart()
+    router.send_multipart([route, *protocol.encode(Commit(1), b"x" * 32)])
+    with pytest.raises(recovery.RecoveryError, match="unauthenticated"):
+        client.wait(Commit, time.monotonic() + 5.0)
+    client.close()
+    router.close()
+    context.term()

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Worker- and frontend-side connection to the recovery authority."""
+"""Worker-side connection to the recovery authority."""
 
 import os
 import time
@@ -20,22 +20,72 @@ from typing import TypeVar
 
 import zmq
 
-from .protocol import Abort, Message, Register, authenticate, decode, encode
+from .protocol import (
+    Abort,
+    Message,
+    ProtocolError,
+    Register,
+    Registered,
+    authenticate,
+    decode,
+    encode,
+)
 
 __all__ = [
-    "RECOVERY_ENDPOINT_ENV",
-    "RECOVERY_KEY_ENV",
+    "AUTHORITY_ENV",
+    "AUTHORITY_KEY_ENV",
+    "FAULT_TOLERANCE_MODE_ENV",
     "RecoveryAborted",
     "RecoveryClient",
     "RecoveryError",
+    "RecoveryTimeout",
+    "load_key",
+    "recovery_requested",
 ]
 
-RECOVERY_ENDPOINT_ENV = "TLLM_WIDEEP_RECOVERY"
-RECOVERY_KEY_ENV = "TLLM_WIDEEP_RECOVERY_KEY"
+FAULT_TOLERANCE_MODE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
+AUTHORITY_ENV = "TLLM_FAULT_TOLERANCE_AUTHORITY"
+AUTHORITY_KEY_ENV = "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY"
 
+_MIN_KEY_BYTES = 16
 _SEND_TIMEOUT_MS = 5000
 
 _M = TypeVar("_M")
+
+
+def recovery_requested() -> bool:
+    """Whether the environment enables recovery from worker loss.
+
+    ``TLLM_FAULT_TOLERANCE_MODE=1`` alone enables detection only; adding the
+    authority address (``TLLM_FAULT_TOLERANCE_AUTHORITY``) and its HMAC key
+    (``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY``) enables recovery.
+
+    Raises:
+        ValueError: The authority address is set without fault-tolerance mode.
+    """
+    if not os.environ.get(AUTHORITY_ENV):
+        return False
+    if os.environ.get(FAULT_TOLERANCE_MODE_ENV) != "1":
+        raise ValueError(f"{AUTHORITY_ENV} requires {FAULT_TOLERANCE_MODE_ENV}=1")
+    return True
+
+
+def load_key() -> bytes:
+    """Return the HMAC key held in ``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`` as hex.
+
+    Raises:
+        ValueError: The key is missing, not hex, or shorter than 16 bytes.
+    """
+    text = os.environ.get(AUTHORITY_KEY_ENV)
+    if not text:
+        raise ValueError(f"{AUTHORITY_KEY_ENV} is not set")
+    try:
+        key = bytes.fromhex(text)
+    except ValueError as error:
+        raise ValueError(f"{AUTHORITY_KEY_ENV} is not a hex string") from error
+    if len(key) < _MIN_KEY_BYTES:
+        raise ValueError(f"{AUTHORITY_KEY_ENV} must hold at least {_MIN_KEY_BYTES} bytes")
+    return key
 
 
 class RecoveryError(RuntimeError):
@@ -50,52 +100,82 @@ class RecoveryAborted(RecoveryError):
         self.reason = reason
 
 
-class RecoveryClient:
-    """DEALER connection to the recovery authority; registers on construction.
+class RecoveryTimeout(RecoveryError, TimeoutError):
+    """The authority did not answer before the deadline."""
 
-    Not thread-safe: use each client from one thread at a time.
+
+class RecoveryClient:
+    """DEALER connection of one worker rank to the recovery authority.
+
+    The socket identity is derived from the rank, so the authority recognizes the
+    worker after a reconnect. Not thread-safe: use each client from one thread at a
+    time.
 
     Args:
         endpoint: Authority address, e.g. ``tcp://host:5555``.
         key: HMAC key shared with the authority.
-        role: ``ROLE_WORKER`` or ``ROLE_FRONTEND``.
-        rank: Logical worker rank (0 for the frontend).
+        rank: Logical worker rank.
     """
 
-    def __init__(self, endpoint: str, key: bytes, role: str, rank: int) -> None:
+    def __init__(self, endpoint: str, key: bytes, rank: int) -> None:
         self._key = key
+        self._rank = rank
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.DEALER)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.setsockopt(zmq.SNDTIMEO, _SEND_TIMEOUT_MS)
+        self._socket.setsockopt(zmq.ROUTING_ID, f"rank-{rank}".encode())
         self._socket.connect(endpoint)
-        self.send(Register(role, rank, os.getpid()))
 
     @classmethod
-    def from_env(cls, role: str, rank: int) -> "RecoveryClient | None":
-        """Connect using ``TLLM_WIDEEP_RECOVERY``/``_KEY``; None when recovery is disabled."""
-        endpoint = os.environ.get(RECOVERY_ENDPOINT_ENV)
-        if not endpoint:
+    def from_env(cls, rank: int) -> "RecoveryClient | None":
+        """Connect to the authority named by the environment; None when recovery is disabled."""
+        if not recovery_requested():
             return None
-        key = os.environ.get(RECOVERY_KEY_ENV)
-        if not key:
-            raise ValueError(f"{RECOVERY_ENDPOINT_ENV} is set but {RECOVERY_KEY_ENV} is not")
-        return cls(endpoint, bytes.fromhex(key), role, rank)
+        return cls(os.environ[AUTHORITY_ENV], load_key(), rank)
+
+    def register(self, recoverable_ranks: tuple[int, ...], deadline: float) -> frozenset[int]:
+        """Register this rank and wait until every rank has registered.
+
+        Args:
+            recoverable_ranks: Ranks whose loss this worker's expert placement covers.
+            deadline: Absolute ``time.monotonic()`` value.
+
+        Returns:
+            The ranks whose loss the deployment recovers from.
+
+        Raises:
+            RecoveryError: Registration was rejected or timed out.
+        """
+        self.send(Register(self._rank, os.getpid(), tuple(recoverable_ranks)))
+        return frozenset(self.wait(Registered, deadline).admitted_ranks)
 
     def send(self, message: Message) -> None:
+        """Send ``message`` to the authority.
+
+        Raises:
+            RecoveryError: The message could not be queued in time.
+        """
         try:
             self._socket.send_multipart(encode(message, self._key))
         except zmq.Again as error:
             raise RecoveryError(f"Timed out sending {message} to the authority") from error
 
     def recv(self, timeout: float) -> Message | None:
-        """Return the next authority message, or None if none arrives within ``timeout`` s."""
-        if not self._socket.poll(max(0, int(timeout * 1000))):
+        """Return the next authority message, or None if none arrives within ``timeout`` s.
+
+        Raises:
+            RecoveryError: A frame failed authentication or did not decode.
+        """
+        if not self._socket.poll(max(1, int(timeout * 1000))):
             return None
         frames = self._socket.recv_multipart()
         if not authenticate(frames, self._key):
             raise RecoveryError("Received an unauthenticated frame from the authority")
-        return decode(frames[0])
+        try:
+            return decode(frames[0])
+        except ProtocolError as error:
+            raise RecoveryError(f"Received a malformed message: {error}") from error
 
     def wait(self, message_type: type[_M], deadline: float) -> _M:
         """Block until a ``message_type`` message arrives.
@@ -106,8 +186,8 @@ class RecoveryClient:
 
         Raises:
             RecoveryAborted: The authority sent ``Abort``.
+            RecoveryTimeout: ``deadline`` passed first.
             RecoveryError: Any other unexpected message arrived.
-            TimeoutError: ``deadline`` passed first.
         """
         while (remaining := deadline - time.monotonic()) > 0:
             message = self.recv(remaining)
@@ -118,8 +198,9 @@ class RecoveryClient:
             if not isinstance(message, message_type):
                 raise RecoveryError(f"Expected {message_type.__name__}, received {message}")
             return message
-        raise TimeoutError(f"Timed out waiting for {message_type.__name__} from the authority")
+        raise RecoveryTimeout(f"Timed out waiting for {message_type.__name__} from the authority")
 
     def close(self) -> None:
+        """Close the connection."""
         self._socket.close()
         self._context.term()

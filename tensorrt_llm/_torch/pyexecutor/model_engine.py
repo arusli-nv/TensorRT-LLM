@@ -956,9 +956,11 @@ class PyTorchModelEngine(ModelEngine):
         """Route MoE traffic around ``failed_ranks`` using resident replicas.
 
         Must run while the engine is idle. Masks the failed ranks' slots out of
-        EPLB routing, commits them as failed in the EP membership, and installs
-        the new rank mask into the MoE execution state captured by the CUDA
-        graphs.
+        EPLB routing and checks the live device routing never reaches them,
+        commits them as failed in the EP membership, and installs the new rank
+        mask into the MoE execution state captured by the CUDA graphs. The
+        routing must exclude the failed ranks before the mask is installed:
+        the MoE kernels silently skip routes to a masked rank.
 
         Args:
             failed_ranks: Logical EP ranks that left the group.
@@ -973,11 +975,13 @@ class PyTorchModelEngine(ModelEngine):
                 failed_ranks) != placement_digest:
             raise RuntimeError(
                 "Installed EPLB placement differs from the agreed placement")
+        load_balancer.check_routing_excludes(failed_ranks)
         execution_state = self.moe_execution_state
         health = execution_state.health
         generation = health.generation
         for rank in sorted(failed_ranks):
             generation = health.commit_failed(rank, generation)
+        execution_state.rearm()
         execution_state.install_mask(health.get_mask_words())
 
     @contextmanager

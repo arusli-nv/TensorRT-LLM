@@ -4,7 +4,6 @@
 import atexit
 import dataclasses
 import datetime
-import functools
 import math
 import os
 import sys
@@ -104,6 +103,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           initialize_multimodal_encoder_request,
                           is_multimodal_encoder_ready)
 from .model_engine import ModelEngine
+from .peer_loss_recovery import PeerLossRecovery
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
@@ -119,8 +119,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import (ADPRouter, DefaultADPRouter, RankState,
-                                   count_retiring_requests)
+from .scheduler.adp_router import ADPRouter, RankState, count_retiring_requests
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -143,10 +142,6 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
 
-# Bound on the whole peer-loss recovery exchange, from the interrupted host
-# collective until the authority commits the survivor membership.
-PEER_LOSS_RECOVERY_TIMEOUT_ENV_VAR_NAME = "TLLM_WIDEEP_RECOVERY_TIMEOUT_S"
-_PEER_LOSS_RECOVERY_TIMEOUT_DEFAULT_S = 120.0
 # With recovery enabled, an idle rank 0 re-enters the request broadcast at this
 # interval so that it observes a peer loss reported by the other ranks.
 _PEER_LOSS_IDLE_POLL_INTERVAL = datetime.timedelta(seconds=1)
@@ -154,19 +149,6 @@ _PEER_LOSS_IDLE_POLL_INTERVAL = datetime.timedelta(seconds=1)
 # (context, generation, tokens, real generation requests): it neither blocks
 # context batching nor counts as the least busy rank.
 _ADP_BALANCE_DEPARTED_RANK_COUNTS = (1, 1, 0, sys.maxsize)
-
-
-@functools.cache
-def _worker_recovery_client(rank: int):
-    """Return this process's recovery client, or None when recovery is disabled.
-
-    Cached because a process constructs more than one PyExecutor (KV cache
-    estimation, then serving) but registers with the authority exactly once.
-    """
-    from tensorrt_llm.executor.recovery.client import RecoveryClient
-    from tensorrt_llm.executor.recovery.protocol import ROLE_WORKER
-    return RecoveryClient.from_env(ROLE_WORKER, rank)
-
 
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
@@ -410,8 +392,8 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
-    # Connection to the WideEP recovery authority; None when recovery is off.
-    _recovery_client = None
+    # Recovery from a peer process loss; None when it is disabled.
+    _peer_loss_recovery: Optional[PeerLossRecovery] = None
 
     def __init__(
             self,
@@ -1132,7 +1114,7 @@ class PyExecutor:
         # Requests rank 0 fetched but failed to broadcast because a host
         # collective was interrupted.
         self._unbroadcast_requests: List[RequestQueueItem] = []
-        self._init_peer_loss_recovery()
+        self._peer_loss_recovery = PeerLossRecovery.create(self)
 
         if start_worker:
             self.start_worker()
@@ -1387,9 +1369,10 @@ class PyExecutor:
             # Even when this rank has no responses we must participate in the
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
-            self._enqueue_responses(responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+            self._publish_responses(responses, requests_to_terminate)
+        else:
+            for request in requests_to_terminate:
+                self._terminate_request(request)
 
     def _flush_iter_stats_synced(self):
         """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
@@ -1516,134 +1499,10 @@ class PyExecutor:
         and restarted when the loop is re-entered. A failed recovery raises out
         of here into the existing terminal path of ``_event_loop_wrapper``.
         """
-        while True:
-            try:
-                self.event_loop()
-                return
-            except HostCollectiveInterrupted as error:
-                if self._recovery_client is None:
-                    raise
-                self._recover_from_peer_loss(error)
-
-    def _init_peer_loss_recovery(self) -> None:
-        """Connect to the recovery authority if enabled and qualify the config."""
-        client = _worker_recovery_client(self.dist.rank)
-        if client is None:
-            return
-        load_balancer = getattr(self.model_engine, "moe_load_balancer", None)
-        static_eplb = (load_balancer is not None
-                       and load_balancer.is_static_routing())
-        execution_state = getattr(self.model_engine, "moe_execution_state",
-                                  None)
-        sleep_config = getattr(self.llm_args, "sleep_config", None)
-        requirements = {
-            "attention DP": self.enable_attention_dp,
-            "MPI executor": not self._disable_mpi,
-            "PP=CP=1": self.dist.pp_size == 1 and self.dist.cp_size == 1,
-            "DefaultADPRouter": type(self.adp_router) is DefaultADPRouter,
-            "no separate draft model": self.draft_model_engine is None,
-            "no KV cache transceiver": self.kv_cache_transceiver is None,
-            "no sleep/wakeup": sleep_config is None,
-            "static EPLB": static_eplb,
-            "MoE execution state": execution_state is not None,
-        }
-        unmet = [name for name, met in requirements.items() if not met]
-        if unmet:
-            raise ValueError("WideEP peer-loss recovery is enabled but the "
-                             f"configuration lacks: {', '.join(unmet)}")
-        self._recovery_client = client
-        self._peer_loss_recovery_timeout_s = float(
-            os.environ.get(PEER_LOSS_RECOVERY_TIMEOUT_ENV_VAR_NAME,
-                           _PEER_LOSS_RECOVERY_TIMEOUT_DEFAULT_S))
-
-    def _recover_from_peer_loss(self, error: HostCollectiveInterrupted) -> None:
-        """Continue serving without one departed peer, or raise to go terminal.
-
-        Only an idle executor recovers. Survivors agree on the new membership
-        through the recovery authority (``Stopped`` -> ``Propose`` -> ``Ready``
-        -> ``Install`` -> ``Installed`` -> ``Commit``) and keep their CUDA
-        graphs: the departed rank is masked out of host collectives, EPLB
-        routing, and the MoE dispatch/combine descriptor. Every wait is bounded
-        by one deadline.
-        """
-        from tensorrt_llm.executor.recovery.protocol import (Commit, Install,
-                                                             Installed, Propose,
-                                                             Ready, Stopped)
-
-        deadline = time.monotonic() + self._peer_loss_recovery_timeout_s
-        rank = self.dist.rank
-        logger.warning(f"Rank {rank}: host collective interrupted ({error}); "
-                       "attempting peer-loss recovery")
-        self.dist.revoke()
-        # Shrink is a ULFM agreement among survivors, so every survivor reports
-        # the same failed set even if it only observed the revocation.
-        failed = self.dist.shrink()
-        if len(failed) != 1:
-            raise RuntimeError("Peer-loss recovery requires exactly one "
-                               f"departed rank, got {sorted(failed)}")
-        (failed_rank, ) = failed
-        self._require_idle_for_recovery()
-        self._join_device_work(deadline)
-        self.executor_request_queue.begin_recovery()
-
-        client = self._recovery_client
-        client.send(Stopped(rank=rank, failed_rank=failed_rank))
-        proposal = client.wait(Propose, deadline)
-        if (proposal.failed_rank != failed_rank
-                or rank not in proposal.survivors
-                or failed_rank in proposal.survivors):
-            raise RuntimeError(
-                f"Rank {rank} observed the loss of rank {failed_rank} but the "
-                f"authority proposed {proposal}")
-        generation = proposal.generation
-
-        placement_digest = self.model_engine.prepare_resident_placement(failed)
-        client.send(
-            Ready(rank=rank,
-                  generation=generation,
-                  placement_digest=placement_digest))
-        self._expect_recovery_generation(client.wait(Install, deadline),
-                                         generation)
-
-        self.dist.install_survivors(failed)
-        self.model_engine.install_resident_placement(failed, placement_digest,
-                                                     deadline)
-        client.send(Installed(rank=rank, generation=generation))
-        self._expect_recovery_generation(client.wait(Commit, deadline),
-                                         generation)
-
-        self.executor_request_queue.complete_recovery()
-        logger.warning(f"Rank {rank}: resumed serving without rank "
-                       f"{failed_rank} at membership generation {generation}")
-
-    def _require_idle_for_recovery(self) -> None:
-        if (self.active_requests or self.waiting_queue
-                or self._unbroadcast_requests
-                or self.previous_batch is not None):
-            raise RuntimeError(
-                "Peer-loss recovery requires an idle executor: "
-                f"{len(self.active_requests)} active, "
-                f"{len(self.waiting_queue)} waiting, "
-                f"{len(self._unbroadcast_requests)} unbroadcast requests")
-
-    def _join_device_work(self, deadline: float) -> None:
-        """Wait for work enqueued on the executor streams, up to ``deadline``."""
-        events = []
-        for stream in (torch.cuda.current_stream(), self.execution_stream):
-            event = torch.cuda.Event()
-            event.record(stream)
-            events.append(event)
-        while not all(event.query() for event in events):
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    "Timed out joining device work for peer-loss recovery")
-            time.sleep(0.001)
-
-    @staticmethod
-    def _expect_recovery_generation(message, generation: int) -> None:
-        if message.generation != generation:
-            raise RuntimeError(f"Expected recovery generation {generation}, "
-                               f"received {message}")
+        if self._peer_loss_recovery is None:
+            self.event_loop()
+        else:
+            self._peer_loss_recovery.run(self.event_loop)
 
     @property
     def is_warmup(self) -> bool:
@@ -4877,6 +4736,8 @@ class PyExecutor:
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if self._peer_loss_recovery is not None:
+                        self._peer_loss_recovery.step_prepared(scheduled_batch)
 
                 if self._kv_connector_moves_kv:
                     self.kv_connector_manager.handle_metadata()
@@ -4993,6 +4854,8 @@ class PyExecutor:
                             spec_resource_mgr.process_and_save(
                                 scheduled_batch, spec_metadata)
 
+                    if self._peer_loss_recovery is not None:
+                        self._peer_loss_recovery.commit_step(sample_state)
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
                     if self.speculation_gate is not None:
@@ -6423,7 +6286,7 @@ class PyExecutor:
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             if self._disable_mpi:
                 timeout = datetime.timedelta(seconds=1200)
-            elif self._recovery_client is not None:
+            elif self._peer_loss_recovery is not None:
                 timeout = _PEER_LOSS_IDLE_POLL_INTERVAL
             else:
                 timeout = None
@@ -6696,6 +6559,8 @@ class PyExecutor:
                 all_ranks_new_requests, all_rank_states)
             if unservable:
                 self._fail_unservable_requests(unservable)
+            if self._peer_loss_recovery is not None:
+                self._peer_loss_recovery.requests_routed(all_ranks_new_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
@@ -8411,7 +8276,12 @@ class PyExecutor:
                                                      scheduled_requests)
 
             return outputs
+        except HostCollectiveInterrupted:
+            if route_capture is not None:
+                route_capture.abort_forward()
+            raise
         except Exception as e:
+            self._raise_if_peer_failed("forward", e)
             self._maybe_record_hang_diagnostic_phase("forward_error",
                                                      scheduled_requests)
             if route_capture is not None:
@@ -8456,8 +8326,40 @@ class PyExecutor:
         if mm_data:
             strip_mm_data_for_generation(mm_data)
 
-    def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
-        # handle potential attention dp dummy request
+    def _discard_uncommitted_step(self,
+                                  batch: Optional[ScheduledRequests]) -> None:
+        """Undo a step that a peer loss interrupted before its results applied.
+
+        Returns the KV cache reserved for ``batch`` (None when the loss came
+        before resources were prepared) and the attention-DP padding request,
+        so that the step's requests are scheduled again unchanged.
+        """
+        self._finalize_adp_dummy_allocation(False)
+        if batch is not None:
+            self.kv_cache_manager.revert_prepare_resources(batch)
+        self._retire_attention_dp_dummy()
+
+    def _requeue_unscheduled_requests(self) -> None:
+        """Re-admit requests that were received but never scheduled.
+
+        A peer loss can interrupt the broadcast of new requests, leaving them
+        on some ranks and not others. Rank 0 holds every such request, so it
+        re-broadcasts them in arrival order and the other ranks drop theirs.
+        """
+        unscheduled = [*self.waiting_queue, *self._unbroadcast_requests]
+        self.waiting_queue.remove_by_ids({item.id for item in unscheduled})
+        self._unbroadcast_requests = []
+        if self.dist.rank == 0:
+            self.request_accumulated[:0] = unscheduled
+
+    def _raise_if_peer_failed(self, operation: str, error: Exception) -> None:
+        """Report an error of a step that a peer loss interrupted as such."""
+        recovery = self._peer_loss_recovery
+        if recovery is not None and recovery.peer_failed:
+            raise HostCollectiveInterrupted(operation, frozenset()) from error
+
+    def _retire_attention_dp_dummy(self) -> None:
+        """Terminate the attention-DP padding request of the last step, if any."""
         if self.active_requests and self.active_requests[
                 -1].is_attention_dp_dummy:
             request = self.active_requests[-1]
@@ -8465,6 +8367,9 @@ class PyExecutor:
             self.inflight_req_ids.erase(request.py_request_id)
             self._terminate_request(request)
             self.active_requests.remove(request)
+
+    def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
+        self._retire_attention_dp_dummy()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
@@ -8549,7 +8454,10 @@ class PyExecutor:
                 return sample_state
             self._maybe_record_hang_diagnostic_phase("sampling_skipped",
                                                      scheduled_batch)
+        except HostCollectiveInterrupted:
+            raise
         except Exception as e:
+            self._raise_if_peer_failed("sampling", e)
             self._maybe_record_hang_diagnostic_phase("sampling_error",
                                                      scheduled_batch)
             traceback.print_exc()
@@ -8578,7 +8486,10 @@ class PyExecutor:
         try:
             self.sampler.update_requests(sample_state, resource_manager)
             self._accumulate_spec_dec_stats(sample_state)
+        except HostCollectiveInterrupted:
+            raise
         except Exception as e:
+            self._raise_if_peer_failed("request update", e)
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
@@ -8810,9 +8721,8 @@ class PyExecutor:
             self._pending_transfer_responses = []
             pending_terminations = self._pending_response_terminations
             self._pending_response_terminations = []
-            self._enqueue_responses(pending + list(error_responses.items()))
-            for request in pending_terminations:
-                self._terminate_request(request)
+            self._publish_responses(pending + list(error_responses.items()),
+                                    pending_terminations)
 
         if not defer_termination:
             for request in failed_requests:
@@ -8977,6 +8887,23 @@ class PyExecutor:
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
+    def _publish_responses(self, responses: Iterable[Tuple[int, LlmResponse]],
+                           terminations: Iterable[LlmRequest]) -> None:
+        """Enqueue ``responses``, then terminate the requests they finish.
+
+        If a peer loss interrupts the response gather, peer-loss recovery
+        delivers the responses and terminates the requests afterwards.
+        """
+        terminations = list(terminations)
+        try:
+            self._enqueue_responses(responses)
+        except HostCollectiveInterrupted:
+            if self._peer_loss_recovery is not None:
+                self._peer_loss_recovery.defer_terminations(terminations)
+            raise
+        for request in terminations:
+            self._terminate_request(request)
+
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         self._maybe_record_hang_diagnostic_phase("enqueueing_responses")
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
@@ -8985,6 +8912,10 @@ class PyExecutor:
 
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
+                recovery = self._peer_loss_recovery
+                if recovery is not None:
+                    responses = list(responses)
+                    recovery.gathering_responses(responses)
                 responses_list = self.dist.tp_gather(responses)
             else:
                 responses_list = self.dist.allgather(responses)
@@ -9016,6 +8947,9 @@ class PyExecutor:
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
+
+        if self._peer_loss_recovery is not None:
+            self._peer_loss_recovery.responses_gathered(responses)
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
@@ -9255,9 +9189,7 @@ class PyExecutor:
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
-        self._enqueue_responses(new_responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+        self._publish_responses(new_responses, requests_to_terminate)
         # Under multi-rank ADP the coordinator defers the error response to
         # its synced drain; an in-place tp_allgather here would desync
         # (reached from per-rank-divergent gates).

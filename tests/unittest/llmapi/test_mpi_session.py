@@ -750,6 +750,11 @@ def _fake_ulfm_mpi(monkeypatch: pytest.MonkeyPatch):
                         SimpleNamespace(MPI=fake_mpi),
                         raising=False)
     monkeypatch.setattr(mpi_session, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpi_session, "is_mpi_peer_failure", lambda error: isinstance(
+            error, _FakeMPIException) and error.error_class in (75, 76, 77))
+    # A departed peer has been reported once a peer-failure error surfaced.
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
     return fake_mpi
 
 
@@ -772,9 +777,11 @@ def test_server_async_callback_departed_peer(monkeypatch: pytest.MonkeyPatch,
     from concurrent.futures import BrokenExecutor
 
     if recovery:
-        monkeypatch.setenv("TLLM_WIDEEP_RECOVERY", "tcp://127.0.0.1:1")
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY",
+                           "tcp://127.0.0.1:1")
     else:
-        monkeypatch.delenv("TLLM_WIDEEP_RECOVERY", raising=False)
+        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
     server = object.__new__(RemoteMpiCommSessionServer)
     sent = []
     server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
@@ -802,9 +809,11 @@ def test_task_end_barrier_tolerates_departed_peer_with_recovery(
     from tensorrt_llm.llmapi import mpi_session
 
     if recovery:
-        monkeypatch.setenv("TLLM_WIDEEP_RECOVERY", "tcp://127.0.0.1:1")
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY",
+                           "tcp://127.0.0.1:1")
     else:
-        monkeypatch.delenv("TLLM_WIDEEP_RECOVERY", raising=False)
+        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
     error = _FakeMPIException(75)
 
     def failing_barrier():
@@ -820,3 +829,43 @@ def test_task_end_barrier_tolerates_departed_peer_with_recovery(
     error.error_class = 16
     with pytest.raises(_FakeMPIException):
         RemoteMpiCommSessionServer._finish_barrier()
+
+
+@pytest.mark.cpu_only
+def test_server_stops_waiting_for_tasks_after_a_rank_departed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """After ULFM reports a failed rank, the server stops waiting for task results.
+
+    No result arrives any more, so the server only accepts shutdown.
+    """
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    done = Future()
+    done.set_result(None)
+    never = Future()
+    monkeypatch.setattr(mpi_session, "_recovery_enabled", lambda: True)
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    assert RemoteMpiCommSessionServer._live_worker_futures([done, never]) == []
+
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 0)
+    assert RemoteMpiCommSessionServer._live_worker_futures([done]) == [done]
+
+    monkeypatch.setattr(mpi_session, "_recovery_enabled", lambda: False)
+    futures = [done, never]
+    assert RemoteMpiCommSessionServer._live_worker_futures(futures) is futures
+
+
+@pytest.mark.cpu_only
+def test_broken_executor_counts_as_departure_only_after_a_failure(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from concurrent.futures import BrokenExecutor
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    monkeypatch.setattr(mpi_session, "_recovery_enabled", lambda: True)
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 0)
+    assert not mpi_session._is_departed_peer_failure(BrokenExecutor())
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    assert mpi_session._is_departed_peer_failure(BrokenExecutor())

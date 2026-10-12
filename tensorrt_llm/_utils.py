@@ -564,6 +564,30 @@ def default_gpus_per_node():
     return min(num_ranks, num_gpus)
 
 
+_PEER_FAILURE_ERROR_NAMES = ("ERR_PROC_FAILED", "ERR_PROC_FAILED_PENDING",
+                             "ERR_REVOKED")
+_GENERIC_ERROR_NAMES = ("ERR_UNKNOWN", "ERR_OTHER", "ERR_INTERN",
+                        "ERR_LASTCODE")
+
+
+@lru_cache(maxsize=1)
+def _peer_failure_error_classes() -> frozenset:
+    """ULFM error classes for a failed peer or a revoked communicator.
+
+    Empty without ULFM support; classes that alias a generic error class are
+    excluded so that ordinary MPI errors are never classified as peer failures.
+    """
+    generic = {getattr(MPI, name, None) for name in _GENERIC_ERROR_NAMES}
+    classes = {getattr(MPI, name, None) for name in _PEER_FAILURE_ERROR_NAMES}
+    return frozenset(classes - generic - {None})
+
+
+def is_mpi_peer_failure(error: BaseException) -> bool:
+    """Whether *error* reports a failed MPI peer or a revoked communicator."""
+    return (isinstance(error, MPI.Exception)
+            and error.Get_error_class() in _peer_failure_error_classes())
+
+
 def mpi_barrier():
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Barrier()

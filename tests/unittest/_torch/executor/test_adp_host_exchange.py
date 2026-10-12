@@ -41,6 +41,8 @@ class _LockstepDist:
         dist = self
 
         class _Proxy:
+            live_ranks = (0, 1)
+
             def tp_allgather_int64(self, values):
                 vec = list(values)
                 with dist.lock:

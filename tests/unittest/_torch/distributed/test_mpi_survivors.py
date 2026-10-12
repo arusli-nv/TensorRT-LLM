@@ -19,6 +19,8 @@ single CPU process without an MPI launcher.
 """
 
 import pickle
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -75,6 +77,7 @@ class FakeComm:
         self.bcast_roots = []
         self.barriers = 0
         self.shrink_members = None
+        self.freed = False
 
     def _check(self) -> None:
         if self.error is not None:
@@ -128,6 +131,37 @@ class FakeComm:
         self._check()
         return obj * len(self.members)
 
+    def Dup(self) -> "FakeComm":
+        return self
+
+    def Free(self) -> None:
+        self.freed = True
+
+    def Irecv(self, buf, source):
+        return self.pending
+
+
+class FakeRequest:
+    """Receive that completes with ``error`` from its ``fail_after``-th test on."""
+
+    def __init__(self, error=None, fail_after=3) -> None:
+        self.error = error
+        self.fail_after = fail_after
+        self.tests = 0
+        self.cancelled = False
+
+    def Test(self) -> bool:
+        self.tests += 1
+        if self.error is not None and self.tests >= self.fail_after:
+            raise self.error
+        return False
+
+    def Cancel(self) -> None:
+        self.cancelled = True
+
+    def Wait(self) -> None:
+        pass
+
 
 WORLD = 4
 ME = 1
@@ -161,13 +195,21 @@ def fake_mpi(monkeypatch):
         ERR_INTERN=17,
         ERR_LASTCODE=92,
         UNDEFINED=-32766,
+        ANY_SOURCE=-1,
         INT64_T="int64",
         BYTE="byte",
+        THREAD_MULTIPLE=3,
+        Query_thread=lambda: 3,
+        Comm=SimpleNamespace(Revoke=None, Shrink=None, Get_failed=None),
     )
     monkeypatch.setattr(communicator, "MPI", fake)
-    communicator._peer_failure_error_classes.cache_clear()
-    yield fake
-    communicator._peer_failure_error_classes.cache_clear()
+    monkeypatch.setattr(
+        communicator,
+        "is_mpi_peer_failure",
+        lambda error: isinstance(error, FakeMPIException)
+        and error.error_class in (ERR_PROC_FAILED, 76, ERR_REVOKED),
+    )
+    return fake
 
 
 @pytest.fixture
@@ -183,7 +225,23 @@ def world(fake_mpi, monkeypatch):
 def dist(world):
     dist = MPIDist(_mapping())
     dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
+    dist.enable_peer_loss_recovery()
     return dist
+
+
+def test_recovery_revokes_a_private_world_not_the_session_world(world, monkeypatch):
+    """The MPI session keeps using the world communicator after a peer loss."""
+    private = FakeComm(range(WORLD), ME, failed=(FAILED,))
+    monkeypatch.setattr(world, "Dup", lambda: private, raising=False)
+    dist = MPIDist(_mapping())
+    dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
+    with pytest.raises(RuntimeError):
+        dist.revoke()
+    dist.enable_peer_loss_recovery()
+    dist.broadcast_int64([1], root=0)
+    dist.revoke()
+    assert private.bcast_roots == [0] and world.bcast_roots == []
+    assert private.revoke_calls == 1 and world.revoke_calls == 0
 
 
 def test_healthy_paths_return_compact_results(dist, world):
@@ -340,3 +398,57 @@ def test_shrink_only_once(dist):
     _install(dist)
     with pytest.raises(RuntimeError):
         dist.shrink()
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.001)
+
+
+def test_watch_peer_failures_reports_once_from_background_thread(dist, world):
+    world.pending = FakeRequest(FakeMPIException(ERR_PROC_FAILED))
+    calls = []
+    watch = dist.watch_peer_failures(lambda: calls.append(threading.current_thread().name))
+    _wait_for(lambda: calls)
+    watch.stop()
+    assert calls == ["peer_failure_watch"] and world.pending.tests == 3
+
+
+def test_watch_peer_failures_fails_closed_on_other_errors(dist, world):
+    world.pending = FakeRequest(FakeMPIException(ERR_OTHER), fail_after=1)
+    calls = []
+    watch = dist.watch_peer_failures(lambda: calls.append(1))
+    _wait_for(lambda: calls)
+    watch.stop()
+    assert calls == [1]
+
+
+def test_stopped_watch_reports_nothing_and_releases_resources(dist, world):
+    world.pending = FakeRequest(FakeMPIException(ERR_PROC_FAILED), fail_after=10**9)
+    calls = []
+    watch = dist.watch_peer_failures(lambda: calls.append(1))
+    _wait_for(lambda: world.pending.tests > 1)
+    watch.stop()
+    world.pending.fail_after = 0
+    time.sleep(0.05)
+    assert calls == [] and world.pending.cancelled and world.freed
+
+
+def test_peer_failures_stay_mpi_errors_without_recovery(world):
+    dist = MPIDist(_mapping())
+    dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
+    world.error = FakeMPIException(ERR_PROC_FAILED)
+    with pytest.raises(FakeMPIException):
+        dist.broadcast_int64([0])
+
+
+def test_recovery_requires_ulfm_and_thread_multiple(world, fake_mpi, monkeypatch):
+    dist = MPIDist(_mapping())
+    monkeypatch.setattr(fake_mpi, "Query_thread", lambda: 1)
+    with pytest.raises(RuntimeError, match="THREAD_MULTIPLE"):
+        dist.enable_peer_loss_recovery()
+    monkeypatch.setattr(fake_mpi, "Comm", SimpleNamespace())
+    with pytest.raises(RuntimeError, match="ULFM"):
+        dist.enable_peer_loss_recovery()

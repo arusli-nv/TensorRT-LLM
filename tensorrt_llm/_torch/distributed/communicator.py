@@ -3,6 +3,8 @@
 
 import math
 import pickle  # nosec B403
+import threading
+import time
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import lru_cache, wraps
@@ -21,10 +23,11 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
-from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
-                                 mpi_comm, mpi_disabled, mpi_isend,
-                                 mpi_isend_object, mpi_recv, mpi_recv_object,
-                                 mpi_send, mpi_send_object, mpi_world_size,
+from tensorrt_llm._utils import (is_mpi_peer_failure, local_mpi_size,
+                                 mpi_allgather, mpi_barrier, mpi_comm,
+                                 mpi_disabled, mpi_isend, mpi_isend_object,
+                                 mpi_recv, mpi_recv_object, mpi_send,
+                                 mpi_send_object, mpi_world_size,
                                  torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
@@ -35,25 +38,6 @@ try:
     import ray
 except ModuleNotFoundError:
     from tensorrt_llm.executor.ray import stub as ray
-
-_PEER_FAILURE_ERROR_NAMES = ("ERR_PROC_FAILED", "ERR_PROC_FAILED_PENDING",
-                             "ERR_REVOKED")
-_GENERIC_ERROR_NAMES = ("ERR_UNKNOWN", "ERR_OTHER", "ERR_INTERN",
-                        "ERR_LASTCODE")
-
-
-@lru_cache(maxsize=1)
-def _peer_failure_error_classes() -> frozenset[int]:
-    """MPI error classes that report a failed peer or a revoked communicator.
-
-    Empty when the MPI library has no ULFM support. Classes that alias a
-    generic error class are excluded so ordinary MPI errors stay unclassified.
-    """
-    if MPI is None:
-        return frozenset()
-    generic = {getattr(MPI, name, None) for name in _GENERIC_ERROR_NAMES}
-    classes = {getattr(MPI, name, None) for name in _PEER_FAILURE_ERROR_NAMES}
-    return frozenset(classes - generic - {None})
 
 
 class HostCollectiveInterrupted(Exception):
@@ -81,8 +65,8 @@ class HostCollectiveInterrupted(Exception):
 
 
 def _interruptible(operation: str) -> Callable[[Callable], Callable]:
-    """Convert peer-failure MPI errors raised by an ``MPIDist`` method into
-    :class:`HostCollectiveInterrupted`."""
+    """With peer-loss recovery enabled, convert peer-failure MPI errors raised
+    by an ``MPIDist`` method into :class:`HostCollectiveInterrupted`."""
 
     def decorator(func: Callable) -> Callable:
 
@@ -90,8 +74,8 @@ def _interruptible(operation: str) -> Callable[[Callable], Callable]:
         def wrapper(self: "MPIDist", *args, **kwargs):
             try:
                 return func(self, *args, **kwargs)
-            except MPI.Exception as error:
-                if error.Get_error_class() not in _peer_failure_error_classes():
+            except Exception as error:
+                if self._host_world is None or not is_mpi_peer_failure(error):
                     raise
                 raise HostCollectiveInterrupted(
                     operation, self._known_failed_ranks()) from error
@@ -236,6 +220,11 @@ class Distributed(ABC):
         """Logical TP ranks whose processes take part in host collectives."""
         return tuple(range(self.tp_size))
 
+    def enable_peer_loss_recovery(self) -> None:
+        """Run host collectives on communicators that recovery may revoke."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support peer-loss recovery")
+
     def revoke(self) -> None:
         """Interrupt host collectives blocked on this rank's peers."""
         raise NotImplementedError(
@@ -250,6 +239,13 @@ class Distributed(ABC):
         """Continue host collectives over the ranks not in *failed*."""
         raise NotImplementedError(
             f"{type(self).__name__} does not support survivor communicators")
+
+    def watch_peer_failures(
+            self, on_failure: Callable[[], None]) -> "PeerFailureWatch":
+        """Call *on_failure* once, from a background thread, when a peer
+        fails before the returned watch is stopped."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support peer failure detection")
 
     @abstractmethod
     def barrier(self):
@@ -796,6 +792,54 @@ def safe_allgather(
     return _deserialize_recvbuf(recvbuf, lengths, displs, size)
 
 
+class PeerFailureWatch:
+    """Background detection of a failed peer on a private communicator.
+
+    Args:
+        comm: Communicator owned by the watch; freed by :meth:`stop`.
+        on_failure: Called once from the watch thread when a peer fails, or
+            when detection itself fails.
+        poll_interval: Seconds between polls of the pending receive.
+    """
+
+    def __init__(self,
+                 comm: "MPI.Comm",
+                 on_failure: Callable[[], None],
+                 poll_interval: float = 0.01) -> None:
+        self._comm = comm
+        self._request = comm.Irecv(bytearray(1), source=MPI.ANY_SOURCE)
+        self._on_failure = on_failure
+        self._poll_interval = poll_interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch,
+                                        name="peer_failure_watch",
+                                        daemon=True)
+        self._thread.start()
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._request.Test()
+            except Exception as error:  # noqa: BLE001 - every failure is fatal
+                if not is_mpi_peer_failure(error):
+                    logger.error(f"Peer failure detection failed: {error!r}")
+                self._on_failure()
+                return
+            time.sleep(self._poll_interval)
+
+    def stop(self) -> None:
+        """Stop watching and release the receive and the communicator."""
+        self._stop.set()
+        self._thread.join()
+        try:
+            self._request.Cancel()
+            self._request.Wait()
+        except Exception as error:  # noqa: BLE001 - a failed peer may fail it
+            if not is_mpi_peer_failure(error):
+                raise
+        self._comm.Free()
+
+
 class MPIDist(Distributed):
     tp_comm: MPI.Comm
 
@@ -812,6 +856,10 @@ class MPIDist(Distributed):
         # Set by shrink(): the survivor communicator and its logical ranks,
         # held until install_survivors() activates them.
         self._shrunk: Optional[tuple[MPI.Comm, tuple[int, ...]]] = None
+        # Set by enable_peer_loss_recovery(): a private duplicate of the world
+        # communicator for host collectives, so revoking it leaves the MPI
+        # session's own use of the world communicator intact.
+        self._host_world: Optional[MPI.Comm] = None
 
     @property
     def live_ranks(self) -> tuple[int, ...]:
@@ -819,12 +867,37 @@ class MPIDist(Distributed):
             return super().live_ranks
         return self._live_ranks
 
+    def enable_peer_loss_recovery(self) -> None:
+        """Move world-level host collectives to a private communicator.
+
+        Collective over the world; call before any host collective that
+        recovery may need to interrupt.
+
+        Raises:
+            RuntimeError: The MPI library lacks ULFM, or MPI was not
+                initialized with ``MPI_THREAD_MULTIPLE``.
+        """
+        if not all(
+                hasattr(MPI.Comm, name)
+                for name in ("Revoke", "Shrink", "Get_failed")):
+            raise RuntimeError(
+                "Peer-loss recovery requires mpi4py>=4 on an MPI library "
+                "with ULFM support")
+        if MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+            raise RuntimeError(
+                "Peer-loss recovery requires MPI_THREAD_MULTIPLE")
+        if self._host_world is None:
+            self._host_world = mpi_comm().Dup()
+
     def revoke(self) -> None:
         """Revoke the communicators host collectives run on so that every
         rank blocked in one of them raises :class:`HostCollectiveInterrupted`.
 
-        Idempotent. Requires an MPI library with ULFM support.
+        Idempotent. Requires :meth:`enable_peer_loss_recovery` and an MPI
+        library with ULFM support.
         """
+        if self._host_world is None:
+            raise RuntimeError("revoke() requires enable_peer_loss_recovery()")
         comms = [self._world_comm()]
         if self._survivor_comm is None and self._tp_comm is not None:
             comms.append(self._tp_comm)
@@ -843,7 +916,7 @@ class MPIDist(Distributed):
 
         Raises:
             ValueError: The layout is unsupported.
-            RuntimeError: A survivor communicator already exists.
+            RuntimeError: A peer was already lost.
         """
         mapping = self.mapping
         if not (mapping.enable_attention_dp and mapping.pp_size == 1
@@ -854,8 +927,9 @@ class MPIDist(Distributed):
                 "(tp_size == moe_ep_size == world_size, pp_size == cp_size == 1)"
             )
         if self._survivor_comm is not None or self._shrunk is not None:
-            raise RuntimeError("Survivor communicator already exists")
-        comm = self._tp_comm if self._tp_comm is not None else mpi_comm()
+            raise RuntimeError("A second peer loss is not recoverable")
+        comm = self._tp_comm if self._tp_comm is not None else self._world_comm(
+        )
         survivor_comm = comm.Shrink()
         live_ranks = self._world_ranks(survivor_comm.Get_group())
         self._shrunk = (survivor_comm, live_ranks)
@@ -894,10 +968,24 @@ class MPIDist(Distributed):
         self._survivor_comm = survivor_comm
         self._shrunk = None
 
+    def watch_peer_failures(
+            self, on_failure: Callable[[], None]) -> "PeerFailureWatch":
+        """Call *on_failure* once, from a daemon thread, when a peer fails
+        before the returned watch is stopped.
+
+        Detects failures while this rank is outside host collectives, for
+        example while it waits on the GPU. Collective over the current
+        (survivor) world: posts a receive that no peer matches on a private
+        duplicate, which ULFM completes with a process-failure error.
+        """
+        return PeerFailureWatch(self._world_comm().Dup(), on_failure)
+
     def _world_comm(self) -> MPI.Comm:
-        if self._survivor_comm is None:
-            return mpi_comm()
-        return self._survivor_comm
+        if self._survivor_comm is not None:
+            return self._survivor_comm
+        if self._host_world is not None:
+            return self._host_world
+        return mpi_comm()
 
     @staticmethod
     def _world_ranks(group: MPI.Group) -> tuple[int, ...]:
@@ -953,9 +1041,11 @@ class MPIDist(Distributed):
 
     @_interruptible("allgather")
     def allgather(self, obj):
-        if self._survivor_comm is None:
-            return mpi_allgather(obj)
-        return self._to_logical(self._survivor_comm.allgather(obj))
+        if self._survivor_comm is not None:
+            return self._to_logical(self._survivor_comm.allgather(obj))
+        if self._host_world is not None:
+            return self._host_world.allgather(obj)
+        return mpi_allgather(obj)
 
     @property
     def local_world_size(self):
@@ -963,10 +1053,10 @@ class MPIDist(Distributed):
 
     @_interruptible("barrier")
     def barrier(self):
-        if self._survivor_comm is None:
+        if self._survivor_comm is None and self._host_world is None:
             mpi_barrier()
         else:
-            self._survivor_comm.Barrier()
+            self._world_comm().Barrier()
 
     @_interruptible("tp_barrier")
     def tp_barrier(self):

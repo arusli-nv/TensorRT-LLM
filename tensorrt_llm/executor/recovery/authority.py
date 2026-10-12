@@ -12,29 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Recovery authority: coordinates survivors through one idle worker loss.
+"""Recovery authority: coordinates the survivors of one worker process loss.
 
 Run as ``python -m tensorrt_llm.executor.recovery.authority --endpoint tcp://*:PORT
---world-size N --admitted-ranks 1,2`` with ``TLLM_WIDEEP_RECOVERY_KEY`` set to a hex
-HMAC key shared with the workers and the frontend.
+--world-size N`` with ``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`` set to the hex HMAC key
+shared with the workers. Run it outside the workers' launch and termination groups:
+it must outlive any one worker.
 """
 
 import argparse
 import enum
 import logging
-import os
 import signal
 import threading
 import time
 
 import zmq
 
+from .client import load_key
 from .protocol import (
-    ROLE_FRONTEND,
-    ROLE_WORKER,
     Abort,
-    AdmissionClosed,
-    CloseAdmission,
     Commit,
     Install,
     Installed,
@@ -43,7 +40,7 @@ from .protocol import (
     ProtocolError,
     Ready,
     Register,
-    ReopenAdmission,
+    Registered,
     Stopped,
     authenticate,
     decode,
@@ -56,8 +53,13 @@ logger = logging.getLogger(__name__)
 
 Outbound = list[tuple[bytes, Message]]
 
+# Upper bound on an incoming message; real messages are a few hundred bytes.
+_MAX_MESSAGE_BYTES = 64 * 1024
+
 
 class Phase(enum.Enum):
+    """Progress of the deployment through registration and one recovery."""
+
     REGISTERING = enum.auto()
     SERVING = enum.auto()
     STOPPING = enum.auto()
@@ -68,50 +70,54 @@ class Phase(enum.Enum):
 
 
 class _Violation(Exception):
-    """A report that the recovery protocol cannot accept; aborts recovery."""
+    """A message that the recovery protocol cannot accept; aborts recovery."""
 
 
 class RecoveryAuthority:
-    """Pure state machine for recovering from one admitted, idle worker loss.
+    """State machine for recovering from the loss of one admitted worker.
 
     The authority performs no I/O: ``handle`` and ``expire`` return the messages to
-    send as ``(routing_id, message)`` pairs. Any protocol violation or expired phase
-    deadline moves it to the terminal ``ABORTED`` phase and broadcasts ``Abort``.
+    send as ``(routing_id, message)`` pairs. Any protocol violation, or a recovery that
+    does not commit within ``recovery_timeout``, moves it to the terminal ``ABORTED``
+    phase and broadcasts ``Abort``. Its attributes are read-only for callers.
 
     Args:
         world_size: Number of worker ranks that must register.
-        admitted_ranks: Ranks whose loss may be recovered. Rank 0 is never admitted.
-        phase_timeout: Seconds allowed for each of the STOPPING, PREPARING, and
-            INSTALLING phases.
-        generation: Membership generation the workers start with.
+        admitted_ranks: Ranks whose loss may be recovered, or None for every rank
+            that all workers report as recoverable. Rank 0 is never admitted.
+            Registration aborts if a listed rank is not recoverable.
+        recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
+            below the workers' recovery timeout so that workers observe ``Abort``.
     """
 
     def __init__(
         self,
         world_size: int,
-        admitted_ranks: frozenset[int],
-        phase_timeout: float = 60.0,
-        generation: int = 0,
+        admitted_ranks: frozenset[int] | None = None,
+        recovery_timeout: float = 60.0,
     ) -> None:
         if world_size < 2:
             raise ValueError(f"world_size must be at least 2, got {world_size}")
-        if not admitted_ranks or not all(0 < rank < world_size for rank in admitted_ranks):
+        if admitted_ranks is not None and (
+            not admitted_ranks or not all(0 < rank < world_size for rank in admitted_ranks)
+        ):
             raise ValueError(f"admitted ranks must lie in [1, {world_size}): {admitted_ranks}")
+        if recovery_timeout <= 0:
+            raise ValueError(f"recovery_timeout must be positive, got {recovery_timeout}")
         self.world_size = world_size
-        self.admitted_ranks = frozenset(admitted_ranks)
-        self.phase_timeout = phase_timeout
-        self.generation = generation
+        self.recovery_timeout = recovery_timeout
+        self._requested_admitted = admitted_ranks
+        self.admitted_ranks: frozenset[int] = frozenset()
+        self.generation = 0
         self.phase = Phase.REGISTERING
         self.deadline: float | None = None
         self.failed_rank: int | None = None
         self.abort_reason: str | None = None
-        self._peers: dict[bytes, Register] = {}
-        self._workers: dict[int, bytes] = {}
-        self._frontend: bytes | None = None
-        self._stopped: dict[int, Stopped] = {}
-        self._ready: dict[int, Ready] = {}
-        self._installed: dict[int, Installed] = {}
-        self._admission_closed = False
+        self._workers: dict[bytes, Register] = {}
+        self._routes: dict[int, bytes] = {}
+        self._stopped: set[int] = set()
+        self._ready: dict[int, str] = {}
+        self._installed: set[int] = set()
 
     @property
     def survivors(self) -> tuple[int, ...]:
@@ -120,218 +126,228 @@ class RecoveryAuthority:
     def handle(self, route: bytes, message: Message, now: float) -> Outbound:
         """Apply ``message`` received from ``route`` at monotonic time ``now``."""
         if self.phase is Phase.ABORTED:
-            return self.abort(self.abort_reason, route)
+            return [(route, Abort(self.abort_reason))]
         try:
             return self._dispatch(route, message, now)
         except _Violation as violation:
             return self.abort(str(violation), route)
 
     def expire(self, now: float) -> Outbound:
-        """Abort if the current phase deadline has passed at monotonic time ``now``."""
+        """Abort if the recovery deadline has passed at monotonic time ``now``."""
         if self.deadline is not None and now >= self.deadline:
-            return self.abort(f"{self.phase.name} phase exceeded {self.phase_timeout}s")
+            return self.abort(f"recovery did not commit within {self.recovery_timeout}s")
         return []
 
     def abort(self, reason: str, route: bytes | None = None) -> Outbound:
-        """Enter the terminal phase and tell every known peer (and ``route``) why."""
+        """Enter the terminal phase and tell every worker (and ``route``) why."""
         if self.phase is Phase.ABORTED:
             return [] if route is None else [(route, Abort(self.abort_reason))]
         logger.error(f"Recovery aborted in phase {self.phase.name}: {reason}")
         self.phase = Phase.ABORTED
         self.deadline = None
         self.abort_reason = reason
-        routes = list(self._peers)
-        if route is not None and route not in self._peers:
+        routes = list(self._workers)
+        if route is not None and route not in self._workers:
             routes.append(route)
         return [(peer, Abort(reason)) for peer in routes]
 
     def _dispatch(self, route: bytes, message: Message, now: float) -> Outbound:
         if isinstance(message, Register):
             return self._on_register(route, message)
-        peer = self._peers.get(route)
-        if peer is None:
+        worker = self._workers.get(route)
+        if worker is None:
             raise _Violation(f"{message} from unregistered peer")
         if self.phase is Phase.REGISTERING:
             raise _Violation(f"{message} before registration completed")
-        if isinstance(message, AdmissionClosed):
-            if peer.role != ROLE_FRONTEND:
-                raise _Violation(f"AdmissionClosed from worker rank {peer.rank}")
-            return self._on_admission_closed(now)
-        if not isinstance(message, (Stopped, Ready, Installed)):
-            raise _Violation(f"unexpected {message} from {peer}")
-        if peer.role != ROLE_WORKER or peer.rank != message.rank:
-            raise _Violation(f"{message} sent by {peer}")
+        if not isinstance(message, (Stopped, Ready, Installed)) or message.rank != worker.rank:
+            raise _Violation(f"unexpected {message} from rank {worker.rank}")
         if message.rank == self.failed_rank:
             raise _Violation(f"departed rank sent {message}")
         if isinstance(message, Stopped):
             return self._on_stopped(message, now)
         if isinstance(message, Ready):
-            return self._on_ready(message, now)
+            return self._on_ready(message)
         return self._on_installed(message)
 
     def _on_register(self, route: bytes, message: Register) -> Outbound:
-        previous = self._peers.get(route)
-        if previous == message:
+        if self.phase is not Phase.REGISTERING:
+            raise _Violation(f"registration {message} after registration completed")
+        if not 0 <= message.rank < self.world_size or message.rank in self._routes:
+            raise _Violation(f"invalid or duplicate registration {message}")
+        if route in self._workers:
+            raise _Violation(f"{message} from the route of rank {self._workers[route].rank}")
+        self._workers[route] = message
+        self._routes[message.rank] = route
+        if len(self._routes) < self.world_size:
             return []
-        if previous is not None or self.phase is not Phase.REGISTERING:
-            raise _Violation(f"unexpected registration {message}")
-        if message.role == ROLE_WORKER:
-            if not 0 <= message.rank < self.world_size or message.rank in self._workers:
-                raise _Violation(f"invalid or duplicate worker registration {message}")
-            self._workers[message.rank] = route
-        elif message.role == ROLE_FRONTEND:
-            if self._frontend is not None:
-                raise _Violation(f"duplicate frontend registration {message}")
-            self._frontend = route
+        self._admit()
+        self.phase = Phase.SERVING
+        registered = Registered(tuple(sorted(self.admitted_ranks)))
+        return [(peer, registered) for peer in self._workers]
+
+    def _admit(self) -> None:
+        recoverable = frozenset(range(1, self.world_size))
+        for registration in self._workers.values():
+            recoverable &= frozenset(registration.recoverable_ranks)
+        if self._requested_admitted is None:
+            self.admitted_ranks = recoverable
+        elif uncovered := self._requested_admitted - recoverable:
+            raise _Violation(
+                f"admitted ranks {sorted(uncovered)} lack resident replicas of all their experts"
+            )
         else:
-            raise _Violation(f"unknown role in {message}")
-        self._peers[route] = message
-        if len(self._workers) == self.world_size and self._frontend is not None:
-            self.phase = Phase.SERVING
-            logger.info(f"Recovery authority: {self.world_size} workers and frontend registered")
-        return []
+            self.admitted_ranks = self._requested_admitted
+        if self.admitted_ranks:
+            logger.info(
+                f"Recovery authority: {self.world_size} workers registered; "
+                f"recoverable ranks {sorted(self.admitted_ranks)}"
+            )
+        else:
+            logger.warning(
+                f"Recovery authority: {self.world_size} workers registered, but the expert "
+                "placement covers the loss of no rank"
+            )
 
     def _on_stopped(self, message: Stopped, now: float) -> Outbound:
-        outbound: Outbound = []
         if self.phase is Phase.SERVING:
-            failed = message.failed_rank
-            if failed not in self.admitted_ranks:
-                raise _Violation(f"loss of rank {failed} is not admitted for recovery")
-            self.failed_rank = failed
-            self._enter(Phase.STOPPING, now)
-            outbound.append((self._frontend, CloseAdmission()))
-        elif self.phase is Phase.RECOVERED:
-            raise _Violation(f"second worker loss reported by {message}")
+            if message.failed_rank not in self.admitted_ranks:
+                raise _Violation(f"loss of rank {message.failed_rank} is not admitted")
+            self.failed_rank = message.failed_rank
+            self.deadline = now + self.recovery_timeout
+            self._enter(Phase.STOPPING)
+        elif self.phase is not Phase.STOPPING:
+            raise _Violation(f"{message} in phase {self.phase.name}")
         if message.failed_rank != self.failed_rank:
             raise _Violation(f"{message} conflicts with departed rank {self.failed_rank}")
-        if message.rank == self.failed_rank:
-            raise _Violation(f"departed rank sent {message}")
-        if not self._collect(self._stopped, message, Phase.STOPPING):
-            return outbound
-        return outbound + self._maybe_propose(now)
-
-    def _on_admission_closed(self, now: float) -> Outbound:
-        if self._admission_closed:
+        self._record(self._stopped, message)
+        if len(self._stopped) < len(self.survivors):
             return []
-        if self.phase is not Phase.STOPPING:
-            raise _Violation(f"AdmissionClosed in phase {self.phase.name}")
-        self._admission_closed = True
-        return self._maybe_propose(now)
-
-    def _maybe_propose(self, now: float) -> Outbound:
-        if not self._admission_closed or len(self._stopped) < len(self.survivors):
-            return []
-        self._enter(Phase.PREPARING, now)
+        self._enter(Phase.PREPARING)
         proposal = Propose(self.generation + 1, self.failed_rank, self.survivors)
-        return [(self._workers[rank], proposal) for rank in self.survivors]
+        return self._to_survivors(proposal)
 
-    def _on_ready(self, message: Ready, now: float) -> Outbound:
-        if message.generation != self.generation + 1:
-            raise _Violation(f"{message} does not match generation {self.generation + 1}")
-        digests = {ready.placement_digest for ready in self._ready.values()}
+    def _on_ready(self, message: Ready) -> Outbound:
+        self._expect(Phase.PREPARING, message)
+        digests = set(self._ready.values())
         if digests and message.placement_digest not in digests:
             raise _Violation(f"{message} placement digest differs from {digests}")
-        if not self._collect(self._ready, message, Phase.PREPARING):
-            return []
+        if message.rank in self._ready:
+            raise _Violation(f"duplicate {message}")
+        self._ready[message.rank] = message.placement_digest
         if len(self._ready) < len(self.survivors):
             return []
-        self._enter(Phase.INSTALLING, now)
-        return [(self._workers[rank], Install(self.generation + 1)) for rank in self.survivors]
+        self._enter(Phase.INSTALLING)
+        return self._to_survivors(Install(self.generation + 1))
 
     def _on_installed(self, message: Installed) -> Outbound:
-        if message.generation != self.generation + 1:
-            raise _Violation(f"{message} does not match generation {self.generation + 1}")
-        if not self._collect(self._installed, message, Phase.INSTALLING):
-            return []
+        self._expect(Phase.INSTALLING, message)
+        self._record(self._installed, message)
         if len(self._installed) < len(self.survivors):
             return []
         self.generation += 1
-        self.phase = Phase.RECOVERED
         self.deadline = None
-        self._admission_closed = False
+        self._enter(Phase.RECOVERED)
         logger.info(
             f"Recovery authority: committed generation {self.generation} "
             f"without rank {self.failed_rank}"
         )
-        outbound: Outbound = [
-            (self._workers[rank], Commit(self.generation)) for rank in self.survivors
-        ]
-        outbound.append((self._frontend, ReopenAdmission(self.generation)))
-        return outbound
+        return self._to_survivors(Commit(self.generation))
 
-    def _collect(self, reports: dict, message: Stopped | Ready | Installed, phase: Phase) -> bool:
-        """Record ``message``; return False for an identical retransmission."""
-        previous = reports.get(message.rank)
-        if previous == message:
-            return False
-        if previous is not None:
-            raise _Violation(f"{message} conflicts with earlier {previous}")
+    def _expect(self, phase: Phase, message: Ready | Installed) -> None:
         if self.phase is not phase:
             raise _Violation(f"{message} in phase {self.phase.name}")
-        reports[message.rank] = message
-        return True
+        if message.generation != self.generation + 1:
+            raise _Violation(f"{message} does not match generation {self.generation + 1}")
 
-    def _enter(self, phase: Phase, now: float) -> None:
+    @staticmethod
+    def _record(reports: set[int], message: Stopped | Installed) -> None:
+        if message.rank in reports:
+            raise _Violation(f"duplicate {message}")
+        reports.add(message.rank)
+
+    def _to_survivors(self, message: Message) -> Outbound:
+        return [(self._routes[rank], message) for rank in self.survivors]
+
+    def _enter(self, phase: Phase) -> None:
         logger.info(f"Recovery authority: {self.phase.name} -> {phase.name}")
         self.phase = phase
-        self.deadline = now + self.phase_timeout
 
 
 def serve(
     authority: RecoveryAuthority,
-    endpoint: str,
+    socket: zmq.Socket,
     key: bytes,
     stop: threading.Event,
     poll_interval: float = 0.1,
 ) -> None:
-    """Drive ``authority`` from a ROUTER socket bound at ``endpoint`` until ``stop`` is set.
+    """Drive ``authority`` from a bound ROUTER ``socket`` until ``stop`` is set.
 
-    Frames that fail HMAC authentication are dropped; authenticated frames that do not
-    decode abort recovery.
+    Frames that fail HMAC authentication are dropped; authenticated frames that do
+    not decode abort recovery.
     """
-    context = zmq.Context()
+    while not stop.is_set():
+        outbound = authority.expire(time.monotonic())
+        if socket.poll(int(poll_interval * 1000)):
+            route, *frames = socket.recv_multipart()
+            if not authenticate(frames, key):
+                logger.debug("Recovery authority: dropped an unauthenticated frame")
+                continue
+            try:
+                message = decode(frames[0])
+            except ProtocolError as error:
+                outbound += authority.abort(str(error), route)
+            else:
+                outbound += authority.handle(route, message, time.monotonic())
+        for route, message in outbound:
+            socket.send_multipart([route, *encode(message, key)])
+
+
+def router_socket(context: zmq.Context, endpoint: str) -> zmq.Socket:
+    """Return a ROUTER bound at ``endpoint`` that keeps worker identities across reconnects."""
     socket = context.socket(zmq.ROUTER)
     socket.setsockopt(zmq.LINGER, 0)
+    socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
+    socket.setsockopt(zmq.MAXMSGSIZE, _MAX_MESSAGE_BYTES)
     socket.bind(endpoint)
-    try:
-        while not stop.is_set():
-            outbound = authority.expire(time.monotonic())
-            if socket.poll(int(poll_interval * 1000)):
-                route, *frames = socket.recv_multipart()
-                if not authenticate(frames, key):
-                    logger.warning("Recovery authority: dropped unauthenticated frame")
-                    continue
-                try:
-                    message = decode(frames[0])
-                except ProtocolError as error:
-                    outbound += authority.abort(str(error), route)
-                else:
-                    outbound += authority.handle(route, message, time.monotonic())
-            for route, message in outbound:
-                socket.send_multipart([route, *encode(message, key)])
-    finally:
-        socket.close()
-        context.term()
+    return socket
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Run the recovery authority until SIGINT or SIGTERM."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True, help="ROUTER bind address, e.g. tcp://*:5555")
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument(
-        "--admitted-ranks", required=True, help="comma-separated ranks whose loss may be recovered"
+        "--admitted-ranks",
+        help="comma-separated ranks whose loss may be recovered (default: every rank the "
+        "workers' expert placement can recover from)",
     )
-    parser.add_argument("--phase-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--recovery-timeout",
+        type=float,
+        default=60.0,
+        help="seconds from the first Stopped to Commit; keep below the workers' timeout",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    key = bytes.fromhex(os.environ["TLLM_WIDEEP_RECOVERY_KEY"])
-    admitted = frozenset(int(rank) for rank in args.admitted_ranks.split(","))
-    authority = RecoveryAuthority(args.world_size, admitted, args.phase_timeout)
+    key = load_key()
+    admitted = (
+        None
+        if args.admitted_ranks is None
+        else frozenset(int(rank) for rank in args.admitted_ranks.split(","))
+    )
+    authority = RecoveryAuthority(args.world_size, admitted, args.recovery_timeout)
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
-    serve(authority, args.endpoint, key, stop)
+    context = zmq.Context()
+    socket = router_socket(context, args.endpoint)
+    try:
+        serve(authority, socket, key, stop)
+    finally:
+        socket.close()
+        context.term()
 
 
 if __name__ == "__main__":

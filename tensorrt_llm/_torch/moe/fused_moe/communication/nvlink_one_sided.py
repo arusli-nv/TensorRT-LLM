@@ -49,6 +49,7 @@ from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
+from ..wide_ep_ft import recovery_enabled
 from .base import Communication
 
 if TYPE_CHECKING:
@@ -437,7 +438,7 @@ class NVLinkOneSided(Communication):
                 dtype,
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
                 can_use_cft_counted_writes=self.can_use_cft_counted_writes,
-                fixed_source_slots=ep_group_health is not None,
+                fixed_source_slots=recovery_enabled(),
             )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
@@ -603,7 +604,7 @@ class NVLinkOneSided(Communication):
         self.invalid_token_expert_id: int = -1
 
     def bind_execution_state(self, state: "MoeExecutionState") -> None:
-        """Run every later dispatch/combine through the state's graph-latched descriptor.
+        """Run every later dispatch/combine through the state's execution descriptor.
 
         Descriptor execution uses the fence path with fixed per-source dispatch
         slots, so CUDA graphs captured afterwards stay valid when the state
@@ -619,8 +620,19 @@ class NVLinkOneSided(Communication):
             raise ValueError("Execution state and communicator track different EP membership")
         if self._dispatch_state.get("phase") != "idle":
             raise RuntimeError("Cannot bind an execution state during a dispatch/combine pair")
-        state.retain(self.mnnvl_mem)
+        state.retain(self.mnnvl_mem, self.reset_local_workspace)
         self._execution_state = state
+
+    def reset_local_workspace(self) -> None:
+        """Return this rank's workspace row to its initial state.
+
+        Same as initialization, without the barrier: the caller guarantees that
+        no rank runs a collective on this workspace until every rank has reset.
+        """
+        row = self.workspace[self.ep_rank]
+        row.zero_()
+        recv_counters = int(self.moe_a2a_metainfo[self.RECV_COUNTERS_OFFSET_INDEX])
+        row[recv_counters : recv_counters + 2 * self.ep_size * 4].fill_(0xFF)
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
@@ -920,7 +932,8 @@ class NVLinkOneSided(Communication):
             can_use_cft_for_dispatch, payloads
         )
         expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
-        can_fuse_sanitize = can_use_cft_for_dispatch
+        # CFT dispatch and the gather of descriptor execution sanitize the expert ids themselves.
+        can_fuse_sanitize = can_use_cft_for_dispatch or state is not None
 
         eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
@@ -996,7 +1009,6 @@ class NVLinkOneSided(Communication):
                 self.moe_a2a_metainfo,
                 self.ep_rank,
                 int(self.invalid_token_expert_id),
-                **(state.dispatch_kwargs() if state is not None else {}),
             )
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends

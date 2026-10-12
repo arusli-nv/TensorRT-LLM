@@ -20,19 +20,24 @@ from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.distributed.communicator import HostCollectiveInterrupted
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     ExecutorRequestQueue,
-    RequestAdmissionState,
+    RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import PeerLossRecovery
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.executor.recovery.client import RecoveryAborted
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
@@ -63,28 +68,6 @@ def _request_queue(rank=0):
         enable_iter_perf_stats=False,
         batch_wait_timeout_ms=0,
     )
-
-
-def test_request_queue_recovering_closes_and_reopens_admission():
-    queue = _request_queue()
-    queue.begin_recovery()
-    assert queue.get_admission_state() is RequestAdmissionState.RECOVERING
-    assert not queue.can_enqueue_request()
-    with pytest.raises(RuntimeError, match="recovering"):
-        queue.enqueue_request(Mock())
-
-    queue.complete_recovery()
-    assert queue.get_admission_state() is RequestAdmissionState.RUNNING
-    assert queue.can_enqueue_request()
-
-
-def test_request_queue_recovery_requires_running_admission():
-    queue = _request_queue()
-    queue.begin_sleep_transition(["weights"])
-    with pytest.raises(RuntimeError, match="Invalid executor admission transition"):
-        queue.begin_recovery()
-    with pytest.raises(RuntimeError, match="Invalid executor admission transition"):
-        queue.complete_recovery()
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +208,22 @@ class _FakeLayer:
     def get_old_rank_expert_ids(self):
         return [list(row) for row in self.placement]
 
+    def route(self, token_selected_experts):
+        """Round-robin over each expert's live replicas, like the device routing."""
+        slots = {}
+        for rank, row in enumerate(self.placement):
+            for local_slot, expert in enumerate(row):
+                if expert >= 0:
+                    slots.setdefault(expert, []).append(rank * len(row) + local_slot)
+        flat = token_selected_experts.flatten().tolist()
+        seen = {}
+        routed = []
+        for expert in flat:
+            replicas = slots[expert]
+            routed.append(replicas[seen.get(expert, 0) % len(replicas)])
+            seen[expert] = seen.get(expert, 0) + 1
+        return torch.tensor(routed, dtype=torch.int32).view_as(token_selected_experts)
+
 
 def _load_balancer(placements, expert_count=4):
     load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
@@ -235,6 +234,7 @@ def _load_balancer(placements, expert_count=4):
     load_balancer.single_layer_load_balancers = [
         _FakeLayer(idx, placement, expert_count) for idx, placement in enumerate(placements)
     ]
+    load_balancer._layer_routing_shapes = [(2, len(placements[0][0]))] * len(placements)
     return load_balancer
 
 
@@ -311,8 +311,11 @@ def test_install_resident_placement_commits_mask(no_cuda_device):
         layer.placement = [[-1, -1] if r in dead_ranks else row for r, row in enumerate(_REDUNDANT)]
 
     load_balancer.reconfigure_mask_only = reconfigure
+    events = []
+    load_balancer.check_routing_excludes = lambda dead: events.append(("checked", set(dead)))
     health = EPGroupHealth(WORLD_SIZE)
     execution_state = Mock(health=health)
+    execution_state.install_mask.side_effect = lambda words: events.append(("mask", words))
     engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
     engine.moe_load_balancer = load_balancer
 
@@ -326,7 +329,33 @@ def test_install_resident_placement_commits_mask(no_cuda_device):
         engine.install_resident_placement(frozenset({FAILED_RANK}), digest, time.monotonic() + 5)
 
     assert health.get_failed_ranks() == frozenset({FAILED_RANK})
-    execution_state.install_mask.assert_called_once_with(health.get_mask_words())
+    # The kernels skip routes to a masked rank, so routing must exclude it first.
+    assert events == [("checked", {FAILED_RANK}), ("mask", health.get_mask_words())]
+
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+
+
+@requires_cuda
+def test_check_routing_excludes_accepts_routing_around_departed_rank():
+    load_balancer = _load_balancer([_REDUNDANT, _REDUNDANT])
+    for layer in load_balancer.single_layer_load_balancers:
+        layer.placement = [
+            [-1, -1] if r == FAILED_RANK else row for r, row in enumerate(_REDUNDANT)
+        ]
+    load_balancer.check_routing_excludes({FAILED_RANK})
+
+
+@requires_cuda
+def test_check_routing_excludes_rejects_route_to_departed_rank():
+    load_balancer = _load_balancer([_REDUNDANT, _REDUNDANT])
+    layer = load_balancer.single_layer_load_balancers[1]
+    layer.placement = [[-1, -1] if r == FAILED_RANK else row for r, row in enumerate(_REDUNDANT)]
+    # Layer 0 keeps routing to the departed rank's replicas of experts 1 and 0.
+    with pytest.raises(
+        RuntimeError, match=r"layer 0 still routes experts \[0, 1\] to departed ranks \[2\]"
+    ):
+        load_balancer.check_routing_excludes({FAILED_RANK})
 
 
 def test_install_resident_placement_rejects_divergent_placement(no_cuda_device):
@@ -370,13 +399,15 @@ def _happy_replies(generation=1):
     ]
 
 
-def _executor(client, rank=1, failed=frozenset({FAILED_RANK})):
+def _executor(rank=1, failed=frozenset({FAILED_RANK})):
     executor = PyExecutor.__new__(PyExecutor)
     events = []
     dist = Mock(rank=rank)
     dist.revoke.side_effect = lambda: events.append("revoke")
     dist.shrink.side_effect = lambda: events.append("shrink") or failed
     dist.install_survivors.side_effect = lambda failed: events.append(("survivors", failed))
+    dist.watch_peer_failures.side_effect = lambda callback: events.append("watch") or Mock()
+    dist.broadcast.side_effect = lambda value, root: value
     engine = Mock()
     engine.prepare_resident_placement.return_value = "digest"
     engine.install_resident_placement.side_effect = lambda failed, digest, deadline: events.append(
@@ -384,16 +415,25 @@ def _executor(client, rank=1, failed=frozenset({FAILED_RANK})):
     )
     executor.dist = dist
     executor.model_engine = engine
-    executor._recovery_client = client
-    executor._peer_loss_recovery_timeout_s = 30.0
     executor.active_requests = []
     executor.waiting_queue = FCFSWaitingQueue()
     executor._unbroadcast_requests = []
+    executor.request_accumulated = []
+    executor._terminate_request = Mock()
+    executor._enqueue_responses = Mock()
+    executor.gather_all_responses = False
     executor.previous_batch = None
-    executor.executor_request_queue = _request_queue(rank)
-    executor._join_device_work = Mock()
     executor._events = events
     return executor
+
+
+def _recovery(client, rank=1, failed=frozenset({FAILED_RANK})):
+    executor = _executor(rank, failed)
+    recovery = PeerLossRecovery(executor, client)
+    recovery._join_device_work = Mock()
+    recovery._watch = Mock()
+    executor._peer_loss_recovery = recovery
+    return recovery
 
 
 def _interrupted(failed=frozenset({FAILED_RANK})):
@@ -402,9 +442,9 @@ def _interrupted(failed=frozenset({FAILED_RANK})):
 
 def test_recovery_runs_protocol_and_installs_in_order():
     client = _FakeClient(_happy_replies(generation=1))
-    executor = _executor(client)
+    recovery = _recovery(client)
 
-    executor._recover_from_peer_loss(_interrupted())
+    recovery._recover(_interrupted())
 
     assert client.sent == [
         Stopped(rank=1, failed_rank=FAILED_RANK),
@@ -412,52 +452,53 @@ def test_recovery_runs_protocol_and_installs_in_order():
         Installed(rank=1, generation=1),
     ]
     failed = frozenset({FAILED_RANK})
-    assert executor._events == [
+    assert recovery._executor._events == [
         "revoke",
         "shrink",
         ("survivors", failed),
         ("placement", failed, "digest"),
+        "watch",
     ]
-    executor.model_engine.prepare_resident_placement.assert_called_once_with(failed)
-    assert executor.executor_request_queue.get_admission_state() is RequestAdmissionState.RUNNING
+    recovery._executor.model_engine.prepare_resident_placement.assert_called_once_with(failed)
 
 
 def test_recovery_learns_failed_rank_from_shrink_after_revocation():
     """A survivor that only saw ERR_REVOKED still reports the agreed failed rank."""
     client = _FakeClient(_happy_replies())
-    executor = _executor(client)
+    recovery = _recovery(client)
 
-    executor._recover_from_peer_loss(_interrupted(frozenset()))
+    recovery._recover(_interrupted(frozenset()))
 
     assert client.sent[0] == Stopped(rank=1, failed_rank=FAILED_RANK)
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda ex: ex.active_requests.append(Mock()),
-        lambda ex: ex.waiting_queue.add_request(Mock()),
-        lambda ex: ex._unbroadcast_requests.append(Mock()),
-        lambda ex: setattr(ex, "previous_batch", Mock()),
-    ],
-    ids=["active", "waiting", "unbroadcast", "previous_batch"],
-)
-def test_recovery_requires_idle_executor(mutate):
-    client = _FakeClient(_happy_replies())
-    executor = _executor(client)
-    mutate(executor)
-    with pytest.raises(RuntimeError, match="requires an idle executor"):
-        executor._recover_from_peer_loss(_interrupted())
-    assert client.sent == []
-    assert executor._events == ["revoke", "shrink"]
+def _queued(request_id):
+    return RequestQueueItem(request_id, Mock())
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_recovery_keeps_unscheduled_requests_on_rank0_only(rank):
+    """Rank 0 re-broadcasts received-but-unscheduled requests after recovery."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=rank)
+    executor = recovery._executor
+    executor.request_accumulated = [_queued(5)]
+    executor.waiting_queue.add_requests([_queued(1), _queued(2)])
+    executor._unbroadcast_requests = [_queued(3)]
+
+    recovery._recover(_interrupted())
+
+    assert len(executor.waiting_queue) == 0
+    assert executor._unbroadcast_requests == []
+    expected = [1, 2, 3, 5] if rank == 0 else [5]
+    assert [item.id for item in executor.request_accumulated] == expected
 
 
 @pytest.mark.parametrize("failed", [frozenset(), frozenset({1, 2})])
 def test_recovery_requires_exactly_one_departed_rank(failed):
     client = _FakeClient(_happy_replies())
-    executor = _executor(client, rank=0, failed=failed)
+    recovery = _recovery(client, rank=0, failed=failed)
     with pytest.raises(RuntimeError, match="exactly one departed rank"):
-        executor._recover_from_peer_loss(_interrupted())
+        recovery._recover(_interrupted())
     assert client.sent == []
 
 
@@ -473,40 +514,325 @@ def test_recovery_requires_exactly_one_departed_rank(failed):
     ids=["wrong_failed_rank", "not_a_survivor", "install_gen", "commit_gen", "abort"],
 )
 def test_recovery_fails_closed_on_protocol_mismatch(replies, match):
-    executor = _executor(_FakeClient(replies))
+    recovery = _recovery(_FakeClient(replies))
     with pytest.raises(RuntimeError, match=match):
-        executor._recover_from_peer_loss(_interrupted())
-    assert executor.executor_request_queue.get_admission_state() is (
-        RequestAdmissionState.RECOVERING
-    )
+        recovery._recover(_interrupted())
 
 
 def test_recovery_deadline_bounds_authority_wait():
     client = Mock()
     client.wait.side_effect = TimeoutError("Timed out waiting for Propose")
-    executor = _executor(client)
+    recovery = _recovery(client)
     with pytest.raises(TimeoutError):
-        executor._recover_from_peer_loss(_interrupted())
+        recovery._recover(_interrupted())
     (_, deadline), _ = client.wait.call_args
-    assert deadline - time.monotonic() <= executor._peer_loss_recovery_timeout_s
+    assert deadline - time.monotonic() <= recovery._timeout_s
 
 
-def test_run_event_loop_resumes_after_recovery():
-    executor = _executor(_FakeClient([]))
+def test_run_discards_the_step_then_recovers_and_resumes():
+    recovery = _recovery(_FakeClient([]))
     error = _interrupted()
-    executor.event_loop = Mock(side_effect=[error, None])
-    executor._recover_from_peer_loss = Mock()
+    event_loop = Mock(side_effect=[error, None])
+    calls = []
+    batch = Mock(name="batch")
+    recovery.step_prepared(batch)
+    recovery._executor._discard_uncommitted_step = lambda step: calls.append(("discard", step))
+    recovery._recover = lambda err: calls.append(("recover", err))
 
-    executor._run_event_loop()
+    recovery.run(event_loop)
 
-    assert executor.event_loop.call_count == 2
-    executor._recover_from_peer_loss.assert_called_once_with(error)
+    assert event_loop.call_count == 2
+    assert calls == [("discard", batch), ("recover", error)]
+    assert recovery._uncommitted_step is None
 
 
-def test_run_event_loop_without_recovery_reraises():
-    executor = _executor(None)
+def test_run_watches_peers_only_while_the_loop_runs():
+    recovery = _recovery(_FakeClient([]))
+    recovery.run(Mock(return_value=None))
+    recovery._executor.dist.watch_peer_failures.assert_called_once_with(recovery._on_peer_failure)
+    recovery._watch.stop.assert_called_once()
+
+
+def test_run_does_not_recover_during_kv_cache_estimation():
+    recovery = _recovery(_FakeClient([]))
+    recovery._executor.gather_all_responses = True
+    with pytest.raises(HostCollectiveInterrupted):
+        recovery.run(Mock(side_effect=_interrupted()))
+    recovery._executor.dist.watch_peer_failures.assert_not_called()
+
+
+def test_event_loop_without_recovery_reraises():
+    executor = _executor()
+    executor._peer_loss_recovery = None
     executor.event_loop = Mock(side_effect=_interrupted())
-    executor._recover_from_peer_loss = Mock()
     with pytest.raises(HostCollectiveInterrupted):
         executor._run_event_loop()
-    executor._recover_from_peer_loss.assert_not_called()
+
+
+def test_recovery_keeps_active_requests_and_rearms_failure_watch():
+    """Requests of a rolled-back step stay active and run again after recovery."""
+    recovery = _recovery(_FakeClient(_happy_replies()))
+    request = Mock(is_attention_dp_dummy=False)
+    recovery._executor.active_requests.append(request)
+    recovery._peer_failed.set()
+
+    recovery._recover(_interrupted())
+
+    assert recovery._executor.active_requests == [request]
+    assert not recovery._peer_failed.is_set()
+    assert recovery._executor._events[-1] == "watch"
+
+
+def _gated_recovery():
+    recovery = _recovery(_FakeClient([]))
+    recovery.step_prepared(Mock(name="batch"))
+    return recovery, Mock()
+
+
+def test_commit_step_accepts_step_without_peer_failure():
+    recovery, sample_state = _gated_recovery()
+    recovery.commit_step(sample_state)
+    sample_state.sampler_event.synchronize.assert_called_once()
+    assert recovery._uncommitted_step is None
+
+
+def test_commit_step_discards_step_after_peer_failure():
+    recovery, sample_state = _gated_recovery()
+    batch = recovery._uncommitted_step
+    recovery._peer_failed.set()
+    with pytest.raises(HostCollectiveInterrupted):
+        recovery.commit_step(sample_state)
+    sample_state.sampler_event.synchronize.assert_called_once()
+    assert recovery._uncommitted_step is batch
+
+
+def test_commit_step_without_prepared_step_does_not_wait():
+    recovery = _recovery(_FakeClient([]))
+    sample_state = Mock()
+    recovery.commit_step(sample_state)
+    sample_state.sampler_event.synchronize.assert_not_called()
+
+
+def test_peer_failure_flags_before_aborting_collectives():
+    recovery = _recovery(_FakeClient([]))
+    seen = []
+    engine = recovery._executor.model_engine
+    engine.moe_execution_state.request_abort.side_effect = lambda: seen.append(
+        recovery._peer_failed.is_set()
+    )
+    recovery._on_peer_failure()
+    assert seen == [True]
+
+
+def test_discard_returns_step_resources_and_padding_request():
+    executor = _executor()
+    executor.kv_cache_manager = Mock()
+    executor.inflight_req_ids = Mock()
+    executor._pending_adp_dummy_request = None
+    batch = Mock(name="batch")
+    request = Mock(is_attention_dp_dummy=False)
+    dummy = Mock(is_attention_dp_dummy=True, py_request_id=99)
+    executor.active_requests.extend([request, dummy])
+
+    executor._discard_uncommitted_step(batch)
+
+    executor.kv_cache_manager.revert_prepare_resources.assert_called_once_with(batch)
+    executor._terminate_request.assert_called_once_with(dummy)
+    assert executor.active_requests == [request]
+
+
+def test_discard_before_prepare_releases_the_tentative_padding_request():
+    """A loss in the can-queue exchange precedes prepare_resources."""
+    executor = _executor()
+    executor.kv_cache_manager = Mock()
+    executor.inflight_req_ids = Mock()
+    executor.resource_manager = Mock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    request = Mock(is_attention_dp_dummy=False)
+    dummy = Mock(is_attention_dp_dummy=True, py_request_id=99, py_seq_slot=None)
+    executor.active_requests.extend([request, dummy])
+    executor._pending_adp_dummy_request = dummy
+
+    executor._discard_uncommitted_step(None)
+
+    executor.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+    executor.kv_cache_manager.revert_prepare_resources.assert_not_called()
+    executor._terminate_request.assert_not_called()
+    assert executor.active_requests == [request]
+
+
+def test_publish_defers_terminations_when_the_gather_is_interrupted():
+    recovery = _recovery(_FakeClient([]))
+    executor = recovery._executor
+    executor._enqueue_responses = Mock(side_effect=_interrupted())
+    finished = Mock(name="finished")
+    with pytest.raises(HostCollectiveInterrupted):
+        executor._publish_responses([], [finished])
+    executor._terminate_request.assert_not_called()
+    assert recovery._undelivered_terminations == [finished]
+
+
+def test_step_errors_after_a_peer_failure_become_interruptions():
+    recovery = _recovery(_FakeClient([]))
+    executor = recovery._executor
+    executor._raise_if_peer_failed("forward", RuntimeError("garbage"))
+    recovery._peer_failed.set()
+    with pytest.raises(HostCollectiveInterrupted):
+        executor._raise_if_peer_failed("forward", RuntimeError("garbage"))
+
+
+def test_revert_prepare_resources_undoes_v1_reservations():
+    """Each reservation prepare_resources made for the step is returned."""
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.mapping = Mock(has_cp_helix=Mock(return_value=False))
+    manager.impl = Mock()
+    manager._kv_reserve_draft_tokens = 0
+    manager._preprepared_dummy_request_ids = {7}
+    manager.kv_connector_manager = None
+    first_chunk = Mock(py_request_id=1, is_first_context_chunk=True, py_beam_width=1)
+    later_chunk = Mock(py_request_id=2, is_first_context_chunk=False, py_beam_width=1)
+    prepared_dummy = Mock(py_request_id=7, is_first_context_chunk=True, py_beam_width=1)
+    generating = Mock(py_request_id=3, py_draft_tokens=None)
+    batch = Mock(
+        context_requests=[first_chunk, later_chunk, prepared_dummy],
+        generation_requests=[generating],
+    )
+    manager.revert_prepare_resources(batch)
+    manager.impl.remove_sequence.assert_called_once_with(1, first_chunk, False)
+    manager.impl.rewind_kv_cache.assert_called_once_with(3, 1)
+
+
+def _sent_responses(recovery):
+    sent = []
+    recovery._executor._enqueue_responses = lambda responses: sent.append(list(responses))
+    return sent
+
+
+def test_routed_requests_are_tracked_until_their_final_response():
+    recovery = _recovery(_FakeClient([]), rank=0)
+    item = Mock(id=11, request=Mock(client_id="c11"))
+    recovery.requests_routed({FAILED_RANK: [item]})
+    assert recovery._request_owners == {11: (FAILED_RANK, "c11")}
+    streaming = Mock(spec=LlmResponse, result=Mock(is_final=False))
+    streaming.has_error.return_value = False
+    recovery.responses_gathered([(11, streaming)])
+    assert 11 in recovery._request_owners
+    final = Mock(spec=LlmResponse, result=Mock(is_final=True))
+    final.has_error.return_value = False
+    recovery.responses_gathered([(11, final)])
+    assert recovery._request_owners == {}
+
+
+def test_recovery_fails_requests_owned_by_departed_rank():
+    """Rank 0 fails the requests whose KV cache left with the departed rank, once."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    recovery._request_owners = {11: (FAILED_RANK, "c11"), 12: (3, "c12")}
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    ((request_id, response),) = sent[-1]
+    assert request_id == 11 and response.client_id == "c11"
+    assert f"rank {FAILED_RANK} failed" in response.error_msg
+    assert recovery._request_owners == {12: (3, "c12")}
+
+
+def test_survivors_join_departed_request_responses():
+    """Ranks without the owner table still take part in the response collective."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    assert recovery._request_owners is None
+    sent = _sent_responses(recovery)
+    recovery._recover(_interrupted())
+    assert sent == [[]]
+
+
+@pytest.mark.parametrize("processed", [0, 1, 2])
+def test_recovery_resends_gathers_rank0_did_not_process(processed):
+    """A rank resends its parts of every gather rank 0 did not process."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    first, second = [(5, Mock(name="first"))], [(6, Mock(name="second"))]
+    recovery.gathering_responses(first)
+    recovery.gathering_responses(second)
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: processed
+    finished = Mock(name="finished")
+    recovery.defer_terminations([finished])
+    order = []
+    executor = recovery._executor
+    executor._enqueue_responses = lambda responses: order.append(("send", list(responses)))
+    executor._terminate_request = lambda request: order.append(("terminate", request))
+
+    recovery._recover(_interrupted())
+
+    expected = [first + second, second, []][processed]
+    assert order == [("send", expected), ("terminate", finished)]
+    assert recovery._undelivered_terminations == []
+
+
+def _supported_executor():
+    from types import SimpleNamespace
+
+    load_balancer = Mock()
+    load_balancer.is_static_routing.return_value = True
+    load_balancer.covers_loss_of.side_effect = lambda rank: rank in (1, 2)
+    return SimpleNamespace(
+        model_engine=SimpleNamespace(
+            moe_load_balancer=load_balancer, moe_execution_state=Mock(), spec_config=None
+        ),
+        kv_cache_manager=SimpleNamespace(enable_block_reuse=False),
+        enable_attention_dp=True,
+        _disable_mpi=False,
+        dist=Mock(rank=0, world_size=4, pp_size=1, cp_size=1),
+        adp_router=DefaultADPRouter.__new__(DefaultADPRouter),
+        drafter=None,
+        draft_model_engine=None,
+        guided_decoder=None,
+        max_beam_width=1,
+        kv_cache_transceiver=None,
+        kv_connector_manager=None,
+        _is_kv_manager_v2=False,
+        disable_overlap_scheduler=True,
+        llm_args=SimpleNamespace(sleep_config=None),
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported, requirement",
+    [
+        (lambda ex: setattr(ex, "drafter", Mock()), "no speculative decoding"),
+        (lambda ex: setattr(ex.model_engine, "spec_config", Mock()), "no speculative decoding"),
+        (lambda ex: setattr(ex, "guided_decoder", Mock()), "no guided decoding"),
+        (lambda ex: setattr(ex, "max_beam_width", 2), "no beam search"),
+        (lambda ex: setattr(ex.kv_cache_manager, "enable_block_reuse", True), "block reuse"),
+        (lambda ex: setattr(ex, "kv_connector_manager", Mock()), "no KV connector"),
+        (lambda ex: setattr(ex, "disable_overlap_scheduler", False), "no overlap scheduler"),
+        (lambda ex: setattr(ex, "_is_kv_manager_v2", True), "KV cache manager v1"),
+    ],
+)
+def test_create_rejects_configurations_a_discarded_step_cannot_rerun(
+    monkeypatch, unsupported, requirement
+):
+    from tensorrt_llm._torch.pyexecutor import peer_loss_recovery
+
+    monkeypatch.setattr(peer_loss_recovery, "recovery_enabled", lambda: True)
+    executor = _supported_executor()
+    unsupported(executor)
+    with pytest.raises(ValueError, match=requirement):
+        PeerLossRecovery.create(executor)
+    executor.dist.enable_peer_loss_recovery.assert_not_called()
+
+
+def test_create_registers_the_ranks_whose_loss_the_placement_covers(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import peer_loss_recovery
+
+    monkeypatch.setattr(peer_loss_recovery, "recovery_enabled", lambda: True)
+    registered = []
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "_register",
+        lambda rank, recoverable: registered.append((rank, recoverable)) or (Mock(), frozenset()),
+    )
+    executor = _supported_executor()
+    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    assert registered == [(0, (1, 2))]
+    executor.dist.enable_peer_loss_recovery.assert_called_once()

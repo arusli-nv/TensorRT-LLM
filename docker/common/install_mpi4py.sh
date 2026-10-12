@@ -10,7 +10,7 @@ if [ -n "${GITHUB_MIRROR}" ]; then
     export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
-MPI4PY_VERSION="4.0.0"
+MPI4PY_VERSION="4.1.2"
 RELEASE_URL="${GITHUB_URL}/mpi4py/mpi4py/archive/refs/tags/${MPI4PY_VERSION}.tar.gz"
 
 # Create and use a temporary directory
