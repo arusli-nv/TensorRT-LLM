@@ -18,7 +18,7 @@ Only static placement is supported, with `layer_updates_per_iter: 0` and `initia
 
 FT-off impact: the new methods have no caller, and the shared barrier re-raises every error as before.
 
-This PR does not stand alone: its methods get their first caller in PR 13.
+This PR does not stand alone: its methods get their first caller in PR 14.
 
 ## Test Coverage
 

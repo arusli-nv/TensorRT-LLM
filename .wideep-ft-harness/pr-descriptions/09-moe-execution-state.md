@@ -12,7 +12,7 @@ This PR binds the execution descriptor of PR 8 to the model, so survivors can ab
 
 FT-off impact: `for_model()` returns `None`, no layer is bound, the workspace keeps its size, the watchdog path is unchanged, and rank-mask mode still rejects CUDA graphs.
 
-FT-on cost: one gather kernel per MoE layer. With the full series on DeepSeek-R1 NVFP4 at EP32 with all ranks active, throughput was 14,488 tok/s with FT on and 14,689 tok/s with FT off, 1.4% lower, three trials each. That figure also includes the per-step commit sync of PR 13.
+FT-on cost: one gather kernel per MoE layer. With the full series on DeepSeek-R1 NVFP4 at EP32 with all ranks active, throughput was 14,488 tok/s with FT on and 14,689 tok/s with FT off, 1.4% lower, three trials each. That figure also includes the per-step commit sync of PR 14.
 
 ## Test Coverage
 

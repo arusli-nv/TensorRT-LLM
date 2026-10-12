@@ -14,7 +14,7 @@ FT-off impact: no TRT-LLM code changes. Every MPI path runs on the new mpi4py, s
 
 mpi4py.futures itself has no ULFM support. After a member dies, `MPICommExecutor` can neither collect results nor shut down. PR 12 bounds that with `MPI_Abort(0)`. A proper fix, upstream or as a TRT-LLM dispatcher, is follow-up work.
 
-Until this image is in CI, the ULFM unit test of PR 7 and the WideEP integration test of PR 13 skip.
+Until this image is in CI, the ULFM unit test of PR 7 and the WideEP integration test of PR 14 skip.
 
 ## Test Coverage
 

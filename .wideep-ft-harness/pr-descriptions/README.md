@@ -26,7 +26,8 @@ PRs 1 to 4 do not depend on each other or on the feature series. Merge them firs
 | 10 | 10-resident-replica-eplb.md | `[None][feat] resident-replica EPLB placement after a rank loss` | 7, 9 |
 | 11 | 11-adp-absent-ranks.md | `[None][feat] let attention-DP routing skip absent ranks` | 7 |
 | 12 | 12-mpi-session-peer-loss.md | `[None][feat] keep the MPI session serving after a peer loss` | 6, 7 |
-| 13 | 13-executor-peer-loss-recovery.md | `[None][feat] recover the executor from a WideEP peer loss` | all |
+| 13 | 13-kv-cache-revert.md | `[None][feat] revert the KV cache allocations of a discarded step` | none |
+| 14 | 14-executor-peer-loss-recovery.md | `[None][feat] recover the executor from a WideEP peer loss` | all |
 
 ## Open items before posting
 
