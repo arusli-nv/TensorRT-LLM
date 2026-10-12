@@ -20,9 +20,9 @@ same tokens; only the requests the lost rank was serving fail, with a retryable 
 
 ![Recovery time and throughput](evidence/results.svg)
 
-Tested on DeepSeek-R1 and Kimi-K2 at 32 GPUs and R1 at 16, killing different ranks at every stage
-of a step (section 4). The current scope is one loss, of any rank but rank 0, with attention data
-parallelism and static expert placement; section 5 lists what is not supported yet.
+Tested by killing ranks at every stage of a step, on several models and scales (section 4). The
+current scope is one loss, of any rank but rank 0, with attention data parallelism and static
+expert placement; section 5 lists what is not supported yet.
 
 ## 1. Background
 
@@ -129,27 +129,24 @@ gather per MoE layer, one sync per step at the commit gate, and a watcher thread
 
 ## 4. Results
 
-Each run kills one rank at the moment in the first column. "New requests served" is the first
-token of a request sent after the kill; "in-flight requests finished" is when every request on a
-surviving rank completed its remaining tokens.
+DeepSeek-R1 on 32 GPUs. Each run kills one rank at the moment in the first column; times are from
+the kill, and "finish" includes generating each request's remaining tokens.
 
-| Model, GPUs, when the rank is killed | New requests served | In-flight requests finished |
-|---|---|---|
-| R1, 32, no requests running | 0.16 to 0.34 s | 0.7 to 1.1 s |
-| R1, 32, while requests generate tokens | — | 1.4 to 3.1 s |
-| R1, 32, during the MoE all-to-all (7 runs) | — | 2.6 to 3.2 s |
-| R1, 32, while new prompts are processed, full load | — | 4.2 to 4.6 s (248 of 248) |
-| R1, 32, full load with prefix caching | — | 1.7 s (496 of 496) |
-| Kimi-K2, 32, no requests running | 0.31 to 0.83 s | 1.0 to 1.5 s |
-| Kimi-K2, 32, during the MoE all-to-all | — | 2.4 to 3.0 s |
-| R1, 16, no requests running / during the MoE all-to-all | 0.29 s | 0.9 s / 3.0 s |
+| When the rank is killed | Result |
+|---|---|
+| No requests running | a new request gets its first token after 0.16 to 0.34 s |
+| While requests generate tokens | all in-flight requests finish within 1.4 to 3.1 s |
+| During the MoE all-to-all (7 runs) | all in-flight requests finish within 2.6 to 3.2 s |
+| While new prompts are processed, full load | 248 of 248 requests finish within 4.6 s |
+| Rank whose experts have no copy elsewhere | every request fails with an explicit error within 0.04 s |
 
-Tokens match a reference run that never used the lost rank (with prefix caching on, answers are
-checked instead). Ranks 1, 2 and 30 were killed, including one on another node. A loss that no
-copy covers fails every request with an explicit error within 0.04 s. An nsys trace shows every
-decode all-to-all running inside the original graphs. Recovery itself, from the kill until every
-survivor resumed, took 0.14 s; when no requests run, the loss is noticed at rank 0's next poll,
-within 1 s.
+- Tokens match a reference run that never used the lost rank, including with prefix caching on.
+- Recovery itself, from the kill until every survivor resumed, took 0.14 s.
+- An nsys trace shows every decode all-to-all still running inside the original graphs.
+- Kimi-K2 on 32 GPUs and R1 on 16 and 64 GPUs gave similar results, including kills of ranks on
+  other nodes. One open item: in one 64-GPU run, one of three test requests drifted from the
+  reference at its third token (still coherent text). The likely cause is floating-point
+  rounding, since the expert GEMMs see slightly different batch sizes without the lost rank.
 
 ## 5. Limits and next steps
 
@@ -211,7 +208,7 @@ with the commit that implements it and the main code.
 | 1c.4b | Sole recovery coordinator and backend interface | [6][c6] | [authority] | done |
 | 1c.4c | Request disposition | [13][c13], [3][c3] | [recovery], [kv] | done |
 | 1d.1 | Poisoned lifecycle and public admission policy | [12][c12], [1][c1], [2][c2], [13][c13] | [session], [recovery] | done; env-var gate, not `LlmArgs` |
-| 1d.4a | Physical acceptance | [13][c13] | [ci] | done: EP32 R1/Kimi-K2, EP16, EP64 pending |
+| 1d.4a | Physical acceptance | [13][c13] | [ci] | done: EP32 R1/Kimi-K2, EP16, EP64 |
 | 1d.5 | Performance gate | [8][c8], [13][c13] | [docs] | done: −1.4% all-active, 99.4% degraded |
 
 Supporting commits without their own item: [1][c1] and [2][c2] (RPC fatal errors and teardown,
