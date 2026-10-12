@@ -623,6 +623,14 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     assert not executor._prefetched_request_ids
 
 
+def test_update_requests_skips_absent_sample_state() -> None:
+    executor = types.SimpleNamespace(sampler=Mock())
+
+    PyExecutor._update_requests(executor, None)
+
+    executor.sampler.update_requests.assert_not_called()
+
+
 class _InflightRequestIds:
     def __init__(self):
         self.ids = set()
