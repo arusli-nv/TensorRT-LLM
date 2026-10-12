@@ -39,6 +39,7 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
+from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
@@ -824,6 +825,13 @@ class PyTorchModelEngine(ModelEngine):
             self._spec_metadata = value
 
     @property
+    def moe_execution_state(self) -> Optional[MoeExecutionState]:
+        """MoE execution state of the decoder runner; None without recovery."""
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner.moe_execution_state
+        return None
+
+    @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):
@@ -1155,6 +1163,10 @@ class PyTorchModelEngine(ModelEngine):
         # Release runner-owned graphs before dropping the runner. Keep the
         # handle available if graph release fails and cleanup is retried.
         self._release_cuda_graphs()
+        # No captured graph can replay against the MoE workspaces any more.
+        execution_state = self.moe_execution_state
+        if execution_state is not None:
+            execution_state.close()
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
