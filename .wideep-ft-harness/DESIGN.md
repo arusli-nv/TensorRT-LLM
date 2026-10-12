@@ -10,15 +10,10 @@ With fault tolerance (FT) on, the surviving ranks keep serving on the CUDA graph
 startup. Nothing reloads, recompiles or recaptures. Requests on surviving ranks continue with the
 same tokens; only the requests the lost rank was serving fail, with a retryable error.
 
-| DeepSeek-R1 NVFP4 on 32 GB200 GPUs | With FT | Without FT |
-|---|---|---|
-| Kill until new requests are served | 0.16 to 0.34 s | restart: 81 to 173 s of load and warmup, plus teardown and rescheduling |
-| Kill until in-flight requests finish | 0.8 to 3.2 s | never: they are lost |
-| Throughput with all 32 GPUs | −1.4% (14,488 vs 14,689 tokens/s) | baseline |
-| Throughput per GPU after losing one | 99.4% | 0 until the restart finishes |
-| FT built in but turned off | no change | — |
-
 ![Recovery time and throughput](evidence/results.svg)
+
+Measured on DeepSeek-R1 NVFP4 on 32 GB200 GPUs. With FT built in but turned off, nothing changes:
+the kernels used are instruction-identical to main. No CUDA graph is recaptured after a loss.
 
 Tested by killing ranks at every stage of a step, on several models and scales (section 4). The
 current scope is one loss, of any rank but rank 0, with attention data parallelism and static
@@ -129,12 +124,13 @@ gather per MoE layer, one sync per step at the commit gate, and a watcher thread
 
 ## 4. Results
 
-DeepSeek-R1 on 32 GPUs. Each run kills one rank at the moment in the first column; times are from
-the kill, and "finish" includes generating each request's remaining tokens.
+DeepSeek-R1 on 32 GPUs. The summary chart shows how soon new requests are served. This table
+shows what happens to requests already running: each run kills one rank at the moment in the
+first column, and times run from the kill until the requests have generated all their remaining
+tokens.
 
 | When the rank is killed | Result |
 |---|---|
-| No requests running | a new request gets its first token after 0.16 to 0.34 s |
 | While requests generate tokens | all in-flight requests finish within 1.4 to 3.1 s |
 | During the MoE all-to-all (7 runs) | all in-flight requests finish within 2.6 to 3.2 s |
 | While new prompts are processed, full load | 248 of 248 requests finish within 4.6 s |
