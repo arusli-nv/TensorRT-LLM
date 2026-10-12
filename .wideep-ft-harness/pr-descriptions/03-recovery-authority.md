@@ -2,9 +2,9 @@
 
 ## Description
 
-This PR adds the recovery authority of the v7 design "WideEP Fault Tolerance in TensorRT-LLM". It implements the coordinator of item 1c.4b and the authority side of admission, item 1b.2a. It is PR 2 of the WideEP peer-loss recovery series and has no dependency.
+This PR adds the recovery authority: the single coordinator of a peer-loss recovery, and the place where the recoverable ranks are admitted. It is PR 3 of the WideEP peer-loss recovery series and has no dependency.
 
-v7 requires an authority outside the workers' launch and termination group, because agreement among survivors over MPI does not prove they can make progress. ULFM `Shrink` only rebuilds the communicator. The authority is one CPU process.
+The authority runs outside the workers' launch and termination group, because agreement among survivors over MPI does not prove they can make progress. ULFM `Shrink` only rebuilds the communicator. The authority is one CPU process.
 
 New package `tensorrt_llm/executor/recovery/`; it runs as a separate CPU process from a TensorRT-LLM install:
 

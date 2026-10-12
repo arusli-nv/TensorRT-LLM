@@ -2,7 +2,7 @@
 
 ## Description
 
-After a rank loss, routing must stop selecting the dead rank's slots without moving weights and without changing anything a captured graph depends on. Static EPLB with spare slots can hold a replica of every expert of a rank on other ranks. This PR points routing at those resident replicas. It implements v7 item 1b.2a, admission of resident-replica configurations, and the EPLB part of 1b.4a. It is PR 6 of the WideEP peer-loss recovery series and depends on PR 3 for `is_mpi_peer_failure` and on PR 5 for the execution state.
+After a rank loss, routing must stop selecting the dead rank's slots without moving weights and without changing anything a captured graph depends on. Static EPLB with spare slots can hold a replica of every expert of a rank on other ranks. This PR points routing at those resident replicas. It also decides which rank losses a placement can cover. It is PR 7 of the WideEP peer-loss recovery series and depends on PR 4 for `is_mpi_peer_failure` and on PR 6 for the execution state.
 
 `MoeLoadBalancer` gains:
 
@@ -14,11 +14,11 @@ After a rank loss, routing must stop selecting the dead rank's slots without mov
 
 The node-local shared-memory barrier in `MoeLoadBalancer` tolerates a dead peer only with recovery on.
 
-Only static placement is supported, with `layer_updates_per_iter: 0` and `initial_global_assignments` set. Online EPLB needs the quiesced integration of v7 item 1b.3.
+Only static placement is supported, with `layer_updates_per_iter: 0` and `initial_global_assignments` set. Online EPLB needs a quiesced integration and is follow-up work.
 
 FT-off impact: the new methods have no caller, and the shared barrier re-raises every error as before.
 
-This PR does not stand alone: its methods get their first caller in PR 9.
+This PR does not stand alone: its methods get their first caller in PR 11.
 
 ## Test Coverage
 

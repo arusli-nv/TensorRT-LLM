@@ -2,7 +2,7 @@
 
 ## Description
 
-Attention-DP routing assumes every TP rank answers every host exchange. After a recovered peer loss, gathers return `None` or a fill value at the departed rank's logical position, as PR 7 provides. This PR makes routing and the per-step ADP exchanges work on the ranks that are present. It is PR 11 of the WideEP peer-loss recovery series and depends on PR 7.
+Attention-DP routing assumes every TP rank answers every host exchange. After a recovered peer loss, gathers return `None` or a fill value at the departed rank's logical position, as PR 4 provides. This PR makes routing and the per-step ADP exchanges work on the ranks that are present. It is PR 8 of the WideEP peer-loss recovery series and depends on PR 4.
 
 - `ADPRouter.gather_all_rank_states` drops absent ranks. Per-rank request and token counts become dicts keyed by logical rank, in `adp_router.py`, `request_utils.py` and the executor.
 - Before any router runs, `ADPRouter.split_unservable_requests` removes the requests strictly pinned to a rank that is not serving, and `PyExecutor._fail_unservable_requests` answers them with the error "Attention DP rank N is not serving". Every rank routes the same requests, so every rank reaches the response collective. `can_process_attention_dp_request` lets such a request leave the waiting queue so that it can be failed. `DefaultADPRouter` load balances a relaxed pin to a rank that is not serving.

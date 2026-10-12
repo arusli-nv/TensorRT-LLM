@@ -4,7 +4,7 @@
 
 The container builds mpi4py 3.1.5 from source with a TRT-LLM patch. WideEP peer-loss recovery needs the ULFM bindings that mpi4py 4 adds: `Comm.Revoke`, `Comm.Shrink` and `Comm.Get_failed`. This PR moves the container to mpi4py 4.1.2, the version `security_scanning/poetry.lock` already pins.
 
-This is PR 5 of the WideEP peer-loss recovery series. It has no code dependency.
+This is PR 2 of the WideEP peer-loss recovery series. It has no code dependency.
 
 - The `TRTLLM_USE_MPI_KVCACHE` patch selects the CUDA device for MPI KV-cache transfer when mpi4py.futures starts its manager. It moves from `futures/_lib.py` `_manager_split` to `futures/_core.py` `_comm_executor_helper`, where mpi4py 4 splits the communicator. A singleton executor still returns before the device selection, as in 3.1.5.
 - The setuptools `< 69` pin and the aarch64 Cython 0.29.37 install go away. mpi4py 4 builds with current tooling.
@@ -12,9 +12,9 @@ This is PR 5 of the WideEP peer-loss recovery series. It has no code dependency.
 
 FT-off impact: no TRT-LLM code changes. Every MPI path runs on the new mpi4py, so the existing MPI unit and multi-GPU tests are the regression check.
 
-mpi4py.futures itself has no ULFM support. After a member dies, `MPICommExecutor` can neither collect results nor shut down. PR 12 bounds that with `MPI_Abort(0)`. A proper fix, upstream or as a TRT-LLM dispatcher, is follow-up work.
+mpi4py.futures itself has no ULFM support. After a member dies, `MPICommExecutor` can neither collect results nor shut down. PR 9 bounds that with `MPI_Abort(0)`. A proper fix, upstream or as a TRT-LLM dispatcher, is follow-up work.
 
-Until this image is in CI, the ULFM unit test of PR 7 and the WideEP integration test of PR 14 skip.
+Until this image is in CI, the ULFM unit test of PR 4 and the WideEP integration test of PR 11 skip.
 
 ## Test Coverage
 

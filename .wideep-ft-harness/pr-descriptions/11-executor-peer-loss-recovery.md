@@ -2,16 +2,16 @@
 
 ## Description
 
-When one worker process of a WideEP deployment dies, idle or mid-step, the other ranks now keep serving on the CUDA graphs captured at startup. Nothing reloads, recompiles, recaptures or retunes. Requests on surviving ranks continue with the same tokens, and requests of the dead rank's attention-DP shard fail with a retryable error. This PR ties the series together in the executor. It is PR 14 of the series and depends on PRs 5 to 13.
+When one worker process of a WideEP deployment dies, idle or mid-step, the other ranks now keep serving on the CUDA graphs captured at startup. Nothing reloads, recompiles, recaptures or retunes. Requests on surviving ranks continue with the same tokens, and requests of the dead rank's attention-DP shard fail with a retryable error. This PR ties the series together in the executor. It is PR 11 of the series and depends on PRs 2 to 10.
 
 `peer_loss_recovery.py` adds `PeerLossRecovery`, and `py_executor.py` calls it. On each survivor:
 
 1. Detect. A host collective raises `HostCollectiveInterrupted`, or the peer-failure watch fires. The watch sets the step-abort flag, requests a device abort and revokes the host communicators.
-2. Discard. A commit gate before `_update_request_states` syncs the step and raises if the flag is set. `revert_prepare_resources` from PR 13 then undoes the step. KV manager V1 releases first-chunk sequences without storing their blocks for reuse and rewinds generation tokens. V2 undoes the scheduler's allocations, and a discarded V2 step never commits blocks for reuse. The ADP padding request retires, and unscheduled requests stay in rank 0's queue.
+2. Discard. A commit gate before `_update_request_states` syncs the step and raises if the flag is set. `revert_prepare_resources` from PR 10 then undoes the step. KV manager V1 releases first-chunk sequences without storing their blocks for reuse and rewinds generation tokens. V2 undoes the scheduler's allocations, and a discarded V2 step never commits blocks for reuse. The ADP padding request retires, and unscheduled requests stay in rank 0's queue.
 3. Agree and install. The survivor runs `Shrink`, reports `Stopped` to the authority, answers `Propose` with its placement digest, and on `Install` switches to the survivor communicator and installs the resident placement and the mask.
 4. Commit. Survivors resend the response gathers rank 0 did not process, fail the dead rank's requests, restart the watch and resume.
 
-Recovery runs under the executor's `HangDetector`. Workers wait at most 120 s for the authority, set by `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S`, and the authority's deadline is 60 s. Any failure takes today's terminal path. `PeerLossRecovery.create()` rejects unsupported configurations at startup; `MPIDist.enable_peer_loss_recovery()` from PR 7 adds the pure attention-DP layout check (PP and CP of 1). It requires the MPI executor, expert TP 1, `DefaultADPRouter`, static EPLB, the non-overlap scheduler, KV manager V1 or V2, and a hang-detection timeout above the recovery timeout. It rejects speculative or guided decoding, beam search, PEFT, a KV connector or transceiver, attention-DP balancing, a conversation manager, sleep/wakeup, LM-head TP in ADP, hybrid or Mamba cache managers. Losing rank 0, a second loss and a rank without replicas fail closed. If a rank's own event loop crashes while the survivors could recover without it, that rank SIGKILLs itself instead of tearing down the job, and the others recover as from any other loss.
+Recovery runs under the executor's `HangDetector`. Workers wait at most 120 s for the authority, set by `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S`, and the authority's deadline is 60 s. Any failure takes today's terminal path. `PeerLossRecovery.create()` rejects unsupported configurations at startup; `MPIDist.enable_peer_loss_recovery()` from PR 4 adds the pure attention-DP layout check (PP and CP of 1). It requires the MPI executor, expert TP 1, `DefaultADPRouter`, static EPLB, the non-overlap scheduler, KV manager V1 or V2, and a hang-detection timeout above the recovery timeout. It rejects speculative or guided decoding, beam search, PEFT, a KV connector or transceiver, attention-DP balancing, a conversation manager, sleep/wakeup, LM-head TP in ADP, hybrid or Mamba cache managers. Losing rank 0, a second loss and a rank without replicas fail closed. If a rank's own event loop crashes while the survivors could recover without it, that rank SIGKILLs itself instead of tearing down the job, and the others recover as from any other loss.
 
 The PR adds `docs/source/features/wide-ep-fault-tolerance.md` with an index entry, marked experimental. It documents three limits. The server keeps reporting "healthy" while it recovers and after it lost a rank. On multiple nodes `mpirun` can outlive the ranks after `MPI_Abort`, so the launcher must stop it. Penalties, seeded sampling and multi-token stop words are not rolled back with a discarded step. New requests that arrive during recovery wait in rank 0's queue.
 
@@ -23,12 +23,12 @@ Evidence on DeepSeek-R1 NVFP4, EP32 on eight 4-GPU GB200 nodes, attention DP wit
 - An nsys trace shows every decode all-to-all running inside the captured graphs.
 - All-active throughput with FT on was 14,488 tok/s against 14,689 tok/s with FT off, 1.4% lower over three trials each.
 
-FT-off impact: `create()` returns `None`, every hook checks for it, `_publish_responses` keeps the enqueue-then-terminate order, and the idle broadcast timeout is unchanged. The FT-off kernels are opcode-identical to main, as PR 8 shows.
+FT-off impact: `create()` returns `None`, every hook checks for it, `_publish_responses` keeps the enqueue-then-terminate order, and the idle broadcast timeout is unchanged. The FT-off kernels are opcode-identical to main, as PR 5 shows.
 
 ## Test Coverage
 
 - `tests/unittest/_torch/executor/test_peer_loss_recovery.py`, new, runs in `l0_cpu` through `unittest/_torch/executor`. It covers the protocol order, failure at every transition, the deadline, the commit gate, discarding a step, deferred terminations, request ownership, response resend and the `create()` checks.
-- `tests/integration/defs/wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[idle]` and `[inflight]` are added to `l0_gb200_multi_gpus` post-merge. They serve DeepSeek-V3-Lite at EP4 on one GB200 node and SIGKILL rank 2. They need the mpi4py 4.1.2 image from PR 5 and skip without it. `tests/integration/defs/wide_ep_ft/README.md` describes how to run them.
+- `tests/integration/defs/wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[idle]` and `[inflight]` are added to `l0_gb200_multi_gpus` post-merge. They serve DeepSeek-V3-Lite at EP4 on one GB200 node and SIGKILL rank 2. They need the mpi4py 4.1.2 image from PR 2 and skip without it. `tests/integration/defs/wide_ep_ft/README.md` describes how to run them.
 
 ## PR Checklist
 

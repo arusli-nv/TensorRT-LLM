@@ -2,14 +2,14 @@
 
 ## Description
 
-WideEP peer-loss recovery (PR 14) discards a step that a peer loss interrupted and runs it again. The KV cache must then look as if the step was never scheduled, and nothing the discarded forward wrote may become a reusable prefix. This PR adds that rollback to both KV cache managers. It depends only on main.
+WideEP peer-loss recovery (PR 11) discards a step that a peer loss interrupted and runs it again. The KV cache must then look as if the step was never scheduled, and nothing the discarded forward wrote may become a reusable prefix. This PR adds that rollback to both KV cache managers. It depends only on main.
 
 - `KVCacheManager.revert_prepare_resources` (V1) undoes `prepare_resources`. First context chunks release the sequences added for them without storing their blocks for reuse, and rewind the request's reused-prefix state so the re-run can match a shorter prefix. Generation requests give back the tokens added for the step.
 - `KVCacheManagerV2.revert_prepare_resources` undoes what V2 allocates during scheduling. First context chunks are freed before their blocks are committed for reuse, later chunks restore their previous capacity, and generation requests use the existing `revert_allocate_generation`.
 - Cross-attention caches, helix context parallelism, SWA scratch reuse, draft caches and KV connectors raise `NotImplementedError`.
 - The nanobind `remove_sequence` binding names its arguments and accepts `None` for `llm_request`, so a sequence can be released without storing its blocks.
 
-Nothing calls the new methods yet, so behavior is unchanged until PR 14.
+Nothing calls the new methods yet, so behavior is unchanged until PR 11.
 
 ## Test Coverage
 

@@ -2,7 +2,7 @@
 
 ## Description
 
-When one worker of a WideEP job dies, host collectives that include it hang or abort the job. This PR lets survivors interrupt those collectives, agree on the membership, and continue on a communicator without the dead rank. Collectives keep logical rank positions, so callers see the same layout with the dead rank's entry filled. It is PR 7 of the WideEP peer-loss recovery series and has no code dependency.
+When one worker of a WideEP job dies, host collectives that include it hang or abort the job. This PR lets survivors interrupt those collectives, agree on the membership, and continue on a communicator without the dead rank. Collectives keep logical rank positions, so callers see the same layout with the dead rank's entry filled. It is PR 4 of the WideEP peer-loss recovery series and has no code dependency.
 
 `MPIDist` in `communicator.py` gains:
 
@@ -12,7 +12,7 @@ When one worker of a WideEP job dies, host collectives that include it hang or a
 - With recovery on, peer-failure MPI errors from collectives become `HostCollectiveInterrupted`, which carries the known failed ranks. Other errors propagate unchanged.
 - After installation, gathers keep each result at its logical rank. Object gathers return `None` for the departed rank, `tp_allgather_int64` takes a `fill_value`, and `live_ranks` lists the ranks still present.
 
-The base `Distributed` gains `live_ranks` (every TP rank) and an `enable_peer_loss_recovery()` that raises `NotImplementedError`, so other backends reject recovery at startup. `_utils` gains `is_mpi_peer_failure()`, which classifies `ERR_PROC_FAILED`, `ERR_PROC_FAILED_PENDING` and `ERR_REVOKED` and ignores classes that alias a generic error class, plus `mpi_failed_ranks()` and `mpi_world_ranks()`, which PR 12 reuses.
+The base `Distributed` gains `live_ranks` (every TP rank) and an `enable_peer_loss_recovery()` that raises `NotImplementedError`, so other backends reject recovery at startup. `_utils` gains `is_mpi_peer_failure()`, which classifies `ERR_PROC_FAILED`, `ERR_PROC_FAILED_PENDING` and `ERR_REVOKED` and ignores classes that alias a generic error class, plus `mpi_failed_ranks()` and `mpi_world_ranks()`, which PR 9 reuses.
 
 ULFM needs `mpirun --with-ft ulfm --mca pml ob1 --mca btl self,tcp --mca coll ^hcoll,ucc`. MPI carries only host control traffic, and MoE data uses NVLink.
 
@@ -21,7 +21,7 @@ FT-off impact: nothing calls the new methods. The wrapper on each collective re-
 ## Test Coverage
 
 - `tests/unittest/_torch/distributed/test_mpi_survivors.py` is new and uses a fake MPI. It covers revoke, shrink and install, logical results, interruption mapping, watch start and stop, the layout and launch checks, and the peer-failure error classes against a fake MPI that aliases one of them to `ERR_UNKNOWN`. `l0_cpu` runs it through `unittest/_torch/distributed`.
-- `tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py::test_survivors_recover_from_a_departed_rank` is new and runs in `l0_cpu`. It launches `mpirun --with-ft ulfm -np 4`, and rank 2 dies. Survivors interrupt, shrink, install and gather. It needs the mpi4py 4.1.2 image from PR 5 and skips without it or without an Open MPI whose `ompi_info` reports `ftmpi`.
+- `tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py::test_survivors_recover_from_a_departed_rank` is new and runs in `l0_cpu`. It launches `mpirun --with-ft ulfm -np 4`, and rank 2 dies. Survivors interrupt, shrink, install and gather. It needs the mpi4py 4.1.2 image from PR 2 and skips without it or without an Open MPI whose `ompi_info` reports `ftmpi`.
 
 ## PR Checklist
 

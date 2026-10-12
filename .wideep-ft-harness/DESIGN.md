@@ -20,23 +20,25 @@
 | 1c.1 (#15677) | EP error classification | kept |
 | 1d.0 (#14160) | no abort or parent kill from signal handlers | survivors stay alive |
 
-### New contributions (implemented)
+### New contributions
 
-| ID | Implemented |
-|---|---|
-| 1a.8 | recoverable abort: graph-visible execution descriptor, abort flag in pinned host memory |
-| 1a.8a | late-write confinement (non-CFT): fixed per-source regions, gather kernel |
-| 1a.8b | abort, rearm and mask install for the bound workspaces |
-| 1a.11 | rank-mask execution inside CUDA graphs (main rejected it) |
-| 1b.2a | coverage check at startup and at loss time; authority admission |
-| 1b.4a | fixed-N logical/physical mapping; fixed-size host gathers |
-| 1c.3 | ULFM failure detection (to become a transport of #15785, below) |
-| 1c.3a | ULFM runtime adapter; survivor–authority protocol |
-| 1c.4, 1c.4c | engine hook: commit gate, KV rollback, response resend, retryable errors |
-| 1c.4a | survivor communicator; attention-DP routing over survivors |
-| 1c.4b | sole CPU recovery authority |
-| 1d.1 | degraded MPI session, bounded teardown, startup configuration checks |
-| 1d.4a, 1d.5 | multi-node kill qualification; overhead and degraded-throughput measurements |
+One commit per PR, in merge order; each commit link shows all its files and tests. 1 is a
+standalone fix; 10 depends only on main. Whole series as one diff:
+[main...wideep-ft](https://github.com/NVIDIA/TensorRT-LLM/compare/main...arusli-nv:TensorRT-LLM:wideep-ft).
+
+| # | Commit | PR | Work items | Main code |
+|---|---|---|---|---|
+| 1 | [35f93bdcb9](https://github.com/arusli-nv/TensorRT-LLM/commit/35f93bdcb9) | `[fix]` keep EPGroupHealth identity across ConfigurableMoE deepcopy | prerequisite (1a.8) | [ep_group_health.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py) |
+| 2 | [7e0c92bfe6](https://github.com/arusli-nv/TensorRT-LLM/commit/7e0c92bfe6) | `[infra]` upgrade mpi4py to 4.1.2 | 1c.3 | [install_mpi4py.sh](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/docker/common/install_mpi4py.sh) |
+| 3 | [7468074ed6](https://github.com/arusli-nv/TensorRT-LLM/commit/7468074ed6) | `[feat]` WideEP recovery authority | 1c.4b, 1c.3a, 1b.2a | [authority.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/executor/recovery/authority.py), [client.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/executor/recovery/client.py), [protocol.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/executor/recovery/protocol.py) |
+| 4 | [ef431c5a9b](https://github.com/arusli-nv/TensorRT-LLM/commit/ef431c5a9b) | `[feat]` ULFM survivor communicators for host collectives | 1c.3, 1c.3a, 1c.4a | [communicator.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/distributed/communicator.py), [_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_utils.py) |
+| 5 | [4482cc3e11](https://github.com/arusli-nv/TensorRT-LLM/commit/4482cc3e11) | `[feat]` fault-tolerant execution descriptor for the NVLinkOneSided all-to-all | 1a.8, 1a.8a, 1a.11 | [moeAlltoAllKernels.cu](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.cu), [moeAlltoAllOp.cpp](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp), [moeAlltoAllKernels.h](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h) |
+| 6 | [11cf718e24](https://github.com/arusli-nv/TensorRT-LLM/commit/11cf718e24) | `[feat]` MoE execution state for WideEP recovery | 1a.8a, 1a.8b | [execution_state.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py), [nvlink_one_sided.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py), [_mnnvl_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_mnnvl_utils.py) |
+| 7 | [37bd2d8917](https://github.com/arusli-nv/TensorRT-LLM/commit/37bd2d8917) | `[feat]` resident-replica EPLB placement after a rank loss | 1b.2a, 1b.4a | [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py), [model_engine.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/model_engine.py) |
+| 8 | [8d7a5cdc08](https://github.com/arusli-nv/TensorRT-LLM/commit/8d7a5cdc08) | `[feat]` let attention-DP routing skip absent ranks | 1b.4a, 1c.4a | [adp_router.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/py_executor.py), [request_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/request_utils.py) |
+| 9 | [6866d3a7de](https://github.com/arusli-nv/TensorRT-LLM/commit/6866d3a7de) | `[feat]` keep the MPI session serving after a peer loss | 1d.1 | [mpi_session.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/llmapi/mpi_session.py), [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) |
+| 10 | [612c4e0b3b](https://github.com/arusli-nv/TensorRT-LLM/commit/612c4e0b3b) | `[feat]` revert the KV cache allocations of a discarded step | 1c.4c | [kv_cache_manager_v2.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py), [resource_manager.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/resource_manager.py), [kvCacheManager.cpp](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp) |
+| 11 | [981d36c434](https://github.com/arusli-nv/TensorRT-LLM/commit/981d36c434) | `[feat]` recover the executor from a WideEP peer loss, with the docs page | 1c.4, 1c.4c, 1d.1, 1d.4a | [peer_loss_recovery.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/981d36c434/tensorrt_llm/_torch/pyexecutor/py_executor.py) |
 
 ### Validated configurations
 
@@ -66,36 +68,14 @@
 ### Remaining qualification
 
 - **Scope:** KV Cache Manager V2 only; for disaggregated serving, the Python transceiver only.
-- **Kernel benchmarks:** per-kernel cost of the gather, dispatch and combine changes (running).
+- **Kernel cost:** the gather adds 4–14 µs per MoE layer (section below); fusing or removing it is
+  open.
 - **Production config:** overlap scheduler and MTP are not supported yet; with them the same 32
   GPUs reach 157k tokens/s versus 80k with FT. Online EPLB (1b.3) is not supported.
 - **CI:** an image with ULFM Open MPI and mpi4py 4.1.2; until then the ULFM tests skip.
 - **1d.3** health reporting; **1d.7** v1 qualification (other backends, soak runs).
 - **Not started:** 1a.6 TwoSided, 1a.7 NCCL, 1b.7 N−K placement, 1c.2 per-rank evidence budgets.
 - **Follow-ups:** CFT, Ray, disaggregated serving, repeated failures (1c.6), restore to N ranks.
-
-### Deliverables
-
-One commit per PR, in merge order; each commit link shows all its files and tests. 1–4 are
-standalone fixes; 13 depends only on main. Whole series as one diff:
-[ca3a6c4c62...cb20d75a99](https://github.com/arusli-nv/TensorRT-LLM/compare/ca3a6c4c62...cb20d75a99).
-
-| # | Commit | PR | Work items | Main code |
-|---|---|---|---|---|
-| 1 | [bf3791cb9c](https://github.com/arusli-nv/TensorRT-LLM/commit/bf3791cb9c) | `[fix]` propagate fatal RPC worker errors | prerequisite (1d.1) | [rpc_proxy_mixin.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/executor/rpc_proxy_mixin.py), [llm.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/llmapi/llm.py), [rpc_worker_mixin.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/executor/rpc_worker_mixin.py) |
-| 2 | [b0bb2786ad](https://github.com/arusli-nv/TensorRT-LLM/commit/b0bb2786ad) | `[fix]` bound RPC socket teardown with unreachable peers | prerequisite (1d.1) | [rpc_client.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/executor/rpc/rpc_client.py) |
-| 3 | [6f7331dc5e](https://github.com/arusli-nv/TensorRT-LLM/commit/6f7331dc5e) | `[fix]` skip request updates without a sampling result | prerequisite (1c.4c) | [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/py_executor.py) |
-| 4 | [82e568a236](https://github.com/arusli-nv/TensorRT-LLM/commit/82e568a236) | `[fix]` keep EPGroupHealth identity across ConfigurableMoE deepcopy | prerequisite (1a.8) | [ep_group_health.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py) |
-| 5 | [200602863d](https://github.com/arusli-nv/TensorRT-LLM/commit/200602863d) | `[infra]` upgrade mpi4py to 4.1.2 | 1c.3 | [install_mpi4py.sh](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/docker/common/install_mpi4py.sh) |
-| 6 | [c989b2bc8a](https://github.com/arusli-nv/TensorRT-LLM/commit/c989b2bc8a) | `[feat]` WideEP recovery authority | 1c.4b, 1c.3a, 1b.2a | [authority.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/executor/recovery/authority.py), [client.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/executor/recovery/client.py), [protocol.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/executor/recovery/protocol.py) |
-| 7 | [7de2a38e53](https://github.com/arusli-nv/TensorRT-LLM/commit/7de2a38e53) | `[feat]` ULFM survivor communicators for host collectives | 1c.3, 1c.3a, 1c.4a | [communicator.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/distributed/communicator.py), [_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_utils.py) |
-| 8 | [bf6ff93509](https://github.com/arusli-nv/TensorRT-LLM/commit/bf6ff93509) | `[feat]` fault-tolerant execution descriptor for the NVLinkOneSided all-to-all | 1a.8, 1a.8a, 1a.11 | [moeAlltoAllKernels.cu](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.cu), [moeAlltoAllOp.cpp](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp), [moeAlltoAllKernels.h](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h) |
-| 9 | [948efcc0e9](https://github.com/arusli-nv/TensorRT-LLM/commit/948efcc0e9) | `[feat]` MoE execution state for WideEP recovery | 1a.8a, 1a.8b | [execution_state.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py), [nvlink_one_sided.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py), [_mnnvl_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_mnnvl_utils.py) |
-| 10 | [c4354a62f5](https://github.com/arusli-nv/TensorRT-LLM/commit/c4354a62f5) | `[feat]` resident-replica EPLB placement after a rank loss | 1b.2a, 1b.4a | [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py), [model_engine.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/model_engine.py) |
-| 11 | [7abbf48a36](https://github.com/arusli-nv/TensorRT-LLM/commit/7abbf48a36) | `[feat]` let attention-DP routing skip absent ranks | 1b.4a, 1c.4a | [adp_router.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/py_executor.py), [request_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/request_utils.py) |
-| 12 | [68524ed0c1](https://github.com/arusli-nv/TensorRT-LLM/commit/68524ed0c1) | `[feat]` keep the MPI session serving after a peer loss | 1d.1 | [mpi_session.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/llmapi/mpi_session.py), [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) |
-| 13 | [b383cb7753](https://github.com/arusli-nv/TensorRT-LLM/commit/b383cb7753) | `[feat]` revert the KV cache allocations of a discarded step | 1c.4c | [kv_cache_manager_v2.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py), [resource_manager.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/resource_manager.py), [kvCacheManager.cpp](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp) |
-| 14 | [cb20d75a99](https://github.com/arusli-nv/TensorRT-LLM/commit/cb20d75a99) | `[feat]` recover the executor from a WideEP peer loss, with the docs page | 1c.4, 1c.4c, 1d.1, 1d.4a | [peer_loss_recovery.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/cb20d75a99/tensorrt_llm/_torch/pyexecutor/py_executor.py) |
 
 ### Integration boundary with #15785 (1c.3, evidence transport)
 
@@ -204,9 +184,20 @@ source**, which later execution neither consumes nor repurposes:
 - **Alternatives rejected:** a pull-based dispatch (a round trip per MoE layer, rewrite of main's
   hot kernel); strided expert inputs (changes every MoE backend).
 
-**Benchmarks:**
-- End to end, FT on: −2.4% throughput at 8 requests per GPU, −3.7% at 64 (includes the gather, the
-  descriptor reads and the per-step commit-gate sync).
-- Per-kernel comparison of gather, dispatch and combine, FT on versus off: running.
+**Benchmarks** (R1, 32 GPUs, nsys on one rank, medians over ~139k MoE-layer executions from CUDA
+graphs):
+
+| | Dispatch | Combine | Expert-id step | Dispatch start → combine end |
+|---|---|---|---|---|
+| FT off, 8 requests/GPU | 13.4 µs | 34.4 µs | sanitize 9.4 µs | 81.7 µs |
+| FT on, 8 requests/GPU | 14.6 µs | 36.1 µs | gather 13.8 µs | 88.4 µs (+8%) |
+| FT off, 64 requests/GPU | 15.3 µs | 41.7 µs | sanitize 10.6 µs | 125.3 µs |
+| FT on, 64 requests/GPU | 16.4 µs | 43.1 µs | gather 24.6 µs | 144.1 µs (+15%) |
+
+- Dispatch and combine changes cost 1–2 µs each (descriptor read, mask checks).
+- The gather is the main cost and grows with batch: it replaces main's sanitize kernel but copies
+  every row, where main hands the GEMMs a zero-copy view.
+- End to end: −2.4% throughput at 8 requests per GPU, −3.7% at 64 (about 19 µs × 58 MoE layers
+  per step, plus the commit-gate sync). Fusing or removing the gather is the main optimization.
 
 Launch and configuration: `docs/source/features/wide-ep-fault-tolerance.md`.

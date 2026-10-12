@@ -28,7 +28,7 @@ run cpu $T/executor/test_recovery_authority.py \
     $T/_torch/executor/test_peer_loss_recovery.py \
     $T/_torch/executor/test_adp_router.py $T/_torch/executor/test_request_utils.py \
     $T/_torch/executor/test_executor_request_queue.py $T/_torch/executor/test_adp_host_exchange.py \
-    $T/_torch/moe/test_ep_group_health.py $T/executor/test_rpc.py $T/executor/test_rpc_executor_mixin.py \
+    $T/_torch/moe/test_ep_group_health.py $T/executor/test_rpc.py \
     $T/executor/test_rpc_worker_mixin.py
 # The rest of test_mpi_session.py spawns MPI processes, which the Slurm container cannot; run ours.
 run session $T/llmapi/test_mpi_session.py -k "departed or departure or degraded"

@@ -2,7 +2,7 @@
 
 ## Description
 
-When an EP peer dies, NVLinkOneSided dispatch and combine on the survivors spin on its completion flags until the device timeout traps and kills their CUDA context. CUDA graphs bake in kernel arguments, so a rank mask passed by value cannot change after capture. This PR adds an execution descriptor that the kernels read at run time, for a bounded cooperative abort and a live-rank mask, and fixed per-source slots that keep a dead rank's late writes out of live rows. It is PR 8 of the WideEP peer-loss recovery series and has no dependency.
+When an EP peer dies, NVLinkOneSided dispatch and combine on the survivors spin on its completion flags until the device timeout traps and kills their CUDA context. CUDA graphs bake in kernel arguments, so a rank mask passed by value cannot change after capture. This PR adds an execution descriptor that the kernels read at run time, for a bounded cooperative abort and a live-rank mask, and fixed per-source slots that keep a dead rank's late writes out of live rows. It is PR 5 of the WideEP peer-loss recovery series and has no dependency.
 
 `moe_a2a_dispatch` and `moe_a2a_combine` take an optional `execution_descriptor`, an int64 device tensor holding `MoeA2AFenceDescriptor`: the active-rank mask words and an abort record with `requested` and `status`. It is valid only on the fence path with `enable_rank_mask`. With a descriptor:
 
@@ -17,7 +17,7 @@ FT-off impact: without a descriptor the kernels run as on main. A SASS compariso
 
 Coordination: #19610 rewrites these kernels; we rebase after it merges and move the abort check into its `wait_round_flag`. #15895 proposes a competing abort ABI that passes a host epoch by value and does not work with graphs; we will align with its owner.
 
-PR 9 binds the descriptor to the model. It also carries the two-process late-write test, which needs PR 9's workspace sizing. With the full series on DeepSeek-R1 at EP32, a kill timed to land during dispatch and combine made all 31 survivors abort their in-flight MoE collectives, and their requests completed 2.6 s after the kill with exact tokens. For comparison, survivors' requests complete 0.8 s after an idle kill and 1.4 s after a kill during decode.
+PR 6 binds the descriptor to the model. It also carries the two-process late-write test, which needs PR 6's workspace sizing. With the full series on DeepSeek-R1 at EP32, a kill timed to land during dispatch and combine made all 31 survivors abort their in-flight MoE collectives, and their requests completed 2.6 s after the kill with exact tokens. For comparison, survivors' requests complete 0.8 s after an idle kill and 1.4 s after a kill during decode.
 
 ## Test Coverage
 

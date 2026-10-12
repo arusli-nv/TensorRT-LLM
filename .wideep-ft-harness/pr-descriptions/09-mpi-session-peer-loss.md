@@ -2,7 +2,7 @@
 
 ## Description
 
-`trtllm-llmapi-launch` runs a `RemoteMpiCommSessionServer` that dispatches worker tasks through mpi4py.futures on `COMM_WORLD`. When one worker dies, that server forwards the failure to the client as fatal, and its task-end barrier and future waits never finish. Recovery needs the session to stay out of the way while survivors recover, and to end in bounded time later. This PR implements the session part of v7 item 1d.1: process death does not kill healthy workers, and teardown is bounded. It is PR 8 of the WideEP peer-loss recovery series and depends on PR 2 for `recovery_requested()` and on PR 3 for `is_mpi_peer_failure` and `mpi_failed_ranks`. The degraded mode does nothing until PR 9 recovers the executor.
+`trtllm-llmapi-launch` runs a `RemoteMpiCommSessionServer` that dispatches worker tasks through mpi4py.futures on `COMM_WORLD`. When one worker dies, that server forwards the failure to the client as fatal, and its task-end barrier and future waits never finish. Recovery needs the session to stay out of the way while survivors recover, and to end in bounded time later. With this PR, process death does not kill healthy workers, and teardown is bounded. It is PR 9 of the WideEP peer-loss recovery series and depends on PR 3 for `recovery_requested()` and on PR 4 for `is_mpi_peer_failure` and `mpi_failed_ranks`. The degraded mode does nothing until PR 11 recovers the executor.
 
 With recovery enabled, a ULFM peer-failure error, or a `BrokenExecutor` once ULFM reports a failed rank, counts as a departed peer:
 
@@ -12,7 +12,7 @@ With recovery enabled, a ULFM peer-failure error, or a `BrokenExecutor` once ULF
 - Later tasks fail fast. A sync task returns the error to the client.
 - Shutdown flushes the logs and calls `MPI_Abort(0)`, because mpi4py.futures cannot release a world that lost a member.
 
-Every rank exits after the abort. On multiple nodes, `mpirun` itself can outlive the ranks, so the launcher must stop it once the server exits. The docs in PR 9 state this. Our EP32 harness stops it by PID with SIGKILL after a grace period.
+Every rank exits after the abort. On multiple nodes, `mpirun` itself can outlive the ranks, so the launcher must stop it once the server exits. The docs in PR 11 state this.
 
 mpi4py.futures threads print `MPI_ERR_PROC_FAILED` tracebacks at the loss and at shutdown. They are harmless. Fixing the futures gap cleanly, upstream in mpi4py or with a TRT-LLM dispatcher, is follow-up work.
 
