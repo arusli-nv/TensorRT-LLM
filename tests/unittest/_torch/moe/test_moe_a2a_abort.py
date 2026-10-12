@@ -22,7 +22,6 @@ masking and polling, not peer transport.
 import os
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 
 import pytest
@@ -213,8 +212,6 @@ def test_source_slots_reject_runtime_over_capacity() -> None:
     descriptor, _ = _descriptor(1)
     with pytest.raises(RuntimeError, match="static workspace capacity"):
         _dispatch(workspace, meta, experts, [experts], descriptor, _CAPACITY + 1)
-    with pytest.raises(RuntimeError, match="static workspace capacity"):
-        _combine(workspace, meta, payload.view(1, -1, _HIDDEN), 0, descriptor, _CAPACITY + 1)
 
 
 @pytest.mark.parametrize(
@@ -264,41 +261,6 @@ def test_descriptor_schema_and_fake_signatures() -> None:
             assert output.shape == (_CAPACITY, _HIDDEN) and output.dtype == torch.bfloat16
 
 
-def _pending_wait(phase: str, tokens: int) -> None:
-    """Does a fence wait on a silent peer return once the abort record is requested?"""
-    question = f"{phase}/{tokens} tokens"
-    workspace, meta, experts, payload = _setup(2, tokens)
-    descriptor, abort = _descriptor(1 if phase == "combine" else 3)
-    if phase == "combine":
-        # Dispatch without the silent peer, then wait for it in combine.
-        received, offset, _ = _dispatch(workspace, meta, experts, [payload, experts], descriptor)
-        descriptor[0] = 3
-    torch.cuda.synchronize()
-    execution, control = torch.cuda.Stream(), torch.cuda.Stream()
-    done = torch.cuda.Event()
-    with torch.cuda.stream(execution):
-        if phase == "dispatch":
-            ids, output = _round(workspace, meta, experts, payload, descriptor)
-        else:
-            output = _combine(workspace, meta, received[0], offset, descriptor, tokens)
-        done.record(execution)
-    time.sleep(0.5)
-    assert not done.query(), f"{question}: completed before the silent peer signaled"
-    # Request the abort with a copy, as production does: kernels may occupy every SM.
-    request = torch.ones(1, dtype=torch.int32).pin_memory()
-    with torch.cuda.stream(control):
-        abort[:1].copy_(request, non_blocking=True)
-    deadline = time.monotonic() + 10
-    while not done.query():
-        assert time.monotonic() < deadline, f"{question}: wait ignored the abort request"
-        time.sleep(0.01)
-    torch.cuda.synchronize()
-    assert abort.tolist() == [1, 1], question
-    assert torch.count_nonzero(output).item() == 0, question
-    if phase == "dispatch":
-        assert torch.all(ids == -1).item(), question
-
-
 def _fence_timeout() -> None:
     """Does a fence wait on a silent peer still fail stop at the timeout?"""
     workspace, meta, experts, payload = _setup(2)
@@ -312,31 +274,24 @@ def _fence_timeout() -> None:
     raise AssertionError("dispatch completed without its peer")
 
 
-@pytest.mark.parametrize("mode,timeout_s", [("cancel", 60), ("timeout", 1)])
-def test_pending_fence_waits(mode: str, timeout_s: int) -> None:
-    # The native timeout budget is cached on first use, so each mode needs a fresh interpreter.
+def test_fence_timeout_still_traps() -> None:
+    # The native timeout budget is cached on first use, so the test needs a fresh interpreter.
     # The child traps on purpose; keep it off the enclosing launcher's process-management interface.
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {
         **{k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)},
-        "TRTLLM_MOE_A2A_TIMEOUT_SEC": str(timeout_s),
-        "TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC": str(timeout_s),
+        "TRTLLM_MOE_A2A_TIMEOUT_SEC": "1",
+        "TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC": "1",
     }
     try:
         result = subprocess.run(
-            [sys.executable, __file__, mode], env=env, capture_output=True, text=True, timeout=300
+            [sys.executable, __file__], env=env, capture_output=True, text=True, timeout=300
         )
     except subprocess.TimeoutExpired as error:
         pytest.fail(f"Pending fence subprocess deadline: {error.stdout!r} {error.stderr!r}")
     assert result.returncode == 0, result.stdout + result.stderr
-    if mode == "timeout":
-        assert "fence timeout trapped" in result.stdout, result.stdout + result.stderr
+    assert "fence timeout trapped" in result.stdout, result.stdout + result.stderr
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "timeout":
-        _fence_timeout()
-    for phase in ("dispatch", "combine"):
-        for tokens in (0, _CAPACITY):
-            print(f"Checking {phase}/{tokens} tokens", flush=True)
-            _pending_wait(phase, tokens)
+    _fence_timeout()

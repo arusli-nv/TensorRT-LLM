@@ -184,7 +184,32 @@ def _survivor(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> N
             assert torch.count_nonzero(row[start:end]) == 0, f"late write into {name}"
 
 
-def _worker(rank: int, port: int) -> None:
+def _cancel(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> None:
+    """Dispatch to the silent survivor, then release the wait the way recovery does."""
+    descriptor = torch.tensor([3, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
+    abort = descriptor[4:].view(torch.int32)
+    request = torch.ones(1, dtype=torch.int32).pin_memory()
+    side = torch.cuda.Stream()
+    experts = torch.zeros((_CAPACITY, 1), dtype=torch.int32, device="cuda")
+    payload = torch.ones((_CAPACITY, _HIDDEN), dtype=torch.bfloat16, device="cuda")
+    stats = torch.zeros((_EP_SIZE,), dtype=torch.int32, device="cuda")
+    done = torch.cuda.Event()
+    received, _, _ = _dispatch(workspace, meta, _VICTIM, experts, payload, descriptor, stats)
+    done.record()
+    time.sleep(0.5)
+    assert not done.query(), "dispatch finished without its peer"
+    with torch.cuda.stream(side):
+        abort[:1].copy_(request, non_blocking=True)
+    deadline = time.monotonic() + 10
+    while not done.query():
+        assert time.monotonic() < deadline, "dispatch ignored the abort request"
+        time.sleep(0.01)
+    assert abort.tolist() == [1, 1]
+    assert torch.all(received[1] == -1).item()
+    store.set("cancelled", "1")
+
+
+def _worker(rank: int, port: int, mode: str) -> None:
     store = TCPStore("127.0.0.1", port, is_master=False, timeout=_TIMEOUT)
     torch.cuda.set_device(rank)
     mapping = Mapping(_EP_SIZE, rank, _EP_SIZE, tp_size=_EP_SIZE, moe_ep_size=_EP_SIZE)
@@ -206,6 +231,12 @@ def _worker(rank: int, port: int) -> None:
     meta = torch.ops.trtllm.moe_a2a_initialize(workspace, rank, _EP_SIZE, _CAPACITY, _EP_SIZE)
     # No peer may write into a row before its owner has initialized it.
     comm.barrier()
+    if mode == "cancel":
+        if rank == _SURVIVOR:
+            store.wait(["cancelled"])  # Stays silent until the victim's dispatch returned.
+        else:
+            _cancel(store, workspace, meta)
+        return
     (_survivor if rank == _SURVIVOR else _victim)(store, workspace, meta)
 
 
@@ -228,7 +259,7 @@ def test_killed_peer_writes_stay_in_its_storage(kill_delay_s: float) -> None:
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)}
     workers = [
-        subprocess.Popen([sys.executable, __file__, str(rank), str(store.port)], env=env)
+        subprocess.Popen([sys.executable, __file__, str(rank), str(store.port), "kill"], env=env)
         for rank in range(_EP_SIZE)
     ]
     survivor, victim = workers[_SURVIVOR], workers[_VICTIM]
@@ -250,5 +281,26 @@ def test_killed_peer_writes_stay_in_its_storage(kill_delay_s: float) -> None:
                 worker.wait()
 
 
+def test_abort_request_releases_a_dispatch_waiting_on_a_silent_peer() -> None:
+    reason = _mnnvl_skip_reason()
+    if reason:
+        pytest.skip(reason)
+    store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, timeout=_TIMEOUT)
+    launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)}
+    env["TRTLLM_MOE_A2A_TIMEOUT_SEC"] = "60"
+    workers = [
+        subprocess.Popen([sys.executable, __file__, str(rank), str(store.port), "cancel"], env=env)
+        for rank in range(_EP_SIZE)
+    ]
+    try:
+        assert [worker.wait(timeout=_TIMEOUT.total_seconds()) for worker in workers] == [0, 0]
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait()
+
+
 if __name__ == "__main__":
-    _worker(int(sys.argv[1]), int(sys.argv[2]))
+    _worker(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3])
