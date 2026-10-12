@@ -66,6 +66,55 @@ struct PayloadDescriptor
     int elements_per_token; // Number of elements per token (e.g., hidden_size, top_k)
 };
 
+// Abort record of a fence execution descriptor. The host sets `requested` to make kernels that wait for peers
+// return; a kernel that observes the request records `status = kCancelled`. While the record is nonzero the
+// outputs of every collective using the descriptor are invalid.
+// Lives in pinned host memory: the host requests an abort with a plain CPU store, which kernels observe
+// without any CUDA work having to make progress.
+struct MoeA2AAbortState
+{
+    static constexpr int32_t kCancelled = 1;
+
+    int32_t requested; // Set by the host to release kernels waiting on lost peers
+    int32_t status;    // Diagnostic: kCancelled once a dispatch or combine returned early
+};
+
+// Local device descriptor read by fence rank-mask kernels at execution time. Its address is fixed, so captured CUDA
+// graphs observe a mask rewritten in place while no collective runs. A dispatch bound to a descriptor places each
+// source rank's payloads in a fixed slot of the receiver's workspace (see DispatchKernelPointers), so late writes
+// from an excluded rank only reach its own slot.
+struct MoeA2AFenceDescriptor
+{
+    uint64_t activeMask[kRankMaskWords];
+    MoeA2AAbortState* abort; // Host-mapped
+};
+
+static_assert(sizeof(MoeA2AFenceDescriptor) == (kRankMaskWords + 1) * sizeof(uint64_t));
+
+// Compacts this rank's fixed per-source receive slots into dense [ep_size, maxTokens] tensors. Rows of inactive
+// sources, rows past a source's received count, and all rows of an aborted execution are invalid: their expert ids
+// are set to invalidExpertId and their other payload rows are zeroed.
+struct MoeA2AGatherParams
+{
+    void const* source[kMaxPayloads]; // Slot of source rank 0 per payload
+    void* destination[kMaxPayloads];  // [epSize, maxTokens, bytesPerToken] per payload
+    int bytesPerToken[kMaxPayloads];
+    int numPayloads;
+    int expertIdPayloadIndex; // Payload that holds the int32 expert ids
+    int32_t invalidExpertId;
+    int epSize;
+    int maxTokens;             // Runtime tokens per source rank
+    int64_t sourceStrideBytes; // Byte distance between consecutive source slots
+    int const* recvCounters;   // [2, epSize]
+    uint32_t const* flagVal;
+    int const* sourceStats;    // [epSize, statsExperts] or nullptr
+    int* destinationStats;     // [epSize, statsExperts] or nullptr
+    int statsExperts;
+    MoeA2AFenceDescriptor* descriptor;
+};
+
+void moe_a2a_gather_local_launch(MoeA2AGatherParams const& params, cudaStream_t stream);
+
 // Kernel pointers packed into a struct for device access
 // Dispatch kernel pointers - const source data
 struct DispatchKernelPointers
@@ -122,6 +171,12 @@ struct DispatchKernelPointers
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    // Optional fence rank-mask execution descriptor. When set, its mask replaces active_rank_mask, an abort request
+    // releases the completion-flag wait, and source rank r writes token t of payload p at
+    // recv_buffers[target][p] + r * source_stride_bytes + t * payload_bytes_per_token[p].
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
+    int64_t source_stride_bytes{0};
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -152,6 +207,10 @@ struct CombineKernelPointers
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    // Optional fence rank-mask execution descriptor. When set, its mask replaces active_rank_mask and an abort
+    // request releases the completion-flag wait; aborted blocks zero their output token.
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
 };
 
 // Dispatch phase parameters
@@ -218,12 +277,16 @@ struct MoeA2ADispatchParams
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
     // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
+    // The mask is copied by value into kernel arguments, so CUDA graphs captured in rank-mask
+    // mode must read membership from execution_descriptor instead.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    // Optional fence rank-mask execution descriptor; see DispatchKernelPointers::execution_descriptor.
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
+    int64_t source_stride_bytes{0};
 
     // CUDA stream
     cudaStream_t stream;
@@ -308,12 +371,15 @@ struct MoeA2ACombineParams
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
     // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
+    // The mask is copied by value into kernel arguments, so CUDA graphs captured in rank-mask
+    // mode must read membership from execution_descriptor instead.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    // Optional fence rank-mask execution descriptor; see CombineKernelPointers::execution_descriptor.
+    MoeA2AFenceDescriptor* execution_descriptor{nullptr};
 
     // CUDA stream
     cudaStream_t stream;
