@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import hashlib
 import os
 import threading
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -927,6 +928,44 @@ class MoeLoadBalancer:
             raise RuntimeError(
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
+
+    def covers_loss_of(self, rank: int) -> bool:
+        """Whether every expert keeps a replica outside ``rank``."""
+        try:
+            self.masked_placement_digest([rank])
+        except ValueError:
+            return False
+        return True
+
+    def masked_placement_digest(self, dead_ranks: Iterable[int]) -> str:
+        """Return a digest of the current placement with ``dead_ranks`` masked.
+
+        The digest covers every layer's slot table with the slots of
+        ``dead_ranks`` cleared, so ranks that agree on it route identically.
+
+        Raises:
+            ValueError: A rank is out of range, or an expert would be left
+                without a replica outside ``dead_ranks``.
+        """
+        dead = sorted(set(dead_ranks))
+        if any(rank < 0 or rank >= self.ep_size for rank in dead):
+            raise ValueError(
+                f"Dead ranks {dead} out of range for EP size {self.ep_size}")
+        digest = hashlib.sha256(np.asarray(dead, dtype=np.int64).tobytes())
+        for layer in self.single_layer_load_balancers:
+            placement = np.asarray(layer.get_old_rank_expert_ids(),
+                                   dtype=np.int32)
+            placement[dead] = -1
+            resident = np.unique(placement[placement >= 0])
+            if not np.array_equal(resident, np.arange(layer.expert_count)):
+                missing = sorted(
+                    set(range(layer.expert_count)) - set(resident.tolist()))
+                raise ValueError(
+                    f"MoE layer {layer.get_layer_idx()} has no surviving "
+                    f"replica for experts {missing}")
+            digest.update(np.asarray(placement.shape, dtype=np.int64).tobytes())
+            digest.update(placement.tobytes())
+        return digest.hexdigest()
 
     def start_iter(self):
         """
