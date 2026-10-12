@@ -2,38 +2,39 @@
 
 ## Summary
 
-**Problem.** A wide expert-parallel (WideEP) deployment spreads one model over 16 to 64 GPUs. If
-one worker process dies, the whole job dies today. Restarting takes about 3 minutes plus the
-relaunch, and every in-flight request is lost.
+**Problem.** A wide expert-parallel (WideEP) deployment spreads one model over 16 to 64 GPUs,
+one worker process (rank) per GPU. Today, if one rank dies, the whole job dies. A restart takes
+minutes, and every in-flight request is lost.
 
-**Result.** The surviving ranks keep serving on the CUDA graphs captured at startup. Nothing
-reloads, recompiles or recaptures. Requests on surviving ranks continue with the same tokens. Only
-the dead rank's own requests fail, with a retryable error.
+**Result.** With fault tolerance (FT) on, the surviving ranks keep serving on the CUDA graphs
+they captured at startup. Nothing reloads, recompiles or recaptures. Requests on surviving ranks
+continue and produce the same tokens. Only the requests the lost rank was serving fail, with a
+retryable error.
 
-| DeepSeek-R1 NVFP4, EP32 on 8×4 GB200 | With FT | Without FT |
+| DeepSeek-R1 NVFP4 on 32 GB200 GPUs (EP32) | With FT | Without FT |
 |---|---|---|
-| Kill to first token | 0.16 to 0.34 s | 166 to 213 s startup, plus relaunch |
-| Kill to recovery committed | 0.14 s | — |
-| Kill to survivors' requests done | 0.8 s idle, 1.4 s mid-decode, 2.6 s mid-MoE | all requests lost |
-| Throughput, all ranks alive | −1.4% (14,488 vs 14,689 tok/s) | baseline |
-| FT built in but off | 0% (kernels used are instruction-identical to main) | — |
-| Throughput per surviving rank after the loss | 99.4% | 0 until restart |
+| Time from the kill until new requests are served | 0.16 to 0.34 s | restart: 81 to 173 s of model load and warmup, plus teardown and rescheduling |
+| Time from the kill until in-flight requests finish | 0.8 to 3.2 s | never: they are lost |
+| Throughput with all 32 GPUs | −1.4% (14,488 vs 14,689 tokens/s) | baseline |
+| Throughput per GPU after losing one | 99.4% | 0 until the restart finishes |
+| FT built in but turned off | no change (the kernels used are instruction-identical to main) | — |
 | CUDA graphs recaptured | 0 | all |
 
 ![Recovery time and throughput](evidence/results.svg)
 
 **Tested.**
 - DeepSeek-R1 and Kimi-K2 at EP32, and R1 at EP16.
-- Victims on ranks 1, 2 and 30 (rank 30 on another node).
-- Kills while idle, mid-decode, inside the MoE all-to-all (5 repeats), during eager prefill, and
-  under full load (248 of 248 survivor requests completed).
+- Killing rank 1, 2 or 30 (rank 30 sits on another node).
+- Killing it while no requests run, while requests generate tokens, while GPUs exchange tokens
+  between experts (the MoE all-to-all, 7 repeats), while new prompts are processed, and under full
+  load (248 of 248 requests on surviving ranks completed).
 - Tokens match a reference run that never used the lost rank. With block reuse on, answers stay
   correct.
 - A loss that cannot be covered fails every request with an explicit error within 0.04 s.
 - nsys shows every decode all-to-all running inside the original graphs.
 
 **Scope.** One loss of any rank except rank 0, in aggregated serving with attention DP and static
-EPLB with spare slots. Block reuse, chunked prefill, eager prefill and KV cache manager V1 and V2
+EPLB with spare slots. Prefix caching (KV block reuse), chunked prefill, and KV cache managers V1 and V2
 all work. The overlap scheduler, MTP, online EPLB and disaggregated serving are rejected at
 startup for now (section 6).
 
@@ -114,7 +115,8 @@ Rules:
   address: the live-rank mask and a pointer to the abort flag. Kernels skip masked ranks in every
   wait and load.
 - **Abort flag in pinned host memory.** The host sets it with a plain CPU write, which needs no GPU
-  work to land. So it reaches spinning kernels that occupy the whole GPU, eager or graph-launched.
+  work to land. So it reaches spinning kernels that occupy the whole GPU, whether they were launched
+  directly or from a CUDA graph.
   Spin loops exit when it is set, and a real timeout still traps. An aborted combine never marks
   its outputs ready, so no peer reads garbage.
 - **Fixed per-source slots, against late writes.** Main lays out dispatch rows as
@@ -123,9 +125,9 @@ Rules:
   rows. FT uses `[source][payload][C rows]` with the fixed C = `max_num_tokens`, so each source's
   region never moves and late writes only hit the dead rank's own rows. Same workspace size.
 - **One extra copy.** The fixed slots are not contiguous per payload, so an FT-only gather kernel
-  packs the valid rows into the dense layout the expert GEMMs expect. It overlaps with dispatch
-  (PDL) and uses 16-byte stores. Invalid rows get expert id −1 and zero data. Combine needs no
-  copy, because it pulls.
+  packs the valid rows into the dense layout the expert GEMMs expect. It starts while dispatch
+  finishes (programmatic dependent launch) and uses 16-byte stores. Invalid rows get expert id −1
+  and zero data. Combine needs no copy, because it pulls.
 
 `MoeExecutionState` owns the descriptor: `request_abort`, `rearm` and `install_mask`.
 
@@ -197,7 +199,7 @@ Enable with `TLLM_FAULT_TOLERANCE_MODE=1` plus the authority address and key.
   one on-GPU copy per layer, only with FT on.
 - **Run-time descriptor instead of recapture.** Graphs stay valid by construction.
 - **Host-memory abort flag.** A host-to-device copy on a side stream never completed while an
-  eager kernel spun on every SM. A CPU write to mapped memory always lands.
+  kernel launched outside a graph occupied the whole GPU. A CPU write to mapped memory always lands.
 - **External authority.** A party outside the failure domain commits membership. `Shrink` only
   rebuilds the communicator.
 - **Environment variables, not `LlmArgs`,** while the feature is experimental.
@@ -206,30 +208,34 @@ Enable with `TLLM_FAULT_TOLERANCE_MODE=1` plus the authority address and key.
 
 ## 5. Results and cost
 
-All times are from the kill. "Done" means every surviving request finished its remaining tokens,
-so it also depends on how many tokens were left.
+Each run kills one rank at the moment named in the first column. Times are measured from the
+kill:
+- **New requests served:** the first token of a request sent after the kill.
+- **Recovery complete:** every survivor installed the new membership and resumed.
+- **In-flight requests finished:** every request running on a surviving rank finished its
+  remaining tokens, so this also depends on how many tokens were left.
 
-| Run | First token | Committed | Survivors' requests done |
+| Model, GPUs, when the rank is killed | New requests served | Recovery complete | In-flight requests finished |
 |---|---|---|---|
-| R1 EP32, idle kill | 0.16 to 0.34 s | 0.14 s | 0.7 to 1.1 s |
-| R1 EP32, mid-decode kill | — | — | 1.4 to 3.1 s |
-| R1 EP32, kill inside the MoE all-to-all (7 runs) | — | — | 2.6 to 3.2 s |
-| R1 EP32, kill at eager prefill under full load | — | — | 4.2 to 4.6 s (248 of 248) |
-| R1 EP32, kill under load with block reuse | — | — | 1.7 s (496 of 496) |
-| Kimi-K2 EP32, idle kill | 0.31 to 0.83 s | — | 1.0 to 1.5 s |
-| Kimi-K2 EP32, kill inside the MoE all-to-all | — | — | 2.4 to 3.0 s |
-| R1 EP16, idle kill / kill inside the MoE all-to-all | 0.29 s | — | 0.9 s / 3.0 s |
-| Without FT: fresh job startup to serving | R1 81 to 173 s, Kimi-K2 162 to 231 s | | |
+| R1, 32 GPUs, no requests running | 0.16 to 0.34 s | 0.14 s | 0.7 to 1.1 s |
+| R1, 32 GPUs, while requests generate tokens | — | — | 1.4 to 3.1 s |
+| R1, 32 GPUs, during the MoE all-to-all (7 runs) | — | — | 2.6 to 3.2 s |
+| R1, 32 GPUs, while new prompts are processed, full load | — | — | 4.2 to 4.6 s (248 of 248) |
+| R1, 32 GPUs, full load with prefix caching on | — | — | 1.7 s (496 of 496) |
+| Kimi-K2, 32 GPUs, no requests running | 0.31 to 0.83 s | — | 1.0 to 1.5 s |
+| Kimi-K2, 32 GPUs, during the MoE all-to-all | — | — | 2.4 to 3.0 s |
+| R1, 16 GPUs, no requests running / during the MoE all-to-all | 0.29 s | — | 0.9 s / 3.0 s |
+| Without FT: restart until serving (load and warmup only) | R1 81 to 173 s, Kimi-K2 162 to 231 s | | |
 
-An idle loss is noticed when rank 0 next polls, at most 1 s, which explains the spread in first
-token times. Startup without FT varies with the file cache, and it excludes failure detection,
-teardown and rescheduling.
+When no requests are running, rank 0 notices the loss on its next poll, at most 1 s later, which
+explains the spread in the first column. Restart time without FT varies with the file cache, and
+it leaves out tearing down the failed job and rescheduling it.
 
-| Throughput (R1 EP32, decode, 8 requests per rank) | tok/s |
+| Generation throughput (R1, 32 GPUs, 8 requests per GPU) | Output tokens/s |
 |---|---|
-| FT off, 32 ranks | 14,689 |
-| FT on, 32 ranks | 14,488 (−1.4%) |
-| FT on, 31 ranks after a loss | 13,960 (99.4% per rank) |
+| FT off, 32 GPUs | 14,689 |
+| FT on, 32 GPUs | 14,488 (−1.4%) |
+| FT on, 31 GPUs after losing one | 13,960 (99.4% per GPU) |
 
 **Cost.** FT off costs nothing: the kernels it uses compile to the same instructions as main. FT
 on adds one gather per MoE layer, one sync per step at the commit gate, a watcher thread polling
@@ -262,15 +268,15 @@ One commit per PR, in merge order. The first four are standalone fixes.
 | 4 | [82e568a236](https://github.com/arusli-nv/TensorRT-LLM/commit/82e568a236) | `[fix]` keep EPGroupHealth identity across ConfigurableMoE deepcopy | unit test |
 | 5 | [200602863d](https://github.com/arusli-nv/TensorRT-LLM/commit/200602863d) | `[infra]` upgrade mpi4py to 4.1.2 | ULFM bindings test; image build |
 | 6 | [c989b2bc8a](https://github.com/arusli-nv/TensorRT-LLM/commit/c989b2bc8a) | `[feat]` WideEP recovery authority | fault injection at every protocol step; end-to-end over ZeroMQ |
-| 7 | [7de2a38e53](https://github.com/arusli-nv/TensorRT-LLM/commit/7de2a38e53) | `[feat]` ULFM survivor communicators for host collectives | real 4-rank ULFM run; victims on ranks 1, 2 and 30 |
+| 7 | [7de2a38e53](https://github.com/arusli-nv/TensorRT-LLM/commit/7de2a38e53) | `[feat]` ULFM survivor communicators for host collectives | real 4-rank ULFM run; losing rank 1, 2 or 30 |
 | 8 | [bf6ff93509](https://github.com/arusli-nv/TensorRT-LLM/commit/bf6ff93509) | `[feat]` fault-tolerant execution descriptor for the NVLinkOneSided all-to-all | abort inside graphs; timeout still traps; FT-off kernels instruction-identical |
-| 9 | [948efcc0e9](https://github.com/arusli-nv/TensorRT-LLM/commit/948efcc0e9) | `[feat]` MoE execution state for WideEP recovery | eager and graph abort; 2-process SIGKILL late-write test |
+| 9 | [948efcc0e9](https://github.com/arusli-nv/TensorRT-LLM/commit/948efcc0e9) | `[feat]` MoE execution state for WideEP recovery | abort with and without CUDA graphs; 2-process SIGKILL late-write test |
 | 10 | [c4354a62f5](https://github.com/arusli-nv/TensorRT-LLM/commit/c4354a62f5) | `[feat]` resident-replica EPLB placement after a rank loss | coverage tests; uncovered loss fails closed |
 | 11 | [7abbf48a36](https://github.com/arusli-nv/TensorRT-LLM/commit/7abbf48a36) | `[feat]` let attention-DP routing skip absent ranks | unit tests; kill under full load |
 | 12 | [68524ed0c1](https://github.com/arusli-nv/TensorRT-LLM/commit/68524ed0c1) | `[feat]` keep the MPI session serving after a peer loss | bounded teardown tests |
 | 13 | [80f188e1c7](https://github.com/arusli-nv/TensorRT-LLM/commit/80f188e1c7) | `[feat]` recover the executor from a WideEP peer loss, with the docs page | rollback tests (V1, V2, reuse); 4-GPU CI test; multi-node runs |
 
-The multi-node runs compare tokens with a reference run whose EPLB excludes the victim from the
+The multi-node runs compare tokens with a reference run whose EPLB excludes the killed rank from the
 start, because greedy tokens depend on which rank serves each expert.
 
 ## Appendix: mapping to the internal design document (v7)
