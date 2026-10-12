@@ -8,9 +8,9 @@
   rank 0, provided that rank's experts have replicas on other GPUs. The surviving ranks keep
   serving **on the CUDA graphs captured at startup** and route the lost rank's experts to their
   replicas.
-- Survivors' in-flight requests continue from their last token (only the interrupted step is redone),
-  with correct output. Only the lost rank's own requests fail,
-  because their KV cache was lost; they end with an explicit error asking the client to retry.
+- Survivors' in-flight requests continue from their last token, with correct output; only the
+  interrupted step is redone. Only the lost rank's own requests fail, because their KV cache was
+  lost; they end with an explicit error asking the client to retry.
 
 ### Reused merged foundations
 
