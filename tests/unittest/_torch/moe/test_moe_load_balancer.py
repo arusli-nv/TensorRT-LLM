@@ -563,5 +563,22 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
     assert get_moe_load_balancer() is None
 
 
+@pytest.mark.parametrize("recovering", [True, False])
+def test_shutdown_barrier_tolerates_a_lost_peer_only_during_recovery(
+        recovering):
+    from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer
+
+    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer.shared_mpi_comm = MagicMock()
+    balancer.shared_mpi_comm.barrier.side_effect = MPI.Exception(MPI.ERR_OTHER)
+    with patch.object(moe_load_balancer, "recovery_enabled", return_value=recovering), \
+            patch.object(moe_load_balancer, "is_mpi_peer_failure", return_value=True):
+        if recovering:
+            balancer._shared_barrier()
+        else:
+            with pytest.raises(MPI.Exception):
+                balancer._shared_barrier()
+
+
 if __name__ == '__main__':
     unittest.main()
