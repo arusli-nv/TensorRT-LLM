@@ -290,6 +290,33 @@ __device__ __forceinline__ uint32_t round_parity(uint32_t flag_val)
     return ((flag_val - 1U) >> 1U) & 1U;
 }
 
+// Membership test of rank-mask kernels: a bound execution descriptor supersedes the launch-time mask.
+template <typename Pointers>
+__device__ __forceinline__ bool is_rank_active(Pointers const& ptrs, MoeA2AFenceDescriptor const* descriptor, int rank)
+{
+    return descriptor != nullptr ? is_rank_active(descriptor->activeMask, rank)
+                                 : is_rank_active(ptrs.active_rank_mask, rank);
+}
+
+// Returns whether the host requested an abort.
+__device__ __forceinline__ bool is_abort_requested(MoeA2AAbortState const* abort)
+{
+    int32_t requested;
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(requested) : "l"(&abort->requested));
+    return requested != 0;
+}
+
+// Returns whether an abort was requested and, if so, records that this kernel cancelled.
+__device__ __forceinline__ bool observe_abort(MoeA2AAbortState* abort)
+{
+    bool const requested = is_abort_requested(abort);
+    if (requested)
+    {
+        asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(&abort->status), "r"(MoeA2AAbortState::kCancelled));
+    }
+    return requested;
+}
+
 template <int TOP_K, bool ENABLE_RANK_MASK>
 __device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
@@ -308,7 +335,7 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     bool keep = (__ffs(same_target) - 1) == k;
     if constexpr (ENABLE_RANK_MASK)
     {
-        keep = keep && is_rank_active(ptrs.active_rank_mask, target_rank);
+        keep = keep && is_rank_active(ptrs, ptrs.execution_descriptor, target_rank);
     }
 
     int const target_rank_to_store = keep ? target_rank : -1;
@@ -367,7 +394,7 @@ __device__ void vectorized_copy(void* dst, void const* src, int size)
 }
 
 // Vectorized dispatch: load one vec from source and write to up to TOP_K destinations
-template <int VEC_SIZE, int TOP_K>
+template <int VEC_SIZE, int TOP_K, bool ENABLE_RANK_MASK>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
     int max_tokens_per_rank, int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks,
     int const* topk_send_indices)
@@ -390,6 +417,14 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
         size_t base_source_rank
             = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx_k);
         size_t base_token = base_source_rank * static_cast<size_t>(bytes_per_token);
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            if (ptrs.execution_descriptor != nullptr)
+            {
+                base_token = static_cast<size_t>(rank_id) * static_cast<size_t>(ptrs.source_stride_bytes)
+                    + static_cast<size_t>(dst_idx_k) * static_cast<size_t>(bytes_per_token);
+            }
+        }
         dst_base_k[k] = dst_data + base_token;
     }
 
@@ -412,34 +447,34 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
     }
 }
 
-template <int TOP_K>
+template <int TOP_K, bool ENABLE_RANK_MASK>
 __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token, int rank_id, int max_tokens_per_rank,
     int payload_idx, DispatchKernelPointers const& ptrs, int const* topk_target_ranks, int const* topk_send_indices)
 {
     if (bytes_per_token % 16 == 0)
     {
-        vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<16, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 8 == 0)
     {
-        vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<8, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 4 == 0)
     {
-        vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<4, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else if (bytes_per_token % 2 == 0)
     {
-        vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<2, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
     else
     {
-        vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-            topk_target_ranks, topk_send_indices);
+        vectorized_dispatch_impl<1, TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+            payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
 }
 
@@ -535,8 +570,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
             uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-            vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs,
-                topk_target_ranks, topk_send_indices);
+            vectorized_dispatch<TOP_K, ENABLE_RANK_MASK>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                payload_idx, ptrs, topk_target_ranks, topk_send_indices);
         }
 
         __syncthreads();
@@ -567,6 +602,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         if (is_last_token)
         {
+            MoeA2AFenceDescriptor* const descriptor = ENABLE_RANK_MASK ? ptrs.execution_descriptor : nullptr;
             uint32_t const parity = round_parity(*ptrs.flag_val);
             int* const round_recv_counters = ptrs.recv_counters[rank_id] + parity * ep_size;
 // Store send_counters to recv_counters.
@@ -576,7 +612,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    if (!is_rank_active(ptrs, descriptor, target_rank))
                         continue;
                 }
                 int send_count = ptrs.send_counters[target_rank];
@@ -592,7 +628,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 {
                     if constexpr (ENABLE_RANK_MASK)
                     {
-                        if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        if (!is_rank_active(ptrs, descriptor, target_rank))
                             continue;
                     }
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
@@ -620,7 +656,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    if (!is_rank_active(ptrs, descriptor, target_rank))
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
@@ -639,13 +675,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!is_rank_active(ptrs, descriptor, peer_rank))
                     {
                         round_recv_counters[peer_rank] = 0;
                         continue;
                     }
                 }
                 bool flag_set = false;
+                bool aborted = false;
                 auto s = clock64();
                 do
                 {
@@ -660,10 +697,15 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                     flag_set = flag_value == expected_value;
-                } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
+                    aborted = !flag_set && descriptor != nullptr && observe_abort(descriptor->abort);
+                } while (!flag_set && !aborted && !check_timeout(s, ptrs.timeout_cycles));
 
                 if (__builtin_expect(!flag_set, 0))
                 {
+                    if (aborted)
+                    {
+                        return;
+                    }
                     printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
                         peer_rank);
                     asm volatile("trap;");
@@ -1184,10 +1226,13 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
             "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
     }
+    TLLM_CHECK(params.execution_descriptor == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes));
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
+    kernel_ptrs.execution_descriptor = params.execution_descriptor;
+    kernel_ptrs.source_stride_bytes = params.source_stride_bytes;
 
     // Fill source data pointers and payload sizes
     for (int i = 0; i < params.num_payloads; i++)
@@ -1311,6 +1356,88 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
                     params.num_experts, params.eplb_stats_num_experts);
             }))})
     }
+}
+
+__global__ void moeA2AGatherLocalKernel(MoeA2AGatherParams const params)
+{
+#if TLLM_MOE_A2A_COMPILE_SM90
+    cudaGridDependencySynchronize();
+#endif
+    MoeA2AFenceDescriptor const* const descriptor = params.descriptor;
+    // Counts of an aborted dispatch do not imply that the counted rows arrived.
+    __shared__ bool aborted;
+    if (threadIdx.x == 0)
+    {
+        aborted = is_abort_requested(descriptor->abort);
+    }
+    __syncthreads();
+    int const token = blockIdx.x;
+    if (token < params.epSize * params.maxTokens)
+    {
+        int const source_rank = token / params.maxTokens;
+        int const source_token = token % params.maxTokens;
+        bool valid = false;
+        if (!aborted && is_rank_active(descriptor->activeMask, source_rank))
+        {
+            int const count = params.recvCounters[round_parity(*params.flagVal) * params.epSize + source_rank];
+            valid = count <= params.maxTokens && source_token < count;
+        }
+        for (int p = 0; p < params.numPayloads; ++p)
+        {
+            int const bytes = params.bytesPerToken[p];
+            uint8_t* const dst = static_cast<uint8_t*>(params.destination[p]) + static_cast<size_t>(token) * bytes;
+            if (valid)
+            {
+                uint8_t const* const src = static_cast<uint8_t const*>(params.source[p])
+                    + static_cast<size_t>(source_rank) * static_cast<size_t>(params.sourceStrideBytes)
+                    + static_cast<size_t>(source_token) * bytes;
+                vectorized_copy(dst, src, bytes);
+            }
+            else if (p == params.expertIdPayloadIndex)
+            {
+                int32_t* const expert_ids = reinterpret_cast<int32_t*>(dst);
+                for (int i = threadIdx.x; i < bytes / static_cast<int>(sizeof(int32_t)); i += blockDim.x)
+                {
+                    expert_ids[i] = params.invalidExpertId;
+                }
+            }
+            else if (bytes % static_cast<int>(sizeof(int4)) == 0)
+            {
+                // Zeros keep invalid rows finite for kernels that read every row.
+                int4* const row = reinterpret_cast<int4*>(dst);
+                for (int i = threadIdx.x; i < bytes / static_cast<int>(sizeof(int4)); i += blockDim.x)
+                {
+                    row[i] = make_int4(0, 0, 0, 0);
+                }
+            }
+            else
+            {
+                for (int i = threadIdx.x; i < bytes; i += blockDim.x)
+                {
+                    dst[i] = 0;
+                }
+            }
+        }
+    }
+    int const stat = blockIdx.x * blockDim.x + threadIdx.x;
+    if (stat < params.epSize * params.statsExperts)
+    {
+        bool const valid = !aborted && is_rank_active(descriptor->activeMask, stat / params.statsExperts);
+        params.destinationStats[stat] = valid ? params.sourceStats[stat] : 0;
+    }
+#if TLLM_MOE_A2A_COMPILE_SM90
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void moe_a2a_gather_local_launch(MoeA2AGatherParams const& params, cudaStream_t stream)
+{
+    TLLM_CHECK(params.descriptor != nullptr);
+    TLLM_CHECK(params.numPayloads > 0 && params.numPayloads <= kMaxPayloads);
+    constexpr int kBlockSize = 256;
+    int const grid
+        = std::max(params.epSize * params.maxTokens, ceilDiv(params.epSize * params.statsExperts, kBlockSize));
+    launchWithPdlWhenEnabled("moeA2AGatherLocalKernel", moeA2AGatherLocalKernel, grid, kBlockSize, 0, stream, params);
 }
 
 // ============================================================================
@@ -1795,6 +1922,8 @@ __global__ void moeA2ACombineKernel(
     cudaGridDependencySynchronize();
 #endif
 
+    [[maybe_unused]] MoeA2AFenceDescriptor* const descriptor = ENABLE_RANK_MASK ? ptrs.execution_descriptor : nullptr;
+    bool aborted = false;
 #if !DISABLE_SYNC_FOR_PROFILING
     // In-kernel readiness synchronization at start of combine:
     // - One warp signals readiness to all peers with current flag_val.
@@ -1805,7 +1934,9 @@ __global__ void moeA2ACombineKernel(
         int lane_id = threadIdx.x % warpSize;
         uint32_t expected_value = *ptrs.flag_val;
 
-        if (blockIdx.x == 0)
+        // An aborted execution withholds readiness so that no peer pulls its expert outputs; the peers wait
+        // until their own abort request arrives.
+        if (blockIdx.x == 0 && !(descriptor != nullptr && is_abort_requested(descriptor->abort)))
         {
             // Signal readiness to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
@@ -1814,7 +1945,7 @@ __global__ void moeA2ACombineKernel(
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!is_rank_active(ptrs, descriptor, peer_rank))
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
@@ -1833,7 +1964,7 @@ __global__ void moeA2ACombineKernel(
         {
             if constexpr (ENABLE_RANK_MASK)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                if (!is_rank_active(ptrs, descriptor, peer_rank))
                     continue;
             }
             bool flag_set = false;
@@ -1852,10 +1983,15 @@ __global__ void moeA2ACombineKernel(
                     rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                 flag_set = flag_value == expected_value;
-            } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
+                aborted = !flag_set && descriptor != nullptr && observe_abort(descriptor->abort);
+            } while (!flag_set && !aborted && !check_timeout(s, ptrs.timeout_cycles));
 
             if (__builtin_expect(!flag_set, 0))
             {
+                if (aborted)
+                {
+                    break;
+                }
                 printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id, peer_rank);
                 asm volatile("trap;");
                 return;
@@ -1868,13 +2004,30 @@ __global__ void moeA2ACombineKernel(
         asm volatile("fence.acq_rel.sys;");
 #endif
     }
-    __syncthreads();
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        aborted = __syncthreads_or(aborted);
+    }
+    else
+    {
+        __syncthreads();
+    }
 #endif
 
     if (local_num_tokens == 0)
         return;
 
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
+    if (aborted)
+    {
+        // Peer contributions may be missing; leave a finite output for the invalidated collective.
+        uint8_t* const output_bytes = reinterpret_cast<uint8_t*>(token_output);
+        for (int i = threadIdx.x; i < elements_per_token * static_cast<int>(sizeof(T)); i += blockDim.x)
+        {
+            output_bytes[i] = 0;
+        }
+        return;
+    }
     vectorized_combine<TOP_K, T, InputT>(
         token_output, size_per_token, stride_per_token, rank_id, max_tokens_per_rank, ptrs);
 #if TLLM_MOE_A2A_COMPILE_SM90
@@ -2180,6 +2333,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
             "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
     }
+    TLLM_CHECK(params.execution_descriptor == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine));
 
     // ---- CFT combine path (one block per token). ----
     // Bypasses the base fence combine below entirely. The CFT push is launched separately by
@@ -2259,6 +2413,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Prepare kernel pointers struct for combine
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
     kernel_ptrs.timeout_cycles = params.timeout_cycles;
+    kernel_ptrs.execution_descriptor = params.execution_descriptor;
 
     // Set output data pointer in src_data_ptrs[0]
     kernel_ptrs.src_data_ptrs[0] = params.output_data;
