@@ -105,28 +105,31 @@ over NVLink. **Dispatch** pushes tokens into the receiving GPU's buffer; **combi
 outputs from peers' buffers. Completion flags live in the same buffers.
 
 **Who owns which rows of one GPU's dispatch buffer** (one payload shown; each digit is the
-source rank that writes that row):
+source rank that writes that row). Main sizes each source's rows by
+`runtime_max_tokens_per_rank`, the largest local batch across ranks this step; FT sizes them by
+the fixed `max_num_tokens_per_rank`.
 
 ```text
 row                0 1 2 3 4 5 6 7 8 9 10 11
 
-Main, step n       0 0 0 0 1 1 1 1 2 2 2  2     R = 4: rows move with R,
-Main, step n+1     0 0 1 1 2 2 3 3 4 4 5  5     R = 2: the step's max tokens per rank
+Main, step n       0 0 0 0 1 1 1 1 2 2 2  2     runtime_max_tokens_per_rank = 4
+Main, step n+1     0 0 1 1 2 2 3 3 4 4 5  5     runtime_max_tokens_per_rank = 2
                                    ^
                                    late write from dead rank 2, aimed at row 8 in step n,
                                    lands in rank 4's rows in step n+1
 
-FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     C = max_num_tokens: rows never move,
-                                                so rank 2's late writes stay in rank 2's rows
+FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     max_num_tokens_per_rank = 4 (fixed):
+                                                rank 2's late writes stay in rank 2's rows
 ```
 
-- FT also stores each source's payloads together (`[source][payload][C]`, versus main's
-  `[payload][source][R]`).
+- FT also stores each source's payloads together: `[source][payload][max_num_tokens_per_rank]`
+  versus main's `[payload][source][runtime_max_tokens_per_rank]`.
 - Same workspace size, plus a small alignment pad per source slot: main already reserves room for
-  R up to C.
+  the largest possible `runtime_max_tokens_per_rank`.
 - **New gather kernel (FT only):** the fixed slots are not contiguous per payload, so it packs the
-  valid rows into the dense `[source][R]` input the expert GEMMs expect. It overlaps with dispatch
-  (programmatic dependent launch). Combine needs no copy because it pulls.
+  valid rows into the dense `[source][runtime_max_tokens_per_rank]` input the expert GEMMs
+  expect. It overlaps with dispatch (programmatic dependent launch). Combine needs no copy
+  because it pulls.
 - **Dispatch and combine (FT path):** read the descriptor (live-rank mask + abort-flag pointer)
   at a fixed address; skip masked ranks in every wait and load; exit spin loops on abort.
 - **FT off:** the same kernels without the descriptor, instruction-identical to main.
