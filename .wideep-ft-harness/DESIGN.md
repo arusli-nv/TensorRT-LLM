@@ -49,6 +49,8 @@ standalone fix; 10 depends only on main. Whole series as one diff:
   cache and low-precision combine at 64 requests per GPU.
 - **Failures:** SIGKILL of rank 1, 2, 30 or 62 (including other nodes) while idle, while generating,
   during the MoE all-to-all, during prefill and under full load. An uncovered loss fails closed.
+- **Tests:** unit tests in the CPU and GPU pre-merge stages; a 4-GPU GB200 integration test
+  (DeepSeek-V3-Lite, kill while idle and while generating) runs post-merge.
 
 ![Recovery time and throughput](evidence/results.svg)
 
@@ -136,6 +138,9 @@ Phase 3: permission to resume
 - **KV and prefix caching:** the step's KV reservations are undone after its GPU work finishes;
   its blocks are never offered for reuse.
 - **No lost or duplicated responses:** an interrupted response gather is resent.
+- **Own crash:** a rank whose own event loop fails (for example a CUDA error on that GPU) while
+  the others can recover exits alone, so the survivors recover instead of main's crash handler
+  killing every rank.
 - **Bounded and fail-closed:** every wait has a deadline; an uncovered loss, a second loss, rank 0's
   loss or any recovery failure ends the job with an explicit error.
 - **Late writes:** below.
