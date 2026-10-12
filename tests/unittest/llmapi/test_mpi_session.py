@@ -46,6 +46,14 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+@pytest.mark.cpu_only
+def test_mpi4py_exposes_ulfm_bindings():
+    from mpi4py import MPI
+
+    for name in ("Revoke", "Shrink", "Get_failed"):
+        assert hasattr(MPI.Comm, name), name
+
+
 def rendezvous_environment_probe():
     from mpi4py import MPI
 
