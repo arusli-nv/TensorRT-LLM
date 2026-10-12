@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="470" font-family="sans-serif" font-size="13">
+<rect width="100%" height="100%" fill="white"/>
+<text x="10" y="24" font-size="16" font-weight="bold">Time until serving again after a rank loss (DeepSeek-R1, EP32; log scale)</text>
+<line x1="300" y1="44" x2="300" y2="234" stroke="#ddd"/>
+<text x="300" y="248" text-anchor="middle" fill="#666">0.1 s</text>
+<line x1="461" y1="44" x2="461" y2="234" stroke="#ddd"/>
+<text x="461" y="248" text-anchor="middle" fill="#666">1 s</text>
+<line x1="622" y1="44" x2="622" y2="234" stroke="#ddd"/>
+<text x="622" y="248" text-anchor="middle" fill="#666">10 s</text>
+<line x1="783" y1="44" x2="783" y2="234" stroke="#ddd"/>
+<text x="783" y="248" text-anchor="middle" fill="#666">100 s</text>
+<text x="292" y="62" text-anchor="end">FT: kill to first token</text>
+<rect x="300" y="44" width="86" height="26" fill="#2e7d32" opacity="0.35"/>
+<rect x="300" y="44" width="33" height="26" fill="#2e7d32"/>
+<text x="392" y="62">0.16 to 0.34 s</text>
+<text x="292" y="100" text-anchor="end">FT: requests done, idle kill</text>
+<rect x="300" y="82" width="168" height="26" fill="#43a047" opacity="0.35"/>
+<rect x="300" y="82" width="145" height="26" fill="#43a047"/>
+<text x="474" y="100">0.8 to 1.1 s</text>
+<text x="292" y="138" text-anchor="end">FT: requests done, mid-decode kill</text>
+<rect x="300" y="120" width="240" height="26" fill="#66bb6a" opacity="0.35"/>
+<rect x="300" y="120" width="185" height="26" fill="#66bb6a"/>
+<text x="546" y="138">1.4 to 3.1 s</text>
+<text x="292" y="176" text-anchor="end">FT: requests done, kill inside MoE</text>
+<rect x="300" y="158" width="242" height="26" fill="#81c784" opacity="0.35"/>
+<rect x="300" y="158" width="228" height="26" fill="#81c784"/>
+<text x="548" y="176">2.6 to 3.2 s</text>
+<text x="292" y="214" text-anchor="end">No FT: fresh job startup only</text>
+<rect x="300" y="196" width="521" height="26" fill="#c62828" opacity="0.35"/>
+<rect x="300" y="196" width="468" height="26" fill="#c62828"/>
+<text x="827" y="214">81 to 173 s</text>
+<text x="10" y="284" font-size="16" font-weight="bold">Decode throughput (tok/s)</text>
+<text x="292" y="318" text-anchor="end">FT off, 32 ranks</text>
+<rect x="300" y="300" width="441" height="26" fill="#9e9e9e"/>
+<text x="747" y="318">14,689</text>
+<text x="292" y="356" text-anchor="end">FT on, 32 ranks</text>
+<rect x="300" y="338" width="435" height="26" fill="#1565c0"/>
+<text x="741" y="356">14,488</text>
+<text x="292" y="394" text-anchor="end">FT on, 31 ranks after a loss</text>
+<rect x="300" y="376" width="419" height="26" fill="#42a5f5"/>
+<text x="725" y="394">13,960</text>
+<text x="10" y="430" fill="#666">Without FT the job also needs failure detection, teardown and rescheduling before startup, and all in-flight requests are lost.</text>
+</svg>
