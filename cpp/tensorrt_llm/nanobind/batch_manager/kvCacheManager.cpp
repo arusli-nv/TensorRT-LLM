@@ -477,7 +477,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 self.addSequenceBatch(requestInfos, llmRequests);
             },
             nb::arg("request_infos"), nb::arg("llm_requests"))
-        .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
+        .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::arg("request_id"),
+            nb::arg("llm_request").none(), nb::arg("pin_on_release"), nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("truncate_blocks", &BaseKVCacheManager::truncateBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,

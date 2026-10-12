@@ -4256,6 +4256,37 @@ class KVCacheManagerV2(BaseResourceManager):
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
 
+    def revert_prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        """Undo the scheduler's KV cache allocations for a step whose forward is discarded.
+
+        A discarded step committed no blocks for reuse, and its KV writes are
+        overwritten when the step runs again.
+        """
+        if (
+            self.is_draft
+            or self.kv_cache_type == CacheTypeCpp.CROSS
+            or self._has_cp_helix
+            or self.enable_swa_scratch_reuse
+            or self.kv_connector_manager is not None
+        ):
+            raise NotImplementedError(
+                "Reverting prepared KV cache resources supports only target "
+                "self-attention caches without helix context parallelism, "
+                "SWA scratch reuse or a KV connector"
+            )
+        for req in scheduled_batch.context_requests:
+            if req.is_first_context_chunk:
+                self.free_resources(req)
+                continue
+            pre_cap, req.py_ctx_pre_resize_cap = req.py_ctx_pre_resize_cap, None
+            if pre_cap is not None and not self.kv_cache_map[req.py_request_id].resize(pre_cap):
+                raise RuntimeError(
+                    f"Failed to revert KV cache capacity for context request "
+                    f"{req.py_request_id} to {pre_cap}"
+                )
+        for req in scheduled_batch.generation_requests:
+            self.revert_allocate_generation(req)
+
     def _publish_sparse_metadata(self) -> None:
         """Refresh stable GPU rows on the execution stream before model work.
 
