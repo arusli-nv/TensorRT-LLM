@@ -145,6 +145,26 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
         ") as active");
 }
 
+// Resolve the optional fence execution descriptor: a contiguous int64 CUDA tensor on the workspace device that holds
+// one MoeA2AFenceDescriptor. The kernels read its mask and abort record at execution time.
+inline tensorrt_llm::kernels::moe_comm::MoeA2AFenceDescriptor* resolveExecutionDescriptor(
+    torch::optional<torch::Tensor> const& descriptor, torch::Tensor const& workspace, bool useCft, bool enableRankMask)
+{
+    using tensorrt_llm::kernels::moe_comm::MoeA2AFenceDescriptor;
+    if (!descriptor.has_value())
+    {
+        return nullptr;
+    }
+    TORCH_CHECK(!useCft && enableRankMask, "execution_descriptor requires the fence path with enable_rank_mask=True");
+    torch::Tensor const& t = descriptor.value();
+    constexpr int64_t kWords = sizeof(MoeA2AFenceDescriptor) / sizeof(int64_t);
+    TORCH_CHECK(
+        t.is_cuda() && t.device() == workspace.device(), "execution_descriptor must be on the workspace CUDA device");
+    TORCH_CHECK(t.scalar_type() == torch::kInt64 && t.dim() == 1 && t.numel() == kWords && t.is_contiguous(),
+        "execution_descriptor must be a contiguous int64 tensor of ", kWords, " elements");
+    return reinterpret_cast<MoeA2AFenceDescriptor*>(t.data_ptr<int64_t>());
+}
+
 // Calculate auxiliary data offsets
 MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts, bool canUseCft)
 {
@@ -247,11 +267,13 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 //   - epSize: Total expert parallel size
 //   - maxNumTokens: Maximum number of tokens supported
 //   - eplbStatsNumExperts: (Optional) Number of experts used for EPLB stats
+//   - barrier: Wait for every rank to initialize. Without it, the caller must keep peers from using
+//     this rank's workspace until it is initialized.
 //
 // Returns:
 //   - metainfo: Tensor containing offsets for auxiliary data
 torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
-    torch::optional<int64_t> eplbStatsNumExperts, bool canUseCftCountedWrites)
+    torch::optional<int64_t> eplbStatsNumExperts, bool canUseCftCountedWrites, bool barrier)
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
@@ -290,7 +312,10 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     // NVLinkOneSided strategy unusable there; fall back to the Torch process
     // group the Ray workers already initialise, as pg_utils does elsewhere.
     cudaDeviceSynchronize();
-    moeA2ABarrier();
+    if (barrier)
+    {
+        moeA2ABarrier();
+    }
 
     return metainfo;
 }
@@ -477,7 +502,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
-    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask)
+    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
+    torch::optional<torch::Tensor> executionDescriptor)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -513,6 +539,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     bool const sanitizeExpertIds = expertIdPayloadIndex.has_value() || invalidTokenExpertId.has_value();
     TORCH_CHECK(expertIdPayloadIndex.has_value() == invalidTokenExpertId.has_value(),
         "expert_id_payload_index and invalid_token_expert_id must be provided together");
+    // Rows of masked or aborted sources hold no received tokens; the gather marks their expert ids invalid.
+    TORCH_CHECK(!executionDescriptor.has_value() || sanitizeExpertIds,
+        "execution_descriptor requires expert_id_payload_index and invalid_token_expert_id");
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
     if (enableEplb)
@@ -546,8 +575,18 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::vector<int> payloadElementsPerToken;
     std::vector<size_t> payloadRecvBufferOffsets;
 
-    // Start offset for the first payload
-    size_t currentOffset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    // Without a descriptor, payload p holds [epSize, runtimeMaxTokensPerRank] tokens. With one, the payloads of a
+    // source rank occupy a fixed slot sized for the static token capacity, so graph-captured addresses stay valid
+    // for any runtime batch, and the slots repeat with stride sourceStrideBytes.
+    size_t const payloadStart = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    int64_t tokensPerPayload = epSize * runtimeMaxTokensPerRank;
+    if (executionDescriptor.has_value())
+    {
+        tokensPerPayload = static_cast<int64_t>(offsets[MAX_NUM_TOKENS_INDEX]);
+        TORCH_CHECK(runtimeMaxTokensPerRank <= tokensPerPayload, "runtime_max_tokens_per_rank (",
+            runtimeMaxTokensPerRank, ") exceeds the static workspace capacity (", tokensPerPayload, ")");
+    }
+    size_t currentOffset = payloadStart;
     for (auto const& payload : inputPayloads)
     {
         CHECK_CONTIGUOUS(payload);
@@ -562,8 +601,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
         int elementsPerToken = static_cast<int>(payload.size(1));
         int elementSize = static_cast<int>(payload.dtype().itemsize());
-        // Each payload buffer stores data from ALL ranks
-        int64_t bytesPerPayload = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+        int64_t bytesPerPayload = tokensPerPayload * elementsPerToken * elementSize;
 
         payloadElementSizes.push_back(elementSize);
         payloadElementsPerToken.push_back(elementsPerToken);
@@ -573,6 +611,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         // Update offset and align to cacheline boundary for the next payload recv buffer.
         currentOffset += bytesPerPayload;
         currentOffset = alignOffset(currentOffset, CACHELINE_ALIGNMENT);
+    }
+    int64_t sourceStrideBytes = 0;
+    if (executionDescriptor.has_value())
+    {
+        sourceStrideBytes = static_cast<int64_t>(currentOffset - payloadStart);
+        currentOffset = payloadStart + static_cast<size_t>(epSize * sourceStrideBytes);
     }
 
     int expertIdPayloadIdx = -1;
@@ -621,6 +665,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Setup dispatch parameters
     MoeA2ADispatchParams params{};
+    params.execution_descriptor
+        = resolveExecutionDescriptor(executionDescriptor, workspace, useCftCountedWrites, enableRankMask);
+    params.source_stride_bytes = sourceStrideBytes;
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.num_experts = static_cast<int>(numExperts);
@@ -688,8 +735,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         }
     }
     params.use_cft_counted_writes = useCftCountedWrites;
-    // Fused sanitization is a CFT dispatch optimisation; the fence path uses the standalone
-    // moe_a2a_sanitize_expert_ids op instead, so these options are ignored without CFT.
+    // Fused sanitization is a CFT dispatch optimisation; descriptor execution sanitizes in its gather kernel, and the
+    // remaining fence path uses the standalone moe_a2a_sanitize_expert_ids op instead.
     params.sanitize_expert_ids = useCftCountedWrites && sanitizeExpertIds;
     params.expert_id_payload_index = expertIdPayloadIdx;
     params.invalid_expert_id = invalidExpertId;
@@ -762,9 +809,10 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         {
             recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
         }
-        auto recvTensor = torch::from_blob(
-            recvDataPtr, {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
-        recvTensors.push_back(recvTensor);
+        std::vector<int64_t> const shape{epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]};
+        recvTensors.push_back(params.execution_descriptor != nullptr
+                ? torch::empty(shape, payload.options())
+                : torch::from_blob(recvDataPtr, shape, payload.options()));
     }
 
     // Compute aligned offset after dispatch payloads for combine payload region
@@ -774,12 +822,45 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     {
         int* gatheredStatsPtr = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[EPLB_GATHERED_STATS_OFFSET_INDEX]);
         auto statsOptions = workspace.options().dtype(torch::kInt32);
-        eplbGatheredStats = torch::from_blob(
-            gatheredStatsPtr, {static_cast<int64_t>(epSize), static_cast<int64_t>(eplbStatsNumExperts)}, statsOptions);
+        std::vector<int64_t> const shape{epSize, eplbStatsNumExperts};
+        eplbGatheredStats = params.execution_descriptor != nullptr
+            ? torch::empty(shape, statsOptions)
+            : torch::from_blob(gatheredStatsPtr, shape, statsOptions);
     }
     else
     {
         eplbGatheredStats = torch::empty({0}, workspace.options().dtype(torch::kInt32));
+    }
+
+    if (params.execution_descriptor != nullptr)
+    {
+        // Compact the fixed per-source slots into the dense outputs and sanitize their expert ids.
+        tensorrt_llm::kernels::moe_comm::MoeA2AGatherParams gather{};
+        gather.numPayloads = num_payloads;
+        for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
+        {
+            gather.source[payload_idx] = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
+            gather.destination[payload_idx] = recvTensors[payload_idx].data_ptr();
+            gather.bytesPerToken[payload_idx] = payloadElementSizes[payload_idx] * payloadElementsPerToken[payload_idx];
+        }
+        gather.expertIdPayloadIndex = expertIdPayloadIdx;
+        gather.invalidExpertId = invalidExpertId;
+        gather.epSize = params.ep_size;
+        gather.maxTokens = params.max_tokens_per_rank;
+        gather.sourceStrideBytes = sourceStrideBytes;
+        gather.recvCounters = params.recv_counters[params.ep_rank];
+        gather.flagVal = params.flag_val;
+        if (enableEplb)
+        {
+            gather.sourceStats
+                = reinterpret_cast<int const*>(rankWorkSpacePtr + offsets[EPLB_GATHERED_STATS_OFFSET_INDEX]);
+            gather.destinationStats = eplbGatheredStats.data_ptr<int32_t>();
+            gather.statsExperts = params.eplb_stats_num_experts;
+        }
+        gather.descriptor = params.execution_descriptor;
+        tensorrt_llm::kernels::moe_comm::moe_a2a_gather_local_launch(gather, params.stream);
+        result = cudaGetLastError();
+        TORCH_CHECK(result == cudaSuccess, "moe_a2a_gather_local kernel launch failed: ", cudaGetErrorString(result));
     }
 
     return std::make_tuple(std::move(recvTensors), combinePayloadOffset, std::move(eplbGatheredStats));
@@ -797,7 +878,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
     bool useCftCountedWrites = false, bool enableRankMask = false,
-    torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt,
+    torch::optional<torch::Tensor> executionDescriptor = torch::nullopt)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
@@ -882,6 +964,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
+    params.execution_descriptor
+        = resolveExecutionDescriptor(executionDescriptor, workspace, useCftCountedWrites, enableRankMask);
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -1087,6 +1171,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     // Note that we returns recv_tensors as a list of views into workspace, we need to upcast its alias
     // group to wildcard (a!->*). See
     // https://github.com/pytorch/pytorch/blob/b1eb6dede556136f9fdcee28415b0358d58ad877/aten/src/ATen/native/README.md#annotations
+    // The (a!) outputs alias the workspace; with an execution_descriptor they are fresh tensors filled by the gather.
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, "
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
@@ -1096,7 +1181,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int? expert_id_payload_index=None, "
         "int? invalid_token_expert_id=None, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor? active_rank_mask=None, "
+        "Tensor? execution_descriptor=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
@@ -1105,14 +1191,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool use_low_precision=False, "
         "bool use_cft_counted_writes=False, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> Tensor");
+        "Tensor? active_rank_mask=None, "
+        "Tensor? execution_descriptor=None) -> Tensor");
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
     module.def("moe_a2a_cft_release(Tensor(a!) workspace, int ep_rank) -> ()");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
-        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor");
+        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False, bool barrier=True) -> Tensor");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
