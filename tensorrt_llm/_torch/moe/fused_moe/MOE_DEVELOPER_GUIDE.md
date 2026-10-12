@@ -228,6 +228,12 @@ do not add concrete strategy checks or inspect private workspace attributes.
 The executor request queue owns the persistent admission state around the
 checkpoint operation and reopens admission only after a complete wakeup.
 
+With WideEP peer-loss recovery enabled, every `NVLinkOneSided` layer is bound
+to the model's `MoeExecutionState` (`communication/execution_state.py`).
+Dispatch and combine read its execution descriptor (rank mask and abort
+request) at a fixed address, so captured CUDA graphs follow mask updates and
+an abort releases kernels waiting on a lost peer.
+
 ### TRTLLM-Gen leaves (`fused_moe/trtllm_gen/`)
 
 Everything TRTLLM-Gen lives in this package: the registered leaves and
