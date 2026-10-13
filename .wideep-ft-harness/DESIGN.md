@@ -327,6 +327,8 @@ replace the watcher as the detector; the authority stays the only decision-maker
 
 ### Late writes: symmetric memory and kernel design (commits 5 and 6)
 
+![From dispatch to the experts: main vs FT](evidence/kernel_path.png)
+
 ![Late writes and fixed per-source regions](evidence/late_writes.png)
 
 A rank can die with writes still in flight into peers' workspaces. The hazard is main's
