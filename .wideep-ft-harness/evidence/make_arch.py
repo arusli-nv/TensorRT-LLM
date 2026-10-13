@@ -149,70 +149,61 @@ def integration():
 
 
 def late_writes():
-    s = Svg(1200, 640)
+    s = Svg(1200, 440)
     s.text(30, 36, "Late writes from a lost rank", 22, anchor="start", weight="bold")
-    s.text(30, 60, "One receiver's all-to-all workspace; each cell is a token row, numbered by the source rank "
+    s.text(30, 60, "One receiver's dispatch workspace; each cell is a token row, numbered by the source rank "
            "that writes it", 13.5, "#666", anchor="start")
+    cw, x0 = 44, 190
 
-    def gpu_icon(x, y, label, dead=False):
-        s.box(x, y, 64, 44, "#ffebee" if dead else "white", DEAD if dead else "#1a1a1a", 6, 2)
-        s.text(x + 32, y + 28, label, 13, DEAD if dead else "#1a1a1a", weight="bold")
-        if dead:
-            s.cross(x + 58, y + 6, 9)
-
-    def bar(x, y, owners, cw, hatch=None, label=None):
+    def bar(y, owners, hatch=None, label=None):
         for i, k in enumerate(owners):
             fill = "url(#hatch)" if k == hatch else SRC[k]
-            s.box(x + i * cw, y, cw - 3, 36, fill, "white", 3, 1)
-            s.text(x + i * cw + cw / 2 - 1, y + 24, str(k), 14, "#333", weight="bold")
+            s.box(x0 + i * cw, y, cw - 4, 38, fill, "white", 3, 1)
+            s.text(x0 + i * cw + cw / 2 - 2, y + 25, str(k), 15, "#333", weight="bold")
         if label:
-            s.text(x - 12, y + 24, label, 13.5, "#444", anchor="end", weight="bold")
+            s.text(x0 - 14, y + 25, label, 14, "#555", anchor="end")
 
-    # Panel A: main, rows move between steps.
-    s.box(20, 80, 560, 250, "#fff", "#e0e0e0", 10)
-    s.text(40, 110, "Main: rows move every step", 17, anchor="start", weight="bold")
-    cw = 36
-    ax = 130
-    bar(ax, 140, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], cw, label="step n")
-    bar(ax, 250, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], cw, label="step n+1")
-    gpu_icon(500, 190, "rank 2", dead=True)
-    tx = ax + 8 * cw + cw / 2
-    s.arrow(500, 214, tx + 6, 247, "red", 3)
-    s.box(ax + 8 * cw - 3, 247, cw + 3, 42, "none", DEAD, 4, 3)
-    s.text(ax + 8.5 * cw, 312, "lands in rank 4's row", 13.5, DEAD, weight="bold")
+    def lost_rank(x, y):
+        s.box(x, y, 78, 42, "#ffebee", DEAD, 6, 2)
+        s.text(x + 39, y + 27, "rank 2", 14, DEAD, weight="bold")
+        s.cross(x + 74, y + 4, 8)
 
-    # Panel B: FT, one fixed region per source.
-    s.box(620, 80, 560, 250, "#fff", "#e0e0e0", 10)
-    s.text(640, 110, "FT: a fixed region per source", 17, anchor="start", weight="bold")
-    bx = 720
-    bar(bx, 195, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], cw, hatch=2, label="every step")
-    gpu_icon(1100, 120, "rank 2", dead=True)
-    s.arrow(1100, 150, bx + 5 * cw - 2, 192, "red", 3)
-    s.text(bx + 5 * cw, 260, "stays in its own region,", 13.5, "#4a7d00", weight="bold")
-    s.text(bx + 5 * cw, 278, "which is never read or reused", 13.5, "#4a7d00", weight="bold")
+    # Main: the layout depends on the step's runtime_max_tokens_per_rank.
+    s.text(30, 112, "Main", 18, anchor="start", weight="bold")
+    s.text(30, 132, "rows move", 13, "#666", anchor="start")
+    s.text(30, 148, "every step", 13, "#666", anchor="start")
+    bar(92, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], label="step n")
+    bar(160, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], label="step n+1")
+    target = x0 + 8 * cw
+    s.box(target - 3, 157, cw + 2, 44, "none", DEAD, 4, 3)
+    s.box(target - 3, 89, cw + 2, 44, "none", DEAD, 4, 2, "5 4")
+    lost_rank(760, 120)
+    s.arrow(760, 150, target + cw - 6, 166, "red", 2.5)
+    s.text(800, 186, "a write issued in step n", 13, DEAD, anchor="start")
+    s.text(800, 203, "lands in rank 4's row in step n+1", 13, DEAD, anchor="start", weight="bold")
 
-    # Every per-source structure is indexed by the source.
-    s.text(30, 380, "Everything rank k writes into a peer is indexed by k", 17, anchor="start", weight="bold")
-    gx, gy, cwid, rh = 230, 400, 56, 40
-    rows = ["payloads", "completion flags", "receive counters", "EPLB statistics"]
-    for c in range(6):
-        s.text(gx + c * cwid + cwid / 2, gy - 4 + 0, "", 1)
-        s.text(gx + c * cwid + cwid / 2, gy + len(rows) * rh + 22, f"src {c}", 12.5, "#666")
-    for r, name in enumerate(rows):
-        y = gy + r * rh
-        s.text(gx - 14, y + 26, name, 14, "#444", anchor="end")
-        for c in range(6):
-            fill = "url(#hatch)" if c == 2 else SRC[c]
-            s.box(gx + c * cwid, y + 3, cwid - 4, rh - 6, fill, "white", 4, 1)
-    s.box(gx + 2 * cwid - 4, gy - 2, cwid + 4, len(rows) * rh + 4, "none", DEAD, 6, 2.5)
+    s.line(30, 238, 1170, 238, "#e0e0e0", 1.5)
 
-    # Gather kernel: skips masked sources, produces the dense expert input.
-    s.arrow(gx + 6 * cwid + 10, gy + 2 * rh, 640, gy + 2 * rh, "orange", 3)
-    s.chip(645, gy + 2 * rh - 30, 150, 60, "gather (new)", NEW, "skips lost rank")
-    s.arrow(797, gy + 2 * rh, 860, gy + 2 * rh, "orange", 3)
-    s.chip(865, gy + 2 * rh - 30, 170, 60, "expert GEMMs", GPU, "dense input")
-    s.text(840, gy + 2 * rh + 70, "Workspaces stay mapped until teardown,", 13, "#444")
-    s.text(840, gy + 2 * rh + 88, "so late writes never hit freed memory.", 13, "#444")
+    # FT: one fixed region per source.
+    s.text(30, 290, "FT", 18, anchor="start", weight="bold")
+    s.text(30, 310, "fixed region", 13, "#666", anchor="start")
+    s.text(30, 326, "per source", 13, "#666", anchor="start")
+    bar(276, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], hatch=2, label="every step")
+    region = x0 + 4 * cw
+    s.box(region - 3, 273, 2 * cw + 2, 44, "none", DEAD, 4, 3)
+    lost_rank(region + 6, 360)
+    s.arrow(region + 45, 358, region + 45, 322, "red", 2.5)
+    s.text(region + 100, 380, "stays in rank 2's own region, never read again", 13, "#4a7d00", anchor="start",
+           weight="bold")
+    s.text(region + 100, 398, "completion flags, receive counters and EPLB stats are per-source slots too",
+           13, "#555", anchor="start")
+    s.text(region + 100, 416, "buffers stay mapped until teardown", 13, "#555", anchor="start")
+
+    # The gather kernel turns the fixed regions into the dense expert input.
+    s.arrow(x0 + 12 * cw + 6, 295, 790, 295, "gray", 2)
+    s.chip(795, 268, 150, 54, "gather (new)", NEW, "skips rank 2")
+    s.arrow(947, 295, 995, 295, "gray", 2)
+    s.chip(1000, 268, 160, 54, "expert GEMMs", "#1a1a1a", "dense input")
     return s.render()
 
 
