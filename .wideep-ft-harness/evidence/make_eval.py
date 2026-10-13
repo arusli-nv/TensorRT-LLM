@@ -140,10 +140,13 @@ def failover_chart(runs: str) -> None:
         for k, (_, a, b) in enumerate(FT_STAGES):
             ax.barh(y, (r[b] - r[a]) * 1e3, left=r[a] * 1e3, color=colors[k], height=0.6,
                     label=short[k] if y == 0 else None)
+        if r.get("first_token"):
+            ax.barh(y, (r["first_token"] - r["resumed"]) * 1e3, left=r["resumed"] * 1e3, color=colors[7],
+                    height=0.6, label="new request → first token" if y == 0 else None)
     ax.set_yticks(range(len(rows)), [label for label, _ in rows])
     ax.invert_yaxis()
     ax.set_xlabel("ms after the kill (median over 31 survivors)")
-    ax.set_title("FT recovery steps")
+    ax.set_title("With FT: steps back to serving new requests")
     ax.legend(frameon=False, ncol=4, fontsize=9, loc="upper center", bbox_to_anchor=(0.5, -0.25))
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
@@ -151,7 +154,68 @@ def failover_chart(runs: str) -> None:
     json.dump({label: r for label, r in rows}, open("eval_ft_recovery.json", "w"), indent=1)
 
 
+RESTART_PHASES = [("model load", "executor_creation/model"),
+                  ("warmup + memory profiling", "executor_creation/profiling_executor_creation"),
+                  ("KV cache allocation", "executor_creation/final_kv_cache_allocation"),
+                  ("final warmup + CUDA graphs", "executor_creation/final_executor_creation")]
+
+
+def timeline(run: str) -> dict:
+    out = {}
+    for line in open(f"{run}/timeline"):
+        parts = line.split()
+        # NODE_CLEAN lines carry the node id before the timestamp.
+        out.setdefault(parts[0], []).append(float(parts[2] if parts[0] == "NODE_CLEAN" else parts[1]))
+    return out
+
+
+def restart(run: str) -> dict:
+    """Seconds per startup phase, from mpirun start to the LLM API being ready (rank 0's startup log)."""
+    res, tl = json.load(open(f"{run}/result.json")), timeline(run)
+    log = open(f"{run}/rank-0.log", errors="ignore").read()
+    phases = {"launch (processes, imports)": res["start_wall_s"] - tl["MPIRUN_START"][0]}
+    for label, key in RESTART_PHASES:
+        phases[label] = float(re.search(re.escape(key) + r": done in ([\d.]+)s", log).group(1))
+    phases["other"] = res["ready_wall_s"] - tl["MPIRUN_START"][0] - sum(phases.values())
+    return phases
+
+
+def teardown(run: str) -> dict:
+    """Seconds from the terminate signal until every node has no rank or GPU process left."""
+    tl = json.load(open(f"{run}/result.json")), timeline(run)
+    term = tl[1]["TEARDOWN_TERM"][0]
+    return {"terminate to all nodes clean": max(tl[1]["NODE_CLEAN"]) - term,
+            "nodes": len(tl[1]["NODE_CLEAN"]), "kill_to_terminate": term - tl[0]["kill_wall_s"]}
+
+
+def noft_chart(runs: str) -> None:
+    starts = [(f"restart {i}", restart(d)) for i, d in enumerate(sorted(glob.glob(f"{runs}/noft-7924227/start-*")), 1)]
+    downs = [(f"teardown {i}", teardown(d)) for i, d in enumerate(sorted(glob.glob(f"{runs}/teardown-*/kill-*")), 1)
+             if os.path.exists(f"{d}/timeline") and "NODE_CLEAN" in open(f"{d}/timeline").read()]
+    colors = plt.get_cmap("tab10").colors
+    rows = [(label, {"terminate → all processes gone": t["terminate to all nodes clean"]}) for label, t in downs]
+    rows += starts
+    names = list(dict.fromkeys(k for _, r in rows for k in r))
+    fig, ax = plt.subplots(figsize=(11, 0.5 * len(rows) + 1.8))
+    for y, (label, r) in enumerate(rows):
+        left = 0.0
+        for name, value in r.items():
+            ax.barh(y, value, left=left, color=colors[names.index(name) % 10], height=0.6,
+                    label=name if name not in ax.get_legend_handles_labels()[1] else None)
+            left += value
+    ax.set_yticks(range(len(rows)), [label for label, _ in rows])
+    ax.invert_yaxis()
+    ax.set_xlabel("seconds")
+    ax.set_title("Without FT: teardown and restart")
+    ax.legend(frameon=False, ncol=3, fontsize=9, loc="upper center", bbox_to_anchor=(0.5, -0.25))
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("eval_noft_failover.png", dpi=160)
+    json.dump({"teardown": dict(downs), "restart": dict(starts)}, open("eval_noft_failover.json", "w"), indent=1)
+
+
 if __name__ == "__main__":
     sweep_chart(sys.argv[1])
     overhead_chart()
     failover_chart(sys.argv[1])
+    noft_chart(sys.argv[1])

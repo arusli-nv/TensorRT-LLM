@@ -135,9 +135,9 @@ def integration():
     # Recovery phases.
     py, ph = 600, 105
     phases = [
-        ("1  Cancel the attempt", ["abort flag: kernels exit", "Revoke: collectives exit", "step discarded"],
-         "Stopped"),
-        ("2  Install (replay paused)", ["Shrink: agree on lost rank", "EPLB: route to replicas",
+        ("1  Cancel the attempt", ["abort flag, Revoke: work stops", "Shrink: agree on lost rank",
+                                   "step discarded"], "Stopped"),
+        ("2  Install (replay paused)", ["switch to survivor comm", "EPLB: route to replicas",
                                         "write mask in place"], "Propose · Ready · Install · Installed"),
         ("3  Permission to resume", ["after every survivor's Installed", "same CUDA graphs"], "Commit"),
     ]
@@ -245,8 +245,8 @@ def late_writes():
 def kernel_path():
     s = Svg(1240, 790)
     s.text(30, 36, "From dispatch to the experts: main vs FT", 22, anchor="start", weight="bold")
-    s.text(30, 60, "One receiver GPU, 3 of its 32 senders shown. Sender 0 sent token A, sender 1 sent B and C, "
-           "sender 2 sent D (and is lost in the FT case).", 13.5, "#666", anchor="start")
+    s.text(30, 60, "One receiver GPU, 3 of its 32 senders; sender 2 is lost in the FT case.", 13.5, "#666",
+           anchor="start")
     payloads = [("hidden_states", "3.5 KB"), ("hidden_states_sf", "448 B"),
                 ("token_selected_slots", "expert ids, 32 B"), ("token_final_scales", "32 B")]
     tokens = {0: ["A"], 1: ["B", "C"], 2: ["D"]}
@@ -281,7 +281,7 @@ def kernel_path():
     # --- Main: blocks of runtime_max rows per sender; sanitize marks ids in place.
     s.line(30, 80, 1210, 80, "#e0e0e0", 1.5)
     s.text(30, 106, "Main (FT off)", 17, anchor="start", weight="bold")
-    s.text(30, 124, "blocks of runtime_max rows per sender (4 here), moved every step", 12.5, "#666", anchor="start")
+    s.text(30, 124, "per-sender blocks sized by this step", 12.5, "#666", anchor="start")
 
     def main_rows(after):
         rows = []
@@ -301,18 +301,13 @@ def kernel_path():
         return rows
 
     end = arrays(230, 170, main_rows(True))
-    s.text(end + 20, 172, "recv_counters = [1, 2, 1]", 13, "#333", anchor="start", weight="bold")
-    s.text(end + 20, 196, "sanitize (main): every row past its sender's count", 12.5, "#333", anchor="start")
-    s.text(end + 20, 213, "gets expert ids −1, in token_selected_slots only.", 12.5, "#333", anchor="start")
-    s.text(end + 20, 230, "Nothing is copied; other payloads keep old bytes.", 12.5, "#333", anchor="start")
-    s.text(end + 20, 262, "The experts read these four arrays in place:", 12.5, "#333", anchor="start")
-    s.text(end + 20, 279, "32 × runtime_max rows (256 in decode).", 12.5, "#333", anchor="start", weight="bold")
+    s.text(end + 20, 196, "sanitize: ids −1 in place", 13, "#333", anchor="start", weight="bold")
+    s.text(end + 20, 216, "experts read the arrays directly", 12.5, "#333", anchor="start")
 
     # --- FT: fixed regions of max rows per sender; the gather copies into main's dense layout.
     s.line(30, 310, 1210, 310, "#e0e0e0", 1.5)
     s.text(30, 336, "FT on", 17, anchor="start", weight="bold")
-    s.text(30, 354, "a fixed region of max_num_tokens rows per sender (256), never moved", 12.5, "#666",
-           anchor="start")
+    s.text(30, 354, "fixed per-sender regions, never moved", 12.5, "#666", anchor="start")
 
     # Fixed regions in the workspace: one per sender, holding its four payloads.
     rx, ry, rw = 30, 392, 330
@@ -334,8 +329,7 @@ def kernel_path():
                 if lab:
                     s.text(x + 14.5, yy + 12.5, lab, 11, "#222", weight="bold")
             s.text(rx + 282, yy + 12, "… 256", 10.5, "#999", anchor="start")
-    s.text(rx, ry + 370, "workspace (symmetric memory), written by the senders over NVLink", 12, "#666",
-           anchor="start")
+    s.text(rx, ry + 370, "workspace (symmetric memory)", 12, "#666", anchor="start")
 
     # The gather.
     s.arrow(rx + rw + 6, 540, 452, 540, "gray", 2.5)
@@ -362,18 +356,9 @@ def kernel_path():
             rows.append(per)
         return rows
 
-    arrays(830, 430, ft_rows(False), cw=30, ch=22, title="dense output, main's layout (today)")
-    notes = [
-        ("copies real rows (all four payloads) from the fixed regions;", "#333", "normal"),
-        ("empty rows: ids −1, and the other payloads zeroed (4 KB/row);", "#333", "normal"),
-        ("the lost sender's block is all empty, whatever its counter says;", "#333", "normal"),
-        ("if the step was aborted, every row is empty.", "#333", "normal"),
-        ("Cheaper gather (proposed, benchmarking): empty rows get ids −1 only,", "#4a7d00", "bold"),
-        ("the rest of the row left uninitialized; writes scale with real tokens.", "#4a7d00", "bold"),
-        ("The experts read 32 × runtime_max rows, as on main.", "#333", "bold"),
-    ]
-    for j, (line, color, weight) in enumerate(notes):
-        s.text(668, 580 + j * 19, line, 12.5, color, anchor="start", weight=weight)
+    arrays(830, 430, ft_rows(False), cw=30, ch=22, title="dense output (main's layout)")
+    s.text(668, 600, "gather: copy real rows, mark the rest", 13, "#333", anchor="start", weight="bold")
+    s.text(668, 620, "experts read the dense output, as on main", 12.5, "#333", anchor="start")
     return s.render()
 
 

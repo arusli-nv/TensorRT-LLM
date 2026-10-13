@@ -22,7 +22,7 @@ Until this image is in CI, the ULFM unit test of PR 4 and the WideEP integration
 - The image build is the proof that the `TRTLLM_USE_MPI_KVCACHE` patch applies to 4.1.2's `futures/_core.py`: `install_mpi4py.sh` fails if it does not.
 - All existing MPI tests in the pre-merge lists run on the rebuilt image.
 
-Compatibility check before the image rebuild, on one GB200 node (ARM): main's MPI-dependent tests, run once with the image's mpi4py 3.1.5 and once with 4.1.2 built by this script, give identical results.
+Compatibility check before the image rebuild, on one GB200 node (ARM): main's MPI-dependent tests, run once with the image's mpi4py 3.1.5 and once with 4.1.2 built by this script, give the same results, apart from this PR's own ULFM guard test (see below).
 
 | Test file | mpi4py 3.1.5 | mpi4py 4.1.2 |
 |---|---|---|

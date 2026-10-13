@@ -1,0 +1,32 @@
+{
+ "teardown": {
+  "teardown 1": {
+   "terminate to all nodes clean": 1.5333573818206787,
+   "nodes": 8,
+   "kill_to_terminate": 30.188177347183228
+  },
+  "teardown 2": {
+   "terminate to all nodes clean": 1.474557638168335,
+   "nodes": 8,
+   "kill_to_terminate": 30.161502838134766
+  }
+ },
+ "restart": {
+  "restart 1": {
+   "launch (processes, imports)": 14.57265853881836,
+   "model load": 50.61,
+   "warmup + memory profiling": 23.245,
+   "KV cache allocation": 8.458,
+   "final warmup + CUDA graphs": 6.566,
+   "other": 4.887720294952388
+  },
+  "restart 2": {
+   "launch (processes, imports)": 14.671910762786865,
+   "model load": 59.858,
+   "warmup + memory profiling": 23.178,
+   "KV cache allocation": 9.751,
+   "final warmup + CUDA graphs": 6.408,
+   "other": 5.7463115978241035
+  }
+ }
+}

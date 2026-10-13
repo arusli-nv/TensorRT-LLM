@@ -10,10 +10,10 @@
 <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#eeeeee"/><line x1="0" y1="0" x2="0" y2="8" stroke="#bdbdbd" stroke-width="4"/></pattern>
 </defs>
 <text x="30" y="36" font-size="22" fill="#222" text-anchor="start" font-weight="bold">From dispatch to the experts: main vs FT</text>
-<text x="30" y="60" font-size="13.5" fill="#666" text-anchor="start" font-weight="normal">One receiver GPU, 3 of its 32 senders shown. Sender 0 sent token A, sender 1 sent B and C, sender 2 sent D (and is lost in the FT case).</text>
+<text x="30" y="60" font-size="13.5" fill="#666" text-anchor="start" font-weight="normal">One receiver GPU, 3 of its 32 senders; sender 2 is lost in the FT case.</text>
 <line x1="30" y1="80" x2="1210" y2="80" stroke="#e0e0e0" stroke-width="1.5"/>
 <text x="30" y="106" font-size="17" fill="#222" text-anchor="start" font-weight="bold">Main (FT off)</text>
-<text x="30" y="124" font-size="12.5" fill="#666" text-anchor="start" font-weight="normal">blocks of runtime_max rows per sender (4 here), moved every step</text>
+<text x="30" y="124" font-size="12.5" fill="#666" text-anchor="start" font-weight="normal">per-sender blocks sized by this step</text>
 <text x="312" y="162" font-size="12" fill="#666" text-anchor="middle" font-weight="normal">sender 0</text>
 <text x="494" y="162" font-size="12" fill="#666" text-anchor="middle" font-weight="normal">sender 1</text>
 <text x="676" y="162" font-size="12" fill="#666" text-anchor="middle" font-weight="normal">sender 2</text>
@@ -121,15 +121,11 @@
 <text x="697.5" y="276.5" font-size="12" fill="#999" text-anchor="middle" font-weight="normal">old</text>
 <rect x="720" y="260" width="39" height="24" rx="3" fill="#eeeeee" stroke="#cfcfcf" stroke-width="1.2"/>
 <text x="739.5" y="276.5" font-size="12" fill="#999" text-anchor="middle" font-weight="normal">old</text>
-<text x="796" y="172" font-size="13" fill="#333" text-anchor="start" font-weight="bold">recv_counters = [1, 2, 1]</text>
-<text x="796" y="196" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">sanitize (main): every row past its sender&#x27;s count</text>
-<text x="796" y="213" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">gets expert ids −1, in token_selected_slots only.</text>
-<text x="796" y="230" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">Nothing is copied; other payloads keep old bytes.</text>
-<text x="796" y="262" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">The experts read these four arrays in place:</text>
-<text x="796" y="279" font-size="12.5" fill="#333" text-anchor="start" font-weight="bold">32 × runtime_max rows (256 in decode).</text>
+<text x="796" y="196" font-size="13" fill="#333" text-anchor="start" font-weight="bold">sanitize: ids −1 in place</text>
+<text x="796" y="216" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">experts read the arrays directly</text>
 <line x1="30" y1="310" x2="1210" y2="310" stroke="#e0e0e0" stroke-width="1.5"/>
 <text x="30" y="336" font-size="17" fill="#222" text-anchor="start" font-weight="bold">FT on</text>
-<text x="30" y="354" font-size="12.5" fill="#666" text-anchor="start" font-weight="normal">a fixed region of max_num_tokens rows per sender (256), never moved</text>
+<text x="30" y="354" font-size="12.5" fill="#666" text-anchor="start" font-weight="normal">fixed per-sender regions, never moved</text>
 <rect x="30" y="392" width="330" height="108" rx="8" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="42" y="412" font-size="13" fill="#333" text-anchor="start" font-weight="bold">sender 0 region</text>
 <text x="42" y="434" font-size="10.5" fill="#666" text-anchor="start" font-weight="normal">hidden_states</text>
@@ -220,7 +216,7 @@
 <rect x="244" y="715" width="29" height="16" rx="2" fill="url(#hatch)" stroke="#cfcfcf" stroke-width="1"/>
 <rect x="276" y="715" width="29" height="16" rx="2" fill="url(#hatch)" stroke="#cfcfcf" stroke-width="1"/>
 <text x="312" y="727" font-size="10.5" fill="#999" text-anchor="start" font-weight="normal">… 256</text>
-<text x="30" y="762" font-size="12" fill="#666" text-anchor="start" font-weight="normal">workspace (symmetric memory), written by the senders over NVLink</text>
+<text x="30" y="762" font-size="12" fill="#666" text-anchor="start" font-weight="normal">workspace (symmetric memory)</text>
 <line x1="366" y1="540" x2="452" y2="540" stroke="#555" stroke-width="2.5" marker-end="url(#gray)"/>
 <rect x="456" y="488" width="170" height="104" rx="6" fill="white" stroke="#76b900" stroke-width="2"/>
 <text x="541.0" y="545.0" font-size="14" fill="#4a7d00" text-anchor="middle" font-weight="bold"></text>
@@ -229,7 +225,7 @@
 <text x="541" y="555" font-size="12" fill="#333" text-anchor="middle" font-weight="normal">live mask [1, 1, 0]</text>
 <text x="541" y="572" font-size="12" fill="#333" text-anchor="middle" font-weight="normal">abort flag</text>
 <line x1="628" y1="540" x2="662" y2="540" stroke="#555" stroke-width="2.5" marker-end="url(#gray)"/>
-<text x="830" y="400" font-size="13.5" fill="#444" text-anchor="start" font-weight="bold">dense output, main&#x27;s layout (today)</text>
+<text x="830" y="400" font-size="13.5" fill="#444" text-anchor="start" font-weight="bold">dense output (main&#x27;s layout)</text>
 <text x="888" y="422" font-size="12" fill="#666" text-anchor="middle" font-weight="normal">sender 0</text>
 <text x="1022" y="422" font-size="12" fill="#666" text-anchor="middle" font-weight="normal">sender 1</text>
 <text x="1156" y="422" font-size="12" fill="#666" text-anchor="middle" font-weight="normal">sender 2</text>
@@ -337,11 +333,6 @@
 <text x="1171.5" y="529.5" font-size="12" fill="#222" text-anchor="middle" font-weight="normal">0</text>
 <rect x="1188" y="514" width="27" height="22" rx="3" fill="#f7f7f7" stroke="#cfcfcf" stroke-width="1.2"/>
 <text x="1201.5" y="529.5" font-size="12" fill="#222" text-anchor="middle" font-weight="normal">0</text>
-<text x="668" y="580" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">copies real rows (all four payloads) from the fixed regions;</text>
-<text x="668" y="599" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">empty rows: ids −1, and the other payloads zeroed (4 KB/row);</text>
-<text x="668" y="618" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">the lost sender&#x27;s block is all empty, whatever its counter says;</text>
-<text x="668" y="637" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">if the step was aborted, every row is empty.</text>
-<text x="668" y="656" font-size="12.5" fill="#4a7d00" text-anchor="start" font-weight="bold">Cheaper gather (proposed, benchmarking): empty rows get ids −1 only,</text>
-<text x="668" y="675" font-size="12.5" fill="#4a7d00" text-anchor="start" font-weight="bold">the rest of the row left uninitialized; writes scale with real tokens.</text>
-<text x="668" y="694" font-size="12.5" fill="#333" text-anchor="start" font-weight="bold">The experts read 32 × runtime_max rows, as on main.</text>
+<text x="668" y="600" font-size="13" fill="#333" text-anchor="start" font-weight="bold">gather: copy real rows, mark the rest</text>
+<text x="668" y="620" font-size="12.5" fill="#333" text-anchor="start" font-weight="normal">experts read the dense output, as on main</text>
 </svg>

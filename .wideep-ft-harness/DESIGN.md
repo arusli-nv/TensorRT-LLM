@@ -104,8 +104,8 @@ authority and workers, so only the deployment's own processes can affect recover
     new rank mask and routing.
   - `Installed`: each survivor confirms.
   - `Commit`: everyone resumes together, so nobody runs with the old state.
-- **Fails closed:** any violation, disagreement, timeout (60 s) or unreachable authority sends
-  `Abort` to every worker, and the job ends as it does today.
+- **Fails closed:** any violation, disagreement or timeout (60 s) sends `Abort` to every worker;
+  if the authority itself is unreachable, workers time out. Either way the job ends as it does today.
 - **Limits:** one recovery per deployment (repeated failures are 1c.6, beyond the MVP).
 
 #### 4. 1c.3, 1c.3a, 1c.4a: [feat] ULFM survivor communicators for host collectives ([b5ade7ed87](https://github.com/arusli-nv/TensorRT-LLM/commit/b5ade7ed87))
@@ -118,6 +118,10 @@ Makes the executor's CPU-side MPI collectives survive a peer loss using ULFM. Us
 - **Unblock and agree (1c.3a):** Revoke wakes survivors stuck in a collective. Shrink makes them
   agree on the dead rank and builds a survivor communicator, which is switched to only at the
   authority's `Install`.
+- **Corrupted results:** ULFM can complete a collective that a peer died in with undefined data on
+  some ranks. A host collective therefore counts as interrupted whenever ULFM reports a failed peer,
+  even if it returned; a non-MPI error waits up to 1 s for that evidence before it counts as this
+  rank's own error.
 - **Survivor-aware collectives (1c.4a):** rank numbers stay the same after a loss and gathers return
   an empty entry for the dead rank, so survivors are never renumbered (same CUDA graphs).
 - **Limits:** pure attention DP only; requires launching with `mpirun --with-ft ulfm`; a second loss
@@ -130,7 +134,7 @@ pointer to an abort record in pinned host memory. Captured CUDA graphs therefore
 made in place, and a CPU write releases kernels spinning on a dead peer instead of trapping.
 Each sender writes to a fixed per-source slot, so a dead or late sender can only corrupt its own
 slot. A new gather kernel compacts the slots and blanks inactive or aborted rows. Without a
-descriptor the kernels run unchanged (FT-off SASS is identical to main). Details and benchmarks in
+descriptor the kernels run main's code path (FT-off kernels are opcode-identical to main). Details and benchmarks in
 [Late writes](#late-writes-symmetric-memory-and-kernel-design-commits-5-and-6).
 
 #### 6. 1a.8a, 1a.8b: [feat] bind MoE layers to the all-to-all execution descriptor for recovery ([4d855f706b](https://github.com/arusli-nv/TensorRT-LLM/commit/4d855f706b))
@@ -204,14 +208,13 @@ from the same state:
 - later prompt chunks shrink back to their previous capacity;
 - generating requests give back the step's tokens.
 
-The discarded step's KV writes are overwritten by the redo. KV Cache Manager V2 only.
-Recurrent-state (linear attention) and sparse-attention managers are rejected at startup; a
-discarded step can't be undone for them by freeing blocks.
+The discarded step's KV writes are overwritten by the redo. Plain KV Cache Manager V2 only.
 
 #### 11. 1c.4, 1c.4c, 1d.1, 1d.4a: [feat] recover the executor from a WideEP peer loss ([1f7d4182cf](https://github.com/arusli-nv/TensorRT-LLM/commit/1f7d4182cf))
 
 Adds `PeerLossRecovery`, which hooks into `PyExecutor` and runs the recovery using commits 3–10. At
-startup it validates the configuration and registers with the authority.
+startup it validates the configuration (unsupported features fail with a clear error, see
+[Remaining qualifications](#remaining-qualifications)) and registers with the authority.
 
 - **Detect and stop:** the watcher sets a flag, aborts MoE collectives and revokes host
   communicators; the step in flight is discarded, not committed.
@@ -256,29 +259,34 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 - **Failures:** SIGKILL of one rank (1, 2, 30 or 62, including ranks on other nodes), killed while
   idle, generating, inside the MoE all-to-all, during prefill and under full load. A rank without
   expert coverage fails closed.
-- **Tests:** CPU and GPU unit tests; a 4-GPU integration test (DeepSeek-V3-Lite, kill idle and
-  mid-step).
+- **Tests:** CPU and GPU unit tests pass on the current series; the 4-GPU integration test
+  (DeepSeek-V3-Lite, kill idle and mid-step) last passed on an earlier tip of the series.
+- **Build measured:** EP32 runs used a wheel from an earlier tip of the series; kernels are the same,
+  host code differs by the commit 4 fix (in-flight kills on the fixed code: 4 of 4 passed).
 
-**Results (DeepSeek-R1 NVFP4, 32 GB200 GPUs):**
+### Failover
 
-| Rank killed while… | Result |
-|---|---|
-| no requests run (idle) | serving again after 0.16–0.34 s (restart without FT: 81–173 s) |
-| requests generate tokens | all finish within 1.4–3.1 s |
-| GPUs run the MoE all-to-all | all finish within 2.6–3.2 s |
-| prefill, full load | 248 of 248 finish within 4.6 s |
-| its experts have no copy elsewhere | every request fails with an explicit error within 0.04 s |
+![With FT: steps back to serving new requests](evidence/eval_ft_recovery.png)
 
-![Recovery time and throughput](evidence/results.png)
+![Without FT: teardown and restart](evidence/eval_noft_failover.png)
 
-- Survivors' tokens match a reference run that never used the lost rank, and all decode steps stay
-  in the original CUDA graphs (Nsight Systems: no graph captures after the kill).
-- FT overhead vs FT off with the same config: -1.3% throughput at 8 requests per GPU, -4.9% at 64,
-  almost all of it in the MoE all-to-all, mostly the new gather kernel (see [Evaluation](#evaluation)).
-- After a loss, the 31 remaining GPUs serve 75.7k tok/s at 64 requests per GPU, 98% of their per-GPU
-  throughput before the loss (97–98% across loads).
-- With the overlap scheduler and MTP (production config, not yet supported with FT), the same 32
-  GPUs reach 157k tok/s.
+DeepSeek-R1 NVFP4, 32 GB200, rank 2 SIGKILLed. With FT: 3 idle and 4 in-flight kills, wall-clock
+markers at each step on every survivor (median shown). Without FT: 2 kills and 2 clean restarts,
+plain mpirun.
+
+- With FT, survivors serve again 28–94 ms after the kill; detection and Shrink are most of it.
+  The authority waits for the slowest survivor (idle kill 2: one GPU took 86 ms to drain).
+- The first new token reaches the client 0.23–0.29 s after the kill. Most of that comes after
+  recovery; a no-kill time-to-first-token was not measured, so it is not split further.
+- Requests in flight at the kill finish with exact tokens (4 of 4 runs); the lost rank's own
+  request gets the retry error.
+- Without FT, nothing tears the job down: after a kill it hung for over 13 minutes until stopped.
+  Once terminated, every node is clean within 1.5 s; the restart then takes 108–120 s, about half
+  of it loading the model.
+- A loss whose experts have no copy elsewhere fails every request with an explicit error within
+  0.04 s (one run, earlier build).
+- With the overlap scheduler, MTP and LM-head TP (production config, not supported with FT), the
+  same 32 GPUs reach 157k tok/s.
 
 ## Evaluation
 
@@ -286,16 +294,17 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 
 ![FT overhead breakdown](evidence/eval_overhead.png)
 
-FT off vs on, same build, config and nodes, at 8 and 64 requests per GPU; Nsight Systems on one
-rank, medians over about 2,400 decode steps.
+FT off vs on, same build and nodes: 8 requests per GPU on the test config (max_batch_size 8), 64 on
+the production-shaped config (max_batch_size 64). Nsight Systems on one rank, medians over about
+2,400 decode steps.
 
-- All of FT's extra time is in the MoE all-to-all; attention, the expert GEMMs and host work are
-  unchanged.
+- FT's extra time is inside the MoE layers; at 64 requests per GPU about 80% of it is all-to-all
+  kernel time. GPU idle time does not change.
 - The gather is most of it and grows with load because it copies every received row. Skipping its
   zeroing of empty rows saves under 1 µs, so the next steps are its launch layout or fusing it into
   dispatch.
 - The larger cost of FT today is indirect: it requires the non-overlap scheduler, which leaves the
-  GPU idle for a quarter to a third of every step (gray), with or without FT.
+  GPU idle for 25–31% of every step (gray), with or without FT.
 
 ### Throughput vs load
 
@@ -312,16 +321,17 @@ FT off, FT on, and FT on after a loss (31 survivors), at 8 to 64 requests per GP
 
 ## Remaining qualifications
 
-- **Production config:** the overlap scheduler and MTP aren't supported with FT. This is the
-  largest gap: 157k tok/s without FT versus 80k with FT on the same 32 GPUs. Online EPLB (1b.3)
+- **Production config:** the overlap scheduler, MTP and LM-head TP aren't supported with FT. This
+  is the largest gap: 157k tok/s without FT versus 80k with FT on the same 32 GPUs. Online EPLB (1b.3)
   isn't supported either.
 - **1c.3a live-rank fencing:** only process death is recovered. A hung or unreachable rank ends the
   job after the hang detector's 300 s timeout (needs live-rank fencing, plus 1c.2 and 1c.3 for
   suspicion).
-- **Model coverage:** KV Cache Manager V2 only. Recurrent-state (e.g. Kimi K3) and sparse-attention
-  models are rejected at startup; sliding-window attention is unvalidated. Greedy sampling is
-  expected: penalties, seeded sampling and multi-token stop words aren't rolled back with a
-  discarded step.
+- **Rejected at startup:** KV managers other than plain V2 (recurrent-state such as Kimi K3,
+  sparse attention), speculative decoding, guided decoding, beam search, attention-DP balancing,
+  expert TP > 1, PEFT, KV connector or transceiver, sleep/wakeup. Sliding-window attention is
+  unvalidated. Greedy sampling is expected: penalties, seeded sampling and multi-token stop words
+  aren't rolled back with a discarded step.
 - **Kernel cost:** the gather adds 3–16 µs per MoE layer (8–64 requests per GPU); a faster launch layout
   or fusing it into dispatch is open.
 - **CI:** needs an image with mpi4py 4.1.2; until then the ULFM tests skip. x86 is unverified (only
@@ -342,8 +352,9 @@ replace the watcher as the detector; the authority stays the only decision-maker
 
 ### Safety features
 
-- **Resume only on permission:** survivors resume only after `Commit` for their generation, and
-  only after every survivor reported `Installed` with the same placement digest.
+- **Resume only on permission:** survivors install only after every survivor reported `Ready` with
+  the same placement digest, and resume only after `Commit`, sent once every survivor reported
+  `Installed`.
 - **Cancellation reaches spinning kernels:** a CPU write to pinned host memory needs no GPU work, so
   it reaches kernels that occupy the whole GPU.
 - **No garbage data:** rows from masked ranks or an aborted step reach the expert GEMMs as expert
@@ -373,7 +384,7 @@ teardown, so the backing memory stays valid.
 
 - **Kernels (commit 5):** dispatch and combine read the descriptor, skip masked ranks in every wait
   and load, and exit spin loops on abort. A new gather kernel packs valid rows into the dense GEMM
-  input. With FT off, the kernels are instruction-identical to main.
+  input. With FT off, the kernels are opcode-identical to main.
 - **Model binding (commit 6):** the workspace is sized for the fixed regions and kept mapped for the
   model's lifetime.
 - **Verified:** a 2-process test kills a rank mid-dispatch at three timings. Every byte outside the
