@@ -1,156 +1,156 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" font-family="Helvetica, Arial, sans-serif">
 <rect width="100%" height="100%" fill="white"/>
 <defs>
-<marker id="blue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#1565c0"/></marker>
-<marker id="purple" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#6a1b9a"/></marker>
-<marker id="orange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#e65100"/></marker>
-<marker id="red" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#c62828"/></marker>
+<marker id="blue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#76b900"/></marker>
+<marker id="purple" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#1a1a1a"/></marker>
+<marker id="orange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#1a1a1a"/></marker>
+<marker id="red" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#d32f2f"/></marker>
 <marker id="gray" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#555"/></marker>
-<marker id="green" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#558b2f"/></marker>
+<marker id="green" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#757575"/></marker>
 <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#eeeeee"/><line x1="0" y1="0" x2="0" y2="8" stroke="#bdbdbd" stroke-width="4"/></pattern>
 </defs>
 <text x="30" y="36" font-size="22" fill="#222" text-anchor="start" font-weight="bold">WideEP FT architecture</text>
-<rect x="990" y="18" width="92" height="26" rx="6" fill="#558b2f" stroke="#558b2f" stroke-width="2"/>
+<rect x="990" y="18" width="92" height="26" rx="6" fill="#757575" stroke="#757575" stroke-width="2"/>
 <text x="1036.0" y="36.0" font-size="14" fill="white" text-anchor="middle" font-weight="bold">reused</text>
-<rect x="1092" y="18" width="78" height="26" rx="6" fill="#1565c0" stroke="#1565c0" stroke-width="2"/>
+<rect x="1092" y="18" width="78" height="26" rx="6" fill="#76b900" stroke="#76b900" stroke-width="2"/>
 <text x="1131.0" y="36.0" font-size="14" fill="white" text-anchor="middle" font-weight="bold">new</text>
-<rect x="60" y="62" width="360" height="58" rx="10" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2"/>
-<text x="240" y="88" font-size="17" fill="#6a1b9a" text-anchor="middle" font-weight="bold">Recovery authority</text>
-<text x="240" y="108" font-size="12.5" fill="#6a1b9a" text-anchor="middle" font-weight="normal">separate CPU process, outside mpirun</text>
-<rect x="30" y="140" width="760" height="350" rx="12" fill="#fafafa" stroke="#9e9e9e" stroke-width="2"/>
+<rect x="60" y="62" width="360" height="58" rx="10" fill="white" stroke="#1a1a1a" stroke-width="2"/>
+<text x="240" y="88" font-size="17" fill="#1a1a1a" text-anchor="middle" font-weight="bold">Recovery authority</text>
+<text x="240" y="108" font-size="12.5" fill="#1a1a1a" text-anchor="middle" font-weight="normal">separate CPU process, outside mpirun</text>
+<rect x="30" y="140" width="760" height="350" rx="12" fill="white" stroke="#bdbdbd" stroke-width="1.5"/>
 <text x="780" y="162" font-size="13" fill="#777" text-anchor="end" font-weight="bold">each surviving rank</text>
-<line x1="170" y1="122" x2="170" y2="196" stroke="#6a1b9a" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#purple)" marker-start="url(#purple)"/>
-<text x="182" y="165" font-size="12.5" fill="#6a1b9a" text-anchor="start" font-weight="bold">ZeroMQ + HMAC</text>
+<line x1="170" y1="122" x2="170" y2="196" stroke="#1a1a1a" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#purple)" marker-start="url(#purple)"/>
+<text x="182" y="165" font-size="12.5" fill="#1a1a1a" text-anchor="start" font-weight="bold">ZeroMQ + HMAC</text>
 <text x="40" y="232" font-size="12" fill="#888" text-anchor="start" font-weight="bold">CPU</text>
-<rect x="80" y="200" width="180" height="56" rx="6" fill="white" stroke="#1565c0" stroke-width="2"/>
-<text x="170.0" y="226.0" font-size="14" fill="#1565c0" text-anchor="middle" font-weight="bold">PeerLossRecovery</text>
-<text x="170.0" y="243.0" font-size="11.5" fill="#1565c0" text-anchor="middle" font-weight="normal">executor hook</text>
-<rect x="280" y="200" width="150" height="56" rx="6" fill="white" stroke="#558b2f" stroke-width="2"/>
-<text x="355.0" y="226.0" font-size="14" fill="#558b2f" text-anchor="middle" font-weight="bold">EPLB</text>
-<text x="355.0" y="243.0" font-size="11.5" fill="#558b2f" text-anchor="middle" font-weight="normal">mask-only API</text>
-<rect x="450" y="200" width="150" height="56" rx="6" fill="white" stroke="#558b2f" stroke-width="2"/>
-<text x="525.0" y="226.0" font-size="14" fill="#558b2f" text-anchor="middle" font-weight="bold">EPGroupHealth</text>
-<text x="525.0" y="243.0" font-size="11.5" fill="#558b2f" text-anchor="middle" font-weight="normal">live-rank mask</text>
-<rect x="620" y="200" width="150" height="56" rx="6" fill="white" stroke="#1565c0" stroke-width="2"/>
-<text x="695.0" y="226.0" font-size="14" fill="#1565c0" text-anchor="middle" font-weight="bold">ULFM MPI</text>
-<text x="695.0" y="243.0" font-size="11.5" fill="#1565c0" text-anchor="middle" font-weight="normal">watcher, Shrink</text>
+<rect x="80" y="200" width="180" height="56" rx="6" fill="white" stroke="#76b900" stroke-width="2"/>
+<text x="170.0" y="226.0" font-size="14" fill="#4a7d00" text-anchor="middle" font-weight="bold">PeerLossRecovery</text>
+<text x="170.0" y="243.0" font-size="11.5" fill="#4a7d00" text-anchor="middle" font-weight="normal">executor hook</text>
+<rect x="280" y="200" width="150" height="56" rx="6" fill="white" stroke="#757575" stroke-width="2"/>
+<text x="355.0" y="226.0" font-size="14" fill="#757575" text-anchor="middle" font-weight="bold">EPLB</text>
+<text x="355.0" y="243.0" font-size="11.5" fill="#757575" text-anchor="middle" font-weight="normal">mask-only API</text>
+<rect x="450" y="200" width="150" height="56" rx="6" fill="white" stroke="#757575" stroke-width="2"/>
+<text x="525.0" y="226.0" font-size="14" fill="#757575" text-anchor="middle" font-weight="bold">EPGroupHealth</text>
+<text x="525.0" y="243.0" font-size="11.5" fill="#757575" text-anchor="middle" font-weight="normal">live-rank mask</text>
+<rect x="620" y="200" width="150" height="56" rx="6" fill="white" stroke="#76b900" stroke-width="2"/>
+<text x="695.0" y="226.0" font-size="14" fill="#4a7d00" text-anchor="middle" font-weight="bold">ULFM MPI</text>
+<text x="695.0" y="243.0" font-size="11.5" fill="#4a7d00" text-anchor="middle" font-weight="normal">watcher, Shrink</text>
 <line x1="40" y1="285" x2="780" y2="285" stroke="#bdbdbd" stroke-width="1.5" stroke-dasharray="4 4"/>
-<rect x="80" y="296" width="180" height="42" rx="6" fill="white" stroke="#1565c0" stroke-width="2"/>
-<text x="170.0" y="315.0" font-size="14" fill="#1565c0" text-anchor="middle" font-weight="bold">abort flag</text>
-<text x="170.0" y="332.0" font-size="11.5" fill="#1565c0" text-anchor="middle" font-weight="normal">pinned host memory</text>
-<rect x="330" y="296" width="270" height="42" rx="6" fill="white" stroke="#1565c0" stroke-width="2"/>
-<text x="465.0" y="315.0" font-size="14" fill="#1565c0" text-anchor="middle" font-weight="bold">execution descriptor</text>
-<text x="465.0" y="332.0" font-size="11.5" fill="#1565c0" text-anchor="middle" font-weight="normal">mask | abort-flag address</text>
-<line x1="170" y1="258" x2="170" y2="293" stroke="#1565c0" stroke-width="2" marker-end="url(#blue)"/>
-<line x1="355" y1="258" x2="355" y2="293" stroke="#558b2f" stroke-width="2" marker-end="url(#green)"/>
-<line x1="525" y1="258" x2="525" y2="293" stroke="#558b2f" stroke-width="2" marker-end="url(#green)"/>
-<line x1="262" y1="317" x2="328" y2="317" stroke="#1565c0" stroke-width="2" stroke-dasharray="4 3"/>
+<rect x="80" y="296" width="180" height="42" rx="6" fill="white" stroke="#76b900" stroke-width="2"/>
+<text x="170.0" y="315.0" font-size="14" fill="#4a7d00" text-anchor="middle" font-weight="bold">abort flag</text>
+<text x="170.0" y="332.0" font-size="11.5" fill="#4a7d00" text-anchor="middle" font-weight="normal">pinned host memory</text>
+<rect x="330" y="296" width="270" height="42" rx="6" fill="white" stroke="#76b900" stroke-width="2"/>
+<text x="465.0" y="315.0" font-size="14" fill="#4a7d00" text-anchor="middle" font-weight="bold">execution descriptor</text>
+<text x="465.0" y="332.0" font-size="11.5" fill="#4a7d00" text-anchor="middle" font-weight="normal">mask | abort-flag address</text>
+<line x1="170" y1="258" x2="170" y2="293" stroke="#76b900" stroke-width="2" marker-end="url(#blue)"/>
+<line x1="355" y1="258" x2="355" y2="293" stroke="#757575" stroke-width="2" marker-end="url(#green)"/>
+<line x1="525" y1="258" x2="525" y2="293" stroke="#757575" stroke-width="2" marker-end="url(#green)"/>
+<line x1="262" y1="317" x2="328" y2="317" stroke="#76b900" stroke-width="2" stroke-dasharray="4 3"/>
 <text x="40" y="372" font-size="12" fill="#888" text-anchor="start" font-weight="bold">GPU</text>
-<rect x="80" y="356" width="690" height="120" rx="10" fill="#fff3e0" stroke="#e65100" stroke-width="2"/>
-<line x1="465" y1="340" x2="465" y2="368" stroke="#1565c0" stroke-width="2"/>
-<line x1="170" y1="368" x2="650" y2="368" stroke="#1565c0" stroke-width="2"/>
-<rect x="100" y="384" width="140" height="50" rx="6" fill="#e65100" stroke="#e65100" stroke-width="2"/>
-<text x="170.0" y="414.0" font-size="14" fill="white" text-anchor="middle" font-weight="bold">dispatch</text>
-<line x1="170" y1="368" x2="170" y2="381" stroke="#1565c0" stroke-width="2" marker-end="url(#blue)"/>
-<rect x="260" y="384" width="140" height="50" rx="6" fill="#e65100" stroke="#e65100" stroke-width="2"/>
-<text x="330.0" y="414.0" font-size="14" fill="white" text-anchor="middle" font-weight="bold">gather</text>
-<rect x="420" y="384" width="140" height="50" rx="6" fill="white" stroke="#e65100" stroke-width="2"/>
-<text x="490.0" y="414.0" font-size="14" fill="#e65100" text-anchor="middle" font-weight="bold">experts</text>
-<rect x="580" y="384" width="140" height="50" rx="6" fill="#e65100" stroke="#e65100" stroke-width="2"/>
-<text x="650.0" y="414.0" font-size="14" fill="white" text-anchor="middle" font-weight="bold">combine</text>
-<line x1="650" y1="368" x2="650" y2="381" stroke="#1565c0" stroke-width="2" marker-end="url(#blue)"/>
-<line x1="242" y1="409" x2="257" y2="409" stroke="#e65100" stroke-width="2" marker-end="url(#orange)"/>
-<line x1="402" y1="409" x2="417" y2="409" stroke="#e65100" stroke-width="2" marker-end="url(#orange)"/>
-<line x1="562" y1="409" x2="577" y2="409" stroke="#e65100" stroke-width="2" marker-end="url(#orange)"/>
-<text x="425" y="464" font-size="13" fill="#e65100" text-anchor="middle" font-weight="bold">CUDA graph, captured once at startup</text>
+<rect x="80" y="356" width="690" height="120" rx="10" fill="#f7f7f7" stroke="#9e9e9e" stroke-width="1.5"/>
+<line x1="465" y1="340" x2="465" y2="368" stroke="#76b900" stroke-width="2"/>
+<line x1="170" y1="368" x2="650" y2="368" stroke="#76b900" stroke-width="2"/>
+<rect x="100" y="384" width="140" height="50" rx="6" fill="white" stroke="#1a1a1a" stroke-width="2"/>
+<text x="170.0" y="414.0" font-size="14" fill="#1a1a1a" text-anchor="middle" font-weight="bold">dispatch</text>
+<line x1="170" y1="368" x2="170" y2="381" stroke="#76b900" stroke-width="2" marker-end="url(#blue)"/>
+<rect x="260" y="384" width="140" height="50" rx="6" fill="white" stroke="#76b900" stroke-width="2"/>
+<text x="330.0" y="414.0" font-size="14" fill="#4a7d00" text-anchor="middle" font-weight="bold">gather</text>
+<rect x="420" y="384" width="140" height="50" rx="6" fill="white" stroke="#1a1a1a" stroke-width="2"/>
+<text x="490.0" y="414.0" font-size="14" fill="#1a1a1a" text-anchor="middle" font-weight="bold">experts</text>
+<rect x="580" y="384" width="140" height="50" rx="6" fill="white" stroke="#1a1a1a" stroke-width="2"/>
+<text x="650.0" y="414.0" font-size="14" fill="#1a1a1a" text-anchor="middle" font-weight="bold">combine</text>
+<line x1="650" y1="368" x2="650" y2="381" stroke="#76b900" stroke-width="2" marker-end="url(#blue)"/>
+<line x1="242" y1="409" x2="257" y2="409" stroke="#1a1a1a" stroke-width="2" marker-end="url(#orange)"/>
+<line x1="402" y1="409" x2="417" y2="409" stroke="#1a1a1a" stroke-width="2" marker-end="url(#orange)"/>
+<line x1="562" y1="409" x2="577" y2="409" stroke="#1a1a1a" stroke-width="2" marker-end="url(#orange)"/>
+<text x="425" y="464" font-size="13" fill="#555" text-anchor="middle" font-weight="bold">CUDA graph, captured once at startup</text>
 <text x="1006" y="176" font-size="15" fill="#444" text-anchor="middle" font-weight="bold">32 ranks</text>
-<rect x="870" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="870" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="884" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">0</text>
-<rect x="904" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="904" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="918" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">1</text>
-<rect x="938" y="190" width="28" height="28" rx="4" fill="#ffebee" stroke="#c62828" stroke-width="1.5"/>
-<line x1="944" y1="196" x2="960" y2="212" stroke="#c62828" stroke-width="4"/>
-<line x1="944" y1="212" x2="960" y2="196" stroke="#c62828" stroke-width="4"/>
-<rect x="972" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="938" y="190" width="28" height="28" rx="4" fill="#ffebee" stroke="#d32f2f" stroke-width="1.5"/>
+<line x1="944" y1="196" x2="960" y2="212" stroke="#d32f2f" stroke-width="4"/>
+<line x1="944" y1="212" x2="960" y2="196" stroke="#d32f2f" stroke-width="4"/>
+<rect x="972" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="986" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">3</text>
-<rect x="1006" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1006" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1020" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">4</text>
-<rect x="1040" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1040" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1054" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">5</text>
-<rect x="1074" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1074" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1088" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">6</text>
-<rect x="1108" y="190" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1108" y="190" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1122" y="209" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">7</text>
-<rect x="870" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="870" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="884" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">8</text>
-<rect x="904" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="904" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="918" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">9</text>
-<rect x="938" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="938" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="952" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">10</text>
-<rect x="972" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="972" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="986" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">11</text>
-<rect x="1006" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1006" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1020" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">12</text>
-<rect x="1040" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1040" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1054" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">13</text>
-<rect x="1074" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1074" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1088" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">14</text>
-<rect x="1108" y="224" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1108" y="224" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1122" y="243" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">15</text>
-<rect x="870" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="870" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="884" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">16</text>
-<rect x="904" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="904" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="918" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">17</text>
-<rect x="938" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="938" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="952" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">18</text>
-<rect x="972" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="972" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="986" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">19</text>
-<rect x="1006" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1006" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1020" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">20</text>
-<rect x="1040" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1040" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1054" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">21</text>
-<rect x="1074" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1074" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1088" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">22</text>
-<rect x="1108" y="258" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1108" y="258" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1122" y="277" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">23</text>
-<rect x="870" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="870" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="884" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">24</text>
-<rect x="904" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="904" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="918" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">25</text>
-<rect x="938" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="938" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="952" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">26</text>
-<rect x="972" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="972" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="986" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">27</text>
-<rect x="1006" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1006" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1020" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">28</text>
-<rect x="1040" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1040" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1054" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">29</text>
-<rect x="1074" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1074" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1088" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">30</text>
-<rect x="1108" y="292" width="28" height="28" rx="4" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<rect x="1108" y="292" width="28" height="28" rx="4" fill="white" stroke="#9e9e9e" stroke-width="1.5"/>
 <text x="1122" y="311" font-size="11" fill="#455a64" text-anchor="middle" font-weight="normal">31</text>
-<text x="1006" y="346" font-size="13" fill="#c62828" text-anchor="middle" font-weight="bold">rank 2 lost</text>
-<line x1="774" y1="228" x2="864" y2="228" stroke="#1565c0" stroke-width="2.5" marker-end="url(#blue)" marker-start="url(#blue)"/>
-<text x="818" y="218" font-size="12" fill="#1565c0" text-anchor="middle" font-weight="bold">MPI</text>
-<line x1="774" y1="420" x2="905" y2="340" stroke="#e65100" stroke-width="2.5" marker-end="url(#orange)" marker-start="url(#orange)"/>
-<text x="872" y="410" font-size="12" fill="#e65100" text-anchor="start" font-weight="bold">NVLink</text>
-<text x="872" y="425" font-size="12" fill="#e65100" text-anchor="start" font-weight="bold">all-to-all</text>
-<polygon points="30,545 395,545 417,597.5 395,650 30,650" fill="#c62828" fill-opacity="0.08" stroke="#c62828" stroke-width="2"/>
-<text x="68" y="573" font-size="16" fill="#c62828" text-anchor="start" font-weight="bold">1  Cancel the attempt</text>
+<text x="1006" y="346" font-size="13" fill="#d32f2f" text-anchor="middle" font-weight="bold">rank 2 lost</text>
+<line x1="774" y1="228" x2="864" y2="228" stroke="#76b900" stroke-width="2.5" marker-end="url(#blue)" marker-start="url(#blue)"/>
+<text x="818" y="218" font-size="12" fill="#76b900" text-anchor="middle" font-weight="bold">MPI</text>
+<line x1="774" y1="420" x2="905" y2="340" stroke="#1a1a1a" stroke-width="2.5" marker-end="url(#orange)" marker-start="url(#orange)"/>
+<text x="872" y="410" font-size="12" fill="#1a1a1a" text-anchor="start" font-weight="bold">NVLink</text>
+<text x="872" y="425" font-size="12" fill="#1a1a1a" text-anchor="start" font-weight="bold">all-to-all</text>
+<polygon points="30,545 395,545 417,597.5 395,650 30,650" fill="#f7f7f7" stroke="#9e9e9e" stroke-width="2"/>
+<text x="68" y="573" font-size="16" fill="#1a1a1a" text-anchor="start" font-weight="bold">1  Cancel the attempt</text>
 <text x="68" y="597" font-size="13" fill="#333" text-anchor="start" font-weight="normal">abort flag: kernels exit</text>
 <text x="68" y="616" font-size="13" fill="#333" text-anchor="start" font-weight="normal">Revoke: collectives exit</text>
 <text x="68" y="635" font-size="13" fill="#333" text-anchor="start" font-weight="normal">step discarded</text>
-<text x="222.5" y="674" font-size="13" fill="#6a1b9a" text-anchor="middle" font-weight="bold" font-style="italic">Stopped</text>
-<polygon points="413,545 778,545 800,597.5 778,650 413,650 435,597.5" fill="#1565c0" fill-opacity="0.08" stroke="#1565c0" stroke-width="2"/>
-<text x="451" y="573" font-size="16" fill="#1565c0" text-anchor="start" font-weight="bold">2  Install (replay paused)</text>
+<text x="222.5" y="674" font-size="13" fill="#555" text-anchor="middle" font-weight="bold" font-style="italic">Stopped</text>
+<polygon points="413,545 778,545 800,597.5 778,650 413,650 435,597.5" fill="#f7f7f7" stroke="#9e9e9e" stroke-width="2"/>
+<text x="451" y="573" font-size="16" fill="#1a1a1a" text-anchor="start" font-weight="bold">2  Install (replay paused)</text>
 <text x="451" y="597" font-size="13" fill="#333" text-anchor="start" font-weight="normal">Shrink: agree on lost rank</text>
 <text x="451" y="616" font-size="13" fill="#333" text-anchor="start" font-weight="normal">EPLB: route to replicas</text>
 <text x="451" y="635" font-size="13" fill="#333" text-anchor="start" font-weight="normal">write mask in place</text>
-<text x="605.5" y="674" font-size="13" fill="#6a1b9a" text-anchor="middle" font-weight="bold" font-style="italic">Propose · Ready · Install · Installed</text>
-<polygon points="796,545 1161,545 1183,597.5 1161,650 796,650 818,597.5" fill="#2e7d32" fill-opacity="0.08" stroke="#2e7d32" stroke-width="2"/>
-<text x="834" y="573" font-size="16" fill="#2e7d32" text-anchor="start" font-weight="bold">3  Permission to resume</text>
+<text x="605.5" y="674" font-size="13" fill="#555" text-anchor="middle" font-weight="bold" font-style="italic">Propose · Ready · Install · Installed</text>
+<polygon points="796,545 1161,545 1183,597.5 1161,650 796,650 818,597.5" fill="#f7f7f7" stroke="#9e9e9e" stroke-width="2"/>
+<text x="834" y="573" font-size="16" fill="#1a1a1a" text-anchor="start" font-weight="bold">3  Permission to resume</text>
 <text x="834" y="597" font-size="13" fill="#333" text-anchor="start" font-weight="normal">only after every Installed</text>
 <text x="834" y="616" font-size="13" fill="#333" text-anchor="start" font-weight="normal">same CUDA graphs</text>
-<text x="988.5" y="674" font-size="13" fill="#6a1b9a" text-anchor="middle" font-weight="bold" font-style="italic">Commit</text>
+<text x="988.5" y="674" font-size="13" fill="#555" text-anchor="middle" font-weight="bold" font-style="italic">Commit</text>
 <text x="30" y="528" font-size="15" fill="#444" text-anchor="start" font-weight="bold">Recovery</text>
 </svg>
