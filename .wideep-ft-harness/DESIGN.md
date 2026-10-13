@@ -108,7 +108,7 @@ authority and workers, so only the deployment's own processes can affect recover
   `Abort` to every worker, and the job ends as it does today.
 - **Limits:** one recovery per deployment (repeated failures are 1c.6, beyond the MVP).
 
-#### 4. 1c.3, 1c.3a, 1c.4a: [feat] ULFM survivor communicators for host collectives ([1fd4629c5c](https://github.com/arusli-nv/TensorRT-LLM/commit/1fd4629c5c))
+#### 4. 1c.3, 1c.3a, 1c.4a: [feat] ULFM survivor communicators for host collectives ([b5ade7ed87](https://github.com/arusli-nv/TensorRT-LLM/commit/b5ade7ed87))
 
 Makes the executor's CPU-side MPI collectives survive a peer loss using ULFM. Uses a private copy of
 `COMM_WORLD`, so revoking it doesn't break other users of `COMM_WORLD`, such as the MPI session.
@@ -123,7 +123,7 @@ Makes the executor's CPU-side MPI collectives survive a peer loss using ULFM. Us
 - **Limits:** pure attention DP only; requires launching with `mpirun --with-ft ulfm`; a second loss
   is not recoverable.
 
-#### 5. 1a.8, 1a.8a, 1a.11: [feat] add a run-time rank mask and abort to the NVLinkOneSided all-to-all ([d6f44ab1d7](https://github.com/arusli-nv/TensorRT-LLM/commit/d6f44ab1d7))
+#### 5. 1a.8, 1a.8a, 1a.11: [feat] add a run-time rank mask and abort to the NVLinkOneSided all-to-all ([4bb66c8409](https://github.com/arusli-nv/TensorRT-LLM/commit/4bb66c8409))
 
 Kernels take the address of a fixed execution descriptor in GPU memory: a live-rank mask plus a
 pointer to an abort record in pinned host memory. Captured CUDA graphs therefore see mask changes
@@ -133,7 +133,7 @@ slot. A new gather kernel compacts the slots and blanks inactive or aborted rows
 descriptor the kernels run unchanged (FT-off SASS is identical to main). Details and benchmarks in
 [Late writes](#late-writes-symmetric-memory-and-kernel-design-commits-5-and-6).
 
-#### 6. 1a.8a, 1a.8b: [feat] bind MoE layers to the all-to-all execution descriptor for recovery ([300b5218ef](https://github.com/arusli-nv/TensorRT-LLM/commit/300b5218ef))
+#### 6. 1a.8a, 1a.8b: [feat] bind MoE layers to the all-to-all execution descriptor for recovery ([4d855f706b](https://github.com/arusli-nv/TensorRT-LLM/commit/4d855f706b))
 
 Adds `MoeExecutionState`: one execution descriptor per model, bound to the NVLinkOneSided object of
 every MoE layer before CUDA-graph capture (requires one shared `EPGroupHealth`, see commit 1).
@@ -150,7 +150,7 @@ All-to-all buffers stay mapped for the model's lifetime, so the addresses captur
 stay valid. Since kernels now read the mask from the descriptor, rank-mask mode allows CUDA graphs
 when FT is on (previously rejected).
 
-#### 7. 1b.2a, 1b.4a: [feat] route a lost rank's experts to their replicas after a peer loss ([f6c4a211da](https://github.com/arusli-nv/TensorRT-LLM/commit/f6c4a211da))
+#### 7. 1b.2a, 1b.4a: [feat] route a lost rank's experts to their replicas after a peer loss ([ff9ee2ca3d](https://github.com/arusli-nv/TensorRT-LLM/commit/ff9ee2ca3d))
 
 Uses main's mask-only EPLB API (#15525) to route a lost rank's experts to replicas already resident
 on other GPUs: no weights move, and graphs are untouched.
@@ -164,7 +164,7 @@ on other GPUs: no weights move, and graphs are untouched.
   rank failed, rearms, and writes the mask. Routing must exclude the rank before the mask hides it,
   or kernels would silently drop its tokens.
 
-#### 8. 1b.4a, 1c.4a: [feat] let attention-DP routing skip absent ranks ([77b6d49173](https://github.com/arusli-nv/TensorRT-LLM/commit/77b6d49173))
+#### 8. 1b.4a, 1c.4a: [feat] let attention-DP routing skip absent ranks ([0b7b7dedb3](https://github.com/arusli-nv/TensorRT-LLM/commit/0b7b7dedb3))
 
 Every iteration, the attention-DP scheduler runs a host allgather of each rank's state (its active
 requests and tokens) to decide where new requests go. After a loss, that list has an empty entry
@@ -178,7 +178,7 @@ instead of a list), so no live rank's count shifts to another rank's position.
   ranks vote, so the dead rank's empty entry can't force survivors out of their graphs.
 - With all ranks present, behavior is unchanged.
 
-#### 9. 1d.1: [feat] keep the MPI session serving after a peer loss ([80e7d1f69f](https://github.com/arusli-nv/TensorRT-LLM/commit/80e7d1f69f))
+#### 9. 1d.1: [feat] keep the MPI session serving after a peer loss ([126fac2151](https://github.com/arusli-nv/TensorRT-LLM/commit/126fac2151))
 
 With FT on, the MPI session server on rank 0 treats a dead rank's task failure (a ULFM peer-failure
 error, or `BrokenExecutor` once ULFM reports a failed rank) as a departed peer, not a job failure,
@@ -194,7 +194,7 @@ so the session doesn't tear down the survivors.
   lost a rank.
 - Without FT, nothing changes.
 
-#### 10. 1c.4c: [feat] roll back KV Cache Manager V2 allocations of a discarded step ([ac90e817b4](https://github.com/arusli-nv/TensorRT-LLM/commit/ac90e817b4))
+#### 10. 1c.4c: [feat] roll back KV Cache Manager V2 allocations of a discarded step ([3b4b73baab](https://github.com/arusli-nv/TensorRT-LLM/commit/3b4b73baab))
 
 Adds `revert_prepare_resources()`, which undoes the KV-cache space the scheduler reserved for a step
 whose forward is discarded (the step interrupted by a peer loss), so its redo after recovery starts
@@ -208,7 +208,7 @@ The discarded step's KV writes are overwritten by the redo. KV Cache Manager V2 
 Recurrent-state (linear attention) and sparse-attention managers are rejected at startup; a
 discarded step can't be undone for them by freeing blocks.
 
-#### 11. 1c.4, 1c.4c, 1d.1, 1d.4a: [feat] recover the executor from a WideEP peer loss ([5e292620cc](https://github.com/arusli-nv/TensorRT-LLM/commit/5e292620cc))
+#### 11. 1c.4, 1c.4c, 1d.1, 1d.4a: [feat] recover the executor from a WideEP peer loss ([1f7d4182cf](https://github.com/arusli-nv/TensorRT-LLM/commit/1f7d4182cf))
 
 Adds `PeerLossRecovery`, which hooks into `PyExecutor` and runs the recovery using commits 3–10. At
 startup it validates the configuration and registers with the authority.
@@ -273,13 +273,52 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 
 - Survivors' tokens match a reference run that never used the lost rank, and all decode steps stay
   in the original CUDA graphs (Nsight Systems: no graph captures after the kill).
-- FT overhead vs FT off with the same config: −2.4% (8 requests per GPU), −3.7% (64 per GPU),
-  mostly the new gather kernel (about half of the added MoE-layer time at 8 requests per GPU,
-  about 80% at 64; see [Benchmarks](#benchmarks)).
-- After a loss, the 31 remaining GPUs serve 75.8k tok/s, 98% of their per-GPU throughput before
-  the loss.
+- FT overhead vs FT off with the same config: -1.3% throughput at 8 requests per GPU, -4.9% at 64,
+  almost all of it in the MoE all-to-all, mostly the new gather kernel (see [Evaluation](#evaluation)).
+- After a loss, the 31 remaining GPUs serve 75.7k tok/s at 64 requests per GPU, 98% of their per-GPU
+  throughput before the loss (97–98% across loads).
 - With the overlap scheduler and MTP (production config, not yet supported with FT), the same 32
   GPUs reach 157k tok/s.
+
+## Evaluation
+
+### Where the FT overhead comes from
+
+![FT overhead breakdown](evidence/eval_overhead.png)
+
+Experiment: FT off vs on, same build, config and nodes, at 8 and 64 requests per GPU (decode, 480
+output tokens). Nsight Systems on one rank; medians over about 2,400 decode steps (58 MoE layers
+each) per run.
+
+- The decode step is +1.7% slower at 8 requests per GPU and +5.9% at 64. Almost all of it is
+  in the MoE all-to-all: 58 × the MoE-layer span change (+0.36 ms and +1.17 ms) accounts for the
+  step change (+0.29 ms and +1.30 ms); GPU idle time and the other kernels are unchanged.
+- Per MoE layer, the gather is the main cost: +3.4 µs at 8 requests per GPU and +16.1 µs at 64,
+  growing with load because it copies every received row. Dispatch and combine add 1–2 µs each.
+- Improvement opportunities: the gather's launch layout (its time barely depends on how much it
+  writes: skipping the zeroing of empty rows was measured to save under 1 µs), then fusing it into
+  dispatch. Separately, the GPU is idle 26–31% of every decode step with or
+  without FT, because FT needs the non-overlap scheduler; supporting the overlap scheduler is the
+  larger opportunity.
+
+### Throughput vs load
+
+![Throughput vs load](evidence/eval_load_sweep.png)
+
+Experiment: FT off, FT on, and FT on after a loss (31 survivors), at 8 to 64 concurrent requests
+per GPU (max_batch_size 64; decode, 480 output tokens). Median with min–max of 5 rounds after a
+warmup round.
+
+| Requests per GPU | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|
+| FT off (tok/s) | 14.7k | 27.5k | 49.4k | 84.1k |
+| FT on | 14.5k (-1.3%) | 26.8k (-2.8%) | 47.6k (-3.8%) | 79.9k (-4.9%) |
+| FT on, after a loss (31 GPUs) | 13.6k | 25.4k | 45.1k | 75.7k |
+| After loss, per GPU vs before | 97% | 98% | 98% | 98% |
+
+- Throughput grows almost linearly up to 64 requests per GPU, the configured batch limit.
+- FT's overhead grows with load (-1.3% to -4.9%), as the gather scales with tokens.
+- After a loss, each surviving GPU keeps 97–98% of its throughput at every load.
 
 ## Remaining qualifications
 
@@ -293,7 +332,8 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
   models are rejected at startup; sliding-window attention is unvalidated. Greedy sampling is
   expected: penalties, seeded sampling and multi-token stop words aren't rolled back with a
   discarded step.
-- **Kernel cost:** the gather kernel adds 4–14 µs per MoE layer; fusing or removing it is open.
+- **Kernel cost:** the gather adds 3–16 µs per MoE layer (8–64 requests per GPU); a faster launch layout
+  or fusing it into dispatch is open.
 - **CI:** needs an image with mpi4py 4.1.2; until then the ULFM tests skip. x86 is unverified (only
   aarch64 was available).
 - **Follow-ups:** CFT (needs the R615 driver), Ray, disaggregated serving, repeated failures (1c.6),
@@ -353,19 +393,13 @@ teardown, so the backing memory stays valid.
 
 #### Benchmarks
 
-R1 NVFP4, 32 GB200 GPUs; Nsight Systems on one rank (job `kbench-7900025`); medians per MoE layer
-over about 142k layer executions from CUDA graphs. Sanitize and gather launch with PDL and start
-while dispatch is still running, so their column is the time they add after dispatch ends.
+Same traced runs as [Evaluation](#evaluation): R1 NVFP4, 32 GB200, nsys on one rank, medians per MoE
+layer from CUDA graphs. Sanitize and gather launch with PDL and start while dispatch is still
+running, so their column is the time they add after dispatch ends.
 
 | | Dispatch | Combine | Sanitize (off) / Gather (on), after dispatch | MoE-layer span |
 |---|---|---|---|---|
-| FT off, 8 req/GPU | 13.4 µs | 34.1 µs | 1.7 µs | 82.0 µs |
-| FT on, 8 req/GPU | 14.6 µs | 35.8 µs | 5.1 µs | 88.6 µs (+8%) |
-| FT off, 64 req/GPU | 15.2 µs | 41.3 µs | 1.7 µs | 126.0 µs |
-| FT on, 64 req/GPU | 16.4 µs | 42.7 µs | 16.6 µs | 144.8 µs (+15%) |
-
-- Dispatch and combine changes cost 1–2 µs each (descriptor read, mask checks).
-- The gather is the main cost and grows with batch: +3.4 µs at 8 requests per GPU and +14.9 µs at
-  64, because it copies every row where main's sanitize only marks invalid expert ids in place.
-- End to end, that is −2.4% / −3.7% throughput. A cheaper gather (copy only received rows) or
-  fusing it into dispatch is the main optimization left.
+| FT off, 8 req/GPU | 13.3 µs | 34.0 µs | 1.7 µs | 81.2 µs |
+| FT on, 8 req/GPU | 14.3 µs | 35.7 µs | 5.1 µs | 87.4 µs (+8%) |
+| FT off, 64 req/GPU | 15.3 µs | 41.9 µs | 1.8 µs | 125.2 µs |
+| FT on, 64 req/GPU | 16.5 µs | 42.9 µs | 17.9 µs | 145.3 µs (+16%) |

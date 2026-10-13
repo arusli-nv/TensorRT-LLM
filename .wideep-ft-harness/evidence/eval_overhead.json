@@ -1,0 +1,52 @@
+{
+ "8/off": {
+  "dispatch": 13.28,
+  "fixup_after_dispatch": 1.696,
+  "combine": 34.048,
+  "span": 81.248,
+  "layers": 142100,
+  "step": 16841.813,
+  "gpu_busy": 11606.043,
+  "gpu_idle": 5284.057,
+  "decode_steps": 2433
+ },
+ "8/on": {
+  "dispatch": 14.272,
+  "fixup_after_dispatch": 5.056,
+  "combine": 35.744,
+  "span": 87.424,
+  "layers": 142100,
+  "step": 17134.039,
+  "gpu_busy": 11969.049,
+  "gpu_idle": 5264.694,
+  "decode_steps": 2433
+ },
+ "64/off": {
+  "dispatch": 15.264,
+  "fixup_after_dispatch": 1.76,
+  "combine": 41.888,
+  "span": 125.216,
+  "layers": 143724,
+  "step": 22204.658,
+  "gpu_busy": 16331.568,
+  "gpu_idle": 5804.96,
+  "decode_steps": 2449
+ },
+ "64/on": {
+  "dispatch": 16.544,
+  "fixup_after_dispatch": 17.856,
+  "combine": 42.944,
+  "span": 145.344,
+  "layers": 143724,
+  "step": 23503.732,
+  "gpu_busy": 17534.577,
+  "gpu_idle": 5897.061,
+  "decode_steps": 2449
+ },
+ "_source": {
+  "8/off": "kexp-small-7921296/noft/nsys-rank5.sqlite",
+  "8/on": "kexp-small-7921296/gather/nsys-rank5.sqlite",
+  "64/off": "kexp-prod-7921297/noft/nsys-rank5.sqlite",
+  "64/on": "kexp-prod-7921297/gather/nsys-rank5.sqlite"
+ }
+}

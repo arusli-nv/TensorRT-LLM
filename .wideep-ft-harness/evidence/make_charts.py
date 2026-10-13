@@ -30,11 +30,18 @@ bar(64, "With fault tolerance", xt(0.1), xt(0.34), GREEN, "0.16 – 0.34 s")
 bar(98, "Without (restart)", xt(0.1), xt(173), RED, "81 – 173 s")
 
 # Throughput at production shape: 64 requests per GPU, 9k-token sequences, fp8 KV cache.
-title(186, "Generation throughput (output tokens/s), 64 requests per GPU", "medians of three runs; first three bars: no overlap scheduler, no MTP (required by FT); last bar: production config")
+# FT off / on / after loss: the load sweep's 64-requests-per-GPU point (median of 5 rounds).
+import json, statistics
+sweep = json.load(open("eval_load_sweep.json"))
+off, on, loss = (statistics.median(sweep[m]["64"]) for m in ("noft", "ft", "ft-loss"))
+title(186, "Generation throughput (output tokens/s), 64 requests per GPU",
+      "first three bars: load sweep, median of 5 rounds, no overlap scheduler / no MTP (required by FT); "
+      "last bar: production config, separate run")
 xs = lambda v: LEFT + v / 200000 * (W - LEFT - RIGHT)
-bar(216, "FT off, 32 GPUs", LEFT, xs(82661), GRAY, "82.7k  (baseline)")
-bar(250, "FT on, 32 GPUs", LEFT, xs(79636), BLUE, "79.6k  (−3.7%)")
-bar(284, "FT on, 31 GPUs after a loss", LEFT, xs(75750), "#64b5f6", "75.8k  (98% per GPU of FT on)")
+bar(216, "FT off, 32 GPUs", LEFT, xs(off), GRAY, f"{off / 1e3:.1f}k  (baseline)")
+bar(250, "FT on, 32 GPUs", LEFT, xs(on), BLUE, f"{on / 1e3:.1f}k  ({(on / off - 1) * 100:+.1f}%)")
+bar(284, "FT on, 31 GPUs after a loss", LEFT, xs(loss), "#64b5f6",
+    f"{loss / 1e3:.1f}k  ({(loss / 31) / (on / 32) * 100:.0f}% per GPU of FT on)")
 bar(318, "FT off, overlap + MTP, 32 GPUs", LEFT, xs(157183), "#616161", "157.2k")
 out.append("</svg>")
 open("results.svg", "w").write("\n".join(out))
