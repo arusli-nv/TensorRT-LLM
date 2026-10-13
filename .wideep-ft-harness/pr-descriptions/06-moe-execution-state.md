@@ -1,4 +1,4 @@
-[None][feat] MoE execution state for WideEP recovery
+[None][feat] bind MoE layers to the all-to-all execution descriptor for recovery
 
 ## Description
 

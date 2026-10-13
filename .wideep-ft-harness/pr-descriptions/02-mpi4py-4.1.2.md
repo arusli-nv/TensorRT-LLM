@@ -1,4 +1,4 @@
-[None][infra] upgrade mpi4py to 4.1.2
+[None][infra] upgrade mpi4py to 4.1.2 for ULFM fault tolerance
 
 ## Description
 

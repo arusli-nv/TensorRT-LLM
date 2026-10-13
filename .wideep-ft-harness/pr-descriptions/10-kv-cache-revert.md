@@ -1,4 +1,4 @@
-[None][feat] revert the KV cache allocations of a discarded step
+[None][feat] roll back KV Cache Manager V2 allocations of a discarded step
 
 ## Description
 

@@ -1,4 +1,4 @@
-[None][feat] resident-replica EPLB placement after a peer loss
+[None][feat] route a lost rank's experts to their replicas after a peer loss
 
 ## Description
 

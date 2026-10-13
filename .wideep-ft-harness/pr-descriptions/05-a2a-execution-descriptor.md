@@ -1,4 +1,4 @@
-[None][feat] fault-tolerant execution descriptor for the NVLinkOneSided all-to-all
+[None][feat] add a run-time rank mask and abort to the NVLinkOneSided all-to-all
 
 ## Description
 

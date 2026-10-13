@@ -1,4 +1,4 @@
-[None][feat] WideEP recovery authority
+[None][feat] add an external recovery authority for WideEP peer loss
 
 ## Description
 
