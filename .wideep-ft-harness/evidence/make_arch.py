@@ -158,7 +158,7 @@ def integration():
 
 
 def late_writes():
-    s = Svg(1200, 590)
+    s = Svg(1200, 610)
     s.text(30, 36, "Late writes from a lost rank", 22, anchor="start", weight="bold")
     s.text(30, 60, "One receiver's dispatch workspace; each cell is a token row, numbered by the source rank "
            "that writes it", 13.5, "#666", anchor="start")
@@ -227,8 +227,10 @@ def late_writes():
             s.text(x + k * w + w / 2 - 1.5, y + 22, str(k), 11.5, "#333")
         s.box(x + 2 * w - 3, y - 3, w + 3, 40, "none", DEAD, 3, 2.5)
         x += 6 * w + 30
-    s.text(190, y + 62, "Five separate arrays, not one block per rank; each has one slot per source rank, "
-           "so rank 2's late writes only reach slot 2 of each.", 13, "#555", anchor="start")
+    s.text(190, y + 62, "Separate arrays, each with one slot per source rank: rank 2's late writes only reach "
+           "slot 2 of each.", 13, "#555", anchor="start")
+    s.text(190, y + 82, "Only the payload layout is new; the counters, flags and EPLB stats already had one fixed "
+           "slot per source on main.", 13, "#555", anchor="start")
 
     # The gather kernel turns the fixed regions into the dense expert input.
     s.arrow(x0 + 12 * cw + 26, 305, 790, 305, "gray", 2)

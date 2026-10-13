@@ -333,8 +333,10 @@ A rank can die with writes still in flight into peers' workspaces. The hazard is
 runtime-dependent layout, not rank renumbering: main sizes each source's rows by the step's
 `runtime_max_tokens_per_rank`, so rows move between steps, and a late write can land in a
 survivor's rows. With FT, each source writes into a fixed region sized by `max_num_tokens_per_rank`.
-Everything a dead rank writes (payloads, flags, counters, EPLB stats) stays in storage indexed by
-that rank, which later execution neither reads nor reassigns. Workspaces stay mapped until
+Only the payload layout changes: the receive counters, completion flags and EPLB stats are separate
+arrays that already have one fixed slot per source on main. So everything a dead rank writes
+(payloads, flags, counters, EPLB stats) stays in storage indexed by that rank, which later
+execution neither reads nor reassigns. Workspaces stay mapped until
 teardown, so the backing memory stays valid.
 
 - **Kernels (commit 5):** dispatch and combine read the descriptor, skip masked ranks in every wait
