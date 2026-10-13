@@ -22,6 +22,18 @@ Until this image is in CI, the ULFM unit test of PR 4 and the WideEP integration
 - The image build is the proof that the `TRTLLM_USE_MPI_KVCACHE` patch applies to 4.1.2's `futures/_core.py`: `install_mpi4py.sh` fails if it does not.
 - All existing MPI tests in the pre-merge lists run on the rebuilt image.
 
+Compatibility check before the image rebuild, on one GB200 node (ARM): main's MPI-dependent tests, run once with the image's mpi4py 3.1.5 and once with 4.1.2 built by this script, give identical results.
+
+| Test file | mpi4py 3.1.5 | mpi4py 4.1.2 |
+|---|---|---|
+| `_torch/moe/multi_gpu/test_moe_a2a.py` (`mpi4py.futures` workers) | 19 passed, 9 skipped | 19 passed, 9 skipped |
+| `_torch/moe/multi_gpu/test_moe_a2a_workspace.py` | 8 passed, 8 skipped | 8 passed, 8 skipped |
+| `_torch/executor/kv_cache/test_kvcm2_integration.py` | 165 passed | 165 passed |
+| `_torch/disaggregation/test_disagg_inflight_cancel_gate.py` (`TRTLLM_USE_MPI_KVCACHE` path) | 51 passed | 51 passed |
+| `llmapi/test_mpi_session.py` | 45 passed, 2 failed | 46 passed, 1 failed |
+
+The 3.1.5-only failure is this PR's `test_mpi4py_exposes_ulfm_bindings`. `test_remote_mpi_session[flashinfer_temporary_cleanup]` fails identically on both versions because the test environment's temporary path makes a ZMQ IPC socket path exceed 107 characters. The build was also checked on a second ARM node; no x86 node was available, so the x86 build is first exercised by the image rebuild.
+
 ## PR Checklist
 
 Please review the following before submitting your PR:
