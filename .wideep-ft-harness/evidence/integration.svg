@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="740" font-family="Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="white"/>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6a1b9a"/></marker></defs>
+<text x="20" y="32" font-size="20" fill="#222" text-anchor="start" font-weight="bold">WideEP FT: recovery from one rank loss</text>
+<text x="20" y="54" font-size="13" fill="#555" text-anchor="start" font-weight="normal">Each survivor runs the same steps; the recovery authority is the only decision-maker. [R] reused from main   [N] new</text>
+<rect x="274" y="70" width="309" height="584" rx="8" fill="#fdecea"/>
+<text x="428.33333333333337" y="90" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">1. Cancel the attempt</text>
+<text x="428.33333333333337" y="106" font-size="12" fill="#555" text-anchor="middle" font-weight="normal">each survivor on its own</text>
+<rect x="591" y="70" width="309" height="584" rx="8" fill="#e8f0fe"/>
+<text x="745.0000000000001" y="90" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">2. Install routing and mask</text>
+<text x="745.0000000000001" y="106" font-size="12" fill="#555" text-anchor="middle" font-weight="normal">graph replay paused; authority-driven</text>
+<rect x="907" y="70" width="309" height="584" rx="8" fill="#e6f4ea"/>
+<text x="1061.6666666666667" y="90" font-size="15" fill="#222" text-anchor="middle" font-weight="bold">3. Permission to resume</text>
+<text x="1061.6666666666667" y="106" font-size="12" fill="#555" text-anchor="middle" font-weight="normal">only after every Installed</text>
+<rect x="20" y="116" width="238" height="96" rx="6" fill="#6a1b9a"/>
+<text x="32" y="150" font-size="15" fill="white" text-anchor="start" font-weight="bold">Recovery authority</text>
+<text x="32" y="170" font-size="11.5" fill="white" text-anchor="start" font-weight="normal">separate CPU process [N]</text>
+<rect x="284" y="118" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="296.0" y="159.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Receives Stopped from</text>
+<text x="296.0" y="176.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">every survivor</text>
+<rect x="601" y="118" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="612.6666666666667" y="151.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Propose(generation, survivors)</text>
+<text x="612.6666666666667" y="168.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Checks all Ready digests match</text>
+<text x="612.6666666666667" y="185.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Install</text>
+<rect x="917" y="118" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="929.3333333333334" y="151.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="bold">Commit only after every</text>
+<text x="929.3333333333334" y="168.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="bold">survivor sent Installed</text>
+<text x="929.3333333333334" y="185.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">(otherwise Abort: fail closed)</text>
+<rect x="20" y="224" width="238" height="96" rx="6" fill="#1565c0"/>
+<text x="32" y="258" font-size="15" fill="white" text-anchor="start" font-weight="bold">Executor</text>
+<text x="32" y="278" font-size="11.5" fill="white" text-anchor="start" font-weight="normal">PeerLossRecovery [N]</text>
+<rect x="284" y="226" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="296.0" y="250.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Watcher detects the death</text>
+<text x="296.0" y="267.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Commit gate discards the step</text>
+<text x="296.0" y="284.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">KV Cache Manager V2 rollback</text>
+<text x="296.0" y="301.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">→ Stopped</text>
+<rect x="601" y="226" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="612.6666666666667" y="259.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Placement digest → Ready</text>
+<text x="612.6666666666667" y="276.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">On Install: apply, then</text>
+<text x="612.6666666666667" y="293.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">→ Installed</text>
+<rect x="917" y="226" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="929.3333333333334" y="259.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Resume; redo the step</text>
+<text x="929.3333333333334" y="276.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Dead rank&#x27;s requests fail</text>
+<text x="929.3333333333334" y="293.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">with a retry error</text>
+<rect x="20" y="332" width="238" height="96" rx="6" fill="#1565c0"/>
+<text x="32" y="366" font-size="15" fill="white" text-anchor="start" font-weight="bold">Host collectives</text>
+<text x="32" y="386" font-size="11.5" fill="white" text-anchor="start" font-weight="normal">ULFM survivor communicator [N]</text>
+<rect x="284" y="334" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="296.0" y="358.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Revoke wakes ranks blocked</text>
+<text x="296.0" y="375.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">in host collectives</text>
+<text x="296.0" y="392.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Shrink: survivors agree on</text>
+<text x="296.0" y="409.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">the dead rank</text>
+<rect x="601" y="334" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="612.6666666666667" y="375.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Switch to the survivor</text>
+<text x="612.6666666666667" y="392.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">communicator (rank ids kept)</text>
+<rect x="917" y="334" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="929.3333333333334" y="367.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Per-step allgathers run on</text>
+<text x="929.3333333333334" y="384.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">survivors; dead rank&#x27;s entry</text>
+<text x="929.3333333333334" y="401.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">is empty</text>
+<rect x="20" y="440" width="238" height="96" rx="6" fill="#6a8f3a"/>
+<text x="32" y="474" font-size="15" fill="white" text-anchor="start" font-weight="bold">Routing and membership</text>
+<text x="32" y="494" font-size="11.5" fill="white" text-anchor="start" font-weight="normal">EPLB mask-only API, EPGroupHealth [R]</text>
+<rect x="284" y="442" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="296.0" y="492.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Unchanged</text>
+<rect x="601" y="442" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="612.6666666666667" y="475.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">reconfigure_mask_only(dead):</text>
+<text x="612.6666666666667" y="492.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">its experts → their replicas [R]</text>
+<text x="612.6666666666667" y="509.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">EPGroupHealth marks it failed [R]</text>
+<rect x="917" y="442" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="929.3333333333334" y="483.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Tokens for the dead rank&#x27;s</text>
+<text x="929.3333333333334" y="500.5" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">experts go to replicas</text>
+<rect x="20" y="548" width="238" height="96" rx="6" fill="#ef6c00"/>
+<text x="32" y="582" font-size="15" fill="white" text-anchor="start" font-weight="bold">GPU all-to-all</text>
+<text x="32" y="602" font-size="11.5" fill="white" text-anchor="start" font-weight="normal">graph-visible descriptor [N]</text>
+<rect x="284" y="550" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="296.0" y="583.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">Abort flag (pinned host memory)</text>
+<text x="296.0" y="600.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">releases spinning kernels;</text>
+<text x="296.0" y="617.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">the step&#x27;s output is invalid</text>
+<rect x="601" y="550" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="612.6666666666667" y="583.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">rearm(): reset round counters</text>
+<text x="612.6666666666667" y="600.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">install_mask(): new mask</text>
+<text x="612.6666666666667" y="617.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">written in place</text>
+<rect x="917" y="550" width="289" height="92" rx="6" fill="white" stroke="#ccc"/>
+<text x="929.3333333333334" y="583.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="bold">Same CUDA graphs replay</text>
+<text x="929.3333333333334" y="600.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">on N-1 ranks; kernels skip</text>
+<text x="929.3333333333334" y="617.0" font-size="12.5" fill="#222" text-anchor="start" font-weight="normal">the masked rank</text>
+<line x1="547" y1="226" x2="547" y2="210" stroke="#6a1b9a" stroke-width="2.5" marker-end="url(#a)"/>
+<line x1="1180" y1="210" x2="1180" y2="226" stroke="#6a1b9a" stroke-width="2.5" marker-end="url(#a)"/>
+<text x="20" y="718" font-size="12.5" fill="#555" text-anchor="start" font-weight="normal">Messages are HMAC-signed ZeroMQ: Stopped → Propose → Ready → Install → Installed → Commit. Any violation, mismatch or timeout sends Abort to every worker.</text>
+<text x="20" y="736" font-size="12.5" fill="#555" text-anchor="start" font-weight="normal">Later, #15785&#x27;s evidence transport can replace the watcher as the detector (Executor lane, phase 1); the authority stays the only decision-maker.</text>
+</svg>
