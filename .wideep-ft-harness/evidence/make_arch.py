@@ -63,6 +63,7 @@ class Svg:
 def integration():
     s = Svg(1200, 760)
     s.text(30, 36, "WideEP FT architecture", 22, anchor="start", weight="bold")
+    s.chip(800, 18, 100, 26, "existing", "#1a1a1a")
     s.chip(910, 18, 80, 26, "lost", DEAD, filled=True)
     s.chip(1000, 18, 90, 26, "reused", REUSED, filled=True)
     s.chip(1100, 18, 70, 26, "new", NEW, filled=True)
@@ -138,8 +139,7 @@ def integration():
          "Stopped"),
         ("2  Install (replay paused)", ["Shrink: agree on lost rank", "EPLB: route to replicas",
                                         "write mask in place"], "Propose · Ready · Install · Installed"),
-        ("3  Permission to resume", ["after every survivor's Installed", "same CUDA graphs",
-                                     "any failure: Abort, job ends"], "Commit"),
+        ("3  Permission to resume", ["after every survivor's Installed", "same CUDA graphs"], "Commit"),
     ]
     w = 365
     for i, (title, rows, msgs) in enumerate(phases):
@@ -154,6 +154,8 @@ def integration():
             s.text(x + 38, py + 52 + j * 19, r, 13, "#333", anchor="start")
         s.text(x + w / 2 + 10, py + ph + 24, msgs, 13, "#555", weight="bold", italic=True)
     s.text(30, 583, "Recovery", 15, "#444", anchor="start", weight="bold")
+    s.text(1170, 583, "any failure in any phase: Abort to every worker, job ends as without FT", 13,
+           "#d32f2f", anchor="end", weight="bold")
     return s.render()
 
 
