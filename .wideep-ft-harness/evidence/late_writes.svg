@@ -1,127 +1,159 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="700" font-family="Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" font-family="Helvetica, Arial, sans-serif">
 <rect width="100%" height="100%" fill="white"/>
-<defs><pattern id="h" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#e0e0e0"/><line x1="0" y1="0" x2="0" y2="8" stroke="#9e9e9e" stroke-width="3"/></pattern><marker id="r" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#c62828"/></marker></defs>
-<text x="20" y="32" font-size="20" fill="#222" text-anchor="start" font-weight="bold">Late writes from a dead rank: fixed per-source regions</text>
-<text x="20" y="54" font-size="13" fill="#555" text-anchor="start" font-weight="normal">One receiver&#x27;s dispatch workspace (symmetric memory, written by peers over NVLink). Each cell is one token row; color = source rank that owns it.</text>
-<text x="204" y="122" font-size="15" fill="#222" text-anchor="end" font-weight="bold">Main, step n</text>
-<rect x="220" y="100" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="248.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="278" y="100" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="306.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="336" y="100" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="364.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="394" y="100" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="422.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="452" y="100" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="480.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="510" y="100" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="538.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="568" y="100" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="596.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="626" y="100" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="654.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="684" y="100" width="55" height="34" rx="3" fill="#ffcc80"/>
-<text x="712.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="742" y="100" width="55" height="34" rx="3" fill="#ffcc80"/>
-<text x="770.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="800" y="100" width="55" height="34" rx="3" fill="#ffcc80"/>
-<text x="828.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="858" y="100" width="55" height="34" rx="3" fill="#ffcc80"/>
-<text x="886.0" y="122" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<text x="930" y="122" font-size="13" fill="#444" text-anchor="start" font-weight="normal">runtime_max_tokens_per_rank = 4</text>
-<text x="204" y="197" font-size="15" fill="#222" text-anchor="end" font-weight="bold">Main, step n+1</text>
-<rect x="220" y="175" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="248.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="278" y="175" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="306.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="336" y="175" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="364.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="394" y="175" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="422.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="452" y="175" width="55" height="34" rx="3" fill="#ffcc80"/>
-<text x="480.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="510" y="175" width="55" height="34" rx="3" fill="#ffcc80"/>
-<text x="538.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="568" y="175" width="55" height="34" rx="3" fill="#ce93d8"/>
-<text x="596.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">3</text>
-<rect x="626" y="175" width="55" height="34" rx="3" fill="#ce93d8"/>
-<text x="654.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">3</text>
-<rect x="684" y="175" width="55" height="34" rx="3" fill="#80cbc4"/>
-<text x="712.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">4</text>
-<rect x="742" y="175" width="55" height="34" rx="3" fill="#80cbc4"/>
-<text x="770.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">4</text>
-<rect x="800" y="175" width="55" height="34" rx="3" fill="#f48fb1"/>
-<text x="828.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">5</text>
-<rect x="858" y="175" width="55" height="34" rx="3" fill="#f48fb1"/>
-<text x="886.0" y="197" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">5</text>
-<text x="930" y="197" font-size="13" fill="#444" text-anchor="start" font-weight="normal">runtime_max_tokens_per_rank = 2</text>
-<text x="204" y="312" font-size="15" fill="#222" text-anchor="end" font-weight="bold">FT, every step</text>
-<rect x="220" y="290" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="248.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="278" y="290" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="306.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="336" y="290" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="364.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="394" y="290" width="55" height="34" rx="3" fill="#90caf9"/>
-<text x="422.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">0</text>
-<rect x="452" y="290" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="480.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="510" y="290" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="538.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="568" y="290" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="596.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="626" y="290" width="55" height="34" rx="3" fill="#a5d6a7"/>
-<text x="654.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">1</text>
-<rect x="684" y="290" width="55" height="34" rx="3" fill="url(#h)"/>
-<text x="712.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="742" y="290" width="55" height="34" rx="3" fill="url(#h)"/>
-<text x="770.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="800" y="290" width="55" height="34" rx="3" fill="url(#h)"/>
-<text x="828.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<rect x="858" y="290" width="55" height="34" rx="3" fill="url(#h)"/>
-<text x="886.0" y="312" font-size="14" fill="#222" text-anchor="middle" font-weight="bold">2</text>
-<text x="930" y="312" font-size="13" fill="#444" text-anchor="start" font-weight="normal">max_num_tokens_per_rank = 4 (fixed)</text>
-<text x="248.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 0</text>
-<text x="306.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 1</text>
-<text x="364.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 2</text>
-<text x="422.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 3</text>
-<text x="480.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 4</text>
-<text x="538.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 5</text>
-<text x="596.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 6</text>
-<text x="654.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 7</text>
-<text x="712.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 8</text>
-<text x="770.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 9</text>
-<text x="828.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 10</text>
-<text x="886.0" y="92" font-size="10.5" fill="#888" text-anchor="middle" font-weight="normal">row 11</text>
-<line x1="713.0" y1="136" x2="713.0" y2="171" stroke="#c62828" stroke-width="3" marker-end="url(#r)"/>
-<rect x="682" y="173" width="59" height="38" fill="none" stroke="#c62828" stroke-width="3" rx="4"/>
-<text x="220" y="233" font-size="13" fill="#c62828" text-anchor="start" font-weight="bold">Dead rank 2&#x27;s in-flight write, aimed at row 8 in step n, lands in rank 4&#x27;s row in step n+1: it corrupts a survivor&#x27;s data.</text>
-<text x="220" y="348" font-size="13" fill="#2e7d32" text-anchor="start" font-weight="bold">Rank 2&#x27;s region (hatched) is never reassigned or read after it dies: its late writes stay there.</text>
-<text x="20" y="400" font-size="16" fill="#222" text-anchor="start" font-weight="bold">Everything source k writes into a peer&#x27;s workspace</text>
-<rect x="20" y="418" width="1200" height="32" fill="#eceff1" stroke="#ddd"/>
-<text x="30" y="439" font-size="13" fill="#222" text-anchor="start" font-weight="bold">Written by source k</text>
-<text x="330" y="439" font-size="13" fill="#222" text-anchor="start" font-weight="bold">Location in the peer</text>
-<text x="780" y="439" font-size="13" fill="#222" text-anchor="start" font-weight="bold">After rank k is lost</text>
-<rect x="20" y="450" width="1200" height="32" fill="#fafafa" stroke="#ddd"/>
-<text x="30" y="471" font-size="13" fill="#222" text-anchor="start" font-weight="normal">Dispatch payloads</text>
-<text x="330" y="471" font-size="13" fill="#222" text-anchor="start" font-weight="normal">fixed region k: [source][payload][max_num_tokens_per_rank]</text>
-<text x="780" y="471" font-size="13" fill="#222" text-anchor="start" font-weight="normal">gather skips masked sources; region never reassigned</text>
-<rect x="20" y="482" width="1200" height="32" fill="white" stroke="#ddd"/>
-<text x="30" y="503" font-size="13" fill="#222" text-anchor="start" font-weight="normal">Dispatch / combine completion flags</text>
-<text x="330" y="503" font-size="13" fill="#222" text-anchor="start" font-weight="normal">word k of each flag array</text>
-<text x="780" y="503" font-size="13" fill="#222" text-anchor="start" font-weight="normal">masked sources are never waited on</text>
-<rect x="20" y="514" width="1200" height="32" fill="#fafafa" stroke="#ddd"/>
-<text x="30" y="535" font-size="13" fill="#222" text-anchor="start" font-weight="normal">Receive counters (two parities)</text>
-<text x="330" y="535" font-size="13" fill="#222" text-anchor="start" font-weight="normal">word k of each parity</text>
-<text x="780" y="535" font-size="13" fill="#222" text-anchor="start" font-weight="normal">not read for masked sources</text>
-<rect x="20" y="546" width="1200" height="32" fill="white" stroke="#ddd"/>
-<text x="30" y="567" font-size="13" fill="#222" text-anchor="start" font-weight="normal">EPLB gathered statistics</text>
-<text x="330" y="567" font-size="13" fill="#222" text-anchor="start" font-weight="normal">row k</text>
-<text x="780" y="567" font-size="13" fill="#222" text-anchor="start" font-weight="normal">ignored for masked sources</text>
-<rect x="20" y="578" width="1200" height="32" fill="#fafafa" stroke="#ddd"/>
-<text x="30" y="599" font-size="13" fill="#222" text-anchor="start" font-weight="normal">Combine outputs</text>
-<text x="330" y="599" font-size="13" fill="#222" text-anchor="start" font-weight="normal">none: combine pulls from peers</text>
-<text x="780" y="599" font-size="13" fill="#222" text-anchor="start" font-weight="normal">—</text>
-<text x="20" y="640" font-size="13" fill="#333" text-anchor="start" font-weight="normal">Backing memory stays valid: bound workspaces stay mapped until model teardown, so late writes never hit freed or reused memory.</text>
-<text x="20" y="662" font-size="13" fill="#333" text-anchor="start" font-weight="normal">Gather kernel (new): packs valid rows of the fixed regions into the dense input the expert GEMMs expect; masked or aborted rows become expert id -1 with zero data.</text>
+<defs>
+<marker id="blue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#1565c0"/></marker>
+<marker id="purple" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#6a1b9a"/></marker>
+<marker id="orange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#e65100"/></marker>
+<marker id="red" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#c62828"/></marker>
+<marker id="gray" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#555"/></marker>
+<marker id="green" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L11,5.5 L0,11 z" fill="#558b2f"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#eeeeee"/><line x1="0" y1="0" x2="0" y2="8" stroke="#bdbdbd" stroke-width="4"/></pattern>
+</defs>
+<text x="30" y="36" font-size="22" fill="#222" text-anchor="start" font-weight="bold">Late writes from a lost rank</text>
+<text x="30" y="60" font-size="13.5" fill="#666" text-anchor="start" font-weight="normal">One receiver&#x27;s all-to-all workspace; each cell is a token row, colored by the source rank that writes it</text>
+<rect x="20" y="80" width="560" height="250" rx="10" fill="#fff" stroke="#e0e0e0" stroke-width="1.5"/>
+<text x="40" y="110" font-size="17" fill="#c62828" text-anchor="start" font-weight="bold">Main: rows move every step</text>
+<rect x="130" y="140" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="147.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="166" y="140" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="183.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="202" y="140" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="219.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="238" y="140" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="255.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="274" y="140" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="291.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="310" y="140" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="327.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="346" y="140" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="363.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="382" y="140" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="399.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="418" y="140" width="33" height="36" rx="3" fill="#ffcc80" stroke="white" stroke-width="1"/>
+<text x="435.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="454" y="140" width="33" height="36" rx="3" fill="#ffcc80" stroke="white" stroke-width="1"/>
+<text x="471.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="490" y="140" width="33" height="36" rx="3" fill="#ffcc80" stroke="white" stroke-width="1"/>
+<text x="507.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="526" y="140" width="33" height="36" rx="3" fill="#ffcc80" stroke="white" stroke-width="1"/>
+<text x="543.0" y="164" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<text x="118" y="164" font-size="13.5" fill="#444" text-anchor="end" font-weight="bold">step n</text>
+<rect x="130" y="250" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="147.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="166" y="250" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="183.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="202" y="250" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="219.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="238" y="250" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="255.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="274" y="250" width="33" height="36" rx="3" fill="#ffcc80" stroke="white" stroke-width="1"/>
+<text x="291.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="310" y="250" width="33" height="36" rx="3" fill="#ffcc80" stroke="white" stroke-width="1"/>
+<text x="327.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="346" y="250" width="33" height="36" rx="3" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<text x="363.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">3</text>
+<rect x="382" y="250" width="33" height="36" rx="3" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<text x="399.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">3</text>
+<rect x="418" y="250" width="33" height="36" rx="3" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<text x="435.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">4</text>
+<rect x="454" y="250" width="33" height="36" rx="3" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<text x="471.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">4</text>
+<rect x="490" y="250" width="33" height="36" rx="3" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="507.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">5</text>
+<rect x="526" y="250" width="33" height="36" rx="3" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="543.0" y="274" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">5</text>
+<text x="118" y="274" font-size="13.5" fill="#444" text-anchor="end" font-weight="bold">step n+1</text>
+<rect x="500" y="190" width="64" height="44" rx="6" fill="#ffebee" stroke="#c62828" stroke-width="2"/>
+<text x="532" y="218" font-size="13" fill="#c62828" text-anchor="middle" font-weight="bold">rank 2</text>
+<line x1="549" y1="187" x2="567" y2="205" stroke="#c62828" stroke-width="4"/>
+<line x1="549" y1="205" x2="567" y2="187" stroke="#c62828" stroke-width="4"/>
+<line x1="500" y1="214" x2="442.0" y2="247" stroke="#c62828" stroke-width="3" marker-end="url(#red)"/>
+<rect x="415" y="247" width="39" height="42" rx="4" fill="none" stroke="#c62828" stroke-width="3"/>
+<text x="436.0" y="312" font-size="13.5" fill="#c62828" text-anchor="middle" font-weight="bold">lands in rank 4&#x27;s row</text>
+<rect x="620" y="80" width="560" height="250" rx="10" fill="#fff" stroke="#e0e0e0" stroke-width="1.5"/>
+<text x="640" y="110" font-size="17" fill="#2e7d32" text-anchor="start" font-weight="bold">FT: a fixed region per source</text>
+<rect x="720" y="195" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="737.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="756" y="195" width="33" height="36" rx="3" fill="#90caf9" stroke="white" stroke-width="1"/>
+<text x="773.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">0</text>
+<rect x="792" y="195" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="809.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="828" y="195" width="33" height="36" rx="3" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<text x="845.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">1</text>
+<rect x="864" y="195" width="33" height="36" rx="3" fill="url(#hatch)" stroke="white" stroke-width="1"/>
+<text x="881.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="900" y="195" width="33" height="36" rx="3" fill="url(#hatch)" stroke="white" stroke-width="1"/>
+<text x="917.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">2</text>
+<rect x="936" y="195" width="33" height="36" rx="3" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<text x="953.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">3</text>
+<rect x="972" y="195" width="33" height="36" rx="3" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<text x="989.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">3</text>
+<rect x="1008" y="195" width="33" height="36" rx="3" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<text x="1025.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">4</text>
+<rect x="1044" y="195" width="33" height="36" rx="3" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<text x="1061.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">4</text>
+<rect x="1080" y="195" width="33" height="36" rx="3" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="1097.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">5</text>
+<rect x="1116" y="195" width="33" height="36" rx="3" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="1133.0" y="219" font-size="14" fill="#333" text-anchor="middle" font-weight="bold">5</text>
+<text x="708" y="219" font-size="13.5" fill="#444" text-anchor="end" font-weight="bold">every step</text>
+<rect x="1100" y="120" width="64" height="44" rx="6" fill="#ffebee" stroke="#c62828" stroke-width="2"/>
+<text x="1132" y="148" font-size="13" fill="#c62828" text-anchor="middle" font-weight="bold">rank 2</text>
+<line x1="1149" y1="117" x2="1167" y2="135" stroke="#c62828" stroke-width="4"/>
+<line x1="1149" y1="135" x2="1167" y2="117" stroke="#c62828" stroke-width="4"/>
+<line x1="1100" y1="150" x2="898" y2="192" stroke="#c62828" stroke-width="3" marker-end="url(#red)"/>
+<text x="900" y="260" font-size="13.5" fill="#2e7d32" text-anchor="middle" font-weight="bold">stays in its own region,</text>
+<text x="900" y="278" font-size="13.5" fill="#2e7d32" text-anchor="middle" font-weight="bold">which is never read or reused</text>
+<text x="30" y="380" font-size="17" fill="#222" text-anchor="start" font-weight="bold">Everything rank k writes into a peer is indexed by k</text>
+<text x="258.0" y="396" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<text x="258.0" y="582" font-size="12.5" fill="#666" text-anchor="middle" font-weight="normal">src 0</text>
+<text x="314.0" y="396" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<text x="314.0" y="582" font-size="12.5" fill="#666" text-anchor="middle" font-weight="normal">src 1</text>
+<text x="370.0" y="396" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<text x="370.0" y="582" font-size="12.5" fill="#666" text-anchor="middle" font-weight="normal">src 2</text>
+<text x="426.0" y="396" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<text x="426.0" y="582" font-size="12.5" fill="#666" text-anchor="middle" font-weight="normal">src 3</text>
+<text x="482.0" y="396" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<text x="482.0" y="582" font-size="12.5" fill="#666" text-anchor="middle" font-weight="normal">src 4</text>
+<text x="538.0" y="396" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<text x="538.0" y="582" font-size="12.5" fill="#666" text-anchor="middle" font-weight="normal">src 5</text>
+<text x="216" y="426" font-size="14" fill="#444" text-anchor="end" font-weight="normal">payloads</text>
+<rect x="230" y="403" width="52" height="34" rx="4" fill="#90caf9" stroke="white" stroke-width="1"/>
+<rect x="286" y="403" width="52" height="34" rx="4" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<rect x="342" y="403" width="52" height="34" rx="4" fill="url(#hatch)" stroke="white" stroke-width="1"/>
+<rect x="398" y="403" width="52" height="34" rx="4" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<rect x="454" y="403" width="52" height="34" rx="4" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<rect x="510" y="403" width="52" height="34" rx="4" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="216" y="466" font-size="14" fill="#444" text-anchor="end" font-weight="normal">completion flags</text>
+<rect x="230" y="443" width="52" height="34" rx="4" fill="#90caf9" stroke="white" stroke-width="1"/>
+<rect x="286" y="443" width="52" height="34" rx="4" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<rect x="342" y="443" width="52" height="34" rx="4" fill="url(#hatch)" stroke="white" stroke-width="1"/>
+<rect x="398" y="443" width="52" height="34" rx="4" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<rect x="454" y="443" width="52" height="34" rx="4" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<rect x="510" y="443" width="52" height="34" rx="4" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="216" y="506" font-size="14" fill="#444" text-anchor="end" font-weight="normal">receive counters</text>
+<rect x="230" y="483" width="52" height="34" rx="4" fill="#90caf9" stroke="white" stroke-width="1"/>
+<rect x="286" y="483" width="52" height="34" rx="4" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<rect x="342" y="483" width="52" height="34" rx="4" fill="url(#hatch)" stroke="white" stroke-width="1"/>
+<rect x="398" y="483" width="52" height="34" rx="4" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<rect x="454" y="483" width="52" height="34" rx="4" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<rect x="510" y="483" width="52" height="34" rx="4" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<text x="216" y="546" font-size="14" fill="#444" text-anchor="end" font-weight="normal">EPLB statistics</text>
+<rect x="230" y="523" width="52" height="34" rx="4" fill="#90caf9" stroke="white" stroke-width="1"/>
+<rect x="286" y="523" width="52" height="34" rx="4" fill="#a5d6a7" stroke="white" stroke-width="1"/>
+<rect x="342" y="523" width="52" height="34" rx="4" fill="url(#hatch)" stroke="white" stroke-width="1"/>
+<rect x="398" y="523" width="52" height="34" rx="4" fill="#ce93d8" stroke="white" stroke-width="1"/>
+<rect x="454" y="523" width="52" height="34" rx="4" fill="#80cbc4" stroke="white" stroke-width="1"/>
+<rect x="510" y="523" width="52" height="34" rx="4" fill="#f48fb1" stroke="white" stroke-width="1"/>
+<rect x="338" y="398" width="60" height="164" rx="6" fill="none" stroke="#c62828" stroke-width="2.5"/>
+<line x1="576" y1="480" x2="640" y2="480" stroke="#e65100" stroke-width="3" marker-end="url(#orange)"/>
+<rect x="645" y="450" width="150" height="60" rx="6" fill="#e65100" stroke="#e65100" stroke-width="2"/>
+<text x="720.0" y="478.0" font-size="14" fill="white" text-anchor="middle" font-weight="bold">gather</text>
+<text x="720.0" y="495.0" font-size="11.5" fill="white" text-anchor="middle" font-weight="normal">skips lost rank</text>
+<line x1="797" y1="480" x2="860" y2="480" stroke="#e65100" stroke-width="3" marker-end="url(#orange)"/>
+<rect x="865" y="450" width="170" height="60" rx="6" fill="white" stroke="#e65100" stroke-width="2"/>
+<text x="950.0" y="478.0" font-size="14" fill="#e65100" text-anchor="middle" font-weight="bold">expert GEMMs</text>
+<text x="950.0" y="495.0" font-size="11.5" fill="#e65100" text-anchor="middle" font-weight="normal">dense input</text>
+<text x="840" y="550" font-size="13" fill="#444" text-anchor="middle" font-weight="normal">Workspaces stay mapped until teardown,</text>
+<text x="840" y="568" font-size="13" fill="#444" text-anchor="middle" font-weight="normal">so late writes never hit freed memory.</text>
 </svg>
