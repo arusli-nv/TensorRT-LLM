@@ -262,7 +262,7 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 - **Tests:** CPU and GPU unit tests pass on the current series; the 4-GPU integration test
   (DeepSeek-V3-Lite, kill idle and mid-step) last passed on an earlier tip of the series.
 - **Build measured:** EP32 runs used a wheel from an earlier tip of the series; kernels are the same,
-  host code differs by the commit 4 fix (in-flight kills on the fixed code: 4 of 4 passed).
+  host code differs by the commit 4 fix (in-flight kills on the fixed code: 7 of 7 passed).
 
 ### Failover
 
@@ -270,16 +270,17 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 
 ![Without FT: teardown and restart](evidence/eval_noft_failover.png)
 
-DeepSeek-R1 NVFP4, 32 GB200, rank 2 SIGKILLed. With FT: 3 idle and 4 in-flight kills, wall-clock
+DeepSeek-R1 NVFP4, 32 GB200, rank 2 SIGKILLed. With FT: 3 idle and 3 in-flight kills, wall-clock
 markers at each step on every survivor (median shown). Without FT: 2 kills and 2 clean restarts,
 plain mpirun.
 
-- With FT, survivors serve again 28–94 ms after the kill; detection and Shrink are most of it.
+- With FT, survivors serve again 28–94 ms after the kill (in-flight kills 31–37 ms); detection and Shrink are most of it.
   The authority waits for the slowest survivor: in idle kill 2 one GPU still had work queued and
   drained 65 ms after the others (not yet traced; likely the rest of an in-progress step).
-- The first new token reaches the client 0.23–0.29 s after the kill. Most of that comes after
+- A request sent right after the kill gets its first token 0.23–0.29 s after the kill, idle or
+  in flight. Most of that comes after
   recovery; a no-kill time-to-first-token was not measured, so it is not split further.
-- Requests in flight at the kill finish with exact tokens (4 of 4 runs); the lost rank's own
+- Requests in flight at the kill finish with exact tokens (3 of 3 runs); the lost rank's own
   request gets the retry error.
 - Without FT, nothing tears the job down: after a kill it hung for over 13 minutes until stopped.
   Once terminated, every node is clean within 1.5 s; the restart then takes 108–120 s, about half

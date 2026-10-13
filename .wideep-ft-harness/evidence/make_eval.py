@@ -115,7 +115,7 @@ def ft_recovery(run: str) -> dict | None:
 def failover_chart(runs: str) -> None:
     cases = [(f"idle kill {i}", f"{runs}/failover-7923692/ft-idle-{i}") for i in (1, 2, 3)]
     cases += [(f"in-flight kill {i}", d) for i, d in
-              enumerate(sorted(glob.glob(f"{runs}/inflight-fix-*/inflight-*")), 1)]
+              enumerate(sorted(glob.glob(f"{runs}/inflight-probe-*/inflight-*")), 1)]
     rows = [(label, ft_recovery(d)) for label, d in cases]
     rows = [(label, r) for label, r in rows if r is not None]
     short = ["detect + stop", "Shrink", "GPU drain + KV rollback", "authority: prepare",
