@@ -6,7 +6,7 @@ Attention-DP routing assumes every TP rank answers every host exchange. After a 
 
 - `ADPRouter.gather_all_rank_states` drops absent ranks. Per-rank request and token counts become dicts keyed by logical rank, in `adp_router.py`, `request_utils.py` and the executor.
 - Before any router runs, `ADPRouter.split_unservable_requests` removes the requests strictly pinned to a rank that is not serving, and `PyExecutor._fail_unservable_requests` answers them with the error "Attention DP rank N is not serving". Every rank routes the same requests, so every rank reaches the response collective. `can_process_attention_dp_request` lets such a request leave the waiting queue so that it can be failed. `DefaultADPRouter` load balances a relaxed pin to a rank that is not serving.
-- Admission counts an absent rank as full, so it never exceeds what the serving ranks hold.
+- Admission capacity counts only serving ranks, so it never exceeds what they can hold.
 - The batch-size exchange in `_can_queue` passes a fill value, so an absent rank does not veto the forward, and the CUDA graph vote in `CUDAGraphRunner` ignores absent ranks.
 
 Recovery requires `DefaultADPRouter` and rejects attention-DP balancing and a KV cache transceiver, so the balance exchange, the fetch-status gather and the KV pool rebalance stay as on main.
