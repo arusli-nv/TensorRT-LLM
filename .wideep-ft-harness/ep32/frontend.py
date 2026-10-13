@@ -96,6 +96,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--victim", type=int, default=2)
+    parser.add_argument("--signal", default="KILL", help="signal sent to the victim, e.g. STOP to freeze it")
     parser.add_argument("--no-kill", action="store_true", help="healthy run only")
     parser.add_argument("--reference", type=Path, help="result.json of the same-routing healthy run")
     parser.add_argument("--inflight-after", type=float,
@@ -104,6 +105,9 @@ def main() -> None:
     parser.add_argument("--bench-tokens", type=int, default=480)
     parser.add_argument("--load-kill", type=float, metavar="S",
                         help="kill S seconds into a full load of long, chunk-prefilled prompts")
+    parser.add_argument("--load-per-rank", type=int, default=8)
+    parser.add_argument("--shared-prefix", action="store_true",
+                        help="load prompts share their long prefix, so block reuse hits it")
     parser.add_argument("--degraded-bench", type=int, metavar="PER_RANK",
                         help="after an idle-mode recovery, benchmark the survivors")
     parser.add_argument("--bench", type=int, metavar="PER_RANK",
@@ -123,7 +127,7 @@ def main() -> None:
         if args.trigger is None:
             pid = find_worker(args.victim)
             result["victim_pid"] = pid
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, getattr(signal, f"SIG{args.signal}"))
             result["kill_wall_s"] = time.time()
             return time.monotonic()
         # The victim may run on another node; it logs a line right before killing itself.
@@ -159,8 +163,11 @@ def main() -> None:
         if args.load_kill is not None:
             # About 400 prompt tokens, so prefill spans several chunks of max_num_tokens.
             filler = " ".join(f"item{i}" for i in range(130))
-            requests = [(f"Request {i} on rank {rank}. {filler}. The capital of France is", "", rank)
-                        for rank in range(WORLD) for i in range(args.bench or 8)]
+            prompt = ("{filler}. Request {i} on rank {rank}. The capital of France is"
+                      if args.shared_prefix else
+                      "Request {i} on rank {rank}. {filler}. The capital of France is")
+            requests = [(prompt.format(filler=filler, i=i, rank=rank), "", rank)
+                        for rank in range(WORLD) for i in range(args.load_per_rank)]
             pending = submit(llm, requests, 64)
             time.sleep(args.load_kill)
             killed = kill_victim()
