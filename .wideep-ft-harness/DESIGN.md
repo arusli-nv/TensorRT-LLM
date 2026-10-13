@@ -286,39 +286,29 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 
 ![FT overhead breakdown](evidence/eval_overhead.png)
 
-Experiment: FT off vs on, same build, config and nodes, at 8 and 64 requests per GPU (decode, 480
-output tokens). Nsight Systems on one rank; medians over about 2,400 decode steps (58 MoE layers
-each) per run.
+FT off vs on, same build, config and nodes, at 8 and 64 requests per GPU; Nsight Systems on one
+rank, medians over about 2,400 decode steps.
 
-- The decode step is +1.7% slower at 8 requests per GPU and +5.9% at 64. Almost all of it is
-  in the MoE all-to-all: 58 × the MoE-layer span change (+0.36 ms and +1.17 ms) accounts for the
-  step change (+0.29 ms and +1.30 ms); GPU idle time and the other kernels are unchanged.
-- Per MoE layer, the gather is the main cost: +3.4 µs at 8 requests per GPU and +16.1 µs at 64,
-  growing with load because it copies every received row. Dispatch and combine add 1–2 µs each.
-- Improvement opportunities: the gather's launch layout (its time barely depends on how much it
-  writes: skipping the zeroing of empty rows was measured to save under 1 µs), then fusing it into
-  dispatch. Separately, the GPU is idle 26–31% of every decode step with or
-  without FT, because FT needs the non-overlap scheduler; supporting the overlap scheduler is the
-  larger opportunity.
+- All of FT's extra time is in the MoE all-to-all; attention, the expert GEMMs and host work are
+  unchanged.
+- The gather is most of it and grows with load because it copies every received row. Skipping its
+  zeroing of empty rows saves under 1 µs, so the next steps are its launch layout or fusing it into
+  dispatch.
+- The larger cost of FT today is indirect: it requires the non-overlap scheduler, which leaves the
+  GPU idle for a quarter to a third of every step (gray), with or without FT.
 
 ### Throughput vs load
 
 ![Throughput vs load](evidence/eval_load_sweep.png)
 
-Experiment: FT off, FT on, and FT on after a loss (31 survivors), at 8 to 64 concurrent requests
-per GPU (max_batch_size 64; decode, 480 output tokens). Median with min–max of 5 rounds after a
-warmup round.
+FT off, FT on, and FT on after a loss (31 survivors), at 8 to 64 requests per GPU
+(max_batch_size 64, decode); median and min–max of 5 rounds after a warmup round.
 
-| Requests per GPU | 8 | 16 | 32 | 64 |
-|---|---|---|---|---|
-| FT off (tok/s) | 14.7k | 27.5k | 49.4k | 84.1k |
-| FT on | 14.5k (-1.3%) | 26.8k (-2.8%) | 47.6k (-3.8%) | 79.9k (-4.9%) |
-| FT on, after a loss (31 GPUs) | 13.6k | 25.4k | 45.1k | 75.7k |
-| After loss, per GPU vs before | 97% | 98% | 98% | 98% |
-
-- Throughput grows almost linearly up to 64 requests per GPU, the configured batch limit.
-- FT's overhead grows with load (-1.3% to -4.9%), as the gather scales with tokens.
-- After a loss, each surviving GPU keeps 97–98% of its throughput at every load.
+- Throughput still grows almost linearly at 64 requests per GPU: in this configuration the batch
+  limit, not the GPUs, caps it.
+- FT's overhead grows with load because the gather scales with tokens.
+- Losing a rank costs about that rank's share and no more: each survivor keeps about 98% of its
+  throughput at every load.
 
 ## Remaining qualifications
 
