@@ -52,7 +52,7 @@ standalone fix; 10 depends only on main. Whole series as one diff:
 | 8 | [29e3553ea6](https://github.com/arusli-nv/TensorRT-LLM/commit/29e3553ea6) | `[feat]` let attention-DP routing skip absent ranks | 1b.4a, 1c.4a | [adp_router.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/py_executor.py), [request_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/request_utils.py) |
 | 9 | [701ee950a1](https://github.com/arusli-nv/TensorRT-LLM/commit/701ee950a1) | `[feat]` keep the MPI session serving after a peer loss | 1d.1 | [mpi_session.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/llmapi/mpi_session.py), [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) |
 | 10 | [ddd5a7f568](https://github.com/arusli-nv/TensorRT-LLM/commit/ddd5a7f568) | `[feat]` roll back KV Cache Manager V2 allocations of a discarded step | 1c.4c | [kv_cache_manager_v2.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py) |
-| 11 | [94e41375b0](https://github.com/arusli-nv/TensorRT-LLM/commit/94e41375b0) | `[feat]` recover the executor from a WideEP peer loss, with the docs page | 1c.4, 1c.4c, 1d.1, 1d.4a | [peer_loss_recovery.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/py_executor.py) |
+| 11 | [94e41375b0](https://github.com/arusli-nv/TensorRT-LLM/commit/94e41375b0) | `[feat]` recover the executor from a WideEP peer loss | 1c.4, 1c.4c, 1d.1, 1d.4a | [peer_loss_recovery.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/tensorrt_llm/_torch/pyexecutor/py_executor.py), [wide-ep-fault-tolerance.md](https://github.com/arusli-nv/TensorRT-LLM/blob/94e41375b0/docs/source/features/wide-ep-fault-tolerance.md) |
 
 ### Validated configurations
 
@@ -98,17 +98,19 @@ standalone fix; 10 depends only on main. Whole series as one diff:
 
 ### Integration boundary with #15785 (1c.3, evidence transport)
 
-| Concern | Single owner |
-|---|---|
-| detect and propagate failure evidence | #15785 `FailureEvidenceTransport`; never mutates membership |
-| decide and commit membership | recovery authority (1c.4b), the only consumer of evidence |
-| wake survivors, rebuild host communicators | `MPIDist` (1c.3a), only inside an authority-driven recovery |
+Evidence means "rank R looks dead"; only the authority turns it into a membership change.
 
-- Our ULFM watcher becomes the ULFM implementation of `FailureEvidenceTransport`; #15785's gossip
-  transport covers MPI without ULFM. Recovery consumes only `FailureDetectedCallback`.
-- Separate communicators: #15785 revokes its own FT subcommunicator, only for terminal aborts;
-  recovery revokes only the host-collective communicator, to wake survivors.
-- No dependency today; once #15785 merges, a small adapter connects the two.
+| Concern | Owner | Never |
+|---|---|---|
+| detect and spread failure evidence | #15785 `FailureEvidenceTransport`; our ULFM watcher becomes one implementation | changes membership, the rank mask or communicators |
+| decide and commit membership | recovery authority (1c.4b) | detects failures itself |
+| apply a commit: shrink the host communicator, install the mask and placement | workers (`MPIDist`, MoE layers) | act before the authority's `Install` |
+
+- One handoff: the transport's `FailureDetectedCallback(failed_rank, ...)` makes the worker send
+  `Stopped`. Our watcher calls `on_failure()` with no arguments, so a small adapter joins the two.
+- Separate communicators: #15785 revokes only its own detection subcommunicator, for terminal
+  aborts; recovery revokes only the host-collective communicator, to wake survivors.
+- No dependency today. Once #15785 merges, the authority and protocol stay unchanged.
 
 ## MVP Architecture
 

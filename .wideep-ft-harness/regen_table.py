@@ -20,16 +20,18 @@ log = subprocess.check_output(["git", "log", "--reverse", "--format=%h|%s", f"{b
 for i, line in enumerate(filter(None, log.split("\n")), 1):
     sha, subj = line.split("|", 1)
     kind, title = re.match(r"\[None\]\[(\w+)\] (.*)", subj).groups()
-    files = []
+    files, docs = [], []
     for st in filter(None, subprocess.check_output(["git", "show", "--numstat", "--format=", sha], text=True).split("\n")):
         a, d, f = st.split("\t")
+        if f.startswith("docs/source/features/"):
+            docs.append(f)
         if f.startswith(("tests/", "docs/", "jenkins/", "security_scanning/")) or f.endswith((".md", ".yml", ".txt", ".lock", ".toml")):
             continue
         files.append((int(a) if a != "-" else 0, f))
     files.sort(reverse=True)
-    code = ", ".join(f"[{os.path.basename(f)}]({R}/blob/{tip}/{f})" for _, f in files[:3])
-    t = title + (", with the docs page" if title.startswith("recover the executor") else "")
-    rows.append(f"| {i} | [{sha}]({R}/commit/{sha}) | `[{kind}]` {t} | {work[title]} | {code} |")
+    shown = [f for _, f in files[:3]] + docs
+    code = ", ".join(f"[{os.path.basename(f)}]({R}/blob/{tip}/{f})" for f in shown)
+    rows.append(f"| {i} | [{sha}]({R}/commit/{sha}) | `[{kind}]` {title} | {work[title]} | {code} |")
 p = "../DESIGN.md"; s = open(p).read()
 i = s.index("| # | Commit | PR | Work items | Main code |"); j = s.index("\n\n", i)
 s = s[:i] + "| # | Commit | PR | Work items | Main code |\n|---|---|---|---|---|\n" + "\n".join(rows) + s[j:]
