@@ -23,6 +23,17 @@
 | 1c.1 (#15677) | EP error classification | kept |
 | 1d.0 (#14160) | no abort or parent kill from signal handlers | survivors stay alive |
 
+### v7 draft PRs
+
+None is built on; each is either outside the MVP path or replaced by a graph-compatible design.
+
+| ID | Draft | Used? | Why |
+|---|---|---|---|
+| 1c.3 (#15785) | MPI failure-evidence transport (gossip on a dedicated communicator) | no; plugs in later | one admitted loss needs only the ULFM watcher; see the boundary below |
+| 1a.8 (#15895) | cooperative all-to-all abort: abort epoch as a kernel argument | no; commit 5 replaces it | a per-call argument is frozen by CUDA graphs, so it keeps the capture guard; ours latches a descriptor address. Worth reusing: its abort diagnostics and C++ kernel test |
+| 1a.7 (#15789) | NCCL abort and survivor re-init | no | the MVP path uses MPI and the NVLink all-to-all, no NCCL group with the lost rank |
+| 1d.3 (#15788) | EP rank-health metrics | no | observability is outside the MVP; commit 1 is the same `EPGroupHealth` deepcopy fix |
+
 ### New contributions
 
 One commit per PR, in merge order; each commit link shows all its files and tests. 1 is a
