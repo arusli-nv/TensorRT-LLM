@@ -67,34 +67,20 @@ def sweep_chart(runs: str) -> None:
 
 def overhead_chart() -> None:
     data = json.load(open("eval_overhead.json"))
-    fig, (step_ax, layer_ax) = plt.subplots(1, 2, figsize=(12, 4.2))
-    labels = [f"{load} req/GPU\nFT {mode}" for load in ("8", "64") for mode in ("off", "on")]
-    rows = [data[f"{load}/{mode}"] for load in ("8", "64") for mode in ("off", "on")]
-    x = range(len(rows))
-    busy = [r["gpu_busy"] / 1e3 for r in rows]
-    idle = [r["gpu_idle"] / 1e3 for r in rows]
-    step_ax.bar(x, busy, color=OFF, label="GPU busy")
-    step_ax.bar(x, idle, bottom=busy, color="lightgray", label="GPU idle")
-    step_ax.set_xticks(list(x), labels)
-    step_ax.set_ylabel("ms per decode step")
-    step_ax.set_title("Decode step time")
-    step_ax.legend(frameon=False, loc="upper left")
-    step_ax.grid(axis="y", alpha=0.3)
-
-    parts = [("dispatch", "dispatch"), ("fixup_after_dispatch", "sanitize/gather"), ("combine", "combine")]
-    width = 0.2
-    for j, (load, mode, color) in enumerate((("8", "off", OFF), ("8", "on", ON), ("64", "off", OFF),
-                                             ("64", "on", ON))):
-        d = data[f"{load}/{mode}"]
-        offs = [k + (j - 1.5) * width for k in range(len(parts))]
-        layer_ax.bar(offs, [d[key] for key, _ in parts], width, color=color,
-                     hatch="//" if load == "64" else None, edgecolor="white",
-                     label=f"FT {mode}, {load} req/GPU")
-    layer_ax.set_xticks(range(len(parts)), [name for _, name in parts])
-    layer_ax.set_ylabel("µs per MoE layer")
-    layer_ax.set_title("MoE all-to-all kernels")
-    layer_ax.legend(frameon=False, fontsize=9)
-    layer_ax.grid(axis="y", alpha=0.3)
+    parts = [("dispatch", "dispatch"), ("fixup_after_dispatch", "sanitize (off) / gather (on)"), ("combine", "combine")]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+    for ax, load in zip(axes, ("8", "64")):
+        x = range(len(parts))
+        for j, (mode, color) in enumerate((("off", OFF), ("on", ON))):
+            d = data[f"{load}/{mode}"]
+            ax.bar([k + (j - 0.5) * 0.38 for k in x], [d[key] for key, _ in parts], 0.38, color=color,
+                   label=f"FT {mode}")
+        ax.set_xticks(list(x), [name for _, name in parts], fontsize=9)
+        ax.set_title(f"{load} requests per GPU")
+        ax.grid(axis="y", alpha=0.3)
+    axes[0].set_ylabel("µs per MoE layer")
+    axes[0].legend(frameon=False)
+    fig.suptitle("MoE all-to-all kernel time per layer")
     fig.tight_layout()
     fig.savefig("eval_overhead.png", dpi=160)
 

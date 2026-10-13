@@ -243,122 +243,54 @@ def late_writes():
 
 
 def kernel_path():
-    s = Svg(1240, 790)
-    s.text(30, 36, "From dispatch to the experts: main vs FT", 22, anchor="start", weight="bold")
-    s.text(30, 60, "One receiver GPU, 3 of its 32 senders; sender 2 is lost in the FT case.", 13.5, "#666",
+    s = Svg(900, 425)
+    s.text(30, 36, "Why FT receives into fixed regions", 21, anchor="start", weight="bold")
+    s.text(30, 58, "One receiver, 3 senders. Sender 2 dies; its last write lands one step late.", 13, "#666",
            anchor="start")
-    payloads = [("hidden_states", "3.5 KB"), ("hidden_states_sf", "448 B"),
-                ("token_selected_slots", "expert ids, 32 B"), ("token_final_scales", "32 B")]
-    tokens = {0: ["A"], 1: ["B", "C"], 2: ["D"]}
+    cw, gap = 36, 10
 
-    def cell(x, y, w, h, kind, label=""):
-        fills = {"real": "white", "old": "#eeeeee", "id": "#dcdcdc", "zero": "#f7f7f7", "lost": "url(#hatch)"}
-        stroke = {"real": "#1a1a1a", "id": "#555", "lost": "#bdbdbd"}.get(kind, "#cfcfcf")
-        s.box(x, y, w - 3, h, fills[kind], stroke, 3, 1.2)
-        if label:
-            weight = "bold" if kind in ("real", "id") else "normal"
-            s.text(x + (w - 3) / 2, y + h / 2 + 4.5, label, 12, "#222" if kind != "old" else "#999",
-                   weight=weight)
-
-    def arrays(x0, y0, rows, cw=42, ch=24, label=True, title=None):
-        """rows[p][k] = list of (kind, label) cells of sender k in payload p."""
-        if title:
-            s.text(x0, y0 - 30, title, 13.5, "#444", anchor="start", weight="bold")
-        for k in range(3):
-            bx = x0 + k * (4 * cw + 14)
-            s.text(bx + 2 * cw - 2, y0 - 8, f"sender {k}", 12, "#666")
-        for p, (name, size) in enumerate(payloads):
-            y = y0 + p * (ch + 6)
-            if label:
-                s.text(x0 - 12, y + 16, name, 12.5, "#333", anchor="end", weight="bold")
-                s.text(x0 - 12, y + 29, size, 10.5, "#888", anchor="end")
-            for k in range(3):
-                bx = x0 + k * (4 * cw + 14)
-                for j, (kind, lab) in enumerate(rows[p][k]):
-                    cell(bx + j * cw, y, cw, ch, kind, lab)
-        return x0 + 3 * (4 * cw + 14)
-
-    # --- Main: blocks of runtime_max rows per sender; sanitize marks ids in place.
-    s.line(30, 80, 1210, 80, "#e0e0e0", 1.5)
-    s.text(30, 106, "Main (FT off)", 17, anchor="start", weight="bold")
-    s.text(30, 124, "per-sender blocks sized by this step", 12.5, "#666", anchor="start")
-
-    def main_rows(after):
-        rows = []
-        for p in range(4):
-            per = []
-            for k in range(3):
-                block = []
-                for j in range(4):
-                    if j < len(tokens[k]):
-                        block.append(("real", tokens[k][j]))
-                    elif p == 2 and after:
-                        block.append(("id", "−1"))
-                    else:
-                        block.append(("old", "old"))
-                per.append(block)
-            rows.append(per)
-        return rows
-
-    end = arrays(230, 170, main_rows(True))
-    s.text(end + 20, 196, "sanitize: ids −1 in place", 13, "#333", anchor="start", weight="bold")
-    s.text(end + 20, 216, "experts read the arrays directly", 12.5, "#333", anchor="start")
-
-    # --- FT: fixed regions of max rows per sender; the gather copies into main's dense layout.
-    s.line(30, 310, 1210, 310, "#e0e0e0", 1.5)
-    s.text(30, 336, "FT on", 17, anchor="start", weight="bold")
-    s.text(30, 354, "fixed per-sender regions, never moved", 12.5, "#666", anchor="start")
-
-    # Fixed regions in the workspace: one per sender, holding its four payloads.
-    rx, ry, rw = 30, 392, 330
-    for k in range(3):
-        y = ry + k * 118
-        dead = k == 2
-        s.box(rx, y, rw, 108, "white", DEAD if dead else "#9e9e9e", 8, 2 if dead else 1.5)
-        s.text(rx + 12, y + 20, f"sender {k} region" + (" (lost, masked)" if dead else ""), 13,
-               DEAD if dead else "#333", anchor="start", weight="bold")
-        for p, (name, _) in enumerate(payloads):
-            yy = y + 30 + p * 19
-            s.text(rx + 12, yy + 12, name, 10.5, "#666", anchor="start")
-            for j in range(4):
-                kind = "lost" if dead else ("real" if j < len(tokens[k]) else "zero")
-                lab = tokens[k][j] if (not dead and j < len(tokens[k])) else ""
-                x = rx + 150 + j * 32
-                s.box(x, yy, 29, 16, {"real": "white", "zero": "#f2f2f2", "lost": "url(#hatch)"}[kind],
-                      "#1a1a1a" if kind == "real" else "#cfcfcf", 2, 1)
+    def strip(x0, y, groups, label):
+        """groups[k] = list of cell kinds/labels for sender k; returns x of each (sender, row)."""
+        s.text(x0 - 14, y + 22, label, 13, "#444", anchor="end")
+        pos, x = {}, x0
+        for k, cells in enumerate(groups):
+            for j, (kind, lab) in enumerate(cells):
+                fill = {"tok": "white", "free": "#f2f2f2", "lost": "url(#hatch)", "bad": "#fde0e0"}[kind]
+                stroke = {"tok": "#1a1a1a", "bad": DEAD}.get(kind, "#cfcfcf")
+                s.box(x, y, cw - 3, 32, fill, stroke, 3, 1.5 if kind in ("tok", "bad") else 1)
                 if lab:
-                    s.text(x + 14.5, yy + 12.5, lab, 11, "#222", weight="bold")
-            s.text(rx + 282, yy + 12, "… 256", 10.5, "#999", anchor="start")
-    s.text(rx, ry + 370, "workspace (symmetric memory)", 12, "#666", anchor="start")
+                    s.text(x + (cw - 3) / 2, y + 21, lab, 13, DEAD if kind == "bad" else "#222", weight="bold")
+                pos[k, j] = x + (cw - 3) / 2
+                x += cw
+            x += gap
+        return pos, x
 
-    # The gather.
-    s.arrow(rx + rw + 6, 540, 452, 540, "gray", 2.5)
-    s.chip(456, 488, 170, 104, "", NEW)
-    s.text(541, 514, "gather (new)", 15, "#4a7d00", weight="bold")
-    for j, line in enumerate(["recv_counters [1, 2, ·]", "live mask [1, 1, 0]", "abort flag"]):
-        s.text(541, 538 + j * 17, line, 12, "#333")
-    s.arrow(628, 540, 662, 540, "gray", 2.5)
+    T, F, L = ("tok", ""), ("free", ""), ("lost", "")
+    # Main: sender k starts at k x (this step's max rows per sender), so the layout moves with load.
+    s.text(30, 100, "Main", 16, anchor="start", weight="bold")
+    a, _ = strip(205, 112, [[("tok", "A"), F], [("tok", "B"), ("tok", "C")], [("tok", "D"), F]],
+                 "step N: 2 rows/sender")
+    b, end = strip(205, 182, [[("tok", "A"), F, F, F], [("bad", "D"), ("tok", "C"), F, F], [L, L, L, L]],
+                   "step N+1: 4 rows/sender")
+    s.arrow(a[2, 0], 146, b[1, 0], 180, "red", 2.5)
+    s.text(end + 6, 196, "D overwrites B;", 13, DEAD, anchor="start", weight="bold")
+    s.text(end + 6, 214, "experts read it in place", 13, "#333", anchor="start")
+    for k, name in enumerate(("sender 0", "sender 1", "sender 2")):
+        s.text((b[k, 0] + b[k, 3]) / 2, 240, name, 11.5, "#888")
 
-    def ft_rows(cheap):
-        rows = []
-        for p in range(4):
-            per = []
-            for k in range(3):
-                block = []
-                for j in range(4):
-                    if k != 2 and j < len(tokens[k]):
-                        block.append(("real", tokens[k][j]))
-                    elif p == 2:
-                        block.append(("id", "−1"))
-                    else:
-                        block.append(("old", "old") if cheap else ("zero", "0"))
-                per.append(block)
-            rows.append(per)
-        return rows
-
-    arrays(830, 430, ft_rows(False), cw=30, ch=22, title="dense output (main's layout)")
-    s.text(668, 600, "gather: copy real rows, mark the rest", 13, "#333", anchor="start", weight="bold")
-    s.text(668, 620, "experts read the dense output, as on main", 12.5, "#333", anchor="start")
+    s.line(30, 262, 870, 262, "#e0e0e0", 1.5)
+    # FT: sender k always starts at k x max_num_tokens_per_rank; the gather copies live rows out.
+    s.text(30, 296, "FT on", 16, anchor="start", weight="bold")
+    c, end = strip(205, 330, [[("tok", "A"), F, F], [("tok", "B"), ("tok", "C"), F], [("bad", "D"), L, L]],
+                   "every step: 256 rows/sender")
+    for k, name in enumerate(("sender 0", "sender 1", "sender 2 (masked)")):
+        s.text((c[k, 0] + c[k, 2]) / 2, 384, name, 11.5, DEAD if k == 2 else "#888")
+    s.arrow(end - 2, 346, end + 40, 346, "gray", 2.5)
+    s.chip(end + 44, 324, 120, 44, "gather", NEW, "live mask [1, 1, 0]")
+    s.arrow(end + 166, 346, end + 200, 346, "gray", 2.5)
+    s.text(end + 206, 341, "copy for", 13, "#333", anchor="start")
+    s.text(end + 206, 358, "the experts", 13, "#333", anchor="start")
+    s.text(205, 412, "D stays in sender 2's region, which the gather never reads.", 13, "#333", anchor="start")
     return s.render()
 
 

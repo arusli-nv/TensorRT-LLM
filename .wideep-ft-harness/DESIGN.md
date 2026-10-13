@@ -275,7 +275,8 @@ markers at each step on every survivor (median shown). Without FT: 2 kills and 2
 plain mpirun.
 
 - With FT, survivors serve again 28–94 ms after the kill; detection and Shrink are most of it.
-  The authority waits for the slowest survivor (idle kill 2: one GPU took 86 ms to drain).
+  The authority waits for the slowest survivor: in idle kill 2 one GPU still had work queued and
+  drained 65 ms after the others (not yet traced; likely the rest of an in-progress step).
 - The first new token reaches the client 0.23–0.29 s after the kill. Most of that comes after
   recovery; a no-kill time-to-first-token was not measured, so it is not split further.
 - Requests in flight at the kill finish with exact tokens (4 of 4 runs); the lost rank's own
@@ -296,15 +297,16 @@ plain mpirun.
 
 FT off vs on, same build and nodes: 8 requests per GPU on the test config (max_batch_size 8), 64 on
 the production-shaped config (max_batch_size 64). Nsight Systems on one rank, medians over about
-2,400 decode steps.
+2,400 decode steps. Each bar is one GPU kernel per MoE layer; the middle bar counts only the time past
+the end of dispatch, because it starts early under PDL.
 
-- FT's extra time is inside the MoE layers; at 64 requests per GPU about 80% of it is all-to-all
-  kernel time. GPU idle time does not change.
+- A decode step takes 1.7% longer with FT at 8 requests per GPU and 5.9% at 64. That extra time is
+  inside the MoE layers, and at 64 requests per GPU about 80% of it is all-to-all kernel time.
 - The gather is most of it and grows with load because it copies every received row. Skipping its
   zeroing of empty rows saves under 1 µs, so the next steps are its launch layout or fusing it into
   dispatch.
 - The larger cost of FT today is indirect: it requires the non-overlap scheduler, which leaves the
-  GPU idle for 25–31% of every step (gray), with or without FT.
+  GPU idle for 25–31% of every step, with or without FT.
 
 ### Throughput vs load
 
@@ -332,6 +334,9 @@ FT off, FT on, and FT on after a loss (31 survivors), at 8 to 64 requests per GP
   expert TP > 1, PEFT, KV connector or transceiver, sleep/wakeup. Sliding-window attention is
   unvalidated. Greedy sampling is expected: penalties, seeded sampling and multi-token stop words
   aren't rolled back with a discarded step.
+- **Beyond 64 requests per GPU:** not measured. With max_batch_size 128 or 256 this build hits an
+  illegal memory access while warming up, with FT off as well, and stalls when the larger CUDA
+  graphs are left out, so saturation beyond the 64-request batch limit is open.
 - **Kernel cost:** the gather adds 3–16 µs per MoE layer (8–64 requests per GPU); a faster launch layout
   or fusing it into dispatch is open.
 - **CI:** needs an image with mpi4py 4.1.2; until then the ULFM tests skip. x86 is unverified (only
@@ -368,9 +373,7 @@ replace the watcher as the detector; the authority stays the only decision-maker
 
 ### Late writes: symmetric memory and kernel design (commits 5 and 6)
 
-![From dispatch to the experts: main vs FT](evidence/kernel_path.png)
-
-![Late writes and fixed per-source regions](evidence/late_writes.png)
+![Why FT receives into fixed regions](evidence/kernel_path.png)
 
 A rank can die with writes still in flight into peers' workspaces. The hazard is main's
 runtime-dependent layout, not rank renumbering: main sizes each source's rows by the step's
