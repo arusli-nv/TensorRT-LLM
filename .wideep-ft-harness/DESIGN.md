@@ -274,8 +274,8 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 - Survivors' tokens match a reference run that never used the lost rank, and all decode steps stay
   in the original CUDA graphs (Nsight Systems: no graph captures after the kill).
 - FT overhead vs FT off with the same config: −2.4% (8 requests per GPU), −3.7% (64 per GPU),
-  mostly the new gather kernel (about 65–75% of the added MoE-layer time; see
-  [Benchmarks](#benchmarks)).
+  mostly the new gather kernel (about half of the added MoE-layer time at 8 requests per GPU,
+  about 80% at 64; see [Benchmarks](#benchmarks)).
 - After a loss, the 31 remaining GPUs serve 75.8k tok/s, 98% of their per-GPU throughput before
   the loss.
 - With the overlap scheduler and MTP (production config, not yet supported with FT), the same 32
@@ -351,18 +351,19 @@ teardown, so the backing memory stays valid.
 
 #### Benchmarks
 
-R1, 32 GPUs; nsys on one rank; medians over about 139k MoE-layer executions from CUDA graphs.
+R1 NVFP4, 32 GB200 GPUs; Nsight Systems on one rank (job `kbench-7900025`); medians per MoE layer
+over about 142k layer executions from CUDA graphs. Sanitize and gather launch with PDL and start
+while dispatch is still running, so their column is the time they add after dispatch ends.
 
-| | Dispatch | Combine | Sanitize (off) / Gather (on) | MoE-layer span |
+| | Dispatch | Combine | Sanitize (off) / Gather (on), after dispatch | MoE-layer span |
 |---|---|---|---|---|
-| FT off, 8 req/GPU | 13.4 µs | 34.4 µs | 9.4 µs | 81.7 µs |
-| FT on, 8 req/GPU | 14.6 µs | 36.1 µs | 13.8 µs | 88.4 µs (+8%) |
-| FT off, 64 req/GPU | 15.3 µs | 41.7 µs | 10.6 µs | 125.3 µs |
-| FT on, 64 req/GPU | 16.4 µs | 43.1 µs | 24.6 µs | 144.1 µs (+15%) |
+| FT off, 8 req/GPU | 13.4 µs | 34.1 µs | 1.7 µs | 82.0 µs |
+| FT on, 8 req/GPU | 14.6 µs | 35.8 µs | 5.1 µs | 88.6 µs (+8%) |
+| FT off, 64 req/GPU | 15.2 µs | 41.3 µs | 1.7 µs | 126.0 µs |
+| FT on, 64 req/GPU | 16.4 µs | 42.7 µs | 16.6 µs | 144.8 µs (+15%) |
 
 - Dispatch and combine changes cost 1–2 µs each (descriptor read, mask checks).
-- The gather is the main cost and grows with batch: it copies every row, where main's sanitize
-  kernel works in place. It accounts for about 65% of the added span at 8 requests per GPU (+4.4 of
-  +6.7 µs) and about 75% at 64 (+14.0 of +18.8 µs).
-- End to end, that is −2.4% / −3.7% throughput (about 19 µs × 58 MoE layers per step, plus the
-  per-step commit sync). Fusing or removing the gather is the main optimization left.
+- The gather is the main cost and grows with batch: +3.4 µs at 8 requests per GPU and +14.9 µs at
+  64, because it copies every row where main's sanitize only marks invalid expert ids in place.
+- End to end, that is −2.4% / −3.7% throughput. A cheaper gather (copy only received rows) or
+  fusing it into dispatch is the main optimization left.
