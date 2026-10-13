@@ -1,4 +1,4 @@
-"""Regenerate the PR table in DESIGN.md from the commits of wideep-ft-folded (run in the fold worktree)."""
+"""Refresh the commit headings in DESIGN.md from the commits of wideep-ft-folded (run in the fold worktree)."""
 import os, re, subprocess
 R = "https://github.com/arusli-nv/TensorRT-LLM"; base = "ca3a6c4c62"
 tip = subprocess.check_output(["git", "rev-parse", "--short=10", "HEAD"], text=True).strip()
@@ -15,24 +15,12 @@ work = {
  "roll back KV Cache Manager V2 allocations of a discarded step": "1c.4c",
  "recover the executor from a WideEP peer loss": "1c.4, 1c.4c, 1d.1, 1d.4a",
 }
-rows = []
+p = "../DESIGN.md"; s = open(p).read()
 log = subprocess.check_output(["git", "log", "--reverse", "--format=%h|%s", f"{base}..HEAD"], text=True)
 for i, line in enumerate(filter(None, log.split("\n")), 1):
     sha, subj = line.split("|", 1)
     kind, title = re.match(r"\[None\]\[(\w+)\] (.*)", subj).groups()
-    files, docs = [], []
-    for st in filter(None, subprocess.check_output(["git", "show", "--numstat", "--format=", sha], text=True).split("\n")):
-        a, d, f = st.split("\t")
-        if f.startswith("docs/source/features/"):
-            docs.append(f)
-        if f.startswith(("tests/", "docs/", "jenkins/", "security_scanning/")) or f.endswith((".md", ".yml", ".txt", ".lock", ".toml")):
-            continue
-        files.append((int(a) if a != "-" else 0, f))
-    files.sort(reverse=True)
-    shown = [f for _, f in files[:3]] + docs
-    code = ", ".join(f"[{os.path.basename(f)}]({R}/blob/{tip}/{f})" for f in shown)
-    rows.append(f"| {i} | [{sha}]({R}/commit/{sha}) | `[{kind}]` {title} | {work[title]} | {code} |")
-p = "../DESIGN.md"; s = open(p).read()
-i = s.index("| # | Commit | PR | Work items | Main code |"); j = s.index("\n\n", i)
-s = s[:i] + "| # | Commit | PR | Work items | Main code |\n|---|---|---|---|---|\n" + "\n".join(rows) + s[j:]
-open(p, "w").write(s); print("table at", tip, len(rows), "rows")
+    heading = f"#### {i}. {work[title]}: [{kind}] {title} ([{sha}]({R}/commit/{sha}))"
+    s, n = re.subn(rf"^#### {i}\. .*$", lambda _: heading, s, flags=re.M)
+    assert n == 1, f"no heading for commit {i}"
+open(p, "w").write(s); print("headings at", tip, i, "commits")

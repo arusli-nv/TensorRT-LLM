@@ -1,227 +1,364 @@
-# [WIP] WideEP Fault Tolerance
+# [WIP] WideEP Fault Tolerance Design Doc
+
+Andrew Rusli | Created: Oct 12, 2026 | Updated: Oct 13, 2026 | Status: Prototyping
 
 ## Overview
 
-- Today, losing one worker process (rank) of a WideEP job kills the whole job, and a restart takes
-  minutes.
-- This MVP (MPI, non-CFT), an initial proof of concept, survives the loss of one rank other than
-  rank 0, provided that rank's experts have replicas on other GPUs. The surviving ranks keep
-  serving **on the CUDA graphs captured at startup** and route the lost rank's experts to their
-  replicas.
-- Survivors' in-flight requests continue from their last token, with correct output; only the
-  interrupted step is redone. Only the lost rank's own requests fail, because their KV cache was
-  lost; they end with an explicit error asking the client to retry.
+Today, losing one worker process (rank) of a WideEP job kills the whole job, and a restart takes
+minutes. This WideEP Fault Tolerance (FT) MVP is an initial PoC which recovers from the loss of one
+rank (except rank 0), provided that rank's experts have replicas on other GPUs, and keeps the
+healthy ranks serving.
 
-### Reused merged foundations
+The surviving ranks use the same CUDA graphs captured at startup and route the lost rank's experts
+to their replicas. Survivors' in-flight requests continue from their last token (only the
+interrupted step is redone), with correct output. Only the lost rank's own requests fail, because
+their KV cache was lost; they end with an explicit error asking the client to retry.
 
-| ID | Already on main | Used for |
-|---|---|---|
-| 1a.1 (#13302) | `EPGroupHealth`: process-local rank-health mask and generation | the committed live-rank mask |
-| 1a.2 (#13404) | rank masking in the all-to-all kernels, at launch time | extended to run-time masking inside graphs |
-| 1a.3, 1a.4 (#15524) | Python binding, detection-only watchdog | kept |
-| 1b.1, 1b.2 (#15525) | mask-only EPLB API; rejects zero-replica outcomes | routing around the lost rank |
-| 1c.1 (#15677) | EP error classification | kept |
-| 1d.0 (#14160) | no abort or parent kill from signal handlers | survivors stay alive |
+## Background
 
-### v7 draft PRs
+The WideEP MVP uses Open MPI User Level Failure Mitigation (ULFM), MPI's fault tolerance, which
+provides:
 
-None is built on; each is either outside the MVP path or replaced by a graph-compatible design.
+- **Error returns:** MPI calls involving a dead process return an error instead of hanging or
+  aborting the job.
+- **`Comm.Revoke`:** when called by any rank, it makes every pending and future operation on the
+  communicator fail with `ERR_REVOKED` on every rank, waking survivors blocked in a collective.
+- **`Comm.Shrink`:** builds a new communicator without the dead ranks (identified automatically),
+  identical on every survivor. This is a form of survivor agreement.
+- **`Comm.Get_failed`:** names the processes that died. Used to tell whether a `BrokenExecutor`
+  failure is a peer loss, so the job is not terminated and recovery can run.
 
-| ID | Draft | Used? | Why |
-|---|---|---|---|
-| 1c.3 (#15785) | MPI failure-evidence transport (gossip on a dedicated communicator) | no; plugs in later | one admitted loss needs only the ULFM watcher; see the boundary below |
-| 1a.8 (#15895) | cooperative all-to-all abort: abort epoch as a kernel argument | no; commit 5 replaces it | a per-call argument is frozen by CUDA graphs, so it keeps the capture guard; ours latches a descriptor address. Worth reusing: its abort diagnostics and C++ kernel test |
-| 1a.7 (#15789) | NCCL abort and survivor re-init | no | the MVP path uses MPI and the NVLink all-to-all, no NCCL group with the lost rank |
-| 1d.3 (#15788) | EP rank-health metrics | no | observability is outside the MVP; commit 1 is the same `EPGroupHealth` deepcopy fix |
+## Reused merged foundations
 
-### New contributions
+**1a.1 (#13302):** `EPGroupHealth`: process-local rank-health mask and generation.
+Used directly as our live-rank mask.
 
-One commit per PR, in merge order; each commit link shows all its files and tests. 1 is a
-standalone fix; 10 depends only on main. Whole series as one diff:
-[main...wideep-ft](https://github.com/NVIDIA/TensorRT-LLM/compare/main...arusli-nv:TensorRT-LLM:wideep-ft).
+**1a.2 (#13404):** rank masking in the all-to-all kernels, at launch time.
+We extend this to run-time masking inside CUDA graphs. The kernel argument is the address of the
+execution descriptor in GPU memory, which holds the live-rank mask and the address of an abort flag
+in pinned host memory. This lets us reuse captured graphs and rewrite the mask in place between
+graph replays.
 
-| # | Commit | PR | Work items | Main code |
-|---|---|---|---|---|
-| 1 | [84fc6524bd](https://github.com/arusli-nv/TensorRT-LLM/commit/84fc6524bd) | `[fix]` keep EPGroupHealth identity across ConfigurableMoE deepcopy | prerequisite (1a.8) | [ep_group_health.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py) |
-| 2 | [efc083e9d3](https://github.com/arusli-nv/TensorRT-LLM/commit/efc083e9d3) | `[infra]` upgrade mpi4py to 4.1.2 for ULFM fault tolerance | 1c.3 | [install_mpi4py.sh](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/docker/common/install_mpi4py.sh) |
-| 3 | [7954af7253](https://github.com/arusli-nv/TensorRT-LLM/commit/7954af7253) | `[feat]` add an external recovery authority for WideEP peer loss | 1c.4b, 1c.3a, 1b.2a | [authority.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/executor/recovery/authority.py), [client.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/executor/recovery/client.py), [protocol.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/executor/recovery/protocol.py) |
-| 4 | [1fd4629c5c](https://github.com/arusli-nv/TensorRT-LLM/commit/1fd4629c5c) | `[feat]` ULFM survivor communicators for host collectives | 1c.3, 1c.3a, 1c.4a | [communicator.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/distributed/communicator.py), [_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_utils.py) |
-| 5 | [d6f44ab1d7](https://github.com/arusli-nv/TensorRT-LLM/commit/d6f44ab1d7) | `[feat]` add a run-time rank mask and abort to the NVLinkOneSided all-to-all | 1a.8, 1a.8a, 1a.11 | [moeAlltoAllKernels.cu](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.cu), [moeAlltoAllOp.cpp](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp), [moeAlltoAllKernels.h](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h) |
-| 6 | [300b5218ef](https://github.com/arusli-nv/TensorRT-LLM/commit/300b5218ef) | `[feat]` bind MoE layers to the all-to-all execution descriptor for recovery | 1a.8a, 1a.8b | [execution_state.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py), [nvlink_one_sided.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py), [_mnnvl_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_mnnvl_utils.py) |
-| 7 | [f6c4a211da](https://github.com/arusli-nv/TensorRT-LLM/commit/f6c4a211da) | `[feat]` route a lost rank's experts to their replicas after a peer loss | 1b.2a, 1b.4a | [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py), [model_engine.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/model_engine.py) |
-| 8 | [e78147290b](https://github.com/arusli-nv/TensorRT-LLM/commit/e78147290b) | `[feat]` let attention-DP routing skip absent ranks | 1b.4a, 1c.4a | [adp_router.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/py_executor.py), [request_utils.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/request_utils.py) |
-| 9 | [d98a04e25e](https://github.com/arusli-nv/TensorRT-LLM/commit/d98a04e25e) | `[feat]` keep the MPI session serving after a peer loss | 1d.1 | [mpi_session.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/llmapi/mpi_session.py), [moe_load_balancer.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) |
-| 10 | [f1bb11d9dd](https://github.com/arusli-nv/TensorRT-LLM/commit/f1bb11d9dd) | `[feat]` roll back KV Cache Manager V2 allocations of a discarded step | 1c.4c | [kv_cache_manager_v2.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py) |
-| 11 | [a4efd09919](https://github.com/arusli-nv/TensorRT-LLM/commit/a4efd09919) | `[feat]` recover the executor from a WideEP peer loss | 1c.4, 1c.4c, 1d.1, 1d.4a | [peer_loss_recovery.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py), [py_executor.py](https://github.com/arusli-nv/TensorRT-LLM/blob/a4efd09919/tensorrt_llm/_torch/pyexecutor/py_executor.py) |
+**1a.3, 1a.4 (#15524):** Python binding for the all-to-all kernels, detection-only
+`AlltoAllWatchdog`, and `EPGroupHealth` generation checks in the NVLinkOneSided dispatch/combine
+ops.
+We reuse the Python bindings, extended with an execution descriptor. The watchdog is not used with
+FT (ULFM detects the loss and the abort flag releases kernels). The generation check is redundant,
+because the mask only changes while no collective runs (at startup and in recovery's install
+phase).
 
-### Validated configurations
+**1b.1, 1b.2 (#15525):** `reconfigure_mask_only` EPLB API (C++ with Python binding); rejects
+updates that would leave an expert with no replica, or that arrive during an active or queued
+forward iteration.
+We use it in recovery's install phase, while serving is paused. Each survivor calls it with the
+lost rank, changing routing before the new live-rank mask is written and kernels start ignoring
+the dead rank.
 
-- **Models and scale:** DeepSeek-R1 NVFP4 on 16, 32 and 64 GB200 GPUs; Kimi-K2 NVFP4 on 32.
-- **Serving config:** attention DP, expert TP 1, static EPLB with redundant experts (8 experts + 1
-  redundant slot per GPU for R1 at EP32), NVLinkOneSided fence path, CUTEDSL MoE backend, decode CUDA graphs,
-  non-overlap scheduler, KV Cache Manager V2, chunked prefill, KV cache reuse on and off, fp8 KV
-  cache and low-precision combine at 64 requests per GPU.
-- **Failures:** SIGKILL of rank 1, 2, 30 or 62 (including other nodes) while idle, while generating,
-  during the MoE all-to-all, during prefill and under full load. An uncovered loss fails closed.
-- **Tests:** unit tests in the CPU and GPU pre-merge stages; a 4-GPU GB200 integration test
-  (DeepSeek-V3-Lite, kill while idle and while generating) runs post-merge.
+**1c.1 (#15677):** adds EP error patterns (GPU fallen off the bus, CUDA context destroyed, MPI rank
+terminated, all-to-all timeouts, etc.) to main's fatal-error classifier from #12718. A message
+containing one of those strings is classified as fatal/severe instead of transient.
+Kept. We use it for a rank's own fatal errors, and with FT that rank ends alone. Peer losses bypass
+it and go straight to recovery. This is a local per-rank decision; agreeing on which rank was lost
+is done separately by ULFM Shrink and the recovery authority.
 
-![Recovery time and throughput](evidence/results.svg)
+**1d.0 (#14160):** with FT on, a crashing rank's signal handler ends only that rank (`_exit`),
+instead of aborting every rank and killing the launcher (`mpirun`).
+Used. It is why other ranks survive a rank crash; we add launcher survival (the job is not torn
+down) by running under `mpirun --with-ft ulfm`, confirmed in multi-node kill runs.
 
-| R1, 32 GPUs, rank killed while… | Result |
+## New contributions
+
+Branch: [main...wideep-ft](https://github.com/NVIDIA/TensorRT-LLM/compare/main...arusli-nv:TensorRT-LLM:wideep-ft).
+One commit per PR, in merge order.
+
+#### 1. prerequisite (1a.8): [fix] keep EPGroupHealth identity across ConfigurableMoE deepcopy ([84fc6524bd](https://github.com/arusli-nv/TensorRT-LLM/commit/84fc6524bd))
+
+When a layer passes `override_quant_config`, `ConfigurableMoE` deepcopies `model_config`, which
+contains `EPGroupHealth` (shared by all layers). We override `__deepcopy__` to return `self`.
+Without this, layers with a quant override hold their own copy, so a rank-health update never
+reaches them. The same fix is in draft #15788 (1d.3, EP health metrics).
+
+#### 2. 1c.3: [infra] upgrade mpi4py to 4.1.2 for ULFM fault tolerance ([efc083e9d3](https://github.com/arusli-nv/TensorRT-LLM/commit/efc083e9d3))
+
+Moves the `TRTLLM_USE_MPI_KVCACHE` patch to mpi4py 4's file layout (behavior unchanged) and removes
+two 3.1.5-only build workarounds. 4.1.2 is already the version declared and scanned in
+`security_scanning`.
+Takes effect after the CI image is rebuilt; until `current_image_tags.properties` is updated, CI
+stays on 3.1.5 and the ULFM tests skip.
+
+#### 3. 1c.4b, 1c.3a, 1b.2a: [feat] add an external recovery authority for WideEP peer loss ([7954af7253](https://github.com/arusli-nv/TensorRT-LLM/commit/7954af7253))
+
+A separate CPU process, outside the workers' launch and termination groups so it survives any
+worker's death. It decides whether and how survivors continue after a worker dies. It uses ZeroMQ
+messages because MPI is broken mid-recovery, signed with HMAC-SHA256 using a key shared by the
+authority and workers, so only the deployment's own processes can affect recovery.
+
+- **Startup admission:** each worker sends `Register` (its rank and the ranks whose loss the expert
+  placement can cover). All workers must report the same ranks, otherwise registration aborts. The
+  authority admits them (never rank 0) and replies with `Registered`.
+- **Recovery:**
+  - `Stopped`: each survivor has paused and names the dead rank.
+  - `Propose`: the authority assigns a new generation and lists the survivors.
+  - `Ready`: survivors send a digest of their new expert routing; all must match.
+  - `Install`: the authority tells survivors to switch to the survivor communicator and write the
+    new rank mask and routing.
+  - `Installed`: each survivor confirms.
+  - `Commit`: everyone resumes together, so nobody runs with the old state.
+- **Fails closed:** any violation, disagreement, timeout (60 s) or unreachable authority sends
+  `Abort` to every worker, and the job ends as it does today.
+- **Limits:** one recovery per deployment (repeated failures are 1c.6, beyond the MVP).
+
+#### 4. 1c.3, 1c.3a, 1c.4a: [feat] ULFM survivor communicators for host collectives ([1fd4629c5c](https://github.com/arusli-nv/TensorRT-LLM/commit/1fd4629c5c))
+
+Makes the executor's CPU-side MPI collectives survive a peer loss using ULFM. Uses a private copy of
+`COMM_WORLD`, so revoking it doesn't break other users of `COMM_WORLD`, such as the MPI session.
+
+- **Detect (1c.3):** a background watch thread notices a peer death even while the rank is busy on
+  the GPU.
+- **Unblock and agree (1c.3a):** Revoke wakes survivors stuck in a collective. Shrink makes them
+  agree on the dead rank and builds a survivor communicator, which is switched to only at the
+  authority's `Install`.
+- **Survivor-aware collectives (1c.4a):** rank numbers stay the same after a loss and gathers return
+  an empty entry for the dead rank, so survivors are never renumbered (same CUDA graphs).
+- **Limits:** pure attention DP only; requires launching with `mpirun --with-ft ulfm`; a second loss
+  is not recoverable.
+
+#### 5. 1a.8, 1a.8a, 1a.11: [feat] add a run-time rank mask and abort to the NVLinkOneSided all-to-all ([d6f44ab1d7](https://github.com/arusli-nv/TensorRT-LLM/commit/d6f44ab1d7))
+
+Kernels take the address of a fixed execution descriptor in GPU memory: a live-rank mask plus a
+pointer to an abort record in pinned host memory. Captured CUDA graphs therefore see mask changes
+made in place, and a CPU write releases kernels spinning on a dead peer instead of trapping.
+Each sender writes to a fixed per-source slot, so a dead or late sender can only corrupt its own
+slot. A new gather kernel compacts the slots and blanks inactive or aborted rows. Without a
+descriptor the kernels run unchanged (FT-off SASS is identical to main). Details and benchmarks in
+[Late writes](#late-writes-symmetric-memory-and-kernel-design-commits-5-and-6).
+
+#### 6. 1a.8a, 1a.8b: [feat] bind MoE layers to the all-to-all execution descriptor for recovery ([300b5218ef](https://github.com/arusli-nv/TensorRT-LLM/commit/300b5218ef))
+
+Adds `MoeExecutionState`: one execution descriptor per model, bound to the NVLinkOneSided object of
+every MoE layer before CUDA-graph capture (requires one shared `EPGroupHealth`, see commit 1).
+Recovery controls it with:
+
+- `request_abort()`: sets a flag in pinned host memory that every waiting kernel polls, so kernels
+  stuck on the dead peer return early, the rest of the step runs without waiting, and its invalid
+  output is discarded and redone after recovery.
+- `rearm()`: once all survivors are quiet, resets each workspace's round counter and flags and
+  clears the abort record, so the redone step starts in sync.
+- `install_mask()`: writes the new mask in place.
+
+All-to-all buffers stay mapped for the model's lifetime, so the addresses captured in CUDA graphs
+stay valid. Since kernels now read the mask from the descriptor, rank-mask mode allows CUDA graphs
+when FT is on (previously rejected).
+
+#### 7. 1b.2a, 1b.4a: [feat] route a lost rank's experts to their replicas after a peer loss ([f6c4a211da](https://github.com/arusli-nv/TensorRT-LLM/commit/f6c4a211da))
+
+Uses main's mask-only EPLB API (#15525) to route a lost rank's experts to replicas already resident
+on other GPUs: no weights move, and graphs are untouched.
+
+- **Admission (1b.2a):** `covers_loss_of(rank)` checks whether every expert in every MoE layer keeps
+  a copy if that rank is lost. Each worker asks this for every rank (except 0) to build the
+  `recoverable_ranks` list it sends in `Register`.
+- **Agreement:** `masked_placement_digest()` hashes every layer's placement with the dead rank
+  cleared. This is the digest in `Ready`, so all survivors route identically.
+- **Install (1b.4a):** at `Install`, `install_resident_placement()` reroutes first, then marks the
+  rank failed, rearms, and writes the mask. Routing must exclude the rank before the mask hides it,
+  or kernels would silently drop its tokens.
+
+#### 8. 1b.4a, 1c.4a: [feat] let attention-DP routing skip absent ranks ([e78147290b](https://github.com/arusli-nv/TensorRT-LLM/commit/e78147290b))
+
+Every iteration, the attention-DP scheduler runs a host allgather of each rank's state (its active
+requests and tokens) to decide where new requests go. After a loss, that list has an empty entry
+for the dead rank. ADP routing now drops it and stores per-rank counts by rank number (a dict
+instead of a list), so no live rank's count shifts to another rank's position.
+
+- New requests go only to live ranks. One strictly pinned to the dead rank gets an explicit error
+  instead of waiting forever.
+- Admission capacity counts only live ranks, so it never admits more requests than they can hold.
+- Each step, ranks vote on whether to use CUDA graphs and which batch size to pad to; only live
+  ranks vote, so the dead rank's empty entry can't force survivors out of their graphs.
+- With all ranks present, behavior is unchanged.
+
+#### 9. 1d.1: [feat] keep the MPI session serving after a peer loss ([d98a04e25e](https://github.com/arusli-nv/TensorRT-LLM/commit/d98a04e25e))
+
+With FT on, the MPI session server on rank 0 treats a dead rank's task failure (a ULFM peer-failure
+error, or `BrokenExecutor` once ULFM reports a failed rank) as a departed peer, not a job failure,
+so the session doesn't tear down the survivors.
+
+- The CPU-side MPI barriers at task end and at the load balancer's shutdown (between ranks of one
+  node, around shared host memory) tolerate the dead rank. Previously they could hang or error when
+  the recovered job shuts down.
+- After a loss, new requests are served normally. Only the MPI session's task mechanism (running a
+  function on every rank, used at startup and teardown) can't be used, so new task commands fail
+  fast and only shutdown is honored.
+- Shutdown ends the world with `MPI_Abort(0)`, because mpi4py.futures can't release a world that
+  lost a rank.
+- Without FT, nothing changes.
+
+#### 10. 1c.4c: [feat] roll back KV Cache Manager V2 allocations of a discarded step ([f1bb11d9dd](https://github.com/arusli-nv/TensorRT-LLM/commit/f1bb11d9dd))
+
+Adds `revert_prepare_resources()`, which undoes the KV-cache space the scheduler reserved for a step
+whose forward is discarded (the step interrupted by a peer loss), so its redo after recovery starts
+from the same state:
+
+- new requests free their blocks (never committed for reuse);
+- later prompt chunks shrink back to their previous capacity;
+- generating requests give back the step's tokens.
+
+The discarded step's KV writes are overwritten by the redo. KV Cache Manager V2 only.
+Recurrent-state (linear attention) and sparse-attention managers are rejected at startup; a
+discarded step can't be undone for them by freeing blocks.
+
+#### 11. 1c.4, 1c.4c, 1d.1, 1d.4a: [feat] recover the executor from a WideEP peer loss ([a4efd09919](https://github.com/arusli-nv/TensorRT-LLM/commit/a4efd09919))
+
+Adds `PeerLossRecovery`, which hooks into `PyExecutor` and runs the recovery using commits 3–10. At
+startup it validates the configuration and registers with the authority.
+
+- **Detect and stop:** the watcher sets a flag, aborts MoE collectives and revokes host
+  communicators; the step in flight is discarded, not committed.
+- **Recover:**
+  - Shrink to agree on the dead rank.
+  - Wait for the GPU and roll back the step's KV allocations.
+  - Authority handshake: `Stopped` → `Propose` → `Ready` (digest) → `Install` (survivor
+    communicator, resident placement, rearm, mask) → `Installed` → `Commit`.
+- **Requests (1c.4c):** responses lost in an interrupted gather are redelivered. The dead rank's
+  requests fail with an explicit retry error. Requests cut off mid-broadcast are re-admitted.
+- **Resume** on the CUDA graphs captured at startup. If the recovery itself can't complete
+  (`Abort`, a timeout, more than one dead rank), survivors shut down as they would without FT; the
+  hang detector bounds a stuck recovery.
+- Adds a 4-GPU integration test (1d.4a). The user doc lands as a separate docs PR (draft:
+  [wide-ep-fault-tolerance.md](wide-ep-fault-tolerance.md)).
+
+## Related draft PRs
+
+**1c.3 (#15785):** MPI failure-evidence transport. Spreads "rank R looks dead" across ranks on its
+own communicator.
+Not used yet; our ULFM watch thread plays this role. It can plug in later as the detector: it
+reports the dead rank, and the recovery authority still makes the only decision. The two never
+share a communicator.
+
+**1a.8 (#15895):** cooperative all-to-all abort. Lets kernels waiting on a dead peer return instead
+of trapping.
+Same goal as commit 5, but the abort epoch is a kernel argument, which CUDA graphs freeze, so it
+can't run under graphs. We keep our descriptor and can port its failure diagnostics (phase, reason,
+waiting peer).
+
+**1a.7 (#15789):** NCCL abort and survivor rebuild.
+Not needed: the MVP uses MPI and the NVLink all-to-all, not NCCL.
+
+**1d.3 (#15788):** EP rank-health metrics.
+Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as commit 1.
+
+## Validated configurations
+
+- **Configurations:** DeepSeek-R1 NVFP4 on 16, 32 and 64 GB200 GPUs; Kimi-K2 NVFP4 on 32.
+  Attention DP, static EPLB with redundant experts, NVLinkOneSided fence path, CUTEDSL MoE, decode
+  CUDA graphs, non-overlap scheduler, KV Cache Manager V2.
+- **Failures:** SIGKILL of one rank (1, 2, 30 or 62, including ranks on other nodes), killed while
+  idle, generating, inside the MoE all-to-all, during prefill and under full load. A rank without
+  expert coverage fails closed.
+- **Tests:** CPU and GPU unit tests; a 4-GPU integration test (DeepSeek-V3-Lite, kill idle and
+  mid-step).
+
+**Results (DeepSeek-R1 NVFP4, 32 GB200 GPUs):**
+
+| Rank killed while… | Result |
 |---|---|
-| no requests run | new requests served after 0.16–0.34 s (restart without FT: 81–173 s) |
+| no requests run (idle) | serving again after 0.16–0.34 s (restart without FT: 81–173 s) |
 | requests generate tokens | all finish within 1.4–3.1 s |
-| GPUs run the MoE all-to-all (7 runs) | all finish within 2.6–3.2 s |
-| new prompts are processed, full load | 248 of 248 finish within 4.6 s |
+| GPUs run the MoE all-to-all | all finish within 2.6–3.2 s |
+| prefill, full load | 248 of 248 finish within 4.6 s |
 | its experts have no copy elsewhere | every request fails with an explicit error within 0.04 s |
 
-- Recovery itself (kill → all survivors resumed): 0.14 s. Tokens match a reference run that never
-  used the lost rank. nsys shows every decode all-to-all inside the original graphs.
-- Throughput with FT on: −2.4% at 8 requests per GPU, −3.7% at 64. After a loss: 98% per remaining
-  GPU. FT built in but off: kernels instruction-identical to main.
+![Recovery time and throughput](evidence/results.png)
 
-### Remaining qualification
+- Survivors' tokens match a reference run that never used the lost rank, and all decode steps stay
+  in the original CUDA graphs (Nsight Systems: no graph captures after the kill).
+- FT overhead vs FT off with the same config: −2.4% (8 requests per GPU), −3.7% (64 per GPU),
+  mostly the new gather kernel (about 65–75% of the added MoE-layer time; see
+  [Benchmarks](#benchmarks)).
+- After a loss, the 31 remaining GPUs serve 75.8k tok/s, 98% of their per-GPU throughput before
+  the loss.
+- With the overlap scheduler and MTP (production config, not yet supported with FT), the same 32
+  GPUs reach 157k tok/s.
 
-- **Scope:** KV Cache Manager V2 only; for disaggregated serving, the Python transceiver only.
-- **Kernel cost:** the gather adds 4–14 µs per MoE layer (section below); fusing or removing it is
-  open.
-- **Production config:** overlap scheduler and MTP are not supported yet; with them the same 32
-  GPUs reach 157k tokens/s versus 80k with FT. Online EPLB (1b.3) is not supported.
-- **CI:** an image with ULFM Open MPI and mpi4py 4.1.2; until then the ULFM tests skip.
-- **1c.3a fencing of a live rank:** the MVP fences only by process death; a hung or unreachable
-  rank ends the job through the hang detector (needs live-rank fencing, plus 1c.2 and 1c.3 for
+## Remaining qualifications
+
+- **Production config:** the overlap scheduler and MTP aren't supported with FT. This is the
+  largest gap: 157k tok/s without FT versus 80k with FT on the same 32 GPUs. Online EPLB (1b.3)
+  isn't supported either.
+- **1c.3a live-rank fencing:** only process death is recovered. A hung or unreachable rank ends the
+  job after the hang detector's 300 s timeout (needs live-rank fencing, plus 1c.2 and 1c.3 for
   suspicion).
-- **1d.3** health reporting; **1d.7** v1 qualification (other backends, soak runs).
-- **Not started:** 1a.6 TwoSided, 1a.7 NCCL, 1b.7 N−K placement, 1c.2 per-rank evidence budgets.
-- **Follow-ups:** CFT, Ray, disaggregated serving, repeated failures (1c.6), restore to N ranks.
-
-### Integration boundary with #15785 (1c.3, evidence transport)
-
-Evidence means "rank R looks dead"; only the authority turns it into a membership change.
-
-| Concern | Owner | Never |
-|---|---|---|
-| detect and spread failure evidence | #15785 `FailureEvidenceTransport`; our ULFM watcher becomes one implementation | changes membership, the rank mask or communicators |
-| decide and commit membership | recovery authority (1c.4b) | detects failures itself |
-| apply a commit: shrink the host communicator, install the mask and placement | workers (`MPIDist`, MoE layers) | act before the authority's `Install` |
-
-- One handoff: the transport's `FailureDetectedCallback(failed_rank, ...)` makes the worker send
-  `Stopped`. Our watcher calls `on_failure()` with no arguments, so a small adapter joins the two.
-- Separate communicators: #15785 revokes only its own detection subcommunicator, for terminal
-  aborts; recovery revokes only the host-collective communicator, to wake survivors.
-- No dependency today. Once #15785 merges, the authority and protocol stay unchanged.
+- **Model coverage:** KV Cache Manager V2 only. Recurrent-state (e.g. Kimi K3) and sparse-attention
+  models are rejected at startup; sliding-window attention is unvalidated. Greedy sampling is
+  expected: penalties, seeded sampling and multi-token stop words aren't rolled back with a
+  discarded step.
+- **Kernel cost:** the gather kernel adds 4–14 µs per MoE layer; fusing or removing it is open.
+- **CI:** needs an image with mpi4py 4.1.2; until then the ULFM tests skip. x86 is unverified (only
+  aarch64 was available).
+- **Follow-ups:** CFT (needs the R615 driver), Ray, disaggregated serving, repeated failures (1c.6),
+  restore to N ranks, health reporting (1d.3).
 
 ## MVP Architecture
 
-### Integration diagram
+![Integration diagram](evidence/integration.png)
 
-```text
-[R] reused from main   [N] new in this work
-
-Phase 1: cancel the attempt (each survivor, on its own)
-  detect    [N] ULFM watcher, or a host collective failing with a ULFM error
-  cancel    [N] abort flag in pinned host memory, read through the graph-visible descriptor
-            [N] ULFM Revoke wakes ranks blocked in host collectives
-  discard   [N] commit gate drops the step; KV Cache Manager V2 rollback
-  report    [N] Stopped → recovery authority (sole CPU coordinator)
-
-Phase 2: install routing and mask (graph replay paused; authority-driven)
-  agree     [N] ULFM Shrink → survivor communicator; Propose → Ready with placement digest
-  route     [R] mask-only EPLB API: the lost rank's experts → their copies
-  mask      [R] EPGroupHealth commits the live mask → [N] written into the descriptor in place
-  rearm     [N] reset workspaces and abort flag → Installed
-
-Phase 3: permission to resume
-  commit    [N] authority sends Commit only after matching Installed from every survivor
-  resume        survivors replay the same CUDA graphs on N−1 ranks
-```
-
-- **ULFM** (Open MPI 5, mpi4py 4): calls involving a dead process return an error instead of
-  aborting; `Revoke` makes a communicator fail on every member; `Shrink` returns the same
-  survivor-only communicator on every survivor.
-- **Graph-visible descriptor:** graphs bake in addresses, not contents. Dispatch and combine read
-  one small tensor at a fixed address (live-rank mask + abort-flag pointer); after a loss only it
-  and the routing tables are rewritten in place. Shapes, rank ids, layout and addresses never
-  change.
+Rows are components; columns are the three phases: attempt cancellation, routing/mask installation,
+and permission to resume. Survivors install while graph replay is paused, and resume only after
+`Commit`, which the authority sends after every survivor has sent `Installed`. #15785 can later
+replace the watcher as the detector; the authority stays the only decision-maker.
 
 ### Safety features
 
-- **Resume only on permission:** survivors resume only after a Commit for their generation, which
-  the authority sends after every survivor reports Installed with the same placement digest.
-- **Cancellation reaches spinning kernels:** a CPU write to mapped host memory needs no GPU work,
-  so it reaches kernels that occupy the whole GPU. A real timeout still traps.
-- **No garbage data:** an aborted combine never marks its output ready; rows of masked ranks or of
-  an aborted step reach the expert GEMMs as expert id −1 with zero data.
-- **No partial output:** the commit gate discards an aborted step before it updates any request.
-- **KV cache and KV cache reuse:** the step's KV reservations are undone after its GPU work finishes;
-  its blocks are never offered for reuse.
-- **No lost or duplicated responses:** an interrupted response gather is resent.
-- **Own crash:** a rank whose own event loop fails (for example a CUDA error on that GPU) while
-  the others can recover exits alone, so the survivors recover instead of main's crash handler
-  killing every rank.
-- **Bounded and fail-closed:** every wait has a deadline; an uncovered loss, a second loss, rank 0's
+- **Resume only on permission:** survivors resume only after `Commit` for their generation, and
+  only after every survivor reported `Installed` with the same placement digest.
+- **Cancellation reaches spinning kernels:** a CPU write to pinned host memory needs no GPU work, so
+  it reaches kernels that occupy the whole GPU.
+- **No garbage data:** rows from masked ranks or an aborted step reach the expert GEMMs as expert
+  id −1 with zero data. An aborted combine never marks its output ready.
+- **No partial output:** the interrupted step is discarded before it updates any request. Its KV
+  reservations are rolled back and its blocks are never offered for reuse.
+- **No lost or duplicated responses:** responses from an interrupted gather are resent.
+- **Own crash:** an admitted rank whose own loop crashes exits alone, so the survivors recover.
+- **Bounded and fail-closed:** every wait has a deadline. An uncovered loss, a second loss, rank 0's
   loss or any recovery failure ends the job with an explicit error.
-- **Late writes:** below.
 
-### Late writes: symmetric memory and kernel design
+### Late writes: symmetric memory and kernel design (commits 5 and 6)
 
-Each GPU allocates one all-to-all workspace in symmetric memory, mapped by every peer over NVLink.
-Dispatch pushes tokens into the receiving GPU's workspace; combine pulls outputs from peers'. A
-rank can die with writes still in flight. The hazard is main's **runtime-dependent layout**, not
-rank renumbering (rank ids never change): main sizes each source's rows by
-`runtime_max_tokens_per_rank`, so rows move between steps.
+![Late writes and fixed per-source regions](evidence/late_writes.png)
 
-```text
-row                0 1 2 3 4 5 6 7 8 9 10 11      digit = source rank that owns the row
+A rank can die with writes still in flight into peers' workspaces. The hazard is main's
+runtime-dependent layout, not rank renumbering: main sizes each source's rows by the step's
+`runtime_max_tokens_per_rank`, so rows move between steps, and a late write can land in a
+survivor's rows. With FT, each source writes into a fixed region sized by `max_num_tokens_per_rank`.
+Everything a dead rank writes (payloads, flags, counters, EPLB stats) stays in storage indexed by
+that rank, which later execution neither reads nor reassigns. Workspaces stay mapped until
+teardown, so the backing memory stays valid.
 
-Main, step n       0 0 0 0 1 1 1 1 2 2 2  2     runtime_max_tokens_per_rank = 4
-Main, step n+1     0 0 1 1 2 2 3 3 4 4 5  5     runtime_max_tokens_per_rank = 2
-                                   ^
-                                   late write from dead rank 2, aimed at row 8 in step n,
-                                   lands in rank 4's rows in step n+1
+- **Kernels (commit 5):** dispatch and combine read the descriptor, skip masked ranks in every wait
+  and load, and exit spin loops on abort. A new gather kernel packs valid rows into the dense GEMM
+  input. With FT off, the kernels are instruction-identical to main.
+- **Model binding (commit 6):** the workspace is sized for the fixed regions and kept mapped for the
+  model's lifetime.
+- **Verified:** a 2-process test kills a rank mid-dispatch at three timings. Every byte outside the
+  dead rank's regions is unchanged, and masked execution continues correctly.
+- **Alternatives rejected:** a pull-based dispatch (a round trip per MoE layer, plus a rewrite of
+  main's hot kernel); strided expert inputs (would change every MoE backend).
 
-FT, every step     0 0 0 0 1 1 1 1 2 2 2  2     max_num_tokens_per_rank = 4 (fixed):
-                                                rank 2's late writes stay in rank 2's rows
-```
+#### Benchmarks
 
-**Everything a source writes into a peer's workspace is confined to storage indexed by that
-source**, which later execution neither consumes nor repurposes:
+R1, 32 GPUs; nsys on one rank; medians over about 139k MoE-layer executions from CUDA graphs.
 
-| Written by source k into a peer | Location | After rank k is lost |
-|---|---|---|
-| dispatch payloads | fixed region k: `[source][payload][max_num_tokens_per_rank]` | gather skips masked sources; region k is never reassigned |
-| dispatch and combine completion flags | word k of each flag array | masked sources are never waited on |
-| receive counters (two parities) | word k of each parity | not read for masked sources |
-| EPLB gathered statistics | row k | ignored for masked sources |
-| combine outputs | none (combine pulls) | — |
-
-- **Backing memory stays valid:** bound workspaces are pinned until model teardown, so late writes
-  never hit freed or reused memory. Survivors keep the lost rank's mapping but never read it.
-- **Verified:** a 2-process test SIGKILLs a rank mid-dispatch at three timings; every byte outside
-  rank k's regions above is unchanged, and masked execution then continues correctly.
-- **Workspace size:** unchanged except a small alignment pad per source region.
-- **Gather kernel (new, FT only):** packs the valid rows of the fixed regions into the dense input
-  the expert GEMMs expect; overlapped with dispatch (programmatic dependent launch).
-- **Dispatch and combine (FT path):** read the descriptor, skip masked ranks in every wait and load,
-  exit spin loops on abort. FT off: instruction-identical to main.
-- **Alternatives rejected:** a pull-based dispatch (a round trip per MoE layer, rewrite of main's
-  hot kernel); strided expert inputs (changes every MoE backend).
-
-**Benchmarks** (R1, 32 GPUs, nsys on one rank, medians over ~139k MoE-layer executions from CUDA
-graphs):
-
-| | Dispatch | Combine | Expert-id step | Dispatch start → combine end |
+| | Dispatch | Combine | Sanitize (off) / Gather (on) | MoE-layer span |
 |---|---|---|---|---|
-| FT off, 8 requests/GPU | 13.4 µs | 34.4 µs | sanitize 9.4 µs | 81.7 µs |
-| FT on, 8 requests/GPU | 14.6 µs | 36.1 µs | gather 13.8 µs | 88.4 µs (+8%) |
-| FT off, 64 requests/GPU | 15.3 µs | 41.7 µs | sanitize 10.6 µs | 125.3 µs |
-| FT on, 64 requests/GPU | 16.4 µs | 43.1 µs | gather 24.6 µs | 144.1 µs (+15%) |
+| FT off, 8 req/GPU | 13.4 µs | 34.4 µs | 9.4 µs | 81.7 µs |
+| FT on, 8 req/GPU | 14.6 µs | 36.1 µs | 13.8 µs | 88.4 µs (+8%) |
+| FT off, 64 req/GPU | 15.3 µs | 41.7 µs | 10.6 µs | 125.3 µs |
+| FT on, 64 req/GPU | 16.4 µs | 43.1 µs | 24.6 µs | 144.1 µs (+15%) |
 
 - Dispatch and combine changes cost 1–2 µs each (descriptor read, mask checks).
-- The gather is the main cost and grows with batch: it replaces main's sanitize kernel but copies
-  every row, where main hands the GEMMs a zero-copy view.
-- End to end: −2.4% throughput at 8 requests per GPU, −3.7% at 64 (about 19 µs × 58 MoE layers
-  per step, plus the commit-gate sync). Fusing or removing the gather is the main optimization.
-
-Launch and configuration: draft user doc `wide-ep-fault-tolerance.md` (this branch; lands as a separate docs PR).
+- The gather is the main cost and grows with batch: it copies every row, where main's sanitize
+  kernel works in place. It accounts for about 65% of the added span at 8 requests per GPU (+4.4 of
+  +6.7 µs) and about 75% at 64 (+14.0 of +18.8 µs).
+- End to end, that is −2.4% / −3.7% throughput (about 19 µs × 58 MoE layers per step, plus the
+  per-step commit sync). Fusing or removing the gather is the main optimization left.
