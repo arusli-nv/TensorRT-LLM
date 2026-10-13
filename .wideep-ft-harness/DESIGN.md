@@ -303,9 +303,11 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 
 ![Integration diagram](evidence/integration.png)
 
-Rows are components; columns are the three phases: attempt cancellation, routing/mask installation,
-and permission to resume. Survivors install while graph replay is paused, and resume only after
-`Commit`, which the authority sends after every survivor has sent `Installed`. #15785 can later
+Top: the components of each surviving rank and how they connect (ZeroMQ to the authority, MPI and
+NVLink to the other ranks). Bottom: the three recovery phases (attempt cancellation, routing/mask
+installation, permission to resume) and the authority messages of each. Survivors install while
+graph replay is paused, and resume only after `Commit`, which the authority sends after every
+survivor has sent `Installed`. #15785 can later
 replace the watcher as the detector; the authority stays the only decision-maker.
 
 ### Safety features
