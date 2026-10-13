@@ -164,7 +164,7 @@ on other GPUs: no weights move, and graphs are untouched.
   rank failed, rearms, and writes the mask. Routing must exclude the rank before the mask hides it,
   or kernels would silently drop its tokens.
 
-#### 8. 1b.4a, 1c.4a: [feat] let attention-DP routing skip absent ranks ([e78147290b](https://github.com/arusli-nv/TensorRT-LLM/commit/e78147290b))
+#### 8. 1b.4a, 1c.4a: [feat] let attention-DP routing skip absent ranks ([77b6d49173](https://github.com/arusli-nv/TensorRT-LLM/commit/77b6d49173))
 
 Every iteration, the attention-DP scheduler runs a host allgather of each rank's state (its active
 requests and tokens) to decide where new requests go. After a loss, that list has an empty entry
@@ -178,7 +178,7 @@ instead of a list), so no live rank's count shifts to another rank's position.
   ranks vote, so the dead rank's empty entry can't force survivors out of their graphs.
 - With all ranks present, behavior is unchanged.
 
-#### 9. 1d.1: [feat] keep the MPI session serving after a peer loss ([d98a04e25e](https://github.com/arusli-nv/TensorRT-LLM/commit/d98a04e25e))
+#### 9. 1d.1: [feat] keep the MPI session serving after a peer loss ([80e7d1f69f](https://github.com/arusli-nv/TensorRT-LLM/commit/80e7d1f69f))
 
 With FT on, the MPI session server on rank 0 treats a dead rank's task failure (a ULFM peer-failure
 error, or `BrokenExecutor` once ULFM reports a failed rank) as a departed peer, not a job failure,
@@ -194,7 +194,7 @@ so the session doesn't tear down the survivors.
   lost a rank.
 - Without FT, nothing changes.
 
-#### 10. 1c.4c: [feat] roll back KV Cache Manager V2 allocations of a discarded step ([f1bb11d9dd](https://github.com/arusli-nv/TensorRT-LLM/commit/f1bb11d9dd))
+#### 10. 1c.4c: [feat] roll back KV Cache Manager V2 allocations of a discarded step ([ac90e817b4](https://github.com/arusli-nv/TensorRT-LLM/commit/ac90e817b4))
 
 Adds `revert_prepare_resources()`, which undoes the KV-cache space the scheduler reserved for a step
 whose forward is discarded (the step interrupted by a peer loss), so its redo after recovery starts
@@ -208,7 +208,7 @@ The discarded step's KV writes are overwritten by the redo. KV Cache Manager V2 
 Recurrent-state (linear attention) and sparse-attention managers are rejected at startup; a
 discarded step can't be undone for them by freeing blocks.
 
-#### 11. 1c.4, 1c.4c, 1d.1, 1d.4a: [feat] recover the executor from a WideEP peer loss ([a4efd09919](https://github.com/arusli-nv/TensorRT-LLM/commit/a4efd09919))
+#### 11. 1c.4, 1c.4c, 1d.1, 1d.4a: [feat] recover the executor from a WideEP peer loss ([5e292620cc](https://github.com/arusli-nv/TensorRT-LLM/commit/5e292620cc))
 
 Adds `PeerLossRecovery`, which hooks into `PyExecutor` and runs the recovery using commits 3–10. At
 startup it validates the configuration and registers with the authority.
