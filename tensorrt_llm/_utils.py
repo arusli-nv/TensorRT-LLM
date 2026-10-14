@@ -1406,6 +1406,11 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def device_visible_host_zeros(size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Zeros in pinned host memory, which kernels read through its mapped address."""
+    return torch.zeros(size, dtype=dtype).pin_memory()
+
+
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
     """Build a CPU tensor from `data` and ship it to `device` with a
