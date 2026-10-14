@@ -730,6 +730,7 @@ def _register_fake():
         invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        execution_descriptor: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -763,6 +764,7 @@ def _register_fake():
         use_cft_counted_writes: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        execution_descriptor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
@@ -774,6 +776,7 @@ def _register_fake():
         max_num_tokens_per_rank: int,
         eplb_stats_num_experts: Optional[int] = None,
         can_use_cft_counted_writes: bool = False,
+        barrier: bool = True,
     ) -> torch.Tensor:
         return torch.empty((10, ), dtype=torch.int64, device="cpu")
 
