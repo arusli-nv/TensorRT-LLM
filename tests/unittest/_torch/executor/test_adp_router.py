@@ -883,10 +883,10 @@ def test_achieve_max_num_active_requests(attention_dp_config):
             )
             req_id += 1
 
-    all_ranks_num_active_requests = [5, 6, 3, 7]
+    all_ranks_num_active_requests = dict(enumerate([5, 6, 3, 7]))
     waiting_queue = FCFSWaitingQueue()
     waiting_queue.extend(req_list)
-    available = max_num_active_requests * 4 - sum(all_ranks_num_active_requests)
+    available = max_num_active_requests * 4 - sum(all_ranks_num_active_requests.values())
 
     result = get_from_waiting_queue(
         waiting_queue,
@@ -928,8 +928,9 @@ def test_attention_dp_scheduling_cases(
     for rank, relax in request_configs:
         append_to_waiting_queue(waiting_queue, rank, relax)
 
+    all_ranks_num_active_requests = dict(enumerate(all_ranks_num_active_requests))
     num_ranks = len(all_ranks_num_active_requests)
-    total_num_active_requests = sum(all_ranks_num_active_requests)
+    total_num_active_requests = sum(all_ranks_num_active_requests.values())
     total_max = max_num_active_requests * num_ranks
 
     new_requests = get_from_waiting_queue(
@@ -960,8 +961,8 @@ def test_balance_requests_across_ranks_empty_requests():
     result = DefaultADPRouter(dist=dist)._balance_requests_across_ranks(
         [],
         all_ranks_new_requests,
-        [2, 1, 3, 0],
-        [20, 10, 30, 5],
+        dict(enumerate([2, 1, 3, 0])),
+        dict(enumerate([20, 10, 30, 5])),
         3,
     )
     for rank in range(4):
@@ -976,8 +977,8 @@ def test_balance_requests_across_ranks_single_request():
     )
     req.request.input_token_ids = [1, 2, 3, 4, 5]  # 5 tokens
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    all_ranks_num_active_requests = [1, 2, 0, 1]  # Rank 2 has lowest count
-    all_ranks_num_active_tokens = [10, 20, 5, 15]
+    all_ranks_num_active_requests = dict(enumerate([1, 2, 0, 1]))  # Rank 2 has lowest count
+    all_ranks_num_active_tokens = dict(enumerate([10, 20, 5, 15]))
     expected_num_active_requests = 2
 
     dist = _mock_dist()
@@ -1018,8 +1019,8 @@ def test_balance_requests_across_ranks_multiple_requests():
     req3.request.input_token_ids = [1, 2]  # 2 tokens
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    all_ranks_num_active_requests = [0, 1, 2, 1]
-    all_ranks_num_active_tokens = [5, 15, 25, 10]
+    all_ranks_num_active_requests = dict(enumerate([0, 1, 2, 1]))
+    all_ranks_num_active_tokens = dict(enumerate([5, 15, 25, 10]))
     expected_num_active_requests = 2
 
     dist = _mock_dist()
@@ -1057,8 +1058,8 @@ def test_balance_requests_across_ranks_capacity_limits():
         requests.append(req)
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    all_ranks_num_active_requests = [1, 1, 1, 1]  # All ranks start with 1
-    all_ranks_num_active_tokens = [10, 10, 10, 10]
+    all_ranks_num_active_requests = dict(enumerate([1, 1, 1, 1]))  # All ranks start with 1
+    all_ranks_num_active_tokens = dict(enumerate([10, 10, 10, 10]))
     expected_num_active_requests = 2
 
     dist = _mock_dist()
@@ -1100,8 +1101,8 @@ def test_balance_requests_across_ranks_heap_ordering():
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     # Rank 0 has highest active count, should get requests last
-    all_ranks_num_active_requests = [3, 1, 0, 2]
-    all_ranks_num_active_tokens = [30, 10, 5, 20]
+    all_ranks_num_active_requests = dict(enumerate([3, 1, 0, 2]))
+    all_ranks_num_active_tokens = dict(enumerate([30, 10, 5, 20]))
     expected_num_active_requests = 4
 
     dist = _mock_dist()
@@ -1153,8 +1154,8 @@ def test_balance_requests_across_ranks_token_count_sorting():
     result = DefaultADPRouter(dist=dist)._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
-        [0, 0, 0, 0],
-        [5, 5, 5, 5],
+        dict(enumerate([0, 0, 0, 0])),
+        dict(enumerate([5, 5, 5, 5])),
         2,
     )
 

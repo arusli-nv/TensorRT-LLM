@@ -184,6 +184,7 @@ class MockBenchmarkExecutor:
         self.dist.tp_size = tp_size
         self.dist.pp_size = pp_size
         self.dist.world_size = tp_size
+        self.dist.live_ranks = tuple(range(tp_size))
 
         # State the gate's stall bound reads. 0 disables the bound, which is
         # what these tests want twice over: they assert retry semantics, not
@@ -763,6 +764,7 @@ class MockPadDummyExecutor:
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
+        self.dist.live_ranks = tuple(range(tp_size))
         self.dist.tp_allgather.side_effect = lambda value: [value]
         # Simulate a peer rank with generation compute after the fill gate
         # opens, so an empty local rank needs a generation dummy.
@@ -945,6 +947,7 @@ class TestBenchmarkFillAdmissionFlowControl:
 
         ex.dist = Mock()
         ex.dist.tp_size = tp_size
+        ex.dist.live_ranks = tuple(range(tp_size))
         return ex
 
     @staticmethod
@@ -1670,6 +1673,7 @@ class TestFillPhaseEndToEnd:
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
+        ex.dist.live_ranks = tuple(range(self.TP_SIZE))
         ex.dist.tp_allreduce.return_value = 0
         ex.dist.tp_allgather.return_value = [(0, False)] * self.TP_SIZE
         ex.is_shutdown = False
