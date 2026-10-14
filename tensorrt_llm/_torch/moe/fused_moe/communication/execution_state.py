@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,6 +14,9 @@ from tensorrt_llm._utils import device_visible_host_zeros, peer_loss_recovery_en
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
 from .nvlink_one_sided import NVLinkOneSided
+
+if TYPE_CHECKING:
+    from ..moe_load_balancer import MoeLoadBalancer
 
 
 def _mask_tensor(health: EPGroupHealth) -> torch.Tensor:
@@ -111,6 +115,26 @@ class MoeExecutionState:
             raise RuntimeError(f"MoE All-to-All abort record is {self.abort.tolist()}")
         self.descriptor[:EP_MASK_NUM_WORDS].copy_(_mask_tensor(self.health))
         torch.cuda.synchronize(self.descriptor.device)
+
+    def install_resident_placement(
+        self, load_balancer: MoeLoadBalancer, failed_ranks: Iterable[int]
+    ) -> None:
+        """Route MoE traffic around ``failed_ranks`` using resident replicas.
+
+        Only call while the model is idle. Routing must exclude the failed
+        ranks before their mask is installed, because the MoE kernels silently
+        skip routes to a masked rank.
+
+        Raises:
+            RuntimeError: A rank in ``failed_ranks`` had already failed.
+        """
+        failed = sorted(set(failed_ranks))
+        load_balancer.reconfigure_mask_only(failed)
+        for rank in failed:
+            if not self.health.mark_failed(rank):
+                raise RuntimeError(f"EP rank {rank} is already failed")
+        self.rearm()
+        self.install_mask()
 
     def close(self) -> None:
         """Release the workspace pins. Only call after the last forward has completed."""
