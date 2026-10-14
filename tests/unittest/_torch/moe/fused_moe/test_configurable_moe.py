@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from unittest.mock import Mock, patch
 
 import pytest
@@ -27,6 +28,8 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SiTuActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import _HEALTH_KEY
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -170,6 +173,31 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     assert wrapper.quant_config.quant_algo is None
     assert backend.quant_config.quant_algo is None
     backend.create_weights.assert_called_once_with()
+
+
+def test_layer_quant_override_shares_ep_group_health() -> None:
+    health = EPGroupHealth(4)
+    assert copy.deepcopy(health) is health
+    model_config = ModelConfig(quant_config=QuantConfig())
+    model_config.extra_attrs[_HEALTH_KEY] = health
+    wrapper = _wrapper()
+    wrapper.quant_config = model_config.quant_config
+    create_backend = Mock(return_value=_backend_mock())
+
+    with (
+        patch("tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls", return_value=Mock()),
+        patch("tensorrt_llm._torch.moe.fused_moe.create_moe.create_moe_backend", create_backend),
+    ):
+        wrapper._create_and_sync_backend(
+            model_config=model_config,
+            routing_method=Mock(),
+            override_quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+        )
+
+    backend_config = create_backend.call_args.kwargs["model_config"]
+    assert backend_config is not model_config
+    assert backend_config.quant_config.quant_algo == QuantAlgo.FP8
+    assert backend_config.extra_attrs[_HEALTH_KEY] is health
 
 
 @pytest.mark.parametrize("missing", ["gate_softcap", "linear_softcap"])
