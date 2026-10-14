@@ -1,7 +1,7 @@
 """Diagnostic hooks for the EP32 experiments, loaded via a .pth file in MPI worker processes.
 
-- TLLM_TEST_ORACLE_EXCLUDE_RANK=r: every rank except r excludes r's EPLB slots from routing at
-  startup. A healthy all-alive run then routes exactly as after rank r is lost, so its greedy
+- TLLM_TEST_ORACLE_EXCLUDE_RANK=r: every rank, r included, excludes r's EPLB slots from routing
+  at startup, so all ranks keep one placement. A healthy all-alive run then routes exactly as after rank r is lost, so its greedy
   tokens are the exact oracle for post-recovery tokens.
 - TLLM_TEST_TRACE_CAPTURE=1: print a line for every CUDA graph capture, to show that recovery
   captures nothing.
@@ -52,9 +52,8 @@ def _patch_eplb(module):
 
     def finalize_model(self):
         original(self)
-        if self.ep_rank != int(exclude_rank):
-            self.load_balancer_impl.reconfigure_mask_only([int(exclude_rank)])
-            print(f"WIDEEP_ORACLE rank {self.ep_rank} excluded rank {exclude_rank}", flush=True)
+        self.load_balancer_impl.reconfigure_mask_only([int(exclude_rank)])
+        print(f"WIDEEP_ORACLE rank {self.ep_rank} excluded rank {exclude_rank}", flush=True)
 
     module.MoeLoadBalancer.finalize_model = finalize_model
 

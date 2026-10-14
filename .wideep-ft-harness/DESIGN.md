@@ -235,9 +235,13 @@ startup it validates the configuration (unsupported features fail with a clear e
 
 **1c.3 (#15785):** MPI failure-evidence transport. Spreads "rank R looks dead" across ranks on its
 own communicator.
-Not used yet; our ULFM watch thread plays this role. It can plug in later as the detector: it
-reports the dead rank, and the recovery authority still makes the only decision. The two never
-share a communicator.
+Not used: with ULFM, our watcher already detects a dead process within milliseconds and MPI
+spreads the failure itself. It is the path for failures ULFM can't see (a hung rank found by the
+AlltoAll watchdog, or MPI without ULFM). Boundary: its failure callback only calls PeerLossRecovery's
+entry point, where the watcher calls today, and replaces the watcher rather than running beside it.
+Evidence never changes membership, routing or requests; the lost rank is fixed by Shrink and the
+authority, which aborts if they disagree. It uses its own MPI subcommunicator; the authority uses
+ZeroMQ outside MPI.
 
 **1a.8 (#15895):** cooperative all-to-all abort. Lets kernels waiting on a dead peer return instead
 of trapping.
@@ -270,23 +274,26 @@ Not needed for the MVP; it contains the same `EPGroupHealth` deepcopy fix as com
 
 ![Without FT: teardown and restart](evidence/eval_noft_failover.png)
 
-DeepSeek-R1 NVFP4, 32 GB200, rank 2 SIGKILLed. With FT: 3 idle and 3 in-flight kills, wall-clock
-markers at each step on every survivor (median shown). Without FT: 2 kills and 2 clean restarts,
+DeepSeek-R1 NVFP4, 32 GB200, rank 2 SIGKILLed. With FT: 3 idle kills, 3 kills while generating and
+1 during prefill under full load (256 requests); wall-clock markers at each step on every survivor
+(median shown). Without FT: 2 kills and 2 clean restarts,
 plain mpirun.
 
-- With FT, survivors serve again 28–94 ms after the kill (in-flight kills 31–37 ms); detection and Shrink are most of it.
-  The authority waits for the slowest survivor: in idle kill 2 one GPU still had work queued and
-  drained 65 ms after the others (not yet traced; likely the rest of an in-progress step).
-- A request sent right after the kill gets its first token 0.23–0.29 s after the kill, idle or
-  in flight. Most of that comes after
-  recovery; a no-kill time-to-first-token was not measured, so it is not split further.
+- With FT, survivors serve again 28–37 ms after the kill in 6 of 7 runs; detection and Shrink are
+  most of it. Idle kill 2 took 94 ms: the authority waits for every survivor to stop, and one GPU
+  needed 65 ms to finish work already queued on it (kernels other than the all-to-all can't be
+  cancelled). What that work was is not traced.
+- A request sent right after the kill gets its first token 0.23–0.29 s after the kill. Most of
+  that comes after recovery; a no-kill time-to-first-token was not measured, so it is not split
+  further.
 - Requests in flight at the kill finish with exact tokens (3 of 3 runs); the lost rank's own
-  request gets the retry error.
+  request gets the retry error. Under full prefill load, all 248 survivor requests finished and the
+  lost rank's 8 got the retry error.
 - Without FT, nothing tears the job down: after a kill it hung for over 13 minutes until stopped.
   Once terminated, every node is clean within 1.5 s; the restart then takes 108–120 s, about half
   of it loading the model.
-- A loss whose experts have no copy elsewhere fails every request with an explicit error within
-  0.04 s (one run, earlier build).
+- A loss whose experts have no copy elsewhere is refused by the authority ("not admitted"): the
+  job fails closed and every request gets an explicit error.
 - With the overlap scheduler, MTP and LM-head TP (production config, not supported with FT), the
   same 32 GPUs reach 157k tok/s.
 
@@ -335,9 +342,11 @@ FT off, FT on, and FT on after a loss (31 survivors), at 8 to 64 requests per GP
   expert TP > 1, PEFT, KV connector or transceiver, sleep/wakeup. Sliding-window attention is
   unvalidated. Greedy sampling is expected: penalties, seeded sampling and multi-token stop words
   aren't rolled back with a discarded step.
-- **Beyond 64 requests per GPU:** not measured. With max_batch_size 128 or 256 this build hits an
-  illegal memory access while warming up, with FT off as well, and stalls when the larger CUDA
-  graphs are left out, so saturation beyond the 64-request batch limit is open.
+- **Beyond 64 requests per GPU:** not measured. With max_batch_size 128, startup fails with FT off:
+  every rank hits an illegal memory access in main's FP8 MLA decode attention kernel while
+  capturing the batch-1 CUDA graph (the same max_seq_len and KV dtype start at 64). Disabling its
+  multi-CTA KV split doesn't help, and leaving out the batch-128 graph hangs capture instead. Not
+  root-caused; saturation beyond 64 is open.
 - **Kernel cost:** the gather adds 3–16 µs per MoE layer (8–64 requests per GPU); a faster launch layout
   or fusing it into dispatch is open.
 - **CI:** needs an image with mpi4py 4.1.2; until then the ULFM tests skip. x86 is unverified (only

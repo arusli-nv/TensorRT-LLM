@@ -116,5 +116,26 @@
   "kill": 0.0,
   "first_token": 0.25216904596891254,
   "ranks": 31
+ },
+ "prefill, full load 1": {
+  "recover_start": 0.008822917938232422,
+  "revoked": 0.012017011642456055,
+  "shrink_done": 0.021795034408569336,
+  "gpu_drained": 0.021916866302490234,
+  "kv_rollback_done": 0.021997928619384766,
+  "stopped_sent": 0.022151947021484375,
+  "propose_recv": 0.02391195297241211,
+  "ready_sent": 0.025783061981201172,
+  "install_recv": 0.02671504020690918,
+  "install_applied": 0.029172897338867188,
+  "installed_sent": 0.029286861419677734,
+  "commit_recv": 0.030017852783203125,
+  "requests_settled": 0.03256797790527344,
+  "resumed": 0.03424501419067383,
+  "watcher_detect": 0.005794405937194824,
+  "watcher_revoked": 0.006749510765075684,
+  "kill": 0.0,
+  "first_token": null,
+  "ranks": 31
  }
 }
