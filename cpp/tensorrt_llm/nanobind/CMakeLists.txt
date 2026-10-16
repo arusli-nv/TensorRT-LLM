@@ -20,6 +20,7 @@ set(SRCS
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
+    runtime/peerFailureWatch.cpp
     suffixAutomaton/bindings.cpp
     testing/kvCacheManagerTestUtilBinding.cpp
     userbuffers/bindings.cpp
