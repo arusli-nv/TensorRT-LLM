@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import hashlib
 import os
 import threading
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import EventType
+from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -928,6 +930,56 @@ class MoeLoadBalancer:
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
 
+    def covers_loss_of(self, rank: int) -> bool:
+        """Whether every expert keeps a replica outside ``rank``."""
+        return not self._experts_without_replica([rank])
+
+    def masked_placement_digest(self, dead_ranks: Iterable[int]) -> str:
+        """Return a digest of the current placement with ``dead_ranks`` masked.
+
+        The digest covers every layer's slot table with the slots of
+        ``dead_ranks`` cleared, so ranks that agree on it route identically.
+
+        Raises:
+            ValueError: A rank is out of range, or an expert would be left
+                without a replica outside ``dead_ranks``.
+        """
+        dead = sorted(set(dead_ranks))
+        if any(rank < 0 or rank >= self.ep_size for rank in dead):
+            raise ValueError(
+                f"Dead ranks {dead} out of range for EP size {self.ep_size}")
+        missing = self._experts_without_replica(dead)
+        if missing:
+            raise ValueError(
+                f"No surviving replica for experts (by MoE layer): {missing}")
+        digest = hashlib.sha256(np.asarray(dead, dtype=np.int64).tobytes())
+        for layer in self.single_layer_load_balancers:
+            placement = self._masked_placement(layer, dead)
+            digest.update(np.asarray(placement.shape, dtype=np.int64).tobytes())
+            digest.update(placement.tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _masked_placement(layer: "SingleLayerMoeLoadBalancer",
+                          dead_ranks: List[int]) -> np.ndarray:
+        """``[ep_size, slots_per_rank]`` expert ids, -1 on ``dead_ranks``."""
+        placement = np.asarray(layer.get_old_rank_expert_ids(), dtype=np.int32)
+        placement[dead_ranks] = -1
+        return placement
+
+    def _experts_without_replica(self,
+                                 dead_ranks: List[int]) -> Dict[int, List[int]]:
+        """Experts of each layer whose every replica is on ``dead_ranks``."""
+        missing = {}
+        for layer in self.single_layer_load_balancers:
+            placement = self._masked_placement(layer, dead_ranks)
+            lost = sorted(
+                set(range(layer.expert_count)) -
+                set(placement[placement >= 0].tolist()))
+            if lost:
+                missing[layer.get_layer_idx()] = lost
+        return missing
+
     def start_iter(self):
         """
         Start a new iteration.
@@ -957,11 +1009,24 @@ class MoeLoadBalancer:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
         self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
-        self.shared_mpi_comm.barrier()
+        self._shared_barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_post_shutdown_cleanup()
-        self.shared_mpi_comm.barrier()
+        self._shared_barrier()
         self.is_shutdown = True
+
+    def _shared_barrier(self) -> None:
+        """Wait for the node's other ranks.
+
+        With peer-loss recovery, a rank that died no longer uses the shared
+        memory, so its absence is tolerated.
+        """
+        try:
+            self.shared_mpi_comm.barrier()
+        except MPI.Exception as error:
+            if not (peer_loss_recovery_enabled()
+                    and is_mpi_peer_failure(error)):
+                raise
 
     def __repr__(self):
         """

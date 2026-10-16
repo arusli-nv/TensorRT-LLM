@@ -23,10 +23,10 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
 )
+from tensorrt_llm._utils import FAULT_TOLERANCE_MODE_ENV
 
 from .ep_group_health import EPGroupHealth
 
-_ENABLE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
 _TIMEOUT_ENV = "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S"
 _POLL_INTERVAL_ENV = "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S"
 
@@ -38,7 +38,7 @@ _POLL_INTERVAL_KEY = "alltoall_watchdog_poll_interval_s"
 
 
 def _env_enabled() -> bool:
-    return os.environ.get(_ENABLE_ENV) == "1"
+    return os.environ.get(FAULT_TOLERANCE_MODE_ENV) == "1"
 
 
 def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) -> float:
