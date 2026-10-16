@@ -879,7 +879,6 @@ def _supported_executor():
             "no LM head TP",
         ),
         (lambda ex: setattr(ex.dist.mapping, "moe_tp_size", 2), "expert TP 1"),
-        (lambda ex: setattr(ex, "attention_dp_enable_balance", True), "no attention DP balancing"),
         (lambda ex: setattr(ex.hang_detector, "timeout", 60), "hang detection timeout"),
         (lambda ex: setattr(ex, "dist", Mock(mapping=ex.dist.mapping)), "MPI executor"),
     ],

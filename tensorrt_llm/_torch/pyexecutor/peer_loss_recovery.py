@@ -232,7 +232,6 @@ class PeerLossRecovery(RecoveryHook):
         requirements = {
             "MPI executor": isinstance(dist, MPIDist),
             "expert TP 1": dist.mapping.moe_tp_size == 1,
-            "no attention DP balancing": not executor.attention_dp_enable_balance,
             "DefaultADPRouter": type(executor.adp_router) is DefaultADPRouter,
             "no speculative decoding": executor.drafter is None
             and executor.draft_model_engine is None
