@@ -27,6 +27,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import moe_comm_serving_timeouts
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -80,7 +81,13 @@ from tensorrt_llm._torch.utils import (
     set_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import global_mpi_rank, maybe_pin_memory, nvtx_range, prefer_pinned
+from tensorrt_llm._utils import (
+    global_mpi_rank,
+    maybe_pin_memory,
+    nvtx_range,
+    peer_loss_recovery_enabled,
+    prefer_pinned,
+)
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -322,6 +329,8 @@ class DecoderRunner(ScheduledModelRunner):
     # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
     # the longest one; None keeps the cache manager's default.
     _dummy_request_tokens: int | None = None
+    # Bound to every NVLinkOneSided layer when recovery is enabled; None otherwise.
+    moe_execution_state: MoeExecutionState | None = None
 
     def __init__(
         self,
@@ -396,6 +405,10 @@ class DecoderRunner(ScheduledModelRunner):
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
         self._initialize_moe_workspace_reclaimer()
+        # Checked at startup: a misconfigured recovery environment fails here, not in the serving loop.
+        self.moe_execution_state = (
+            MoeExecutionState.for_model(model) if peer_loss_recovery_enabled() else None
+        )
 
     @property
     def max_beam_width(self) -> int:
