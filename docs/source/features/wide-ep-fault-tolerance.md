@@ -100,6 +100,15 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
   followed by "a rank departed; only shutdown is accepted from now on". This is the MPI session noticing the
   loss; serving is not affected.
 
+## Monitoring
+
+`trtllm-serve` asks the recovery authority for its state. `GET /health` returns 200 only while the
+deployment is `healthy` (no loss) or `degraded` (serving after a recovery); it returns 503 with the state
+while `starting`, `recovering`, `terminal` (the recovery aborted), or `unavailable` (the authority did not
+answer). `GET /fault_tolerance` returns that state with the membership generation, live and failed ranks
+(sorted), the number of recoveries, the last recovery's stop / agree / install durations in milliseconds,
+and the number of requests the loss failed.
+
 ## Cost
 
 Fault tolerance lowers healthy throughput, most at low load. Most of the cost is the MPI transport that ULFM

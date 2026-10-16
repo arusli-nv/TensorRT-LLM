@@ -767,6 +767,23 @@ def test_recovery_fails_requests_owned_by_departed_rank():
     assert recovery._request_owners == {12: (3, item_12)}
 
 
+def test_rank0_reports_how_many_requests_the_departed_rank_was_serving():
+    """The authority's status counts the requests a loss failed; rank 0 routed them all."""
+    client = _FakeClient(_happy_replies())
+    recovery = _recovery(client, rank=0)
+    recovery._request_owners = {
+        11: (FAILED_RANK, Mock(id=11, child_req_ids=None)),
+        12: (FAILED_RANK, Mock(id=12, child_req_ids=None)),
+        13: (1, Mock(id=13, child_req_ids=None)),
+    }
+    _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    (installed,) = [message for message in client.sent if isinstance(message, Installed)]
+    assert installed.failed_requests == 2
+
+
 def test_recovery_readmits_requests_that_never_reached_their_rank():
     """A torn broadcast can leave a routed request unknown to its live owner."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)

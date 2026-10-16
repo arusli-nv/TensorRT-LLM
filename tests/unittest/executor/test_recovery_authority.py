@@ -28,6 +28,8 @@ from tensorrt_llm.executor.recovery.protocol import (
     Ready,
     Register,
     Registered,
+    Status,
+    StatusQuery,
     Stopped,
 )
 
@@ -118,6 +120,37 @@ def test_node_loss_recovers_in_one_transaction():
     out = _report(authority, Installed, (0, 1), generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
     assert authority.failed_ranks == frozenset(NODE) and authority.phase is Phase.RECOVERED
+
+
+def _status(authority) -> Status:
+    ((route, status),) = authority.handle(b"observer", StatusQuery(), 0.0)
+    assert route == b"observer"
+    return status
+
+
+def test_status_reports_the_recovery_and_its_stage_durations():
+    authority = _registered()
+    assert _status(authority) == Status("SERVING", 0, (0, 1, 2, 3), (), 0, (), 0, "")
+    authority.handle(_route(0), Stopped(0, NODE), 1.0)
+    assert _status(authority).phase == "STOPPING"
+    _report(authority, Stopped, (1,), now=1.5, failed_ranks=NODE)
+    _report(authority, Ready, (0, 1), now=1.75, generation=1, placement_digest="digest")
+    # Rank 0 routes every request, so it reports how many the departed ranks were serving.
+    authority.handle(_route(0), Installed(0, 1, failed_requests=3), 2.0)
+    _report(authority, Installed, (1,), now=2.0, generation=1)
+    assert _status(authority) == Status(
+        "RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 3, ""
+    )
+
+
+def test_status_is_answered_after_an_abort_and_changes_nothing():
+    authority = _registered()
+    authority.handle(_route(0), Stopped(0, (FAILED,)), 1.0)
+    # An observer polling mid-recovery neither registers nor disturbs the recovery.
+    assert _status(authority).phase == "STOPPING" and authority.phase is Phase.STOPPING
+    authority.expire(1e9)
+    status = _status(authority)
+    assert status.phase == "ABORTED" and "did not commit" in status.abort_reason
 
 
 @pytest.mark.parametrize("failed", [(0,), (3,), (1, FAILED), (0, 1), (1, 2, 3), ()])
@@ -219,6 +252,9 @@ def test_wire_roundtrip_and_authentication():
         Stopped(1, NODE),
         Propose(3, NODE, (0, 1)),
         Abort("lost"),
+        StatusQuery(),
+        Status("RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),
+        Status("SERVING", 0, (0, 1), (), 0, (), 0, ""),
     ):
         frames = protocol.encode(message, KEY, route)
         assert protocol.authenticate(frames, KEY, route)
@@ -449,3 +485,59 @@ def test_client_rejects_unauthenticated_frames(tmp_path):
     client.close()
     router.close()
     context.term()
+
+
+def test_server_probe_reads_the_status_and_reports_unavailable_without_an_answer(served):
+    from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe, health_state
+
+    authority, endpoint = served
+    probe = RecoveryStatusProbe(endpoint, KEY, timeout_s=2.0, max_age_s=0.0)
+    try:
+        status = probe.status()
+        assert status is not None and status.phase == "REGISTERING"
+        assert health_state(status) == "starting"
+        # A probe with the wrong key gets no answer, so it reports nothing rather than a stale state.
+        stranger = RecoveryStatusProbe(endpoint, b"x" * 32, timeout_s=0.2, max_age_s=0.0)
+        try:
+            assert stranger.status() is None
+            assert health_state(stranger.status()) == "unavailable"
+        finally:
+            stranger.close()
+    finally:
+        probe.close()
+    assert authority.phase is Phase.REGISTERING
+
+
+@pytest.mark.parametrize(
+    "phase,state",
+    [
+        ("REGISTERING", "starting"),
+        ("SERVING", "healthy"),
+        ("STOPPING", "recovering"),
+        ("PREPARING", "recovering"),
+        ("INSTALLING", "recovering"),
+        ("RECOVERED", "degraded"),
+        ("ABORTED", "terminal"),
+    ],
+)
+def test_health_states_follow_the_authority_phase(phase, state):
+    from tensorrt_llm.serve.fault_tolerance_status import SERVING_STATES, health_state
+
+    assert health_state(Status(phase, 0, (0, 1), (), 0, (), 0, "")) == state
+    assert (state in SERVING_STATES) == (state in ("healthy", "degraded"))
+
+
+def test_status_body_reports_live_ranks_stages_and_failed_requests():
+    from tensorrt_llm.serve.fault_tolerance_status import status_body
+
+    status = Status("RECOVERED", 1, (0, 1), NODE, 1, (40_000, 6_000, 18_000), 256, "")
+    assert status_body(status) == {
+        "state": "degraded",
+        "generation": 1,
+        "live_ranks": [0, 1],
+        "failed_ranks": [2, 3],
+        "recoveries": 1,
+        "last_recovery_stage_ms": {"stop": 40.0, "agree": 6.0, "install": 18.0},
+        "failed_requests": 256,
+    }
+    assert status_body(None) == {"state": "unavailable"}

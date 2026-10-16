@@ -32,6 +32,8 @@ __all__ = [
     "Ready",
     "Register",
     "Registered",
+    "Status",
+    "StatusQuery",
     "Stopped",
     "authenticate",
     "decode",
@@ -80,10 +82,15 @@ class Ready:
 
 @dataclass(frozen=True)
 class Installed:
-    """Worker -> authority: survivor membership for ``generation`` is installed."""
+    """Worker -> authority: survivor membership for ``generation`` is installed.
+
+    ``failed_requests`` is how many requests the departed ranks were serving; only rank 0,
+    which routes every request, reports them (0 elsewhere).
+    """
 
     rank: int
     generation: int
+    failed_requests: int = 0
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,33 @@ class Fence:
     pid: int
 
 
+@dataclass(frozen=True)
+class StatusQuery:
+    """Observer -> authority: report the deployment's recovery state; changes nothing."""
+
+
+@dataclass(frozen=True)
+class Status:
+    """Authority -> observer: the committed recovery state.
+
+    ``phase`` is the authority's phase name; ``live_ranks`` exclude the departed
+    ``failed_ranks`` (sorted) once they are known. ``recovery_stage_us`` holds the last
+    committed recovery's durations in microseconds: stop (first ``Stopped`` to ``Propose``),
+    agree (to ``Install``) and install (to ``Commit``); empty before any recovery.
+    ``failed_requests`` counts the requests that failed with the departed ranks.
+    ``abort_reason`` is empty unless aborted.
+    """
+
+    phase: str
+    generation: int
+    live_ranks: tuple[int, ...]
+    failed_ranks: tuple[int, ...]
+    recoveries: int
+    recovery_stage_us: tuple[int, ...]
+    failed_requests: int
+    abort_reason: str
+
+
 Message = (
     Register
     | Registered
@@ -166,6 +200,8 @@ Message = (
     | Heartbeat
     | DeviceWait
     | Fence
+    | StatusQuery
+    | Status
 )
 
 _MESSAGE_TYPES: dict[str, type] = {cls.__name__: cls for cls in typing.get_args(Message)}

@@ -632,7 +632,8 @@ class PeerLossRecovery(RecoveryHook):
         install_recovery_placement(
             engine.moe_execution_state, load_balancer, failed, placements, own_rank=rank
         )
-        client.send(Installed(rank=rank, generation=generation))
+        failed_requests = self._departed_requests(failed)
+        client.send(Installed(rank=rank, generation=generation, failed_requests=failed_requests))
         _expect_generation(client.wait(Commit, deadline), generation)
 
         # What each survivor holds: the requests it serves and those it already answered (for example
@@ -678,6 +679,12 @@ class PeerLossRecovery(RecoveryHook):
             raise TimeoutError("Timed out joining device work for peer-loss recovery")
         if errors:
             raise errors[0]
+
+    def _departed_requests(self, failed: frozenset) -> int:
+        """How many requests the departed ranks were serving; known on rank 0 only (0 elsewhere)."""
+        if self._request_owners is None:
+            return 0
+        return sum(owner in failed for owner, _ in self._request_owners.values())
 
     def _requeue_unscheduled_requests(self, served: List[Optional[Set[int]]]) -> None:
         """Admit again the requests that were received but never scheduled.

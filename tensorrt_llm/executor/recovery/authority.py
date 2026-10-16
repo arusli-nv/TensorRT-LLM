@@ -43,6 +43,8 @@ from .protocol import (
     Ready,
     Register,
     Registered,
+    Status,
+    StatusQuery,
     Stopped,
     authenticate,
     decode,
@@ -135,6 +137,10 @@ class RecoveryAuthority:
         self._evidence: dict[int, tuple[bytes, str]] = {}
         # The fence command's deadline and target, while the workers' fencing is under way.
         self._command_fence: tuple[float, HungRank] | None = None
+        # Monotonic times at which the current recovery entered STOPPING, PREPARING and INSTALLING.
+        self._stage_starts: list[float] = []
+        self._recovery_stage_us: tuple[int, ...] = ()
+        self._failed_requests = 0
 
     @property
     def survivors(self) -> tuple[int, ...]:
@@ -143,6 +149,8 @@ class RecoveryAuthority:
 
     def handle(self, route: bytes, message: Message, now: float) -> Outbound:
         """Apply ``message`` received from ``route`` at monotonic time ``now``."""
+        if isinstance(message, StatusQuery):
+            return [(route, self.status())]
         if isinstance(message, (Heartbeat, DeviceWait)):
             # Evidence, not protocol: a worker sends it from its own connection, at any time.
             if isinstance(message, Heartbeat):
@@ -155,6 +163,19 @@ class RecoveryAuthority:
             return self._dispatch(route, message, now)
         except _Violation as violation:
             return self.abort(str(violation), route)
+
+    def status(self) -> Status:
+        """The recovery state, for observers; reading it changes nothing."""
+        return Status(
+            phase=self.phase.name,
+            generation=self.generation,
+            live_ranks=self.survivors,
+            failed_ranks=tuple(sorted(self.failed_ranks)),
+            recoveries=self.generation,
+            recovery_stage_us=self._recovery_stage_us,
+            failed_requests=self._failed_requests,
+            abort_reason=self.abort_reason or "",
+        )
 
     def expire(self, now: float) -> Outbound:
         """Abort if the recovery deadline passed at monotonic time ``now``; act on a hung rank."""
@@ -243,8 +264,8 @@ class RecoveryAuthority:
         if isinstance(message, Stopped):
             return self._on_stopped(message, now)
         if isinstance(message, Ready):
-            return self._on_ready(message)
-        return self._on_installed(message)
+            return self._on_ready(message, now)
+        return self._on_installed(message, now)
 
     def _on_register(self, route: bytes, message: Register) -> Outbound:
         if self.phase is not Phase.REGISTERING:
@@ -298,6 +319,7 @@ class RecoveryAuthority:
                 for rank in failed:
                     self.hang_monitor.remove(rank)
             self.deadline = now + self.recovery_timeout
+            self._stage_starts = [now]
             self._enter(Phase.STOPPING)
         elif self.phase is not Phase.STOPPING:
             raise _Violation(f"{message} in phase {self.phase.name}")
@@ -306,11 +328,12 @@ class RecoveryAuthority:
         self._record(self._stopped, message)
         if len(self._stopped) < len(self.survivors):
             return []
+        self._stage_starts.append(now)
         self._enter(Phase.PREPARING)
         proposal = Propose(self.generation + 1, tuple(sorted(failed)), self.survivors)
         return self._to_survivors(proposal)
 
-    def _on_ready(self, message: Ready) -> Outbound:
+    def _on_ready(self, message: Ready, now: float) -> Outbound:
         self._expect(Phase.PREPARING, message)
         digests = set(self._ready.values())
         if digests and message.placement_digest not in digests:
@@ -320,16 +343,22 @@ class RecoveryAuthority:
         self._ready[message.rank] = message.placement_digest
         if len(self._ready) < len(self.survivors):
             return []
+        self._stage_starts.append(now)
         self._enter(Phase.INSTALLING)
         return self._to_survivors(Install(self.generation + 1))
 
-    def _on_installed(self, message: Installed) -> Outbound:
+    def _on_installed(self, message: Installed, now: float) -> Outbound:
         self._expect(Phase.INSTALLING, message)
         self._record(self._installed, message)
+        self._failed_requests += message.failed_requests
         if len(self._installed) < len(self.survivors):
             return []
         self.generation += 1
         self.deadline = None
+        ends = [*self._stage_starts[1:], now]
+        self._recovery_stage_us = tuple(
+            round((end - start) * 1e6) for start, end in zip(self._stage_starts, ends)
+        )
         self._enter(Phase.RECOVERED)
         if self.hang_monitor is not None:
             # Evidence from before the recovery describes waits that no longer exist.

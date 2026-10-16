@@ -94,6 +94,10 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.extensions.kimi_k3 import dynamic_tool_dicts
+from tensorrt_llm.serve.fault_tolerance_status import (SERVING_STATES,
+                                                       RecoveryStatusProbe,
+                                                       health_state,
+                                                       status_body)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
@@ -855,6 +859,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_embedding_batcher()
             self.register_embedding_routes()
         else:
+            # WideEP peer-loss recovery: the recovery authority's state, for /health and
+            # /fault_tolerance.
+            self._recovery_status = RecoveryStatusProbe.from_env()
             self.register_routes()
 
         if self._collect_perf_metrics:
@@ -1248,6 +1255,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
+        if getattr(self, "_recovery_status", None) is not None:
+            self.app.add_api_route("/fault_tolerance",
+                                   self.fault_tolerance_status,
+                                   methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
@@ -1666,8 +1677,19 @@ class OpenAIServer(_VideoRoutesMixin):
             base64.b64encode(state).decode("utf-8")
         })
 
+    async def fault_tolerance_status(self) -> JSONResponse:
+        status = await asyncio.to_thread(self._recovery_status.status)
+        return JSONResponse(content=status_body(status))
+
     async def health(self) -> Response:
         if self._check_health():
+            probe = getattr(self, "_recovery_status", None)
+            if probe is not None:
+                # Recovering, terminal or unknown: not serving, so load balancers move on.
+                state = health_state(await asyncio.to_thread(probe.status))
+                if state not in SERVING_STATES:
+                    return JSONResponse(status_code=503,
+                                        content={"state": state})
             return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the
