@@ -56,6 +56,22 @@ struct CftCombinePeerInfo
 static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
 static constexpr int64_t kDefaultTimeoutCycles = 300ll * kAssumedClockHz;
 
+// A wait on a peer reads the host abort record only once it has lasted this long (50 us at an assumed 2 GHz), and
+// then once per period: healthy waits are shorter, and concurrent host reads from every waiting thread would slow
+// them down.
+static constexpr int64_t kAbortPollCycles = 100ll * 1000ll;
+
+// Abort record in pinned host memory. The host sets `requested` with a plain CPU store to make rank-mask kernels
+// that wait for peers return; a kernel that observes it records `status = kCancelled`. While the record is nonzero
+// the outputs of every collective that uses it are invalid.
+struct MoeA2AAbortState
+{
+    static constexpr int32_t kCancelled = 1;
+
+    int32_t requested; // Set by the host to release kernels waiting on lost peers
+    int32_t status;    // Diagnostic: kCancelled once a dispatch or combine returned early
+};
+
 // Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
 // cudaFuncAttributeMaxDynamicSharedMemorySize.
 static constexpr int kDefaultDynamicSmemBytes = 48 * 1024;
@@ -122,6 +138,15 @@ struct DispatchKernelPointers
     // so captured CUDA graphs observe a mask rewritten in place while no collective runs. Its writer keeps the
     // local rank's own bit set.
     uint64_t const* active_rank_mask{nullptr};
+    // Optional (rank-mask fence path): an abort request releases the completion-flag waits.
+    MoeA2AAbortState* abort{nullptr};
+    // Optional (rank-mask fence path): with slot_tokens > 0, source rank r writes token t of payload p at row
+    // r * slot_tokens + t of recv_buffers[target][p], a fixed slot per source whatever the runtime batch, so a late
+    // write from a lost rank reaches only its own slot. source_valid_counts ([ep_size], local) then receives the rows
+    // each active source sent this round once its flag arrived, and 0 otherwise. When the round aborts, sources
+    // whose flags arrived may still get their counts: the caller discards an aborted step without reading them.
+    int slot_tokens{0};
+    int* source_valid_counts{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -152,6 +177,8 @@ struct CombineKernelPointers
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
     // completion flag writes/waits to/from inactive peers.
     uint64_t const* active_rank_mask{nullptr};
+    // Optional: see DispatchKernelPointers::abort; an aborted combine writes zeros.
+    MoeA2AAbortState* abort{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -222,6 +249,10 @@ struct MoeA2ADispatchParams
     // Active-rank bitmask in device memory: see DispatchKernelPointers::active_rank_mask. Required when
     // enable_rank_mask is true; kernels read it through this pointer at execution time.
     uint64_t const* active_rank_mask{nullptr};
+    // Optional: see DispatchKernelPointers::abort, slot_tokens and source_valid_counts.
+    MoeA2AAbortState* abort{nullptr};
+    int slot_tokens{0};
+    int* source_valid_counts{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -301,6 +332,8 @@ struct MoeA2ACombineParams
     // Active-rank bitmask in device memory: see DispatchKernelPointers::active_rank_mask. Required when
     // enable_rank_mask is true; kernels read it through this pointer at execution time.
     uint64_t const* active_rank_mask{nullptr};
+    // Optional: see CombineKernelPointers::abort.
+    MoeA2AAbortState* abort{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
