@@ -105,17 +105,22 @@ def derive_attention_dp_per_rank_request_cap(
 
 
 def can_process_attention_dp_request(
-    req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
+    req_item,
+    all_ranks_num_active_requests: Dict[int, int],
+    max_num_active_requests: int,
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
     Args:
         req_item: The request queue item to check.
-        all_ranks_num_active_requests: Number of active requests for each rank.
+        all_ranks_num_active_requests: Number of active requests of each
+            serving rank, keyed by its logical rank.
         max_num_active_requests: Maximum number of active requests per rank.
 
     Returns:
-        True if the request can be processed, False otherwise.
+        True if the request can be processed, False otherwise. A request pinned
+        to a rank that is not serving is returned as processable so the ADP
+        router can fail it instead of leaving it queued forever.
     """
     scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None:
@@ -123,6 +128,9 @@ def can_process_attention_dp_request(
 
     target_dp_rank = scheduling_params.attention_dp_rank
     if target_dp_rank is None or scheduling_params.attention_dp_relax:
+        return True
+
+    if target_dp_rank not in all_ranks_num_active_requests:
         return True
 
     if all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests:
@@ -137,7 +145,7 @@ def get_from_waiting_queue(
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
-    all_ranks_num_active_requests: Optional[List[int]] = None,
+    all_ranks_num_active_requests: Optional[Dict[int, int]] = None,
 ) -> List:
     """Get requests from the waiting queue.
 

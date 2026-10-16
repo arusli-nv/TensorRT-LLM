@@ -4036,8 +4036,9 @@ class PyExecutor:
                              and (sizes[:, 1] > 0).any())
             can_queue_this_rank = scheduled_batch.batch_size > 0
         elif self.enable_attention_dp:
+            # A rank that left the group must not veto the forward.
             tp_batch_sizes = self.dist.tp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0].tolist()
+                [scheduled_batch.batch_size], departed=1)[:, 0].tolist()
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
@@ -6528,7 +6529,7 @@ class PyExecutor:
     def _get_request_admission_capacity(self) -> int:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
-            return self.dist.tp_size * self.max_num_active_requests
+            return len(self.dist.live_ranks) * self.max_num_active_requests
         return self.max_num_active_requests
 
     def _configure_benchmark_req_queues_size(self) -> None:
@@ -6626,7 +6627,7 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
+        all_ranks_num_active_requests: Optional[Dict[int, int]] = None
     ) -> List[RequestQueueItem]:
         """Pop requests from waiting_queue based on available capacity."""
         admission_capacity = self._get_request_admission_capacity()
@@ -6716,10 +6717,12 @@ class PyExecutor:
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
                         gpu_forward_time_ms=record.gpu_forward_time_ms)
-            all_ranks_num_active_requests = [
-                s.num_active_requests for s in all_rank_states
-            ]
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+            all_ranks_num_active_requests = {
+                s.rank: s.num_active_requests
+                for s in all_rank_states
+            }
+            total_num_active_requests = sum(
+                all_ranks_num_active_requests.values())
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -6749,6 +6752,10 @@ class PyExecutor:
             if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
+            new_requests, unservable = self.adp_router.split_unservable_requests(
+                new_requests, all_rank_states)
+            if unservable:
+                self._fail_unservable_requests(unservable)
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
@@ -6775,6 +6782,25 @@ class PyExecutor:
                               cp_size=self.dist.cp_size,
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits())
+
+    def _fail_unservable_requests(self,
+                                  requests: List[RequestQueueItem]) -> None:
+        """Fail requests pinned to an attention-DP rank that is not serving.
+
+        Every rank routes the same requests, so every rank reaches the response
+        collective together.
+        """
+        responses = []
+        if self.dist.rank == 0 or self.gather_all_responses:
+            for item in requests:
+                target = item.request.py_scheduling_params.attention_dp_rank
+                responses.append(
+                    (item.id,
+                     LlmResponse(
+                         request_id=item.id,
+                         error_msg=f"Attention DP rank {target} is not serving",
+                         client_id=getattr(item.request, "client_id", None))))
+        self._enqueue_responses(responses)
 
     def _handle_special_queue_items(
             self,

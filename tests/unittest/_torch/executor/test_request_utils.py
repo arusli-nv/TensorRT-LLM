@@ -45,7 +45,7 @@ def attention_dp_config():
 
 @pytest.fixture
 def all_ranks_num_active_requests():
-    return [2, 1, 3, 0]  # 4 ranks
+    return dict(enumerate([2, 1, 3, 0]))  # 4 ranks
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
@@ -609,18 +609,22 @@ def test_can_process_attention_dp_request(attention_dp_config):
     max_num_active_requests = attention_dp_config["max_num_active_requests"]
 
     req_no_params = RequestQueueItem(1, Mock())
-    assert can_process_attention_dp_request(req_no_params, [0, 0, 0, 0], max_num_active_requests)
+    assert can_process_attention_dp_request(
+        req_no_params, dict.fromkeys(range(4), 0), max_num_active_requests
+    )
 
     req_relax = RequestQueueItem(
         2, create_mock_request_with_py_schedule_params(attention_dp_rank=0, attention_dp_relax=True)
     )
-    assert can_process_attention_dp_request(req_relax, [0, 0, 0, 0], max_num_active_requests)
+    assert can_process_attention_dp_request(
+        req_relax, dict.fromkeys(range(4), 0), max_num_active_requests
+    )
 
     req_target = RequestQueueItem(
         3,
         create_mock_request_with_py_schedule_params(attention_dp_rank=1, attention_dp_relax=False),
     )
-    all_ranks = [0, 0, 0, 0]
+    all_ranks = dict.fromkeys(range(4), 0)
     assert can_process_attention_dp_request(req_target, all_ranks, max_num_active_requests)
     assert all_ranks[1] == 1
 
@@ -628,7 +632,7 @@ def test_can_process_attention_dp_request(attention_dp_config):
         4,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0, attention_dp_relax=False),
     )
-    all_ranks_full = [8, 0, 0, 0]  # Rank 0 is at capacity
+    all_ranks_full = dict(enumerate([8, 0, 0, 0]))  # Rank 0 is at capacity
     assert not can_process_attention_dp_request(
         req_no_capacity, all_ranks_full, max_num_active_requests
     )
