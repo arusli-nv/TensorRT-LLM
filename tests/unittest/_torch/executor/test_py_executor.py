@@ -3720,13 +3720,14 @@ class TestAdpBalanceExcludesPadDummies:
     """
 
     @staticmethod
-    def _make_executor(per_rank, threshold):
+    def _make_executor(per_rank, threshold, live_ranks=None):
         """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock()
         executor.dist.tp_allgather_int64 = Mock(
             return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
         )
+        executor.dist.live_ranks = tuple(range(len(per_rank)) if live_ranks is None else live_ranks)
         executor.max_batch_size = 64
         executor.attention_dp_enable_balance = True
         executor.attention_dp_time_out_iters = 60
@@ -3797,6 +3798,28 @@ class TestAdpBalanceExcludesPadDummies:
         gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
+
+    def test_balancing_continues_over_the_serving_ranks_after_a_loss(self):
+        """After a recovered peer loss the departed rank's row is filled with zeros.
+
+        Balancing compares the serving ranks only. Every serving rank holds
+        context and decode work, so the context batch is held for the batching
+        wait as usual; counting the departed rank's empty row would release it
+        at once and switch balancing off for the rest of the job.
+        """
+        executor = self._make_executor(
+            [(1, 4, 4), (0, 0, 0), (1, 4, 4)], threshold=0, live_ranks=(0, 2)
+        )
+        executor.attention_dp_batching_wait_iters = 2
+
+        balanced = executor._balance_adp_requests(
+            [self._make_context_request()], [self._make_generation_request(False)]
+        )
+
+        assert balanced == []
+        assert executor.adp_ctx_batching_wait_iters_count == 1
+        # A departed rank's row reads as an idle rank.
+        assert executor.dist.tp_allgather_int64.call_args.kwargs == {"departed": 0}
 
 
 def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:

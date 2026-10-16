@@ -6988,10 +6988,17 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather_int64([
+        counts = [
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens, num_real_generation_requests
-        ]).tolist()
+        ]
+        gathered = self.dist.tp_allgather_int64(counts, departed=0)
+        # Balance over the serving ranks only: a rank that left the group
+        # after a recovered peer loss schedules nothing.
+        live_ranks = self.dist.live_ranks
+        if len(live_ranks) != len(gathered):
+            gathered = gathered[list(live_ranks)]
+        responses_list = gathered.tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]
