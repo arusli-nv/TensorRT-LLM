@@ -635,6 +635,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # under at construction. A comm strategy with no registered hook is
         # the one combination left to refuse at runtime, inside the helper.
         if not do_finalize and (moe.unfinalized_combine_fn is not None or moe.comm is not None):
+            if ctx.comm_plan is not None and ctx.comm_plan.source_slots is not None:
+                raise NotImplementedError(
+                    "do_finalize=False is not supported while the routing tensors are "
+                    "the WideEP dispatch receive slots"
+                )
             final_hidden_states = self._finalize_before_combine(
                 final_hidden_states,
                 token_selected_slots=token_selected_slots,
@@ -1033,6 +1038,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
             moe.comm.payload_in_workspace = payload_in_workspace
         recv_expert_count = None
         deep_ep_expert_capacity = None
+        source_slots = None
+        if isinstance(moe.comm, NVLinkOneSided):
+            source_slots = moe.comm.dispatch_source_slots()
         if use_deep_ep_direct_metadata:
             assert isinstance(moe.comm, DeepEPLowLatency)
             recv_expert_count, deep_ep_expert_capacity = (
@@ -1046,6 +1054,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+            source_slots=source_slots,
         )
 
 

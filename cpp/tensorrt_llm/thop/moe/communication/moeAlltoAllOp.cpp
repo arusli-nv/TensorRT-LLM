@@ -1079,6 +1079,35 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
         at::cuda::getCurrentCUDAStream());
 }
 
+// Op: moe_a2a_compact_source_slots
+// The expert ids and router weights of the tokens in the fixed receive slots of a source_valid_counts dispatch, as
+// the compact [num_sources * source_tokens, top_k] lists the routing sort reads; rows without a token get expert -1
+// and weight 0.
+std::tuple<torch::Tensor, torch::Tensor> moeA2ACompactSourceSlotsOp(torch::Tensor const& slotExpertIds,
+    torch::Tensor const& slotWeights, torch::Tensor const& sourceValidCounts, int64_t sourceTokens)
+{
+    CHECK_INPUT(slotExpertIds, torch::kInt32);
+    CHECK_INPUT(slotWeights, torch::kFloat32);
+    CHECK_INPUT(sourceValidCounts, torch::kInt32);
+    TORCH_CHECK(slotExpertIds.dim() == 2, "slot_expert_ids must be [num_sources * slot_tokens, top_k]");
+    TORCH_CHECK(slotWeights.sizes() == slotExpertIds.sizes(), "slot_weights must match slot_expert_ids");
+    TORCH_CHECK(sourceValidCounts.dim() == 1, "source_valid_counts must be 1D");
+    int64_t const numSources = sourceValidCounts.size(0);
+    TORCH_CHECK(numSources > 0 && slotExpertIds.size(0) % numSources == 0,
+        "slot_expert_ids must hold one equal slot per source");
+    int64_t const slotTokens = slotExpertIds.size(0) / numSources;
+    TORCH_CHECK(sourceTokens > 0 && sourceTokens <= slotTokens, "source_tokens must be in (0, slot_tokens]");
+    int64_t const topK = slotExpertIds.size(1);
+
+    auto expertIds = torch::empty({numSources * sourceTokens, topK}, slotExpertIds.options());
+    auto weights = torch::empty({numSources * sourceTokens, topK}, slotWeights.options());
+    tensorrt_llm::kernels::moe_comm::moe_a2a_compact_source_slots_launch(slotExpertIds.data_ptr<int32_t>(),
+        slotWeights.data_ptr<float>(), sourceValidCounts.data_ptr<int32_t>(), expertIds.data_ptr<int32_t>(),
+        weights.data_ptr<float>(), static_cast<int>(numSources), static_cast<int>(sourceTokens),
+        static_cast<int>(slotTokens), static_cast<int>(topK), at::cuda::getCurrentCUDAStream());
+    return {expertIds, weights};
+}
+
 // Return a workspace-backed tensor for combine payload region using from_blob
 torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, torch::Tensor const& metainfo,
     int64_t epRank, int64_t epSize, int64_t runtimeMaxTokensPerRank, c10::ScalarType outDtype, int64_t hiddenSize)
@@ -1156,6 +1185,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
     module.def(
+        "moe_a2a_compact_source_slots(Tensor slot_expert_ids, Tensor slot_weights, Tensor source_valid_counts, "
+        "int source_tokens) -> (Tensor, Tensor)");
+    module.def(
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, Tensor metainfo, int ep_rank, int ep_size, "
         "int runtime_max_tokens_per_rank, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
@@ -1173,6 +1205,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_combine", &tensorrt_llm::torch_ext::moe_comm::moeA2ACombineOp);
     module.impl("moe_a2a_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2AInitializeOp);
     module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
+    module.impl("moe_a2a_compact_source_slots", &tensorrt_llm::torch_ext::moe_comm::moeA2ACompactSourceSlotsOp);
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
     module.impl("moe_a2a_cft_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftInitializeOp);

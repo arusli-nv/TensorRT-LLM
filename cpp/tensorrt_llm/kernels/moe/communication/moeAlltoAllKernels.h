@@ -357,6 +357,15 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
     int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
+// Copy the routing of the tokens in the fixed receive slots (MoeA2ADispatchParams::slot_tokens) into a compact list
+// for the routing sort: source s's token i becomes row s * source_tokens + i.
+// slot_expert_ids, slot_weights: [num_sources * slot_tokens, top_k] (int32, float)
+// source_valid_counts: [num_sources] (int32), rows of each slot that hold a token
+// expert_ids, weights: [num_sources * source_tokens, top_k]; rows without a token get expert -1 and weight 0
+void moe_a2a_compact_source_slots_launch(int32_t const* slot_expert_ids, float const* slot_weights,
+    int32_t const* source_valid_counts, int32_t* expert_ids, float* weights, int num_sources, int source_tokens,
+    int slot_tokens, int top_k, cudaStream_t stream);
+
 } // namespace kernels::moe_comm
 
 TRTLLM_NAMESPACE_END

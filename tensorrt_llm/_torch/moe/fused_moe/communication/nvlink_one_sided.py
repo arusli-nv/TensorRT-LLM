@@ -27,7 +27,7 @@ NVLINK One-Sided supports post-quant dispatch.
 import os
 import re
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import pynvml
 import torch
@@ -54,8 +54,12 @@ from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
+from ..impl_contract import DispatchSourceSlots
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
+
+if TYPE_CHECKING:
+    from .execution_state import MoeExecutionState
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
@@ -435,7 +439,8 @@ class NVLinkOneSided(Communication):
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. The kernels read the mask from a device record at execution time,
                 so captured CUDA graphs follow membership changes made between captures. The watchdog observes
-                eager launches only.
+                eager launches only. A layer bound to a ``MoeExecutionState`` reads the
+                state's mask and abort records instead.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -662,6 +667,7 @@ class NVLinkOneSided(Communication):
         # graphs captured once observe a mask rewritten in place. Holds the words last published.
         self._rank_mask_record: Optional[torch.Tensor] = None
         self._rank_mask_words: Optional[Tuple[int, ...]] = None
+        self._execution_state: "MoeExecutionState | None" = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -719,6 +725,34 @@ class NVLinkOneSided(Communication):
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
+
+    def bind_execution_state(self, state: "MoeExecutionState") -> None:
+        """Run every later dispatch/combine with the state's rank-mask and abort records.
+
+        Bound execution uses the fence path with fixed per-source dispatch
+        slots, so CUDA graphs captured afterwards stay valid when the state
+        installs a new rank mask or requests an abort. The state keeps the
+        workspace mapped.
+        """
+        if self._execution_state is not None:
+            raise RuntimeError("NVLinkOneSided is already bound to an execution state")
+        if not self._rank_mask_enabled:
+            raise ValueError("Bound execution requires rank-mask mode (ep_group_health)")
+        if self.can_use_cft_counted_writes:
+            raise ValueError("Bound execution requires the fence path; CFT is enabled")
+        state.retain(self.mnnvl_mem, self._reset_local_workspace)
+        state.track_layer(self.ep_rank, self.reset_state)
+        self._execution_state = state
+
+    def _reset_local_workspace(self) -> None:
+        """Return this rank's workspace row to its initial state.
+
+        Same as initialization, without the barrier: the caller guarantees that
+        no rank runs a collective on this workspace until every rank has reset.
+        """
+        torch.ops.trtllm.moe_a2a_initialize(
+            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
+        )
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
@@ -950,6 +984,26 @@ class NVLinkOneSided(Communication):
     def _mnnvl_checkpoint_reset(self) -> None:
         self._dispatch_state = {"phase": "idle"}
 
+    def _source_valid_counts(self) -> torch.Tensor:
+        """The [ep_size] rows each source's receive slot holds this round, written by the dispatch.
+
+        Local memory no peer writes, shared by every layer of this workspace: like the receive
+        slots, it holds one dispatch's state until that layer's routing has read it. Allocated once, by
+        the first dispatch, which runs eagerly before any CUDA graph capture; captured graphs keep
+        its address.
+        """
+        counts = self._workspace_state.get("source_valid_counts")
+        if counts is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the first bound dispatch must run before CUDA graph capture")
+            counts = torch.zeros(self.ep_size, dtype=torch.int32, device=self.workspace.device)
+            self._workspace_state["source_valid_counts"] = counts
+        return counts
+
+    def dispatch_source_slots(self) -> Optional[DispatchSourceSlots]:
+        """The receive-slot layout of the last dispatch, or None when not bound to an execution state."""
+        return self._dispatch_state.get("source_slots")
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -977,12 +1031,15 @@ class NVLinkOneSided(Communication):
                 artifact, not valid model output.
 
         Returns:
-            Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
-            Each tensor has shape [ep_size, max_tokens_per_rank, ...]
+            Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales), each
+            [ep_size * max_tokens_per_rank, ...]. When bound to an execution state, all four are the fixed
+            receive slots instead, [ep_size * capacity, ...]: source s's token i at row
+            s * capacity + i; see dispatch_source_slots().
         """
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
+        state = self._execution_state
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -1003,7 +1060,9 @@ class NVLinkOneSided(Communication):
             can_use_cft_for_dispatch, payloads
         )
         expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
-        can_fuse_sanitize = can_use_cft_for_dispatch
+        # CFT dispatch sanitizes the expert ids itself. Bound execution never does: its readers
+        # take the received rows of each slot from the source valid counts instead.
+        can_fuse_sanitize = can_use_cft_for_dispatch and state is None
 
         eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
@@ -1020,6 +1079,7 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
+        source_valid_counts = None if state is None else self._source_valid_counts()
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -1036,12 +1096,20 @@ class NVLinkOneSided(Communication):
                 expert_id_payload_index if can_fuse_sanitize else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
-                self._publish_rank_mask(active_rank_mask),
+                self._publish_rank_mask(active_rank_mask)
+                if state is None
+                else state.active_rank_mask,
+                abort_state=None if state is None else state.abort,
+                source_valid_counts=source_valid_counts,
             )
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "dispatch", active_rank_mask
-        )
+        # The host watchdog tracks each eager call, but replayed CUDA graphs skip
+        # this code: bound execution relies on the abort record, set by peer-loss
+        # detection, and on the device timeout instead.
+        if state is None:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "dispatch", active_rank_mask
+            )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
@@ -1049,6 +1117,15 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
+        self._dispatch_state["source_slots"] = (
+            None
+            if state is None
+            else DispatchSourceSlots(
+                valid_counts=source_valid_counts,
+                source_tokens=runtime_max_tokens_per_rank,
+                slot_tokens=self.max_num_tokens_per_rank,
+            )
+        )
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -1064,7 +1141,7 @@ class NVLinkOneSided(Communication):
             token_selected_slots_recv = recv_buffers[1]
             token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
 
-        if not can_fuse_sanitize:
+        if not can_fuse_sanitize and state is None:
             torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
                 token_selected_slots_recv,
                 self.workspace,
@@ -1074,7 +1151,10 @@ class NVLinkOneSided(Communication):
             )
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends
-        # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...]
+        # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...].
+        # When bound, every payload is the receive slots, [ep_size * capacity, ...]:
+        # source s's row i is row s * capacity + i, and dispatch_source_slots() says which rows
+        # hold tokens. The MoE backend reads them so.
         hidden_states_recv = hidden_states_recv.view(-1, hidden_states_recv.shape[-1])
         if hidden_states_sf_recv is not None:
             hidden_states_sf_recv = hidden_states_sf_recv.view(-1, hidden_states_sf_recv.shape[-1])
@@ -1123,6 +1203,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
+        state = self._execution_state
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1179,11 +1260,13 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             use_cft_for_combine,
             self._rank_mask_enabled,
-            self._publish_rank_mask(active_rank_mask),
+            self._publish_rank_mask(active_rank_mask) if state is None else state.active_rank_mask,
+            abort_state=None if state is None else state.abort,
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "combine", active_rank_mask
-        )
+        if state is None:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "combine", active_rank_mask
+            )
 
         # Reset state for next round
         self.reset_state()

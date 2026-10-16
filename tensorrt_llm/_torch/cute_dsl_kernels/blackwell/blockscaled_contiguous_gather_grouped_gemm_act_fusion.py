@@ -290,6 +290,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_local_experts: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        read_source_slots: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -340,6 +341,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param situ_linear_beta: Linear-side (up) SiTU constant. Required for --
             and only valid with -- ``ActivationType.SiTu``.
         :type situ_linear_beta: Optional[float]
+        :param read_source_slots: A holds a fixed slot of ``slot_tokens`` rows per
+            source rank, of which the token ids count ``source_tokens``: token
+            ``t`` is row ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
+        :type read_source_slots: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -430,6 +435,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.has_swiglu_limit = swiglu_limit != float("inf")
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
+        self.read_source_slots = read_source_slots
+        assert not (read_source_slots and use_expert_counts)
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
         if self.use_expert_counts:
             assert self.topk == 1
@@ -700,6 +707,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         return num_valid_tiles, expert_idx, mn_limit, expanded_row_start
 
     @cute.jit
+    def _source_slot_row(
+        self,
+        token: cutlass.Int32,
+        source_tokens: cutlass.Int32,
+        slot_tokens: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Row of ``token`` in A under ``read_source_slots``."""
+        return token + (token // source_tokens) * (slot_tokens - source_tokens)
+
+    @cute.jit
     def __call__(
         self,
         a: cute.Tensor,
@@ -715,6 +732,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         expert_capacity: cutlass.Int32,
+        source_tokens: cutlass.Int32,
+        slot_tokens: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -1040,6 +1059,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha_tuple,
             expert_capacity,
+            source_tokens,
+            slot_tokens,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1125,6 +1146,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
         expert_capacity: cutlass.Int32,
+        source_tokens: cutlass.Int32,
+        slot_tokens: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1680,6 +1703,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             < tile_info[4]
                             else 0
                         )
+                        if cutlass.const_expr(self.read_source_slots):
+                            a_token_offset_tensor[i] = self._source_slot_row(
+                                a_token_offset_tensor[i], source_tokens, slot_tokens
+                            )
 
                 token_ml_tile_offset = (
                     8 * (tidx_in_warpgroup // 32)
@@ -1690,6 +1717,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     sfa_token_offset_tensor[0] = tile_info[5] + token_ml_tile_offset
                 else:
                     sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset] // self.topk
+                    if cutlass.const_expr(self.read_source_slots):
+                        sfa_token_offset_tensor[0] = self._source_slot_row(
+                            sfa_token_offset_tensor[0], source_tokens, slot_tokens
+                        )
                 sfa_predicate_tensor[0] = (
                     cutlass.Boolean(1)
                     if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
@@ -3595,6 +3626,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         k: cutlass.Int64,
         l: cutlass.Int64,  # noqa: E741
         expert_capacity: cutlass.Int32,
+        source_tokens: cutlass.Int32,
+        slot_tokens: cutlass.Int32,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -3664,6 +3697,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             expert_capacity,
+            source_tokens,
+            slot_tokens,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,

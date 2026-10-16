@@ -4063,7 +4063,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      swiglu_limit_scalar: float = float("inf"),
                      use_expert_counts: bool = False,
                      situ_beta: Optional[float] = None,
-                     situ_linear_beta: Optional[float] = None):
+                     situ_linear_beta: Optional[float] = None,
+                     source_tokens: int = 0,
+                     slot_tokens: int = 0):
             """Initialize the runner.
 
             Args:
@@ -4074,6 +4076,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_beta: Gate-side SiTU soft-cap. Required for -- and only
                     valid with -- ``ActivationType.SiTu``.
                 situ_linear_beta: Linear-side SiTU soft-cap, same rule.
+                source_tokens: If positive, ``a`` and ``a_sf`` are the WideEP
+                    dispatch receive slots: ``slot_tokens`` rows per source
+                    rank, of which the expanded token ids count
+                    ``source_tokens``. Token ``t`` is slot row
+                    ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
+                slot_tokens: Rows of ``a`` per source rank; see ``source_tokens``.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -4092,6 +4100,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.scaling_vector_size = scaling_vector_size
             self.swiglu_limit_scalar = swiglu_limit_scalar
             self.use_expert_counts = use_expert_counts
+            self.source_tokens = source_tokens
+            self.slot_tokens = slot_tokens
+            if source_tokens:
+                if use_expert_counts:
+                    raise ValueError("Source slots and expert-count "
+                                     "scheduling are exclusive")
+                if not 0 < source_tokens <= slot_tokens:
+                    raise ValueError(
+                        "source_tokens must be in (0, slot_tokens]")
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
@@ -4113,7 +4130,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             so two runners that differ in any of them are different kernels
             and must not share a tuning result. That is why the activation
             soft-caps appear: ``swiglu_limit_scalar`` and the two SiTU betas
-            are baked in as ``const_expr``, not passed at launch.
+            are baked in as ``const_expr``, not passed at launch. Reading
+            source slots only changes how a token's row is addressed, so it
+            shares the tuning result of the compact layout.
             """
             return (
                 self.num_experts,
@@ -4305,6 +4324,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert a_sf.size(1) == scale_k
 
             num_tiles = m // self.tile_size
+            # Unused unless the kernel reads source slots; 1 keeps its divisor valid.
+            source_tokens = self.source_tokens or 1
+            slot_tokens = self.slot_tokens or 1
+            if self.source_tokens and orig_m % self.slot_tokens:
+                raise ValueError("a must hold whole source slots")
             if self.use_expert_counts:
                 for metadata in (tile_idx_to_group_idx, tile_idx_to_mn_limit,
                                  permuted_idx_to_expanded_idx,
@@ -4392,7 +4416,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
                          self.use_expert_counts, self.num_local_experts,
-                         self.situ_beta, self.situ_linear_beta)
+                         self.situ_beta, self.situ_linear_beta,
+                         self.source_tokens > 0)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -4408,6 +4433,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_local_experts=self.num_local_experts,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
+                    read_source_slots=self.source_tokens > 0,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -4432,6 +4458,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     k,
                     l,
                     expert_capacity,
+                    source_tokens,
+                    slot_tokens,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -4466,6 +4494,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 k,
                 l,
                 expert_capacity,
+                source_tokens,
+                slot_tokens,
             ]
 
             compiled_gemm(*exec_args, stream=stream)
@@ -4499,6 +4529,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        source_tokens: int = 0,
+        slot_tokens: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4509,6 +4541,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps, and
         are ``None`` for every other activation. The runner rejects a mismatch
         against ``activation_type`` in either direction.
+
+        ``source_tokens`` > 0 reads ``input`` / ``input_scale`` as WideEP
+        dispatch receive slots of ``slot_tokens`` rows per source rank.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
@@ -4536,7 +4571,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar=swiglu_limit_scalar,
             use_expert_counts=expert_counts is not None,
             situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta)
+            situ_linear_beta=situ_linear_beta,
+            source_tokens=source_tokens,
+            slot_tokens=slot_tokens)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4577,6 +4614,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_capacity: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        source_tokens: int = 0,
+        slot_tokens: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Meta-device shapes for the FC1 output and its block scales.
 
