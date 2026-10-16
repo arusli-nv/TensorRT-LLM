@@ -30,7 +30,6 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     CompletionFlagReadTimeout,
-    reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import get_wide_ep_ft_options
@@ -198,9 +197,10 @@ def test_wide_ep_ft_options_create_shared_health_when_enabled(
     assert poll_again_s == poll_interval_s
 
 
-def test_wide_ep_ft_options_reject_cuda_graphs(
+def test_wide_ep_ft_options_allow_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The kernels read the rank mask at execution time, so rank-mask mode works with CUDA graphs."""
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
@@ -208,19 +208,8 @@ def test_wide_ep_ft_options_reject_cuda_graphs(
         use_cuda_graph=True,
     )
 
-    with pytest.raises(ValueError, match="does not support CUDA graphs"):
-        get_wide_ep_ft_options(model_config)
-    assert model_config.extra_attrs == {}
-
-
-def test_rank_mask_mode_rejects_direct_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    reject_rank_mask_cuda_graph_capture(False)
-    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
-        reject_rank_mask_cuda_graph_capture(True)
+    health, _, _ = get_wide_ep_ft_options(model_config)
+    assert health is not None
 
 
 def test_wide_ep_ft_options_ignore_legacy_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:

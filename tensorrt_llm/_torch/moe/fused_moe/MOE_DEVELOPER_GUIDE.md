@@ -161,6 +161,10 @@ Several MoE communication kernels wait for their peers inside the kernel and tra
 
 Timeouts are nominal: NVLinkOneSided, DeepGEMM and DeepEP convert seconds at an assumed 2 GHz SM clock, while NcclEP uses the device's clock rate.
 
+### NVLinkOneSided rank mask
+
+With committed EP membership (`ep_group_health`), NVLinkOneSided launches its rank-mask kernels, which skip masked peers. The kernels read the active-rank mask through a pointer to a device record that each communicator owns, at execution time. The record is rewritten, by a copy on the current stream, only when the committed or requested mask changes, and never during CUDA graph capture. Graphs captured once therefore follow membership changes made between captures. Without rank-mask mode the mask-free kernel variants run.
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components

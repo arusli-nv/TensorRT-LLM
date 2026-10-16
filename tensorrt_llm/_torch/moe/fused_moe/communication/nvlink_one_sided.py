@@ -40,7 +40,6 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     EPGroupHealthLike,
-    reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.distributed.mnnvl_memory import (
     CftMnnvlMemory,
@@ -434,7 +433,9 @@ class NVLinkOneSided(Communication):
                 Corresponds to model_config.use_low_precision_moe_combine.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
-                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
+                detection never mutates it. The kernels read the mask from a device record at execution time,
+                so captured CUDA graphs follow membership changes made between captures. The watchdog observes
+                eager launches only.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -657,6 +658,10 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
+        # Rank-mask mode: the kernels read the active-rank mask from this device record at execution time, so CUDA
+        # graphs captured once observe a mask rewritten in place. Holds the words last published.
+        self._rank_mask_record: Optional[torch.Tensor] = None
+        self._rank_mask_words: Optional[Tuple[int, ...]] = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -831,6 +836,31 @@ class NVLinkOneSided(Communication):
         self._workspace_registered = False
         self._workspace_lifecycle = None
 
+    def _publish_rank_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Return the device record of the active-rank mask, after writing ``mask`` (CPU uint64 words) into it.
+
+        The write is a copy on the current stream, so collectives launched before it still read the previous mask.
+        Under CUDA graph capture the record is only read: membership changes between captures, never during one.
+        """
+        if mask is None:
+            return None
+        words = tuple(int(word) for word in mask.tolist())
+        if words == self._rank_mask_words:
+            return self._rank_mask_record
+        if not (words[self.ep_rank >> 6] >> (self.ep_rank & 63)) & 1:
+            raise ValueError(
+                f"active_rank_mask must mark the local ep_rank ({self.ep_rank}) as active"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("the active-rank mask changed during CUDA graph capture")
+        if self._rank_mask_record is None:
+            self._rank_mask_record = torch.empty(
+                len(words), dtype=torch.uint64, device=self.workspace.device
+            )
+        self._rank_mask_record.copy_(mask)
+        self._rank_mask_words = words
+        return self._rank_mask_record
+
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
         Check if NVLINK one-sided comm is feasible for the given workload at runtime.
@@ -953,7 +983,6 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -1007,7 +1036,7 @@ class NVLinkOneSided(Communication):
                 expert_id_payload_index if can_fuse_sanitize else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
-                active_rank_mask,
+                self._publish_rank_mask(active_rank_mask),
             )
         )
         self._watchdog_coordinator.watch_collective(
@@ -1094,7 +1123,6 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1151,7 +1179,7 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             use_cft_for_combine,
             self._rank_mask_enabled,
-            active_rank_mask,
+            self._publish_rank_mask(active_rank_mask),
         )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask

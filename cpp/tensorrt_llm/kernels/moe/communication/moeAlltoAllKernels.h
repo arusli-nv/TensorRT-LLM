@@ -49,7 +49,7 @@ struct CftCombinePeerInfo
 {
     uint32_t ids[kMaxRanks];
     uint32_t* completion_flags[kMaxRanks];
-    uint64_t active_rank_mask[kRankMaskWords];
+    uint64_t const* active_rank_mask; // See DispatchKernelPointers::active_rank_mask
 };
 
 // Nominal clock64 rate used to convert timeout seconds to SM cycles.
@@ -116,11 +116,12 @@ struct DispatchKernelPointers
     int expert_id_payload_index;
     int32_t invalid_expert_id;
 
-    // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
-    // Word w covers ranks 64*w..64*w+63 for w in [0, kRankMaskWords). Tokens routed to a masked
-    // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
-    // The local rank's own bit must always be set; this is checked at launch time.
-    uint64_t active_rank_mask[kRankMaskWords];
+    // Active-rank bitmask in device memory, read at execution time: bit i set => rank i is alive and participates
+    // in this collective. Word w covers ranks 64*w..64*w+63 for w in [0, kRankMaskWords). Tokens routed to a masked
+    // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped. Its address is fixed,
+    // so captured CUDA graphs observe a mask rewritten in place while no collective runs. Its writer keeps the
+    // local rank's own bit set.
+    uint64_t const* active_rank_mask{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -150,7 +151,7 @@ struct CombineKernelPointers
     int combine_counter_ep_stride = 0;  // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
     // completion flag writes/waits to/from inactive peers.
-    uint64_t active_rank_mask[kRankMaskWords];
+    uint64_t const* active_rank_mask{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -218,11 +219,9 @@ struct MoeA2ADispatchParams
     // This is a launch-lifetime mode, independent of future execution-abort handling.
     bool enable_rank_mask{false};
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
-    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
-    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
+    // Active-rank bitmask in device memory: see DispatchKernelPointers::active_rank_mask. Required when
+    // enable_rank_mask is true; kernels read it through this pointer at execution time.
+    uint64_t const* active_rank_mask{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -299,11 +298,9 @@ struct MoeA2ACombineParams
     // This is a launch-lifetime mode, independent of future execution-abort handling.
     bool enable_rank_mask{false};
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
-    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
-    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
+    // Active-rank bitmask in device memory: see DispatchKernelPointers::active_rank_mask. Required when
+    // enable_rank_mask is true; kernels read it through this pointer at execution time.
+    uint64_t const* active_rank_mask{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
