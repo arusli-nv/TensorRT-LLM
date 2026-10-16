@@ -148,30 +148,21 @@ inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
     return maskTensor.has_value() && maskTensor.value().defined();
 }
 
-// Resolve a provided rank-mask tensor into a fixed-width uint64 array. On failure
-// (wrong dtype / device / shape), throw at the Python op boundary rather than launch.
-inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTensor, int64_t epRank,
-    uint64_t (&out)[tensorrt_llm::kernels::moe_comm::kRankMaskWords])
+// Return the device address of the rank-mask tensor, which the kernels read at execution time: a contiguous uint64
+// tensor of kRankMaskWords elements on the workspace's device. Its writer keeps the local rank's bit set. Wrong
+// dtype / device / shape throws at the Python op boundary rather than launch.
+inline uint64_t const* resolveActiveRankMask(
+    torch::optional<torch::Tensor> const& maskTensor, torch::Tensor const& workspace)
 {
     using tensorrt_llm::kernels::moe_comm::kRankMaskWords;
-    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
-    TORCH_CHECK(
-        epRank >= 0 && epRank < kMaxRanks, "epRank must be in the range [0, ", kMaxRanks, ") for active_rank_mask");
     TORCH_CHECK(hasActiveRankMask(maskTensor), "active_rank_mask must be defined");
     torch::Tensor const& t = maskTensor.value();
-    TORCH_CHECK(t.is_cpu(), "active_rank_mask must be a CPU tensor");
+    TORCH_CHECK(t.is_cuda() && t.device() == workspace.device(), "active_rank_mask must be on the workspace device");
     TORCH_CHECK(t.scalar_type() == torch::kUInt64, "active_rank_mask must have dtype uint64");
     TORCH_CHECK(t.dim() == 1, "active_rank_mask must be a 1D tensor");
     TORCH_CHECK(t.numel() == kRankMaskWords, "active_rank_mask must have exactly ", kRankMaskWords, " uint64 elements");
     TORCH_CHECK(t.is_contiguous(), "active_rank_mask must be contiguous");
-    auto const* src = static_cast<uint64_t const*>(t.const_data_ptr());
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        out[w] = src[w];
-    }
-    // Local rank's bit must be set; otherwise the kernel would be running on a "dead" rank.
-    TORCH_CHECK((out[epRank >> 6] >> (epRank & 63)) & 1ULL, "active_rank_mask must mark the local ep_rank (", epRank,
-        ") as active");
+    return static_cast<uint64_t const*>(t.const_data_ptr());
 }
 
 // All offsets and capacities are per rank. Payload capacities are padded so
@@ -754,12 +745,11 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
             = reinterpret_cast<uint64_t*>(rankWorkSpacePtr + offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX]);
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
-    // exactly reproduces the pre-fault-tolerance kernel behavior.
+    // Rank-mask mode reads the mask through its device address; without it, the mask-free kernels run.
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
-        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, workspace);
     }
     else
     {
@@ -967,11 +957,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         params.use_cft_for_combine = false;
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set.
+    // Rank-mask mode reads the mask through its device address; without it, the mask-free kernels run.
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
-        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, workspace);
     }
     else
     {

@@ -280,6 +280,11 @@ def _read_nvlink_topk_target_indices(
     return raw.view(torch.int32).view(max_num_tokens, top_k).cpu()
 
 
+def _device_rank_mask(comm: NVLinkOneSided, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """The kernels read the active-rank mask from device memory at execution time."""
+    return None if mask is None else mask.to(comm.workspace.device)
+
+
 def _run_nvlink_rank_mask_dispatch(
     comm: NVLinkOneSided,
     token_selected_experts: torch.Tensor,
@@ -300,8 +305,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=_device_rank_mask(comm, active_rank_mask),
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -339,8 +344,8 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=_device_rank_mask(comm, active_rank_mask),
     )
 
 

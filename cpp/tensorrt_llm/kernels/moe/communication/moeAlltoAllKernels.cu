@@ -1154,11 +1154,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
     // The local rank must always be marked active in its own view of the mask;
     // otherwise the kernel itself would be running on a "dead" rank.
-    if (params.enable_rank_mask)
-    {
-        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
-    }
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
+        "rank-mask mode needs the device address of active_rank_mask");
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -1216,11 +1213,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.invalid_expert_id = params.invalid_expert_id;
     }
 
-    // Copy active-rank bitmask into the kernel pointers struct
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
-    }
+    kernel_ptrs.active_rank_mask = params.active_rank_mask;
 
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)
@@ -1958,8 +1951,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         peer_info.ids[i] = params.cft_peer_le_ids[i];
         peer_info.completion_flags[i] = params.completion_flags[i];
     }
-    for (int w = 0; w < kRankMaskWords; ++w)
-        peer_info.active_rank_mask[w] = params.active_rank_mask[w];
+    peer_info.active_rank_mask = params.active_rank_mask;
 
     // Push parallelism is env-overridable for tuning:
     //   TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_WARPS           : warps per block (default kCombinePushWarpsPerBlock)
@@ -2050,11 +2042,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK(params.elements_per_token > 0);
     // The local rank must always be marked active in its own view of the mask;
     // otherwise the kernel itself would be running on a "dead" rank.
-    if (params.enable_rank_mask)
-    {
-        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
-    }
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
+        "rank-mask mode needs the device address of active_rank_mask");
 
     // ---- CFT combine path (one block per token). ----
     // Bypasses the base fence combine below entirely. The CFT push is launched separately by
@@ -2083,10 +2072,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kp.combine_counter_baseline = params.cft_combine_counter_baseline;
         kp.combine_counter_ep_stride = params.combine_counter_ep_stride;
         kp.timeout_cycles = params.timeout_cycles;
-        for (int w = 0; w < kRankMaskWords; ++w)
-        {
-            kp.active_rank_mask[w] = params.active_rank_mask[w];
-        }
+        kp.active_rank_mask = params.active_rank_mask;
 
         // A source rank's pushed tokens occupy one runtime-packed slice in the local inbox.
         int64_t const peer_stride = static_cast<int64_t>(params.max_tokens_per_rank) * params.wire_bytes_per_token;
@@ -2143,11 +2129,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_target_indices = params.topk_target_indices;
 
-    // Copy active-rank bitmask into the kernel pointers struct
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
-    }
+    kernel_ptrs.active_rank_mask = params.active_rank_mask;
 
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
         SWITCH_DTYPE(params.dtype, T, {
