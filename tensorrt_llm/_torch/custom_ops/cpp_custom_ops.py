@@ -809,6 +809,17 @@ def _register_fake():
     ) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::moe_a2a_compact_source_slots")
+    def _(
+        slot_expert_ids: torch.Tensor,
+        slot_weights: torch.Tensor,
+        source_valid_counts: torch.Tensor,
+        source_tokens: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        shape = (source_valid_counts.size(0) * source_tokens,
+                 slot_expert_ids.size(1))
+        return slot_expert_ids.new_empty(shape), slot_weights.new_empty(shape)
+
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,

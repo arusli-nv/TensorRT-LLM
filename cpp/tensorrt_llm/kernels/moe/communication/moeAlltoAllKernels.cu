@@ -1208,8 +1208,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
+    // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
 
@@ -2133,8 +2132,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
+    // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
 
@@ -2290,6 +2288,39 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
     int grid = ceilDiv(total_tokens, kBlockSize);
     launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
         stream, expert_ids, recv_counters, flag_val, ep_size, max_tokens_per_rank, top_k, invalid_id);
+}
+
+// One thread per (token, k) of the compact list: source s's token i is slot row s * slot_tokens + i.
+__global__ void moeA2ACompactSourceSlotsKernel(int32_t const* slot_expert_ids, float const* slot_weights,
+    int32_t const* source_valid_counts, int32_t* expert_ids, float* weights, int num_sources, int source_tokens,
+    int slot_tokens, int top_k)
+{
+    int const per_source = source_tokens * top_k;
+    int const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_sources * per_source)
+        return;
+    int const source = idx / per_source;
+    int const offset = idx - source * per_source;
+    int64_t const slot_idx = static_cast<int64_t>(source) * slot_tokens * top_k + offset;
+
+#if TLLM_MOE_A2A_COMPILE_SM90
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    bool const received = offset < source_valid_counts[source] * top_k;
+    expert_ids[idx] = received ? slot_expert_ids[slot_idx] : -1;
+    weights[idx] = received ? slot_weights[slot_idx] : 0.F;
+}
+
+void moe_a2a_compact_source_slots_launch(int32_t const* slot_expert_ids, float const* slot_weights,
+    int32_t const* source_valid_counts, int32_t* expert_ids, float* weights, int num_sources, int source_tokens,
+    int slot_tokens, int top_k, cudaStream_t stream)
+{
+    constexpr int kBlockSize = 256;
+    int grid = ceilDiv(num_sources * source_tokens * top_k, kBlockSize);
+    launchWithPdlWhenEnabled("moeA2ACompactSourceSlotsKernel", moeA2ACompactSourceSlotsKernel, grid, kBlockSize, 0,
+        stream, slot_expert_ids, slot_weights, source_valid_counts, expert_ids, weights, num_sources, source_tokens,
+        slot_tokens, top_k);
 }
 
 } // namespace kernels::moe_comm

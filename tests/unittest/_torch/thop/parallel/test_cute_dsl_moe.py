@@ -25,6 +25,7 @@ from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     SITU_BETA_DISABLED,
     SWIGLU_LIMIT_SCALAR_DISABLED,
+    GatherGroupedGemmInputsHelper,
     GroupedGemmInputsHelper,
     _get_sm107_nvfp4_default_mma_config,
 )
@@ -130,6 +131,22 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
     assert set([helper.map_to_tuning_buckets(x) for x in max_num_permuted_tokens_list]) == set(
         buckets
     )
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("source_tokens,slot_tokens", [(1, 1), (3, 8), (8, 8), (100, 256)])
+def test_gather_helper_source_slot_rows(source_tokens: int, slot_tokens: int, tile_size: int):
+    """Tuning inputs for a source-slot FC1 hold whole slots covering every token."""
+    num_experts, ep_size, top_k = 288, 32, 8
+    helper = GatherGroupedGemmInputsHelper(num_experts, top_k, num_experts // ep_size, 0, tile_size)
+    shapes = [torch.Size([0])] * 10
+    for max_num_permuted_tokens in helper.gen_tuning_buckets(16384):
+        shapes[helper.IDX_SHAPE_INFER] = torch.Size([max_num_permuted_tokens])
+        num_tokens = helper.infer_shape_num_tokens(shapes)
+        rows = helper.infer_shape_source_slot_rows(shapes, source_tokens, slot_tokens)
+        assert rows % slot_tokens == 0
+        last = num_tokens - 1
+        assert last + (last // source_tokens) * (slot_tokens - source_tokens) < rows
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])

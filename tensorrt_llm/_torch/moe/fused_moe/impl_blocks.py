@@ -84,6 +84,14 @@ class MoEExecutionContractMixin:
         """
         return False
 
+    def supports_dispatch_receive_slots(self) -> bool:
+        """Whether ``run_moe`` can read NVLinkOneSided's fixed receive slots in place.
+
+        WideEP peer-loss recovery hands the experts the receive slots instead
+        of a compact copy, and refuses backends that answer ``False``.
+        """
+        return False
+
     @property
     def supports_alltoall(self) -> bool:
         """Whether the kernel can consume tokens dispatched with all-to-all."""

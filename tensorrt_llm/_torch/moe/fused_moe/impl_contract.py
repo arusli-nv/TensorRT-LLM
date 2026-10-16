@@ -569,6 +569,24 @@ class MoEResolutionReport:
 
 
 @dataclass(frozen=True)
+class DispatchSourceSlots:
+    """The receive layout of NVLinkOneSided under WideEP peer-loss recovery.
+
+    Every dispatched payload (hidden states, their scales, expert ids, router
+    weights) is ``[num_sources * slot_tokens, ...]``: source ``s``'s token ``i``
+    is row ``s * slot_tokens + i``. Of each slot only the first
+    ``valid_counts[s]`` rows (at most ``source_tokens``, this forward's tokens
+    per source) hold tokens; the routing, compact ``[num_sources *
+    source_tokens]`` token order maps token ``t`` to row
+    ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
+    """
+
+    valid_counts: torch.Tensor  # [num_sources] int32, written by the dispatch on the device
+    source_tokens: int
+    slot_tokens: int
+
+
+@dataclass(frozen=True)
 class MoECommPlan:
     """What the comm layer decided for THIS forward. Facts, not capabilities.
 
@@ -594,6 +612,9 @@ class MoECommPlan:
     recv_expert_count: Optional[torch.Tensor] = None
     deep_ep_expert_capacity: Optional[int] = None
     use_deep_ep_direct_metadata: bool = False
+    # NVLinkOneSided under WideEP peer-loss recovery: x, x_sf and the routing
+    # tensors are fixed per-source receive slots. None otherwise.
+    source_slots: Optional[DispatchSourceSlots] = None
 
 
 @dataclass(frozen=True)
