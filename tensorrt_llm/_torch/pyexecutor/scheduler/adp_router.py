@@ -37,7 +37,7 @@ import math
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -200,6 +200,10 @@ class ADPRouter(ABC):
                 piggyback on this allgather, if one is pending.
             forward_work: Context and generation work eligible before this
                 iteration polls transfers, used by conditional attention DP.
+
+        Returns:
+            One state per serving rank, ordered by logical rank. Ranks that
+            left the group (``None`` allgather entries) are omitted.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -212,20 +216,23 @@ class ADPRouter(ABC):
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
-        responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
-        return [RankState.deserialize(data=resp) for resp in responses]
+        responses = self.dist.tp_allgather(
+            local_state.serialize(include_kv_cache_load), departed=None
+        )
+        return [RankState.deserialize(data=resp) for resp in responses if resp is not None]
 
     @staticmethod
     def _assign_explicit_dp_ranks(
         requests: List["RequestQueueItem"],
         all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
-        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_requests: Dict[int, int],
         max_num_active_requests: int,
     ) -> List["RequestQueueItem"]:
         """Place requests carrying an explicit ``attention_dp_rank`` on that rank
         (while it is under ``max_num_active_requests``) and return the rest for
         load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
-        place. Shared by Default and ConversationAware routers.
+        place. A relaxed request targeting a rank that is not serving is load
+        balanced; :meth:`split_unservable_requests` removes strict ones first.
         """
         remaining: List["RequestQueueItem"] = []
         for req_item in requests:
@@ -233,6 +240,9 @@ class ADPRouter(ABC):
             target_dp_rank = (
                 scheduling_params.attention_dp_rank if scheduling_params is not None else None
             )
+            if target_dp_rank is not None and target_dp_rank not in all_ranks_num_active_requests:
+                remaining.append(req_item)
+                continue
             if (
                 target_dp_rank is not None
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
@@ -244,8 +254,30 @@ class ADPRouter(ABC):
         return remaining
 
     @staticmethod
+    def split_unservable_requests(
+        requests: List["RequestQueueItem"],
+        all_rank_states: list[RankState],
+    ) -> Tuple[List["RequestQueueItem"], List["RequestQueueItem"]]:
+        """Split off the requests strictly pinned to a rank that is not serving.
+
+        Returns:
+            The requests to route and the unservable ones, each in order.
+        """
+        serving = {state.rank for state in all_rank_states}
+        routable: List["RequestQueueItem"] = []
+        unservable: List["RequestQueueItem"] = []
+        for req_item in requests:
+            params = getattr(req_item.request, "py_scheduling_params", None)
+            target = None if params is None else params.attention_dp_rank
+            if target is None or params.attention_dp_relax or target in serving:
+                routable.append(req_item)
+            else:
+                unservable.append(req_item)
+        return routable, unservable
+
+    @staticmethod
     def _expected_num_active_requests(
-        all_ranks_num_active_requests: List[int],
+        all_ranks_num_active_requests: Collection[int],
         num_new_requests: int,
         tp_size: int,
         *,
@@ -331,8 +363,8 @@ class DefaultADPRouter(ADPRouter):
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
         }
-        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
-        all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+        all_ranks_num_active_requests = {s.rank: s.num_active_requests for s in all_rank_states}
+        all_ranks_num_active_tokens = {s.rank: s.num_active_tokens for s in all_rank_states}
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
@@ -354,7 +386,7 @@ class DefaultADPRouter(ADPRouter):
         # Cap at max_num_active_requests so the per-rank target never
         # exceeds what the rank can physically schedule.
         expected_num_active_requests = self._expected_num_active_requests(
-            all_ranks_num_active_requests,
+            all_ranks_num_active_requests.values(),
             num_new_requests_all_ranks,
             tp_size,
             hard_cap=max_num_active_requests,
@@ -374,8 +406,8 @@ class DefaultADPRouter(ADPRouter):
         self,
         new_requests: List,
         all_ranks_new_requests: Dict[int, List],
-        all_ranks_num_active_requests: List[int],
-        all_ranks_num_active_tokens: List[int],
+        all_ranks_num_active_requests: Dict[int, int],
+        all_ranks_num_active_tokens: Dict[int, int],
         expected_num_active_requests: int,
     ) -> Dict[int, List]:
         """Balance requests across ranks for attention DP.
@@ -387,8 +419,10 @@ class DefaultADPRouter(ADPRouter):
             new_requests: List of new requests to distribute.
             all_ranks_new_requests: Dict mapping rank to list of already assigned
                 requests (will be extended in-place).
-            all_ranks_num_active_requests: Number of active requests per rank.
-            all_ranks_num_active_tokens: Number of active tokens per rank.
+            all_ranks_num_active_requests: Number of active requests per
+                serving rank, keyed by logical rank.
+            all_ranks_num_active_tokens: Number of active tokens per serving
+                rank, keyed by logical rank.
             expected_num_active_requests: Target number of active requests per rank.
 
         Returns:
@@ -399,7 +433,7 @@ class DefaultADPRouter(ADPRouter):
 
         all_ranks_new_requests_heap = [
             HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
-            for tp_rank, val in enumerate(all_ranks_num_active_requests)
+            for tp_rank, val in all_ranks_num_active_requests.items()
         ]
 
         all_ranks_new_requests_heap = [
