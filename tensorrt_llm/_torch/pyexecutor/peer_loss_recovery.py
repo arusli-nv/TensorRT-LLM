@@ -37,6 +37,8 @@ from .scheduler import ScheduledRequests
 from .scheduler.adp_router import DefaultADPRouter
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from tensorrt_llm.executor.recovery.client import RecoveryClient
     from tensorrt_llm.executor.recovery.protocol import Commit, Install
 
@@ -563,13 +565,15 @@ class PeerLossRecovery(RecoveryHook):
             )
         generation = proposal.generation
 
-        placement_digest = engine.moe_load_balancer.masked_placement_digest(failed)
+        load_balancer = engine.moe_load_balancer
+        placements = load_balancer.recovery_placements(failed)
+        placement_digest = load_balancer.placement_digest(failed, placements)
         client.send(Ready(rank=rank, generation=generation, placement_digest=placement_digest))
         _expect_generation(client.wait(Install, deadline), generation)
 
         dist.install_survivors()
-        install_resident_placement(
-            engine.moe_execution_state, engine.moe_load_balancer, failed, own_rank=rank
+        install_recovery_placement(
+            engine.moe_execution_state, load_balancer, failed, placements, own_rank=rank
         )
         client.send(Installed(rank=rank, generation=generation))
         _expect_generation(client.wait(Commit, deadline), generation)
@@ -735,20 +739,23 @@ class PeerLossRecovery(RecoveryHook):
             self._executor.readmit_requests(missing)
 
 
-def install_resident_placement(
+def install_recovery_placement(
     state: "MoeExecutionState",
     load_balancer: "MoeLoadBalancer",
     failed_ranks: Iterable[int],
+    placements: List["np.ndarray"],
     own_rank: int,
 ) -> None:
-    """Serve without ``failed_ranks``: route MoE traffic to resident replicas, then mask the ranks.
+    """Serve without ``failed_ranks``: route MoE traffic by ``placements``, then mask the ranks.
 
+    ``placements`` come from ``MoeLoadBalancer.recovery_placements``: resident
+    replicas, plus experts restored into survivors' slots from host weights.
     Only while the model is idle. Routing must exclude the failed ranks before
     their mask is installed, because the MoE kernels silently skip routes to a
-    masked rank. The caller has validated the masked routing (its digest, sent
+    masked rank. The caller has validated the placements (their digest, sent
     with Ready); the ranks are validated here before anything changes. An error
-    after that (from the native routing update or the device) leaves the state
-    mixed and ends the job.
+    after that (from the native routing update, a slot load or the device)
+    leaves the state mixed and ends the job.
 
     Raises:
         RuntimeError: A rank is ``own_rank`` or had already failed.
@@ -760,7 +767,7 @@ def install_resident_placement(
             raise RuntimeError(f"EP rank {rank} is this rank")
         if not state.health.is_active(rank):
             raise RuntimeError(f"EP rank {rank} is already failed")
-    load_balancer.reconfigure_mask_only(failed)
+    load_balancer.install_recovery_placement(failed, placements)
     for rank in failed:
         state.health.mark_failed(rank)
     state.rearm()

@@ -496,6 +496,134 @@ TEST(MoeLoadBalancerMaskOnlyTest, ReconfigureMaskOnlyFailsClosedForLastReplica)
     loadBalancer.shutdown();
 }
 
+namespace
+{
+
+// One layer on EP rank 0 of 4 with 2 slots per rank; experts 2 and 3 live only on rank 2. Every expert's host
+// weight is filled with expertId + 1 and every local slot starts with its expert's values.
+class RestorePlacementLayer
+{
+public:
+    static constexpr int kExpertCount = 4;
+    static constexpr int kEpSize = 4;
+    static constexpr int kSlotCountPerRank = 2;
+    static constexpr int kDeadRank = 2;
+    static constexpr int kWeightElems = 256;
+
+    explicit RestorePlacementLayer(bool withHostWeights)
+        : mLoadBalancer(/*epRank=*/0, kEpSize, /*layerUpdatesPerIter=*/1)
+    {
+        mLoadBalancer.setUseGpuMemcpy(true);
+        mLayer = mLoadBalancer.AddLayer(kExpertCount, /*topK=*/2, kSlotCountPerRank);
+        std::vector<int> const initialAssignments{0, 1, 0, 1, 2, 3, 0, 1};
+        for (int expertId = 0; withHostWeights && expertId < kExpertCount; ++expertId)
+        {
+            float* host = nullptr;
+            TLLM_CUDA_CHECK(cudaMallocHost(&host, kWeightElems * sizeof(float)));
+            std::fill_n(host, kWeightElems, static_cast<float>(expertId + 1));
+            mHostWeights.push_back(host);
+            mLayer->addSingleHostWeight(expertId, "w", weight(host));
+        }
+        for (int slotId = 0; withHostWeights && slotId < kSlotCountPerRank; ++slotId)
+        {
+            float* slot = nullptr;
+            TLLM_CUDA_CHECK(cudaMalloc(&slot, kWeightElems * sizeof(float)));
+            TLLM_CUDA_CHECK(cudaMemcpy(
+                slot, mHostWeights[initialAssignments[slotId]], kWeightElems * sizeof(float), cudaMemcpyHostToDevice));
+            mSlots.push_back(slot);
+            mLayer->addSingleWeightSlot(slotId, "w", weight(slot));
+        }
+        mLayer->setInitialWeightAssignments(initialAssignments);
+        mLoadBalancer.finalizeModel();
+    }
+
+    ~RestorePlacementLayer()
+    {
+        mLoadBalancer.shutdown();
+        for (auto* host : mHostWeights)
+        {
+            cudaFreeHost(host);
+        }
+        for (auto* slot : mSlots)
+        {
+            cudaFree(slot);
+        }
+    }
+
+    float slotValue(int slotId) const
+    {
+        float value = 0;
+        TLLM_CUDA_CHECK(cudaMemcpy(&value, mSlots[slotId], sizeof(float), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    MoeLoadBalancer mLoadBalancer;
+    std::shared_ptr<SingleLayerMoeLoadBalancer> mLayer;
+
+private:
+    static MoeWeight weight(float* ptr)
+    {
+        MoeWeight w;
+        w.mWeightPtr = ptr;
+        w.mHeight = 1;
+        w.mWidth = kWeightElems * sizeof(float);
+        w.mPitch = w.mWidth;
+        return w;
+    }
+
+    std::vector<float*> mHostWeights;
+    std::vector<float*> mSlots;
+};
+
+} // namespace
+
+TEST(MoeLoadBalancerRestoreTest, RestorePlacementLoadsLostExpertsIntoSlots)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    RestorePlacementLayer setup(/*withHostWeights=*/true);
+
+    // Rank 0 takes expert 2 over a replica of expert 0, rank 1 takes expert 3 over a replica of expert 1.
+    std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+
+    auto* info = setup.mLayer->getPlacementCpuInfo();
+    EXPECT_EQ(info->oldRankExpertIds[0], (std::vector<int>{2, 1}));
+    EXPECT_EQ(info->oldRankExpertIds[RestorePlacementLayer::kDeadRank], (std::vector<int>{-1, -1}));
+    std::vector<int> const expectedReplicaCounts{2, 2, 1, 1};
+    for (int expertId = 0; expertId < RestorePlacementLayer::kExpertCount; ++expertId)
+    {
+        EXPECT_EQ(info->placementInfoForGPU.expertReplicaCount[expertId], expectedReplicaCounts[expertId]);
+    }
+    EXPECT_EQ(setup.slotValue(0), 3.0f); // expert 2, loaded from the host copy
+    EXPECT_EQ(setup.slotValue(1), 2.0f); // expert 1, unchanged
+}
+
+TEST(MoeLoadBalancerRestoreTest, RestorePlacementRejectsPlacementMissingAnExpert)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    RestorePlacementLayer setup(/*withHostWeights=*/true);
+
+    // Expert 3 has no replica outside the dead rank: nothing may change.
+    std::vector<std::vector<int>> const placement{{2, 1}, {0, 1}, {-1, -1}, {0, 1}};
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
+        tensorrt_llm::common::TllmException);
+    EXPECT_EQ(setup.mLayer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{0, 1}));
+    EXPECT_EQ(setup.slotValue(0), 1.0f);
+}
+
+TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsHostWeights)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    RestorePlacementLayer setup(/*withHostWeights=*/false);
+
+    std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
+        tensorrt_llm::common::TllmException);
+}
+
 // Iteration control parameter structure
 struct IterConfig
 {

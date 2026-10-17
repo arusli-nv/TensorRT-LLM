@@ -83,6 +83,7 @@ public:
     virtual void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) = 0;
     virtual void finalizeWeights();
     virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) = 0;
+    virtual bool hasHostWeights() const = 0;
 
 protected:
     void finalizeWeightSlot();
@@ -104,6 +105,11 @@ public:
     void finalizeWeights() override;
 
     void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) override;
+
+    bool hasHostWeights() const override
+    {
+        return mHostWeightsFinalized && !mHostWeights.empty();
+    }
 
 private:
     static void copyWeights(MoeWeight const& src, MoeWeight const& dst, cudaStream_t stream);
@@ -194,6 +200,11 @@ private:
     void validateMaskOnly(std::vector<uint8_t> const& deadRankMask) const;
     void reconfigureMaskOnly(std::vector<uint8_t> const& deadRankMask);
     std::vector<int> computeMaskOnlyReplicaCounts(std::vector<uint8_t> const& deadRankMask) const;
+    std::vector<int> computeReplicaCounts(
+        std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
+    void validatePlacement(
+        std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
+    void installPlacement(std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds);
 
     MoeLoadBalancer* mMoeLoadBalancer = nullptr;
 
@@ -291,6 +302,13 @@ public:
     // The caller must separately gate degraded-mode capacity/HBM headroom before invoking it.
     void reconfigureMaskOnly(std::vector<int> const& deadRanks);
 
+    // should bind to python
+    // Mark deadRanks dead and install a new placement per layer ([epSize][slotCountPerRank] expert ids; dead ranks'
+    // rows are ignored), loading the local slots whose expert changes from EPLB's host weights. Every layer is
+    // validated before any changes; only while no iteration runs.
+    void restorePlacement(
+        std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
+
     // Test interface to use GPU to do memcpy test functionality
     void setUseGpuMemcpy(bool useGpuMemcpy = false)
     {
@@ -321,6 +339,8 @@ private:
     int64_t addCopyTask(std::function<void(int, int)> task);
     void waitCopyTaskDone(int64_t taskId);
     std::vector<uint8_t> getDeadRankMaskSnapshot();
+    // The current dead-rank mask plus deadRanks; the local rank must stay alive.
+    std::vector<uint8_t> deadRankMaskWith(std::vector<int> const& deadRanks);
 
     std::vector<std::shared_ptr<SingleLayerMoeLoadBalancer>> mLayers;
 
