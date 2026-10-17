@@ -4,6 +4,7 @@
 
 import pytest
 
+from tensorrt_llm.executor.recovery import authority as authority_module
 from tensorrt_llm.executor.recovery import protocol
 from tensorrt_llm.executor.recovery.authority import Phase, RecoveryAuthority
 from tensorrt_llm.executor.recovery.hang_monitor import HangMonitor, HungRank
@@ -95,9 +96,44 @@ def test_device_waits_need_two_witnesses_and_point_at_the_chain_head():
     monitor.device_wait(1, 2, 1.0, 0.0)
     hung = None
     for now in range(1, 30):
-        _beat(monitor, float(now))
+        # Ranks 2 and 3 are stuck in a step; their iterations stop.
+        _beat(monitor, float(now), iterations={2: 0, 3: 0})
         hung = hung or monitor.check(float(now))
     assert hung is not None and hung.rank == 2
+
+
+def test_device_waits_on_a_rank_that_keeps_stepping_are_not_a_hang():
+    monitor = _monitor()
+    _beat(monitor, 0.0)
+    for waiter in (0, 1):
+        monitor.device_wait(waiter, 2, 1.0, 0.0)
+    for now in range(1, 40):
+        _beat(monitor, float(now))  # rank 2's iteration still advances: a long step, not a hang
+        assert monitor.check(float(now)) is None
+
+
+def test_a_starved_heartbeat_of_a_waiting_victim_points_at_the_hung_rank():
+    monitor = _monitor()
+    _beat(monitor, 0.0, iterations={r: 0 for r in RANKS})
+    for waiter in (0, 1):
+        monitor.device_wait(waiter, 3, 1.0, 0.0)
+    hung = None
+    for now in range(1, 40):
+        # Rank 3's device is stuck; rank 1's heartbeat thread is starved and goes silent.
+        for rank in (0, 2, 3):
+            monitor.heartbeat(rank, 0, False, float(now))
+        hung = hung or monitor.check(float(now))
+    assert hung is not None and hung.rank == 3
+
+
+def test_waits_on_unknown_peers_are_ignored():
+    monitor = _monitor()
+    _beat(monitor, 0.0)
+    monitor.device_wait(0, 7, 1.0, 0.0)
+    monitor.device_wait(1, 7, 1.0, 0.0)
+    for now in range(1, 40):
+        _beat(monitor, float(now))
+        assert monitor.check(float(now)) is None
 
 
 def test_cleared_device_waits_drop_the_evidence():
@@ -119,7 +155,7 @@ def _serving_authority(fenced):
     authority = RecoveryAuthority(
         len(RANKS),
         hang_monitor=_monitor(),
-        fence=lambda rank, reason: fenced.append((rank, reason)),
+        fence=lambda hung: fenced.append((hung.rank, hung.reason, hung.host, hung.pid)),
     )
     for rank in RANKS:
         authority.handle(f"rank-{rank}".encode(), Register(rank, (1, 2, 3)), 0.0)
@@ -133,20 +169,39 @@ def test_authority_fences_a_hung_recoverable_rank_once():
     for now in range(1, 40):
         for rank in (0, 1, 3):
             # Heartbeats come from each worker's own connection, not its protocol route.
-            assert authority.handle(b"heartbeat", Heartbeat(rank, now, False), float(now)) == []
+            assert (
+                authority.handle(
+                    b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
+                )
+                == []
+            )
         if now == 1:
-            authority.handle(b"heartbeat", Heartbeat(2, 0, False), 1.0)
+            authority.handle(b"heartbeat", Heartbeat(2, 0, False, "node", 102), 1.0)
         assert authority.expire(float(now)) == []
-    assert [rank for rank, _ in fenced] == [2]
+    assert [(rank, host, pid) for rank, _, host, pid in fenced] == [(2, "node", 102)]
+
+
+def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
+    launched = []
+    original = authority_module.subprocess.Popen
+    authority_module.subprocess.Popen = lambda command, **kwargs: launched.append(command)
+    try:
+        fence = authority_module.command_fence("ssh {host} kill -KILL {pid}")
+        fence(HungRank(2, "no heartbeat for 30.0s", "node-7", 4242))
+    finally:
+        authority_module.subprocess.Popen = original
+    assert launched == [["ssh", "node-7", "kill", "-KILL", "4242"]]
 
 
 def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery():
     fenced = []
     authority = _serving_authority(fenced)
-    authority.handle(b"heartbeat", Heartbeat(0, 0, False), 0.0)
+    authority.handle(b"heartbeat", Heartbeat(0, 0, False, "node", 100), 0.0)
     for now in range(1, 40):
         for rank in (1, 2, 3):
-            authority.handle(b"heartbeat", Heartbeat(rank, now, False), float(now))
+            authority.handle(
+                b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
+            )
         authority.expire(float(now))
     assert fenced == []  # rank 0's loss is never recovered: reported only
 
@@ -160,9 +215,23 @@ def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery
     assert fenced == []
 
 
+def test_after_a_recovery_a_hung_rank_is_only_reported():
+    fenced = []
+    authority = _serving_authority(fenced)
+    authority.phase = Phase.RECOVERED  # one loss per job: a second one cannot be recovered
+    authority.handle(b"heartbeat", Heartbeat(2, 0, False, "node", 102), 0.0)
+    for now in range(1, 40):
+        for rank in (0, 1, 3):
+            authority.handle(
+                b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
+            )
+        authority.expire(float(now))
+    assert fenced == []
+
+
 def test_evidence_messages_round_trip():
     key, route = b"k" * 32, b"rank-3-heartbeat"
-    for message in (Heartbeat(3, 1234, True), DeviceWait(1, 2, 2500)):
+    for message in (Heartbeat(3, 1234, True, "node-3", 4321), DeviceWait(1, 2, 2500)):
         frames = protocol.encode(message, key, route)
         assert protocol.authenticate(frames, key, route)
         assert protocol.decode(frames[0]) == message

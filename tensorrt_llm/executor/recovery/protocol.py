@@ -120,12 +120,15 @@ class Heartbeat:
     """Worker -> authority, periodically: the process lives and its executor is at ``iteration``.
 
     ``waiting`` says whether the executor waits on something outside its rank: a host
-    collective, or new requests.
+    collective, or new requests. ``host`` and ``pid`` identify the worker process, so the
+    authority can fence it.
     """
 
     rank: int
     iteration: int
     waiting: bool
+    host: str
+    pid: int
 
 
 @dataclass(frozen=True)

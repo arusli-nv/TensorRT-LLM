@@ -754,6 +754,16 @@ class NVLinkOneSided(Communication):
             self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
         )
 
+    def progress_row_offsets(self) -> Tuple[int, int, int]:
+        """Byte offsets of ``flag_val`` and of the dispatch and combine completion flags in a
+        workspace row: this rank's all-to-all progress, which hang detection reads."""
+        meta = self.moe_a2a_metainfo
+        return (
+            int(meta[self.FLAG_VAL_OFFSET_INDEX]),
+            int(meta[self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]),
+            int(meta[self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]),
+        )
+
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
         return self._require_workspace_lifecycle().metainfo

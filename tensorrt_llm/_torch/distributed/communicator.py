@@ -126,6 +126,8 @@ def _interruptible(func: Callable) -> Callable:
     def wrapper(self: "MPIDist", *args, **kwargs):
         if self._host_world is None:
             return func(self, *args, **kwargs)
+        # Read by hang detection: a rank in a host collective waits on its peers.
+        self.in_host_collective = True
         try:
             result = func(self, *args, **kwargs)
         except Exception as error:  # noqa: BLE001 - classified below; others re-raised as is
@@ -139,6 +141,8 @@ def _interruptible(func: Callable) -> Callable:
             if not failed and not comm.Is_revoked():
                 raise
             raise HostCollectiveInterrupted(func.__name__, failed) from error
+        finally:
+            self.in_host_collective = False
         failed = mpi_failed_ranks(self._world_comm())
         if failed:
             raise HostCollectiveInterrupted(func.__name__, failed)
@@ -191,6 +195,8 @@ class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):
         self.mapping = mapping
+        # Whether this rank is inside a host collective (set with peer-loss recovery).
+        self.in_host_collective = False
 
     @staticmethod
     @lru_cache(maxsize=None)
