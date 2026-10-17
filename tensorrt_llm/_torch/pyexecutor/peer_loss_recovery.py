@@ -3,6 +3,7 @@
 """Keep a WideEP PyExecutor serving after one peer process dies."""
 
 import collections
+import dataclasses
 import functools
 import os
 import threading
@@ -29,7 +30,7 @@ from tensorrt_llm.logger import logger
 from ..distributed.communicator import HostCollectiveInterrupted, MPIDist, PeerFailureWatch
 from .error_classification import classify_error
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .llm_request import LlmRequest, LlmResponse
+from .llm_request import LlmRequest, LlmRequestState, LlmResponse
 from .resource_manager import ResourceManagerType
 from .sampler.penalties import has_occurrence_penalty
 from .scheduler import ScheduledRequests
@@ -53,6 +54,8 @@ _RECOVERY_TIMEOUT_DEFAULT_S = 30.0
 _REGISTRATION_TIMEOUT_S = 600.0
 
 Responses = List[Tuple[int, LlmResponse]]
+# A request and the context position and state it had before a step changed them.
+StepChange = Tuple[LlmRequest, int, LlmRequestState]
 _T = TypeVar("_T")
 _GATHER_HISTORY = 8
 
@@ -81,9 +84,23 @@ def _register(rank: int, recoverable_ranks: Tuple[int, ...]) -> Tuple["RecoveryC
     return client, client.register(recoverable_ranks, time.monotonic() + _REGISTRATION_TIMEOUT_S)
 
 
+@dataclasses.dataclass
+class PreparedStep:
+    """A scheduled step that holds resources but whose results are not accepted yet.
+
+    ``context_capacities`` are its context requests' KV cache capacities before it (the KV cache manager's
+    ``context_capacities``); ``changes`` lists, in order, what each request had before the step changed it.
+    """
+
+    batch: ScheduledRequests
+    context_capacities: Dict[int, Optional[int]]
+    changes: List[StepChange] = dataclasses.field(default_factory=list)
+
+
 class RecoveryHook:
     """The executor's recovery hook; this base, used when peer-loss recovery is off, does nothing."""
 
+    enabled = False
     peer_failed = False
 
     def run(self, event_loop: Callable[[], None]) -> None:
@@ -100,13 +117,13 @@ class RecoveryHook:
     ) -> _T:
         return broadcast(items)
 
-    def step_prepared(self, batch: ScheduledRequests) -> None:
-        pass
+    def step_prepared(self, batch: ScheduledRequests) -> Optional[List[StepChange]]:
+        return None
 
     def step_released(self) -> None:
         pass
 
-    def commit_step(self, sample_state: Optional["SampleState"]) -> None:
+    def commit_step(self, batch: ScheduledRequests, sample_state: Optional["SampleState"]) -> None:
         pass
 
     def validate_request(self, request: LlmRequest) -> None:
@@ -128,7 +145,8 @@ class RecoveryHook:
 class PeerLossRecovery(RecoveryHook):
     """Recovers a PyExecutor from the loss of one peer process.
 
-    Survivors discard the step the loss interrupted, agree on the new
+    Survivors discard the steps the loss interrupted (two under the overlap
+    scheduler), agree on the new
     membership through the recovery authority (``Stopped`` -> ``Propose`` ->
     ``Ready`` -> ``Install`` -> ``Installed`` -> ``Commit``) and resume the
     same requests on their original CUDA graphs: the departed rank is masked
@@ -148,6 +166,8 @@ class PeerLossRecovery(RecoveryHook):
     charged to the error budget. Errors of a recovery itself are terminal.
     """
 
+    enabled = True
+
     def __init__(
         self, executor: "PyExecutor", client: "RecoveryClient", admitted: frozenset
     ) -> None:
@@ -160,7 +180,9 @@ class PeerLossRecovery(RecoveryHook):
         # serving loop watches peers, and never during or after a recovery.
         self.survives_own_loss = False
         self._timeout_s = _recovery_timeout_s()
-        self._uncommitted_step: Optional[ScheduledRequests] = None
+        # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
+        # ahead of the one whose results it applies.
+        self._uncommitted_steps: Deque[PreparedStep] = collections.deque()
         self._peer_failed = threading.Event()
         self._watch: Optional[PeerFailureWatch] = None
         # Response gathers are numbered identically on every rank. A rank can
@@ -235,8 +257,6 @@ class PeerLossRecovery(RecoveryHook):
             )
             is None,
             "no LM head TP in attention DP": not dist.mapping.enable_lm_head_tp_in_adp,
-            # An abort request must not queue behind the kernels it stops.
-            "no overlap scheduler": executor.disable_overlap_scheduler,
             "no conversation manager": getattr(kv_cache_manager, "conversation_manager", None)
             is None,
             # One recovery runs under one hang checkpoint and waits up to the
@@ -265,19 +285,25 @@ class PeerLossRecovery(RecoveryHook):
             logger.info(f"WideEP peer-loss recovery covers the loss of ranks {sorted(admitted)}")
         return cls(executor, client, admitted)
 
-    @staticmethod
-    def validate_request(request: LlmRequest) -> None:
-        """Reject a request whose sampling a discarded step would change.
+    def validate_request(self, request: LlmRequest) -> None:
+        """Reject a request whose state a discarded step would change.
 
         Raises:
             ValueError: The request uses occurrence penalties, whose counts a
-                discarded step updates, or has logits post-processors, which
-                may keep state and would run again on a replayed step.
+                discarded step updates, or carries multimodal data under the
+                overlap scheduler, whose next step releases it before that
+                step is accepted, or has logits post-processors, which may keep
+                state and would run again on a replayed step.
         """
         if has_occurrence_penalty(request):
             raise ValueError(
                 "Repetition, presence and frequency penalties are not supported "
                 "with WideEP peer-loss recovery"
+            )
+        if request.py_multimodal_data and not self._executor.disable_overlap_scheduler:
+            raise ValueError(
+                "Multimodal requests are not supported with WideEP peer-loss "
+                "recovery and the overlap scheduler"
             )
         if getattr(request, "py_logits_post_processors", None):
             raise ValueError(
@@ -355,16 +381,22 @@ class PeerLossRecovery(RecoveryHook):
 
     # Step hooks
 
-    def step_prepared(self, batch: ScheduledRequests) -> None:
-        """Record that ``batch`` holds resources but has no results yet."""
-        self._uncommitted_step = batch
+    def step_prepared(self, batch: ScheduledRequests) -> List[StepChange]:
+        """Record that ``batch`` holds resources but has no results yet.
+
+        Returns:
+            The list into which the executor records each request change the step makes.
+        """
+        step = PreparedStep(batch, self._executor.kv_cache_manager.context_capacities(batch))
+        self._uncommitted_steps.append(step)
+        return step.changes
 
     def step_released(self) -> None:
-        """Record that the prepared step returned its resources without running."""
-        self._uncommitted_step = None
+        """Record that the newest prepared step returned its resources without running."""
+        self._uncommitted_steps.pop()
 
-    def commit_step(self, sample_state: Optional["SampleState"]) -> None:
-        """Accept the prepared step unless a peer failed while it ran.
+    def commit_step(self, batch: ScheduledRequests, sample_state: Optional["SampleState"]) -> None:
+        """Accept the oldest prepared step, ``batch``, unless a peer failed while it ran.
 
         Waits for the step's device work. A peer that stops responding without
         dying is bounded by the MoE kernels' device timeout, which fails stop.
@@ -378,15 +410,17 @@ class PeerLossRecovery(RecoveryHook):
             HostCollectiveInterrupted: The step's MoE collectives may have been
                 aborted; its results must be discarded.
         """
-        if self._uncommitted_step is None:
+        if not self._uncommitted_steps:
             return
+        if self._uncommitted_steps[0].batch is not batch:
+            raise RuntimeError("Steps must be committed in the order they were prepared")
         if sample_state is not None and sample_state.sampler_event is not None:
             sample_state.sampler_event.synchronize()
         else:
             torch.cuda.current_stream().synchronize()
         if self.peer_failed:
             raise HostCollectiveInterrupted("MoE all-to-all", frozenset())
-        self._uncommitted_step = None
+        self._uncommitted_steps.popleft()
 
     # Request and response hooks
 
@@ -409,11 +443,6 @@ class PeerLossRecovery(RecoveryHook):
             self._unbroadcast_requests = list(items)
             raise
         if self._request_owners is not None:
-            # A request cancelled while waiting ends without a response, as without FT: neither re-admit it after
-            # a loss nor keep its entry.
-            for item in items:
-                if item.is_canceled_request:
-                    self._forget(item.id)
             self._broadcast_control_items = [
                 item
                 for item in items
@@ -514,9 +543,10 @@ class PeerLossRecovery(RecoveryHook):
                 "the only replica of an expert"
             )
         self._join_device_work(deadline)
-        # Only now can no kernel of the step still write its KV blocks.
-        executor.discard_interrupted_step(self._uncommitted_step)
-        self._uncommitted_step = None
+        # Only now can no kernel of the steps still write their KV blocks.
+        discarded = len(self._uncommitted_steps)
+        executor.discard_interrupted_steps(reversed(self._uncommitted_steps))
+        self._uncommitted_steps.clear()
 
         client.send(Stopped(rank=rank, failed_rank=failed_rank))
         # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery it cannot
@@ -565,8 +595,9 @@ class PeerLossRecovery(RecoveryHook):
         self._watch_peer_failures()
         logger.warning(
             f"Rank {rank}: resumed serving without rank {failed_rank} at membership generation "
-            f"{generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the interruption; "
-            f"{len(dist.live_ranks)} ranks remain and a further loss is not recoverable"
+            f"{generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the interruption, "
+            f"discarding {discarded} steps; {len(dist.live_ranks)} ranks remain and a further loss "
+            "is not recoverable"
         )
 
     def _join_device_work(self, deadline: float) -> None:

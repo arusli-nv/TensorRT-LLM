@@ -70,8 +70,9 @@ def _assert_answered(rows: list[dict]) -> None:
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
+@pytest.mark.parametrize("overlap", [False, True], ids=["sync", "overlap"])
 @pytest.mark.parametrize("mode", ["idle", "inflight"])
-def test_peer_loss_recovery(mode: str, tmp_path: Path):
+def test_peer_loss_recovery(mode: str, overlap: bool, tmp_path: Path):
     reason = _ulfm_unavailable_reason()
     if reason is not None:
         pytest.skip(reason)
@@ -144,6 +145,7 @@ def test_peer_loss_recovery(mode: str, tmp_path: Path):
                     str(VICTIM),
                     "--output",
                     str(result_path),
+                    *(["--overlap"] if overlap else []),
                 ],
                 env=env,
                 stdout=mpirun_out,

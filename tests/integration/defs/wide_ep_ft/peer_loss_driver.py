@@ -47,7 +47,7 @@ def placement() -> list[int]:
     return slots
 
 
-def llm_kwargs() -> dict:
+def llm_kwargs(overlap: bool = False) -> dict:
     slots = placement()
     return dict(
         tensor_parallel_size=WORLD_SIZE,
@@ -55,7 +55,7 @@ def llm_kwargs() -> dict:
         moe_tensor_parallel_size=1,
         enable_attention_dp=True,
         enable_lm_head_tp_in_adp=False,
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=not overlap,
         enable_autotuner=False,
         max_batch_size=8,
         max_num_tokens=256,
@@ -140,6 +140,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=("idle", "inflight"), required=True)
     parser.add_argument("--victim", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--overlap", action="store_true", help="run the overlap scheduler")
     args = parser.parse_args()
 
     from tensorrt_llm import LLM
@@ -147,7 +148,7 @@ def main() -> None:
     all_ranks = list(range(WORLD_SIZE))
     survivors = [rank for rank in all_ranks if rank != args.victim]
     result = {}
-    llm = LLM(model=args.model, **llm_kwargs())
+    llm = LLM(model=args.model, **llm_kwargs(args.overlap))
     try:
         result["healthy"] = collect(submit(llm, all_ranks, SHORT_MAX_TOKENS))
         if args.mode == "idle":

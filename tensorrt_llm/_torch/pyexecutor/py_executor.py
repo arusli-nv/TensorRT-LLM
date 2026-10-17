@@ -108,7 +108,8 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           initialize_multimodal_encoder_request,
                           is_multimodal_encoder_ready)
 from .model_engine import ModelEngine
-from .peer_loss_recovery import PeerLossRecovery, RecoveryHook
+from .peer_loss_recovery import (PeerLossRecovery, PreparedStep, RecoveryHook,
+                                 StepChange)
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
@@ -418,6 +419,12 @@ class PyExecutor:
 
     # The recovery hook for a peer process loss; the do-nothing base when recovery is off.
     _peer_loss_recovery: RecoveryHook = RecoveryHook()
+    # The request changes of the step being prepared, recorded for peer-loss
+    # recovery; None when recovery is off.
+    _step_changes: Optional[List[StepChange]] = None
+    # Under the overlap scheduler with recovery: the batch whose recompute
+    # victims are freed but not yet paused.
+    _recompute_unpaused: Optional[ScheduledRequests] = None
 
     def __init__(
         self,
@@ -5077,7 +5084,8 @@ class PyExecutor:
                             spec_resource_mgr.process_and_save(
                                 scheduled_batch, spec_metadata)
 
-                    self._peer_loss_recovery.commit_step(sample_state)
+                    self._peer_loss_recovery.commit_step(
+                        scheduled_batch, sample_state)
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
                     if self.speculation_gate is not None:
@@ -5809,6 +5817,14 @@ class PyExecutor:
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
+                    # The V2 scheduler allocates KV cache with the batch.
+                    self._step_changes = self._peer_loss_recovery.step_prepared(
+                        scheduled_batch)
+                    if self._peer_loss_recovery.enabled:
+                        # Recompute victims are freed now and paused after the
+                        # previous step's responses; a peer loss in between
+                        # pauses them in the discard.
+                        self._recompute_unpaused = scheduled_batch
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
@@ -5868,6 +5884,8 @@ class PyExecutor:
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                    if self._is_kv_manager_v2:
+                        self._peer_loss_recovery.step_released()
                 self._finalize_adp_dummy_allocation(can_queue)
 
                 if not can_queue and scheduled_batch.encoder_requests:
@@ -5949,6 +5967,19 @@ class PyExecutor:
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    # The step before runs a step ahead; its results apply
+                    # only once it is accepted.
+                    self._peer_loss_recovery.commit_step(
+                        self.previous_batch.scheduled_requests,
+                        self.previous_batch.sample_state)
+                    if (self._peer_loss_recovery.enabled and self.
+                            previous_batch.scheduled_requests.context_requests):
+                        # Deferred from its step: it commits the chunks' blocks.
+                        # It can rewrite host page-index rows that the current
+                        # step's input copy may still be reading.
+                        self._wait_for_model_engine_input_copy()
+                        self._update_v2_context_resources(
+                            self.previous_batch.scheduled_requests)
                     self._update_requests(self.previous_batch.sample_state)
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
@@ -5984,6 +6015,7 @@ class PyExecutor:
 
                 if self._is_kv_manager_v2:
                     self._pause_recompute_paused_requests(scheduled_batch)
+                    self._recompute_unpaused = None
                 else:
                     self._pause_requests(scheduled_batch.paused_requests)
 
@@ -6019,8 +6051,11 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
+                    # With peer-loss recovery this waits until the step is
+                    # accepted: it commits the chunk's blocks for reuse.
                     if (self._is_kv_manager_v2
-                            and scheduled_batch.context_requests):
+                            and scheduled_batch.context_requests
+                            and not self._peer_loss_recovery.enabled):
                         self._update_v2_context_resources(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
@@ -8574,6 +8609,7 @@ class PyExecutor:
         for request in generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
             ):
+                self._note_step_change(request)
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
@@ -8598,18 +8634,37 @@ class PyExecutor:
     # Peer-loss recovery (see PeerLossRecovery) drives the executor through the
     # methods below and publish_responses.
 
-    def discard_interrupted_step(self,
-                                 batch: Optional[ScheduledRequests]) -> None:
-        """Undo a step that a peer loss interrupted before its results applied.
+    def discard_interrupted_steps(self, steps: Iterable[PreparedStep]) -> None:
+        """Undo steps that a peer loss interrupted before their results applied.
 
-        Returns the KV cache reserved for ``batch`` (None when the loss came
-        before resources were prepared) and the attention-DP padding request,
-        so that the step's requests are scheduled again unchanged.
+        ``steps`` come newest first. Each step's request changes are undone and
+        the KV cache reserved for it is returned, as is the attention-DP padding
+        request, so that the steps' requests are scheduled again unchanged and
+        the loop restarts from host state.
         """
         self._finalize_adp_dummy_allocation(False)
-        if batch is not None:
-            self.kv_cache_manager.revert_prepare_resources(batch)
+        if self._recompute_unpaused is not None:
+            self._pause_recompute_paused_requests(self._recompute_unpaused)
+            self._recompute_unpaused = None
+        for step in steps:
+            for request, position, state in reversed(step.changes):
+                request.context_current_position = position
+                request.state = state
+            self.kv_cache_manager.revert_prepare_resources(
+                step.batch, step.context_capacities)
         self._terminate_attention_dp_dummy_requests()
+        self._step_changes = None
+        self.previous_batch = None
+        # No step's output tokens are on the device any more: every request
+        # takes its input from host state, as after a pause.
+        for request in self.active_requests:
+            request.py_batch_idx = None
+
+    def _note_step_change(self, request: LlmRequest) -> None:
+        """Remember what the step being prepared changes on ``request``, so peer-loss recovery can undo it."""
+        if self._step_changes is not None:
+            self._step_changes.append(
+                (request, request.context_current_position, request.state))
 
     def take_waiting_requests(self) -> List[RequestQueueItem]:
         """Remove and return the requests waiting to be scheduled."""
@@ -8652,6 +8707,7 @@ class PyExecutor:
         self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
+            self._note_step_change(request)
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.py_last_context_chunk = (
                     request.context_current_position,
