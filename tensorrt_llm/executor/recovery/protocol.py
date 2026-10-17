@@ -41,29 +41,29 @@ MAX_MESSAGE_BYTES = 64 * 1024
 
 @dataclass(frozen=True)
 class Register:
-    """Worker -> authority: announce a rank and the ranks whose loss it can recover from.
+    """Worker -> authority: announce a rank and the failure domains whose loss it can recover from.
 
-    ``recoverable_ranks`` are the ranks whose experts all have a resident replica
-    elsewhere in this worker's placement.
+    ``recoverable_domains`` are sorted rank sets (a single rank or a whole node) whose
+    combined loss this worker's expert placement absorbs.
     """
 
     rank: int
-    recoverable_ranks: tuple[int, ...]
+    recoverable_domains: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
 class Registered:
-    """Authority -> workers: every rank registered; losses of ``admitted_ranks`` recover."""
+    """Authority -> workers: every rank registered; the loss of one admitted domain recovers."""
 
-    admitted_ranks: tuple[int, ...]
+    admitted_domains: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
 class Stopped:
-    """Worker -> authority: local work joined after observing ``failed_rank`` depart."""
+    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) depart."""
 
     rank: int
-    failed_rank: int
+    failed_ranks: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -85,10 +85,10 @@ class Installed:
 
 @dataclass(frozen=True)
 class Propose:
-    """Authority -> survivors: prepare to continue without ``failed_rank``."""
+    """Authority -> survivors: prepare to continue without ``failed_ranks`` (sorted)."""
 
     generation: int
-    failed_rank: int
+    failed_ranks: tuple[int, ...]
     survivors: tuple[int, ...]
 
 
@@ -145,15 +145,15 @@ def authenticate(frames: list[bytes], key: bytes, route: bytes) -> bool:
     return hmac.compare_digest(_tag(key, route, frames[0]), frames[1])
 
 
-def _field_value(field: dataclasses.Field, value):
-    """Check a decoded JSON value against the field type; sequences become tuples."""
-    if typing.get_origin(field.type) is tuple:
-        (item_type, _) = typing.get_args(field.type)
-        if isinstance(value, list) and all(type(item) is item_type for item in value):
-            return tuple(value)
-    elif type(value) is field.type:
+def _field_value(name: str, value_type: type, value):
+    """Check a decoded JSON value of field ``name`` against ``value_type``; lists become tuples."""
+    if typing.get_origin(value_type) is tuple:
+        (item_type, _) = typing.get_args(value_type)
+        if isinstance(value, list):
+            return tuple(_field_value(name, item_type, item) for item in value)
+    elif type(value) is value_type:
         return value
-    raise ProtocolError(f"field {field.name} has invalid value {value!r}")
+    raise ProtocolError(f"field {name} has invalid value {value!r}")
 
 
 def decode(payload: bytes) -> Message:
@@ -170,4 +170,6 @@ def decode(payload: bytes) -> Message:
     fields = {field.name: field for field in dataclasses.fields(cls)}
     if body.keys() != fields.keys():
         raise ProtocolError(f"{cls.__name__} fields mismatch: {sorted(body)}")
-    return cls(**{name: _field_value(fields[name], value) for name, value in body.items()})
+    return cls(
+        **{name: _field_value(name, fields[name].type, value) for name, value in body.items()}
+    )

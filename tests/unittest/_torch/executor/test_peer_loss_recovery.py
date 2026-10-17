@@ -45,6 +45,7 @@ pytestmark = pytest.mark.cpu_only
 WORLD_SIZE = 4
 FAILED_RANK = 2
 SURVIVORS = (0, 1, 3)
+ADMITTED = frozenset({frozenset({1}), frozenset({FAILED_RANK}), frozenset({3})})
 
 
 class _FakeClient:
@@ -66,19 +67,19 @@ class _FakeClient:
         return reply
 
 
-def _happy_replies(generation=1):
+def _happy_replies(generation=1, failed=(FAILED_RANK,), survivors=SURVIVORS):
     return [
-        Propose(generation=generation, failed_rank=FAILED_RANK, survivors=SURVIVORS),
+        Propose(generation=generation, failed_ranks=failed, survivors=survivors),
         Install(generation=generation),
         Commit(generation=generation),
     ]
 
 
-def _executor(rank=1, failed=frozenset({FAILED_RANK})):
+def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
     executor = PyExecutor.__new__(PyExecutor)
     executor.iter_counter = 0
     events = []
-    dist = Mock(rank=rank, live_ranks=tuple(r for r in range(WORLD_SIZE) if r not in failed))
+    dist = Mock(rank=rank, live_ranks=tuple(r for r in range(world_size) if r not in failed))
     dist.revoke.side_effect = lambda: events.append("revoke")
     dist.shrink.side_effect = lambda: events.append("shrink") or failed
     dist.install_survivors.side_effect = lambda: events.append("survivors")
@@ -86,14 +87,16 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK})):
         "watch"
     ) or Mock(failed=False)
     dist.broadcast.side_effect = lambda value, root: value
-    dist.allgather.side_effect = lambda value, departed: [value] * WORLD_SIZE
+    dist.allgather.side_effect = lambda value, departed: [
+        departed if r in failed else value for r in range(world_size)
+    ]
     engine = Mock()
     engine.moe_load_balancer.recovery_placements.return_value = ["placement"]
     engine.moe_load_balancer.placement_digest.return_value = "digest"
     engine.moe_load_balancer.install_recovery_placement.side_effect = (
         lambda failed, placements: events.append(("placement", frozenset(failed)))
     )
-    engine.moe_execution_state.health = EPGroupHealth(WORLD_SIZE)
+    engine.moe_execution_state.health = EPGroupHealth(world_size)
     executor.dist = dist
     executor.model_engine = engine
     executor.executor_request_queue = Mock()
@@ -113,9 +116,11 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK})):
     return executor
 
 
-def _recovery(client, rank=1, failed=frozenset({FAILED_RANK})):
-    executor = _executor(rank, failed)
-    recovery = PeerLossRecovery(executor, client, frozenset({1, FAILED_RANK, 3}))
+def _recovery(
+    client, rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE, admitted=ADMITTED
+):
+    executor = _executor(rank, failed, world_size)
+    recovery = PeerLossRecovery(executor, client, admitted)
     recovery._join_device_work = Mock()
     recovery._watch = Mock(failed=False)
     executor.discard_interrupted_steps = Mock()
@@ -137,7 +142,7 @@ def test_recovery_runs_protocol_and_installs_in_order():
     recovery._recover(_interrupted())
 
     assert client.sent == [
-        Stopped(rank=1, failed_rank=FAILED_RANK),
+        Stopped(rank=1, failed_ranks=(FAILED_RANK,)),
         Ready(rank=1, generation=1, placement_digest="digest"),
         Installed(rank=1, generation=1),
     ]
@@ -156,6 +161,33 @@ def test_recovery_runs_protocol_and_installs_in_order():
     # The placements installed are the ones whose digest went out with Ready.
     load_balancer.placement_digest.assert_called_once_with(failed, ["placement"])
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
+
+
+def test_a_node_loss_recovers_every_rank_in_one_transaction():
+    """Losing node 1 (ranks 4-7) masks all four ranks and fails the requests each one served."""
+    node = frozenset({4, 5, 6, 7})
+    client = _FakeClient(_happy_replies(failed=(4, 5, 6, 7), survivors=(0, 1, 2, 3)))
+    recovery = _recovery(client, rank=0, failed=node, world_size=8, admitted=ADMITTED | {node})
+    recovery._request_owners = {
+        request_id: (owner, Mock(id=request_id, request=Mock(client_id=None), child_req_ids=None))
+        for request_id, owner in ((11, 4), (12, 7), (13, 2))
+    }
+    recovery._executor.active_requests.append(
+        Mock(is_child=False, py_request_id=13, is_attention_dp_dummy=False)
+    )
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted(node))
+
+    assert client.sent[0] == Stopped(rank=0, failed_ranks=(4, 5, 6, 7))
+    engine = recovery._executor.model_engine
+    engine.moe_load_balancer.recovery_placements.assert_called_once_with(node)
+    engine.moe_load_balancer.install_recovery_placement.assert_called_once_with(
+        [4, 5, 6, 7], ["placement"]
+    )
+    assert engine.moe_execution_state.health.get_failed_ranks() == node
+    assert sorted(request_id for request_id, _ in sent[-1]) == [11, 12]
+    assert list(recovery._request_owners) == [13]
 
 
 def _queued(request_id):
@@ -297,11 +329,11 @@ def test_multimodal_requests_are_rejected_only_under_the_overlap_scheduler(overl
         recovery.validate_request(request)
 
 
-@pytest.mark.parametrize("failed", [frozenset(), frozenset({1, 2})])
-def test_recovery_requires_exactly_one_departed_rank(failed):
+@pytest.mark.parametrize("failed", [frozenset(), frozenset({1, 2}), frozenset({2, 3})])
+def test_recovery_requires_an_admitted_failed_set(failed):
     client = _FakeClient(_happy_replies())
     recovery = _recovery(client, rank=0, failed=failed)
-    with pytest.raises(RuntimeError, match="exactly one departed rank"):
+    with pytest.raises(RuntimeError, match="is not recoverable"):
         recovery._recover(_interrupted())
     assert client.sent == []
 
@@ -309,12 +341,13 @@ def test_recovery_requires_exactly_one_departed_rank(failed):
 @pytest.mark.parametrize(
     "replies, match",
     [
-        ([Propose(generation=1, failed_rank=3, survivors=(0, 1, 2))], "authority proposed"),
-        ([Propose(generation=1, failed_rank=FAILED_RANK, survivors=(0, 3))], "authority proposed"),
+        ([Propose(generation=1, failed_ranks=(3,), survivors=(0, 1, 2))], "authority proposed"),
+        ([Propose(generation=1, failed_ranks=(2, 3), survivors=(0, 1))], "authority proposed"),
+        ([Propose(generation=1, failed_ranks=(2,), survivors=(0, 3))], "authority proposed"),
         (_happy_replies()[:1] + [Install(generation=2)], "Expected recovery generation 1"),
         (_happy_replies()[:2] + [Commit(generation=2)], "Expected recovery generation 1"),
     ],
-    ids=["wrong_failed_rank", "not_a_survivor", "install_gen", "commit_gen"],
+    ids=["wrong_failed_rank", "wrong_failed_set", "not_a_survivor", "install_gen", "commit_gen"],
 )
 def test_recovery_fails_closed_on_protocol_mismatch(replies, match):
     recovery = _recovery(_FakeClient(replies))
@@ -763,7 +796,7 @@ def test_recovery_fails_closed_if_gather_numbers_diverged():
 
 def test_an_unrecoverable_loss_fails_before_waiting_on_the_device():
     recovery = _recovery(_FakeClient(_happy_replies()), failed=frozenset({0}))
-    with pytest.raises(RuntimeError, match="rank 0 is not recoverable"):
+    with pytest.raises(RuntimeError, match=r"ranks \[0\] is not recoverable"):
         recovery._recover(_interrupted(frozenset({0})))
     recovery._join_device_work.assert_not_called()
 
@@ -813,7 +846,7 @@ def test_recovery_delivers_buffered_error_responses_before_readmission():
 def _supported_executor():
     load_balancer = Mock()
     load_balancer.is_static_routing.return_value = True
-    load_balancer.covers_loss_of.side_effect = lambda rank: rank in (1, 2)
+    load_balancer.covers_loss_of.side_effect = lambda dead: tuple(dead) in ((1,), (2,), (2, 3))
     kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     return SimpleNamespace(
         model_engine=SimpleNamespace(
@@ -825,7 +858,7 @@ def _supported_executor():
             spec=MPIDist,
             rank=0,
             world_size=4,
-            mapping=SimpleNamespace(enable_lm_head_tp_in_adp=False, moe_tp_size=1),
+            mapping=SimpleNamespace(enable_lm_head_tp_in_adp=False, moe_tp_size=1, gpus_per_node=2),
         ),
         adp_router=DefaultADPRouter.__new__(DefaultADPRouter),
         drafter=None,
@@ -902,7 +935,13 @@ def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
     executor.dist.enable_peer_loss_recovery.assert_not_called()
 
 
-def test_create_registers_the_ranks_whose_loss_the_placement_covers(monkeypatch):
+def test_failure_domains_are_every_rank_then_every_node_but_rank_0_s():
+    assert peer_loss_recovery.failure_domains(8, 4) == [*((r,) for r in range(1, 8)), (4, 5, 6, 7)]
+    assert peer_loss_recovery.failure_domains(6, 4)[-1] == (4, 5)
+    assert peer_loss_recovery.failure_domains(4, 1) == [(1,), (2,), (3,)]
+
+
+def test_create_registers_the_domains_whose_loss_the_placement_covers(monkeypatch):
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
     registered = []
     monkeypatch.setattr(
@@ -912,7 +951,7 @@ def test_create_registers_the_ranks_whose_loss_the_placement_covers(monkeypatch)
     )
     executor = _supported_executor()
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
-    assert registered == [(0, (1, 2))]
+    assert registered == [(0, ((1,), (2,), (2, 3)))]
     executor.dist.enable_peer_loss_recovery.assert_called_once()
 
 

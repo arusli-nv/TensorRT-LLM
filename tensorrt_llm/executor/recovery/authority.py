@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Recovery authority: coordinates the survivors of one worker process loss.
+"""Recovery authority: coordinates the survivors of a lost failure domain (a rank or a node).
 
 Run as ``python -m tensorrt_llm.executor.recovery.authority --world-size N`` with
 ``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`` set to the hex HMAC key shared with the
@@ -62,12 +62,21 @@ class Phase(enum.Enum):
     ABORTED = enum.auto()
 
 
+def _sorted_domains(domains) -> tuple[tuple[int, ...], ...]:
+    """``domains`` (rank sets) as sorted tuples, in order: the wire form of a set of domains."""
+    return tuple(sorted(tuple(sorted(domain)) for domain in domains))
+
+
 class _Violation(Exception):
     """A message that the recovery protocol cannot accept; aborts recovery."""
 
 
 class RecoveryAuthority:
-    """State machine for recovering from the loss of one admitted worker.
+    """State machine for recovering from the loss of one admitted failure domain.
+
+    A failure domain is a set of worker ranks lost together: a single rank or a whole
+    node. A loss recovers only if every survivor reports the same failed set and that
+    set is an admitted domain.
 
     The authority performs no I/O: ``handle`` and ``expire`` return the messages to
     send as ``(routing_id, message)`` pairs. Any protocol violation, or a recovery that
@@ -76,7 +85,7 @@ class RecoveryAuthority:
 
     Args:
         world_size: Number of worker ranks that must register. Every worker must
-            report the same recoverable ranks; the loss of rank 0 is never recovered.
+            report the same recoverable domains; a domain with rank 0 is never admitted.
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
     """
@@ -88,11 +97,11 @@ class RecoveryAuthority:
     ) -> None:
         self.world_size = world_size
         self.recovery_timeout = recovery_timeout
-        self.admitted_ranks: frozenset[int] = frozenset()
+        self.admitted_domains: frozenset[frozenset[int]] = frozenset()
         self.generation = 0
         self.phase = Phase.REGISTERING
         self.deadline: float | None = None
-        self.failed_rank: int | None = None
+        self.failed_ranks: frozenset[int] = frozenset()
         self.abort_reason: str | None = None
         self._workers: dict[bytes, Register] = {}
         self._routes: dict[int, bytes] = {}
@@ -102,8 +111,8 @@ class RecoveryAuthority:
 
     @property
     def survivors(self) -> tuple[int, ...]:
-        """Every rank except the departed one, in rank order."""
-        return tuple(rank for rank in range(self.world_size) if rank != self.failed_rank)
+        """Every rank except the departed ones, in rank order."""
+        return tuple(rank for rank in range(self.world_size) if rank not in self.failed_ranks)
 
     def handle(self, route: bytes, message: Message, now: float) -> Outbound:
         """Apply ``message`` received from ``route`` at monotonic time ``now``."""
@@ -143,7 +152,7 @@ class RecoveryAuthority:
             raise _Violation(f"{message} before registration completed")
         if not isinstance(message, (Stopped, Ready, Installed)) or message.rank != worker.rank:
             raise _Violation(f"unexpected {message} from rank {worker.rank}")
-        if message.rank == self.failed_rank:
+        if message.rank in self.failed_ranks:
             raise _Violation(f"departed rank sent {message}")
         if isinstance(message, Stopped):
             return self._on_stopped(message, now)
@@ -168,43 +177,48 @@ class RecoveryAuthority:
             return []
         self._admit()
         self.phase = Phase.SERVING
-        registered = Registered(tuple(sorted(self.admitted_ranks)))
+        registered = Registered(_sorted_domains(self.admitted_domains))
         return [(peer, registered) for peer in self._workers]
 
     def _admit(self) -> None:
-        reported = {frozenset(r.recoverable_ranks) for r in self._workers.values()}
+        workers = self._workers.values()
+        reported = {frozenset(map(frozenset, worker.recoverable_domains)) for worker in workers}
         if len(reported) > 1:
-            raise _Violation(f"workers report different recoverable ranks: {reported}")
-        self.admitted_ranks = reported.pop() & frozenset(range(1, self.world_size))
-        if self.admitted_ranks:
+            raise _Violation(f"workers report different recoverable domains: {reported}")
+        recoverable = frozenset(range(1, self.world_size))
+        self.admitted_domains = frozenset(
+            domain for domain in reported.pop() if domain and domain <= recoverable
+        )
+        if self.admitted_domains:
             logger.info(
                 f"Recovery authority: {self.world_size} workers registered; "
-                f"recoverable ranks {sorted(self.admitted_ranks)}"
+                f"recoverable domains {list(_sorted_domains(self.admitted_domains))}"
             )
         else:
             logger.warning(
                 f"Recovery authority: {self.world_size} workers registered, but the expert "
-                "placement covers the loss of no rank"
+                "placement covers the loss of no rank or node"
             )
 
     def _on_stopped(self, message: Stopped, now: float) -> Outbound:
-        if message.failed_rank == message.rank:
+        failed = frozenset(message.failed_ranks)
+        if message.rank in failed:
             raise _Violation(f"rank {message.rank} reported its own loss")
         if self.phase is Phase.SERVING:
-            if message.failed_rank not in self.admitted_ranks:
-                raise _Violation(f"loss of rank {message.failed_rank} is not admitted")
-            self.failed_rank = message.failed_rank
+            if failed not in self.admitted_domains:
+                raise _Violation(f"loss of ranks {sorted(failed)} is not an admitted domain")
+            self.failed_ranks = failed
             self.deadline = now + self.recovery_timeout
             self._enter(Phase.STOPPING)
         elif self.phase is not Phase.STOPPING:
             raise _Violation(f"{message} in phase {self.phase.name}")
-        if message.failed_rank != self.failed_rank:
-            raise _Violation(f"{message} conflicts with departed rank {self.failed_rank}")
+        if failed != self.failed_ranks:
+            raise _Violation(f"{message} conflicts with departed ranks {sorted(self.failed_ranks)}")
         self._record(self._stopped, message)
         if len(self._stopped) < len(self.survivors):
             return []
         self._enter(Phase.PREPARING)
-        proposal = Propose(self.generation + 1, self.failed_rank, self.survivors)
+        proposal = Propose(self.generation + 1, tuple(sorted(failed)), self.survivors)
         return self._to_survivors(proposal)
 
     def _on_ready(self, message: Ready) -> Outbound:
@@ -230,7 +244,7 @@ class RecoveryAuthority:
         self._enter(Phase.RECOVERED)
         logger.info(
             f"Recovery authority: committed generation {self.generation} "
-            f"without rank {self.failed_rank}"
+            f"without ranks {sorted(self.failed_ranks)}"
         )
         return self._to_survivors(Commit(self.generation))
 

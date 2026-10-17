@@ -47,15 +47,23 @@ every other request continues.
 | `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S` | How long a recovery may take before the job stops (default 30) |
 | `TLLM_FAULT_TOLERANCE_EXTRA_SLOTS` | EPLB slots beyond one per expert: `replicas` (default) serve replicas; `empty` are not routed to while healthy and take a lost rank's experts |
 
-At startup each rank logs which ranks' loss the job can recover from. A configuration that recovery does
+At startup rank 0 logs which ranks' and nodes' loss the job can recover from. A configuration that recovery does
 not support is refused at startup with the requirement it misses.
 
 ## What is covered
 
-One loss per job of a recoverable rank's process (killed, for example by the out-of-memory killer, or failed
-with an error that corrupts its CUDA context, such as an illegal memory access, after which it ends itself), with the NVLink fabric healthy. Not covered:
-rank 0, two or more ranks or a whole node, a rank that hangs without dying, the authority itself, and other
-errors in the serving loop, which end the job as without fault tolerance. A job that lost a rank ends with a
+One loss per job, with the NVLink fabric healthy, of either:
+
+- a recoverable rank's process (killed, for example by the out-of-memory killer, or failed with an error
+  that corrupts its CUDA context, such as an illegal memory access, after which it ends itself), or
+- every rank of one node other than node 0 (ranks `n * gpus_per_node` to `(n + 1) * gpus_per_node - 1`).
+  The survivors must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and `K` GPUs
+  per node, `s * (N - K)` must be at least the number of experts. For DeepSeek-R1 (256 experts) at DEP32
+  with 4 GPUs per node, that is 320 slots.
+
+Not covered: rank 0, any other set of ranks (for example two ranks, or part of a node), a second loss,
+including one during a recovery, a rank that hangs without dying, the authority itself, and other errors
+in the serving loop, which end the job as without fault tolerance. A job that lost a rank ends with a
 non-zero exit status at shutdown.
 
 ## Not supported together with fault tolerance
@@ -75,12 +83,12 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
 - Survivors detect the loss within milliseconds and resume serving well under a second later. A step
   that was running finishes first, so under heavy prefill a recovery takes up to the length of one step
   (`max_num_tokens` bounds it).
-- Requests that the lost rank was serving end with a retryable error. Non-streaming requests get an error
+- Requests that the lost ranks were serving end with a retryable error. Non-streaming requests get an error
   response. Streaming `/v1/completions` and `/v1/chat/completions` responses end with an SSE `error` event
   followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that
   never used the lost rank's experts.
-- No CUDA graphs are recaptured, so serving resumes at once, on one GPU fewer.
+- No CUDA graphs are recaptured, so serving resumes at once without the lost GPUs.
 - Expected in the logs: on rank 0, an `mpi4py.futures` manager thread exits with `MPI_ERR_PROC_FAILED`,
   followed by "a rank departed; only shutdown is accepted from now on". This is the MPI session noticing the
   loss; serving is not affected.
