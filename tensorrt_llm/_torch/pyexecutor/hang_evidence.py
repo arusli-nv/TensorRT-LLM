@@ -9,23 +9,29 @@ device waits come from the rank's all-to-all progress row: its current round
 (``flag_val``) and the completion flags its peers write into its workspace.
 The row is copied to host memory on a side stream, so it is read whether the
 step was launched eagerly or replayed from a CUDA graph. Evidence never
-changes membership; the authority decides.
+changes membership; the authority decides. The same thread carries out the
+authority's ``Fence``: of its own rank (its main thread is stuck, this thread
+still runs) by killing its process; of a hung node-mate (whose whole process
+may be stopped) by killing that process after a grace period, if it still runs
+as that rank.
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.executor.recovery.authority import HANG_DETECTION_ENV
-from tensorrt_llm.executor.recovery.protocol import DeviceWait, Heartbeat
+from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat
 from tensorrt_llm.logger import logger
 
 __all__ = [
@@ -39,6 +45,17 @@ __all__ = [
 _SUSPECT_ENV = "TLLM_FAULT_TOLERANCE_HANG_SUSPECT_S"
 _HEARTBEAT_ENV = "TLLM_FAULT_TOLERANCE_HEARTBEAT_S"
 _FLAG_MASK = 0xFFFFFFFF
+# A node-mate fences a hung rank only if that rank's own evidence thread has not done so by then.
+_NODE_MATE_FENCE_GRACE_S = 1.0
+
+
+def _runs_as_rank(pid: int, rank: int) -> bool:
+    """Whether process ``pid`` on this host is the MPI worker of ``rank`` (not a reused pid)."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return f"OMPI_COMM_WORLD_RANK={rank}".encode() in environ
 
 
 @dataclass(frozen=True)
@@ -132,6 +149,8 @@ class HangEvidenceReporter:
         waiting: Returns whether the executor waits on something outside its rank.
         suspect_s: How long a device wait on a peer lasts before it is reported.
         heartbeat_s: Interval between heartbeats; also the polling interval.
+        receive: Returns the authority's next message for this connection, or None; called from the
+            reporter thread only.
     """
 
     def __init__(
@@ -144,9 +163,13 @@ class HangEvidenceReporter:
         waiting: Callable[[], bool],
         suspect_s: float = 2.0,
         heartbeat_s: float = 1.0,
+        receive: Callable[[], object | None] = lambda: None,
     ) -> None:
         self._rank = rank
         self._send = send
+        self._receive = receive
+        # Node-mate fences due: (monotonic deadline, Fence).
+        self._fences: list[tuple[float, Fence]] = []
         self._read_row = read_row
         self._active_ranks = active_ranks
         self._iteration = iteration
@@ -181,6 +204,25 @@ class HangEvidenceReporter:
         if self._thread is not None:
             self._thread.join()
 
+    def _fence(self, now: float) -> None:
+        while (message := self._receive()) is not None:
+            if not isinstance(message, Fence):
+                continue
+            if message.rank == self._rank:
+                logger.error(
+                    f"Rank {self._rank}: fenced as hung by the recovery authority; ending the process"
+                )
+                os.kill(os.getpid(), signal.SIGKILL)
+            self._fences.append((now + _NODE_MATE_FENCE_GRACE_S, message))
+        due = [fence for deadline, fence in self._fences if deadline <= now]
+        self._fences = [(deadline, fence) for deadline, fence in self._fences if deadline > now]
+        for fence in due:
+            if _runs_as_rank(fence.pid, fence.rank):
+                logger.error(
+                    f"Rank {self._rank}: fencing hung node-mate rank {fence.rank} (pid {fence.pid})"
+                )
+                os.kill(fence.pid, signal.SIGKILL)
+
     def _run(self) -> None:
         while not self._stop.wait(self._heartbeat_s):
             try:
@@ -189,7 +231,8 @@ class HangEvidenceReporter:
                 logger.warning(f"Rank {self._rank}: hang evidence reporting failed: {error}")
 
     def poll(self, now: float) -> None:
-        """Send a heartbeat and any change in the device waits worth reporting."""
+        """Carry out fences, then send a heartbeat and any change in the device waits worth reporting."""
+        self._fence(now)
         self._send(
             Heartbeat(
                 rank=self._rank,

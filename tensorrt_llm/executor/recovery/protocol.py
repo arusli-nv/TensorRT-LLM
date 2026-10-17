@@ -21,6 +21,7 @@ __all__ = [
     "Abort",
     "Commit",
     "DeviceWait",
+    "Fence",
     "Heartbeat",
     "Install",
     "Installed",
@@ -140,6 +141,18 @@ class DeviceWait:
     waited_ms: int
 
 
+@dataclass(frozen=True)
+class Fence:
+    """Authority -> a worker's evidence connection: end the worker process ``pid`` of the hung ``rank``.
+
+    Sent to the hung rank itself (its evidence thread kills its own process) and to a
+    node-mate (which kills ``pid`` if that process still runs as ``rank``).
+    """
+
+    rank: int
+    pid: int
+
+
 Message = (
     Register
     | Registered
@@ -152,6 +165,7 @@ Message = (
     | Abort
     | Heartbeat
     | DeviceWait
+    | Fence
 )
 
 _MESSAGE_TYPES: dict[str, type] = {cls.__name__: cls for cls in typing.get_args(Message)}

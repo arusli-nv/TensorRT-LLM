@@ -149,6 +149,14 @@ class RecoveryClient:
         except ProtocolError as error:
             raise RecoveryError(f"Received a malformed message: {error}") from error
 
+    def receive(self) -> Message | None:
+        """Return an authority message already received, or None (waits at most 1 ms).
+
+        Raises:
+            RecoveryError: A frame failed authentication or did not decode.
+        """
+        return self._recv(0)
+
     def wait(self, message_type: type[_M], deadline: float) -> _M:
         """Block until a ``message_type`` message arrives.
 

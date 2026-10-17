@@ -8,7 +8,7 @@ from tensorrt_llm.executor.recovery import authority as authority_module
 from tensorrt_llm.executor.recovery import protocol
 from tensorrt_llm.executor.recovery.authority import Phase, RecoveryAuthority
 from tensorrt_llm.executor.recovery.hang_monitor import HangMonitor, HungRank
-from tensorrt_llm.executor.recovery.protocol import DeviceWait, Heartbeat, Register, Stopped
+from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat, Register, Stopped
 
 pytestmark = pytest.mark.cpu_only
 
@@ -163,22 +163,50 @@ def _serving_authority(fenced):
     return authority
 
 
-def test_authority_fences_a_hung_recoverable_rank_once():
-    fenced = []
-    authority = _serving_authority(fenced)
-    for now in range(1, 40):
+def _hang_rank_2(authority, until, stop_at=None):
+    """Ranks 0, 1, 3 beat and progress; rank 2 beats once, then stops. Returns the outbound Fences by time."""
+    fences = {}
+    for now in range(1, until):
         for rank in (0, 1, 3):
-            # Heartbeats come from each worker's own connection, not its protocol route.
+            # Heartbeats come from each worker's own evidence connection, not its protocol route.
             assert (
                 authority.handle(
-                    b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
+                    f"evidence-{rank}".encode(),
+                    Heartbeat(rank, now, False, "node", 100 + rank),
+                    float(now),
                 )
                 == []
             )
         if now == 1:
-            authority.handle(b"heartbeat", Heartbeat(2, 0, False, "node", 102), 1.0)
-        assert authority.expire(float(now)) == []
+            authority.handle(b"evidence-2", Heartbeat(2, 0, False, "node", 102), 1.0)
+        if now == stop_at:
+            authority.handle(b"rank-0", Stopped(0, 2), float(now))
+        outbound = authority.expire(float(now))
+        if outbound:
+            fences[now] = outbound
+    return fences
+
+
+def test_authority_fences_a_hung_rank_through_itself_and_a_node_mate_then_the_command():
+    fenced = []
+    authority = _serving_authority(fenced)
+    fences = _hang_rank_2(authority, 60)
+    # Once, at confirmation: to the hung rank's evidence thread and to its lowest node-mate.
+    ((confirmed, outbound),) = fences.items()
+    assert outbound == [(b"evidence-2", Fence(2, 102)), (b"evidence-0", Fence(2, 102))]
+    # The workers could not end it (no recovery started): the fence command, once, after the grace.
     assert [(rank, host, pid) for rank, _, host, pid in fenced] == [(2, "node", 102)]
+
+
+def test_the_fence_command_is_skipped_once_the_hung_rank_s_loss_starts_a_recovery():
+    fenced = []
+    authority = _serving_authority(fenced)
+    confirmed = next(iter(_hang_rank_2(_serving_authority([]), 60)))
+    _hang_rank_2(authority, confirmed + 1)
+    authority.handle(b"rank-0", Stopped(0, 2), float(confirmed + 1))
+    for now in range(confirmed + 1, confirmed + 10):
+        authority.expire(float(now))
+    assert fenced == []
 
 
 def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
