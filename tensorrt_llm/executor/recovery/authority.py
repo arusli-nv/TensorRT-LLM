@@ -33,6 +33,7 @@ from .protocol import (
     Abort,
     Commit,
     DeviceWait,
+    Fence,
     Heartbeat,
     Install,
     Installed,
@@ -53,6 +54,9 @@ __all__ = ["Phase", "RecoveryAuthority", "main", "router_socket", "serve"]
 Outbound = list[tuple[bytes, Message]]
 
 _CLOSE_LINGER_MS = 1000
+# How long the workers' own fencing (the hung rank's evidence thread, then a node-mate) gets before the fence
+# command runs.
+_COMMAND_FENCE_GRACE_S = 5.0
 _REJECTION_LOG_INTERVAL_S = 10.0
 # Hang detection runs when the authority and the workers both have it enabled.
 HANG_DETECTION_ENV = "TLLM_FAULT_TOLERANCE_HANG_DETECTION"
@@ -98,9 +102,11 @@ class RecoveryAuthority:
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
         hang_monitor: Judges the workers' heartbeats and device waits; None ignores them.
-        fence: Called once with a recoverable rank the monitor confirms hung (rank,
-            reason, host and pid); it must end that process, whose loss then recovers
-            as any other. None only reports the hang.
+        fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason,
+            host and pid): called if the rank's loss has not started a recovery
+            ``_COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
+            evidence thread and to a node-mate's. It must end that process, whose loss then
+            recovers as any other. None relies on the workers alone.
     """
 
     def __init__(
@@ -125,6 +131,10 @@ class RecoveryAuthority:
         self._stopped: set[int] = set()
         self._ready: dict[int, str] = {}
         self._installed: set[int] = set()
+        # Rank -> (route of its evidence connection, host), from its heartbeats.
+        self._evidence: dict[int, tuple[bytes, str]] = {}
+        # The fence command's deadline and target, while the workers' fencing is under way.
+        self._command_fence: tuple[float, HungRank] | None = None
 
     @property
     def survivors(self) -> tuple[int, ...]:
@@ -135,6 +145,8 @@ class RecoveryAuthority:
         """Apply ``message`` received from ``route`` at monotonic time ``now``."""
         if isinstance(message, (Heartbeat, DeviceWait)):
             # Evidence, not protocol: a worker sends it from its own connection, at any time.
+            if isinstance(message, Heartbeat):
+                self._evidence[message.rank] = (route, message.host)
             self._observe(message, now)
             return []
         if self.phase is Phase.ABORTED:
@@ -148,10 +160,19 @@ class RecoveryAuthority:
         """Abort if the recovery deadline passed at monotonic time ``now``; act on a hung rank."""
         if self.deadline is not None and now >= self.deadline:
             return self.abort(f"recovery did not commit within {self.recovery_timeout}s")
+        if self._command_fence is not None and now >= self._command_fence[0]:
+            hung = self._command_fence[1]
+            self._command_fence = None
+            # A recovery under way means the workers' fencing worked.
+            if self.phase is Phase.SERVING:
+                logger.error(
+                    f"Recovery authority: rank {hung.rank} survived its fence; running the fence command"
+                )
+                self._fence(hung)
         if self.hang_monitor is not None and self.phase in (Phase.SERVING, Phase.RECOVERED):
             hung = self.hang_monitor.check(now)
             if hung is not None:
-                self._on_hung(hung)
+                return self._on_hung(hung, now)
         return []
 
     def _observe(self, message: Heartbeat | DeviceWait, now: float) -> None:
@@ -167,17 +188,32 @@ class RecoveryAuthority:
                 message.rank, message.peer, message.waited_ms / 1000.0, now
             )
 
-    def _on_hung(self, hung: HungRank) -> None:
+    def _on_hung(self, hung: HungRank, now: float) -> Outbound:
+        """Fence a recoverable hung rank.
+
+        Its own evidence thread ends its process; a node-mate ends it if that thread
+        cannot (the process is stopped); the fence command if neither starts a recovery.
+        """
         where = f"rank {hung.rank} (pid {hung.pid} on {hung.host or 'unknown host'})"
         # After a recovery, a further loss is not recoverable: report only.
         recoverable = (
             self.phase is Phase.SERVING and frozenset({hung.rank}) in self.admitted_domains
         )
-        if not recoverable or self._fence is None or not hung.pid:
+        if not recoverable or not hung.pid:
             logger.error(f"Recovery authority: {where} is hung ({hung.reason}); not fencing it")
-            return
+            return []
         logger.error(f"Recovery authority: {where} is hung ({hung.reason}); fencing it")
-        self._fence(hung)
+        fence = Fence(rank=hung.rank, pid=hung.pid)
+        targets = [hung.rank]
+        node_mates = sorted(
+            rank
+            for rank, (_, host) in self._evidence.items()
+            if rank != hung.rank and host and host == hung.host
+        )
+        targets += node_mates[:1]
+        if self._fence is not None:
+            self._command_fence = (now + _COMMAND_FENCE_GRACE_S, hung)
+        return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
 
     def abort(self, reason: str, route: bytes | None = None) -> Outbound:
         """Enter the terminal phase and tell every worker (and ``route``) why."""
@@ -435,9 +471,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--fence-command",
         default="",
-        help="command that kills a hung worker, with {host} and {pid} placeholders, run "
-        "without a shell, e.g. 'ssh {host} kill -KILL {pid}' or the deployment's node agent; "
-        "empty only reports hung ranks",
+        help="last-resort command that kills a hung worker the workers could not fence (its own "
+        "evidence thread, then a node-mate), with {host} and {pid} placeholders, run without a "
+        "shell, e.g. 'ssh {host} kill -KILL {pid}' or the deployment's node agent",
     )
     args = parser.parse_args(argv)
     if "TLLM_LOG_LEVEL" not in os.environ:

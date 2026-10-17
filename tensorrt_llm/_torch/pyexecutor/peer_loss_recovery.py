@@ -360,8 +360,9 @@ class PeerLossRecovery(RecoveryHook):
             return
         self._watch_peer_failures()
         self.survives_own_loss = self._admitted
-        reporter = self._start_hang_evidence()
+        reporter = None
         try:
+            reporter = self._start_hang_evidence()
             while True:
                 try:
                     event_loop()
@@ -403,6 +404,7 @@ class PeerLossRecovery(RecoveryHook):
             waiting=lambda: executor.dist.in_host_collective or queue.waiting_for_requests,
             suspect_s=suspect_s,
             heartbeat_s=heartbeat_s,
+            receive=client.receive,
         )
         reporter.start()
         return reporter

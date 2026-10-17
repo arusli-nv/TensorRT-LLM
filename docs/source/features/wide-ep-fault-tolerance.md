@@ -46,6 +46,13 @@ every other request continues.
 | `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key (64 hex characters) for authority messages |
 | `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S` | How long a recovery may take before the job stops (default 30) |
 | `TLLM_FAULT_TOLERANCE_EXTRA_SLOTS` | EPLB slots beyond one per expert: `replicas` (default) serve replicas; `empty` are not routed to while healthy and take a lost rank's experts |
+| `TLLM_FAULT_TOLERANCE_HANG_DETECTION=1` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (set on workers and authority) |
+| `TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S` | How long the evidence of a hang must hold before it is confirmed (default 30; above the slowest legitimate step) |
+| `TLLM_FAULT_TOLERANCE_HANG_SUSPECT_S`, `TLLM_FAULT_TOLERANCE_HEARTBEAT_S` | Device wait reported after (default 2 s); heartbeat interval (default 1 s) |
+
+A confirmed hung rank is fenced by its own evidence thread (its process ends itself), else by a rank on the
+same node (which ends it after 1 s if it still runs), else by the authority's `--fence-command` (a
+`{host}`/`{pid}` template, run without a shell, 5 s later); its loss then recovers as any other.
 
 At startup rank 0 logs which ranks' and nodes' loss the job can recover from. A configuration that recovery does
 not support is refused at startup with the requirement it misses.

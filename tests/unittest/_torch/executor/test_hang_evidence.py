@@ -2,16 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Worker-side hang evidence: lagging peers from the all-to-all progress row, and the reporter."""
 
+import os
+import signal
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor import hang_evidence
 from tensorrt_llm._torch.pyexecutor.hang_evidence import (
     HangEvidenceReporter,
     ProgressRow,
     ProgressRowReader,
     lagging_peers,
 )
-from tensorrt_llm.executor.recovery.protocol import DeviceWait, Heartbeat
+from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat
 
 RANKS = (0, 1, 2, 3)
 
@@ -84,6 +88,46 @@ def test_a_reported_wait_is_cleared_once_rows_stop_landing():
         r.reporter.poll(now)
     # Reported at 2 s; at 4 s this rank's own copy has not landed for two polls: no current evidence.
     assert r.waits() == [DeviceWait(0, 2, 2000), DeviceWait(0, 2, 0)]
+
+
+def _fence_reporter(monkeypatch, messages, rank_of_pid):
+    killed = []
+    monkeypatch.setattr(hang_evidence.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(
+        hang_evidence, "_runs_as_rank", lambda pid, rank: rank_of_pid.get(pid) == rank
+    )
+    inbox = list(messages)
+    reporter = HangEvidenceReporter(
+        rank=0,
+        send=lambda message: None,
+        read_row=lambda: None,
+        active_ranks=lambda: RANKS,
+        iteration=lambda: 42,
+        waiting=lambda: False,
+        receive=lambda: inbox.pop(0) if inbox else None,
+    )
+    return reporter, killed
+
+
+def test_a_fenced_rank_ends_its_own_process(monkeypatch):
+    reporter, killed = _fence_reporter(monkeypatch, [Fence(0, os.getpid())], {})
+    reporter.poll(0.0)
+    assert killed == [(os.getpid(), signal.SIGKILL)]
+
+
+def test_a_node_mate_fences_a_hung_rank_after_the_grace_only_if_it_still_runs_as_that_rank(
+    monkeypatch,
+):
+    reporter, killed = _fence_reporter(monkeypatch, [Fence(2, 4242)], {4242: 2})
+    reporter.poll(0.0)
+    assert killed == []  # the hung rank's own thread gets the first chance
+    reporter.poll(2.0)
+    assert killed == [(4242, signal.SIGKILL)]
+    # A pid that no longer runs as the rank (it exited, or the pid was reused) is left alone.
+    reporter, killed = _fence_reporter(monkeypatch, [Fence(2, 4242)], {4242: 5})
+    reporter.poll(0.0)
+    reporter.poll(2.0)
+    assert killed == []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
