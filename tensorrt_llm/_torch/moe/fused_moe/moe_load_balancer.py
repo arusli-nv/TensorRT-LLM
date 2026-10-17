@@ -767,6 +767,42 @@ class SingleLayerMoeLoadBalancer:
 _current_moe_load_balancer = threading.local()
 
 
+def restore_lost_experts(placement: np.ndarray, lost: List[int]) -> List[int]:
+    """Place each ``lost`` expert into a live slot of ``placement`` (``[ep_size, slots_per_rank]``, -1 = dead), in place.
+
+    The slot evicted for each lost expert holds a replica of the expert with
+    the most live replicas (so no expert loses its last copy), on the rank
+    that has taken the fewest restored experts so far, then the lowest rank
+    and slot: a minimal change that spreads the loading across ranks and is
+    the same on every rank.
+
+    Returns:
+        The lost experts that found no slot.
+    """
+    live = placement >= 0
+    counts = np.bincount(placement[live],
+                         minlength=max(lost) + 1 if lost else 0)
+    restored_per_rank = np.zeros(placement.shape[0], dtype=np.int64)
+    unplaced = []
+    for expert in lost:
+        ranks, slots = np.nonzero(live)
+        replicas = counts[placement[ranks, slots]]
+        evictable = replicas >= 2
+        if not evictable.any():
+            unplaced.append(expert)
+            continue
+        ranks, slots, replicas = ranks[evictable], slots[evictable], replicas[
+            evictable]
+        best = np.lexsort(
+            (slots, ranks, restored_per_rank[ranks], -replicas))[0]
+        rank, slot = ranks[best], slots[best]
+        counts[placement[rank, slot]] -= 1
+        placement[rank, slot] = expert
+        counts[expert] = 1
+        restored_per_rank[rank] += 1
+    return unplaced
+
+
 class MoeLoadBalancer:
     """
     A class representing a Mixture of Experts (MoE) load balancer.
@@ -931,33 +967,78 @@ class MoeLoadBalancer:
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
 
     def covers_loss_of(self, rank: int) -> bool:
-        """Whether every expert keeps a replica outside ``rank``."""
-        return not self._experts_without_replica([rank])
+        """Whether serving can continue without ``rank`` (see ``recovery_placements``)."""
+        try:
+            self.recovery_placements([rank])
+        except ValueError:
+            return False
+        return True
 
-    def masked_placement_digest(self, dead_ranks: Iterable[int]) -> str:
-        """Return a digest of the current placement with ``dead_ranks`` masked.
+    def recovery_placements(self,
+                            dead_ranks: Iterable[int]) -> List[np.ndarray]:
+        """Per layer, the ``[ep_size, slots_per_rank]`` placement to serve with after losing ``dead_ranks``.
 
-        The digest covers every layer's slot table with the slots of
-        ``dead_ranks`` cleared, so ranks that agree on it route identically.
+        The current placement with the slots of ``dead_ranks`` cleared. In a
+        layer with host weights (online EPLB), each expert left without a
+        replica takes over a slot of a replicated expert
+        (``restore_lost_experts``). Every rank computes the same placements
+        from the same state.
 
         Raises:
             ValueError: A rank is out of range, or an expert would be left
-                without a replica outside ``dead_ranks``.
+                without a replica.
         """
         dead = sorted(set(dead_ranks))
         if any(rank < 0 or rank >= self.ep_size for rank in dead):
             raise ValueError(
                 f"Dead ranks {dead} out of range for EP size {self.ep_size}")
-        missing = self._experts_without_replica(dead)
+        placements, missing = [], {}
+        for layer in self.single_layer_load_balancers:
+            placement = self._masked_placement(layer, dead)
+            lost = sorted(
+                set(range(layer.expert_count)) -
+                set(placement[placement >= 0].tolist()))
+            if lost and layer.updates_enabled:
+                lost = restore_lost_experts(placement, lost)
+            if lost:
+                missing[layer.get_layer_idx()] = lost
+            placements.append(placement)
         if missing:
             raise ValueError(
                 f"No surviving replica for experts (by MoE layer): {missing}")
-        digest = hashlib.sha256(np.asarray(dead, dtype=np.int64).tobytes())
-        for layer in self.single_layer_load_balancers:
-            placement = self._masked_placement(layer, dead)
+        return placements
+
+    @staticmethod
+    def placement_digest(dead_ranks: Iterable[int],
+                         placements: List[np.ndarray]) -> str:
+        """A digest of ``placements`` and ``dead_ranks``: ranks that agree on it route identically."""
+        digest = hashlib.sha256(
+            np.asarray(sorted(set(dead_ranks)), dtype=np.int64).tobytes())
+        for placement in placements:
             digest.update(np.asarray(placement.shape, dtype=np.int64).tobytes())
             digest.update(placement.tobytes())
         return digest.hexdigest()
+
+    def install_recovery_placement(self, dead_ranks: Iterable[int],
+                                   placements: List[np.ndarray]) -> None:
+        """Serve with ``placements`` (from ``recovery_placements``) without ``dead_ranks``.
+
+        Slots that change are loaded from the host weights before routing
+        switches to them. Only while no iteration runs.
+        """
+        if self.in_iter:
+            raise RuntimeError(
+                "Cannot install a recovery placement while an iteration is active"
+            )
+        dead = sorted(set(dead_ranks))
+        if all(
+                np.array_equal(placement, self._masked_placement(layer, dead))
+                for layer, placement in zip(self.single_layer_load_balancers,
+                                            placements)):
+            self.load_balancer_impl.reconfigure_mask_only(dead)
+        else:
+            self.load_balancer_impl.restore_placement(
+                dead, [placement.tolist() for placement in placements])
 
     @staticmethod
     def _masked_placement(layer: "SingleLayerMoeLoadBalancer",
@@ -966,19 +1047,6 @@ class MoeLoadBalancer:
         placement = np.asarray(layer.get_old_rank_expert_ids(), dtype=np.int32)
         placement[dead_ranks] = -1
         return placement
-
-    def _experts_without_replica(self,
-                                 dead_ranks: List[int]) -> Dict[int, List[int]]:
-        """Experts of each layer whose every replica is on ``dead_ranks``."""
-        missing = {}
-        for layer in self.single_layer_load_balancers:
-            placement = self._masked_placement(layer, dead_ranks)
-            lost = sorted(
-                set(range(layer.expert_count)) -
-                set(placement[placement >= 0].tolist()))
-            if lost:
-                missing[layer.get_layer_idx()] = lost
-        return missing
 
     def start_iter(self):
         """

@@ -577,16 +577,27 @@ void SingleLayerMoeLoadBalancer::waitLastUpdateDone()
 std::vector<int> SingleLayerMoeLoadBalancer::computeMaskOnlyReplicaCounts(
     std::vector<uint8_t> const& deadRankMask) const
 {
+    return computeReplicaCounts(deadRankMask, mCpuPlacementInfo.oldRankExpertIds);
+}
+
+std::vector<int> SingleLayerMoeLoadBalancer::computeReplicaCounts(
+    std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const
+{
     TLLM_CHECK_WITH_INFO(static_cast<int>(deadRankMask.size()) == mMetaInfo.epSize,
         "deadRankMask size (%ld) must match epSize (%d)", static_cast<long>(deadRankMask.size()), mMetaInfo.epSize);
+    TLLM_CHECK_WITH_INFO(static_cast<int>(rankExpertIds.size()) == mMetaInfo.epSize,
+        "placement has %ld ranks, expected %d", static_cast<long>(rankExpertIds.size()), mMetaInfo.epSize);
 
     std::vector<int> expertReplicaCount(mMetaInfo.expertCount, 0);
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
         bool const rankDead = deadRankMask[rank] != 0;
+        TLLM_CHECK_WITH_INFO(static_cast<int>(rankExpertIds[rank].size()) == mMetaInfo.slotCountPerRank,
+            "placement of rank %d has %ld slots, expected %d", rank, static_cast<long>(rankExpertIds[rank].size()),
+            mMetaInfo.slotCountPerRank);
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
-            int expertId = mCpuPlacementInfo.oldRankExpertIds[rank][localSlotId];
+            int expertId = rankExpertIds[rank][localSlotId];
             TLLM_CHECK_WITH_INFO(expertId == -1 || (expertId >= 0 && expertId < mMetaInfo.expertCount),
                 "expertId=%d should be -1 or in range [0, %d)", expertId, mMetaInfo.expertCount);
             if (!rankDead && expertId >= 0)
@@ -599,7 +610,7 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeMaskOnlyReplicaCounts(
     for (int expertId = 0; expertId < mMetaInfo.expertCount; ++expertId)
     {
         TLLM_CHECK_WITH_INFO(expertReplicaCount[expertId] > 0,
-            "Mask-only EPLB reconfigure would leave expert %d with no surviving replica", expertId);
+            "EPLB placement would leave expert %d with no surviving replica", expertId);
     }
     return expertReplicaCount;
 }
@@ -627,6 +638,48 @@ void SingleLayerMoeLoadBalancer::reconfigureMaskOnly(std::vector<uint8_t> const&
     copyPlacementInfoToGpu();
     TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
     TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
+}
+
+void SingleLayerMoeLoadBalancer::validatePlacement(
+    std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const
+{
+    (void) computeReplicaCounts(deadRankMask, rankExpertIds);
+    TLLM_CHECK_WITH_INFO(mWeightUpdater->hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
+    for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
+    {
+        TLLM_CHECK_WITH_INFO(rankExpertIds[mMetaInfo.epRank][localSlotId] >= 0,
+            "Local slot %d must hold an expert in the new placement", localSlotId);
+    }
+}
+
+void SingleLayerMoeLoadBalancer::installPlacement(
+    std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds)
+{
+    mCpuPlacementInfo.expertReplicaCount = computeReplicaCounts(deadRankMask, rankExpertIds);
+    for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
+    {
+        bool const rankDead = deadRankMask[rank] != 0;
+        for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
+        {
+            mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = rankDead ? -1 : rankExpertIds[rank][localSlotId];
+        }
+    }
+    prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
+    // The local slots whose expert changed are loaded from the host copies before routing switches to them.
+    if (mMoeLoadBalancer->mUseGpuMemcpy)
+    {
+        mWeightUpdater->updateWeights(&mCpuPlacementInfo);
+        copyPlacementInfoToGpu();
+        TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
+        TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
+    }
+    else
+    {
+        auto const taskId = mMoeLoadBalancer->addCopyTask(
+            [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
+        mMoeLoadBalancer->waitCopyTaskDone(taskId);
+        copyPlacementInfoToGpuByCpu();
+    }
 }
 
 cudaStream_t SingleLayerMoeLoadBalancer::getStream() const
@@ -1101,6 +1154,20 @@ void MoeLoadBalancer::shutdown()
     }
 }
 
+std::vector<uint8_t> MoeLoadBalancer::deadRankMaskWith(std::vector<int> const& deadRanks)
+{
+    std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
+    auto mask = mDeadRankMask;
+    for (int deadRank : deadRanks)
+    {
+        TLLM_CHECK_WITH_INFO(
+            deadRank >= 0 && deadRank < mEpSize, "deadRank=%d should be in range [0, %d)", deadRank, mEpSize);
+        mask[deadRank] = 1;
+    }
+    TLLM_CHECK_WITH_INFO(mask[mEpRank] == 0, "Local epRank (%d) cannot be masked by a survivor", mEpRank);
+    return mask;
+}
+
 void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
@@ -1108,20 +1175,7 @@ void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot reconfigure mask-only placement while an iteration is active.");
     TLLM_CHECK_WITH_INFO(mIterInfoQueue.empty(), "Cannot reconfigure mask-only placement while iterations are queued.");
 
-    std::vector<uint8_t> candidateDeadRankMask;
-    {
-        std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
-        candidateDeadRankMask = mDeadRankMask;
-        for (int deadRank : deadRanks)
-        {
-            TLLM_CHECK_WITH_INFO(
-                deadRank >= 0 && deadRank < mEpSize, "deadRank=%d should be in range [0, %d)", deadRank, mEpSize);
-            candidateDeadRankMask[deadRank] = 1;
-        }
-        TLLM_CHECK_WITH_INFO(
-            candidateDeadRankMask[mEpRank] == 0, "Local epRank (%d) cannot be masked by a survivor", mEpRank);
-    }
-
+    auto const candidateDeadRankMask = deadRankMaskWith(deadRanks);
     for (auto& layer : mLayers)
     {
         layer->waitLastUpdateDone();
@@ -1133,6 +1187,35 @@ void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
     for (auto& layer : mLayers)
     {
         layer->reconfigureMaskOnly(candidateDeadRankMask);
+    }
+    {
+        std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
+        mDeadRankMask = candidateDeadRankMask;
+    }
+}
+
+void MoeLoadBalancer::restorePlacement(
+    std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds)
+{
+    std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
+    TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot restore placement.");
+    TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot restore placement while an iteration is active.");
+    TLLM_CHECK_WITH_INFO(mIterInfoQueue.empty(), "Cannot restore placement while iterations are queued.");
+    TLLM_CHECK_WITH_INFO(layerRankExpertIds.size() == mLayers.size(), "Got placements for %ld layers, expected %ld",
+        static_cast<long>(layerRankExpertIds.size()), static_cast<long>(mLayers.size()));
+
+    auto const candidateDeadRankMask = deadRankMaskWith(deadRanks);
+    for (auto& layer : mLayers)
+    {
+        layer->waitLastUpdateDone();
+    }
+    for (size_t i = 0; i < mLayers.size(); ++i)
+    {
+        mLayers[i]->validatePlacement(candidateDeadRankMask, layerRankExpertIds[i]);
+    }
+    for (size_t i = 0; i < mLayers.size(); ++i)
+    {
+        mLayers[i]->installPlacement(candidateDeadRankMask, layerRankExpertIds[i]);
     }
     {
         std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);

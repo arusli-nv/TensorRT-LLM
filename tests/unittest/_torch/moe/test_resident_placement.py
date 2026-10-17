@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Resident-replica EPLB placement after a WideEP rank loss."""
+"""EPLB placement after a WideEP rank loss: resident replicas and experts restored from host weights."""
 
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer,
+    restore_lost_experts,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -21,8 +25,8 @@ _REDUNDANT = [[0, 1], [2, 3], [1, 0], [3, 2]]
 _SOLE_REPLICAS = [[0, 1], [2, 3], [0, 1], [0, 1]]
 
 
-def _load_balancer(*placements):
-    """A static-routing MoeLoadBalancer over native layers with the given slot tables."""
+def _load_balancer(*placements, host_weights=False):
+    """A MoeLoadBalancer over native layers with the given slot tables (with host weights: online EPLB)."""
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
     native_layers = [
@@ -34,19 +38,23 @@ def _load_balancer(*placements):
     ]
     load_balancer.load_balancer_impl.add_layer.side_effect = native_layers
     for _ in placements:
-        load_balancer.add_layer(EXPERTS, 2, SLOTS_PER_RANK)
+        load_balancer.add_layer(EXPERTS, 2, SLOTS_PER_RANK).updates_enabled = host_weights
     return load_balancer
 
 
-def test_masked_placement_digest_is_deterministic_and_mask_sensitive():
+def _digest(load_balancer, dead):
+    return load_balancer.placement_digest(dead, load_balancer.recovery_placements(dead))
+
+
+def test_placement_digest_is_deterministic_and_mask_sensitive():
     load_balancer = _load_balancer(_REDUNDANT, _REDUNDANT)
-    digest = load_balancer.masked_placement_digest({FAILED_RANK})
-    assert digest == _load_balancer(_REDUNDANT, _REDUNDANT).masked_placement_digest([FAILED_RANK])
-    assert digest != load_balancer.masked_placement_digest({1})
-    assert digest != load_balancer.masked_placement_digest(set())
+    digest = _digest(load_balancer, {FAILED_RANK})
+    assert digest == _digest(_load_balancer(_REDUNDANT, _REDUNDANT), [FAILED_RANK])
+    assert digest != _digest(load_balancer, {1})
+    assert digest != _digest(load_balancer, set())
 
 
-def test_a_loss_is_covered_only_if_every_expert_keeps_a_replica():
+def test_without_host_weights_a_loss_is_covered_only_if_every_expert_keeps_a_replica():
     load_balancer = _load_balancer(_REDUNDANT, _SOLE_REPLICAS)
     assert [load_balancer.covers_loss_of(rank) for rank in range(WORLD_SIZE)] == [
         True,
@@ -55,6 +63,43 @@ def test_a_loss_is_covered_only_if_every_expert_keeps_a_replica():
         True,
     ]
     with pytest.raises(ValueError, match=r"\{1: \[2, 3\]\}"):
-        load_balancer.masked_placement_digest({1})
+        load_balancer.recovery_placements({1})
     with pytest.raises(ValueError, match="out of range"):
-        load_balancer.masked_placement_digest({WORLD_SIZE})
+        load_balancer.recovery_placements({WORLD_SIZE})
+
+
+def test_restore_evicts_the_most_replicated_expert_spread_over_ranks():
+    placement = np.array([[0, 1], [-1, -1], [0, 1], [0, 1]], dtype=np.int32)
+    assert restore_lost_experts(placement, [2, 3]) == []
+    # Expert 2 takes rank 0's first replica of expert 0 (three copies); expert 3 then takes a copy of expert 1
+    # (still three) on rank 2, the lowest rank that has not taken a restored expert yet.
+    assert placement.tolist() == [[2, 1], [-1, -1], [0, 3], [0, 1]]
+
+
+def test_restore_never_evicts_a_last_replica():
+    placement = np.array([[0], [1], [-1], [3]], dtype=np.int32)
+    assert restore_lost_experts(placement, [2]) == [2]
+    assert placement.tolist() == [[0], [1], [-1], [3]]
+
+
+def test_with_host_weights_lost_experts_are_restored():
+    load_balancer = _load_balancer(_SOLE_REPLICAS, host_weights=True)
+    assert all(load_balancer.covers_loss_of(rank) for rank in range(WORLD_SIZE))
+    (placement,) = load_balancer.recovery_placements({1})
+    assert placement.tolist() == [[2, 1], [-1, -1], [0, 3], [0, 1]]
+
+
+def test_install_masks_only_when_no_expert_moves():
+    load_balancer = _load_balancer(_SOLE_REPLICAS, host_weights=True)
+    impl = load_balancer.load_balancer_impl
+
+    load_balancer.install_recovery_placement([3], load_balancer.recovery_placements([3]))
+    impl.reconfigure_mask_only.assert_called_once_with([3])
+    impl.restore_placement.assert_not_called()
+
+    load_balancer.install_recovery_placement([1], load_balancer.recovery_placements([1]))
+    impl.restore_placement.assert_called_once_with([1], [[[2, 1], [-1, -1], [0, 3], [0, 1]]])
+
+    load_balancer.in_iter = True
+    with pytest.raises(RuntimeError, match="iteration is active"):
+        load_balancer.install_recovery_placement([1], load_balancer.recovery_placements([1]))

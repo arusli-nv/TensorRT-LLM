@@ -120,6 +120,10 @@ void initMoeBindings(nb::module_& m)
         .def("reconfigure_mask_only", &tr::MoeLoadBalancer::reconfigureMaskOnly, nb::arg("dead_ranks"),
             "Reconfigure EPLB routing metadata so slots on dead EP ranks are unreachable",
             nb::call_guard<nb::gil_scoped_release>())
+        .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
+            nb::arg("layer_rank_expert_ids"),
+            "Mark dead EP ranks and install a new placement per layer, loading changed local slots from host weights",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
             nb::call_guard<nb::gil_scoped_release>());
 
