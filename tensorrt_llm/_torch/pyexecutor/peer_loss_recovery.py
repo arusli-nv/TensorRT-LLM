@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Keep a WideEP PyExecutor serving after one peer process dies."""
+"""Keep a WideEP PyExecutor serving after one peer process or a whole node dies."""
 
 import collections
 import dataclasses
@@ -56,6 +56,8 @@ _RECOVERY_TIMEOUT_DEFAULT_S = 30.0
 _REGISTRATION_TIMEOUT_S = 600.0
 
 Responses = List[Tuple[int, LlmResponse]]
+# A set of ranks lost together, as a sorted tuple: one rank or a whole node.
+FailureDomain = Tuple[int, ...]
 # A request and the context position and state it had before a step changed them.
 StepChange = Tuple[LlmRequest, int, LlmRequestState]
 _T = TypeVar("_T")
@@ -66,15 +68,29 @@ def _recovery_timeout_s() -> float:
     return float(os.environ.get(_RECOVERY_TIMEOUT_ENV, _RECOVERY_TIMEOUT_DEFAULT_S))
 
 
+def failure_domains(world_size: int, gpus_per_node: int) -> List[FailureDomain]:
+    """The rank sets whose loss recovery can cover: every rank but 0, then every node but node 0.
+
+    Rank ``r`` runs on node ``r // gpus_per_node``.
+    """
+    nodes = [
+        tuple(range(start, min(start + gpus_per_node, world_size)))
+        for start in range(gpus_per_node, world_size, gpus_per_node)
+    ]
+    return list(dict.fromkeys([(rank,) for rank in range(1, world_size)] + nodes))
+
+
 @functools.cache
-def _register(rank: int, recoverable_ranks: Tuple[int, ...]) -> Tuple["RecoveryClient", frozenset]:
+def _register(
+    rank: int, recoverable_domains: Tuple[FailureDomain, ...]
+) -> Tuple["RecoveryClient", frozenset]:
     """Register this process with the recovery authority, once per process.
 
     A process constructs more than one PyExecutor (KV cache estimation, then
     serving) but registers exactly once.
 
     Returns:
-        The client and the ranks whose loss the deployment recovers from.
+        The client and the failure domains (rank sets) whose loss the deployment recovers from.
     """
     from tensorrt_llm.executor.recovery.client import RecoveryClient
 
@@ -83,7 +99,7 @@ def _register(rank: int, recoverable_ranks: Tuple[int, ...]) -> Tuple["RecoveryC
         f"Rank {rank}: registering with the WideEP recovery authority; "
         f"waiting up to {_REGISTRATION_TIMEOUT_S:.0f} s for every rank"
     )
-    return client, client.register(recoverable_ranks, time.monotonic() + _REGISTRATION_TIMEOUT_S)
+    return client, client.register(recoverable_domains, time.monotonic() + _REGISTRATION_TIMEOUT_S)
 
 
 @dataclasses.dataclass
@@ -145,15 +161,15 @@ class RecoveryHook:
 
 
 class PeerLossRecovery(RecoveryHook):
-    """Recovers a PyExecutor from the loss of one peer process.
+    """Recovers a PyExecutor from the loss of one failure domain: a peer process or a whole node.
 
     Survivors discard the steps the loss interrupted (two under the overlap
     scheduler), agree on the new
     membership through the recovery authority (``Stopped`` -> ``Propose`` ->
     ``Ready`` -> ``Install`` -> ``Installed`` -> ``Commit``) and resume the
-    same requests on their original CUDA graphs: the departed rank is masked
+    same requests on their original CUDA graphs: the departed ranks are masked
     out of host collectives, EPLB routing and the MoE dispatch/combine
-    descriptor. Requests the departed attention-DP rank was serving fail.
+    descriptor. Requests the departed attention-DP ranks were serving fail.
     A failure raises into the executor's terminal path.
 
     The executor calls :meth:`step_prepared` after reserving a step's
@@ -175,9 +191,9 @@ class PeerLossRecovery(RecoveryHook):
     ) -> None:
         self._executor = executor
         self._client = client
-        # Ranks whose loss the survivors recover from.
+        # Failure domains (rank sets) whose loss the survivors recover from.
         self._recoverable = admitted
-        self._admitted = executor.dist.rank in admitted
+        self._admitted = frozenset({executor.dist.rank}) in admitted
         # Whether the survivors can recover if this rank exits: only while the
         # serving loop watches peers, and never during or after a recovery.
         self.survives_own_loss = False
@@ -278,12 +294,17 @@ class PeerLossRecovery(RecoveryHook):
                 f"lacks: {', '.join(unmet)}"
             )
         recoverable = tuple(
-            rank for rank in range(1, dist.world_size) if load_balancer.covers_loss_of(rank)
+            domain
+            for domain in failure_domains(dist.world_size, dist.mapping.gpus_per_node)
+            if load_balancer.covers_loss_of(domain)
         )
         dist.enable_peer_loss_recovery()
         client, admitted = _register(dist.rank, recoverable)
         if dist.rank == 0:
-            logger.info(f"WideEP peer-loss recovery covers the loss of ranks {sorted(admitted)}")
+            logger.info(
+                "WideEP peer-loss recovery covers the loss of one of "
+                f"{sorted(sorted(domain) for domain in admitted)}"
+            )
         return cls(executor, client, admitted)
 
     def validate_request(self, request: LlmRequest) -> None:
@@ -508,7 +529,12 @@ class PeerLossRecovery(RecoveryHook):
     # Recovery
 
     def _recover(self, error: HostCollectiveInterrupted) -> None:
-        """Continue serving without one departed peer, or raise."""
+        """Continue serving without the departed peers, or raise.
+
+        The failed set is the one ULFM's shrink agrees on; it must be an admitted failure
+        domain. A peer that fails after the shrink, before ``Commit``, is not recovered:
+        the survivors' collectives or the authority's deadline end the job.
+        """
         from tensorrt_llm.executor.recovery.protocol import (
             Commit,
             Install,
@@ -533,34 +559,30 @@ class PeerLossRecovery(RecoveryHook):
         # Shrink is a ULFM agreement among survivors, so every survivor reports
         # the same failed set even if it only observed the revocation.
         failed = dist.shrink()
-        if len(failed) != 1:
+        if failed not in self._recoverable:
             raise RuntimeError(
-                f"Peer-loss recovery requires exactly one departed rank, got {sorted(failed)}"
+                f"The loss of ranks {sorted(failed)} is not recoverable: it is not exactly one "
+                "rank or whole node, other than rank 0's, whose experts the survivors can serve"
             )
-        (failed_rank,) = failed
-        if failed_rank not in self._recoverable:
-            raise RuntimeError(
-                f"The loss of rank {failed_rank} is not recoverable: rank 0 or a rank holding "
-                "the only replica of an expert"
-            )
+        failed_ranks = tuple(sorted(failed))
         self._join_device_work(deadline)
         # Only now can no kernel of the steps still write their KV blocks.
         discarded = len(self._uncommitted_steps)
         executor.discard_interrupted_steps(reversed(self._uncommitted_steps))
         self._uncommitted_steps.clear()
 
-        client.send(Stopped(rank=rank, failed_rank=failed_rank))
+        client.send(Stopped(rank=rank, failed_ranks=failed_ranks))
         # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery it cannot
         # complete reaches every survivor as Abort rather than as a timeout here.
         deadline = time.monotonic() + self._timeout_s
         proposal = client.wait(Propose, deadline)
         if (
-            proposal.failed_rank != failed_rank
+            proposal.failed_ranks != failed_ranks
             or rank not in proposal.survivors
-            or failed_rank in proposal.survivors
+            or not failed.isdisjoint(proposal.survivors)
         ):
             raise RuntimeError(
-                f"Rank {rank} observed the loss of rank {failed_rank} but the "
+                f"Rank {rank} observed the loss of ranks {list(failed_ranks)} but the "
                 f"authority proposed {proposal}"
             )
         generation = proposal.generation
@@ -597,10 +619,10 @@ class PeerLossRecovery(RecoveryHook):
         self._peer_failed.clear()
         self._watch_peer_failures()
         logger.warning(
-            f"Rank {rank}: resumed serving without rank {failed_rank} at membership generation "
-            f"{generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the interruption, "
-            f"discarding {discarded} steps; {len(dist.live_ranks)} ranks remain and a further loss "
-            "is not recoverable"
+            f"Rank {rank}: resumed serving without ranks {list(failed_ranks)} at membership "
+            f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
+            f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain and "
+            "a further loss is not recoverable"
         )
 
     def _join_device_work(self, deadline: float) -> None:

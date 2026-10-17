@@ -39,7 +39,9 @@ RecoveryAuthority = authority_module.RecoveryAuthority
 WORLD = 4
 FAILED = 2
 SURVIVORS = (0, 1, 3)
-RECOVERABLE = (1, 2, 3)
+RECOVERABLE = ((1,), (2,), (3,))
+# With two GPUs per node, ranks 2 and 3 form node 1.
+NODE = (2, 3)
 KEY = b"k" * 32
 
 
@@ -57,9 +59,10 @@ def _register_all(authority, recoverable=lambda rank: RECOVERABLE):
 
 def _registered(timeout: float = 10.0) -> RecoveryAuthority:
     authority = RecoveryAuthority(WORLD, recovery_timeout=timeout)
-    out = _register_all(authority, lambda rank: (1, FAILED))
+    out = _register_all(authority, lambda rank: ((1,), NODE, (FAILED,)))
     assert authority.phase is Phase.SERVING
-    assert out == [(_route(rank), Registered((1, FAILED))) for rank in range(WORLD)]
+    admitted = Registered(((1,), (FAILED,), NODE))
+    assert out == [(_route(rank), admitted) for rank in range(WORLD)]
     return authority
 
 
@@ -76,28 +79,29 @@ def _assert_aborted(out, authority: RecoveryAuthority) -> None:
     assert out and all(isinstance(message, Abort) for _, message in out)
 
 
-def test_admission_is_the_reported_ranks_without_rank0():
+def test_admission_is_the_reported_domains_without_rank0():
     authority = RecoveryAuthority(WORLD)
-    out = _register_all(authority, lambda rank: (0, 2, 3, WORLD))
-    assert authority.admitted_ranks == frozenset({2, 3})
-    assert all(message == Registered((2, 3)) for _, message in out)
+    out = _register_all(authority, lambda rank: ((0,), (3,), (WORLD,), (0, 1), NODE, (2,), ()))
+    assert authority.admitted_domains == {frozenset({2}), frozenset({3}), frozenset(NODE)}
+    assert all(message == Registered(((2,), NODE, (3,))) for _, message in out)
 
 
-def test_workers_reporting_different_recoverable_ranks_abort():
+@pytest.mark.parametrize("other", [((2,), (3,)), ((1,), (2,), (3,), NODE)])
+def test_workers_reporting_different_recoverable_domains_abort(other):
     authority = RecoveryAuthority(WORLD)
-    out = _register_all(authority, lambda rank: (1, 2, 3) if rank != 3 else (2, 3))
+    out = _register_all(authority, lambda rank: RECOVERABLE if rank != 3 else other)
     _assert_aborted(out, authority)
     assert {route for route, _ in out} == {_route(rank) for rank in range(WORLD)}
 
 
 def test_idle_loss_recovers():
     authority = _registered()
-    authority.handle(_route(0), Stopped(0, FAILED), 1.0)
+    authority.handle(_route(0), Stopped(0, (FAILED,)), 1.0)
     assert authority.phase is Phase.STOPPING
     assert authority.deadline == pytest.approx(11.0)
 
-    out = _report(authority, Stopped, SURVIVORS[1:], failed_rank=FAILED)
-    assert out == [(_route(rank), Propose(1, FAILED, SURVIVORS)) for rank in SURVIVORS]
+    out = _report(authority, Stopped, SURVIVORS[1:], failed_ranks=(FAILED,))
+    assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
     out = _report(authority, Ready, generation=1, placement_digest="digest")
     assert out == [(_route(rank), Install(1)) for rank in SURVIVORS]
     out = _report(authority, Installed, generation=1)
@@ -106,7 +110,17 @@ def test_idle_loss_recovers():
     assert authority.deadline is None and authority.expire(1e9) == []
 
 
-@pytest.mark.parametrize("failed", [0, 3])
+def test_node_loss_recovers_in_one_transaction():
+    authority = _registered()
+    out = _report(authority, Stopped, (0, 1), failed_ranks=NODE)
+    assert out == [(_route(rank), Propose(1, NODE, (0, 1))) for rank in (0, 1)]
+    _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
+    out = _report(authority, Installed, (0, 1), generation=1)
+    assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
+    assert authority.failed_ranks == frozenset(NODE) and authority.phase is Phase.RECOVERED
+
+
+@pytest.mark.parametrize("failed", [(0,), (3,), (1, FAILED), (0, 1), (1, 2, 3), ()])
 def test_unadmitted_loss_aborts_every_worker(failed):
     authority = _registered()
     out = authority.handle(_route(1), Stopped(1, failed), 1.0)
@@ -117,19 +131,20 @@ def test_unadmitted_loss_aborts_every_worker(failed):
 @pytest.mark.parametrize(
     "route, message",
     [
-        (_route(3), Stopped(3, 1)),  # second distinct failure
-        (_route(FAILED), Stopped(FAILED, FAILED)),  # departed rank still talking
-        (_route(1), Stopped(3, FAILED)),  # rank spoofing
-        (_route(1), Stopped(1, FAILED)),  # duplicate report
+        (_route(3), Stopped(3, (1,))),  # second distinct failure
+        (_route(0), Stopped(0, NODE)),  # a different failed set
+        (_route(FAILED), Stopped(FAILED, (FAILED,))),  # departed rank still talking
+        (_route(1), Stopped(3, (FAILED,))),  # rank spoofing
+        (_route(1), Stopped(1, (FAILED,))),  # duplicate report
         (_route(1), Ready(1, 1, "digest")),  # Ready before Propose
         (_route(1), Commit(1)),  # authority-only message from a worker
         (_route(1), Register(1, RECOVERABLE)),  # registration after it completed
-        (b"stranger", Stopped(1, FAILED)),  # unregistered peer
+        (b"stranger", Stopped(1, (FAILED,))),  # unregistered peer
     ],
 )
 def test_protocol_violations_abort(route, message):
     authority = _registered()
-    authority.handle(_route(1), Stopped(1, FAILED), 1.0)
+    authority.handle(_route(1), Stopped(1, (FAILED,)), 1.0)
     out = authority.handle(route, message, 1.0)
     _assert_aborted(out, authority)
     assert (route, Abort(authority.abort_reason)) in out
@@ -137,12 +152,12 @@ def test_protocol_violations_abort(route, message):
 
 def test_rank_reporting_its_own_loss_aborts():
     authority = _registered()
-    _assert_aborted(authority.handle(_route(1), Stopped(1, 1), 1.0), authority)
+    _assert_aborted(authority.handle(_route(1), Stopped(1, (1,)), 1.0), authority)
 
 
 def test_placement_digests_must_agree():
     authority = _registered()
-    _report(authority, Stopped, failed_rank=FAILED)
+    _report(authority, Stopped, failed_ranks=(FAILED,))
     authority.handle(_route(0), Ready(0, 1, "a"), 2.0)
     _assert_aborted(authority.handle(_route(1), Ready(1, 1, "b"), 2.0), authority)
 
@@ -150,7 +165,7 @@ def test_placement_digests_must_agree():
 @pytest.mark.parametrize("message_type", [Ready, Installed])
 def test_reports_for_another_generation_abort(message_type):
     authority = _registered()
-    _report(authority, Stopped, failed_rank=FAILED)
+    _report(authority, Stopped, failed_ranks=(FAILED,))
     if message_type is Installed:
         _report(authority, Ready, generation=1, placement_digest="digest")
     fields = {"placement_digest": "digest"} if message_type is Ready else {}
@@ -164,7 +179,7 @@ def test_reports_for_another_generation_abort(message_type):
         (_route(1), Register(WORLD, RECOVERABLE)),  # rank above the world
         (_route(1), Register(-1, RECOVERABLE)),  # negative rank
         (_route(1), Register(0, RECOVERABLE)),  # duplicate rank
-        (_route(0), Stopped(0, FAILED)),  # message before registration completed
+        (_route(0), Stopped(0, (FAILED,))),  # message before registration completed
     ],
 )
 def test_registration_violations_abort(route, message):
@@ -176,29 +191,35 @@ def test_registration_violations_abort(route, message):
 @pytest.mark.parametrize("phase_reports", [1, 2, 3], ids=["stopping", "preparing", "installing"])
 def test_recovery_deadline_aborts_and_aborted_is_terminal(phase_reports):
     authority = _registered(timeout=5.0)
-    authority.handle(_route(0), Stopped(0, FAILED), 1.0)
+    authority.handle(_route(0), Stopped(0, (FAILED,)), 1.0)
     if phase_reports >= 2:
-        _report(authority, Stopped, SURVIVORS[1:], failed_rank=FAILED)
+        _report(authority, Stopped, SURVIVORS[1:], failed_ranks=(FAILED,))
     if phase_reports >= 3:
         _report(authority, Ready, generation=1, placement_digest="digest")
     assert authority.expire(5.9) == []
     _assert_aborted(authority.expire(6.0), authority)
-    reply = authority.handle(_route(1), Stopped(1, FAILED), 7.0)
+    reply = authority.handle(_route(1), Stopped(1, (FAILED,)), 7.0)
     assert reply == [(_route(1), Abort(authority.abort_reason))]
     assert authority.expire(1e9) == []
 
 
 def test_second_loss_after_recovery_aborts():
     authority = _registered()
-    _report(authority, Stopped, failed_rank=FAILED)
+    _report(authority, Stopped, failed_ranks=(FAILED,))
     _report(authority, Ready, generation=1, placement_digest="digest")
     _report(authority, Installed, generation=1)
-    _assert_aborted(authority.handle(_route(0), Stopped(0, 1), 5.0), authority)
+    _assert_aborted(authority.handle(_route(0), Stopped(0, (1,)), 5.0), authority)
 
 
 def test_wire_roundtrip_and_authentication():
     route = _route(1)
-    for message in (Propose(3, 2, (0, 1, 3)), Registered((1, 2)), Abort("lost")):
+    for message in (
+        Register(1, ((1,), NODE)),
+        Registered(((1,), NODE)),
+        Stopped(1, NODE),
+        Propose(3, NODE, (0, 1)),
+        Abort("lost"),
+    ):
         frames = protocol.encode(message, KEY, route)
         assert protocol.authenticate(frames, KEY, route)
         assert protocol.decode(frames[0]) == message
@@ -219,7 +240,10 @@ def test_wire_roundtrip_and_authentication():
         b'{"type": "Install", "generation": "1"}',
         b'{"type": "Install", "generation": true}',
         b'{"type": "Install", "generation": 1, "extra": 0}',
-        b'{"type": "Propose", "generation": 1, "failed_rank": 2, "survivors": [0, "1"]}',
+        b'{"type": "Propose", "generation": 1, "failed_ranks": [2], "survivors": [0, "1"]}',
+        b'{"type": "Propose", "generation": 1, "failed_ranks": 2, "survivors": [0, 1]}',
+        b'{"type": "Register", "rank": 1, "recoverable_domains": [1, 2]}',
+        b'{"type": "Register", "rank": 1, "recoverable_domains": [[1], [2, "3"]]}',
         b'{"type": "Install", "generation": ' + b"9" * 5000 + b"}",
         b"[" * 100000 + b"]" * 100000,
     ],
@@ -304,7 +328,7 @@ def _register_clients(clients):
     admitted = {}
 
     def register(rank):
-        admitted[rank] = clients[rank].register((FAILED,), time.monotonic() + 10.0)
+        admitted[rank] = clients[rank].register(((FAILED,),), time.monotonic() + 10.0)
 
     threads = [threading.Thread(target=register, args=(rank,)) for rank in clients]
     for thread in threads:
@@ -317,7 +341,7 @@ def _register_clients(clients):
 def _worker_recovery(client, rank, results) -> None:
     deadline = time.monotonic() + 10.0
     try:
-        client.send(Stopped(rank, FAILED))
+        client.send(Stopped(rank, (FAILED,)))
         proposal = client.wait(Propose, deadline)
         client.send(Ready(rank, proposal.generation, "digest"))
         client.wait(Install, deadline)
@@ -329,7 +353,7 @@ def _worker_recovery(client, rank, results) -> None:
 
 def test_end_to_end_over_zmq(served, clients):
     authority = served[0]
-    assert _register_clients(clients) == {rank: frozenset({FAILED}) for rank in range(WORLD)}
+    assert _register_clients(clients) == {rank: {frozenset({FAILED})} for rank in range(WORLD)}
 
     results = {}
     workers = [
@@ -347,7 +371,7 @@ def test_end_to_end_over_zmq(served, clients):
 
 def test_abort_reaches_every_worker(clients):
     _register_clients(clients)
-    clients[1].send(Stopped(1, 3))  # rank 3 is not admitted
+    clients[1].send(Stopped(1, (3,)))  # rank 3 is not admitted
     for rank in (0, 3):
         with pytest.raises(RecoveryAborted):
             clients[rank].wait(Propose, time.monotonic() + 5.0)
@@ -368,7 +392,7 @@ def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):
     try:
         clients = {rank: make_client(endpoint, rank) for rank in range(WORLD)}
         _register_clients(clients)
-        clients[0].send(Stopped(0, FAILED))
+        clients[0].send(Stopped(0, (FAILED,)))
         deadline = time.monotonic() + 5.0
         while authority.phase is not Phase.STOPPING:
             assert time.monotonic() < deadline
@@ -388,7 +412,7 @@ def test_frames_signed_with_another_key_are_dropped(served, make_client):
     authority, endpoint = served
     make_client(endpoint, WORLD, key=b"x" * 32).send(Register(0, RECOVERABLE))
     clients = {rank: make_client(endpoint, rank) for rank in range(WORLD)}
-    assert _register_clients(clients) == {rank: frozenset({FAILED}) for rank in range(WORLD)}
+    assert _register_clients(clients) == {rank: {frozenset({FAILED})} for rank in range(WORLD)}
     assert authority.phase is Phase.SERVING
 
 
@@ -417,7 +441,7 @@ def test_client_rejects_unauthenticated_frames(tmp_path):
     router = context.socket(zmq.ROUTER)
     router.bind(endpoint)
     client = RecoveryClient(endpoint, KEY, 0)
-    client.send(Stopped(0, FAILED))
+    client.send(Stopped(0, (FAILED,)))
     route, *_ = router.recv_multipart()
     router.send_multipart([route, *protocol.encode(Commit(1), b"x" * 32, route)])
     with pytest.raises(RecoveryError, match="unauthenticated"):

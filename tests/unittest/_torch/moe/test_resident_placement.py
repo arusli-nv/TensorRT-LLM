@@ -27,7 +27,7 @@ _REDUNDANT = [[0, 1], [2, 3], [1, 0], [3, 2]]
 _SOLE_REPLICAS = [[0, 1], [2, 3], [0, 1], [0, 1]]
 
 
-def _load_balancer(*placements, host_weights=False):
+def _load_balancer(*placements, host_weights=False, experts=EXPERTS):
     """A MoeLoadBalancer over native layers with the given slot tables (with host weights: online EPLB)."""
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
@@ -40,7 +40,7 @@ def _load_balancer(*placements, host_weights=False):
     ]
     load_balancer.load_balancer_impl.add_layer.side_effect = native_layers
     for _ in placements:
-        load_balancer.add_layer(EXPERTS, 2, SLOTS_PER_RANK).host_copies = host_weights
+        load_balancer.add_layer(experts, 2, SLOTS_PER_RANK).host_copies = host_weights
     return load_balancer
 
 
@@ -76,7 +76,7 @@ def test_placement_digest_is_deterministic_and_mask_sensitive():
 
 def test_without_host_weights_a_loss_is_covered_only_if_every_expert_keeps_a_replica():
     load_balancer = _load_balancer(_REDUNDANT, _SOLE_REPLICAS)
-    assert [load_balancer.covers_loss_of(rank) for rank in range(WORLD_SIZE)] == [
+    assert [load_balancer.covers_loss_of([rank]) for rank in range(WORLD_SIZE)] == [
         True,
         False,
         True,
@@ -126,9 +126,32 @@ def test_extra_slots_mode_rejects_an_unknown_mode(monkeypatch):
 
 def test_with_host_weights_lost_experts_are_restored():
     load_balancer = _load_balancer(_SOLE_REPLICAS, host_weights=True)
-    assert all(load_balancer.covers_loss_of(rank) for rank in range(WORLD_SIZE))
+    assert all(load_balancer.covers_loss_of([rank]) for rank in range(WORLD_SIZE))
     (placement,) = load_balancer.recovery_placements({1})
     assert placement.tolist() == [[2, 1], [-1, -1], [0, 3], [0, 1]]
+
+
+# With two GPUs per node, node 1 (ranks 2 and 3) holds the only replicas of experts 2 and 3.
+_NODE = (2, 3)
+_NODE_EXPERTS = [[0, 1], [0, 1], [2, 3], [2, 3]]
+
+
+def test_with_host_weights_a_node_s_experts_are_restored_into_the_survivors():
+    load_balancer = _load_balancer(_NODE_EXPERTS, host_weights=True)
+    assert load_balancer.covers_loss_of(_NODE)
+    (placement,) = load_balancer.recovery_placements(set(_NODE))
+    # Each lost expert evicts a replica of expert 0 or 1, one per surviving rank.
+    assert placement.tolist() == [[2, 1], [0, 3], [-1, -1], [-1, -1]]
+    assert not _load_balancer(_NODE_EXPERTS).covers_loss_of(_NODE)
+
+
+def test_a_node_loss_is_not_covered_when_the_survivors_have_too_few_slots():
+    # Five experts, but the two surviving ranks hold four slots.
+    load_balancer = _load_balancer([[0, 1], [2, 3], [4, 0], [1, 2]], host_weights=True, experts=5)
+    assert load_balancer.covers_loss_of([2]) and load_balancer.covers_loss_of([3])
+    assert not load_balancer.covers_loss_of(_NODE)
+    with pytest.raises(ValueError, match=r"\{0: \[4\]\}"):
+        load_balancer.recovery_placements(_NODE)
 
 
 def test_install_masks_only_when_no_expert_moves():

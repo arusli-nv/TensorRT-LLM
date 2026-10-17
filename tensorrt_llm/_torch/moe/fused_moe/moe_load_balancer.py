@@ -1001,10 +1001,10 @@ class MoeLoadBalancer:
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
 
-    def covers_loss_of(self, rank: int) -> bool:
-        """Whether serving can continue without ``rank`` (see ``recovery_placements``)."""
+    def covers_loss_of(self, dead_ranks: Iterable[int]) -> bool:
+        """Whether serving can continue without all of ``dead_ranks`` (see ``recovery_placements``)."""
         try:
-            self.recovery_placements([rank])
+            self.recovery_placements(dead_ranks)
         except ValueError:
             return False
         return True

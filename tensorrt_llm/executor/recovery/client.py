@@ -106,21 +106,24 @@ class RecoveryClient:
             return None
         return cls(os.environ[AUTHORITY_ENV], load_key(), rank)
 
-    def register(self, recoverable_ranks: tuple[int, ...], deadline: float) -> frozenset[int]:
+    def register(
+        self, recoverable_domains: tuple[tuple[int, ...], ...], deadline: float
+    ) -> frozenset[frozenset[int]]:
         """Register this rank and wait until every rank has registered.
 
         Args:
-            recoverable_ranks: Ranks whose loss this worker's expert placement covers.
+            recoverable_domains: Sorted rank sets (a single rank or a whole node) whose
+                combined loss this worker's expert placement covers.
             deadline: Absolute ``time.monotonic()`` value.
 
         Returns:
-            The ranks whose loss the deployment recovers from.
+            The failure domains whose loss the deployment recovers from.
 
         Raises:
             RecoveryError: Registration was rejected or timed out.
         """
-        self.send(Register(self._rank, tuple(recoverable_ranks)))
-        return frozenset(self.wait(Registered, deadline).admitted_ranks)
+        self.send(Register(self._rank, tuple(map(tuple, recoverable_domains))))
+        return frozenset(map(frozenset, self.wait(Registered, deadline).admitted_domains))
 
     def send(self, message: Message) -> None:
         """Send ``message`` to the authority.
