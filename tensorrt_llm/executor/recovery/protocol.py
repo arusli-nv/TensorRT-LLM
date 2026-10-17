@@ -20,6 +20,8 @@ from dataclasses import dataclass
 __all__ = [
     "Abort",
     "Commit",
+    "DeviceWait",
+    "Heartbeat",
     "Install",
     "Installed",
     "MAX_MESSAGE_BYTES",
@@ -113,7 +115,41 @@ class Abort:
     reason: str
 
 
-Message = Register | Registered | Stopped | Ready | Installed | Propose | Install | Commit | Abort
+@dataclass(frozen=True)
+class Heartbeat:
+    """Worker -> authority, periodically: the process lives and its executor is at ``iteration``.
+
+    ``waiting`` says whether the executor waits on something outside its rank: a host
+    collective, or new requests.
+    """
+
+    rank: int
+    iteration: int
+    waiting: bool
+
+
+@dataclass(frozen=True)
+class DeviceWait:
+    """Worker -> authority: this rank's device has waited ``waited_ms`` on ``peer``; 0 clears."""
+
+    rank: int
+    peer: int
+    waited_ms: int
+
+
+Message = (
+    Register
+    | Registered
+    | Stopped
+    | Ready
+    | Installed
+    | Propose
+    | Install
+    | Commit
+    | Abort
+    | Heartbeat
+    | DeviceWait
+)
 
 _MESSAGE_TYPES: dict[str, type] = {cls.__name__: cls for cls in typing.get_args(Message)}
 
