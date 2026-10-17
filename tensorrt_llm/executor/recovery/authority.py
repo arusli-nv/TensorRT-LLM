@@ -19,15 +19,19 @@ import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 
 import zmq
 
 from ...logger import logger
 from .client import load_key
+from .hang_monitor import HangMonitor
 from .protocol import (
     MAX_MESSAGE_BYTES,
     Abort,
     Commit,
+    DeviceWait,
+    Heartbeat,
     Install,
     Installed,
     Message,
@@ -79,15 +83,23 @@ class RecoveryAuthority:
             report the same recoverable ranks; the loss of rank 0 is never recovered.
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
+        hang_monitor: Judges the workers' heartbeats and device waits; None ignores them.
+        fence: Called once with a recoverable rank the monitor confirms hung and the
+            reason; it must end that rank's process, whose loss then recovers as any
+            other. None only reports the hang.
     """
 
     def __init__(
         self,
         world_size: int,
         recovery_timeout: float = 20.0,
+        hang_monitor: HangMonitor | None = None,
+        fence: Callable[[int, str], None] | None = None,
     ) -> None:
         self.world_size = world_size
         self.recovery_timeout = recovery_timeout
+        self.hang_monitor = hang_monitor
+        self._fence = fence
         self.admitted_ranks: frozenset[int] = frozenset()
         self.generation = 0
         self.phase = Phase.REGISTERING
@@ -107,6 +119,10 @@ class RecoveryAuthority:
 
     def handle(self, route: bytes, message: Message, now: float) -> Outbound:
         """Apply ``message`` received from ``route`` at monotonic time ``now``."""
+        if isinstance(message, (Heartbeat, DeviceWait)):
+            # Evidence, not protocol: a worker sends it from its own connection, at any time.
+            self._observe(message, now)
+            return []
         if self.phase is Phase.ABORTED:
             return [(route, Abort(self.abort_reason))]
         try:
@@ -115,10 +131,31 @@ class RecoveryAuthority:
             return self.abort(str(violation), route)
 
     def expire(self, now: float) -> Outbound:
-        """Abort if the recovery deadline has passed at monotonic time ``now``."""
+        """Abort if the recovery deadline passed at monotonic time ``now``; act on a hung rank."""
         if self.deadline is not None and now >= self.deadline:
             return self.abort(f"recovery did not commit within {self.recovery_timeout}s")
+        if self.hang_monitor is not None and self.phase is Phase.SERVING:
+            hung = self.hang_monitor.check(now)
+            if hung is not None:
+                self._on_hung(hung.rank, hung.reason)
         return []
+
+    def _observe(self, message: Heartbeat | DeviceWait, now: float) -> None:
+        if self.hang_monitor is None or self.phase is not Phase.SERVING:
+            return
+        if isinstance(message, Heartbeat):
+            self.hang_monitor.heartbeat(message.rank, message.iteration, message.waiting, now)
+        else:
+            self.hang_monitor.device_wait(
+                message.rank, message.peer, message.waited_ms / 1000.0, now
+            )
+
+    def _on_hung(self, rank: int, reason: str) -> None:
+        if rank not in self.admitted_ranks or self._fence is None:
+            logger.error(f"Recovery authority: rank {rank} is hung ({reason}); not fencing it")
+            return
+        logger.error(f"Recovery authority: rank {rank} is hung ({reason}); fencing it")
+        self._fence(rank, reason)
 
     def abort(self, reason: str, route: bytes | None = None) -> Outbound:
         """Enter the terminal phase and tell every worker (and ``route``) why."""
@@ -194,6 +231,8 @@ class RecoveryAuthority:
             if message.failed_rank not in self.admitted_ranks:
                 raise _Violation(f"loss of rank {message.failed_rank} is not admitted")
             self.failed_rank = message.failed_rank
+            if self.hang_monitor is not None:
+                self.hang_monitor.remove(message.failed_rank)
             self.deadline = now + self.recovery_timeout
             self._enter(Phase.STOPPING)
         elif self.phase is not Phase.STOPPING:
