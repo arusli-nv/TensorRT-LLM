@@ -20,7 +20,11 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
-from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import PeerLossRecovery, RecoveryHook
+from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
+    PeerLossRecovery,
+    PreparedStep,
+    RecoveryHook,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
@@ -92,6 +96,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK})):
     executor.model_engine = engine
     executor.executor_request_queue = Mock()
     executor.executor_request_queue.wake.side_effect = lambda: events.append("wake")
+    executor.kv_cache_manager = Mock()
     executor.active_requests = []
     executor.waiting_queue = FCFSWaitingQueue()
     executor.request_accumulated = []
@@ -111,7 +116,7 @@ def _recovery(client, rank=1, failed=frozenset({FAILED_RANK})):
     recovery = PeerLossRecovery(executor, client, frozenset({1, FAILED_RANK, 3}))
     recovery._join_device_work = Mock()
     recovery._watch = Mock(failed=False)
-    executor.discard_interrupted_step = Mock()
+    executor.discard_interrupted_steps = Mock()
     executor._peer_loss_recovery = recovery
     return recovery
 
@@ -263,13 +268,30 @@ def test_gather_numbers_follow_rank0_after_a_recovery():
 
 
 def test_requests_with_occurrence_penalties_are_rejected():
+    recovery = _recovery(_FakeClient([]))
     request = Mock(
-        sampling_config=Mock(repetition_penalty=1.0, presence_penalty=0.5, frequency_penalty=None)
+        sampling_config=Mock(repetition_penalty=1.0, presence_penalty=0.5, frequency_penalty=None),
+        py_multimodal_data=None,
     )
     with pytest.raises(ValueError, match="penalties"):
-        PeerLossRecovery.validate_request(request)
+        recovery.validate_request(request)
     request.sampling_config.presence_penalty = 0.0
-    PeerLossRecovery.validate_request(request)
+    recovery.validate_request(request)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_multimodal_requests_are_rejected_only_under_the_overlap_scheduler(overlap):
+    recovery = _recovery(_FakeClient([]))
+    recovery._executor.disable_overlap_scheduler = not overlap
+    request = Mock(
+        sampling_config=Mock(repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0),
+        py_multimodal_data={"image": Mock()},
+    )
+    if overlap:
+        with pytest.raises(ValueError, match="Multimodal"):
+            recovery.validate_request(request)
+    else:
+        recovery.validate_request(request)
 
 
 @pytest.mark.parametrize("failed", [frozenset(), frozenset({1, 2})])
@@ -357,18 +379,33 @@ def test_run_surfaces_a_failed_recovery_after_stopping_the_watch():
     watch.stop.assert_called()
 
 
-def test_recovery_discards_the_step_after_joining_its_device_work():
+def test_recovery_discards_the_steps_newest_first_after_joining_their_device_work():
     recovery = _recovery(_FakeClient(_happy_replies()))
     calls = []
-    batch = Mock(name="batch")
-    recovery.step_prepared(batch)
+    older, newer = Mock(name="older"), Mock(name="newer")
+    recovery.step_prepared(older)
+    recovery.step_prepared(newer)
     recovery._join_device_work = lambda deadline: calls.append("join")
-    recovery._executor.discard_interrupted_step = lambda step: calls.append(("discard", step))
+    recovery._executor.discard_interrupted_steps = lambda steps: calls.append(
+        ("discard", [step.batch for step in steps])
+    )
 
     recovery._recover(_interrupted())
 
-    assert calls == ["join", ("discard", batch)]
-    assert recovery._uncommitted_step is None
+    assert calls == ["join", ("discard", [newer, older])]
+    assert not recovery._uncommitted_steps
+
+
+def test_steps_commit_oldest_first_and_release_the_newest():
+    recovery = _recovery(_FakeClient([]))
+    older, newer = Mock(name="older"), Mock(name="newer")
+    recovery.step_prepared(older)
+    recovery.step_prepared(newer)
+    with pytest.raises(RuntimeError, match="order"):
+        recovery.commit_step(newer, Mock())
+    recovery.step_released()
+    recovery.commit_step(older, Mock())
+    assert not recovery._uncommitted_steps
 
 
 def test_run_recovers_and_resumes():
@@ -455,21 +492,22 @@ def test_commit_step_waits_then_accepts_or_discards(peer_failed):
     if peer_failed:
         recovery._peer_failed.set()
         with pytest.raises(HostCollectiveInterrupted):
-            recovery.commit_step(sample_state)
+            recovery.commit_step(batch, sample_state)
     else:
-        recovery.commit_step(sample_state)
+        recovery.commit_step(batch, sample_state)
     sample_state.sampler_event.synchronize.assert_called_once()
-    assert recovery._uncommitted_step is (batch if peer_failed else None)
+    assert [step.batch for step in recovery._uncommitted_steps] == ([batch] if peer_failed else [])
 
 
 def test_commit_step_discards_a_step_whose_peer_failed_while_it_ran():
     """The flag is read after waiting for the step's device work, not before."""
     recovery = _recovery(_FakeClient([]))
-    recovery.step_prepared(Mock(name="batch"))
+    batch = Mock(name="batch")
+    recovery.step_prepared(batch)
     sample_state = Mock()
     sample_state.sampler_event.synchronize.side_effect = recovery._peer_failed.set
     with pytest.raises(HostCollectiveInterrupted):
-        recovery.commit_step(sample_state)
+        recovery.commit_step(batch, sample_state)
 
 
 def test_recovery_aborts_collectives_and_delivers_only_after_commit():
@@ -525,16 +563,38 @@ def test_discard_returns_step_resources_and_padding_request():
     executor.kv_cache_manager = Mock()
     executor.inflight_req_ids = Mock()
     executor._pending_adp_dummy_request = None
-    batch = Mock(name="batch")
+    step = PreparedStep(Mock(name="batch"), {7: 64})
     request = Mock(is_attention_dp_dummy=False)
     dummy = Mock(is_attention_dp_dummy=True, py_request_id=99)
     executor.active_requests.extend([request, dummy])
 
-    executor.discard_interrupted_step(batch)
+    executor.discard_interrupted_steps([step])
 
-    executor.kv_cache_manager.revert_prepare_resources.assert_called_once_with(batch)
+    executor.kv_cache_manager.revert_prepare_resources.assert_called_once_with(step.batch, {7: 64})
     executor._terminate_request.assert_called_once_with(dummy)
     assert executor.active_requests == [request]
+    assert executor.previous_batch is None and request.py_batch_idx is None
+
+
+def test_discard_undoes_each_step_s_request_changes_newest_first():
+    """Under the overlap scheduler two steps can be uncommitted; each one's changes are undone in reverse."""
+    executor = _executor()
+    executor.inflight_req_ids = Mock()
+    executor._pending_adp_dummy_request = None
+    request = Mock(is_attention_dp_dummy=False, context_current_position=0, state="CONTEXT_INIT")
+    older, newer = PreparedStep(Mock(), {}), PreparedStep(Mock(), {})
+    for step, position, state in (
+        (older, 64, "CONTEXT_INIT"),
+        (newer, 128, "GENERATION_IN_PROGRESS"),
+    ):
+        executor._step_changes = step.changes
+        executor._note_step_change(request)
+        request.context_current_position, request.state = position, state
+
+    executor.discard_interrupted_steps([newer, older])
+
+    assert (request.context_current_position, request.state) == (0, "CONTEXT_INIT")
+    assert executor._step_changes is None
 
 
 def test_discard_before_prepare_releases_the_tentative_padding_request():
@@ -549,7 +609,7 @@ def test_discard_before_prepare_releases_the_tentative_padding_request():
     executor.active_requests.extend([request, dummy])
     executor._pending_adp_dummy_request = dummy
 
-    executor.discard_interrupted_step(None)
+    executor.discard_interrupted_steps([])
 
     executor.kv_cache_manager.free_resources.assert_called_once_with(dummy)
     executor.kv_cache_manager.revert_prepare_resources.assert_not_called()
@@ -787,7 +847,6 @@ def _supported_executor():
         (lambda ex: setattr(ex, "guided_decoder", Mock()), "no guided decoding"),
         (lambda ex: setattr(ex, "max_beam_width", 2), "no beam search"),
         (lambda ex: setattr(ex, "kv_connector_manager", Mock()), "no KV connector"),
-        (lambda ex: setattr(ex, "disable_overlap_scheduler", False), "no overlap scheduler"),
         (lambda ex: setattr(ex, "enable_kv_pool_rebalance", True), "no KV pool rebalance"),
         (lambda ex: setattr(ex.kv_cache_manager, "enable_block_reuse", True), "no KV block reuse"),
         (

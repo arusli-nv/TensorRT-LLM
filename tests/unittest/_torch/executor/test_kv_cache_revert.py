@@ -60,6 +60,11 @@ def _prepare_step(manager, context_requests, generation_requests):
     return batch
 
 
+def _revert(manager, batch):
+    """Revert the step prepared last."""
+    manager.revert_prepare_resources(batch, manager.context_capacities(batch))
+
+
 def _commit_step(manager, batch):
     """Apply a step's results as the executor does after the forward."""
     for request in batch.context_requests:
@@ -99,7 +104,7 @@ def test_revert_prepare_resources_round_trip():
         batch = _prepare_step(manager, [fresh, chunked], [generating])
         prepared = _kv_state(manager)
         assert prepared != before
-        manager.revert_prepare_resources(batch)
+        _revert(manager, batch)
         assert _kv_state(manager) == before
         assert chunked.context_current_position == position
 
@@ -115,7 +120,7 @@ def test_reverted_context_is_not_offered_for_reuse():
     """KV a discarded step wrote never becomes a reusable prefix; committed KV does."""
     manager = _real_kv_cache_manager(enable_block_reuse=True)
     try:
-        manager.revert_prepare_resources(_prepare_step(manager, [_prompt_request(1, 96)], []))
+        _revert(manager, _prepare_step(manager, [_prompt_request(1, 96)], []))
         probe = _prompt_request(2, 96)
         _prepare_step(manager, [probe], [])
         assert probe.context_current_position == 0
@@ -142,10 +147,41 @@ def test_reverted_first_chunk_that_reused_a_prefix_runs_again_unchanged():
         batch = _prepare_step(manager, [reusing], [])
         matched, prepared = reusing.context_current_position, _kv_state(manager)
         assert matched > 0
-        manager.revert_prepare_resources(batch)
+        _revert(manager, batch)
         assert reusing.context_current_position == 0 and reusing.prepopulated_prompt_len == 0
         assert _kv_state(manager) == before
         _prepare_step(manager, [reusing], [])
         assert reusing.context_current_position == matched and _kv_state(manager) == prepared
+    finally:
+        manager.shutdown()
+
+
+def test_two_overlapped_steps_revert_newest_first():
+    """The overlap scheduler prepares a step before the one before it commits; both revert exactly.
+
+    The context request runs two chunks and the generation request two tokens, and the executor advances
+    the context cursor between the steps, as its request-state update does before a step commits.
+    """
+    manager = _real_kv_cache_manager()
+    try:
+        chunked = _prompt_request(1, chunk_size=32)
+        generating = _prompt_request(2, chunk_size=96)
+        _commit_step(manager, _prepare_step(manager, [chunked, generating], []))
+        chunked.context_chunk_size = 32
+        before = _kv_state(manager)
+
+        older = _prepare_step(manager, [chunked], [generating])
+        older_capacities = manager.context_capacities(older)
+        chunked.move_to_next_context_chunk()
+        chunked.context_chunk_size = 32
+        newer = _prepare_step(manager, [chunked], [generating])
+        newer_capacities = manager.context_capacities(newer)
+
+        chunked.context_current_position = 64
+        manager.revert_prepare_resources(newer, newer_capacities)
+        chunked.context_current_position = 32
+        manager.revert_prepare_resources(older, older_capacities)
+
+        assert _kv_state(manager) == before
     finally:
         manager.shutdown()

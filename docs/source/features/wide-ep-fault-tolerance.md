@@ -59,7 +59,7 @@ non-zero exit status at shutdown.
 
 ## Not supported together with fault tolerance
 
-Refused at startup, with the requirement that is missing: speculative decoding (MTP), the overlap scheduler,
+Refused at startup, with the requirement that is missing: speculative decoding (MTP),
 attention-DP balancing or a non-default attention-DP router, expert tensor parallelism, beam search, guided
 decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving) and
 connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder
@@ -67,7 +67,7 @@ models, sleep/wake-up, a non-MPI executor (Ray, RPC), and a hang-detection timeo
 `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S`.
 
 Rejected per request: repetition, presence and frequency penalties (their token counts cannot be rolled back
-when a step is discarded).
+when a step is discarded), and multimodal requests under the overlap scheduler.
 
 ## What happens during a recovery
 
