@@ -24,6 +24,21 @@ from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+# "empty": under WideEP peer-loss recovery, EPLB slots beyond one per expert
+# are not routed to while healthy and receive a lost rank's experts;
+# "replicas": they keep serving replicas (a loss reroutes to them, or restores
+# into them).
+EXTRA_SLOTS_ENV = "TLLM_FAULT_TOLERANCE_EXTRA_SLOTS"
+
+
+def extra_slots_mode() -> str:
+    """The ``TLLM_FAULT_TOLERANCE_EXTRA_SLOTS`` mode: ``replicas`` (default) or ``empty``."""
+    mode = os.environ.get(EXTRA_SLOTS_ENV, "replicas")
+    if mode not in ("replicas", "empty"):
+        raise ValueError(
+            f"{EXTRA_SLOTS_ENV} must be 'replicas' or 'empty', got {mode!r}")
+    return mode
+
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     """
@@ -773,36 +788,41 @@ class SingleLayerMoeLoadBalancer:
 _current_moe_load_balancer = threading.local()
 
 
-def restore_lost_experts(placement: np.ndarray, lost: List[int]) -> List[int]:
-    """Place each ``lost`` expert into a live slot of ``placement`` (``[ep_size, slots_per_rank]``, -1 = dead), in place.
+def restore_lost_experts(placement: np.ndarray, lost: List[int],
+                         dead_ranks: Iterable[int]) -> List[int]:
+    """Place each ``lost`` expert into a slot of a live rank in ``placement`` (``[ep_size, slots_per_rank]``
+    expert ids, -1 = no expert), in place.
 
-    The slot evicted for each lost expert holds a replica of the expert with
-    the most live replicas (so no expert loses its last copy), on the rank
-    that has taken the fewest restored experts so far, then the lowest rank
-    and slot: a minimal change that spreads the loading across ranks and is
-    the same on every rank.
+    Empty slots of live ranks are taken first; then the slot of a replica of
+    the expert with the most replicas (so no expert loses its last copy). Ties
+    go to the rank that has taken the fewest restored experts so far, then the
+    lowest rank and slot: a minimal change that spreads the loading across
+    ranks and is the same on every rank.
 
     Returns:
         The lost experts that found no slot.
     """
-    live = placement >= 0
-    counts = np.bincount(placement[live],
+    usable = np.ones(placement.shape, dtype=bool)
+    usable[list(dead_ranks)] = False
+    counts = np.bincount(placement[placement >= 0],
                          minlength=max(lost) + 1 if lost else 0)
     restored_per_rank = np.zeros(placement.shape[0], dtype=np.int64)
     unplaced = []
     for expert in lost:
-        ranks, slots = np.nonzero(live)
-        replicas = counts[placement[ranks, slots]]
-        evictable = replicas >= 2
-        if not evictable.any():
+        ranks, slots = np.nonzero(usable)
+        held = placement[ranks, slots]
+        replicas = np.where(held >= 0, counts[np.maximum(held, 0)], 0)
+        free = (held < 0) | (replicas >= 2)
+        if not free.any():
             unplaced.append(expert)
             continue
-        ranks, slots, replicas = ranks[evictable], slots[evictable], replicas[
-            evictable]
+        ranks, slots, held, replicas = (a[free]
+                                        for a in (ranks, slots, held, replicas))
         best = np.lexsort(
-            (slots, ranks, restored_per_rank[ranks], -replicas))[0]
+            (slots, ranks, restored_per_rank[ranks], -replicas, held >= 0))[0]
         rank, slot = ranks[best], slots[best]
-        counts[placement[rank, slot]] -= 1
+        if held[best] >= 0:
+            counts[held[best]] -= 1
         placement[rank, slot] = expert
         counts[expert] = 1
         restored_per_rank[rank] += 1
@@ -942,6 +962,14 @@ class MoeLoadBalancer:
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
+        if peer_loss_recovery_enabled() and extra_slots_mode() == "empty":
+            # Before warmup, so autotuning and CUDA graph capture see the
+            # healthy routing.
+            emptied = self.empty_replica_slots()
+            if self.ep_rank == 0:
+                logger.info(
+                    f"WideEP peer-loss recovery keeps {emptied} EPLB slots empty for restores"
+                )
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):
@@ -1006,7 +1034,7 @@ class MoeLoadBalancer:
                 set(range(layer.expert_count)) -
                 set(placement[placement >= 0].tolist()))
             if lost and layer.host_copies:
-                lost = restore_lost_experts(placement, lost)
+                lost = restore_lost_experts(placement, lost, dead)
             if lost:
                 missing[layer.get_layer_idx()] = lost
             placements.append(placement)
@@ -1050,6 +1078,33 @@ class MoeLoadBalancer:
             dead, [placement.tolist() for placement in placements])
         logger.info(f"Restored {restored} expert slots without ranks {dead} in "
                     f"{(time.monotonic() - start) * 1e3:.1f} ms")
+
+    def empty_replica_slots(self) -> int:
+        """Stop routing to every replica beyond an expert's first, leaving those slots empty for restores.
+
+        Routing then uses one slot per expert, as a placement without spare
+        slots does; the slot buffers stay allocated (CUDA graphs keep their
+        addresses). The kept replica is the one with the lowest local slot
+        (an expert's home slot), ties to the lowest rank. Needs host copies,
+        to fill the slots later. Returns the number of slots emptied.
+        """
+        placements = []
+        for layer in self.single_layer_load_balancers:
+            placement = np.asarray(layer.get_old_rank_expert_ids(),
+                                   dtype=np.int32)
+            seen = set()
+            for slot, rank in np.ndindex(placement.shape[::-1]):
+                expert = int(placement[rank, slot])
+                if expert in seen:
+                    placement[rank, slot] = -1
+                elif expert >= 0:
+                    seen.add(expert)
+            placements.append(placement)
+        emptied = sum(int((p < 0).sum()) for p in placements)
+        if emptied:
+            self.load_balancer_impl.restore_placement(
+                [], [placement.tolist() for placement in placements])
+        return emptied
 
     @staticmethod
     def _masked_placement(layer: "SingleLayerMoeLoadBalancer",

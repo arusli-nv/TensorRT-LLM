@@ -613,6 +613,30 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementRejectsPlacementMissingAnExpert
     EXPECT_EQ(setup.slotValue(0), 1.0f);
 }
 
+TEST(MoeLoadBalancerRestoreTest, EmptySlotIsNotRoutedAndTakesALostExpert)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    RestorePlacementLayer setup(/*withHostWeights=*/true);
+    auto* info = setup.mLayer->getPlacementCpuInfo();
+
+    // Empty rank 0's slot 1 (a replica of expert 1): routing skips it, nothing is loaded.
+    setup.mLoadBalancer.restorePlacement({}, {{{0, -1}, {0, 1}, {2, 3}, {0, 1}}});
+    EXPECT_EQ(info->oldRankExpertIds[0], (std::vector<int>{0, -1}));
+    EXPECT_EQ(info->placementInfoForGPU.expertReplicaCount[1], 2);
+    EXPECT_EQ(setup.slotValue(1), 2.0f);
+
+    // Losing rank 2: expert 2 goes into the empty slot and is loaded from its host copy.
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {{{0, 2}, {3, 1}, {-1, -1}, {0, 1}}});
+    EXPECT_EQ(info->oldRankExpertIds[0], (std::vector<int>{0, 2}));
+    std::vector<int> const expectedReplicaCounts{2, 2, 1, 1};
+    for (int expertId = 0; expertId < RestorePlacementLayer::kExpertCount; ++expertId)
+    {
+        EXPECT_EQ(info->placementInfoForGPU.expertReplicaCount[expertId], expectedReplicaCounts[expertId]);
+    }
+    EXPECT_EQ(setup.slotValue(1), 3.0f);
+}
+
 TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsHostWeights)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);

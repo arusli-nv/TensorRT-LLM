@@ -645,11 +645,6 @@ void SingleLayerMoeLoadBalancer::validatePlacement(
 {
     (void) computeReplicaCounts(deadRankMask, rankExpertIds);
     TLLM_CHECK_WITH_INFO(mWeightUpdater->hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
-    for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
-    {
-        TLLM_CHECK_WITH_INFO(rankExpertIds[mMetaInfo.epRank][localSlotId] >= 0,
-            "Local slot %d must hold an expert in the new placement", localSlotId);
-    }
 }
 
 void SingleLayerMoeLoadBalancer::installPlacement(
@@ -969,11 +964,12 @@ void HostMemoryMoeWeightUpdater::updateWeights(
     {
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
         int newExpertId = placementCpuInfo->rankExpertIds[mMetaInfo.epRank][slotId];
-        TLLM_CHECK_WITH_INFO(oldExpertId >= 0 && oldExpertId < mMetaInfo.expertCount,
-            "oldExpertId=%d, should in range [0, %d)", oldExpertId, mMetaInfo.expertCount);
-        TLLM_CHECK_WITH_INFO(newExpertId >= 0 && newExpertId < mMetaInfo.expertCount,
-            "newExpertId=%d, should in range [0, %d)", newExpertId, mMetaInfo.expertCount);
-        if (oldExpertId == newExpertId)
+        // -1: an empty slot (no routing to it). Emptying a slot loads nothing; filling one loads its expert.
+        TLLM_CHECK_WITH_INFO(oldExpertId >= -1 && oldExpertId < mMetaInfo.expertCount,
+            "oldExpertId=%d, should be -1 or in range [0, %d)", oldExpertId, mMetaInfo.expertCount);
+        TLLM_CHECK_WITH_INFO(newExpertId >= -1 && newExpertId < mMetaInfo.expertCount,
+            "newExpertId=%d, should be -1 or in range [0, %d)", newExpertId, mMetaInfo.expertCount);
+        if (oldExpertId == newExpertId || newExpertId == -1)
         {
             continue;
         }

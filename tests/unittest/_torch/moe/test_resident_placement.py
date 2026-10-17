@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    EXTRA_SLOTS_ENV,
     MoeLoadBalancer,
+    extra_slots_mode,
     restore_lost_experts,
 )
 
@@ -88,7 +90,7 @@ def test_without_host_weights_a_loss_is_covered_only_if_every_expert_keeps_a_rep
 
 def test_restore_evicts_the_most_replicated_expert_spread_over_ranks():
     placement = np.array([[0, 1], [-1, -1], [0, 1], [0, 1]], dtype=np.int32)
-    assert restore_lost_experts(placement, [2, 3]) == []
+    assert restore_lost_experts(placement, [2, 3], [1]) == []
     # Expert 2 takes rank 0's first replica of expert 0 (three copies); expert 3 then takes a copy of expert 1
     # (still three) on rank 2, the lowest rank that has not taken a restored expert yet.
     assert placement.tolist() == [[2, 1], [-1, -1], [0, 3], [0, 1]]
@@ -96,8 +98,30 @@ def test_restore_evicts_the_most_replicated_expert_spread_over_ranks():
 
 def test_restore_never_evicts_a_last_replica():
     placement = np.array([[0], [1], [-1], [3]], dtype=np.int32)
-    assert restore_lost_experts(placement, [2]) == [2]
+    assert restore_lost_experts(placement, [2], [2]) == [2]
     assert placement.tolist() == [[0], [1], [-1], [3]]
+
+
+def test_restore_fills_empty_slots_before_evicting_replicas():
+    # Rank 2 is dead; ranks 0 and 3 each keep an empty slot, rank 3 also a replica of expert 0.
+    placement = np.array([[0, -1], [1, 0], [-1, -1], [3, -1]], dtype=np.int32)
+    assert restore_lost_experts(placement, [2], [2]) == []
+    assert placement.tolist() == [[0, 2], [1, 0], [-1, -1], [3, -1]]
+
+
+def test_empty_replica_slots_keeps_one_routed_slot_per_expert():
+    load_balancer = _load_balancer(_REDUNDANT, host_weights=True)
+    assert load_balancer.empty_replica_slots() == 4
+    # Slot 0 of every rank is kept (each expert's lowest local slot); every second copy is emptied.
+    load_balancer.load_balancer_impl.restore_placement.assert_called_once_with(
+        [], [[[0, -1], [2, -1], [1, -1], [3, -1]]]
+    )
+
+
+def test_extra_slots_mode_rejects_an_unknown_mode(monkeypatch):
+    monkeypatch.setenv(EXTRA_SLOTS_ENV, "spare")
+    with pytest.raises(ValueError, match=EXTRA_SLOTS_ENV):
+        extra_slots_mode()
 
 
 def test_with_host_weights_lost_experts_are_restored():
