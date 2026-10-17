@@ -23,6 +23,8 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+# Wakes a blocked get_from_request_queue() and is dropped there; never broadcast.
+WAKE_REQUEST_ID = -6
 
 
 class RequestAdmissionState(enum.Enum):
@@ -64,7 +66,8 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_wake_request)
 
     @property
     def is_prefix_load_completion_request(self):
@@ -81,6 +84,10 @@ class RequestQueueItem:
     @property
     def is_profile_stop_request(self):
         return self.id == PROFILE_STOP_REQUEST_ID
+
+    @property
+    def is_wake_request(self):
+        return self.id == WAKE_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -286,6 +293,10 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
 
+    def wake(self):
+        """Return a blocked get_from_request_queue() without a request; thread-safe."""
+        self.request_queue.put(RequestQueueItem(WAKE_REQUEST_ID))
+
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
@@ -328,7 +339,9 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
-        if self.batch_wait_timeout_ms == 0:
+        woken = any(item.is_wake_request for item in items)
+        items = [item for item in items if not item.is_wake_request]
+        if woken or self.batch_wait_timeout_ms == 0:
             return items
 
         if len(items) >= self.max_batch_size:
@@ -343,9 +356,11 @@ class ExecutorRequestQueue:
 
             try:
                 item = self.request_queue.get(timeout=remaining_timeout)
-                items.append(item)
             except queue.Empty:
                 break
+            if item.is_wake_request:
+                break
+            items.append(item)
 
         return items
 

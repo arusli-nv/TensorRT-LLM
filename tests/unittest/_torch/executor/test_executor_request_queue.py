@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for ExecutorRequestQueue class.
 
 This module tests the ExecutorRequestQueue class functionality including:
@@ -282,6 +284,29 @@ def test_get_from_request_queue_with_timeout(executor_queue):
 
     assert len(items) == 0
     assert elapsed < 0.2  # Should finish within timeout
+
+
+def test_wake_releases_a_blocked_get_without_a_request(executor_queue):
+    executor_queue.batch_wait_timeout_ms = 200.0
+    threading.Timer(0.05, executor_queue.wake).start()
+
+    start_time = time.time()
+    items = executor_queue.get_from_request_queue(None)
+
+    assert items == []
+    assert time.time() - start_time < 0.15
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+    executor_queue.wake()
+    assert [item.id
+            for item in executor_queue.get_from_request_queue(None)] == [1]
+    assert executor_queue.request_queue.empty()
+
+
+def test_wake_item_is_not_a_request():
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import \
+        WAKE_REQUEST_ID
+    item = RequestQueueItem(WAKE_REQUEST_ID)
+    assert item.is_wake_request and not item.is_normal_request
 
 
 def test_get_from_request_queue_async_behavior(executor_queue):
