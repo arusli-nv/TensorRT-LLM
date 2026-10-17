@@ -318,8 +318,9 @@ class MoEEplbWeightLayoutMixin:
     """The EPLB half that follows the weights, not the forward pass.
 
     "Weight" here means weight-side, not static-only: four of these members
-    return early unless ``_using_dynamic_load_balancer()``, so the block serves
-    the dynamic balancer at least as much as the static one. Naming it after
+    return early unless ``_using_host_weight_copies()`` (dynamic routing, or
+    static routing that restores slots), so the block serves the dynamic
+    balancer at least as much as the static one. Naming it after
     static layout would send a reader looking for the dynamic path elsewhere.
 
     ``create_weights`` / ``load_weights`` delegate to
@@ -337,7 +338,7 @@ class MoEEplbWeightLayoutMixin:
     """
 
     def _add_raw_shared_weights_for_unmap(self, weight_tensors: List[torch.Tensor]):
-        if self._using_dynamic_load_balancer():
+        if self._using_host_weight_copies():
             self.layer_load_balancer._add_raw_host_weight_for_unmap(weight_tensors)
 
     def _supports_load_balancer(self) -> bool:
@@ -357,9 +358,16 @@ class MoEEplbWeightLayoutMixin:
             return self.layer_load_balancer.is_dynamic_routing()
         return False
 
+    def _using_host_weight_copies(self) -> bool:
+        """Whether the load balancer keeps host copies of the experts and loadable slots (dynamic routing, or
+        static routing with restores)."""
+        return (
+            bool(self.layer_load_balancer) and self.layer_load_balancer.need_load_shared_weights()
+        )
+
     def register_parameter_weight_slot_fn(self, weight_name: str, local_slot_id: int):
         """Register parameter weight slot function for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not self._using_host_weight_copies():
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
@@ -368,7 +376,7 @@ class MoEEplbWeightLayoutMixin:
 
     def register_to_fix_weight_fn(self, weight_name: str):
         """Register weight fixing function for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not self._using_host_weight_copies():
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
@@ -395,7 +403,7 @@ class MoEEplbWeightLayoutMixin:
         self, weight_and_tensor_dict: Dict[str, torch.Tensor]
     ):
         """Register all parameter slot and weight fixing functions for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not self._using_host_weight_copies():
             return
 
         # Register weight functions for each local slot

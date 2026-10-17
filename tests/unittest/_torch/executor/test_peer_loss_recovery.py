@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scheduler-side WideEP peer-loss recovery with fake distributed, model, and authority."""
 
+import functools
 import signal
 import threading
 import time
@@ -87,9 +88,10 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK})):
     dist.broadcast.side_effect = lambda value, root: value
     dist.allgather.side_effect = lambda value, departed: [value] * WORLD_SIZE
     engine = Mock()
-    engine.moe_load_balancer.masked_placement_digest.return_value = "digest"
-    engine.moe_load_balancer.reconfigure_mask_only.side_effect = lambda failed: events.append(
-        ("placement", frozenset(failed))
+    engine.moe_load_balancer.recovery_placements.return_value = ["placement"]
+    engine.moe_load_balancer.placement_digest.return_value = "digest"
+    engine.moe_load_balancer.install_recovery_placement.side_effect = (
+        lambda failed, placements: events.append(("placement", frozenset(failed)))
     )
     engine.moe_execution_state.health = EPGroupHealth(WORLD_SIZE)
     executor.dist = dist
@@ -149,10 +151,11 @@ def test_recovery_runs_protocol_and_installs_in_order():
     ]
     assert recovery._executor.active_requests == [request]
     assert not recovery._peer_failed.is_set()
-    masked_placement_digest = (
-        recovery._executor.model_engine.moe_load_balancer.masked_placement_digest
-    )
-    masked_placement_digest.assert_called_once_with(failed)
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.recovery_placements.assert_called_once_with(failed)
+    # The placements installed are the ones whose digest went out with Ready.
+    load_balancer.placement_digest.assert_called_once_with(failed, ["placement"])
+    load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
 def _queued(request_id):
@@ -334,7 +337,7 @@ def _fail(error):
         lambda r: setattr(r._client, "replies", _happy_replies()[:2] + [Abort("stalled")]),
         lambda r: setattr(r._executor.dist.shrink, "side_effect", _fail(RuntimeError("shrink"))),
         lambda r: setattr(
-            r._executor.model_engine.moe_load_balancer.masked_placement_digest,
+            r._executor.model_engine.moe_load_balancer.recovery_placements,
             "side_effect",
             _fail(RuntimeError("placement")),
         ),
@@ -913,14 +916,16 @@ def test_create_registers_the_ranks_whose_loss_the_placement_covers(monkeypatch)
     executor.dist.enable_peer_loss_recovery.assert_called_once()
 
 
-def test_install_resident_placement_reroutes_before_masking():
+def test_install_recovery_placement_reroutes_before_masking():
     events = []
     load_balancer = Mock()
-    load_balancer.reconfigure_mask_only.side_effect = lambda dead: events.append(("routed", dead))
+    load_balancer.install_recovery_placement.side_effect = lambda dead, placements: events.append(
+        ("routed", dead)
+    )
     health = EPGroupHealth(WORLD_SIZE)
     state = Mock(health=health)
     state.install_mask.side_effect = lambda: events.append(("mask", health.get_mask_words()))
-    install = peer_loss_recovery.install_resident_placement
+    install = functools.partial(peer_loss_recovery.install_recovery_placement, placements=[])
 
     install(state, load_balancer, {FAILED_RANK}, own_rank=0)
 
