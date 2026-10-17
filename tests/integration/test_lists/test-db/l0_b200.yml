@@ -197,6 +197,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_execution_state.py
   - unittest/_torch/moe/test_moe_slot_gather.py
   - unittest/_torch/moe/test_moe_sort_source_slots.py
+  - unittest/_torch/executor/test_kv_cache_revert.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input

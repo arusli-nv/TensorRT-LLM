@@ -4319,6 +4319,34 @@ class KVCacheManagerV2(BaseResourceManager):
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
 
+    def revert_prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        """Undo the scheduler's KV cache allocations for a step whose forward is discarded.
+
+        A discarded step committed no blocks for reuse, and its KV writes are
+        overwritten when the step runs again. A request whose first context
+        chunk was discarded starts over without a cache. Later chunks shrink
+        back to their capacity before the step and, unlike a step skipped
+        after scheduling (revert_allocate_context, which suspends them), stay
+        resident: the KV cache is left exactly as before the step. Generation
+        requests give back the step's tokens. Draft KV, connectors and SWA
+        scratch reuse are not reverted: peer-loss recovery, the only caller,
+        refuses them.
+        """
+        for req in scheduled_batch.context_requests:
+            if req.is_first_context_chunk:
+                # Preparing it may have matched a reused prefix and moved the context cursor past it.
+                self.free_resources(req)
+                rewind_context_after_cache_drop(req, self.tokens_per_block)
+                continue
+            pre_cap, req.py_ctx_pre_resize_cap = req.py_ctx_pre_resize_cap, None
+            if pre_cap is not None and not self.kv_cache_map[req.py_request_id].resize(pre_cap):
+                raise RuntimeError(
+                    f"Failed to revert KV cache capacity for context request "
+                    f"{req.py_request_id} to {pre_cap}"
+                )
+        for req in scheduled_batch.generation_requests:
+            self.revert_allocate_generation(req)
+
     def _publish_sparse_metadata(self) -> None:
         """Refresh stable GPU rows on the execution stream before model work.
 
