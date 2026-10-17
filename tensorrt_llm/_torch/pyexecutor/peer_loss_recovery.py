@@ -54,6 +54,9 @@ _RECOVERY_TIMEOUT_ENV = "TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S"
 _RECOVERY_TIMEOUT_DEFAULT_S = 30.0
 # Workers register while every rank constructs its first executor.
 _REGISTRATION_TIMEOUT_S = 600.0
+# "empty": EPLB slots beyond one per expert are not routed to while healthy and receive a lost rank's experts;
+# "replicas": they keep serving replicas (a loss reroutes to them, or restores into them).
+_EXTRA_SLOTS_ENV = "TLLM_FAULT_TOLERANCE_EXTRA_SLOTS"
 
 Responses = List[Tuple[int, LlmResponse]]
 # A request and the context position and state it had before a step changed them.
@@ -277,6 +280,17 @@ class PeerLossRecovery(RecoveryHook):
                 "WideEP peer-loss recovery is enabled but the configuration "
                 f"lacks: {', '.join(unmet)}"
             )
+        extra_slots = os.environ.get(_EXTRA_SLOTS_ENV, "replicas")
+        if extra_slots not in ("replicas", "empty"):
+            raise ValueError(
+                f"{_EXTRA_SLOTS_ENV} must be 'replicas' or 'empty', got {extra_slots!r}"
+            )
+        if extra_slots == "empty":
+            emptied = load_balancer.empty_replica_slots()
+            if dist.rank == 0:
+                logger.info(
+                    f"WideEP peer-loss recovery keeps {emptied} EPLB slots empty for restores"
+                )
         recoverable = tuple(
             rank for rank in range(1, dist.world_size) if load_balancer.covers_loss_of(rank)
         )

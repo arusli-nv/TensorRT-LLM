@@ -45,6 +45,7 @@ every other request continues.
 | `TLLM_FAULT_TOLERANCE_AUTHORITY` | The authority's address; required to recover |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key (64 hex characters) for authority messages |
 | `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S` | How long a recovery may take before the job stops (default 30) |
+| `TLLM_FAULT_TOLERANCE_EXTRA_SLOTS` | EPLB slots beyond one per expert: `replicas` (default) serve replicas; `empty` are not routed to while healthy and take a lost rank's experts |
 
 At startup each rank logs which ranks' loss the job can recover from. A configuration that recovery does
 not support is refused at startup with the requirement it misses.

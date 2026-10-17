@@ -303,9 +303,9 @@ public:
     void reconfigureMaskOnly(std::vector<int> const& deadRanks);
 
     // should bind to python
-    // Mark deadRanks dead and install a new placement per layer ([epSize][slotCountPerRank] expert ids; dead ranks'
-    // rows are ignored), loading the local slots whose expert changes from EPLB's host weights. Every layer is
-    // validated before any changes; only while no iteration runs.
+    // Mark deadRanks dead and install a new placement per layer ([epSize][slotCountPerRank] expert ids, -1 = an
+    // empty slot that routing skips; dead ranks' rows are ignored), loading the local slots that get a new expert
+    // from EPLB's host weights. Every layer is validated before any changes; only while no iteration runs.
     void restorePlacement(
         std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
 
