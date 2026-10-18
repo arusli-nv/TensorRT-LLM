@@ -94,6 +94,21 @@ dying unless hang detection is on, the authority itself, and other errors in the
 the job as without fault tolerance. A job that lost a rank ends with a
 non-zero exit status at shutdown.
 
+Failure model: a failing rank stops (it dies, or it hangs and is fenced). A rank that keeps running but
+computes wrong results (for example silent memory corruption) is not detected: the survivors keep its
+results until it fails, and any tokens they streamed meanwhile stay delivered.
+
+Timeouts (see the settings above):
+
+| What | How long |
+|---|---|
+| A dead process | detected when its TCP connections close, in milliseconds |
+| A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured from a SIGSTOP to serving again at DEP32: 10.6 / 15.9 / 36.7 s with `hang_confirm_s` 3 / 10 / 30 |
+| A recovery | `recovery_timeout_s` (30 s) at the workers, `authority_timeout_s` (20 s) at the authority; a recovery takes milliseconds after detection |
+
+`hang_confirm_s` must exceed the slowest legitimate step plus host stalls (page-cache or file-system stalls of
+up to a minute were observed under load): a shorter value fences a slow but healthy rank.
+
 ## Not supported together with fault tolerance
 
 Refused at startup, with the requirement that is missing: speculative decoding other than one-model MTP
