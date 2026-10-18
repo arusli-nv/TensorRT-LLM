@@ -28,7 +28,11 @@ def load(monkeypatch, tmp_path):
 
 def test_defaults_without_a_file(load):
     assert load() == FaultToleranceConfig()
-    assert load().extra_slots == "empty" and not load().hang_detection
+    assert (
+        load().extra_slots == "empty"
+        and load().failure_domain == "node"
+        and not load().hang_detection
+    )
 
 
 def test_file_fields_override_the_defaults(load):
@@ -44,6 +48,7 @@ def test_file_fields_override_the_defaults(load):
     "text, match",
     [
         ("extra_slots: replicas\n", "extra_slots"),
+        ("failure_domain: rack\n", "failure_domain"),
         ("spare_slots: empty\n", "spare_slots"),
         ("recovery_timeout_s: 10\nauthority_timeout_s: 20\n", "authority_timeout_s"),
         ("heartbeat_s: 5\n", "heartbeat_s"),
@@ -70,6 +75,7 @@ def test_digest_is_stable_and_changes_with_any_field():
     assert digest == FaultToleranceConfig().digest() == FaultToleranceConfig(heartbeat_s=1).digest()
     changed = {
         "extra_slots": "borrowed",
+        "failure_domain": "rank",
         "recovery_timeout_s": 40.0,
         "authority_timeout_s": 10.0,
         "hang_detection": True,

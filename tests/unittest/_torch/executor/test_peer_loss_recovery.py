@@ -1063,7 +1063,7 @@ def test_recovery_delivers_buffered_error_responses_before_readmission():
 def _supported_executor():
     load_balancer = Mock()
     load_balancer.is_static_routing.return_value = True
-    load_balancer.covers_loss_of.side_effect = lambda dead: tuple(dead) in ((1,), (2,), (2, 3))
+    load_balancer.covers_loss_of.return_value = True
     kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     return SimpleNamespace(
         model_engine=SimpleNamespace(
@@ -1076,6 +1076,7 @@ def _supported_executor():
             rank=0,
             world_size=4,
             mapping=SimpleNamespace(enable_lm_head_tp_in_adp=False, moe_tp_size=1, gpus_per_node=2),
+            allgather=Mock(return_value=["a", "a", "b", "b"]),
         ),
         adp_router=DefaultADPRouter.__new__(DefaultADPRouter),
         drafter=None,
@@ -1169,10 +1170,42 @@ def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
     executor.dist.enable_peer_loss_recovery.assert_not_called()
 
 
-def test_failure_domains_are_every_rank_then_every_node_but_rank_0_s():
-    assert peer_loss_recovery.failure_domains(8, 4) == [*((r,) for r in range(1, 8)), (4, 5, 6, 7)]
-    assert peer_loss_recovery.failure_domains(6, 4)[-1] == (4, 5)
-    assert peer_loss_recovery.failure_domains(4, 1) == [(1,), (2,), (3,)]
+def test_failure_domains_are_every_rank_then_every_host_but_rank_0_s():
+    hosts = ["a"] * 4 + ["b"] * 4
+    assert peer_loss_recovery.failure_domains(hosts, "rank") == [(r,) for r in range(1, 8)]
+    assert peer_loss_recovery.failure_domains(hosts, "node") == [
+        *((r,) for r in range(1, 8)),
+        (4, 5, 6, 7),
+    ]
+    # Ranks mapped round-robin over the hosts: a node is the ranks on one host, not a block of ranks.
+    assert peer_loss_recovery.failure_domains(["a", "b", "a", "b"], "node")[-1] == (1, 3)
+    assert peer_loss_recovery.failure_domains(["a", "b", "c", "d"], "node") == [
+        (1,),
+        (2,),
+        (3,),
+    ]
+
+
+@pytest.mark.parametrize("failure_domain, refused", [("rank", False), ("node", True)])
+def test_create_refuses_a_failure_domain_the_slots_cannot_cover(
+    monkeypatch, failure_domain, refused
+):
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "fault_tolerance_config",
+        lambda: FaultToleranceConfig(failure_domain=failure_domain),
+    )
+    monkeypatch.setattr(
+        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+    )
+    executor = _supported_executor()
+    executor.model_engine.moe_load_balancer.covers_loss_of.side_effect = lambda dead: len(dead) == 1
+    if refused:
+        with pytest.raises(ValueError, match=r"failure_domain=node .* \(2, 3\)"):
+            PeerLossRecovery.create(executor)
+    else:
+        assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 
 def test_create_accepts_online_eplb(monkeypatch):
@@ -1230,9 +1263,14 @@ def test_create_registers_the_domains_whose_loss_the_placement_covers(monkeypatc
         "_register",
         lambda rank, recoverable: registered.append((rank, recoverable)) or (Mock(), frozenset()),
     )
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "fault_tolerance_config",
+        lambda: FaultToleranceConfig(failure_domain="node"),
+    )
     executor = _supported_executor()
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
-    assert registered == [(0, ((1,), (2,), (2, 3)))]
+    assert registered == [(0, ((1,), (2,), (3,), (2, 3)))]
     executor.dist.enable_peer_loss_recovery.assert_called_once()
 
 

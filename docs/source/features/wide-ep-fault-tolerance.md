@@ -51,6 +51,7 @@ every other request continues.
 
 | Setting | Meaning |
 |---|---|
+| `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
 | `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `empty` (default) are not routed to while healthy and take a lost rank's experts; `borrowed` are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
 | `recovery_timeout_s` | How long a worker's recovery may take before the job stops (default 30) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20; below `recovery_timeout_s`) |
@@ -71,10 +72,10 @@ The loss, with the NVLink fabric healthy, of either:
 
 - a recoverable rank's process (killed, for example by the out-of-memory killer, or failed with an error
   that corrupts its CUDA context, such as an illegal memory access, after which it ends itself), or
-- every rank of one node other than node 0 (ranks `n * gpus_per_node` to `(n + 1) * gpus_per_node - 1`).
-  The survivors must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and `K` GPUs
-  per node, `s * (N - K)` must be at least the number of experts. For DeepSeek-R1 (256 experts) at DEP32
-  with 4 GPUs per node, that is 320 slots.
+- with `failure_domain: node` (the default), every rank on one host other than rank 0's (the ranks that report the same
+  host name). The survivors must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and
+  `K` ranks per host, `s * (N - K)` must be at least the number of experts, which startup checks. For
+  DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, that is 320 slots.
 
 Several such ranks lost together, or one more during a recovery (before the survivors install the new
 communicator), are recovered as one loss if the survivors' slots still hold every expert.

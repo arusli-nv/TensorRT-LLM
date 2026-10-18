@@ -40,6 +40,11 @@ class FaultToleranceConfig(StrictBaseModel):
         "them; a restore fills them) or ``borrowed`` (also without device memory until a restore, the KV cache can "
         "use it). Online EPLB keeps replicas in them; setting this with online EPLB is an error.",
     )
+    failure_domain: Literal["rank", "node"] = Field(
+        default="node",
+        description="The largest loss to recover from: every rank of one host (rank 0's excluded), or one rank. "
+        "Startup refuses an EPLB placement whose slots cannot serve every expert without such a loss.",
+    )
     recovery_timeout_s: PositiveFloat = Field(
         default=30.0,
         description="How long a worker's recovery may take, including finishing a long step first.",

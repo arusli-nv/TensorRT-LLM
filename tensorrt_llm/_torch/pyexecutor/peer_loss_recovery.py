@@ -6,6 +6,7 @@ import base64
 import collections
 import dataclasses
 import functools
+import socket
 import threading
 import time
 from typing import (
@@ -97,16 +98,20 @@ def _one_model_mtp_or_none(spec_config) -> bool:
     )
 
 
-def failure_domains(world_size: int, gpus_per_node: int) -> List[FailureDomain]:
-    """The rank sets whose loss recovery can cover: every rank but 0, then every node but node 0.
+def failure_domains(hosts: Sequence[str], failure_domain: str) -> List[FailureDomain]:
+    """The rank sets to recover from: every rank but 0, then for ``node`` every node but rank 0's.
 
-    Rank ``r`` runs on node ``r // gpus_per_node``.
+    Args:
+        hosts: Per rank, the host it runs on.
+        failure_domain: ``rank`` or ``node`` (FaultToleranceConfig.failure_domain).
     """
-    nodes = [
-        tuple(range(start, min(start + gpus_per_node, world_size)))
-        for start in range(gpus_per_node, world_size, gpus_per_node)
-    ]
-    return list(dict.fromkeys([(rank,) for rank in range(1, world_size)] + nodes))
+    domains = [(rank,) for rank in range(1, len(hosts))]
+    if failure_domain == "node":
+        nodes: Dict[str, List[int]] = {}
+        for rank, host in enumerate(hosts):
+            nodes.setdefault(host, []).append(rank)
+        domains += [tuple(ranks) for host, ranks in nodes.items() if host != hosts[0]]
+    return list(dict.fromkeys(domains))
 
 
 @functools.cache
@@ -332,11 +337,16 @@ class PeerLossRecovery(RecoveryHook):
                 "WideEP peer-loss recovery is enabled but the configuration "
                 f"lacks: {', '.join(unmet)}"
             )
-        recoverable = tuple(
-            domain
-            for domain in failure_domains(dist.world_size, dist.mapping.gpus_per_node)
-            if load_balancer.covers_loss_of(domain)
-        )
+        # Nodes from the hosts the ranks run on, not from the rank order (a launcher may map ranks round-robin).
+        domains = failure_domains(dist.allgather(socket.gethostname()), config.failure_domain)
+        uncovered = [domain for domain in domains if not load_balancer.covers_loss_of(domain)]
+        if uncovered:
+            raise ValueError(
+                f"WideEP peer-loss recovery with failure_domain={config.failure_domain} needs EPLB slots that "
+                f"serve every expert without each domain; the survivors cannot after losing {uncovered[0]} "
+                "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
+            )
+        recoverable = tuple(domains)
         dist.enable_peer_loss_recovery()
         client, admitted = _register(dist.rank, recoverable)
         if dist.rank == 0:
