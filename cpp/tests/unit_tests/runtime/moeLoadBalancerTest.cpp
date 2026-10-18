@@ -510,8 +510,8 @@ public:
     static constexpr int kDeadRank = 2;
     static constexpr int kWeightElems = 256;
 
-    explicit RestorePlacementLayer(bool withHostWeights)
-        : mLoadBalancer(/*epRank=*/0, kEpSize, /*layerUpdatesPerIter=*/1)
+    explicit RestorePlacementLayer(bool withHostWeights, int layerUpdatesPerIter = 1)
+        : mLoadBalancer(/*epRank=*/0, kEpSize, layerUpdatesPerIter)
     {
         mLoadBalancer.setUseGpuMemcpy(true);
         mLayer = mLoadBalancer.AddLayer(kExpertCount, /*topK=*/2, kSlotCountPerRank);
@@ -576,6 +576,28 @@ private:
 };
 
 } // namespace
+
+TEST(MoeLoadBalancerRestoreTest, OneSlotPerExpertRoutingKeepsOneReplicaPerExpert)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/0);
+    // Experts 0 and 1 have two replicas: routing must choose between them.
+    EXPECT_FALSE(setup.mLayer->routesEachExpertToOneSlot());
+
+    // Every second copy emptied: one slot per expert.
+    setup.mLoadBalancer.restorePlacement({}, {{{0, -1}, {1, -1}, {2, 3}, {-1, -1}}});
+    EXPECT_TRUE(setup.mLayer->routesEachExpertToOneSlot());
+
+    // Losing rank 2 moves its experts into empty slots: still one replica each.
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {{{0, 2}, {1, 3}, {-1, -1}, {-1, -1}}});
+    EXPECT_TRUE(setup.mLayer->routesEachExpertToOneSlot());
+
+    // A second copy would need the replica-choosing kernel, which captured graphs do not launch.
+    EXPECT_THROW(
+        setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {{{0, 2}, {1, 3}, {-1, -1}, {0, -1}}}),
+        std::exception);
+}
 
 TEST(MoeLoadBalancerRestoreTest, RestorePlacementLoadsLostExpertsIntoSlots)
 {

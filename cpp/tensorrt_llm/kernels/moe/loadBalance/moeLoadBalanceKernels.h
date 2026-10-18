@@ -110,8 +110,11 @@ void moeHierarchicalStatisticUpdate(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBala
 // @param tokenCount: the token count to compute the route
 // @param offsetByEpRank: whether to offset the round robin position by epRank
 // @param stream: the CUDA stream to be used
+// @param oneSlotPerExpert: every expert has exactly one replica (more slots than experts, the rest empty), so no
+// replica needs choosing
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream);
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream,
+    bool oneSlotPerExpert = false);
 
 // @brief wait for the signal from gpu to cpu on host
 //

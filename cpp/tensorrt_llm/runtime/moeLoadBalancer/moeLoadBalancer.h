@@ -172,6 +172,11 @@ public:
         return mGpuPlacementGpuAccess;
     }
 
+    // Whether routing may use the kernel for one slot per expert: the placement is static and every expert has
+    // exactly one replica. Once this returned true (CUDA graphs may have captured that kernel), every later
+    // placement must keep one replica per expert.
+    bool routesEachExpertToOneSlot();
+
     tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal* getSignal()
     {
         return mSingleLayerSignal;
@@ -205,8 +210,11 @@ private:
     void validatePlacement(
         std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
     void installPlacement(std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds);
+    // Rejects replica counts the captured routing kernel cannot serve (see routesEachExpertToOneSlot).
+    void checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const;
 
     MoeLoadBalancer* mMoeLoadBalancer = nullptr;
+    bool mOneSlotRoutingUsed = false;
 
     std::unique_ptr<MoeWeightUpdaterBase> mWeightUpdater;
 

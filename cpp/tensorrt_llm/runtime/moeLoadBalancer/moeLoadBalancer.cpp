@@ -615,9 +615,28 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeReplicaCounts(
     return expertReplicaCount;
 }
 
+bool SingleLayerMoeLoadBalancer::routesEachExpertToOneSlot()
+{
+    if (mMoeLoadBalancer->mLayerUpdatesPerIter != 0)
+    {
+        return false;
+    }
+    auto const& counts = mCpuPlacementInfo.expertReplicaCount;
+    bool const oneSlotPerExpert = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 1; });
+    mOneSlotRoutingUsed = mOneSlotRoutingUsed || oneSlotPerExpert;
+    return oneSlotPerExpert;
+}
+
+void SingleLayerMoeLoadBalancer::checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const
+{
+    TLLM_CHECK_WITH_INFO(!mOneSlotRoutingUsed
+            || std::all_of(expertReplicaCount.begin(), expertReplicaCount.end(), [](int count) { return count == 1; }),
+        "Routing of layer %d serves one slot per expert; a placement must keep one replica per expert", mLayerId);
+}
+
 void SingleLayerMoeLoadBalancer::validateMaskOnly(std::vector<uint8_t> const& deadRankMask) const
 {
-    (void) computeMaskOnlyReplicaCounts(deadRankMask);
+    checkRoutingKernelServes(computeMaskOnlyReplicaCounts(deadRankMask));
 }
 
 void SingleLayerMoeLoadBalancer::reconfigureMaskOnly(std::vector<uint8_t> const& deadRankMask)
@@ -643,7 +662,7 @@ void SingleLayerMoeLoadBalancer::reconfigureMaskOnly(std::vector<uint8_t> const&
 void SingleLayerMoeLoadBalancer::validatePlacement(
     std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const
 {
-    (void) computeReplicaCounts(deadRankMask, rankExpertIds);
+    checkRoutingKernelServes(computeReplicaCounts(deadRankMask, rankExpertIds));
     TLLM_CHECK_WITH_INFO(mWeightUpdater->hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
 }
 
