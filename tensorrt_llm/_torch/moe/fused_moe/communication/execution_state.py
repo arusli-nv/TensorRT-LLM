@@ -52,24 +52,20 @@ class MoeExecutionState:
     def for_model(cls, model: torch.nn.Module) -> MoeExecutionState:
         """Create the state and bind every NVLinkOneSided layer of ``model``.
 
+        Bound layers dispatch into fixed receive slots. A backend that cannot
+        read them in place (``supports_dispatch_receive_slots``) gets a compact
+        copy of the hidden states from the scheduler.
+
         Raises:
-            RuntimeError: The model has no NVLinkOneSided layer, a layer's MoE
-                backend cannot read the receive slots, or the layers do not
-                share one EPGroupHealth.
+            RuntimeError: The model has no NVLinkOneSided layer, or the layers
+                do not share one EPGroupHealth.
         """
         from ..configurable_moe import ConfigurableMoE  # imports this package
 
         comms = {}
         for module in model.modules():
             if isinstance(module, ConfigurableMoE) and isinstance(module.comm, NVLinkOneSided):
-                comm = module.comm
-                # Bound execution hands the experts the fixed receive slots.
-                if not module.backend.supports_dispatch_receive_slots():
-                    raise RuntimeError(
-                        "WideEP recovery requires a MoE backend that reads the dispatch receive "
-                        "slots: CuteDSL NVFP4 on Blackwell"
-                    )
-                comms[id(comm)] = comm
+                comms[id(module.comm)] = module.comm
         if not comms:
             raise RuntimeError("WideEP recovery requires NVLinkOneSided MoE communication")
         healths = {id(comm.ep_group_health) for comm in comms.values()}

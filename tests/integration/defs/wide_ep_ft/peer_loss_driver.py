@@ -63,7 +63,7 @@ def llm_kwargs(overlap: bool = False) -> dict:
         cuda_graph_config=dict(batch_sizes=[1, 2, 4, 8], enable_padding=True),
         kv_cache_config=dict(enable_block_reuse=False, free_gpu_memory_fraction=0.2),
         moe_config=dict(
-            # Recovery needs a MoE backend that reads the dispatch receive slots in place.
+            # CuteDSL NVFP4 reads the dispatch receive slots in place (other backends get a copy).
             backend="CUTEDSL",
             disable_finalize_fusion=True,
             load_balancer=dict(

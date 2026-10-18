@@ -618,6 +618,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
+                x, x_sf = self._compact_receive_slots(x, x_sf)
                 if should_update_eplb_after_dispatch:
                     gathered_stats = moe.comm.get_eplb_gathered_statistics()
                     moe._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
@@ -632,6 +633,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
+                x, x_sf = self._compact_receive_slots(x, x_sf)
                 if not uses_internal_dispatch_quantization:
                     x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
@@ -1060,6 +1062,22 @@ class ExternalCommMoEScheduler(MoEScheduler):
             ),
         )
 
+    def _compact_receive_slots(
+        self, x: torch.Tensor, x_sf: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The hidden states (and scales) in compact token order for a backend that cannot read
+        NVLinkOneSided's receive slots in place; unchanged otherwise. The routing is compact already."""
+        moe = self.moe
+        if (
+            not isinstance(moe.comm, NVLinkOneSided)
+            or moe.backend.supports_dispatch_receive_slots()
+        ):
+            return x, x_sf
+        source_slots = moe.comm.dispatch_source_slots()
+        if source_slots is None:
+            return x, x_sf
+        return source_slots.compact(x), None if x_sf is None else source_slots.compact(x_sf)
+
     def _build_comm_plan(
         self,
         all_rank_num_tokens: Optional[List[int]],
@@ -1088,7 +1106,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         recv_expert_count = None
         deep_ep_expert_capacity = None
         source_slots = None
-        if isinstance(moe.comm, NVLinkOneSided):
+        if isinstance(moe.comm, NVLinkOneSided) and moe.backend.supports_dispatch_receive_slots():
             source_slots = moe.comm.dispatch_source_slots()
         if use_deep_ep_direct_metadata:
             assert isinstance(moe.comm, DeepEPLowLatency)

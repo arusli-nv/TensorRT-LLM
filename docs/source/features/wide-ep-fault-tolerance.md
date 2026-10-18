@@ -11,7 +11,9 @@ every other request continues.
 - Attention data parallelism with expert parallelism over the whole world (DEP), PyTorch backend,
   KV Cache Manager V2 without KV block reuse (`kv_cache_config.enable_block_reuse: false`), the default
   attention-DP router.
-- The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`).
+- NVLinkOneSided all-to-all. The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`)
+  reads the receive slots in place; layers on other backends (for example a BF16 MTP layer) get a compact
+  copy of their hidden states.
 - An EPLB load balancer (`moe_config.load_balancer` with `num_slots` above the number of experts), static
   (`layer_updates_per_iter: 0`) or online. Its per-node host copies of every expert restore the experts of a
   lost rank into extra slots; rank 0 is never recoverable. With online EPLB the survivors adopt rank 0's

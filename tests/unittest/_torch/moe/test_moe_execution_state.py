@@ -12,7 +12,6 @@ import torch
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import DispatchSourceSlots
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
@@ -216,23 +215,37 @@ def test_rearm_resets_bound_layers_and_install_refuses_a_membership_without_this
 def test_for_model_refuses_models_it_cannot_bind() -> None:
     with pytest.raises(RuntimeError, match="NVLinkOneSided"):
         MoeExecutionState.for_model(torch.nn.Linear(1, 1))
-    # Bound execution hands the experts the receive slots; other backends are refused.
-    layer = ConfigurableMoE.__new__(ConfigurableMoE)
-    torch.nn.Module.__init__(layer)
-    layer.comm = _frontend(EPGroupHealth(2))
-    layer.backend = SimpleNamespace(supports_dispatch_receive_slots=lambda: False)
-    with pytest.raises(RuntimeError, match="receive slots"):
-        MoeExecutionState.for_model(layer)
 
 
-def test_comm_plan_carries_the_dispatch_source_slots() -> None:
+@pytest.mark.parametrize("reads_slots", [True, False])
+def test_backends_get_the_slots_or_a_compact_copy(reads_slots: bool) -> None:
     comm = _frontend(EPGroupHealth(2))
-    slots = DispatchSourceSlots(torch.zeros(2, dtype=torch.int32), source_tokens=4, slot_tokens=8)
+    slots = DispatchSourceSlots(torch.zeros(2, dtype=torch.int32), source_tokens=2, slot_tokens=3)
     comm._dispatch_state = {"source_slots": slots}
     comm.supports_post_quant_dispatch = lambda: True
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
-    scheduler.moe = SimpleNamespace(comm=comm, enable_alltoall=True)
+    backend = SimpleNamespace(supports_dispatch_receive_slots=lambda: reads_slots)
+    scheduler.moe = SimpleNamespace(comm=comm, enable_alltoall=True, backend=backend)
     plan = scheduler._build_comm_plan(
-        all_rank_num_tokens=[4, 4], output_dtype=None, do_finalize=False
+        all_rank_num_tokens=[2, 2], output_dtype=None, do_finalize=False
     )
-    assert plan.source_slots is slots
+    # Source s's token i is slot row 3 * s + i; row 2 of each slot holds no token of this forward.
+    x = torch.arange(6 * 4).view(6, 4)
+    x_sf = torch.arange(6).view(6, 1)
+    compact_x, compact_sf = scheduler._compact_receive_slots(x, x_sf)
+    if reads_slots:
+        assert plan.source_slots is slots
+        assert compact_x is x and compact_sf is x_sf
+    else:
+        assert plan.source_slots is None
+        assert compact_x.tolist() == x[[0, 1, 3, 4]].tolist()
+        assert compact_sf.view(-1).tolist() == [0, 1, 3, 4]
+
+
+def test_compact_copy_is_contiguous_with_one_token_per_source() -> None:
+    # A draft step sends one token per source; reshaping [sources, 1, hidden] alone would keep the slot stride.
+    slots = DispatchSourceSlots(torch.zeros(4, dtype=torch.int32), source_tokens=1, slot_tokens=3)
+    x = torch.arange(12 * 5).view(12, 5)
+    compact = slots.compact(x)
+    assert compact.is_contiguous()
+    assert compact.tolist() == x[[0, 3, 6, 9]].tolist()

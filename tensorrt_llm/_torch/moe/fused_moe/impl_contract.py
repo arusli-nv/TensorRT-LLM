@@ -585,6 +585,17 @@ class DispatchSourceSlots:
     source_tokens: int
     slot_tokens: int
 
+    def compact(self, payload: torch.Tensor) -> torch.Tensor:
+        """``payload``'s rows in the compact token order, ``[num_sources * source_tokens, ...]`` (a copy).
+
+        For backends that cannot read the slots in place. Rows past a source's ``valid_counts``
+        keep stale values; the compact routing gives them expert -1, so no expert reads them.
+        """
+        sources = self.valid_counts.size(0)
+        rows = payload.view(sources, self.slot_tokens, *payload.shape[1:])[:, : self.source_tokens]
+        # reshape can return a strided view (one token per source merges the size-1 dimension away).
+        return rows.reshape(sources * self.source_tokens, *payload.shape[1:]).contiguous()
+
 
 @dataclass(frozen=True)
 class MoECommPlan:
