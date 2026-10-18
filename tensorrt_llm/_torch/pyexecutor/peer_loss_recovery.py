@@ -274,6 +274,8 @@ class PeerLossRecovery(RecoveryHook):
         """
         if not peer_loss_recovery_enabled():
             return RecoveryHook()
+        from ..attention.backends.sparse.dsa import DSACacheManagerV2
+
         engine = executor.model_engine
         dist = executor.dist
         load_balancer = engine.moe_load_balancer
@@ -290,7 +292,9 @@ class PeerLossRecovery(RecoveryHook):
             "no beam search": executor.max_beam_width == 1,
             "no KV cache transceiver": executor.kv_cache_transceiver is None,
             "no KV connector": executor.kv_connector_manager is None,
-            "KV Cache Manager V2": type(kv_cache_manager) is KVCacheManagerV2,
+            # Managers whose step allocation and revert are KVCacheManagerV2's own (DSA keeps its indexer K
+            # cache as another buffer of the same pages).
+            "KV Cache Manager V2": type(kv_cache_manager) in (KVCacheManagerV2, DSACacheManagerV2),
             # Discarding a later context chunk after earlier chunks committed reusable blocks
             # is not tested yet.
             "no KV block reuse": not getattr(kv_cache_manager, "enable_block_reuse", False),

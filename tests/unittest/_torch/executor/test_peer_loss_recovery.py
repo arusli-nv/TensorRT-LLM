@@ -1030,6 +1030,18 @@ def test_create_accepts_online_eplb(monkeypatch):
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 
+def test_create_accepts_the_dsa_kv_cache_manager(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
+
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+    )
+    executor = _supported_executor()
+    executor.kv_cache_manager = DSACacheManagerV2.__new__(DSACacheManagerV2)
+    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+
+
 def _spec_config(mode: "SpecMode", use_dynamic_tree: bool = False) -> SimpleNamespace:
     return SimpleNamespace(spec_dec_mode=mode, use_dynamic_tree=use_dynamic_tree)
 
