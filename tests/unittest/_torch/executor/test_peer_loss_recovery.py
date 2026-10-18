@@ -35,6 +35,7 @@ from tensorrt_llm.executor.recovery.client import (
     RecoveryInterrupted,
     RecoveryTimeout,
 )
+from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
@@ -638,11 +639,14 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
         128,
     )
 
-    monkeypatch.delenv(hang_evidence.HANG_DETECTION_ENV, raising=False)
     recovery.run(Mock(return_value=None))
     assert started == []
 
-    monkeypatch.setenv(hang_evidence.HANG_DETECTION_ENV, "1")
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "fault_tolerance_config",
+        lambda: FaultToleranceConfig(hang_detection=True),
+    )
     recovery.run(Mock(return_value=None))
     assert len(started) == 1 and stopped == started and closed == [1]
 
@@ -945,6 +949,14 @@ def test_recovery_readmits_requests_that_never_reached_their_rank():
 
     assert recovery._executor.request_accumulated[:1] == [torn]
     assert recovery._request_owners == {22: (1, delivered)}
+
+
+def test_a_request_cancelled_while_waiting_is_forgotten_not_readmitted():
+    """Cancelling a waiting request answers nothing: its owner entry must go with the cancel."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    recovery.requests_routed({3: [_queued(21)]})
+    _broadcast(recovery, [RequestQueueItem(21, is_canceled_request=True)])
+    assert recovery._request_owners == {}
 
 
 def test_survivors_join_departed_request_responses():

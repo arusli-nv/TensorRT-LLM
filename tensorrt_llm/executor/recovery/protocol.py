@@ -49,11 +49,13 @@ class Register:
     """Worker -> authority: announce a rank and the failure domains whose loss it can recover from.
 
     ``recoverable_domains`` are sorted rank sets (a single rank or a whole node) whose
-    combined loss this worker's expert placement absorbs.
+    combined loss this worker's expert placement absorbs. ``config_digest`` is the worker's
+    ``FaultToleranceConfig.digest()``.
     """
 
     rank: int
     recoverable_domains: tuple[tuple[int, ...], ...]
+    config_digest: str
 
 
 @dataclass(frozen=True)

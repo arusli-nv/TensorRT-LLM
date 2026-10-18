@@ -27,6 +27,7 @@ import zmq
 
 from ...logger import logger
 from .client import load_key
+from .config import COMMAND_FENCE_GRACE_S, CONFIG_ENV, FaultToleranceConfig, fault_tolerance_config
 from .hang_monitor import HangMonitor, HungRank
 from .protocol import (
     MAX_MESSAGE_BYTES,
@@ -56,13 +57,7 @@ __all__ = ["Phase", "RecoveryAuthority", "main", "router_socket", "serve"]
 Outbound = list[tuple[bytes, Message]]
 
 _CLOSE_LINGER_MS = 1000
-# How long the workers' own fencing (the hung rank's evidence thread, then a node-mate) gets before the fence
-# command runs.
-_COMMAND_FENCE_GRACE_S = 5.0
 _REJECTION_LOG_INTERVAL_S = 10.0
-# Hang detection runs when the authority and the workers both have it enabled.
-HANG_DETECTION_ENV = "TLLM_FAULT_TOLERANCE_HANG_DETECTION"
-HANG_CONFIRM_ENV = "TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S"
 
 
 class Phase(enum.Enum):
@@ -106,9 +101,11 @@ class RecoveryAuthority:
         hang_monitor: Judges the workers' heartbeats and device waits; None ignores them.
         fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason,
             host and pid): called if the rank's loss has not started a recovery
-            ``_COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
+            ``COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
             evidence thread and to a node-mate's. It must end that process, whose loss then
             recovers as any other. None relies on the workers alone.
+        config_digest: The ``FaultToleranceConfig.digest()`` every worker must register with
+            (default: that of the default settings).
     """
 
     def __init__(
@@ -117,8 +114,10 @@ class RecoveryAuthority:
         recovery_timeout: float = 20.0,
         hang_monitor: HangMonitor | None = None,
         fence: Callable[[HungRank], None] | None = None,
+        config_digest: str | None = None,
     ) -> None:
         self.world_size = world_size
+        self.config_digest = config_digest or FaultToleranceConfig().digest()
         self.recovery_timeout = recovery_timeout
         self.hang_monitor = hang_monitor
         self._fence = fence
@@ -238,7 +237,7 @@ class RecoveryAuthority:
         )
         targets += node_mates[:1]
         if self._fence is not None:
-            self._command_fence = (now + _COMMAND_FENCE_GRACE_S, hung)
+            self._command_fence = (now + COMMAND_FENCE_GRACE_S, hung)
         return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
 
     def abort(self, reason: str, route: bytes | None = None) -> Outbound:
@@ -282,6 +281,11 @@ class RecoveryAuthority:
             raise _Violation(f"invalid or duplicate registration {message}")
         if route in self._workers:
             raise _Violation(f"{message} from the route of rank {self._workers[route].rank}")
+        if message.config_digest != self.config_digest:
+            raise _Violation(
+                f"rank {message.rank} has fault-tolerance settings {message.config_digest}, the authority "
+                f"{self.config_digest}: set the same {CONFIG_ENV} on the workers and the authority"
+            )
         self._workers[route] = message
         self._routes[message.rank] = route
         if len(self._routes) < self.world_size:
@@ -528,25 +532,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument(
-        "--recovery-timeout",
-        type=float,
-        default=20.0,
-        help="seconds from the first Stopped to Commit; keep below the workers' timeout",
-    )
-    parser.add_argument(
-        "--hang-confirm-s",
-        type=float,
-        default=float(os.environ.get(HANG_CONFIRM_ENV, "30")),
-        help="seconds the evidence of a hung rank must hold before it is confirmed; must exceed "
-        f"the slowest legitimate step plus host stalls (default ${HANG_CONFIRM_ENV} or 30)",
-    )
-    parser.add_argument(
-        "--heartbeat-timeout-s",
-        type=float,
-        default=5.0,
-        help="seconds without a worker heartbeat after which it counts as missing",
-    )
-    parser.add_argument(
         "--fence-command",
         default="",
         help="last-resort command that kills a hung worker the workers could not fence (its own "
@@ -558,13 +543,18 @@ def main(argv: list[str] | None = None) -> None:
         logger.set_level("info")
 
     key = load_key()
+    # Timeouts and hang detection come from the workers' configuration file (TLLM_FAULT_TOLERANCE_CONFIG).
+    config = fault_tolerance_config()
     hang_monitor = None
-    if os.environ.get(HANG_DETECTION_ENV) == "1":
+    if config.hang_detection:
         hang_monitor = HangMonitor(
-            tuple(range(args.world_size)), args.hang_confirm_s, args.heartbeat_timeout_s
+            tuple(range(args.world_size)), config.hang_confirm_s, config.heartbeat_timeout_s
         )
     fence = command_fence(args.fence_command) if args.fence_command else None
-    authority = RecoveryAuthority(args.world_size, args.recovery_timeout, hang_monitor, fence)
+    logger.info(f"Recovery authority: fault-tolerance settings {config.digest()}: {config}")
+    authority = RecoveryAuthority(
+        args.world_size, config.authority_timeout_s, hang_monitor, fence, config.digest()
+    )
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())

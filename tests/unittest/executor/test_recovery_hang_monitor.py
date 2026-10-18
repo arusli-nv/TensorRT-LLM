@@ -7,12 +7,14 @@ import pytest
 from tensorrt_llm.executor.recovery import authority as authority_module
 from tensorrt_llm.executor.recovery import protocol
 from tensorrt_llm.executor.recovery.authority import Phase, RecoveryAuthority
+from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 from tensorrt_llm.executor.recovery.hang_monitor import HangMonitor, HungRank
 from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat, Register, Stopped
 
 pytestmark = pytest.mark.cpu_only
 
 RANKS = (0, 1, 2, 3)
+DIGEST = FaultToleranceConfig().digest()
 CONFIRM, HB_TIMEOUT = 10.0, 3.0
 
 
@@ -166,7 +168,7 @@ def _serving_authority(fenced):
         fence=lambda hung: fenced.append((hung.rank, hung.reason, hung.host, hung.pid)),
     )
     for rank in RANKS:
-        authority.handle(f"rank-{rank}".encode(), Register(rank, ((1,), (2,), (3,))), 0.0)
+        authority.handle(f"rank-{rank}".encode(), Register(rank, ((1,), (2,), (3,)), DIGEST), 0.0)
     assert authority.phase is Phase.SERVING
     return authority
 

@@ -22,27 +22,9 @@ from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
+from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-
-# "empty": under WideEP peer-loss recovery, EPLB slots beyond one per expert
-# are not routed to while healthy and receive a lost rank's experts;
-# "borrowed": as "empty", and those slots hold no device memory until a
-# restore loads them (the KV cache can use it meanwhile);
-# "replicas": they keep serving replicas (a loss reroutes to them, or restores
-# into them).
-EXTRA_SLOTS_ENV = "TLLM_FAULT_TOLERANCE_EXTRA_SLOTS"
-
-
-def extra_slots_mode() -> str:
-    """The ``TLLM_FAULT_TOLERANCE_EXTRA_SLOTS`` mode: ``replicas`` (default), ``empty`` or ``borrowed``."""
-    mode = os.environ.get(EXTRA_SLOTS_ENV, "replicas")
-    if mode not in ("replicas", "empty", "borrowed"):
-        raise ValueError(
-            f"{EXTRA_SLOTS_ENV} must be 'replicas', 'empty' or 'borrowed', got {mode!r}"
-        )
-    return mode
-
 
 # madvise(2) advice that builds this process's page-table entries for resident pages (Linux 5.14+).
 _MADV_POPULATE_READ = 22
@@ -1006,12 +988,7 @@ class MoeLoadBalancer:
         """
         Register weights after model has been moved to cuda, should be invoked after model.to("cuda") and before finalize_model.
         """
-        if peer_loss_recovery_enabled() and extra_slots_mode() in (
-                "empty", "borrowed") and not self.is_static_routing():
-            raise ValueError(
-                f"{EXTRA_SLOTS_ENV}={extra_slots_mode()} needs a static EPLB placement; online EPLB fills the "
-                "extra slots")
-        if self._borrows_extra_slots():
+        if self.extra_slots_mode() == "borrowed":
             # Borrowed slots are not host accessible: restores copy on the GPU.
             self.set_use_gpu_memcpy(True)
             for layer in self.single_layer_load_balancers:
@@ -1023,9 +1000,27 @@ class MoeLoadBalancer:
         for layer in self.single_layer_load_balancers:
             layer.register_weight_slots_after_to_cuda()
 
-    def _borrows_extra_slots(self) -> bool:
-        return (peer_loss_recovery_enabled()
-                and extra_slots_mode() == "borrowed")
+    def extra_slots_mode(self) -> Optional[str]:
+        """What WideEP peer-loss recovery keeps in the EPLB slots beyond one per expert; None without it.
+
+        ``replicas`` under online EPLB (a loss reroutes to them or restores
+        into them). With a static placement, the fault-tolerance config's
+        ``empty`` (not routed to while healthy; a restore fills them) or
+        ``borrowed`` (also without device memory until a restore maps it).
+
+        Raises:
+            ValueError: The config sets ``extra_slots`` for online EPLB, which fills the extra slots itself.
+        """
+        if not peer_loss_recovery_enabled():
+            return None
+        config = fault_tolerance_config()
+        if not self.is_static_routing():
+            if "extra_slots" in config.model_fields_set:
+                raise ValueError(
+                    f"extra_slots={config.extra_slots} needs a static EPLB placement; online EPLB keeps replicas "
+                    "in the extra slots")
+            return "replicas"
+        return config.extra_slots
 
     def finalize_model(self):
         """
@@ -1039,8 +1034,7 @@ class MoeLoadBalancer:
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
-        if peer_loss_recovery_enabled() and extra_slots_mode() in ("empty",
-                                                                   "borrowed"):
+        if self.extra_slots_mode() in ("empty", "borrowed"):
             # Before warmup, so autotuning and CUDA graph capture see the
             # healthy routing.
             emptied = self.empty_replica_slots()

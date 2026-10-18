@@ -47,11 +47,16 @@ every other request continues.
 | `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY` | The authority's address; required to recover |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key (64 hex characters) for authority messages |
-| `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S` | How long a recovery may take before the job stops (default 30) |
-| `TLLM_FAULT_TOLERANCE_EXTRA_SLOTS` | EPLB slots beyond one per expert: `replicas` (default) serve replicas; `empty` are not routed to while healthy and take a lost rank's experts; `borrowed` are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it); `empty` and `borrowed` need a static EPLB placement |
-| `TLLM_FAULT_TOLERANCE_HANG_DETECTION=1` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (set on workers and authority) |
-| `TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S` | How long the evidence of a hang must hold before it is confirmed (default 30; above the slowest legitimate step) |
-| `TLLM_FAULT_TOLERANCE_HANG_SUSPECT_S`, `TLLM_FAULT_TOLERANCE_HEARTBEAT_S` | Device wait reported after (default 2 s); heartbeat interval (default 1 s) |
+| `TLLM_FAULT_TOLERANCE_CONFIG` | Optional YAML file with the settings below; set the same file on the workers and the authority, which refuses a worker's registration with different settings (it logs its settings' digest at startup) |
+
+| Setting | Meaning |
+|---|---|
+| `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `empty` (default) are not routed to while healthy and take a lost rank's experts; `borrowed` are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
+| `recovery_timeout_s` | How long a worker's recovery may take before the job stops (default 30) |
+| `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20; below `recovery_timeout_s`) |
+| `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (default off) |
+| `hang_confirm_s` | How long the evidence of a hang must hold before it is confirmed (default 30; above the slowest legitimate step) |
+| `hang_suspect_s`, `heartbeat_s`, `heartbeat_timeout_s` | Device wait reported after (default 2 s); heartbeat interval (default 1 s); a worker without a heartbeat this long counts as missing (default 5 s) |
 
 A confirmed hung rank is fenced by its own evidence thread (its process ends itself), else by a rank on the
 same node (which ends it after 1 s if it still runs), else by the authority's `--fence-command` (a
@@ -87,7 +92,7 @@ attention-DP balancing or a non-default attention-DP router, expert tensor paral
 decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving) and
 connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder
 models, sleep/wake-up, a non-MPI executor (Ray, RPC), and a hang-detection timeout that is not above twice
-`TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S`.
+`recovery_timeout_s`.
 
 Rejected per request: repetition, presence and frequency penalties (their token counts cannot be rolled back
 when a step is discarded), and multimodal requests under the overlap scheduler.

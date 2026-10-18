@@ -30,20 +30,16 @@ from pathlib import Path
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.executor.recovery.authority import HANG_DETECTION_ENV
 from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat
 from tensorrt_llm.logger import logger
 
 __all__ = [
-    "HANG_DETECTION_ENV",
     "HangEvidenceReporter",
     "ProgressRow",
     "ProgressRowReader",
     "lagging_peers",
 ]
 
-_SUSPECT_ENV = "TLLM_FAULT_TOLERANCE_HANG_SUSPECT_S"
-_HEARTBEAT_ENV = "TLLM_FAULT_TOLERANCE_HEARTBEAT_S"
 _FLAG_MASK = 0xFFFFFFFF
 # A node-mate fences a hung rank only if that rank's own evidence thread has not done so by then.
 _NODE_MATE_FENCE_GRACE_S = 1.0
@@ -185,15 +181,6 @@ class HangEvidenceReporter:
         self._row_time = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-
-    @classmethod
-    def enabled(cls) -> bool:
-        return os.environ.get(HANG_DETECTION_ENV) == "1"
-
-    @staticmethod
-    def intervals_from_env() -> tuple[float, float]:
-        """(suspect_s, heartbeat_s) from the environment."""
-        return float(os.environ.get(_SUSPECT_ENV, "2")), float(os.environ.get(_HEARTBEAT_ENV, "1"))
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="hang_evidence", daemon=True)

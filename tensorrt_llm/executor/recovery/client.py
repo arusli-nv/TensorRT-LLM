@@ -13,6 +13,7 @@ import zmq
 
 from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
 
+from .config import fault_tolerance_config
 from .protocol import (
     MAX_MESSAGE_BYTES,
     Abort,
@@ -131,7 +132,8 @@ class RecoveryClient:
         Raises:
             RecoveryError: Registration was rejected or timed out.
         """
-        self.send(Register(self._rank, tuple(map(tuple, recoverable_domains))))
+        domains = tuple(map(tuple, recoverable_domains))
+        self.send(Register(self._rank, domains, fault_tolerance_config().digest()))
         return frozenset(map(frozenset, self.wait(Registered, deadline).admitted_domains))
 
     def send(self, message: Message) -> None:

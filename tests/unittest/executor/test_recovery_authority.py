@@ -20,6 +20,7 @@ from tensorrt_llm.executor.recovery.client import (
     RecoveryInterrupted,
     RecoveryTimeout,
 )
+from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConfig
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
@@ -46,6 +47,7 @@ RECOVERABLE = ((1,), (2,), (3,))
 # With two GPUs per node, ranks 2 and 3 form node 1.
 NODE = (2, 3)
 KEY = b"k" * 32
+DIGEST = FaultToleranceConfig().digest()
 
 
 def _route(rank: int) -> bytes:
@@ -56,7 +58,7 @@ def _register_all(authority, recoverable=lambda rank: RECOVERABLE):
     out = []
     for rank in range(WORLD):
         assert authority.phase is Phase.REGISTERING
-        out = authority.handle(_route(rank), Register(rank, recoverable(rank)), 0.0)
+        out = authority.handle(_route(rank), Register(rank, recoverable(rank), DIGEST), 0.0)
     return out
 
 
@@ -187,7 +189,7 @@ def test_unadmitted_loss_aborts_every_worker(failed):
         (_route(1), Stopped(1, (FAILED,))),  # duplicate report
         (_route(1), Ready(1, 1, "digest")),  # Ready before Propose
         (_route(1), Commit(1)),  # authority-only message from a worker
-        (_route(1), Register(1, RECOVERABLE)),  # registration after it completed
+        (_route(1), Register(1, RECOVERABLE, DIGEST)),  # registration after it completed
         (b"stranger", Stopped(1, (FAILED,))),  # unregistered peer
     ],
 )
@@ -225,16 +227,25 @@ def test_reports_for_another_generation_abort(message_type):
 @pytest.mark.parametrize(
     "route, message",
     [
-        (_route(1), Register(WORLD, RECOVERABLE)),  # rank above the world
-        (_route(1), Register(-1, RECOVERABLE)),  # negative rank
-        (_route(1), Register(0, RECOVERABLE)),  # duplicate rank
+        (_route(1), Register(WORLD, RECOVERABLE, DIGEST)),  # rank above the world
+        (_route(1), Register(-1, RECOVERABLE, DIGEST)),  # negative rank
+        (_route(1), Register(0, RECOVERABLE, DIGEST)),  # duplicate rank
+        (_route(1), Register(1, RECOVERABLE, "other")),  # different fault-tolerance settings
         (_route(0), Stopped(0, (FAILED,))),  # message before registration completed
     ],
 )
 def test_registration_violations_abort(route, message):
     authority = RecoveryAuthority(WORLD)
-    authority.handle(_route(0), Register(0, RECOVERABLE), 0.0)
+    authority.handle(_route(0), Register(0, RECOVERABLE, DIGEST), 0.0)
     _assert_aborted(authority.handle(route, message, 0.0), authority)
+
+
+def test_registration_with_other_settings_is_refused():
+    other = FaultToleranceConfig(hang_detection=True).digest()
+    authority = RecoveryAuthority(WORLD)
+    out = authority.handle(_route(0), Register(0, RECOVERABLE, other), 0.0)
+    _assert_aborted(out, authority)
+    assert other in authority.abort_reason and CONFIG_ENV in authority.abort_reason
 
 
 @pytest.mark.parametrize("phase_reports", [1, 2, 3], ids=["stopping", "preparing", "installing"])
@@ -303,7 +314,7 @@ def test_second_loss_after_recovery_aborts():
 def test_wire_roundtrip_and_authentication():
     route = _route(1)
     for message in (
-        Register(1, ((1,), NODE)),
+        Register(1, ((1,), NODE), DIGEST),
         Registered(((1,), NODE)),
         Stopped(1, NODE),
         Stopped(0, NODE, "AAEAAg=="),
@@ -517,7 +528,7 @@ def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):
 
 def test_frames_signed_with_another_key_are_dropped(served, make_client):
     authority, endpoint = served
-    make_client(endpoint, WORLD, key=b"x" * 32).send(Register(0, RECOVERABLE))
+    make_client(endpoint, WORLD, key=b"x" * 32).send(Register(0, RECOVERABLE, DIGEST))
     clients = {rank: make_client(endpoint, rank) for rank in range(WORLD)}
     assert _register_clients(clients) == {rank: {frozenset({FAILED})} for rank in range(WORLD)}
     assert authority.phase is Phase.SERVING

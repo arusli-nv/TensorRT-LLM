@@ -6,7 +6,6 @@ import base64
 import collections
 import dataclasses
 import functools
-import os
 import threading
 import time
 from typing import (
@@ -27,6 +26,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
+from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.logger import logger
 
 from ..distributed.communicator import HostCollectiveInterrupted, MPIDist, PeerFailureWatch
@@ -49,10 +49,6 @@ if TYPE_CHECKING:
     from .py_executor import PyExecutor
     from .sampler import SampleState
 
-_RECOVERY_TIMEOUT_ENV = "TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S"
-# A recovery takes milliseconds; the bound covers a survivor that must first finish a long step, and
-# decides how long a recovery that cannot complete (e.g. without its authority) holds the job.
-_RECOVERY_TIMEOUT_DEFAULT_S = 30.0
 # Workers register while every rank constructs its first executor.
 _REGISTRATION_TIMEOUT_S = 600.0
 
@@ -65,10 +61,6 @@ _T = TypeVar("_T")
 _GATHER_HISTORY = 8
 # Free device memory left after borrowed slots are mapped: the KV cache rounds its quota to its chunk size per pool.
 _BORROW_MARGIN_BYTES = 256 << 20
-
-
-def _recovery_timeout_s() -> float:
-    return float(os.environ.get(_RECOVERY_TIMEOUT_ENV, _RECOVERY_TIMEOUT_DEFAULT_S))
 
 
 def _free_device_bytes() -> int:
@@ -234,7 +226,7 @@ class PeerLossRecovery(RecoveryHook):
         # Whether the survivors can recover if this rank exits: only while the
         # serving loop watches peers, and never during or after a recovery.
         self.survives_own_loss = False
-        self._timeout_s = _recovery_timeout_s()
+        self._timeout_s = fault_tolerance_config().recovery_timeout_s
         # KV cache bytes given to the borrowed slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
@@ -288,6 +280,7 @@ class PeerLossRecovery(RecoveryHook):
         dist = executor.dist
         load_balancer = engine.moe_load_balancer
         kv_cache_manager = executor.kv_cache_manager
+        config = fault_tolerance_config()
         # MPIDist.enable_peer_loss_recovery() checks the pure attention-DP layout.
         requirements = {
             "MPI executor": isinstance(dist, MPIDist),
@@ -320,7 +313,12 @@ class PeerLossRecovery(RecoveryHook):
             # One recovery runs under one hang checkpoint and waits up to the
             # recovery timeout twice: for the device, then for the authority.
             "hang detection timeout above twice the recovery timeout": executor.hang_detector.timeout
-            > 2 * _recovery_timeout_s(),
+            > 2 * config.recovery_timeout_s,
+            # A hung peer stalls the survivors until it is confirmed and fenced; the executor's own hang
+            # detector must not end them first.
+            "hang detection timeout above the hang confirmation and a recovery": not config.hang_detection
+            or executor.hang_detector.timeout
+            > config.hang_resolution_s() + config.recovery_timeout_s,
             "no sleep/wakeup": executor.llm_args.sleep_config is None,
             # Rebalancing applies a step's results outside the step loop and
             # votes with collectives that do not expect a departed rank.
@@ -426,7 +424,8 @@ class PeerLossRecovery(RecoveryHook):
 
         from .hang_evidence import HangEvidenceReporter, ProgressRowReader
 
-        if not HangEvidenceReporter.enabled():
+        config = fault_tolerance_config()
+        if not config.hang_detection:
             return None
         executor = self._executor
         comm = executor.model_engine.moe_execution_state.progress_comm
@@ -434,7 +433,6 @@ class PeerLossRecovery(RecoveryHook):
         # Its own connection: the recovery client is used only by the serving thread.
         client = self._hang_client = RecoveryClient.from_env(executor.dist.rank)
         queue = executor.executor_request_queue
-        suspect_s, heartbeat_s = HangEvidenceReporter.intervals_from_env()
         reporter = HangEvidenceReporter(
             rank=executor.dist.rank,
             send=client.send,
@@ -442,8 +440,8 @@ class PeerLossRecovery(RecoveryHook):
             active_ranks=lambda: executor.dist.live_ranks,
             iteration=lambda: executor.iter_counter,
             waiting=lambda: executor.dist.in_host_collective or queue.waiting_for_requests,
-            suspect_s=suspect_s,
-            heartbeat_s=heartbeat_s,
+            suspect_s=config.hang_suspect_s,
+            heartbeat_s=config.heartbeat_s,
             receive=client.receive,
         )
         reporter.start()
@@ -540,6 +538,11 @@ class PeerLossRecovery(RecoveryHook):
             self._unbroadcast_requests = list(items)
             raise
         if self._request_owners is not None:
+            # A request cancelled while waiting ends without a response, as without FT: neither re-admit it after
+            # a loss nor keep its entry.
+            for item in items:
+                if item.is_canceled_request:
+                    self._forget(item.id)
             self._broadcast_control_items = [
                 item
                 for item in items
