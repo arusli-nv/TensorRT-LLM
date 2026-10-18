@@ -1020,7 +1020,6 @@ def _supported_executor():
         (lambda ex: setattr(ex, "max_beam_width", 2), "no beam search"),
         (lambda ex: setattr(ex, "kv_connector_manager", Mock()), "no KV connector"),
         (lambda ex: setattr(ex, "enable_kv_pool_rebalance", True), "no KV pool rebalance"),
-        (lambda ex: setattr(ex.kv_cache_manager, "enable_block_reuse", True), "no KV block reuse"),
         (
             lambda ex: setattr(ex, "kv_cache_manager", Mock()),
             "KV Cache Manager V2",
@@ -1097,6 +1096,17 @@ def test_create_accepts_the_dsa_kv_cache_manager(monkeypatch):
     )
     executor = _supported_executor()
     executor.kv_cache_manager = DSACacheManagerV2.__new__(DSACacheManagerV2)
+    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+
+
+def test_create_accepts_kv_block_reuse(monkeypatch):
+    # A step commits its context blocks for reuse only once accepted, so a discarded step published none.
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+    )
+    executor = _supported_executor()
+    executor.kv_cache_manager.enable_block_reuse = True
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 

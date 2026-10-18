@@ -9,8 +9,8 @@ every other request continues.
 ## Requirements
 
 - Attention data parallelism with expert parallelism over the whole world (DEP), PyTorch backend,
-  KV Cache Manager V2 without KV block reuse (`kv_cache_config.enable_block_reuse: false`), the default
-  attention-DP router.
+  KV Cache Manager V2 (KV block reuse is supported: a step's context blocks become reusable only once the step
+  is accepted, so an interrupted step publishes none), the default attention-DP router.
 - NVLinkOneSided all-to-all. The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`)
   reads the receive slots in place; layers on other backends (for example a BF16 MTP layer) get a compact
   copy of their hidden states.

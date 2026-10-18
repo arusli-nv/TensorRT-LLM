@@ -50,9 +50,12 @@ def _prepare_step(manager, context_requests, generation_requests):
     for request in context_requests:
         batch.append_context_request(request)
     batch.generation_requests = list(generation_requests)
-    # The V2 scheduler allocates the step.
+    # The V2 scheduler allocates the step. It sizes each chunk after prepare_context, which spans a first
+    # chunk to the end of the prompt when block reuse is on.
     for request in context_requests:
+        chunk_size = request.context_chunk_size
         assert manager.prepare_context(request)
+        request.context_chunk_size = min(chunk_size, request.context_remaining_length)
         assert manager.resize_context(request, request.context_chunk_size)
     for request in generation_requests:
         assert manager.try_allocate_generation(request)
@@ -183,5 +186,51 @@ def test_two_overlapped_steps_revert_newest_first():
         manager.revert_prepare_resources(older, older_capacities)
 
         assert _kv_state(manager) == before
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["sequential", "overlap"])
+def test_discarded_later_chunk_keeps_the_committed_chunks_reusable(overlap):
+    """Discarding a later chunk keeps the blocks earlier chunks committed for reuse and frees its own.
+
+    With the overlap scheduler the later chunk is prepared before the earlier chunk's step is accepted
+    and commits its blocks.
+    """
+    manager = _real_kv_cache_manager(enable_block_reuse=True)
+    try:
+        chunked = _prompt_request(1, chunk_size=32)
+        first = _prepare_step(manager, [chunked], [])
+        chunked.move_to_next_context_chunk()
+        chunked.context_chunk_size = 32
+        if not overlap:
+            manager.update_context_resources(first)
+        free_before = manager.get_kv_cache_stats().free_num_blocks
+        later = _prepare_step(manager, [chunked], [])
+        later_capacities = manager.context_capacities(later)
+        if overlap:
+            manager.update_context_resources(first)
+        kv_cache = manager.kv_cache_map[chunked.py_request_id]
+        assert kv_cache.num_committed_tokens == 32
+
+        manager.revert_prepare_resources(later, later_capacities)
+        assert manager.get_kv_cache_stats().free_num_blocks == free_before
+        assert kv_cache.capacity == 32 and kv_cache.num_committed_tokens == 32
+        assert chunked.context_current_position == 32
+
+        # Only the first chunk is offered for reuse.
+        probe = _prompt_request(2, 96)
+        probe_step = _prepare_step(manager, [probe], [])
+        assert probe.context_current_position == 32
+        _revert(manager, probe_step)
+        assert manager.get_kv_cache_stats().free_num_blocks == free_before
+
+        # The discarded chunk runs again and commits its blocks.
+        chunked.context_chunk_size = 32
+        _commit_step(manager, _prepare_step(manager, [chunked], []))
+        assert kv_cache.num_committed_tokens == 64
+        probe = _prompt_request(3, 96)
+        _prepare_step(manager, [probe], [])
+        assert probe.context_current_position == 64
     finally:
         manager.shutdown()

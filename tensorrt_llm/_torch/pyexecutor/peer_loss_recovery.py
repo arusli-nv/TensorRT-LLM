@@ -301,9 +301,6 @@ class PeerLossRecovery(RecoveryHook):
             # Managers whose step allocation and revert are KVCacheManagerV2's own (DSA keeps its indexer K
             # cache as another buffer of the same pages).
             "KV Cache Manager V2": type(kv_cache_manager) in (KVCacheManagerV2, DSACacheManagerV2),
-            # Discarding a later context chunk after earlier chunks committed reusable blocks
-            # is not tested yet.
-            "no KV block reuse": not getattr(kv_cache_manager, "enable_block_reuse", False),
             "no SWA scratch reuse": not getattr(
                 kv_cache_manager, "enable_swa_scratch_reuse", False
             ),
