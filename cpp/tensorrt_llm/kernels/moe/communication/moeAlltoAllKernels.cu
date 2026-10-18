@@ -477,6 +477,75 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
+// Fixed slots: copy one source's routed expert ids and router weights to the compact lists (see
+// DispatchKernelPointers::compact_expert_ids) as soon as that source's flag arrives. Runs in a CTA after every token
+// CTA, so its wait never holds an SM a token CTA needs. An abort leaves the lists partial; the step is discarded.
+template <int TOP_K>
+__device__ void compact_source_routing(
+    DispatchKernelPointers const& ptrs, int source, int source_tokens, int rank_id, int ep_size)
+{
+#if TLLM_MOE_A2A_COMPILE_SM90
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    __shared__ int received;
+    if (threadIdx.x == 0)
+    {
+        int count = 0;
+        if (is_rank_active(ptrs.active_rank_mask, source))
+        {
+            uint32_t const expected_value = *ptrs.flag_val;
+            if (!wait_round_flag(&ptrs.completion_flags[rank_id][source], expected_value, ptrs.timeout_cycles,
+                    ptrs.abort, rank_id, source, "dispatch"))
+            {
+                count = -1;
+            }
+            else
+            {
+#if TLLM_MOE_A2A_COMPILE_SM90
+                asm volatile("fence.acquire.sys;");
+#else
+                asm volatile("fence.acq_rel.sys;");
+#endif
+                count = ptrs.recv_counters[rank_id][round_parity(expected_value) * ep_size + source];
+                count = count >= 0 && count <= source_tokens ? count : 0;
+            }
+        }
+        received = count;
+    }
+    __syncthreads();
+    int const count = received;
+    if (count < 0)
+    {
+        return;
+    }
+    int64_t const slot_offset = static_cast<int64_t>(source) * ptrs.slot_tokens * TOP_K;
+    auto const* expert_ids
+        = static_cast<int32_t const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index]) + slot_offset;
+    auto const* weights
+        = static_cast<float const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index + 1]) + slot_offset;
+    int64_t const out_offset = static_cast<int64_t>(source) * source_tokens * TOP_K;
+    // One token row per thread, its TOP_K loads issued together: one memory round trip per row.
+    for (int row = threadIdx.x; row < source_tokens; row += blockDim.x)
+    {
+        int32_t row_ids[TOP_K];
+        float row_weights[TOP_K];
+        bool const sent = row < count;
+#pragma unroll
+        for (int k = 0; k < TOP_K; ++k)
+        {
+            row_ids[k] = sent ? expert_ids[row * TOP_K + k] : -1;
+            row_weights[k] = sent ? weights[row * TOP_K + k] : 0.F;
+        }
+#pragma unroll
+        for (int k = 0; k < TOP_K; ++k)
+        {
+            ptrs.compact_expert_ids[out_offset + row * TOP_K + k] = row_ids[k];
+            ptrs.compact_weights[out_offset + row * TOP_K + k] = row_weights[k];
+        }
+    }
+}
+
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
@@ -486,6 +555,16 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 {
     int thread_idx = threadIdx.x;
     int local_token_idx = blockIdx.x;
+
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        int const token_ctas = local_num_tokens > 0 ? local_num_tokens : 1;
+        if (local_token_idx >= token_ctas)
+        {
+            compact_source_routing<TOP_K>(ptrs, local_token_idx - token_ctas, max_tokens_per_rank, rank_id, ep_size);
+            return;
+        }
+    }
 
     if (local_num_tokens == 0)
     {
@@ -1279,11 +1358,22 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.abort = params.abort;
     kernel_ptrs.slot_tokens = params.slot_tokens;
     kernel_ptrs.source_valid_counts = params.source_valid_counts;
+    bool const compact_routing = params.compact_expert_ids != nullptr;
+    TLLM_CHECK_WITH_INFO(
+        compact_routing == (params.compact_weights != nullptr), "compact_expert_ids and compact_weights go together");
+    TLLM_CHECK_WITH_INFO(!compact_routing || params.slot_tokens > 0, "compact routing lists need fixed slots");
+    kernel_ptrs.compact_expert_ids = params.compact_expert_ids;
+    kernel_ptrs.compact_weights = params.compact_weights;
+    kernel_ptrs.compact_payload_index = params.compact_payload_index;
 
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)
     {
         grid_size = 1;
+    }
+    if (compact_routing)
+    {
+        grid_size += params.ep_size;
     }
 
     int const routing_bytes = 2 * params.top_k * static_cast<int>(sizeof(int));
@@ -2288,39 +2378,6 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
     int grid = ceilDiv(total_tokens, kBlockSize);
     launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
         stream, expert_ids, recv_counters, flag_val, ep_size, max_tokens_per_rank, top_k, invalid_id);
-}
-
-// One thread per (token, k) of the compact list: source s's token i is slot row s * slot_tokens + i.
-__global__ void moeA2ACompactSourceSlotsKernel(int32_t const* slot_expert_ids, float const* slot_weights,
-    int32_t const* source_valid_counts, int32_t* expert_ids, float* weights, int num_sources, int source_tokens,
-    int slot_tokens, int top_k)
-{
-    int const per_source = source_tokens * top_k;
-    int const idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_sources * per_source)
-        return;
-    int const source = idx / per_source;
-    int const offset = idx - source * per_source;
-    int64_t const slot_idx = static_cast<int64_t>(source) * slot_tokens * top_k + offset;
-
-#if TLLM_MOE_A2A_COMPILE_SM90
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-    bool const received = offset < source_valid_counts[source] * top_k;
-    expert_ids[idx] = received ? slot_expert_ids[slot_idx] : -1;
-    weights[idx] = received ? slot_weights[slot_idx] : 0.F;
-}
-
-void moe_a2a_compact_source_slots_launch(int32_t const* slot_expert_ids, float const* slot_weights,
-    int32_t const* source_valid_counts, int32_t* expert_ids, float* weights, int num_sources, int source_tokens,
-    int slot_tokens, int top_k, cudaStream_t stream)
-{
-    constexpr int kBlockSize = 256;
-    int grid = ceilDiv(num_sources * source_tokens * top_k, kBlockSize);
-    launchWithPdlWhenEnabled("moeA2ACompactSourceSlotsKernel", moeA2ACompactSourceSlotsKernel, grid, kBlockSize, 0,
-        stream, slot_expert_ids, slot_weights, source_valid_counts, expert_ids, weights, num_sources, source_tokens,
-        slot_tokens, top_k);
 }
 
 } // namespace kernels::moe_comm

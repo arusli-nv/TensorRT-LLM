@@ -572,13 +572,13 @@ class MoEResolutionReport:
 class DispatchSourceSlots:
     """The receive layout of NVLinkOneSided under WideEP peer-loss recovery.
 
-    Every dispatched payload (hidden states, their scales, expert ids, router
-    weights) is ``[num_sources * slot_tokens, ...]``: source ``s``'s token ``i``
-    is row ``s * slot_tokens + i``. Of each slot only the first
-    ``valid_counts[s]`` rows (at most ``source_tokens``, this forward's tokens
-    per source) hold tokens; the routing, compact ``[num_sources *
-    source_tokens]`` token order maps token ``t`` to row
-    ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
+    The hidden states and their scales are ``[num_sources * slot_tokens, ...]``:
+    source ``s``'s token ``i`` is row ``s * slot_tokens + i``. Of each slot only
+    the first ``valid_counts[s]`` rows (at most ``source_tokens``, this forward's
+    tokens per source) hold tokens. The routing (expert ids, router weights) is
+    compact, ``[num_sources * source_tokens, top_k]``, written by the dispatch
+    with expert -1 and weight 0 on rows without a token; compact token ``t`` is
+    slot row ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
     """
 
     valid_counts: torch.Tensor  # [num_sources] int32, written by the dispatch on the device

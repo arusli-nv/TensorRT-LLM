@@ -1151,7 +1151,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 right before the FC1 gather GEMM (the locality-domain path and
                 empty micro-batches join here).
             source_slots: Under WideEP peer-loss recovery, the receive-slot
-                layout of x, x_sf and the routing tensors.
+                layout of x and x_sf (the routing tensors are compact lists).
         """
         assert self.has_nvfp4
         assert weight_view is not None
@@ -1185,13 +1185,11 @@ class CuteDslFusedMoE(MoEImplBase):
                 )
 
         num_tokens = token_selected_experts.size(0)
-        if source_slots is not None:
-            if use_locality_domain or use_deep_ep_direct_metadata:
-                raise NotImplementedError(
-                    "Reading the dispatch receive slots needs the single-tensor "
-                    "Blackwell NVFP4 path")
-            num_tokens = source_slots.valid_counts.size(
-                0) * source_slots.source_tokens
+        if source_slots is not None and (use_locality_domain
+                                         or use_deep_ep_direct_metadata):
+            raise NotImplementedError(
+                "Reading the dispatch receive slots needs the single-tensor "
+                "Blackwell NVFP4 path")
         if moe_output is None:
             moe_output = torch.empty((num_tokens, self.hidden_size),
                                      dtype=output_dtype,
@@ -1244,9 +1242,9 @@ class CuteDslFusedMoE(MoEImplBase):
                 weight_view,
             ]
 
-        # Under WideEP peer-loss recovery every input but moe_output is the
-        # dispatch receive slots, more rows than tokens. Tune on as many rows as
-        # tokens: profiling only needs their shapes.
+        # Under WideEP peer-loss recovery x and x_sf are the dispatch receive
+        # slots, more rows than tokens. Tune on as many rows as tokens:
+        # profiling only needs their shapes.
         tuner_inputs = inputs
         if source_slots is not None:
             tuner_inputs = [tensor[:num_tokens]
@@ -1297,10 +1295,9 @@ class CuteDslFusedMoE(MoEImplBase):
     ) -> torch.Tensor:
         """Non-DWDP NVFP4 MoE implementation using single-tensor ops.
 
-        With ``source_slots`` (WideEP peer-loss recovery) x, x_sf and the
-        routing tensors are the dispatch receive slots: the routing is copied
-        to compact lists for the sort and the rest of the layer, and FC1 reads
-        x and x_sf in place.
+        With ``source_slots`` (WideEP peer-loss recovery) x and x_sf are the
+        dispatch receive slots, which FC1 reads in place; the routing tensors
+        are the compact lists the dispatch wrote.
         """
         output_dtype = torch.bfloat16
         sm_version = get_sm_version()
@@ -1344,14 +1341,10 @@ class CuteDslFusedMoE(MoEImplBase):
             if use_count_native_expert_metadata:
                 raise RuntimeError(
                     "Count-native metadata requires DeepEP receive counts")
-            if source_slots is not None:
-                if use_rubin:
-                    raise NotImplementedError(
-                        "Reading the dispatch receive slots is qualified on Blackwell only"
-                    )
-                token_selected_experts, token_final_scales = torch.ops.trtllm.moe_a2a_compact_source_slots(
-                    token_selected_experts, token_final_scales,
-                    source_slots.valid_counts, source_slots.source_tokens)
+            if source_slots is not None and use_rubin:
+                raise NotImplementedError(
+                    "Reading the dispatch receive slots is qualified on Blackwell only"
+                )
             tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, _total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,

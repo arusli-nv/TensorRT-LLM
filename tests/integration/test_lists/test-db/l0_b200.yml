@@ -196,7 +196,6 @@ l0_b200:
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   - unittest/_torch/moe/test_moe_execution_state.py
   - unittest/_torch/moe/test_moe_slot_gather.py
-  - unittest/_torch/moe/test_moe_sort_source_slots.py
   - unittest/_torch/executor/test_kv_cache_revert.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip

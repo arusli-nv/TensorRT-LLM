@@ -1080,6 +1080,17 @@ class NVLinkOneSided(Communication):
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
         source_valid_counts = None if state is None else self._source_valid_counts()
+        # Bound execution: the dispatch also copies each source's routed expert ids and router weights to
+        # compact lists once that source's rows have arrived, for the routing sort.
+        compact_routing = {}
+        if state is not None:
+            if token_final_scales is None:
+                raise ValueError("bound dispatch needs the router weights to compact the routing")
+            rows = (self.ep_size * runtime_max_tokens_per_rank, self.top_k)
+            compact_routing = dict(
+                compact_expert_ids=token_selected_slots.new_empty(rows),
+                compact_weights=token_final_scales.new_empty(rows, dtype=torch.float32),
+            )
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -1093,7 +1104,7 @@ class NVLinkOneSided(Communication):
                 self.num_experts,
                 eplb_local_stats,
                 can_use_cft_for_dispatch,
-                expert_id_payload_index if can_fuse_sanitize else None,
+                expert_id_payload_index if can_fuse_sanitize or compact_routing else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 self._publish_rank_mask(active_rank_mask)
@@ -1101,6 +1112,7 @@ class NVLinkOneSided(Communication):
                 else state.active_rank_mask,
                 abort_state=None if state is None else state.abort,
                 source_valid_counts=source_valid_counts,
+                **compact_routing,
             )
         )
         # The host watchdog tracks each eager call, but replayed CUDA graphs skip
@@ -1152,12 +1164,16 @@ class NVLinkOneSided(Communication):
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends
         # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...].
-        # When bound, every payload is the receive slots, [ep_size * capacity, ...]:
+        # When bound, the hidden states and their scales are the receive slots, [ep_size * capacity, ...]:
         # source s's row i is row s * capacity + i, and dispatch_source_slots() says which rows
-        # hold tokens. The MoE backend reads them so.
+        # hold tokens. The MoE backend reads them so. The routing is the compact lists instead,
+        # [ep_size * runtime_max_tokens_per_rank, top_k], expert -1 and weight 0 on rows without a token.
         hidden_states_recv = hidden_states_recv.view(-1, hidden_states_recv.shape[-1])
         if hidden_states_sf_recv is not None:
             hidden_states_sf_recv = hidden_states_sf_recv.view(-1, hidden_states_sf_recv.shape[-1])
+        if compact_routing:
+            token_selected_slots_recv = compact_routing["compact_expert_ids"]
+            token_final_scales_recv = compact_routing["compact_weights"]
         token_selected_slots_recv = token_selected_slots_recv.view(
             -1, token_selected_slots_recv.shape[-1]
         )

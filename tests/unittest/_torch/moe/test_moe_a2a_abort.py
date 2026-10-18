@@ -270,6 +270,94 @@ def test_valid_counts_ignore_a_count_without_its_completion_flag() -> None:
     assert counts.tolist() == [_CAPACITY, 0]
 
 
+def _compact_round(workspace, meta, experts, payloads, controls):
+    """Dispatch with compact routing lists (expert ids at payload 1, router weights at payload 2)."""
+    ep_size = workspace.size(0)
+    counts = torch.full((ep_size,), -7, dtype=torch.int32, device="cuda")
+    ids = torch.full((ep_size * _CAPACITY, 1), 99, dtype=torch.int32, device="cuda")
+    weights = torch.full((ep_size * _CAPACITY, 1), 9.0, device="cuda")
+    received, *_ = torch.ops.trtllm.moe_a2a_dispatch(
+        experts,
+        payloads,
+        workspace,
+        meta,
+        _CAPACITY,
+        0,
+        ep_size,
+        1,
+        ep_size,
+        None,
+        expert_id_payload_index=1,
+        **controls,
+        source_valid_counts=counts,
+        compact_expert_ids=ids,
+        compact_weights=weights,
+    )
+    return received, counts, ids, weights
+
+
+@pytest.mark.parametrize("peer_active", [True, False])
+def test_compact_routing_copies_the_rows_each_source_sent(peer_active: bool) -> None:
+    """The dispatch's compact lists hold each active source's sent rows, -1 / 0 elsewhere."""
+    local = 5
+    workspace, meta, experts, payload = _setup(2, tokens=local)
+    sent_ids = torch.arange(100, 100 + local, dtype=torch.int32, device="cuda").view(local, 1)
+    sent_weights = torch.arange(local, dtype=torch.float32, device="cuda").view(local, 1) + 0.5
+    payloads = [payload, sent_ids, sent_weights]
+    controls, _ = _rank_mask_controls(1)
+    # A first round to learn where peer 1's slot rows live in rank 0's receive buffers.
+    received, *_ = _compact_round(workspace, meta, experts, payloads, controls)
+    torch.cuda.synchronize()
+    # Stand in for peer 1: its 3 rows in its slot, then its count and completion flag for the next round.
+    received[1][1, :3] = torch.tensor([[200], [201], [202]], dtype=torch.int32, device="cuda")
+    received[2][1, :3] = torch.tensor([[7.0], [8.0], [9.0]], device="cuda")
+    expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
+    parity = ((expected_flag - 1) >> 1) & 1
+    _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(3)
+    _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(expected_flag)
+    _set_mask(controls, 3 if peer_active else 1)
+    _, counts, ids, weights = _compact_round(workspace, meta, experts, payloads, controls)
+    torch.cuda.synchronize()
+
+    peer_rows = 3 if peer_active else 0
+    assert counts.tolist() == [local, peer_rows]
+    rows = list(zip(ids.view(-1).tolist(), weights.view(-1).tolist()))
+    # Rank 0's own tokens land in its slot in arrival order; each keeps its weight.
+    assert sorted(rows[:local]) == [(100 + i, i + 0.5) for i in range(local)]
+    assert rows[local:_CAPACITY] == [(-1, 0.0)] * (_CAPACITY - local)
+    peer = [(200, 7.0), (201, 8.0), (202, 9.0)][:peer_rows]
+    assert rows[_CAPACITY:] == peer + [(-1, 0.0)] * (_CAPACITY - peer_rows)
+
+
+@pytest.mark.parametrize(
+    "extra,match",
+    [
+        ({"source_valid_counts": None}, "compact routing lists need source_valid_counts"),
+        ({"compact_weights": None}, "go together"),
+        (
+            {"compact_expert_ids": torch.zeros((3, 1), dtype=torch.int32)},
+            "compact_expert_ids and compact_weights must",
+        ),
+        ({"invalid_token_expert_id": -1}, "exclude expert-id sanitization"),
+    ],
+)
+def test_compact_routing_rejects_inconsistent_options(extra: dict, match: str) -> None:
+    workspace, meta, experts, payload = _setup(1)
+    weights = torch.zeros((_CAPACITY, 1), dtype=torch.float32, device="cuda")
+    kwargs = {
+        **_rank_mask_controls(1)[0],
+        "expert_id_payload_index": 1,
+        "source_valid_counts": torch.zeros(1, dtype=torch.int32, device="cuda"),
+        "compact_expert_ids": torch.zeros((_CAPACITY, 1), dtype=torch.int32, device="cuda"),
+        "compact_weights": torch.zeros((_CAPACITY, 1), dtype=torch.float32, device="cuda"),
+    }
+    kwargs.update({k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in extra.items()})
+    with pytest.raises(RuntimeError, match=match):
+        torch.ops.trtllm.moe_a2a_dispatch(
+            experts, [payload, experts, weights], workspace, meta, _CAPACITY, 0, 1, 1, 1, **kwargs
+        )
+
+
 def test_source_slots_reject_runtime_over_capacity() -> None:
     workspace, meta, experts, payload = _setup(1, _CAPACITY + 1)
     controls, _ = _rank_mask_controls(1)

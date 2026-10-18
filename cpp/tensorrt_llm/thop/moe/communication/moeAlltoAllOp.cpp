@@ -529,7 +529,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
     torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
-    torch::optional<torch::Tensor> abortState, torch::optional<torch::Tensor> sourceValidCounts)
+    torch::optional<torch::Tensor> abortState, torch::optional<torch::Tensor> sourceValidCounts,
+    torch::optional<torch::Tensor> compactExpertIds, torch::optional<torch::Tensor> compactWeights)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -559,9 +560,14 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // ceil/floor contiguous partitioning so ranks [0, numExperts % epSize)
     // own (numExperts / epSize + 1) experts and the rest own (numExperts / epSize).
 
-    bool const sanitizeExpertIds = expertIdPayloadIndex.has_value() || invalidTokenExpertId.has_value();
-    TORCH_CHECK(expertIdPayloadIndex.has_value() == invalidTokenExpertId.has_value(),
-        "expert_id_payload_index and invalid_token_expert_id must be provided together");
+    // expert_id_payload_index names the routed expert ids for sanitization (with invalid_token_expert_id) or, with
+    // compact_expert_ids and compact_weights, for compact routing lists (the router weights are the next payload).
+    bool const sanitizeExpertIds = invalidTokenExpertId.has_value();
+    bool const compactRouting = compactExpertIds.has_value();
+    TORCH_CHECK(compactRouting == compactWeights.has_value(), "compact_expert_ids and compact_weights go together");
+    TORCH_CHECK(expertIdPayloadIndex.has_value() == (sanitizeExpertIds || compactRouting),
+        "expert_id_payload_index goes with invalid_token_expert_id or with compact_expert_ids");
+    TORCH_CHECK(!(sanitizeExpertIds && compactRouting), "compact routing lists exclude expert-id sanitization");
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
     if (enableEplb)
@@ -585,6 +591,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         !fixedSlots || (enableRankMask && !useCftCountedWrites), "source_valid_counts needs the rank-mask fence path");
     TORCH_CHECK(!fixedSlots || (!sanitizeExpertIds && !enableEplb),
         "source_valid_counts marks received rows itself; it excludes expert-id sanitization and EPLB statistics");
+    TORCH_CHECK(!compactRouting || fixedSlots, "compact routing lists need source_valid_counts");
     if (fixedSlots)
     {
         torch::Tensor const& counts = sourceValidCounts.value();
@@ -644,7 +651,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     int expertIdPayloadIdx = -1;
     int32_t invalidExpertId = -1;
-    if (sanitizeExpertIds)
+    if (expertIdPayloadIndex.has_value())
     {
         expertIdPayloadIdx = static_cast<int>(*expertIdPayloadIndex);
         TORCH_CHECK(expertIdPayloadIdx >= 0 && expertIdPayloadIdx < static_cast<int>(inputPayloads.size()),
@@ -652,7 +659,25 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         auto const& expertIdPayload = inputPayloads[expertIdPayloadIdx];
         CHECK_TYPE(expertIdPayload, torch::kInt32);
         TORCH_CHECK(expertIdPayload.size(1) == topK, "expert-id payload must have topK columns");
+    }
+    if (sanitizeExpertIds)
+    {
         invalidExpertId = static_cast<int32_t>(*invalidTokenExpertId);
+    }
+    if (compactRouting)
+    {
+        TORCH_CHECK(expertIdPayloadIdx + 1 < static_cast<int>(inputPayloads.size()),
+            "compact routing needs the router weights in the payload after the expert ids");
+        auto const& weightPayload = inputPayloads[expertIdPayloadIdx + 1];
+        CHECK_TYPE(weightPayload, torch::kFloat32);
+        TORCH_CHECK(weightPayload.size(1) == topK, "router-weight payload must have topK columns");
+        torch::Tensor const& compactIds = compactExpertIds.value();
+        torch::Tensor const& compactW = compactWeights.value();
+        CHECK_INPUT(compactIds, torch::kInt32);
+        CHECK_INPUT(compactW, torch::kFloat32);
+        std::vector<int64_t> const compactShape{epSize * runtimeMaxTokensPerRank, topK};
+        TORCH_CHECK(compactIds.sizes() == compactShape && compactW.sizes() == compactShape,
+            "compact_expert_ids and compact_weights must be [ep_size * runtime_max_tokens_per_rank, top_k]");
     }
 
     CHECK_TH_CUDA(workspace);
@@ -800,6 +825,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.abort = resolveAbortState(abortState);
     params.slot_tokens = fixedSlots ? static_cast<int>(rowsPerSource) : 0;
     params.source_valid_counts = fixedSlots ? sourceValidCounts->data_ptr<int32_t>() : nullptr;
+    params.compact_expert_ids = compactRouting ? compactExpertIds->data_ptr<int32_t>() : nullptr;
+    params.compact_weights = compactRouting ? compactWeights->data_ptr<float>() : nullptr;
+    params.compact_payload_index = compactRouting ? expertIdPayloadIdx : 0;
 
     params.stream = at::cuda::getCurrentCUDAStream();
     params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
@@ -1079,35 +1107,6 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
         at::cuda::getCurrentCUDAStream());
 }
 
-// Op: moe_a2a_compact_source_slots
-// The expert ids and router weights of the tokens in the fixed receive slots of a source_valid_counts dispatch, as
-// the compact [num_sources * source_tokens, top_k] lists the routing sort reads; rows without a token get expert -1
-// and weight 0.
-std::tuple<torch::Tensor, torch::Tensor> moeA2ACompactSourceSlotsOp(torch::Tensor const& slotExpertIds,
-    torch::Tensor const& slotWeights, torch::Tensor const& sourceValidCounts, int64_t sourceTokens)
-{
-    CHECK_INPUT(slotExpertIds, torch::kInt32);
-    CHECK_INPUT(slotWeights, torch::kFloat32);
-    CHECK_INPUT(sourceValidCounts, torch::kInt32);
-    TORCH_CHECK(slotExpertIds.dim() == 2, "slot_expert_ids must be [num_sources * slot_tokens, top_k]");
-    TORCH_CHECK(slotWeights.sizes() == slotExpertIds.sizes(), "slot_weights must match slot_expert_ids");
-    TORCH_CHECK(sourceValidCounts.dim() == 1, "source_valid_counts must be 1D");
-    int64_t const numSources = sourceValidCounts.size(0);
-    TORCH_CHECK(numSources > 0 && slotExpertIds.size(0) % numSources == 0,
-        "slot_expert_ids must hold one equal slot per source");
-    int64_t const slotTokens = slotExpertIds.size(0) / numSources;
-    TORCH_CHECK(sourceTokens > 0 && sourceTokens <= slotTokens, "source_tokens must be in (0, slot_tokens]");
-    int64_t const topK = slotExpertIds.size(1);
-
-    auto expertIds = torch::empty({numSources * sourceTokens, topK}, slotExpertIds.options());
-    auto weights = torch::empty({numSources * sourceTokens, topK}, slotWeights.options());
-    tensorrt_llm::kernels::moe_comm::moe_a2a_compact_source_slots_launch(slotExpertIds.data_ptr<int32_t>(),
-        slotWeights.data_ptr<float>(), sourceValidCounts.data_ptr<int32_t>(), expertIds.data_ptr<int32_t>(),
-        weights.data_ptr<float>(), static_cast<int>(numSources), static_cast<int>(sourceTokens),
-        static_cast<int>(slotTokens), static_cast<int>(topK), at::cuda::getCurrentCUDAStream());
-    return {expertIds, weights};
-}
-
 // Return a workspace-backed tensor for combine payload region using from_blob
 torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, torch::Tensor const& metainfo,
     int64_t epRank, int64_t epSize, int64_t runtimeMaxTokensPerRank, c10::ScalarType outDtype, int64_t hiddenSize)
@@ -1164,7 +1163,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool enable_rank_mask=False, "
         "Tensor? active_rank_mask=None, "
         "Tensor? abort_state=None, "
-        "Tensor(b!)? source_valid_counts=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor(b!)? source_valid_counts=None, "
+        "Tensor(c!)? compact_expert_ids=None, "
+        "Tensor(d!)? compact_weights=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
@@ -1185,9 +1186,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
     module.def(
-        "moe_a2a_compact_source_slots(Tensor slot_expert_ids, Tensor slot_weights, Tensor source_valid_counts, "
-        "int source_tokens) -> (Tensor, Tensor)");
-    module.def(
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, Tensor metainfo, int ep_rank, int ep_size, "
         "int runtime_max_tokens_per_rank, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
@@ -1205,7 +1203,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_combine", &tensorrt_llm::torch_ext::moe_comm::moeA2ACombineOp);
     module.impl("moe_a2a_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2AInitializeOp);
     module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
-    module.impl("moe_a2a_compact_source_slots", &tensorrt_llm::torch_ext::moe_comm::moeA2ACompactSourceSlotsOp);
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
     module.impl("moe_a2a_cft_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftInitializeOp);

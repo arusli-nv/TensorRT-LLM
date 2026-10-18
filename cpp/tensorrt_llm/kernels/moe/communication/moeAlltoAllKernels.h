@@ -147,6 +147,12 @@ struct DispatchKernelPointers
     // whose flags arrived may still get their counts: the caller discards an aborted step without reading them.
     int slot_tokens{0};
     int* source_valid_counts{nullptr};
+    // Optional (fixed slots): one extra CTA per source copies the routed expert ids (payload compact_payload_index,
+    // int32 [TOP_K] per token) and router weights (the next payload, float [TOP_K]) of the rows that source sent to
+    // compact [ep_size * max_tokens_per_rank, TOP_K] lists once its flag arrives; its other rows get -1 and 0.
+    int32_t* compact_expert_ids{nullptr};
+    float* compact_weights{nullptr};
+    int compact_payload_index{0};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -249,10 +255,13 @@ struct MoeA2ADispatchParams
     // Active-rank bitmask in device memory: see DispatchKernelPointers::active_rank_mask. Required when
     // enable_rank_mask is true; kernels read it through this pointer at execution time.
     uint64_t const* active_rank_mask{nullptr};
-    // Optional: see DispatchKernelPointers::abort, slot_tokens and source_valid_counts.
+    // Optional: see DispatchKernelPointers::abort, slot_tokens, source_valid_counts and compact_*.
     MoeA2AAbortState* abort{nullptr};
     int slot_tokens{0};
     int* source_valid_counts{nullptr};
+    int32_t* compact_expert_ids{nullptr};
+    float* compact_weights{nullptr};
+    int compact_payload_index{0};
 
     // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
@@ -356,15 +365,6 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 // invalid_id: value to fill for invalid tokens' expert ids
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
     int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
-
-// Copy the routing of the tokens in the fixed receive slots (MoeA2ADispatchParams::slot_tokens) into a compact list
-// for the routing sort: source s's token i becomes row s * source_tokens + i.
-// slot_expert_ids, slot_weights: [num_sources * slot_tokens, top_k] (int32, float)
-// source_valid_counts: [num_sources] (int32), rows of each slot that hold a token
-// expert_ids, weights: [num_sources * source_tokens, top_k]; rows without a token get expert -1 and weight 0
-void moe_a2a_compact_source_slots_launch(int32_t const* slot_expert_ids, float const* slot_weights,
-    int32_t const* source_valid_counts, int32_t* expert_ids, float* weights, int num_sources, int source_tokens,
-    int slot_tokens, int top_k, cudaStream_t stream);
 
 } // namespace kernels::moe_comm
 
