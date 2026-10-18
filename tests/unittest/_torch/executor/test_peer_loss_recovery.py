@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
 from tensorrt_llm.executor.recovery.client import RecoveryAborted
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
@@ -938,8 +939,25 @@ def _supported_executor():
 @pytest.mark.parametrize(
     "unsupported, requirement",
     [
-        (lambda ex: setattr(ex, "drafter", Mock()), "no speculative decoding"),
-        (lambda ex: setattr(ex.model_engine, "spec_config", Mock()), "no speculative decoding"),
+        (lambda ex: setattr(ex, "drafter", Mock()), "no speculative decoding but one-model MTP"),
+        (
+            lambda ex: setattr(ex.model_engine, "spec_config", _spec_config(SpecMode.MTP)),
+            "no speculative decoding but one-model MTP",
+        ),
+        (
+            lambda ex: setattr(
+                ex.model_engine, "spec_config", _spec_config(SpecMode.EAGLE3_ONE_MODEL)
+            ),
+            "no speculative decoding but one-model MTP",
+        ),
+        (
+            lambda ex: setattr(
+                ex.model_engine,
+                "spec_config",
+                _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL, use_dynamic_tree=True),
+            ),
+            "no speculative decoding but one-model MTP",
+        ),
         (lambda ex: setattr(ex, "guided_decoder", Mock()), "no guided decoding"),
         (lambda ex: setattr(ex, "max_beam_width", 2), "no beam search"),
         (lambda ex: setattr(ex, "kv_connector_manager", Mock()), "no KV connector"),
@@ -1009,6 +1027,20 @@ def test_create_accepts_online_eplb(monkeypatch):
     )
     executor = _supported_executor()
     executor.model_engine.moe_load_balancer.is_static_routing.return_value = False
+    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+
+
+def _spec_config(mode: "SpecMode", use_dynamic_tree: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(spec_dec_mode=mode, use_dynamic_tree=use_dynamic_tree)
+
+
+def test_create_accepts_one_model_mtp(monkeypatch):
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+    )
+    executor = _supported_executor()
+    executor.model_engine.spec_config = _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL)
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 

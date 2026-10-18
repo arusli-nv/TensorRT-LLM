@@ -76,7 +76,8 @@ non-zero exit status at shutdown.
 
 ## Not supported together with fault tolerance
 
-Refused at startup, with the requirement that is missing: speculative decoding (MTP),
+Refused at startup, with the requirement that is missing: speculative decoding other than one-model MTP
+(MTP with one predict layer and a linear draft is supported),
 attention-DP balancing or a non-default attention-DP router, expert tensor parallelism, beam search, guided
 decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving) and
 connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder

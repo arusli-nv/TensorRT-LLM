@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     get_all_rank_ctx_requests,
     get_all_rank_num_tokens,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
@@ -151,6 +152,19 @@ def test_every_per_step_vote_survives_a_departed_rank():
         0,
         1,
     ]
+    # With speculative decoding the token counts travel with the draft counts (tokens, requests, generations).
+    runner = SimpleNamespace(
+        _config=SimpleNamespace(enable_attention_dp=True),
+        mapping=SimpleNamespace(cp_size=1, has_cp_helix=lambda: False),
+        dist=_DepartedRankDist([7, 8, 2, 2]),
+    )
+    spec = SimpleNamespace(dp_num_tokens=lambda: 8, seq_lens=[4, 4], num_generations=2)
+    assert DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(
+        runner, metadata, spec
+    ) == (
+        [7, 7, 0, 7],
+        [[8, 8, 0, 8], [2, 2, 0, 2], [2, 2, 0, 2]],
+    )
 
     # CUDA graph agreement: the departed rank does not vote.
     runner = SimpleNamespace(config=SimpleNamespace(dist=_DepartedRankDist([1, 2, 0])))

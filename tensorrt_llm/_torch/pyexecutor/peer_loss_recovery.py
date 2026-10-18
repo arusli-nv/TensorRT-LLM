@@ -87,6 +87,18 @@ def _decode_placements(text: str, like: List[np.ndarray]) -> List[np.ndarray]:
     return list(flat.reshape(shape).astype(np.int32))
 
 
+def _one_model_mtp_or_none(spec_config) -> bool:
+    """No speculative decoding, or one-model MTP with a linear draft (no dynamic tree)."""
+    if spec_config is None:
+        return True
+    mode = getattr(spec_config, "spec_dec_mode", None)
+    return (
+        mode is not None
+        and mode.is_mtp_eagle_one_model()
+        and not getattr(spec_config, "use_dynamic_tree", False)
+    )
+
+
 def failure_domains(world_size: int, gpus_per_node: int) -> List[FailureDomain]:
     """The rank sets whose loss recovery can cover: every rank but 0, then every node but node 0.
 
@@ -249,8 +261,9 @@ class PeerLossRecovery(RecoveryHook):
         """Return the recovery hook of ``executor``: the do-nothing :class:`RecoveryHook` when it is off.
 
         The configuration must make a discarded step re-runnable: no
-        speculative decoding, guided decoding, beam search, KV connector or
-        PEFT. Requests with occurrence penalties are rejected; a discarded
+        speculative decoding other than one-model MTP (its draft tokens come
+        from committed steps and its KV is the target's), no guided decoding,
+        beam search, KV connector or PEFT. Requests with occurrence penalties are rejected; a discarded
         step can change the samples of a seeded request.
 
         Raises:
@@ -270,9 +283,9 @@ class PeerLossRecovery(RecoveryHook):
             "MPI executor": isinstance(dist, MPIDist),
             "expert TP 1": dist.mapping.moe_tp_size == 1,
             "DefaultADPRouter": type(executor.adp_router) is DefaultADPRouter,
-            "no speculative decoding": executor.drafter is None
+            "no speculative decoding but one-model MTP": executor.drafter is None
             and executor.draft_model_engine is None
-            and engine.spec_config is None,
+            and _one_model_mtp_or_none(engine.spec_config),
             "no guided decoding": executor.guided_decoder is None,
             "no beam search": executor.max_beam_width == 1,
             "no KV cache transceiver": executor.kv_cache_transceiver is None,

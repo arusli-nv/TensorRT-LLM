@@ -468,7 +468,10 @@ class DecoderInputPreparer:
         counts = attn_metadata.get_adp_token_counts()
         if self.mapping.has_cp_helix():
             counts = [math.ceil(count / self.mapping.cp_size) for count in counts]
-        gathered = self.dist.tp_cp_allgather_int64([*counts, *spec_counts])
+            gathered = self.dist.tp_cp_allgather_int64([*counts, *spec_counts])
+        else:
+            # A departed rank contributes no tokens and no requests.
+            gathered = self.dist.tp_allgather_int64([*counts, *spec_counts], departed=0)
         cols = gathered.T.tolist()
         return (attn_metadata.set_adp_token_counts(cols[: len(counts)]), cols[len(counts) :])
 
