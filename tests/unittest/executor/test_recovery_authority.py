@@ -164,6 +164,73 @@ def test_unadmitted_loss_aborts_every_worker(failed):
     assert {route for route, _ in out} == {_route(rank) for rank in range(WORLD)}
 
 
+def test_a_stray_message_while_serving_is_refused_without_ending_the_deployment():
+    authority = _registered()
+    out = authority.handle(_route(1), Ready(1, 1, "digest"), 1.0)
+    assert [(route, type(message)) for route, message in out] == [(_route(1), Abort)]
+    assert authority.phase is Phase.SERVING
+    # A frame that does not decode (e.g. version skew) likewise.
+    assert [route for route, _ in authority.reject("bad frame", _route(1))] == [_route(1)]
+    assert authority.phase is Phase.SERVING
+    # A loss report is real: one the deployment cannot recover from is terminal.
+    _assert_aborted(authority.handle(_route(1), Stopped(1, (0,)), 1.0), authority)
+
+
+def _in_phase(phase: Phase) -> RecoveryAuthority:
+    """An authority in ``phase``, recovering from the loss of rank ``FAILED`` once registered."""
+    if phase is Phase.REGISTERING:
+        authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
+        authority.handle(_route(0), Register(0, RECOVERABLE, DIGEST), 0.0)
+        return authority
+    authority = _registered()
+    steps = [
+        lambda: authority.handle(_route(0), Stopped(0, (FAILED,)), 1.0),
+        lambda: _report(authority, Stopped, SURVIVORS[1:], failed_ranks=(FAILED,)),
+        lambda: _report(authority, Ready, generation=1, placement_digest="d"),
+        lambda: _report(authority, Installed, generation=1),
+    ]
+    # Each step enters the next phase: STOPPING, PREPARING, INSTALLING, RECOVERED.
+    for step in steps:
+        if authority.phase is phase:
+            break
+        step()
+    assert authority.phase is phase
+    return authority
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        Phase.REGISTERING,
+        Phase.SERVING,
+        Phase.STOPPING,
+        Phase.PREPARING,
+        Phase.INSTALLING,
+        Phase.RECOVERED,
+    ],
+    ids=lambda phase: phase.name.lower(),
+)
+def test_a_frame_that_does_not_decode_is_refused_to_its_sender_in_every_phase(phase):
+    """It names no rank and no protocol step: only its sender hears of it, and the authority's state stays."""
+    authority = _in_phase(phase)
+    deadline, failed = authority.deadline, authority.failed_ranks
+    for route in (_route(1), b"stranger"):
+        assert authority.reject("bad frame", route) == [(route, Abort("bad frame"))]
+    assert authority.phase is phase
+    assert (authority.deadline, authority.failed_ranks) == (deadline, failed)
+    assert authority.abort_reason is None
+
+
+def test_a_recovery_completes_after_a_frame_that_does_not_decode():
+    authority = _in_phase(Phase.STOPPING)
+    authority.reject("bad frame", _route(1))
+    _report(authority, Stopped, SURVIVORS[1:], failed_ranks=(FAILED,))
+    _report(authority, Ready, generation=1, placement_digest="digest")
+    out = _report(authority, Installed, generation=1)
+    assert authority.phase is Phase.RECOVERED
+    assert out == [(_route(rank), Commit(1)) for rank in SURVIVORS]
+
+
 @pytest.mark.parametrize(
     "route, message",
     [
@@ -517,7 +584,9 @@ def test_frames_signed_with_another_key_are_dropped(served, make_client):
     assert authority.phase is Phase.SERVING
 
 
-def test_authenticated_malformed_frames_abort(served):
+def test_authenticated_malformed_frames_are_refused_without_ending_registration(
+    served, make_client
+):
     authority, endpoint = served
     context = zmq.Context()
     socket = context.socket(zmq.DEALER)
@@ -528,12 +597,18 @@ def test_authenticated_malformed_frames_abort(served):
     payload = b'{"type": "Nope"}'
     tag = hmac.new(KEY, bytes([len(route)]) + route + payload, "sha256").digest()
     socket.send_multipart([payload, tag])
-    deadline = time.monotonic() + 5.0
-    while authority.phase is not Phase.ABORTED:
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-    socket.close()
-    context.term()
+    try:
+        assert socket.poll(5000), "the sender was not refused"
+        frames = socket.recv_multipart()
+        assert protocol.authenticate(frames, KEY, route)
+        assert isinstance(protocol.decode(frames[0]), Abort)
+    finally:
+        socket.close()
+        context.term()
+    assert authority.phase is Phase.REGISTERING
+    clients = {rank: make_client(endpoint, rank) for rank in range(WORLD)}
+    assert _register_clients(clients) == {rank: {frozenset({FAILED})} for rank in range(WORLD)}
+    assert authority.phase is Phase.SERVING
 
 
 def test_client_rejects_unauthenticated_frames(tmp_path):
@@ -552,7 +627,7 @@ def test_client_rejects_unauthenticated_frames(tmp_path):
     context.term()
 
 
-def test_server_probe_reads_the_status_and_reports_unavailable_without_an_answer(served):
+def test_server_probe_reads_the_status_and_reports_unprotected_without_an_answer(served):
     from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe, health_state
 
     authority, endpoint = served
@@ -565,7 +640,7 @@ def test_server_probe_reads_the_status_and_reports_unavailable_without_an_answer
         stranger = RecoveryStatusProbe(endpoint, b"x" * 32, timeout_s=0.2, max_age_s=0.0)
         try:
             assert stranger.status() is None
-            assert health_state(stranger.status()) == "unavailable"
+            assert health_state(stranger.status()) == "unprotected"
         finally:
             stranger.close()
     finally:
@@ -583,6 +658,7 @@ def test_server_probe_reads_the_status_and_reports_unavailable_without_an_answer
         ("INSTALLING", "recovering"),
         ("RECOVERED", "degraded"),
         ("ABORTED", "terminal"),
+        ("A_PHASE_THIS_SERVER_DOES_NOT_KNOW", "unknown"),
     ],
 )
 def test_health_states_follow_the_authority_phase(phase, state):
@@ -605,4 +681,4 @@ def test_status_body_reports_live_ranks_stages_and_failed_requests():
         "last_recovery_stage_ms": {"stop": 40.0, "agree": 6.0, "install": 18.0},
         "failed_requests": 256,
     }
-    assert status_body(None) == {"state": "unavailable"}
+    assert status_body(None) == {"state": "unprotected"}

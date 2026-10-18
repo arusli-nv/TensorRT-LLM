@@ -1685,11 +1685,12 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._check_health():
             probe = getattr(self, "_recovery_status", None)
             if probe is not None:
-                # Recovering, terminal or unknown: not serving, so load balancers move on.
+                # Starting, recovering or terminal: not serving, so load balancers move on. Serving states
+                # (healthy, degraded, unprotected) return 200 with the state, for alerting.
                 state = health_state(await asyncio.to_thread(probe.status))
-                if state not in SERVING_STATES:
-                    return JSONResponse(status_code=503,
-                                        content={"state": state})
+                return JSONResponse(
+                    status_code=200 if state in SERVING_STATES else 503,
+                    content={"state": state})
             return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the

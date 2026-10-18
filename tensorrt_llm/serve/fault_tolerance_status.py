@@ -4,7 +4,7 @@
 
 The recovery authority is the only holder of the committed state, so the server asks it rather than
 deriving the state itself. Asking changes nothing on the authority. If it does not answer, the state is
-``unavailable``, never ``healthy``.
+``unprotected`` (serving, but a loss would not be recovered), never ``healthy``.
 """
 
 import os
@@ -38,16 +38,20 @@ _STATES = {
     "RECOVERED": "degraded",
     "ABORTED": "terminal",
 }
-# States in which the server answers requests; /health returns 200 only in these.
-SERVING_STATES = frozenset({"healthy", "degraded"})
+# States in which the server answers requests; /health returns 200 only in these. ``unprotected``: the
+# authority does not answer, so a loss would end the job, but the server itself serves.
+SERVING_STATES = frozenset({"healthy", "degraded", "unprotected"})
 _STAGES = ("stop", "agree", "install")
 
 
 def health_state(status: Optional[Status]) -> str:
-    """The server state for an authority status; ``unavailable`` without one."""
+    """The server state for an authority status.
+
+    ``unprotected`` without one; ``unknown`` (not serving) for a phase this server does not know.
+    """
     if status is None:
-        return "unavailable"
-    return _STATES.get(status.phase, "unavailable")
+        return "unprotected"
+    return _STATES.get(status.phase, "unknown")
 
 
 def status_body(status: Optional[Status]) -> dict:
@@ -94,6 +98,9 @@ class RecoveryStatusProbe:
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.DEALER)
         self._socket.setsockopt(zmq.LINGER, 0)
+        # While the authority is unreachable, a query fails at once instead of queueing behind earlier ones
+        # (a DEALER queues up to its high-water mark, then blocks the sender: /health would hang).
+        self._socket.setsockopt(zmq.IMMEDIATE, 1)
         self._route = f"observer-{secrets.token_hex(8)}".encode()
         self._socket.setsockopt(zmq.ROUTING_ID, self._route)
         self._socket.connect(endpoint)
@@ -119,8 +126,17 @@ class RecoveryStatusProbe:
         # Answers to earlier queries that timed out may still be queued: drop them.
         while self._socket.poll(0):
             self._socket.recv_multipart()
-        self._socket.send_multipart(encode(StatusQuery(), self._key, self._route))
         deadline = time.monotonic() + self._timeout_ms / 1000
+        # IMMEDIATE refuses to queue before the connection is up (right after connect, or while the authority
+        # is down): wait for it within the timeout instead of failing the first query.
+        if not self._socket.poll(self._timeout_ms, zmq.POLLOUT):
+            return None
+        try:
+            self._socket.send_multipart(
+                encode(StatusQuery(), self._key, self._route), flags=zmq.NOBLOCK
+            )
+        except zmq.Again:
+            return None
         while (remaining := deadline - time.monotonic()) > 0:
             if not self._socket.poll(int(remaining * 1000)):
                 break

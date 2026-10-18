@@ -142,10 +142,11 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
 
 ## Monitoring
 
-`trtllm-serve` asks the recovery authority for its state. `GET /health` returns 200 only while the
-deployment is `healthy` (no loss) or `degraded` (serving after a recovery); it returns 503 with the state
-while `starting`, `recovering`, `terminal` (the recovery aborted), or `unavailable` (the authority did not
-answer). `GET /fault_tolerance` returns that state with the membership generation, live and failed ranks
+`trtllm-serve` asks the recovery authority for its state. `GET /health` returns 200 with the state while the
+server serves: `healthy` (no loss), `degraded` (serving after a recovery) or `unprotected` (the authority did not
+answer, so a loss would end the job: alert, but keep serving). It returns 503 with the state while `starting`,
+`recovering`, `terminal` (a recovery aborted: restart the deployment) or `unknown` (the authority reported a
+state this server does not know, for example from a different version). `GET /fault_tolerance` returns that state with the membership generation, live and failed ranks
 (sorted), the number of recoveries, the last recovery's stop / agree / install durations in milliseconds,
 and the number of requests the loss failed.
 

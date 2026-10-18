@@ -89,9 +89,11 @@ class RecoveryAuthority:
     set is an admitted domain.
 
     The authority performs no I/O: ``handle`` and ``expire`` return the messages to
-    send as ``(routing_id, message)`` pairs. Any protocol violation, or a recovery that
-    does not commit within ``recovery_timeout``, moves it to the terminal ``ABORTED``
-    phase and broadcasts ``Abort``. Its attributes are read-only for callers.
+    send as ``(routing_id, message)`` pairs. A protocol violation during registration or
+    a recovery, an unrecoverable loss, or a recovery that does not commit within
+    ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts
+    ``Abort``; a violation while serving, or a message that does not decode, is refused
+    to its sender alone. Its attributes are read-only for callers.
 
     Args:
         world_size: Number of worker ranks that must register. Every worker must
@@ -165,6 +167,14 @@ class RecoveryAuthority:
         try:
             return self._dispatch(route, message, now)
         except _Violation as violation:
+            if self.phase in (Phase.SERVING, Phase.RECOVERED) and not isinstance(message, Stopped):
+                # No loss was reported: refuse the sender alone, so a stray or malformed message does not end
+                # a deployment that serves. A Stopped is a real loss, and an unrecoverable one is terminal.
+                logger.error(f"Recovery authority: refusing {message} from {route!r}: {violation}")
+                return [(route, Abort(str(violation)))]
+            # The message authenticated, so a worker (or a holder of its key) broke the protocol: the membership
+            # or the plan is not one every survivor agrees on. Aborting stops every survivor now, before any
+            # installs a plan, rather than at the deadline.
             return self.abort(str(violation), route)
 
     def status(self) -> Status:
@@ -235,6 +245,14 @@ class RecoveryAuthority:
         if self._fence is not None:
             self._command_fence = (now + COMMAND_FENCE_GRACE_S, hung)
         return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
+
+    def reject(self, reason: str, route: bytes) -> Outbound:
+        """Refuse a message that does not decode to its sender alone, in every phase.
+
+        It names no rank and no protocol step, so it changes no state; a recovery it holds
+        up ends at the deadline.
+        """
+        return [(route, Abort(reason))]
 
     def abort(self, reason: str, route: bytes | None = None) -> Outbound:
         """Enter the terminal phase and tell every worker (and ``route``) why."""
@@ -440,8 +458,9 @@ def serve(
 ) -> None:
     """Drive ``authority`` from a bound ROUTER ``socket`` until ``stop`` is set.
 
-    Frames that fail HMAC authentication are dropped; authenticated frames that do
-    not decode abort recovery, and so does stopping during a recovery.
+    Frames that fail HMAC authentication are dropped and authenticated frames that do
+    not decode are refused to their sender (see :meth:`RecoveryAuthority.reject`); neither
+    changes the authority's state. Stopping during a recovery aborts it.
 
     Args:
         authority: State machine to drive.
@@ -455,20 +474,23 @@ def serve(
         outbound = authority.expire(time.monotonic())
         if socket.poll(int(poll_interval * 1000)):
             route, *frames = socket.recv_multipart()
+            rejection = None
             if not authenticate(frames, key, route):
-                if time.monotonic() - last_rejection >= _REJECTION_LOG_INTERVAL_S:
-                    last_rejection = time.monotonic()
-                    logger.warning(
-                        f"Recovery authority: dropped a frame from {route!r} that failed "
-                        "authentication; is its key the authority's?"
-                    )
+                rejection = (
+                    "dropped a frame that failed authentication; is its key the authority's?"
+                )
             else:
                 try:
                     message = decode(frames[0])
                 except ProtocolError as error:
-                    outbound += authority.abort(str(error), route)
+                    rejection = f"refused a frame that does not decode: {error}"
+                    outbound += authority.reject(str(error), route)
                 else:
                     outbound += authority.handle(route, message, time.monotonic())
+            # Rate-limited: a peer that floods bad frames must not flood the log.
+            if rejection and time.monotonic() - last_rejection >= _REJECTION_LOG_INTERVAL_S:
+                last_rejection = time.monotonic()
+                logger.warning(f"Recovery authority: {rejection} (from {route!r})")
         for route, message in outbound:
             socket.send_multipart([route, *encode(message, key, route)])
     # A recovery in progress must not leave the survivors waiting out their deadline.
