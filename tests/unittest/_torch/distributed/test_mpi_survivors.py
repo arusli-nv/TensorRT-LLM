@@ -446,6 +446,21 @@ def test_shrink_only_once(dist):
         dist.shrink()
 
 
+def test_shrink_again_before_install_drops_a_peer_lost_during_recovery(dist):
+    with pytest.raises(RuntimeError, match="prior shrink"):
+        dist.watch_survivor_failures(lambda: None)
+    dist.revoke()
+    assert dist.shrink() == frozenset({FAILED})
+    survivors = dist._shrunk[0]
+    survivors.failed = (3,)
+    # Revoking again releases survivors waiting on the communicator the first shrink built.
+    dist.revoke()
+    assert survivors.Is_revoked()
+    assert dist.shrink() == frozenset({FAILED, 3})
+    dist.install_survivors()
+    assert dist.live_ranks == (0, 1)
+
+
 @pytest.fixture
 def native_watch(monkeypatch):
     watches = []

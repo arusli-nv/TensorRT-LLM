@@ -131,6 +131,9 @@ class RecoveryAuthority:
         self._workers: dict[bytes, Register] = {}
         self._routes: dict[int, bytes] = {}
         self._stopped: set[int] = set()
+        # Times the current recovery started over because more ranks failed during it, and those ranks.
+        self._replans = 0
+        self._failed_during_recovery: frozenset[int] = frozenset()
         # Rank 0's expert placement from its Stopped, relayed in Propose (online EPLB).
         self._base_placement = ""
         self._ready: dict[int, str] = {}
@@ -261,6 +264,9 @@ class RecoveryAuthority:
             raise _Violation(f"{message} before registration completed")
         if not isinstance(message, (Stopped, Ready, Installed)) or message.rank != worker.rank:
             raise _Violation(f"unexpected {message} from rank {worker.rank}")
+        if message.rank in self._failed_during_recovery and isinstance(message, (Stopped, Ready)):
+            # Sent before the rank failed; it was already queued behind the survivors' reports.
+            return []
         if message.rank in self.failed_ranks:
             raise _Violation(f"departed rank sent {message}")
         if isinstance(message, Stopped):
@@ -314,8 +320,7 @@ class RecoveryAuthority:
         if message.rank in failed:
             raise _Violation(f"rank {message.rank} reported its own loss")
         if self.phase is Phase.SERVING:
-            if failed not in self.admitted_domains:
-                raise _Violation(f"loss of ranks {sorted(failed)} is not an admitted domain")
+            self._admissible(failed)
             self.failed_ranks = failed
             if self.hang_monitor is not None:
                 for rank in failed:
@@ -323,6 +328,11 @@ class RecoveryAuthority:
             self.deadline = now + self.recovery_timeout
             self._stage_starts = [now]
             self._enter(Phase.STOPPING)
+        elif self.phase in (Phase.STOPPING, Phase.PREPARING) and failed > self.failed_ranks:
+            self._replan(failed)
+        elif self.phase is Phase.STOPPING and self._replans and failed < self.failed_ranks:
+            # Sent before its rank saw the further loss; the rank's next Stopped follows.
+            return []
         elif self.phase is not Phase.STOPPING:
             raise _Violation(f"{message} in phase {self.phase.name}")
         if failed != self.failed_ranks:
@@ -341,7 +351,38 @@ class RecoveryAuthority:
         )
         return self._to_survivors(proposal)
 
+    def _admissible(self, failed: frozenset[int]) -> None:
+        """Raise unless ``failed`` is a union of admitted domains; the survivors check that their slots cover it."""
+        if not failed or not failed <= frozenset().union(*self.admitted_domains):
+            raise _Violation(f"loss of ranks {sorted(failed)} is not a union of admitted domains")
+
+    def _replan(self, failed: frozenset[int]) -> None:
+        """Start the recovery over without ``failed``: more ranks failed before any survivor installed.
+
+        The survivors that report it shrank again and checked that their slots cover the larger loss.
+        """
+        self._admissible(failed)
+        logger.warning(
+            f"Recovery authority: ranks {sorted(failed - self.failed_ranks)} failed during the "
+            f"recovery; planning again without ranks {sorted(failed)}"
+        )
+        if self.hang_monitor is not None:
+            for rank in failed - self.failed_ranks:
+                self.hang_monitor.remove(rank)
+        self._failed_during_recovery |= failed - self.failed_ranks
+        self.failed_ranks = failed
+        self._replans += 1
+        self._stopped.clear()
+        self._ready.clear()
+        self._base_placement = ""
+        self._stage_starts = self._stage_starts[:1]
+        if self.phase is not Phase.STOPPING:
+            self._enter(Phase.STOPPING)
+
     def _on_ready(self, message: Ready, now: float) -> Outbound:
+        if self.phase is Phase.STOPPING and self._replans and message.rank not in self._stopped:
+            # Sent before its rank saw the further loss; its Stopped for the new plan follows.
+            return []
         self._expect(Phase.PREPARING, message)
         digests = set(self._ready.values())
         if digests and message.placement_digest not in digests:

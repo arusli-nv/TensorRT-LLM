@@ -986,6 +986,8 @@ class MPIDist(Distributed):
         comms = [self._world_comm()]
         if self._live_ranks is None and self._tp_comm is not None:
             comms.append(self._tp_comm)
+        if self._shrunk is not None:
+            comms.append(self._shrunk[0])
         for comm in comms:
             if not comm.Is_revoked():
                 comm.Revoke()
@@ -995,16 +997,22 @@ class MPIDist(Distributed):
 
         Collective over all surviving ranks; call after :meth:`revoke`. Builds
         the survivor communicator without using it yet, and returns the same
-        failed set on every survivor.
+        failed set on every survivor. Called again before
+        :meth:`install_survivors` (another peer failed during the recovery), it
+        shrinks the survivor communicator it built and returns every rank
+        failed so far.
 
         Raises:
-            RuntimeError: Recovery is not enabled, or a peer was already lost.
+            RuntimeError: Recovery is not enabled, or a recovery already
+                installed its survivors.
         """
         if self._host_world is None:
             raise RuntimeError("shrink() requires enable_peer_loss_recovery()")
-        if self._live_ranks is not None or self._shrunk is not None:
-            raise RuntimeError("A second peer loss is not recoverable")
-        survivor_comm = self._tp_comm.Shrink()
+        if self._live_ranks is not None:
+            raise RuntimeError(
+                "A peer loss after a recovery is not recoverable")
+        comm = self._tp_comm if self._shrunk is None else self._shrunk[0]
+        survivor_comm = comm.Shrink()
         live_ranks = mpi_world_ranks(survivor_comm.Get_group())
         self._shrunk = (survivor_comm, live_ranks)
         return frozenset(range(self.mapping.world_size)) - frozenset(live_ranks)
@@ -1017,7 +1025,8 @@ class MPIDist(Distributed):
         per logical rank, with the caller's ``departed`` for failed ranks.
 
         The communicator it replaces is not freed: freeing one with failed
-        members is not guaranteed to be local, and a second loss is terminal.
+        members is not guaranteed to be local, and a loss after it is installed
+        is terminal.
 
         Raises:
             RuntimeError: :meth:`shrink` has not run.
@@ -1043,6 +1052,21 @@ class MPIDist(Distributed):
         """
         return PeerFailureWatch(self._world_comm().Dup(), on_failure,
                                 abort_word)
+
+    def watch_survivor_failures(
+            self, on_failure: Callable[[], None]) -> "PeerFailureWatch":
+        """Like :meth:`watch_peer_failures`, on the survivor communicator that
+        :meth:`shrink` built and :meth:`install_survivors` has not installed:
+        a further peer failure during the recovery. Collective over the
+        survivors.
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "watch_survivor_failures requires a prior shrink()")
+        return PeerFailureWatch(self._shrunk[0].Dup(), on_failure)
 
     def _world_comm(self) -> MPI.Comm:
         if self._live_ranks is not None:

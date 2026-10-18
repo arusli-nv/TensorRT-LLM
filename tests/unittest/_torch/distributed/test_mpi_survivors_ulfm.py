@@ -33,11 +33,15 @@ def _ulfm_available() -> bool:
 
 
 @pytest.mark.skipif(not _ulfm_available(), reason="requires Open MPI with ULFM and mpi4py>=4")
-def test_survivors_recover_from_a_departed_rank():
+@pytest.mark.parametrize("second_victim", [None, 3])
+def test_survivors_recover_from_departed_ranks(second_victim):
+    """One rank exits; with ``second_victim``, another exits during the recovery, before install."""
     command = [
         "mpirun",
         "--with-ft",
         "ulfm",
+        "-x",
+        f"ULFM_SECOND_VICTIM={-1 if second_victim is None else second_victim}",
         "--mca",
         "pml",
         "ob1",
@@ -56,7 +60,7 @@ def test_survivors_recover_from_a_departed_rank():
     ]
     result = subprocess.run(command, capture_output=True, text=True, timeout=300)
     output = result.stdout + result.stderr
-    survivors = [rank for rank in range(WORLD_SIZE) if rank != VICTIM]
+    survivors = [rank for rank in range(WORLD_SIZE) if rank not in (VICTIM, second_victim)]
     for rank in survivors:
         assert f"{_OK} {rank}" in output, output
 
@@ -96,15 +100,29 @@ def _run_rank() -> None:
     dist.revoke()
     failed = dist.shrink()
     assert failed == frozenset({VICTIM}), failed
+    departed = {VICTIM}
+    second = int(os.environ.get("ULFM_SECOND_VICTIM", "-1"))
+    if second >= 0:
+        # Another rank fails during the recovery: the survivors shrink again.
+        replan = threading.Event()
+        watch = dist.watch_survivor_failures(replan.set)
+        if rank == second:
+            os._exit(0)
+        assert replan.wait(60), "the survivor watch did not observe the second departed rank"
+        watch.stop()
+        dist.revoke()
+        failed = dist.shrink()
+        departed.add(second)
+        assert failed == frozenset(departed), failed
     dist.install_survivors()
 
-    survivors = [r for r in range(WORLD_SIZE) if r != VICTIM]
+    survivors = [r for r in range(WORLD_SIZE) if r not in departed]
     assert dist.live_ranks == tuple(survivors)
-    expected = [None if r == VICTIM else r for r in range(WORLD_SIZE)]
+    expected = [None if r in departed else r for r in range(WORLD_SIZE)]
     assert dist.tp_allgather(rank, departed=None) == expected
     assert dist.allgather(rank, departed=None) == expected
     gathered = dist.tp_allgather_int64([rank], departed=-1)[:, 0].tolist()
-    assert gathered == [-1 if r == VICTIM else r for r in range(WORLD_SIZE)]
+    assert gathered == [-1 if r in departed else r for r in range(WORLD_SIZE)]
     assert dist.broadcast(rank * 10) == 0
 
     # Survivors can watch again after recovery; a clean stop never fires.

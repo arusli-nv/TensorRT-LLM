@@ -17,6 +17,7 @@ from tensorrt_llm.executor.recovery.client import (
     RecoveryAborted,
     RecoveryClient,
     RecoveryError,
+    RecoveryInterrupted,
     RecoveryTimeout,
 )
 from tensorrt_llm.executor.recovery.protocol import (
@@ -168,7 +169,7 @@ def test_status_is_answered_after_an_abort_and_changes_nothing():
     assert status.phase == "ABORTED" and "did not commit" in status.abort_reason
 
 
-@pytest.mark.parametrize("failed", [(0,), (3,), (1, FAILED), (0, 1), (1, 2, 3), ()])
+@pytest.mark.parametrize("failed", [(0,), (0, 1), ()])
 def test_unadmitted_loss_aborts_every_worker(failed):
     authority = _registered()
     out = authority.handle(_route(1), Stopped(1, failed), 1.0)
@@ -180,7 +181,7 @@ def test_unadmitted_loss_aborts_every_worker(failed):
     "route, message",
     [
         (_route(3), Stopped(3, (1,))),  # second distinct failure
-        (_route(0), Stopped(0, NODE)),  # a different failed set
+        (_route(0), Stopped(0, (1, 3))),  # a different failed set (a larger one is a re-plan)
         (_route(FAILED), Stopped(FAILED, (FAILED,))),  # departed rank still talking
         (_route(1), Stopped(3, (FAILED,))),  # rank spoofing
         (_route(1), Stopped(1, (FAILED,))),  # duplicate report
@@ -249,6 +250,46 @@ def test_recovery_deadline_aborts_and_aborted_is_terminal(phase_reports):
     reply = authority.handle(_route(1), Stopped(1, (FAILED,)), 7.0)
     assert reply == [(_route(1), Abort(authority.abort_reason))]
     assert authority.expire(1e9) == []
+
+
+def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
+    """Rank 3 fails while the survivors prepare to drop rank 2: the plan restarts without both."""
+    authority = _registered()
+    authority.handle(_route(1), Stopped(1, (FAILED,)), 1.0)
+    out = _report(authority, Stopped, (0, 3), failed_ranks=(FAILED,))
+    assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
+    assert authority.handle(_route(0), Ready(0, 1, "digest"), 1.0) == []
+
+    lost = (FAILED, 3)
+    assert authority.handle(_route(0), Stopped(0, lost), 2.0) == []
+    assert authority.phase is Phase.STOPPING and authority.failed_ranks == frozenset(lost)
+    # Every round shares the first round's deadline.
+    assert authority.deadline == pytest.approx(11.0)
+    # Rank 3 sent this before it failed.
+    assert authority.handle(_route(3), Ready(3, 1, "digest"), 2.0) == []
+    # Rank 1 sent these before it saw rank 3 fail; its Stopped for the new plan follows.
+    assert authority.handle(_route(1), Ready(1, 1, "digest"), 2.0) == []
+    assert authority.handle(_route(1), Stopped(1, (FAILED,)), 2.0) == []
+    out = authority.handle(_route(1), Stopped(1, lost), 2.0)
+    assert out == [(_route(rank), Propose(1, lost, (0, 1))) for rank in (0, 1)]
+    _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
+    out = _report(authority, Installed, (0, 1), generation=1)
+    assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
+    assert authority.phase is Phase.RECOVERED and authority.survivors == (0, 1)
+
+
+def test_a_loss_during_the_recovery_that_takes_rank0_aborts():
+    authority = _registered()
+    _report(authority, Stopped, (1, 3), failed_ranks=(FAILED,))
+    _assert_aborted(authority.handle(_route(1), Stopped(1, (0, FAILED)), 2.0), authority)
+
+
+def test_a_loss_after_install_aborts():
+    authority = _registered()
+    _report(authority, Stopped, failed_ranks=(FAILED,))
+    _report(authority, Ready, generation=1, placement_digest="digest")
+    assert authority.phase is Phase.INSTALLING
+    _assert_aborted(authority.handle(_route(0), Stopped(0, (FAILED, 3)), 2.0), authority)
 
 
 def test_second_loss_after_recovery_aborts():
@@ -430,6 +471,19 @@ def test_abort_reaches_every_worker(clients):
             clients[rank].wait(Propose, time.monotonic() + 5.0)
     with pytest.raises(RecoveryTimeout):
         clients[0].wait(Propose, time.monotonic() + 0.05)
+
+
+def test_an_interrupted_wait_takes_a_message_that_already_arrived(clients):
+    """E.g. an Install the other survivors act on: dropping it for a later loss would leave them waiting."""
+    _register_clients(clients)
+    further_loss = threading.Event()
+    further_loss.set()
+    clients[1].send(Stopped(1, (3,)))
+    assert clients[0]._socket.poll(5000)
+    with pytest.raises(RecoveryAborted):
+        clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_loss)
+    with pytest.raises(RecoveryInterrupted):
+        clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_loss)
 
 
 def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):

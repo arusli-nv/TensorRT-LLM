@@ -5587,11 +5587,12 @@ class PyExecutor:
         # Rebalancing can change the number of primary blocks.
         self._kv_cache_capacity = self._read_kv_cache_capacity()
 
-    def shrink_kv_cache_quota(self, nbytes: int) -> bool:
-        """Return ``nbytes`` of the KV cache's device memory to the driver; False if it cannot.
+    def resize_kv_cache_quota(self, delta: int) -> bool:
+        """Change the KV cache's device memory by ``delta`` bytes; False if it cannot.
 
-        Pages that no longer fit move to the host tier. Only while the model is
-        idle: no forward in flight and every step committed or discarded.
+        A negative ``delta`` returns memory to the driver; pages that no longer
+        fit move to the host tier. Only while the model is idle: no forward in
+        flight and every step committed or discarded.
 
         Raises:
             RuntimeError: Remote-tail attention DP's reserved execution row
@@ -5608,8 +5609,8 @@ class PyExecutor:
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         try:
             quota = mgr.impl.get_quota(GPU_LEVEL)
-            shrunk = nbytes < quota and mgr.impl.resize(GPU_LEVEL,
-                                                        quota - nbytes)
+            resized = quota + delta > 0 and mgr.impl.resize(
+                GPU_LEVEL, quota + delta)
         finally:
             # As in _rebalance_kv_pools_now, the reserved execution row resumes
             # first. A request that cannot resume stays suspended until the
@@ -5628,9 +5629,9 @@ class PyExecutor:
                 0)
             if dummy is None or not mgr.is_request_active(dummy.py_request_id):
                 raise RuntimeError(
-                    "Shrinking the KV cache lost the reserved conditional "
+                    "Resizing the KV cache lost the reserved conditional "
                     "attention-DP execution row")
-        return shrunk
+        return resized
 
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.

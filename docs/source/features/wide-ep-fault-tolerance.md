@@ -62,7 +62,7 @@ not support is refused at startup with the requirement it misses.
 
 ## What is covered
 
-One loss per job, with the NVLink fabric healthy, of either:
+The loss, with the NVLink fabric healthy, of either:
 
 - a recoverable rank's process (killed, for example by the out-of-memory killer, or failed with an error
   that corrupts its CUDA context, such as an illegal memory access, after which it ends itself), or
@@ -71,9 +71,12 @@ One loss per job, with the NVLink fabric healthy, of either:
   per node, `s * (N - K)` must be at least the number of experts. For DeepSeek-R1 (256 experts) at DEP32
   with 4 GPUs per node, that is 320 slots.
 
-Not covered: rank 0, any other set of ranks (for example two ranks, or part of a node), a second loss,
-including one during a recovery, a rank that hangs without dying, the authority itself, and other errors
-in the serving loop, which end the job as without fault tolerance. A job that lost a rank ends with a
+Several such ranks lost together, or one more during a recovery (before the survivors install the new
+communicator), are recovered as one loss if the survivors' slots still hold every expert.
+
+Not covered: rank 0, a loss after a recovery or after the survivors installed, a rank that hangs without
+dying unless hang detection is on, the authority itself, and other errors in the serving loop, which end
+the job as without fault tolerance. A job that lost a rank ends with a
 non-zero exit status at shutdown.
 
 ## Not supported together with fault tolerance

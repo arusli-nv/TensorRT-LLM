@@ -4,7 +4,9 @@
 
 import os
 import secrets
+import threading
 import time
+from collections.abc import Callable
 from typing import TypeVar
 
 import zmq
@@ -29,6 +31,7 @@ __all__ = [
     "RecoveryAborted",
     "RecoveryClient",
     "RecoveryError",
+    "RecoveryInterrupted",
     "RecoveryTimeout",
     "load_key",
 ]
@@ -38,6 +41,8 @@ AUTHORITY_KEY_ENV = "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY"
 
 _MIN_KEY_BYTES = 16
 _SEND_TIMEOUT_MS = 5000
+# How often a wait with an interrupt checks it.
+_INTERRUPT_POLL_S = 0.005
 
 _M = TypeVar("_M")
 
@@ -70,6 +75,10 @@ class RecoveryAborted(RecoveryError):
 
 class RecoveryTimeout(RecoveryError):
     """The authority did not answer before the deadline."""
+
+
+class RecoveryInterrupted(Exception):
+    """The caller's interrupt was set while it waited for the authority (another peer failed)."""
 
 
 class RecoveryClient:
@@ -160,21 +169,38 @@ class RecoveryClient:
         """
         return self._recv(0)
 
-    def wait(self, message_type: type[_M], deadline: float) -> _M:
+    def wait(
+        self,
+        message_type: type[_M],
+        deadline: float,
+        interrupt: threading.Event | None = None,
+        skip: Callable[[Message], bool] | None = None,
+    ) -> _M:
         """Block until a ``message_type`` message arrives.
 
         Args:
             message_type: Expected message class.
             deadline: Absolute ``time.monotonic()`` value.
+            interrupt: Checked every ``_INTERRUPT_POLL_S`` while waiting.
+            skip: Messages it accepts are dropped (left over from an earlier round).
 
         Raises:
             RecoveryAborted: The authority sent ``Abort``.
             RecoveryTimeout: ``deadline`` passed first.
+            RecoveryInterrupted: ``interrupt`` was set and no message was waiting.
             RecoveryError: Any other unexpected message arrived.
         """
         while (remaining := deadline - time.monotonic()) > 0:
-            message = self._recv(remaining)
-            if message is None:
+            interrupted = interrupt is not None and interrupt.is_set()
+            if interrupt is not None:
+                remaining = min(remaining, _INTERRUPT_POLL_S)
+            # Messages that arrived before the interrupt still count (e.g. an Install the other ranks act on).
+            message = self._recv(0 if interrupted else remaining)
+            if message is None and interrupted:
+                raise RecoveryInterrupted(
+                    f"Rank {self._rank} stopped waiting for {message_type.__name__}"
+                )
+            if message is None or (skip is not None and skip(message)):
                 continue
             if isinstance(message, Abort):
                 raise RecoveryAborted(f"Recovery aborted by authority: {message.reason}")

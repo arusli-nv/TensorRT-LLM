@@ -26,7 +26,7 @@ from typing import (
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
 from tensorrt_llm.logger import logger
 
 from ..distributed.communicator import HostCollectiveInterrupted, MPIDist, PeerFailureWatch
@@ -235,6 +235,8 @@ class PeerLossRecovery(RecoveryHook):
         # serving loop watches peers, and never during or after a recovery.
         self.survives_own_loss = False
         self._timeout_s = _recovery_timeout_s()
+        # KV cache bytes given to the borrowed slots of the plan being prepared (returned if it is abandoned).
+        self._kv_lent = 0
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
         # ahead of the one whose results it applies.
         self._uncommitted_steps: Deque[PreparedStep] = collections.deque()
@@ -604,10 +606,18 @@ class PeerLossRecovery(RecoveryHook):
     def _recover(self, error: HostCollectiveInterrupted) -> None:
         """Continue serving without the departed peers, or raise.
 
-        The failed set is the one ULFM's shrink agrees on; it must be an admitted failure
-        domain. A peer that fails after the shrink, before ``Commit``, is not recovered:
-        the survivors' collectives or the authority's deadline end the job.
+        The failed set is the one ULFM's shrink agrees on (see ``_check_recoverable``). A peer
+        that fails after the shrink and before ``Install`` joins it: the survivors shrink again
+        and plan anew. A peer that fails after ``Install`` is not recovered: the survivors'
+        collectives or the authority's deadline end the job. Every round shares the first
+        round's deadline.
+
+        The MPI calls (revoke, shrink, the survivor watch) cannot be interrupted, so
+        none of a further round starts after the deadline. One that never returns, e.g. a shrink
+        waiting for a hung survivor, is ended by the executor's hang detector, armed for the whole
+        recovery (see ``run``); the authority aborts the other survivors at its own deadline.
         """
+        from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
         from tensorrt_llm.executor.recovery.protocol import (
             Commit,
             Install,
@@ -632,11 +642,7 @@ class PeerLossRecovery(RecoveryHook):
         # Shrink is a ULFM agreement among survivors, so every survivor reports
         # the same failed set even if it only observed the revocation.
         failed = dist.shrink()
-        if failed not in self._recoverable:
-            raise RuntimeError(
-                f"The loss of ranks {sorted(failed)} is not recoverable: it is not exactly one "
-                "rank or whole node, other than rank 0's, whose experts the survivors can serve"
-            )
+        self._check_recoverable(failed)
         failed_ranks = tuple(sorted(failed))
         self._join_device_work(deadline)
         # Only now can no kernel of the steps still write their KV blocks.
@@ -654,36 +660,70 @@ class PeerLossRecovery(RecoveryHook):
         placement = (
             _encode_placements(load_balancer.current_placements()) if online and rank == 0 else ""
         )
-        client.send(Stopped(rank=rank, failed_ranks=failed_ranks, placement=placement))
-        # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery it cannot
-        # complete reaches every survivor as Abort rather than as a timeout here.
-        deadline = time.monotonic() + self._timeout_s
-        # A static placement needs nothing from the authority: its restore's memory is mapped while the authority
-        # gathers the survivors' Stopped.
-        placements = None if online else self._restore_placements(load_balancer, failed, None)
-        proposal = client.wait(Propose, deadline)
-        if (
-            proposal.failed_ranks != failed_ranks
-            or rank not in proposal.survivors
-            or not failed.isdisjoint(proposal.survivors)
-        ):
-            raise RuntimeError(
-                f"Rank {rank} observed the loss of ranks {list(failed_ranks)} but the "
-                f"authority proposed {proposal}"
-            )
-        generation = proposal.generation
+        # Until Install, a further loss restarts the plan with every rank lost so far.
+        replans = 0
+        while True:
+            if replans:
+                _check_deadline(deadline, "planning the recovery again")
+            failed_ranks = tuple(sorted(failed))
+            further_loss = threading.Event()
+            survivor_watch = self._watch_survivors(further_loss)
 
-        if placements is None:
-            base = _decode_placements(proposal.base_placement, load_balancer.current_placements())
-            placements = self._restore_placements(load_balancer, failed, base)
-        placement_digest = load_balancer.placement_digest(failed, placements)
-        client.send(Ready(rank=rank, generation=generation, placement_digest=placement_digest))
-        _expect_generation(client.wait(Install, deadline), generation)
+            def stale(message: object) -> bool:
+                """A Propose of an earlier plan, sent before the authority learned of the further loss."""
+                return isinstance(message, Propose) and message.failed_ranks != failed_ranks
+
+            # In the first round a Propose for other ranks is a protocol violation, not a leftover.
+            skip = stale if replans else None
+
+            try:
+                client.send(Stopped(rank=rank, failed_ranks=failed_ranks, placement=placement))
+                # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery
+                # it cannot complete reaches every survivor as Abort rather than as a timeout here.
+                if not replans:
+                    deadline = time.monotonic() + self._timeout_s
+                # A static placement needs nothing from the authority: its restore's memory is mapped while the
+                # authority gathers the survivors' Stopped.
+                placements = (
+                    None if online else self._restore_placements(load_balancer, failed, None)
+                )
+                proposal = client.wait(Propose, deadline, interrupt=further_loss, skip=skip)
+                if (
+                    proposal.failed_ranks != failed_ranks
+                    or rank not in proposal.survivors
+                    or not failed.isdisjoint(proposal.survivors)
+                ):
+                    raise RuntimeError(
+                        f"Rank {rank} observed the loss of ranks {list(failed_ranks)} but the "
+                        f"authority proposed {proposal}"
+                    )
+                generation = proposal.generation
+
+                if placements is None:
+                    base = _decode_placements(
+                        proposal.base_placement, load_balancer.current_placements()
+                    )
+                    placements = self._restore_placements(load_balancer, failed, base)
+                placement_digest = load_balancer.placement_digest(failed, placements)
+                ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
+                client.send(ready)
+                install = client.wait(Install, deadline, interrupt=further_loss)
+                _expect_generation(install, generation)
+            except RecoveryInterrupted:
+                failed = self._shrink_again(survivor_watch, failed, deadline)
+                replans += 1
+                continue
+            finally:
+                if survivor_watch is not None:
+                    survivor_watch.stop()
+            break
 
         dist.install_survivors()
         install_recovery_placement(
             engine.moe_execution_state, load_balancer, failed, placements, own_rank=rank
         )
+        # The KV cache cut now serves the installed slots for good.
+        self._kv_lent = 0
         if online:
             # Every survivor updates the same layers from the same statistics from here on.
             load_balancer.reset_update_schedule()
@@ -716,6 +756,76 @@ class PeerLossRecovery(RecoveryHook):
             "a further loss is not recoverable"
         )
 
+    def _watch_survivors(self, further_loss: threading.Event) -> Optional[PeerFailureWatch]:
+        """Set ``further_loss`` when another survivor fails before Install (at once if one already did)."""
+        try:
+            return self._executor.dist.watch_survivor_failures(further_loss.set)
+        except Exception as error:  # noqa: BLE001 - only a peer failure is expected here
+            if not is_mpi_peer_failure(error):
+                raise
+            further_loss.set()
+            return None
+
+    def _check_recoverable(self, lost: frozenset) -> None:
+        """Raise unless the survivors can serve without every rank in ``lost``.
+
+        Recoverable: an admitted domain (one rank or a whole node), or a union of admitted domains whose experts
+        the survivors' slots can still serve, whether those ranks failed together or one during the other's
+        recovery.
+
+        Raises:
+            RuntimeError: ``lost`` is not recoverable.
+        """
+        if lost in self._recoverable:
+            return
+        if (
+            not lost
+            or not lost <= frozenset().union(*self._recoverable)
+            or not self._executor.model_engine.moe_load_balancer.covers_loss_of(lost)
+        ):
+            raise RuntimeError(
+                f"The loss of ranks {sorted(lost)} is not recoverable: it includes a rank outside the "
+                "admitted domains (e.g. rank 0), or the survivors cannot serve every expert"
+            )
+
+    def _shrink_again(
+        self, watch: Optional[PeerFailureWatch], failed: frozenset, deadline: float
+    ) -> frozenset:
+        """Agree on every rank lost so far once another one failed during the recovery.
+
+        Raises:
+            RecoveryTimeout: ``deadline`` passed before the shrink started.
+            RuntimeError: The survivors' slots cannot serve the larger loss, it includes rank 0, or the KV
+                cache could not take back an abandoned plan's cut.
+        """
+        if watch is not None:
+            watch.stop()
+        _check_deadline(deadline, "shrinking the survivors again")
+        self._executor.dist.revoke()
+        lost = self._executor.dist.shrink()
+        self._check_recoverable(lost)
+        logger.warning(
+            f"Rank {self._executor.dist.rank}: ranks {sorted(lost - failed)} failed during the recovery; "
+            f"planning again without ranks {sorted(lost)}"
+        )
+        self._release_uninstalled_backing()
+        return lost
+
+    def _release_uninstalled_backing(self) -> None:
+        """Undo the borrowed-slot memory and KV cache cut of an abandoned plan; the next plan maps its own.
+
+        Raises:
+            RuntimeError: The KV cache could not take back what it gave, as when it could not give it.
+        """
+        released = self._executor.model_engine.moe_load_balancer.release_uninstalled_backing()
+        lent, self._kv_lent = self._kv_lent, 0
+        if released or lent:
+            logger.info(f"Released {released} bytes of an abandoned plan's borrowed slots")
+        if lent and not self._executor.resize_kv_cache_quota(lent):
+            raise RuntimeError(
+                f"The KV cache could not take back {lent} bytes after a plan was abandoned"
+            )
+
     def _restore_placements(
         self, load_balancer: "MoeLoadBalancer", failed: frozenset, base: Optional[List[np.ndarray]]
     ) -> List[np.ndarray]:
@@ -741,10 +851,11 @@ class PeerLossRecovery(RecoveryHook):
             torch.cuda.empty_cache()
             short = need + _BORROW_MARGIN_BYTES - _free_device_bytes()
         if short > 0:
-            if not self._executor.shrink_kv_cache_quota(short):
+            if not self._executor.resize_kv_cache_quota(-short):
                 raise RuntimeError(
                     f"The KV cache could not give up {short} bytes for the restored expert slots"
                 )
+            self._kv_lent += short
             logger.warning(f"Gave {short} bytes of the KV cache to the restored expert slots")
         load_balancer.back_restored_slots(placements)
         logger.info(
@@ -927,6 +1038,14 @@ def install_recovery_placement(
         state.health.mark_failed(rank)
     state.rearm()
     state.install_mask()
+
+
+def _check_deadline(deadline: float, action: str) -> None:
+    """Raise ``RecoveryTimeout`` instead of ``action`` once ``deadline`` passed."""
+    from tensorrt_llm.executor.recovery.client import RecoveryTimeout
+
+    if time.monotonic() >= deadline:
+        raise RecoveryTimeout(f"The recovery deadline passed before {action}")
 
 
 def _expect_generation(message: "Install | Commit", generation: int) -> None:

@@ -30,7 +30,11 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
-from tensorrt_llm.executor.recovery.client import RecoveryAborted
+from tensorrt_llm.executor.recovery.client import (
+    RecoveryAborted,
+    RecoveryInterrupted,
+    RecoveryTimeout,
+)
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
@@ -60,13 +64,22 @@ class _FakeClient:
     def send(self, message):
         self.sent.append(message)
 
-    def wait(self, message_type, deadline):
+    def wait(self, message_type, deadline, interrupt=None, skip=None):
         assert deadline > time.monotonic()
         reply = self.replies.pop(0)
+        while skip is not None and skip(reply):
+            reply = self.replies.pop(0)
+        if reply is _FURTHER_LOSS:
+            assert interrupt is not None
+            raise RecoveryInterrupted("another peer failed")
         if isinstance(reply, Abort):
             raise RecoveryAborted(reply.reason)
         assert isinstance(reply, message_type)
         return reply
+
+
+# A scripted reply: the survivor watch fires while the worker waits for the authority.
+_FURTHER_LOSS = object()
 
 
 def _happy_replies(generation=1, failed=(FAILED_RANK,), survivors=SURVIVORS):
@@ -171,7 +184,7 @@ def test_borrowed_slots_take_kv_cache_memory_only_when_the_device_is_short(monke
     """Borrowed slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
     recovery = _recovery(_FakeClient([]))
     executor = recovery._executor
-    executor.shrink_kv_cache_quota = Mock(return_value=True)
+    executor.resize_kv_cache_quota = Mock(return_value=True)
     load_balancer = Mock()
     need = 1 << 30
     load_balancer.restore_backing_bytes.return_value = need
@@ -179,22 +192,34 @@ def test_borrowed_slots_take_kv_cache_memory_only_when_the_device_is_short(monke
 
     monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: 4 << 30)
     recovery._back_restored_slots(load_balancer, ["placement"])
-    executor.shrink_kv_cache_quota.assert_not_called()
+    executor.resize_kv_cache_quota.assert_not_called()
     load_balancer.back_restored_slots.assert_called_once_with(["placement"])
 
     free = 512 << 20
     monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: free)
     recovery._back_restored_slots(load_balancer, ["placement"])
-    executor.shrink_kv_cache_quota.assert_called_once_with(
-        need + peer_loss_recovery._BORROW_MARGIN_BYTES - free
-    )
+    lent = need + peer_loss_recovery._BORROW_MARGIN_BYTES - free
+    executor.resize_kv_cache_quota.assert_called_once_with(-lent)
+
+    # A plan abandoned for a further loss returns its slots' memory and the KV cache's share.
+    load_balancer_of_engine = executor.model_engine.moe_load_balancer
+    load_balancer_of_engine.release_uninstalled_backing.return_value = need
+    recovery._release_uninstalled_backing()
+    executor.resize_kv_cache_quota.assert_called_with(lent)
+    assert recovery._kv_lent == 0
 
     # A KV cache that cannot shrink ends the recovery before any slot changes.
-    executor.shrink_kv_cache_quota.return_value = False
+    executor.resize_kv_cache_quota.return_value = False
     load_balancer.back_restored_slots.reset_mock()
     with pytest.raises(RuntimeError, match="could not give up"):
         recovery._back_restored_slots(load_balancer, ["placement"])
     load_balancer.back_restored_slots.assert_not_called()
+
+    # Nor does the recovery go on with a smaller KV cache when it cannot take its share back.
+    recovery._kv_lent = lent
+    with pytest.raises(RuntimeError, match="could not take back"):
+        recovery._release_uninstalled_backing()
+    executor.resize_kv_cache_quota.assert_called_with(lent)
 
 
 def test_kv_cache_quota_cut_suspends_the_active_caches_around_the_resize():
@@ -209,17 +234,17 @@ def test_kv_cache_quota_cut_suspends_the_active_caches_around_the_resize():
     executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor._read_kv_cache_capacity = Mock(return_value={})
 
-    assert executor.shrink_kv_cache_quota(1 << 30)
+    assert executor.resize_kv_cache_quota(-(1 << 30))
     mgr.suspend_request.assert_called_once_with(requests[0])
     mgr.impl.resize.assert_called_once_with(GPU_LEVEL, 9 << 30)
     mgr.resume_request.assert_called_once_with(requests[0])
     # More than the whole quota: nothing to resize.
-    assert not executor.shrink_kv_cache_quota(10 << 30)
+    assert not executor.resize_kv_cache_quota(-(10 << 30))
     assert mgr.impl.resize.call_count == 1
     # A failed resize still resumes the suspended requests.
     mgr.impl.resize.side_effect = RuntimeError("resize")
     with pytest.raises(RuntimeError, match="resize"):
-        executor.shrink_kv_cache_quota(1 << 30)
+        executor.resize_kv_cache_quota(-(1 << 30))
     assert mgr.resume_request.call_count == mgr.suspend_request.call_count == 3
 
 
@@ -248,6 +273,63 @@ def test_a_node_loss_recovers_every_rank_in_one_transaction():
     assert engine.moe_execution_state.health.get_failed_ranks() == node
     assert sorted(request_id for request_id, _ in sent[-1]) == [11, 12]
     assert list(recovery._request_owners) == [13]
+
+
+def test_a_loss_during_the_recovery_plans_again_without_every_lost_rank():
+    """Rank 3 fails while rank 1 waits for the plan without rank 2: rank 1 shrinks again, checks that the
+    survivors' slots serve every expert without both, and recovers without both; the first plan's
+    leftovers are dropped."""
+    lost = (FAILED_RANK, 3)
+    client = _FakeClient(
+        [
+            _FURTHER_LOSS,
+            Propose(1, (FAILED_RANK,), SURVIVORS),
+            Propose(1, lost, (0, 1)),
+            Install(1),
+            Commit(1),
+        ]
+    )
+    recovery = _recovery(client, failed=frozenset(lost))
+    dist = recovery._executor.dist
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset(lost)])
+    dist.shrink.side_effect = lambda: next(shrinks)
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.covers_loss_of.return_value = True
+
+    recovery._recover(_interrupted())
+
+    assert client.sent == [
+        Stopped(rank=1, failed_ranks=(FAILED_RANK,)),
+        Stopped(rank=1, failed_ranks=lost),
+        Ready(rank=1, generation=1, placement_digest="digest"),
+        Installed(rank=1, generation=1),
+    ]
+    assert dist.watch_survivor_failures.call_count == 2
+    load_balancer.covers_loss_of.assert_called_once_with(frozenset(lost))
+    load_balancer.install_recovery_placement.assert_called_once_with(list(lost), ["placement"])
+
+
+def test_a_loss_during_the_recovery_the_slots_cannot_serve_fails_closed():
+    client = _FakeClient([_FURTHER_LOSS])
+    recovery = _recovery(client)
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset({FAILED_RANK, 3})])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = False
+    with pytest.raises(RuntimeError, match="not recoverable"):
+        recovery._recover(_interrupted())
+
+
+def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
+    """A started shrink cannot be interrupted, so none starts once the deadline passed."""
+    recovery = _recovery(_FakeClient([_FURTHER_LOSS]))
+    recovery._timeout_s = 0.2
+    dist = recovery._executor.dist
+    # Stopping the survivor watch outlasts the deadline.
+    dist.watch_survivor_failures.return_value = Mock(stop=lambda: time.sleep(0.3))
+    with pytest.raises(RecoveryTimeout, match="shrinking the survivors again"):
+        recovery._recover(_interrupted())
+    assert dist.shrink.call_count == 1
+    assert dist.revoke.call_count == 1
 
 
 def _queued(request_id):
@@ -395,10 +477,14 @@ def test_multimodal_requests_are_rejected_only_under_the_overlap_scheduler(overl
         recovery.validate_request(request)
 
 
-@pytest.mark.parametrize("failed", [frozenset(), frozenset({1, 2}), frozenset({2, 3})])
-def test_recovery_requires_an_admitted_failed_set(failed):
+@pytest.mark.parametrize(
+    "failed, covered",
+    [(frozenset(), True), (frozenset({0, 1}), True), (frozenset({1, 2}), False)],
+)
+def test_recovery_requires_a_covered_union_of_admitted_domains(failed, covered):
     client = _FakeClient(_happy_replies())
-    recovery = _recovery(client, rank=0, failed=failed)
+    recovery = _recovery(client, rank=3, failed=failed)
+    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = covered
     with pytest.raises(RuntimeError, match="is not recoverable"):
         recovery._recover(_interrupted())
     assert client.sent == []
@@ -654,8 +740,8 @@ def test_recovery_aborts_collectives_and_delivers_only_after_commit():
         "abort"
     )
     client_wait = client.wait
-    client.wait = lambda message_type, deadline: (
-        events.append(message_type.__name__) or client_wait(message_type, deadline)
+    client.wait = lambda message_type, deadline, **kwargs: (
+        events.append(message_type.__name__) or client_wait(message_type, deadline, **kwargs)
     )
     executor._enqueue_responses = lambda responses: events.append("deliver")
 
