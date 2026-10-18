@@ -36,11 +36,17 @@ every other request continues.
    export TLLM_FAULT_TOLERANCE_MODE=1
    export TLLM_FAULT_TOLERANCE_AUTHORITY=tcp://<authority-host>:5555
    mpirun --with-ft ulfm --mca pml ob1 --mca btl self,tcp --mca coll ^hcoll,ucc \
+       --mca mpi_ft_detector true --mca mpi_ft_detector_thread true \
+       --mca mpi_ft_detector_period 1 --mca mpi_ft_detector_timeout 5 \
        -x TLLM_FAULT_TOLERANCE_MODE -x TLLM_FAULT_TOLERANCE_AUTHORITY -x TLLM_FAULT_TOLERANCE_AUTHORITY_KEY \
        ... trtllm-llmapi-launch trtllm-serve <model> --config <config.yaml>
    ```
    ULFM needs Open MPI's ob1 messaging layer; use TCP within nodes too (`btl self,tcp`). On hosts with
-   several network interfaces, add `--mca btl_tcp_if_include <interface>`.
+   several network interfaces, add `--mca btl_tcp_if_include <interface>`. The `mpi_ft_detector` settings turn
+   on Open MPI's in-band failure detector on its own thread. It notices a dead or frozen process whose
+   connections stay open (a stopped process, a frozen host) within about the timeout; without it, only closed
+   connections and hang detection reveal one. It showed no detectable healthy cost at DEP32 (resolved to about 3% at 128 requests per GPU). Open MPI marks it
+   experimental. Its unthreaded form can declare a slow-starting rank dead.
 
 | Variable | Meaning |
 |---|---|
