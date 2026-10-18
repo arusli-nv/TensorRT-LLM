@@ -52,6 +52,8 @@ def test_file_fields_override_the_defaults(load):
         ("spare_slots: empty\n", "spare_slots"),
         ("recovery_timeout_s: 10\nauthority_timeout_s: 20\n", "authority_timeout_s"),
         ("heartbeat_s: 5\n", "heartbeat_s"),
+        # The runtime fence must end before the fence command starts.
+        ("heartbeat_s: 3\n", "heartbeat_s"),
         ("hang_confirm_s: -1\n", "hang_confirm_s"),
         ("- empty\n", "mapping"),
     ],

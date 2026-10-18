@@ -197,13 +197,18 @@ def _hang_rank_2(authority, until, stop_at=None):
     return fences
 
 
-def test_authority_fences_a_hung_rank_through_itself_and_a_node_mate_then_the_command():
+def test_authority_fences_a_hung_rank_through_itself_and_another_rank_then_the_command():
     fenced = []
     authority = _serving_authority(fenced)
     fences = _hang_rank_2(authority, 60)
-    # Once, at confirmation: to the hung rank's evidence thread and to its lowest node-mate.
+    # Once, at confirmation: to the hung rank's evidence thread and to the two lowest live, unsuspected ranks
+    # (either asks the runtime).
     ((confirmed, outbound),) = fences.items()
-    assert outbound == [(b"evidence-2", Fence(2, 102)), (b"evidence-0", Fence(2, 102))]
+    assert outbound == [
+        (b"evidence-2", Fence(2, 102)),
+        (b"evidence-0", Fence(2, 102)),
+        (b"evidence-1", Fence(2, 102)),
+    ]
     # The workers could not end it (no recovery started): the fence command, once, after the grace.
     assert [(rank, host, pid) for rank, _, host, pid in fenced] == [(2, "node", 102)]
 

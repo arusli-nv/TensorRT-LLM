@@ -102,8 +102,9 @@ class RecoveryAuthority:
         fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason,
             host and pid): called if the rank's loss has not started a recovery
             ``COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
-            evidence thread and to a node-mate's. It must end that process, whose loss then
-            recovers as any other. None relies on the workers alone.
+            evidence thread and to another rank's (which has the MPI runtime end it). It
+            must end that process, whose loss then recovers as any other. None relies on
+            the workers alone.
         config_digest: The ``FaultToleranceConfig.digest()`` every worker must register with
             (default: that of the default settings).
     """
@@ -216,8 +217,9 @@ class RecoveryAuthority:
     def _on_hung(self, hung: HungRank, now: float) -> Outbound:
         """Fence a recoverable hung rank.
 
-        Its own evidence thread ends its process; a node-mate ends it if that thread
-        cannot (the process is stopped); the fence command if neither starts a recovery.
+        Its own evidence thread ends its process; another rank has the MPI runtime end it
+        if that thread cannot (the process is stopped); the fence command if neither
+        starts a recovery.
         """
         where = f"rank {hung.rank} (pid {hung.pid} on {hung.host or 'unknown host'})"
         # After a recovery, a further loss is not recoverable: report only.
@@ -229,13 +231,9 @@ class RecoveryAuthority:
             return []
         logger.error(f"Recovery authority: {where} is hung ({hung.reason}); fencing it")
         fence = Fence(rank=hung.rank, pid=hung.pid)
-        targets = [hung.rank]
-        node_mates = sorted(
-            rank
-            for rank, (_, host) in self._evidence.items()
-            if rank != hung.rank and host and host == hung.host
-        )
-        targets += node_mates[:1]
+        # Any live rank can ask the runtime: the lowest other one.
+        # Two live, unsuspected ranks ask the runtime, in case one of their evidence threads cannot.
+        targets = [hung.rank] + self.hang_monitor.live_helpers(hung.rank, now)
         if self._fence is not None:
             self._command_fence = (now + COMMAND_FENCE_GRACE_S, hung)
         return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
@@ -535,7 +533,7 @@ def main(argv: list[str] | None = None) -> None:
         "--fence-command",
         default="",
         help="last-resort command that kills a hung worker the workers could not fence (its own "
-        "evidence thread, then a node-mate), with {host} and {pid} placeholders, run without a "
+        "evidence thread, then the MPI runtime), with {host} and {pid} placeholders, run without a "
         "shell, e.g. 'ssh {host} kill -KILL {pid}' or the deployment's node agent",
     )
     args = parser.parse_args(argv)

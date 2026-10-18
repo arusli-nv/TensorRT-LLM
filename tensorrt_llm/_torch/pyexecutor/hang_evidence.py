@@ -11,9 +11,10 @@ The row is copied to host memory on a side stream, so it is read whether the
 step was launched eagerly or replayed from a CUDA graph. Evidence never
 changes membership; the authority decides. The same thread carries out the
 authority's ``Fence``: of its own rank (its main thread is stuck, this thread
-still runs) by killing its process; of a hung node-mate (whose whole process
-may be stopped) by killing that process after a grace period, if it still runs
-as that rank.
+still runs) by killing its process; of another rank (whose whole process may be
+stopped) after a grace period, by asking the MPI runtime to kill that rank's
+process (``pmix_fence``) on a separate thread, so that heartbeats keep flowing
+while the runtime answers.
 """
 
 from __future__ import annotations
@@ -23,13 +24,14 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
+from tensorrt_llm._torch.distributed.pmix_fence import PmixUnavailable, kill_rank
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_GRACE_S
 from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat
 from tensorrt_llm.logger import logger
 
@@ -41,17 +43,6 @@ __all__ = [
 ]
 
 _FLAG_MASK = 0xFFFFFFFF
-# A node-mate fences a hung rank only if that rank's own evidence thread has not done so by then.
-_NODE_MATE_FENCE_GRACE_S = 1.0
-
-
-def _runs_as_rank(pid: int, rank: int) -> bool:
-    """Whether process ``pid`` on this host is the MPI worker of ``rank`` (not a reused pid)."""
-    try:
-        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return False
-    return f"OMPI_COMM_WORLD_RANK={rank}".encode() in environ
 
 
 @dataclass(frozen=True)
@@ -147,6 +138,8 @@ class HangEvidenceReporter:
         heartbeat_s: Interval between heartbeats; also the polling interval.
         receive: Returns the authority's next message for this connection, or None; called from the
             reporter thread only.
+        pmix_ranks: Each rank's rank in the MPI runtime (``pmix_fence.pmix_ranks`` of the session
+            communicator), for fencing another rank.
     """
 
     def __init__(
@@ -160,12 +153,16 @@ class HangEvidenceReporter:
         suspect_s: float = 2.0,
         heartbeat_s: float = 1.0,
         receive: Callable[[], object | None] = lambda: None,
+        pmix_ranks: Sequence[int] = (),
     ) -> None:
         self._rank = rank
         self._send = send
         self._receive = receive
-        # Node-mate fences due: (monotonic deadline, Fence).
+        self._pmix_ranks = tuple(pmix_ranks)
+        # Runtime fences due: (monotonic deadline, Fence).
         self._fences: list[tuple[float, Fence]] = []
+        # The runtime fence under way; at most one, since a call the runtime never answers blocks its thread.
+        self._runtime_fence: threading.Thread | None = None
         self._read_row = read_row
         self._active_ranks = active_ranks
         self._iteration = iteration
@@ -199,16 +196,30 @@ class HangEvidenceReporter:
                 logger.error(
                     f"Rank {self._rank}: fenced as hung by the recovery authority; ending the process"
                 )
+                # Self-fence: SIGKILL, so that no handler or atexit code of a stuck process runs.
                 os.kill(os.getpid(), signal.SIGKILL)
-            self._fences.append((now + _NODE_MATE_FENCE_GRACE_S, message))
+            self._fences.append((now + RUNTIME_FENCE_GRACE_S, message))
         due = [fence for deadline, fence in self._fences if deadline <= now]
         self._fences = [(deadline, fence) for deadline, fence in self._fences if deadline > now]
         for fence in due:
-            if _runs_as_rank(fence.pid, fence.rank):
-                logger.error(
-                    f"Rank {self._rank}: fencing hung node-mate rank {fence.rank} (pid {fence.pid})"
+            if self._runtime_fence is not None and self._runtime_fence.is_alive():
+                logger.warning(
+                    f"Rank {self._rank}: not fencing rank {fence.rank} through the MPI runtime; it has "
+                    "not answered an earlier fence"
                 )
-                os.kill(fence.pid, signal.SIGKILL)
+                continue
+            logger.error(f"Rank {self._rank}: asking the MPI runtime to end hung rank {fence.rank}")
+            self._runtime_fence = threading.Thread(
+                target=self._kill_rank, args=(fence.rank,), name="runtime_fence", daemon=True
+            )
+            self._runtime_fence.start()
+
+    def _kill_rank(self, rank: int) -> None:
+        try:
+            kill_rank(self._pmix_ranks[rank])
+        except (PmixUnavailable, RuntimeError) as error:
+            # The rank may have ended itself already; else the authority's fence command remains.
+            logger.warning(f"Rank {self._rank}: runtime fence of rank {rank} failed: {error}")
 
     def _run(self) -> None:
         while not self._stop.wait(self._heartbeat_s):

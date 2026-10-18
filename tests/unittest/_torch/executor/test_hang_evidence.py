@@ -90,43 +90,126 @@ def test_a_reported_wait_is_cleared_once_rows_stop_landing():
     assert r.waits() == [DeviceWait(0, 2, 2000), DeviceWait(0, 2, 0)]
 
 
-def _fence_reporter(monkeypatch, messages, rank_of_pid):
+def _fence_reporter(monkeypatch, messages, runtime_kill=None, pmix_ranks=RANKS):
     killed = []
     monkeypatch.setattr(hang_evidence.os, "kill", lambda pid, sig: killed.append((pid, sig)))
-    monkeypatch.setattr(
-        hang_evidence, "_runs_as_rank", lambda pid, rank: rank_of_pid.get(pid) == rank
-    )
+    if runtime_kill is not False:
+        monkeypatch.setattr(
+            hang_evidence,
+            "kill_rank",
+            runtime_kill or (lambda rank: killed.append(("runtime", rank))),
+        )
     inbox = list(messages)
+    sent = []
     reporter = HangEvidenceReporter(
         rank=0,
-        send=lambda message: None,
+        send=sent.append,
         read_row=lambda: None,
         active_ranks=lambda: RANKS,
         iteration=lambda: 42,
         waiting=lambda: False,
         receive=lambda: inbox.pop(0) if inbox else None,
+        pmix_ranks=pmix_ranks,
     )
-    return reporter, killed
+    reporter.sent = sent
+    return reporter, killed, inbox
+
+
+def _join_runtime_fence(reporter):
+    reporter._runtime_fence.join(5)
+    assert not reporter._runtime_fence.is_alive()
 
 
 def test_a_fenced_rank_ends_its_own_process(monkeypatch):
-    reporter, killed = _fence_reporter(monkeypatch, [Fence(0, os.getpid())], {})
+    reporter, killed, _ = _fence_reporter(monkeypatch, [Fence(0, os.getpid())])
     reporter.poll(0.0)
     assert killed == [(os.getpid(), signal.SIGKILL)]
 
 
-def test_a_node_mate_fences_a_hung_rank_after_the_grace_only_if_it_still_runs_as_that_rank(
-    monkeypatch,
-):
-    reporter, killed = _fence_reporter(monkeypatch, [Fence(2, 4242)], {4242: 2})
+def test_another_rank_has_the_runtime_end_a_hung_rank_after_the_grace(monkeypatch):
+    reporter, killed, _ = _fence_reporter(monkeypatch, [Fence(2, 4242)])
     reporter.poll(0.0)
     assert killed == []  # the hung rank's own thread gets the first chance
     reporter.poll(2.0)
-    assert killed == [(4242, signal.SIGKILL)]
-    # A pid that no longer runs as the rank (it exited, or the pid was reused) is left alone.
-    reporter, killed = _fence_reporter(monkeypatch, [Fence(2, 4242)], {4242: 5})
+    _join_runtime_fence(reporter)
+    # Through the runtime, by rank: never a signal to a pid this rank cannot vouch for.
+    assert killed == [("runtime", 2)]
+
+
+def test_the_runtime_fence_needs_a_pmix_runtime(monkeypatch):
+    from tensorrt_llm._torch.distributed import pmix_fence
+
+    monkeypatch.delenv("PMIX_NAMESPACE", raising=False)
+    with pytest.raises(pmix_fence.PmixUnavailable):
+        pmix_fence.kill_rank(2)
+
+
+def test_pmix_ranks_translate_a_communicator_to_the_job():
+    from mpi4py import MPI
+
+    from tensorrt_llm._torch.distributed.pmix_fence import pmix_ranks
+
+    assert pmix_ranks(MPI.COMM_SELF) == (MPI.COMM_WORLD.Get_rank(),)
+
+
+def test_a_failed_runtime_fence_leaves_the_worker_running(monkeypatch):
+    def refuse(rank):
+        raise hang_evidence.PmixUnavailable("not launched by PMIx")
+
+    reporter, killed, _ = _fence_reporter(monkeypatch, [Fence(2, 4242)], refuse)
     reporter.poll(0.0)
     reporter.poll(2.0)
+    _join_runtime_fence(reporter)
+    assert killed == []
+
+
+class _FakeLibpmix:
+    """The libpmix calls ``kill_rank`` makes, recording the job-control target."""
+
+    def __init__(self, answered):
+        self.targets = []
+        self._answered = answered
+
+    def PMIx_Info_create(self, n):
+        return 1
+
+    def PMIx_Info_load(self, info, key, value, type_):
+        assert key == b"pmix.jctrl.kill"
+        return 0
+
+    def PMIx_Info_free(self, info, n):
+        pass
+
+    def PMIx_Job_control(self, targets, ntargets, directives, ndirectives, results, nresults):
+        proc = targets._obj
+        self.targets.append((proc.nspace, proc.rank))
+        self._answered.wait()
+        return 0
+
+
+def test_the_runtime_fence_kills_the_job_rank_off_the_heartbeat_thread(monkeypatch):
+    import threading
+
+    from tensorrt_llm._torch.distributed import pmix_fence
+
+    answered = threading.Event()
+    lib = _FakeLibpmix(answered)
+    monkeypatch.setenv("PMIX_NAMESPACE", "prterun-test@1")
+    monkeypatch.setattr(pmix_fence, "_loaded_libpmix", lambda: lib)
+    # Session rank 2 is job rank 6.
+    reporter, killed, inbox = _fence_reporter(
+        monkeypatch, [Fence(2, 4242)], runtime_kill=False, pmix_ranks=(4, 5, 6, 7)
+    )
+    reporter.poll(0.0)
+    reporter.poll(2.0)
+    # The runtime has not answered: heartbeats keep flowing and a second fence starts no second call.
+    inbox.append(Fence(3, 4343))
+    reporter.poll(3.0)
+    reporter.poll(5.0)
+    assert sum(isinstance(m, Heartbeat) for m in reporter.sent) == 4
+    answered.set()
+    _join_runtime_fence(reporter)
+    assert lib.targets == [(b"prterun-test@1", 6)]
     assert killed == []
 
 

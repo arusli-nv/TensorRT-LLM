@@ -163,8 +163,8 @@ class DeviceWait:
 class Fence:
     """Authority -> a worker's evidence connection: end the worker process ``pid`` of the hung ``rank``.
 
-    Sent to the hung rank itself (its evidence thread kills its own process) and to a
-    node-mate (which kills ``pid`` if that process still runs as ``rank``).
+    Sent to the hung rank itself (its evidence thread kills its own process) and to another
+    rank (which has the MPI runtime kill ``rank``'s process after a grace period).
     """
 
     rank: int

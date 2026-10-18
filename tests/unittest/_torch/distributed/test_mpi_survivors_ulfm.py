@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """MPIDist survivor recovery against a real ULFM MPI library.
 
-The test launches this file under ``mpirun --with-ft ulfm``; one rank exits
-and the others detect, interrupt, shrink and keep running host collectives.
+The test launches this file under ``mpirun --with-ft ulfm``; one rank exits (or
+freezes and is fenced through the runtime) and the others detect, interrupt,
+shrink and keep running host collectives.
 """
 
 import importlib.metadata
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -33,15 +35,25 @@ def _ulfm_available() -> bool:
 
 
 @pytest.mark.skipif(not _ulfm_available(), reason="requires Open MPI with ULFM and mpi4py>=4")
-@pytest.mark.parametrize("second_victim", [None, 3])
-def test_survivors_recover_from_departed_ranks(second_victim):
-    """One rank exits; with ``second_victim``, another exits during the recovery, before install."""
+@pytest.mark.parametrize(
+    "second_victim, frozen",
+    [(None, False), (3, False), (None, True)],
+    ids=["exit", "replan", "fenced"],
+)
+def test_survivors_recover_from_departed_ranks(second_victim, frozen):
+    """One rank exits; with ``second_victim``, another exits during the recovery, before install.
+
+    ``frozen``: the victim stops itself (SIGSTOP) instead, and rank 0 fences it through the runtime
+    (PMIx job control): PRRTE ends it alone, and the survivors see it fail.
+    """
     command = [
         "mpirun",
         "--with-ft",
         "ulfm",
         "-x",
         f"ULFM_SECOND_VICTIM={-1 if second_victim is None else second_victim}",
+        "-x",
+        f"ULFM_FROZEN_VICTIM={int(frozen)}",
         "--mca",
         "pml",
         "ob1",
@@ -89,7 +101,13 @@ def _run_rank() -> None:
     watch = dist.watch_peer_failures(failure_seen.set, abort.ctypes.data)
     dist.barrier()
     if rank == VICTIM:
+        if os.environ.get("ULFM_FROZEN_VICTIM") == "1":
+            os.kill(os.getpid(), signal.SIGSTOP)
         os._exit(0)
+    if rank == 0 and os.environ.get("ULFM_FROZEN_VICTIM") == "1":
+        from tensorrt_llm._torch.distributed.pmix_fence import kill_rank
+
+        kill_rank(VICTIM)
 
     assert failure_seen.wait(60), "the watch did not observe the departed rank"
     assert watch.failed and abort[0] == 1

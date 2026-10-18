@@ -24,8 +24,13 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 __all__ = ["CONFIG_ENV", "FaultToleranceConfig", "fault_tolerance_config"]
 
 CONFIG_ENV = "TLLM_FAULT_TOLERANCE_CONFIG"
-# How long the workers' own fencing (the hung rank's evidence thread, then a node-mate) gets before the
-# authority's fence command runs.
+# A worker asks the MPI runtime to kill a hung rank this long after it received the authority's Fence, unless the
+# hung rank's own evidence thread ended its process first.
+RUNTIME_FENCE_GRACE_S = 1.0
+# How long the MPI runtime may take to kill a rank before the authority's fence command takes over.
+RUNTIME_FENCE_CALL_S = 2.0
+# How long the workers' own fencing gets before the authority's fence command runs: a heartbeat interval until
+# the workers receive the Fence, then the runtime fence's grace and call.
 COMMAND_FENCE_GRACE_S = 5.0
 
 
@@ -69,7 +74,8 @@ class FaultToleranceConfig(StrictBaseModel):
     )
     heartbeat_s: PositiveFloat = Field(
         default=1.0,
-        description="Worker heartbeat interval.",
+        description="Worker heartbeat interval, at most 2 s: a worker receives the authority's ``Fence`` within "
+        "one, and its runtime fence must end before the authority's fence command starts.",
     )
     heartbeat_timeout_s: PositiveFloat = Field(
         default=5.0,
@@ -82,6 +88,12 @@ class FaultToleranceConfig(StrictBaseModel):
             raise ValueError("authority_timeout_s must be below recovery_timeout_s")
         if self.heartbeat_s >= self.heartbeat_timeout_s:
             raise ValueError("heartbeat_s must be below heartbeat_timeout_s")
+        if self.heartbeat_s + RUNTIME_FENCE_GRACE_S + RUNTIME_FENCE_CALL_S > COMMAND_FENCE_GRACE_S:
+            limit = COMMAND_FENCE_GRACE_S - RUNTIME_FENCE_GRACE_S - RUNTIME_FENCE_CALL_S
+            raise ValueError(
+                f"heartbeat_s must be at most {limit}s, so that the workers' runtime fence ends before the "
+                "authority's fence command starts"
+            )
         return self
 
     def hang_resolution_s(self) -> float:

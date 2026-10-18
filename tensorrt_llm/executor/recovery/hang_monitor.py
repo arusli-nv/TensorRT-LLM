@@ -135,6 +135,19 @@ class HangMonitor:
                 )
         return None
 
+    def live_helpers(self, hung: int, now: float, count: int = 2) -> list[int]:
+        """Up to ``count`` ranks, lowest first, that can act for the deployment.
+
+        Their heartbeats are fresh and no evidence points at them.
+        """
+        return [
+            rank
+            for rank, evidence in sorted(self._evidence.items())
+            if rank != hung
+            and rank not in self._suspected_since
+            and now - evidence.heartbeat <= self.heartbeat_timeout_s
+        ][:count]
+
     def _evidence_against(self, rank: int, now: float) -> str | None:
         evidence = self._evidence[rank]
         others = {r: e for r, e in self._evidence.items() if r != rank}

@@ -439,8 +439,10 @@ class PeerLossRecovery(RecoveryHook):
 
     def _start_hang_evidence(self) -> Optional["HangEvidenceReporter"]:
         """Start reporting heartbeats and long all-to-all waits to the authority, if enabled."""
+        from tensorrt_llm._utils import mpi_comm
         from tensorrt_llm.executor.recovery.client import RecoveryClient
 
+        from ..distributed.pmix_fence import pmix_ranks
         from .hang_evidence import HangEvidenceReporter, ProgressRowReader
 
         config = fault_tolerance_config()
@@ -462,6 +464,7 @@ class PeerLossRecovery(RecoveryHook):
             suspect_s=config.hang_suspect_s,
             heartbeat_s=config.heartbeat_s,
             receive=client.receive,
+            pmix_ranks=pmix_ranks(mpi_comm()),
         )
         reporter.start()
         return reporter

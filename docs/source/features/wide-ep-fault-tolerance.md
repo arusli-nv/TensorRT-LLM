@@ -57,11 +57,20 @@ every other request continues.
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20; below `recovery_timeout_s`) |
 | `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (default off) |
 | `hang_confirm_s` | How long the evidence of a hang must hold before it is confirmed (default 30; above the slowest legitimate step) |
-| `hang_suspect_s`, `heartbeat_s`, `heartbeat_timeout_s` | Device wait reported after (default 2 s); heartbeat interval (default 1 s); a worker without a heartbeat this long counts as missing (default 5 s) |
+| `hang_suspect_s`, `heartbeat_s`, `heartbeat_timeout_s` | Device wait reported after (default 2 s); heartbeat interval (default 1 s, at most 2 s); a worker without a heartbeat this long counts as missing (default 5 s) |
 
-A confirmed hung rank is fenced by its own evidence thread (its process ends itself), else by a rank on the
-same node (which ends it after 1 s if it still runs), else by the authority's `--fence-command` (a
+A confirmed hung rank is fenced by its own evidence thread (its process ends itself), else, 1 s later, by
+another rank asking the MPI runtime to kill it (PMIx job control of that one process; under `mpirun` PRRTE
+ends its process group and the job keeps running), else by the authority's `--fence-command` (a
 `{host}`/`{pid}` template, run without a shell, 5 s later); its loss then recovers as any other.
+
+Fault tolerance ends a worker process in exactly these places, always with SIGKILL so that no handler,
+atexit code or MPI finalization of a broken process runs:
+- a rank whose serving loop fails with an error that leaves it unusable (for example a sticky CUDA error)
+  kills itself, so that the survivors recover from its loss (`PyExecutor` event loop);
+- a rank the authority confirmed hung kills itself from its evidence thread (`hang_evidence`);
+- another rank has the MPI runtime kill a hung rank that could not (`pmix_fence`, PMIx job control);
+- the authority's `--fence-command`, if configured.
 
 At startup rank 0 logs which ranks' and nodes' loss the job can recover from. A configuration that recovery does
 not support is refused at startup with the requirement it misses.
