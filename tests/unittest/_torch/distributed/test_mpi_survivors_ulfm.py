@@ -118,6 +118,10 @@ def _run_rank() -> None:
     dist.revoke()
     failed = dist.shrink()
     assert failed == frozenset({VICTIM}), failed
+    # Rank 0's EPLB placement travels over the survivor communicator before it is installed.
+    placement = {"slots": list(range(WORLD_SIZE))}
+    sent = dist.broadcast_among_survivors(placement if rank == 0 else None, root=0)
+    assert sent == placement, sent
     departed = {VICTIM}
     second = int(os.environ.get("ULFM_SECOND_VICTIM", "-1"))
     if second >= 0:
@@ -132,7 +136,12 @@ def _run_rank() -> None:
         failed = dist.shrink()
         departed.add(second)
         assert failed == frozenset(departed), failed
+    # Roots name logical ranks, which the survivor communicator renumbers densely.
+    last = max(r for r in range(WORLD_SIZE) if r not in departed)
+    assert dist.broadcast_among_survivors(rank if rank == last else None, root=last) == last
     dist.install_survivors()
+    with pytest.raises(RuntimeError, match="prior shrink"):
+        dist.broadcast_among_survivors(None)
 
     survivors = [r for r in range(WORLD_SIZE) if r not in departed]
     assert dist.live_ranks == tuple(survivors)

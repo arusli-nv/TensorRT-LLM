@@ -1068,6 +1068,22 @@ class MPIDist(Distributed):
                 "watch_survivor_failures requires a prior shrink()")
         return PeerFailureWatch(self._shrunk[0].Dup(), on_failure)
 
+    def broadcast_among_survivors(self, obj, root: int = 0):
+        """Broadcast *obj* from logical rank *root* over the survivor
+        communicator that :meth:`shrink` built, before it is installed.
+        Collective over the survivors.
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+            MPI.Exception: Another survivor failed, or the communicator was
+                revoked (see ``is_mpi_peer_failure``).
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "broadcast_among_survivors requires a prior shrink()")
+        survivor_comm, live_ranks = self._shrunk
+        return survivor_comm.bcast(obj, root=live_ranks.index(root))
+
     def _world_comm(self) -> MPI.Comm:
         if self._live_ranks is not None:
             return self._survivor_comm

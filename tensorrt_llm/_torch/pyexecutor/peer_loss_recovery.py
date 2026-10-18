@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Keep a WideEP PyExecutor serving after one peer process or a whole node dies."""
 
-import base64
 import collections
 import dataclasses
 import functools
@@ -66,24 +65,6 @@ _BORROW_MARGIN_BYTES = 256 << 20
 
 def _free_device_bytes() -> int:
     return torch.cuda.mem_get_info()[0]
-
-
-def _encode_placements(placements: List[np.ndarray]) -> str:
-    """Per-layer ``[ep_size, slots_per_rank]`` expert ids as compact text for the recovery protocol."""
-    return base64.b64encode(np.asarray(placements, dtype=np.int16).tobytes()).decode()
-
-
-def _decode_placements(text: str, like: List[np.ndarray]) -> List[np.ndarray]:
-    """Placements encoded by ``_encode_placements``, shaped as ``like``.
-
-    Raises:
-        ValueError: ``text`` does not hold placements of that shape.
-    """
-    shape = np.asarray(like).shape
-    flat = np.frombuffer(base64.b64decode(text, validate=True), dtype=np.int16)
-    if flat.size != int(np.prod(shape)):
-        raise ValueError(f"rank 0's placement has {flat.size} slots, expected shape {shape}")
-    return list(flat.reshape(shape).astype(np.int32))
 
 
 def _one_model_mtp_or_none(spec_config) -> bool:
@@ -641,10 +622,11 @@ class PeerLossRecovery(RecoveryHook):
         collectives or the authority's deadline end the job. Every round shares the first
         round's deadline.
 
-        The MPI calls (revoke, shrink, the survivor watch) cannot be interrupted, so
-        none of a further round starts after the deadline. One that never returns, e.g. a shrink
-        waiting for a hung survivor, is ended by the executor's hang detector, armed for the whole
-        recovery (see ``run``); the authority aborts the other survivors at its own deadline.
+        The MPI calls (revoke, shrink, the survivor watch, rank 0's placement broadcast) cannot be
+        interrupted, so none of a further round starts after the deadline. One that never returns,
+        e.g. a shrink waiting for a hung survivor, is ended by the executor's hang detector, armed
+        for the whole recovery (see ``run``); the authority aborts the other survivors at its own
+        deadline.
         """
         from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
         from tensorrt_llm.executor.recovery.protocol import (
@@ -686,9 +668,6 @@ class PeerLossRecovery(RecoveryHook):
         online = not load_balancer.is_static_routing()
         if online and not load_balancer.quiesce(max(0.0, deadline - time.monotonic())):
             raise RuntimeError("EPLB weight updates did not finish within the recovery timeout")
-        placement = (
-            _encode_placements(load_balancer.current_placements()) if online and rank == 0 else ""
-        )
         # Until Install, a further loss restarts the plan with every rank lost so far.
         replans = 0
         while True:
@@ -706,16 +685,15 @@ class PeerLossRecovery(RecoveryHook):
             skip = stale if replans else None
 
             try:
-                client.send(Stopped(rank=rank, failed_ranks=failed_ranks, placement=placement))
+                client.send(Stopped(rank=rank, failed_ranks=failed_ranks))
                 # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery
                 # it cannot complete reaches every survivor as Abort rather than as a timeout here.
                 if not replans:
                     deadline = time.monotonic() + self._timeout_s
-                # A static placement needs nothing from the authority: its restore's memory is mapped while the
-                # authority gathers the survivors' Stopped.
-                placements = (
-                    None if online else self._restore_placements(load_balancer, failed, None)
-                )
+                # The restore's memory is mapped while the authority gathers the survivors' Stopped. Rank 0's
+                # placement travels among the survivors, not through the authority: it can exceed a message.
+                base = self._rank0_placements(load_balancer) if online else None
+                placements = self._restore_placements(load_balancer, failed, base)
                 proposal = client.wait(Propose, deadline, interrupt=further_loss, skip=skip)
                 if (
                     proposal.failed_ranks != failed_ranks
@@ -727,12 +705,6 @@ class PeerLossRecovery(RecoveryHook):
                         f"authority proposed {proposal}"
                     )
                 generation = proposal.generation
-
-                if placements is None:
-                    base = _decode_placements(
-                        proposal.base_placement, load_balancer.current_placements()
-                    )
-                    placements = self._restore_placements(load_balancer, failed, base)
                 placement_digest = load_balancer.placement_digest(failed, placements)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
                 client.send(ready)
@@ -854,6 +826,33 @@ class PeerLossRecovery(RecoveryHook):
             raise RuntimeError(
                 f"The KV cache could not take back {lent} bytes after a plan was abandoned"
             )
+
+    def _rank0_placements(self, load_balancer: "MoeLoadBalancer") -> List[np.ndarray]:
+        """Rank 0's current placements, broadcast among the survivors (online EPLB).
+
+        Raises:
+            RecoveryInterrupted: Another survivor failed during the broadcast.
+            RuntimeError: Rank 0's placements do not have this rank's shape.
+        """
+        from mpi4py import MPI
+
+        from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
+
+        dist = self._executor.dist
+        own = load_balancer.current_placements()
+        try:
+            base = dist.broadcast_among_survivors(own if dist.rank == 0 else None, root=0)
+        except MPI.Exception as error:
+            if not is_mpi_peer_failure(error):
+                raise
+            raise RecoveryInterrupted(
+                f"Rank {dist.rank}: a survivor failed while rank 0 sent its placement"
+            ) from error
+        if np.asarray(base).shape != np.asarray(own).shape:
+            raise RuntimeError(
+                f"Rank 0's placement has shape {np.asarray(base).shape}, expected {np.asarray(own).shape}"
+            )
+        return base
 
     def _restore_placements(
         self, load_balancer: "MoeLoadBalancer", failed: frozenset, base: Optional[List[np.ndarray]]

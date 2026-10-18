@@ -134,8 +134,6 @@ class RecoveryAuthority:
         # Times the current recovery started over because more ranks failed during it, and those ranks.
         self._replans = 0
         self._failed_during_recovery: frozenset[int] = frozenset()
-        # Rank 0's expert placement from its Stopped, relayed in Propose (online EPLB).
-        self._base_placement = ""
         self._ready: dict[int, str] = {}
         self._installed: set[int] = set()
         # Rank -> (route of its evidence connection, host), from its heartbeats.
@@ -339,18 +337,12 @@ class RecoveryAuthority:
             raise _Violation(f"{message} in phase {self.phase.name}")
         if failed != self.failed_ranks:
             raise _Violation(f"{message} conflicts with departed ranks {sorted(self.failed_ranks)}")
-        if message.placement and message.rank != 0:
-            raise _Violation(f"rank {message.rank} sent a placement; only rank 0's is the base")
         self._record(self._stopped, message)
-        if message.rank == 0:
-            self._base_placement = message.placement
         if len(self._stopped) < len(self.survivors):
             return []
         self._stage_starts.append(now)
         self._enter(Phase.PREPARING)
-        proposal = Propose(
-            self.generation + 1, tuple(sorted(failed)), self.survivors, self._base_placement
-        )
+        proposal = Propose(self.generation + 1, tuple(sorted(failed)), self.survivors)
         return self._to_survivors(proposal)
 
     def _admissible(self, failed: frozenset[int]) -> None:
@@ -376,7 +368,6 @@ class RecoveryAuthority:
         self._replans += 1
         self._stopped.clear()
         self._ready.clear()
-        self._base_placement = ""
         self._stage_starts = self._stage_starts[:1]
         if self.phase is not Phase.STOPPING:
             self._enter(Phase.STOPPING)

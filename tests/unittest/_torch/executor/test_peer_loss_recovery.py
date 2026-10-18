@@ -344,6 +344,35 @@ def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
     assert dist.revoke.call_count == 1
 
 
+def test_a_round_after_a_late_shrink_does_not_start_survivor_collectives():
+    """A shrink that returns after the deadline ends the recovery before the next round's watch and broadcast."""
+    import numpy as np
+
+    recovery = _recovery(_FakeClient([_FURTHER_LOSS]))
+    recovery._timeout_s = 0.2
+    dist = recovery._executor.dist
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset({FAILED_RANK, 3})])
+
+    def shrink():
+        lost = next(shrinks)
+        if len(lost) > 1:
+            time.sleep(0.3)  # the second shrink returns after the deadline
+        return lost
+
+    dist.shrink.side_effect = shrink
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.covers_loss_of.return_value = True
+    # Online EPLB: every round broadcasts rank 0's placement among the survivors.
+    load_balancer.is_static_routing.return_value = False
+    load_balancer.quiesce.return_value = True
+    load_balancer.current_placements.return_value = [np.zeros((WORLD_SIZE, 2))]
+    dist.broadcast_among_survivors = Mock(return_value=[np.zeros((WORLD_SIZE, 2))])
+    with pytest.raises(RecoveryTimeout, match="planning the recovery again"):
+        recovery._recover(_interrupted())
+    assert dist.watch_survivor_failures.call_count == 1
+    assert dist.broadcast_among_survivors.call_count == 1
+
+
 def _queued(request_id):
     return RequestQueueItem(request_id, Mock())
 
@@ -1345,15 +1374,35 @@ def test_install_recovery_placement_reroutes_before_masking():
     assert events == [] and health.get_failed_ranks() == frozenset({FAILED_RANK})
 
 
-def test_placements_survive_the_protocol_encoding():
+def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():
+    """A placement can exceed an authority message, so rank 0 broadcasts it over the survivor communicator."""
     import numpy as np
 
-    placements = [
-        np.array([[0, 1, -1], [2, 3, 0]], dtype=np.int32),
-        np.array([[3, 2, 1], [0, -1, 2]]),
-    ]
-    text = peer_loss_recovery._encode_placements(placements)
-    decoded = peer_loss_recovery._decode_placements(text, placements)
-    assert [p.tolist() for p in decoded] == [p.tolist() for p in placements]
-    with pytest.raises(ValueError, match="expected shape"):
-        peer_loss_recovery._decode_placements(text, placements[:1])
+    recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.is_static_routing.return_value = False
+    load_balancer.quiesce.return_value = True
+    own, rank0 = [np.zeros((WORLD_SIZE, 2))], [np.ones((WORLD_SIZE, 2))]
+    load_balancer.current_placements.return_value = own
+    broadcast = recovery._executor.dist.broadcast_among_survivors = Mock(return_value=rank0)
+
+    recovery._recover(_interrupted())
+
+    broadcast.assert_called_once_with(None, root=0)
+    load_balancer.recovery_placements.assert_called_once_with(frozenset({FAILED_RANK}), rank0)
+
+
+def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(monkeypatch):
+    from mpi4py import MPI
+
+    recovery = _recovery(_FakeClient([]))
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    recovery._executor.dist.broadcast_among_survivors = Mock(
+        side_effect=MPI.Exception(MPI.ERR_OTHER)
+    )
+    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
+    with pytest.raises(RecoveryInterrupted):
+        recovery._rank0_placements(load_balancer)
+    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
+    with pytest.raises(MPI.Exception):
+        recovery._rank0_placements(load_balancer)
