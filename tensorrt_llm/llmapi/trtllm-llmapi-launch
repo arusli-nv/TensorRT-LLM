@@ -31,15 +31,18 @@ function mpi_world_size {
     fi
 }
 
-function cleanup_flashinfer_temporary_workspace {
-    local exit_status=$?
-
+function remove_flashinfer_temporary_workspace {
     if [ -n "$flashinfer_temporary_workspace" ]; then
         if ! rm -rf -- "$flashinfer_temporary_workspace"; then
             log_stderr "Failed to remove temporary FlashInfer JIT workspace: $flashinfer_temporary_workspace"
         fi
     fi
+}
 
+function cleanup_flashinfer_temporary_workspace {
+    local exit_status=$?
+
+    remove_flashinfer_temporary_workspace
     trap - EXIT
     exit "$exit_status"
 }
@@ -168,6 +171,21 @@ function configure_flashinfer_workspace {
     done
 }
 
+# Exits with the worker's status. Under WideEP fault tolerance, a worker killed by SIGKILL or SIGTERM (a lost or
+# fenced rank) instead ends this launcher by the same signal, so that the MPI runtime sees an aborted process rather
+# than an exit status: PRRTE survives aborted processes, but a second non-zero exit status ends the whole job.
+function exit_with_worker_status {
+    local status=$1
+    local signal=$((status - 128))
+
+    if [ "$TLLM_FAULT_TOLERANCE_MODE" = "1" ] && { [ "$signal" -eq 9 ] || [ "$signal" -eq 15 ]; }; then
+        remove_flashinfer_temporary_workspace
+        trap - EXIT "$signal"
+        kill -s "$signal" $$
+    fi
+    exit "$status"
+}
+
 function run_child_command {
     if [ "$flashinfer_workspace_lock_held" -eq 1 ]; then
         "$@" 200>&-
@@ -291,5 +309,5 @@ else
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
 
-    exit $mgmn_worker_node_exit_code
+    exit_with_worker_status $mgmn_worker_node_exit_code
 fi
