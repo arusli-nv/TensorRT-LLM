@@ -12,9 +12,10 @@ every other request continues.
   KV Cache Manager V2 without KV block reuse (`kv_cache_config.enable_block_reuse: false`), the default
   attention-DP router.
 - The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`).
-- Static expert placement with resident copies: `moe_config.load_balancer` with `num_slots` above the
-  number of experts and `layer_updates_per_iter: 0`. A rank is recoverable only if every expert it hosts
-  has a copy on another GPU; rank 0 is never recoverable.
+- An EPLB load balancer (`moe_config.load_balancer` with `num_slots` above the number of experts), static
+  (`layer_updates_per_iter: 0`) or online. Its per-node host copies of every expert restore the experts of a
+  lost rank into extra slots; rank 0 is never recoverable. With online EPLB the survivors adopt rank 0's
+  placement during the recovery and restart the update rotation together.
 - Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4.1 or later.
 
 ## Running

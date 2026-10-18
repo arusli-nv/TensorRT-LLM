@@ -1101,6 +1101,11 @@ class NVLinkOneSided(Communication):
                 compact_expert_ids=token_selected_slots.new_empty(rows),
                 compact_weights=token_final_scales.new_empty(rows, dtype=torch.float32),
             )
+            if eplb_local_stats is not None:
+                # The same CTAs copy each active source's statistics row (0 for a lost rank's).
+                compact_routing["eplb_stats_out"] = eplb_local_stats.new_empty(
+                    (self.ep_size, eplb_local_stats.size(0))
+                )
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -1132,7 +1137,9 @@ class NVLinkOneSided(Communication):
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "dispatch", active_rank_mask
             )
-        if eplb_gathered_stats.numel() == 0:
+        if "eplb_stats_out" in compact_routing:
+            eplb_gathered_stats = compact_routing["eplb_stats_out"]
+        elif eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)

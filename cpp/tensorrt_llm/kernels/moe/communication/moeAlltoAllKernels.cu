@@ -479,20 +479,23 @@ __global__ void moeA2APrepareDispatchKernel(
 
 // Fixed slots: copy one source's routed expert ids and router weights to the compact lists (see
 // DispatchKernelPointers::compact_expert_ids) as soon as that source's flag arrives. Runs in a CTA after every token
-// CTA, so its wait never holds an SM a token CTA needs. An abort leaves the lists partial; the step is discarded.
-template <int TOP_K>
-__device__ void compact_source_routing(
-    DispatchKernelPointers const& ptrs, int source, int source_tokens, int rank_id, int ep_size)
+// CTA, so its wait never holds an SM a token CTA needs. With EPLB statistics it also copies the source's row of the
+// gathered statistics to eplb_stats_out (0 for a masked source). An abort leaves the outputs partial; the step is
+// discarded.
+template <int TOP_K, bool ENABLE_EPLB>
+__device__ void compact_source_routing(DispatchKernelPointers const& ptrs, int source, int source_tokens, int rank_id,
+    int ep_size, int eplb_stats_num_experts)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
     __shared__ int received;
+    bool const active = is_rank_active(ptrs.active_rank_mask, source);
     if (threadIdx.x == 0)
     {
         int count = 0;
-        if (is_rank_active(ptrs.active_rank_mask, source))
+        if (active)
         {
             uint32_t const expected_value = *ptrs.flag_val;
             if (!wait_round_flag(&ptrs.completion_flags[rank_id][source], expected_value, ptrs.timeout_cycles,
@@ -518,6 +521,19 @@ __device__ void compact_source_routing(
     if (count < 0)
     {
         return;
+    }
+    if constexpr (ENABLE_EPLB)
+    {
+        // The source wrote its statistics row into this rank's gathered statistics before releasing its flag.
+        if (ptrs.eplb_stats_out != nullptr)
+        {
+            int const* row = ptrs.eplb_gathered_stats[rank_id] + source * eplb_stats_num_experts;
+            int* out = ptrs.eplb_stats_out + source * eplb_stats_num_experts;
+            for (int expert = threadIdx.x; expert < eplb_stats_num_experts; expert += blockDim.x)
+            {
+                out[expert] = active ? row[expert] : 0;
+            }
+        }
     }
     int64_t const slot_offset = static_cast<int64_t>(source) * ptrs.slot_tokens * TOP_K;
     auto const* expert_ids
@@ -561,7 +577,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         int const token_ctas = local_num_tokens > 0 ? local_num_tokens : 1;
         if (local_token_idx >= token_ctas)
         {
-            compact_source_routing<TOP_K>(ptrs, local_token_idx - token_ctas, max_tokens_per_rank, rank_id, ep_size);
+            compact_source_routing<TOP_K, ENABLE_EPLB>(
+                ptrs, local_token_idx - token_ctas, max_tokens_per_rank, rank_id, ep_size, eplb_stats_num_experts);
             return;
         }
     }
@@ -1365,6 +1382,9 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.compact_expert_ids = params.compact_expert_ids;
     kernel_ptrs.compact_weights = params.compact_weights;
     kernel_ptrs.compact_payload_index = params.compact_payload_index;
+    TLLM_CHECK_WITH_INFO(params.eplb_stats_out == nullptr || (compact_routing && params.enable_eplb),
+        "eplb_stats_out needs the compact routing CTAs and EPLB statistics");
+    kernel_ptrs.eplb_stats_out = params.eplb_stats_out;
 
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)

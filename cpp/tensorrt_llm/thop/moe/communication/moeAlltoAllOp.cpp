@@ -530,7 +530,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
     torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
     torch::optional<torch::Tensor> abortState, torch::optional<torch::Tensor> sourceValidCounts,
-    torch::optional<torch::Tensor> compactExpertIds, torch::optional<torch::Tensor> compactWeights)
+    torch::optional<torch::Tensor> compactExpertIds, torch::optional<torch::Tensor> compactWeights,
+    torch::optional<torch::Tensor> eplbStatsOut)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -584,14 +585,18 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // With source_valid_counts, each source rank owns a fixed slot of the static token capacity in every payload, so
     // graph-captured addresses stay valid for any runtime batch and a source's writes never reach another source's
-    // rows. Readers learn from source_valid_counts which rows hold tokens, so expert ids are not sanitized and EPLB
-    // statistics (which would need the same per-source check) are not gathered.
+    // rows. Readers learn from source_valid_counts which rows hold tokens, so expert ids are not sanitized, and EPLB
+    // statistics are read from eplb_stats_out, where the compact-routing CTAs copy each active source's row once its
+    // flag arrives.
     bool const fixedSlots = sourceValidCounts.has_value();
     TORCH_CHECK(
         !fixedSlots || (enableRankMask && !useCftCountedWrites), "source_valid_counts needs the rank-mask fence path");
-    TORCH_CHECK(!fixedSlots || (!sanitizeExpertIds && !enableEplb),
-        "source_valid_counts marks received rows itself; it excludes expert-id sanitization and EPLB statistics");
+    TORCH_CHECK(!fixedSlots || !sanitizeExpertIds,
+        "source_valid_counts marks received rows itself; it excludes expert-id sanitization");
     TORCH_CHECK(!compactRouting || fixedSlots, "compact routing lists need source_valid_counts");
+    TORCH_CHECK(eplbStatsOut.has_value() == (fixedSlots && enableEplb),
+        "EPLB statistics with source_valid_counts are read from eplb_stats_out (and only then)");
+    TORCH_CHECK(!eplbStatsOut.has_value() || compactRouting, "eplb_stats_out needs the compact routing lists");
     if (fixedSlots)
     {
         torch::Tensor const& counts = sourceValidCounts.value();
@@ -828,6 +833,14 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.compact_expert_ids = compactRouting ? compactExpertIds->data_ptr<int32_t>() : nullptr;
     params.compact_weights = compactRouting ? compactWeights->data_ptr<float>() : nullptr;
     params.compact_payload_index = compactRouting ? expertIdPayloadIdx : 0;
+    if (eplbStatsOut.has_value())
+    {
+        torch::Tensor const& statsOut = eplbStatsOut.value();
+        CHECK_INPUT(statsOut, torch::kInt32);
+        TORCH_CHECK(statsOut.dim() == 2 && statsOut.size(0) == epSize && statsOut.size(1) == eplbStatsNumExperts,
+            "eplb_stats_out must be [ep_size, eplb_stats_num_experts]");
+        params.eplb_stats_out = statsOut.data_ptr<int32_t>();
+    }
 
     params.stream = at::cuda::getCurrentCUDAStream();
     params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
@@ -1165,7 +1178,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "Tensor? abort_state=None, "
         "Tensor(b!)? source_valid_counts=None, "
         "Tensor(c!)? compact_expert_ids=None, "
-        "Tensor(d!)? compact_weights=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor(d!)? compact_weights=None, "
+        "Tensor(e!)? eplb_stats_out=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "

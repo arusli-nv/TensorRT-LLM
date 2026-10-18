@@ -270,6 +270,48 @@ def test_valid_counts_ignore_a_count_without_its_completion_flag() -> None:
     assert counts.tolist() == [_CAPACITY, 0]
 
 
+@pytest.mark.parametrize("peer_active", [True, False])
+def test_fixed_slots_gather_eplb_statistics_of_active_sources(peer_active: bool) -> None:
+    """With fixed slots, eplb_stats_out holds each active source's statistics row and 0 for a masked one."""
+    stats_experts = 2  # at most num_experts (2 here)
+    workspace, meta, experts, payload = _setup(2, eplb_stats_num_experts=stats_experts)
+    ids = experts.clone()
+    weights = torch.ones((_CAPACITY, 1), device="cuda")
+    local_stats = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    controls, _ = _rank_mask_controls(3 if peer_active else 1)
+    # Stand in for peer 1: its statistics row in rank 0's gathered buffer, then its count and flag.
+    gathered = _offset(meta, "EPLB_GATHERED_STATS")
+    workspace[0, gathered + stats_experts * 4 : gathered + 2 * stats_experts * 4].view(
+        torch.int32
+    ).copy_(torch.tensor([10, 20], dtype=torch.int32))
+    expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
+    parity = ((expected_flag - 1) >> 1) & 1
+    _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(0)
+    _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(expected_flag)
+    stats_out = torch.full((2, stats_experts), -7, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.moe_a2a_dispatch(
+        experts,
+        [payload, ids, weights],
+        workspace,
+        meta,
+        _CAPACITY,
+        0,
+        2,
+        1,
+        2,
+        local_stats,
+        expert_id_payload_index=1,
+        **controls,
+        source_valid_counts=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        compact_expert_ids=torch.empty((2 * _CAPACITY, 1), dtype=torch.int32, device="cuda"),
+        compact_weights=torch.empty((2 * _CAPACITY, 1), device="cuda"),
+        eplb_stats_out=stats_out,
+    )
+    torch.cuda.synchronize()
+    assert stats_out[0].tolist() == [1, 2]
+    assert stats_out[1].tolist() == ([10, 20] if peer_active else [0, 0])
+
+
 def _compact_round(workspace, meta, experts, payloads, controls):
     """Dispatch with compact routing lists (expert ids at payload 1, router weights at payload 2)."""
     ep_size = workspace.size(0)

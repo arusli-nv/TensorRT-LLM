@@ -754,6 +754,7 @@ def _register_fake():
         source_valid_counts: Optional[torch.Tensor] = None,
         compact_expert_ids: Optional[torch.Tensor] = None,
         compact_weights: Optional[torch.Tensor] = None,
+        eplb_stats_out: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:

@@ -963,6 +963,10 @@ class MoeLoadBalancer:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
         if peer_loss_recovery_enabled() and extra_slots_mode() == "empty":
+            if not self.is_static_routing():
+                raise ValueError(
+                    f"{EXTRA_SLOTS_ENV}=empty needs a static EPLB placement; online EPLB fills the extra slots"
+                )
             # Before warmup, so autotuning and CUDA graph capture see the
             # healthy routing.
             emptied = self.empty_replica_slots()

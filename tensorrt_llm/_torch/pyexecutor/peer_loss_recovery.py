@@ -303,7 +303,7 @@ class PeerLossRecovery(RecoveryHook):
             # Rebalancing applies a step's results outside the step loop and
             # votes with collectives that do not expect a departed rank.
             "no KV pool rebalance": not executor.enable_kv_pool_rebalance,
-            "static EPLB": load_balancer is not None and load_balancer.is_static_routing(),
+            "an EPLB load balancer": load_balancer is not None,
             "MoE execution state": engine.moe_execution_state is not None,
         }
         unmet = [name for name, met in requirements.items() if not met]
