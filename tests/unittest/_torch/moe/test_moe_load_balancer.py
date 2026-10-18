@@ -290,11 +290,38 @@ class TestMoeLoadBalancer(unittest.TestCase):
             mock_load_balancer_impl.return_value.start_iter.assert_called_once_with(
                 0, True, True)
 
-        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(0)
+        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(
+            0, interrupted=False)
 
         # shutdown
         balancer.shutdown()
         mock_load_balancer_impl.return_value.shutdown.assert_called_once()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_forward_raising_mid_layer_ends_the_iteration_interrupted(
+            self, mock_load_balancer_impl):
+        """A forward that raises between a layer's stage calls ends its iteration interrupted."""
+
+        torch.cuda.set_device(0)
+
+        balancer = MoeLoadBalancer(0, 4, 2)
+        layer = balancer.add_layer(4, 2, 1)
+        balancer.set_iter_info(True, True)
+
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'):
+            with self.assertRaises(ValueError):
+                with MoeLoadBalancerIterContext(balancer):
+                    layer.start_wait_gpu_stage()
+                    layer.done_wait_gpu_stage()
+                    raise ValueError("forward interrupted")
+            mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(
+                0, interrupted=True)
+
+            # The next forward starts the layer's stages again.
+            with MoeLoadBalancerIterContext(balancer):
+                layer.start_wait_gpu_stage()
+        mock_load_balancer_impl.return_value.end_iter.assert_called_with(
+            1, interrupted=False)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_reconfigure_mask_only_rejects_active_iteration(

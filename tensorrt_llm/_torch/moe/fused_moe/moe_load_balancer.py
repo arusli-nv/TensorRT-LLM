@@ -1009,15 +1009,38 @@ class MoeLoadBalancer:
             return False
         return True
 
-    def recovery_placements(self,
-                            dead_ranks: Iterable[int]) -> List[np.ndarray]:
+    def quiesce(self, timeout_s: float) -> bool:
+        """Wait until started iterations and EPLB weight updates are done, so the placement stops changing.
+
+        Returns False if that takes longer than ``timeout_s``. After an interrupted iteration, call
+        only once its device work is done.
+        """
+        if self.in_iter:
+            raise RuntimeError("Cannot quiesce while an iteration is active")
+        return self.load_balancer_impl.quiesce(int(timeout_s * 1000))
+
+    def reset_update_schedule(self) -> None:
+        """Restart the EPLB layer update rotation and clear the load factors (only while quiesced)."""
+        self.load_balancer_impl.reset_update_schedule()
+
+    def current_placements(self) -> List[np.ndarray]:
+        """Per layer, the ``[ep_size, slots_per_rank]`` expert ids routing uses now."""
+        return [
+            np.asarray(layer.get_old_rank_expert_ids(), dtype=np.int32)
+            for layer in self.single_layer_load_balancers
+        ]
+
+    def recovery_placements(
+            self,
+            dead_ranks: Iterable[int],
+            base: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
         """Per layer, the ``[ep_size, slots_per_rank]`` placement to serve with after losing ``dead_ranks``.
 
-        The current placement with the slots of ``dead_ranks`` cleared. In a
-        layer with host weights (online EPLB), each expert left without a
-        replica takes over a slot of a replicated expert
-        (``restore_lost_experts``). Every rank computes the same placements
-        from the same state.
+        The current placement (or ``base``, per layer, the placement the
+        survivors agreed on) with the slots of ``dead_ranks`` cleared. In a
+        layer with host weights, each expert left without a replica takes over
+        a slot of a replicated expert (``restore_lost_experts``). Every rank
+        computes the same placements from the same base.
 
         Raises:
             ValueError: A rank is out of range, or an expert would be left
@@ -1027,9 +1050,17 @@ class MoeLoadBalancer:
         if any(rank < 0 or rank >= self.ep_size for rank in dead):
             raise ValueError(
                 f"Dead ranks {dead} out of range for EP size {self.ep_size}")
+        if base is not None and len(base) != len(
+                self.single_layer_load_balancers):
+            raise ValueError(f"Base placement has {len(base)} layers, expected "
+                             f"{len(self.single_layer_load_balancers)}")
         placements, missing = [], {}
-        for layer in self.single_layer_load_balancers:
-            placement = self._masked_placement(layer, dead)
+        for i, layer in enumerate(self.single_layer_load_balancers):
+            if base is None:
+                placement = self._masked_placement(layer, dead)
+            else:
+                placement = np.array(base[i], dtype=np.int32)
+                placement[dead] = -1
             lost = sorted(
                 set(range(layer.expert_count)) -
                 set(placement[placement >= 0].tolist()))
@@ -1123,15 +1154,22 @@ class MoeLoadBalancer:
         self.load_balancer_impl.start_iter(self.iter_id, self.enable_statistic,
                                            self.enable_update_weights)
 
-    def end_iter(self):
+    def end_iter(self, interrupted: bool = False):
         """
         End the current iteration.
 
         Args:
-            iter_id: The ID of the iteration to end
+            interrupted: The forward raised. The layers it did not reach never set their CPU stage;
+                ``quiesce`` releases them once the iteration's device work is done.
         """
         assert self.in_iter, "not in forward, cannot end_iter"
-        self.load_balancer_impl.end_iter(self.iter_id)
+        self.load_balancer_impl.end_iter(self.iter_id, interrupted=interrupted)
+        if interrupted:
+            # The layer the forward raised in stopped between its stage calls.
+            for layer in self.single_layer_load_balancers:
+                layer.func_called_count = dict.fromkeys(layer.func_called_count,
+                                                        0)
+                layer.statistic_flag_tensor = None
         self.in_iter = False
         self.iter_id += 1
 
@@ -1306,7 +1344,7 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.end_iter()
+            self.moe_load_balancer.end_iter(interrupted=exc_type is not None)
         return False
 
 

@@ -1216,6 +1216,97 @@ TEST_P(MoeLoadBalancerTest, MultiLayerTest)
     mLoadBalancer.reset();
 }
 
+TEST_P(MoeLoadBalancerTest, QuiesceWaitsForTheWorkerAndTheGpuStage)
+{
+    auto param = GetParam();
+    if (param.iterConfigs.size() < 2)
+    {
+        GTEST_SKIP() << "needs two iterations";
+    }
+    mLoadBalancer->finalizeModel();
+    if (param.warmUpIters > 0)
+    {
+        mLoadBalancer->setWarmUpIterCount(param.warmUpIters);
+    }
+    setExpertLoadFactors(param);
+    for (int64_t iterId = 0; iterId < 2; ++iterId)
+    {
+        auto const& config = param.iterConfigs[iterId];
+        mLoadBalancer->startIter(iterId, config.statisticEnabled, config.updateWeightsEnabled);
+        mLoadBalancer->endIter(iterId);
+        // The worker waits for the GPU stage of this iteration: not quiesced, and the schedule cannot be reset.
+        EXPECT_FALSE(mLoadBalancer->quiesce(/*timeoutMs=*/100));
+        EXPECT_THROW(mLoadBalancer->resetUpdateSchedule(), std::exception);
+        simulateGpuSignalWaitAndProcess(iterId, config.statisticEnabled,
+            config.updateWeightsEnabled && iterId >= param.warmUpIters,
+            iterId < static_cast<int64_t>(mLayerUpdateSchedule.size()) ? mLayerUpdateSchedule[iterId]
+                                                                       : std::vector<int>{});
+        EXPECT_TRUE(mLoadBalancer->quiesce(/*timeoutMs=*/10000));
+        cudaDeviceSynchronize();
+    }
+    mLoadBalancer->resetUpdateSchedule();
+    for (auto const& layer : mLayers)
+    {
+        auto const* statistic = layer->getStatisticInfo();
+        for (int expertId = 0; expertId < param.expertCount; ++expertId)
+        {
+            EXPECT_EQ(statistic->expertLoadFactor[expertId], 0.0f);
+        }
+    }
+    mLoadBalancer->shutdown();
+    mLoadBalancer.reset();
+}
+
+TEST_P(MoeLoadBalancerTest, QuiesceReleasesTheLayersAnInterruptedForwardDidNotReach)
+{
+    auto param = GetParam();
+    if (mLayers.size() < 2 || param.iterConfigs.size() < 2)
+    {
+        GTEST_SKIP() << "needs two layers and two iterations";
+    }
+    mLoadBalancer->finalizeModel();
+    if (param.warmUpIters > 0)
+    {
+        mLoadBalancer->setWarmUpIterCount(param.warmUpIters);
+    }
+    setExpertLoadFactors(param);
+    auto runLayer = [this](int layerId, int64_t iterId)
+    {
+        auto* signal = mLayers[layerId]->getSignal();
+        int statisticEnabled;
+        moeWaitSignalForGpuStageForTest(signal, &statisticEnabled);
+        EXPECT_EQ(static_cast<int64_t>(signal->stepAndOwner >> 2), iterId) << "layer " << layerId;
+        moeSetSignalForCpuStageForTest(signal);
+    };
+
+    // Iteration 0's forward raises after its first layer: no later layer ever sets its CPU stage.
+    auto const& first = param.iterConfigs[0];
+    mLoadBalancer->startIter(0, first.statisticEnabled, first.updateWeightsEnabled);
+    runLayer(0, 0);
+    mLoadBalancer->endIter(0, /*interrupted=*/true);
+    ASSERT_TRUE(mLoadBalancer->quiesce(/*timeoutMs=*/10000));
+    using Signal = tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal;
+    for (size_t layerId = 0; layerId < mLayers.size(); ++layerId)
+    {
+        ASSERT_EQ(mLayers[layerId]->getSignal()->stepAndOwner & Signal::kDevice, Signal::kCPU)
+            << "layer " << layerId << " is not released to the CPU";
+    }
+    mLoadBalancer->resetUpdateSchedule();
+
+    // The next iteration runs every layer and quiesces as usual.
+    auto const& second = param.iterConfigs[1];
+    mLoadBalancer->startIter(1, second.statisticEnabled, second.updateWeightsEnabled);
+    for (size_t layerId = 0; layerId < mLayers.size(); ++layerId)
+    {
+        runLayer(static_cast<int>(layerId), 1);
+    }
+    mLoadBalancer->endIter(1);
+    EXPECT_TRUE(mLoadBalancer->quiesce(/*timeoutMs=*/10000));
+    cudaDeviceSynchronize();
+    mLoadBalancer->shutdown();
+    mLoadBalancer.reset();
+}
+
 // Define test parameters
 INSTANTIATE_TEST_SUITE_P(MoeLoadBalancerTests, MoeLoadBalancerTest,
     ::testing::Values(

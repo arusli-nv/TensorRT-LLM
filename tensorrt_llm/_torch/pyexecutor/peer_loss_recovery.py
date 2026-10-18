@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Keep a WideEP PyExecutor serving after one peer process or a whole node dies."""
 
+import base64
 import collections
 import dataclasses
 import functools
@@ -22,6 +23,7 @@ from typing import (
     TypeVar,
 )
 
+import numpy as np
 import torch
 
 from tensorrt_llm._utils import peer_loss_recovery_enabled
@@ -37,8 +39,6 @@ from .scheduler import ScheduledRequests
 from .scheduler.adp_router import DefaultADPRouter
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from tensorrt_llm.executor.recovery.client import RecoveryClient
     from tensorrt_llm.executor.recovery.protocol import Commit, Install
 
@@ -67,6 +67,24 @@ _GATHER_HISTORY = 8
 
 def _recovery_timeout_s() -> float:
     return float(os.environ.get(_RECOVERY_TIMEOUT_ENV, _RECOVERY_TIMEOUT_DEFAULT_S))
+
+
+def _encode_placements(placements: List[np.ndarray]) -> str:
+    """Per-layer ``[ep_size, slots_per_rank]`` expert ids as compact text for the recovery protocol."""
+    return base64.b64encode(np.asarray(placements, dtype=np.int16).tobytes()).decode()
+
+
+def _decode_placements(text: str, like: List[np.ndarray]) -> List[np.ndarray]:
+    """Placements encoded by ``_encode_placements``, shaped as ``like``.
+
+    Raises:
+        ValueError: ``text`` does not hold placements of that shape.
+    """
+    shape = np.asarray(like).shape
+    flat = np.frombuffer(base64.b64decode(text, validate=True), dtype=np.int16)
+    if flat.size != int(np.prod(shape)):
+        raise ValueError(f"rank 0's placement has {flat.size} slots, expected shape {shape}")
+    return list(flat.reshape(shape).astype(np.int32))
 
 
 def failure_domains(world_size: int, gpus_per_node: int) -> List[FailureDomain]:
@@ -606,7 +624,17 @@ class PeerLossRecovery(RecoveryHook):
         executor.discard_interrupted_steps(reversed(self._uncommitted_steps))
         self._uncommitted_steps.clear()
 
-        client.send(Stopped(rank=rank, failed_ranks=failed_ranks))
+        load_balancer = engine.moe_load_balancer
+        # Online EPLB: survivors may hold different placements (an update fed by an interrupted step's
+        # statistics, or one more update on a rank that ran one more iteration). Once no update can still
+        # publish, every survivor starts from rank 0's placement.
+        online = not load_balancer.is_static_routing()
+        if online and not load_balancer.quiesce(max(0.0, deadline - time.monotonic())):
+            raise RuntimeError("EPLB weight updates did not finish within the recovery timeout")
+        placement = (
+            _encode_placements(load_balancer.current_placements()) if online and rank == 0 else ""
+        )
+        client.send(Stopped(rank=rank, failed_ranks=failed_ranks, placement=placement))
         # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery it cannot
         # complete reaches every survivor as Abort rather than as a timeout here.
         deadline = time.monotonic() + self._timeout_s
@@ -622,8 +650,10 @@ class PeerLossRecovery(RecoveryHook):
             )
         generation = proposal.generation
 
-        load_balancer = engine.moe_load_balancer
-        placements = load_balancer.recovery_placements(failed)
+        base = None
+        if online:
+            base = _decode_placements(proposal.base_placement, load_balancer.current_placements())
+        placements = load_balancer.recovery_placements(failed, base)
         placement_digest = load_balancer.placement_digest(failed, placements)
         client.send(Ready(rank=rank, generation=generation, placement_digest=placement_digest))
         _expect_generation(client.wait(Install, deadline), generation)
@@ -632,6 +662,9 @@ class PeerLossRecovery(RecoveryHook):
         install_recovery_placement(
             engine.moe_execution_state, load_balancer, failed, placements, own_rank=rank
         )
+        if online:
+            # Every survivor updates the same layers from the same statistics from here on.
+            load_balancer.reset_update_schedule()
         failed_requests = self._departed_requests(failed)
         client.send(Installed(rank=rank, generation=generation, failed_requests=failed_requests))
         _expect_generation(client.wait(Commit, deadline), generation)

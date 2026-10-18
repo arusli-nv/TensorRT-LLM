@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
+#include <functional>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -124,6 +125,14 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
 //
 // @param signal: the signal
 void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal);
+
+// @brief like moeWaitSignalForCpuStageHost, but once abandoned() returns true the host sets the CPU stage itself.
+//
+// Only for a stage the device will never set, e.g. a layer an interrupted forward did not reach.
+//
+// @param signal: the signal
+// @param abandoned: polled while the signal is still owned by the GPU
+void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, std::function<bool()> const& abandoned);
 
 // @brief set the signal for gpu stage on host
 //

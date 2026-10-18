@@ -115,7 +115,8 @@ void initMoeBindings(nb::module_& m)
         .def("start_iter", &tr::MoeLoadBalancer::startIter, nb::arg("iter_id"), nb::arg("enable_statistic"),
             nb::arg("enable_update_weights"), "Start a new iteration with the given ID and settings",
             nb::call_guard<nb::gil_scoped_release>())
-        .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), "End the iteration with the given ID",
+        .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), nb::arg("interrupted") = false,
+            "End the iteration with the given ID; interrupted if its forward raised",
             nb::call_guard<nb::gil_scoped_release>())
         .def("reconfigure_mask_only", &tr::MoeLoadBalancer::reconfigureMaskOnly, nb::arg("dead_ranks"),
             "Reconfigure EPLB routing metadata so slots on dead EP ranks are unreachable",
@@ -123,6 +124,12 @@ void initMoeBindings(nb::module_& m)
         .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
             nb::arg("layer_rank_expert_ids"),
             "Mark dead EP ranks and install a new placement per layer, loading changed local slots from host weights",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("quiesce", &tr::MoeLoadBalancer::quiesce, nb::arg("timeout_ms"),
+            "Wait until started iterations and weight updates are done; false on timeout",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("reset_update_schedule", &tr::MoeLoadBalancer::resetUpdateSchedule,
+            "Restart the layer update rotation and clear the load factors (only while quiesced)",
             nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
             nb::call_guard<nb::gil_scoped_release>());

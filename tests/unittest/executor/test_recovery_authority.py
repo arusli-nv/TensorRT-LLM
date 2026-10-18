@@ -112,6 +112,21 @@ def test_idle_loss_recovers():
     assert authority.deadline is None and authority.expire(1e9) == []
 
 
+def test_propose_relays_rank_0s_placement():
+    authority = _registered()
+    authority.handle(_route(1), Stopped(1, (FAILED,)), 1.0)
+    authority.handle(_route(0), Stopped(0, (FAILED,), placement="rank0"), 1.0)
+    out = authority.handle(_route(3), Stopped(3, (FAILED,)), 1.0)
+    assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS, "rank0")) for rank in SURVIVORS]
+
+
+def test_a_placement_from_another_rank_aborts():
+    authority = _registered()
+    _assert_aborted(
+        authority.handle(_route(1), Stopped(1, (FAILED,), placement="rank1"), 1.0), authority
+    )
+
+
 def test_node_loss_recovers_in_one_transaction():
     authority = _registered()
     out = _report(authority, Stopped, (0, 1), failed_ranks=NODE)
@@ -250,7 +265,9 @@ def test_wire_roundtrip_and_authentication():
         Register(1, ((1,), NODE)),
         Registered(((1,), NODE)),
         Stopped(1, NODE),
+        Stopped(0, NODE, "AAEAAg=="),
         Propose(3, NODE, (0, 1)),
+        Propose(3, NODE, (0, 1), "AAEAAg=="),
         Abort("lost"),
         StatusQuery(),
         Status("RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),

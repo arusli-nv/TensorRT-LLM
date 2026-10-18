@@ -157,7 +157,8 @@ def test_recovery_runs_protocol_and_installs_in_order():
     assert recovery._executor.active_requests == [request]
     assert not recovery._peer_failed.is_set()
     load_balancer = recovery._executor.model_engine.moe_load_balancer
-    load_balancer.recovery_placements.assert_called_once_with(failed)
+    # A static placement needs no agreed base.
+    load_balancer.recovery_placements.assert_called_once_with(failed, None)
     # The placements installed are the ones whose digest went out with Ready.
     load_balancer.placement_digest.assert_called_once_with(failed, ["placement"])
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
@@ -181,7 +182,7 @@ def test_a_node_loss_recovers_every_rank_in_one_transaction():
 
     assert client.sent[0] == Stopped(rank=0, failed_ranks=(4, 5, 6, 7))
     engine = recovery._executor.model_engine
-    engine.moe_load_balancer.recovery_placements.assert_called_once_with(node)
+    engine.moe_load_balancer.recovery_placements.assert_called_once_with(node, None)
     engine.moe_load_balancer.install_recovery_placement.assert_called_once_with(
         [4, 5, 6, 7], ["placement"]
     )
@@ -965,6 +966,7 @@ def _supported_executor():
             "no LM head TP",
         ),
         (lambda ex: setattr(ex.dist.mapping, "moe_tp_size", 2), "expert TP 1"),
+        (lambda ex: setattr(ex.model_engine, "moe_load_balancer", None), "an EPLB load balancer"),
         (lambda ex: setattr(ex.hang_detector, "timeout", 60), "hang detection timeout"),
         (lambda ex: setattr(ex, "dist", Mock(mapping=ex.dist.mapping)), "MPI executor"),
     ],
@@ -998,6 +1000,16 @@ def test_failure_domains_are_every_rank_then_every_node_but_rank_0_s():
     assert peer_loss_recovery.failure_domains(8, 4) == [*((r,) for r in range(1, 8)), (4, 5, 6, 7)]
     assert peer_loss_recovery.failure_domains(6, 4)[-1] == (4, 5)
     assert peer_loss_recovery.failure_domains(4, 1) == [(1,), (2,), (3,)]
+
+
+def test_create_accepts_online_eplb(monkeypatch):
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+    )
+    executor = _supported_executor()
+    executor.model_engine.moe_load_balancer.is_static_routing.return_value = False
+    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 
 def test_create_registers_the_domains_whose_loss_the_placement_covers(monkeypatch):
@@ -1039,3 +1051,17 @@ def test_install_recovery_placement_reroutes_before_masking():
     with pytest.raises(RuntimeError, match="this rank"):
         install(state, load_balancer, {0}, own_rank=0)
     assert events == [] and health.get_failed_ranks() == frozenset({FAILED_RANK})
+
+
+def test_placements_survive_the_protocol_encoding():
+    import numpy as np
+
+    placements = [
+        np.array([[0, 1, -1], [2, 3, 0]], dtype=np.int32),
+        np.array([[3, 2, 1], [0, -1, 2]]),
+    ]
+    text = peer_loss_recovery._encode_placements(placements)
+    decoded = peer_loss_recovery._decode_placements(text, placements)
+    assert [p.tolist() for p in decoded] == [p.tolist() for p in placements]
+    with pytest.raises(ValueError, match="expected shape"):
+        peer_loss_recovery._decode_placements(text, placements[:1])

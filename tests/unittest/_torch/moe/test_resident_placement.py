@@ -118,6 +118,29 @@ def test_empty_replica_slots_keeps_one_routed_slot_per_expert():
     )
 
 
+def test_survivors_with_different_placements_agree_from_a_common_base():
+    # Rank 3's last online-EPLB update swapped two slots on one survivor only.
+    diverged = [[0, 1], [2, 3], [1, 0], [2, 3]]
+    first = _load_balancer(_REDUNDANT, host_weights=True)
+    second = _load_balancer(diverged, host_weights=True)
+    base = first.current_placements()
+
+    placements = [lb.recovery_placements([FAILED_RANK], base) for lb in (first, second)]
+
+    assert [p.tolist() for p in placements[0]] == [p.tolist() for p in placements[1]]
+    assert MoeLoadBalancer.placement_digest(
+        [FAILED_RANK], placements[0]
+    ) == MoeLoadBalancer.placement_digest([FAILED_RANK], placements[1])
+    # Without the base they would disagree.
+    assert second.recovery_placements([FAILED_RANK])[0].tolist() != placements[0][0].tolist()
+
+
+def test_recovery_placements_reject_a_base_with_another_layer_count():
+    load_balancer = _load_balancer(_REDUNDANT, host_weights=True)
+    with pytest.raises(ValueError, match="layers"):
+        load_balancer.recovery_placements([FAILED_RANK], base=[])
+
+
 def test_extra_slots_mode_rejects_an_unknown_mode(monkeypatch):
     monkeypatch.setenv(EXTRA_SLOTS_ENV, "spare")
     with pytest.raises(ValueError, match=EXTRA_SLOTS_ENV):

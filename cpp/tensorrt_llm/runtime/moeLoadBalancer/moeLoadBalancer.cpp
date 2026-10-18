@@ -542,7 +542,8 @@ void SingleLayerMoeLoadBalancer::setGpuStage()
 
 void SingleLayerMoeLoadBalancer::waitCpuStage()
 {
-    tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal);
+    tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal,
+        [this] { return mMoeLoadBalancer->mAbandonedIterId.load(std::memory_order_acquire) == mIterId; });
 }
 
 void SingleLayerMoeLoadBalancer::maybeStartUpdateWeights()
@@ -1146,12 +1147,16 @@ void MoeLoadBalancer::startIter(int64_t iterId, bool enableStatistic, bool enabl
     mWorkerThreadCondition.notify_one();
 }
 
-void MoeLoadBalancer::endIter(int64_t iterId)
+void MoeLoadBalancer::endIter(int64_t iterId, bool interrupted)
 {
     std::unique_lock<std::mutex> lock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mIterActive, "No active iteration to end.");
     TLLM_CHECK_WITH_INFO(mIterId == iterId, "endIter expected iterId=%ld, but got %ld", mIterId, iterId);
     mIterActive = false;
+    if (interrupted)
+    {
+        mInterruptedIterId = iterId;
+    }
 }
 
 void MoeLoadBalancer::shutdown()
@@ -1240,6 +1245,50 @@ void MoeLoadBalancer::restorePlacement(
     }
 }
 
+bool MoeLoadBalancer::quiesce(int64_t timeoutMs)
+{
+    std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
+    TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot quiesce.");
+    TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot quiesce while an iteration is active.");
+    // The device will never set the CPU stage of the layers an interrupted forward did not reach. Without
+    // releasing them, the worker would wait for them forever, and with it every later iteration.
+    bool const releaseInterrupted = mInterruptedIterId >= 0;
+    mAbandonedIterId.store(mInterruptedIterId, std::memory_order_release);
+    if (mLayerUpdatesPerIter == 0 && !releaseInterrupted)
+    {
+        return true;
+    }
+    if (!mWorkerDoneCondition.wait_for(
+            workerLock, std::chrono::milliseconds(timeoutMs), [this] { return mWorkerDoneIterId == mIterId; }))
+    {
+        return false;
+    }
+    mInterruptedIterId = -1;
+    mAbandonedIterId.store(-1, std::memory_order_release);
+    workerLock.unlock();
+    for (auto& layer : mLayers)
+    {
+        layer->waitLastUpdateDone();
+    }
+    return true;
+}
+
+void MoeLoadBalancer::resetUpdateSchedule()
+{
+    std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
+    TLLM_CHECK_WITH_INFO(!mIterActive && mIterInfoQueue.empty() && mWorkerDoneIterId == mIterId,
+        "The update schedule can only be reset while quiesced.");
+    if (mLayerUpdatesPerIter > 0)
+    {
+        mUpdateLayerQueue.clear();
+        generateUpdatePlan();
+    }
+    for (auto& layer : mLayers)
+    {
+        std::fill_n(layer->mStatisticInfo.expertLoadFactor, layer->mMetaInfo.expertCount, 0.0f);
+    }
+}
+
 void MoeLoadBalancer::workerThread()
 {
     TLLM_CUDA_CHECK(cudaSetDevice(mCudaDeviceId));
@@ -1272,12 +1321,15 @@ void MoeLoadBalancer::workerThread()
             layer->waitCpuStage();
             layer->maybeStartUpdateWeights();
         }
+        std::unique_lock<std::mutex> lock(mWorkerThreadMutex);
         if (iterUpdateWeightsEnabled)
         {
             auto currentUpdatedLayers = mUpdateLayerQueue.front();
             mUpdateLayerQueue.pop_front();
             mUpdateLayerQueue.push_back(currentUpdatedLayers);
         }
+        mWorkerDoneIterId = iterId;
+        mWorkerDoneCondition.notify_all();
     }
     for (auto& layer : mLayers)
     {

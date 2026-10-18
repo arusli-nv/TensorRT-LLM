@@ -65,10 +65,15 @@ class Registered:
 
 @dataclass(frozen=True)
 class Stopped:
-    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) depart."""
+    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) depart.
+
+    With online EPLB, rank 0 also sends its current expert placement (``placement``, opaque to the
+    authority), which every survivor then starts from.
+    """
 
     rank: int
     failed_ranks: tuple[int, ...]
+    placement: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,11 +100,15 @@ class Installed:
 
 @dataclass(frozen=True)
 class Propose:
-    """Authority -> survivors: prepare to continue without ``failed_ranks`` (sorted)."""
+    """Authority -> survivors: prepare to continue without ``failed_ranks`` (sorted).
+
+    ``base_placement`` is rank 0's ``Stopped.placement``.
+    """
 
     generation: int
     failed_ranks: tuple[int, ...]
     survivors: tuple[int, ...]
+    base_placement: str = ""
 
 
 @dataclass(frozen=True)

@@ -300,7 +300,8 @@ public:
     // should bind to python
     void startIter(int64_t iterId, bool enableStatistic, bool enableUpdateWeights);
     // should bind to python
-    void endIter(int64_t iterId);
+    // interrupted: the forward raised, so the layers it did not reach never set their CPU stage (see quiesce).
+    void endIter(int64_t iterId, bool interrupted = false);
 
     // should bind to python
     void shutdown();
@@ -316,6 +317,19 @@ public:
     // from EPLB's host weights. Every layer is validated before any changes; only while no iteration runs.
     void restorePlacement(
         std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
+
+    // should bind to python
+    // Wait until the worker has finished every started iteration and every layer's weight update is done, so the
+    // placement no longer changes. Returns false if that takes longer than timeoutMs (a forward that never reached
+    // the GPU stage). Only while no iteration runs. After an interrupted iteration, only once the device work of
+    // that iteration is done: the worker then sets the CPU stage of the layers the forward did not reach itself.
+    bool quiesce(int64_t timeoutMs);
+
+    // should bind to python
+    // Restart the layer update rotation from the update plan's first entry and clear every layer's load factors,
+    // so ranks that ran different numbers of iterations update the same layers from the same statistics again.
+    // Only while quiesced.
+    void resetUpdateSchedule();
 
     // Test interface to use GPU to do memcpy test functionality
     void setUseGpuMemcpy(bool useGpuMemcpy = false)
@@ -334,6 +348,13 @@ private:
     void workerThread();
     std::mutex mWorkerThreadMutex;
     std::condition_variable mWorkerThreadCondition;
+    // The last iteration the worker finished (under mWorkerThreadMutex), signaled on mWorkerDoneCondition.
+    int64_t mWorkerDoneIterId = -1;
+    std::condition_variable mWorkerDoneCondition;
+    // The last iteration that ended interrupted and that quiesce has not yet released (under mWorkerThreadMutex).
+    int64_t mInterruptedIterId = -1;
+    // The iteration whose pending CPU stages the worker sets itself, -1 if none (see quiesce).
+    std::atomic<int64_t> mAbandonedIterId{-1};
     bool mWorkerThreadStopped = true;
     int64_t mWarmUpUntilIter = -1;
 
