@@ -12,6 +12,7 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import slot_rows
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
@@ -605,6 +606,22 @@ def test_shutdown_barrier_tolerates_a_lost_peer_only_during_recovery(
         else:
             with pytest.raises(MPI.Exception):
                 balancer._shared_barrier()
+
+
+def test_slot_rows_copies_a_repacked_slot_as_its_dense_block():
+    """DEEPGEMM's MN-major block scales: no slot is contiguous, but each fills one block of the storage."""
+    storage = torch.arange(2 * 3 * 4, dtype=torch.int32).view(2, 3, 4)
+    scales = storage.transpose(1, 2)
+    rows = slot_rows(scales)
+    assert rows.shape == (2, 12) and rows.is_contiguous()
+    assert rows.data_ptr() == scales.data_ptr()
+    assert torch.equal(rows[1], storage[1].flatten())
+    # Padding inside a slot: copying its block would copy the padding, so it is refused.
+    with pytest.raises(ValueError, match="dense blocks"):
+        slot_rows(torch.zeros(2, 4, 5)[:, :, :3])
+    # Slots innermost: a slot's elements are strided across the storage.
+    with pytest.raises(ValueError, match="dense blocks"):
+        slot_rows(torch.zeros(3, 4).t())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

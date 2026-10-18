@@ -319,6 +319,33 @@ class MoEWeightOwnerMixin:
         return self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
 
 
+def slot_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` ([slots, ...]) as ``[slots, elements]`` rows over the same storage, for EPLB slot copies.
+
+    A slot of a repacked layout (e.g. DEEPGEMM's MN-major block scales) is not contiguous, but its elements fill
+    one dense block of the storage; EPLB copies that block as is, and the host copies share the layout.
+
+    Raises:
+        ValueError: A slot's elements do not fill one dense block.
+    """
+    if tensor.is_contiguous():
+        return tensor.reshape(tensor.shape[0], -1)
+    block = tensor.stride(0)
+    filled = 1
+    for stride, size in sorted(
+        (stride, size) for stride, size in zip(tensor.stride()[1:], tensor.shape[1:]) if size > 1
+    ):
+        if stride != filled:
+            break
+        filled *= size
+    else:
+        if filled == block:
+            return tensor.as_strided((tensor.shape[0], block), (block, 1))
+    raise ValueError(
+        f"EPLB slots of shape {tuple(tensor.shape)} and strides {tensor.stride()} are not dense blocks"
+    )
+
+
 class MoEEplbWeightLayoutMixin:
     """The EPLB half that follows the weights, not the forward pass.
 
@@ -376,7 +403,7 @@ class MoEEplbWeightLayoutMixin:
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
-        weight_tensor = getattr(self, weight_name).data[local_slot_id]
+        weight_tensor = slot_rows(getattr(self, weight_name).data)[local_slot_id]
         self.layer_load_balancer.register_weight_slot(local_slot_id, weight_name, weight_tensor)
 
     def register_to_fix_weight_fn(self, weight_name: str):
@@ -388,10 +415,7 @@ class MoEEplbWeightLayoutMixin:
         param = getattr(self, weight_name)
         weight_tensor = param.detach()
         assert isinstance(weight_tensor, torch.Tensor), f"weight {weight_name} should be a tensor"
-        assert weight_tensor.is_contiguous(), (
-            f"weight {weight_name} should be contiguous, "
-            f"shape={weight_tensor.shape}, strides={weight_tensor.stride()}"
-        )
+        slot_rows(weight_tensor)  # Each slot must be one dense block of the storage.
         assert (
             weight_tensor.numel() * weight_tensor.element_size()
             == weight_tensor.untyped_storage().size()
@@ -426,14 +450,15 @@ class MoEEplbWeightLayoutMixin:
 
         # Setup host tensor sharing
         local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids()
+        host_rows = {name: slot_rows(tensor) for name, tensor in weight_and_tensor_dict.items()}
         for expert_id in range(self.num_experts):
-            for weight_name, weight_tensor in weight_and_tensor_dict.items():
+            for weight_name, rows in host_rows.items():
                 if expert_id in local_shared_load_expert_ids:
                     local_slot_id = local_shared_load_expert_ids.index(expert_id)
                     self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor[local_slot_id]
+                        expert_id, weight_name, rows[local_slot_id]
                     )
                 else:
                     self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype, weight_tensor[0].shape
+                        expert_id, weight_name, rows.dtype, rows[0].shape
                     )

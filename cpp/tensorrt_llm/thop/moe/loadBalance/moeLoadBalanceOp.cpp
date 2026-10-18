@@ -205,8 +205,10 @@ void migrateToHostAccessible(at::Tensor& tensor)
 // until a restore loads them (BorrowedSlotMemory). Their contents are not kept.
 void moeBorrowSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
 {
-    TORCH_CHECK(tensor.device().is_cuda() && tensor.is_contiguous() && tensor.dim() >= 1 && tensor.size(0) > 0,
-        "expects a contiguous CUDA tensor of slots");
+    // A repacked layout (e.g. DEEPGEMM's MN-major scales) is accepted if each slot fills one dense block.
+    TORCH_CHECK(tensor.device().is_cuda() && tensor.is_non_overlapping_and_dense() && tensor.dim() >= 1
+            && tensor.size(0) > 0 && tensor.stride(0) * tensor.size(0) == tensor.numel(),
+        "expects a CUDA tensor of slots, each one dense block");
     size_t const byteSize = tensor.numel() * tensor.element_size();
     int const slotCount = static_cast<int>(tensor.size(0));
     void* devPtr = tensorrt_llm::runtime::BorrowedSlotMemory::getInstance().allocate(
