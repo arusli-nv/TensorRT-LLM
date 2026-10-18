@@ -221,9 +221,15 @@ class PeerLossRecovery(RecoveryHook):
     enabled = True
 
     def __init__(
-        self, executor: "PyExecutor", client: "RecoveryClient", admitted: frozenset
+        self,
+        executor: "PyExecutor",
+        client: "RecoveryClient",
+        admitted: frozenset,
+        hosts: Sequence[str] = (),
     ) -> None:
         self._executor = executor
+        # The host of each rank: a lost rank's undelivered requests run again only when its whole host was lost.
+        self._hosts = tuple(hosts)
         self._client = client
         # Failure domains (rank sets) whose loss the survivors recover from.
         self._recoverable = admitted
@@ -253,6 +259,8 @@ class PeerLossRecovery(RecoveryHook):
         self._request_owners: Optional[Dict[int, Tuple[int, "RequestQueueItem"]]] = None
         # On rank 0: id of each extra sequence of an ``n > 1`` request -> request id.
         self._parent_ids: Dict[int, int] = {}
+        # On rank 0: the owned requests that delivered a response.
+        self._delivered: Set[int] = set()
         if executor.dist.rank == 0:
             self._request_owners = {}
         # Requests rank 0 fetched but failed to broadcast because a peer loss interrupted it.
@@ -338,7 +346,8 @@ class PeerLossRecovery(RecoveryHook):
                 f"lacks: {', '.join(unmet)}"
             )
         # Nodes from the hosts the ranks run on, not from the rank order (a launcher may map ranks round-robin).
-        domains = failure_domains(dist.allgather(socket.gethostname()), config.failure_domain)
+        hosts = dist.allgather(socket.gethostname())
+        domains = failure_domains(hosts, config.failure_domain)
         uncovered = [domain for domain in domains if not load_balancer.covers_loss_of(domain)]
         if uncovered:
             raise ValueError(
@@ -354,7 +363,7 @@ class PeerLossRecovery(RecoveryHook):
                 "WideEP peer-loss recovery covers the loss of one of "
                 f"{sorted(sorted(domain) for domain in admitted)}"
             )
-        return cls(executor, client, admitted)
+        return cls(executor, client, admitted, hosts)
 
     def validate_request(self, request: LlmRequest) -> None:
         """Reject a request whose state a discarded step would change.
@@ -593,11 +602,14 @@ class PeerLossRecovery(RecoveryHook):
         if self._request_owners is None:
             return
         for _, response in responses:
-            if isinstance(response, LlmResponse) and (
-                response.has_error() or (response.result is not None and response.result.is_final)
-            ):
-                # Results carry the request id; an error can carry a sequence's own id.
-                self._forget(self._parent_ids.get(response.request_id, response.request_id))
+            if not isinstance(response, LlmResponse):
+                continue
+            # Results carry the request id; an error can carry a sequence's own id.
+            request_id = self._parent_ids.get(response.request_id, response.request_id)
+            if response.has_error() or (response.result is not None and response.result.is_final):
+                self._forget(request_id)
+            elif request_id in self._request_owners:
+                self._delivered.add(request_id)
 
     def _answered_request_ids(self, buffered: Responses) -> Set[int]:
         """Ids of the requests this rank answered in responses not yet delivered."""
@@ -605,6 +617,7 @@ class PeerLossRecovery(RecoveryHook):
         return {request_id for request_id, _ in pending + buffered}
 
     def _forget(self, request_id: int) -> None:
+        self._delivered.discard(request_id)
         _, item = self._request_owners.pop(request_id, (None, None))
         if item is not None:
             for child_id in item.child_req_ids or ():
@@ -896,10 +909,20 @@ class PeerLossRecovery(RecoveryHook):
             raise errors[0]
 
     def _departed_requests(self, failed: frozenset) -> int:
-        """How many requests the departed ranks were serving; known on rank 0 only (0 elsewhere)."""
+        """How many requests of the departed ranks fail (see ``_deliver_responses``); known on rank 0 only."""
         if self._request_owners is None:
             return 0
-        return sum(owner in failed for owner, _ in self._request_owners.values())
+        return sum(
+            owner in failed
+            and (request_id in self._delivered or not self._lost_with_host(owner, failed))
+            for request_id, (owner, _) in self._request_owners.items()
+        )
+
+    def _lost_with_host(self, rank: int, failed: frozenset) -> bool:
+        """Whether every rank on ``rank``'s host is in ``failed`` (False if the hosts are unknown)."""
+        if not self._hosts:
+            return False
+        return all(r in failed for r, host in enumerate(self._hosts) if host == self._hosts[rank])
 
     def _requeue_unscheduled_requests(self, served: List[Optional[Set[int]]]) -> None:
         """Admit again the requests that were received but never scheduled.
@@ -942,8 +965,9 @@ class PeerLossRecovery(RecoveryHook):
         Collective over the survivors. Every survivor resends its parts of the
         gathers rank 0 did not process, and the ``buffered`` error responses it
         held for the next synchronized flush, then terminates the requests they
-        finished. Rank 0 also fails the requests that were running on a departed
-        attention-DP rank: their KV cache left with the rank.
+        finished. Rank 0 also takes over the requests that were running on a departed
+        attention-DP rank, whose KV cache left with it: after a node loss those that delivered
+        nothing run again from their prompt; the others fail.
         """
         executor = self._executor
         processed = executor.dist.broadcast(self._last_processed_gather, root=0)
@@ -970,26 +994,42 @@ class PeerLossRecovery(RecoveryHook):
         buffered_responses, buffered_terminations = buffered
         responses += buffered_responses
         self._undelivered_terminations += buffered_terminations
+        rerun = []
         if self._request_owners is not None:
+            # A request that delivered nothing runs again from its prompt on a survivor when its rank was lost
+            # with its whole host, which a request cannot cause (only rank 0's own parts are redelivered, so what
+            # it delivered is known now). After a loss of its rank alone it may be what crashed the rank, and the
+            # survivors cannot recover from another loss, so it fails, as does one that streamed tokens.
             for request_id, (owner, item) in list(self._request_owners.items()):
-                if owner in failed:
-                    self._forget(request_id)
-                    responses.append(
-                        (
-                            request_id,
-                            LlmResponse(
-                                request_id=request_id,
-                                error_msg=(
-                                    f"Attention DP rank {owner} failed while "
-                                    "serving this request; retry it"
-                                ),
-                                client_id=getattr(item.request, "client_id", None),
+                if owner not in failed:
+                    continue
+                streamed = request_id in self._delivered
+                self._forget(request_id)
+                if not streamed and self._lost_with_host(owner, failed):
+                    rerun.append(item)
+                    continue
+                reason = "had streamed tokens" if streamed else "may have caused that failure"
+                responses.append(
+                    (
+                        request_id,
+                        LlmResponse(
+                            request_id=request_id,
+                            error_msg=(
+                                f"Attention DP rank {owner} failed while serving this request, "
+                                f"which {reason}; retry it"
                             ),
-                        )
+                            client_id=getattr(item.request, "client_id", None),
+                        ),
                     )
+                )
         terminations, self._undelivered_terminations = self._undelivered_terminations, []
         executor.publish_responses(responses, terminations)
         self._forget_finished(responses)
+        if rerun:
+            logger.warning(
+                f"Running {len(rerun)} requests of the lost ranks again on the survivors"
+            )
+            executor.readmit_requests(rerun)
 
     def _readmit_undelivered_requests(
         self, failed: frozenset, held: Sequence[Optional[Set[int]]]

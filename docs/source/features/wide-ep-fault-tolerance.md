@@ -103,7 +103,10 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
 - Survivors detect the loss within milliseconds and resume serving well under a second later. A step
   that was running finishes first, so under heavy prefill a recovery takes up to the length of one step
   (`max_num_tokens` bounds it).
-- Requests that the lost ranks were serving end with a retryable error. Non-streaming requests get an error
+- After a node loss, the requests its ranks were serving that had delivered nothing yet (every non-streaming
+  request, and a streaming one before its first token) run again from their prompt on a survivor. After the loss
+  of a single rank they do not: the request may be what crashed the rank, and the survivors cannot recover from
+  a second loss. Those, and requests that had streamed tokens, end with a retryable error. Non-streaming requests get an error
   response. Streaming `/v1/completions` and `/v1/chat/completions` responses end with an SSE `error` event
   followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that

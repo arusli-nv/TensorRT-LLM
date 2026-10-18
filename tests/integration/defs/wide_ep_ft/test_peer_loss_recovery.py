@@ -26,7 +26,6 @@ KILL_MARKER = "PEER_LOSS_DRIVER_KILL"
 SERVE_TIMEOUT_S = 1800
 # Shutdown of a world that lost a rank ends in MPI_Abort after a 60 s worker grace period.
 TEARDOWN_TIMEOUT_S = 180
-RETRY_ERROR = f"Attention DP rank {VICTIM} failed while serving this request; retry it"
 
 
 def _ulfm_unavailable_reason() -> str | None:
@@ -167,9 +166,9 @@ def test_peer_loss_recovery(mode: str, overlap: bool, tmp_path: Path):
 
     _assert_answered(result["healthy"])
     if mode == "inflight":
-        during = {row["rank"]: row for row in result["during_loss"]}
-        assert RETRY_ERROR in during.pop(VICTIM).get("error", ""), result["during_loss"]
-        _assert_answered(list(during.values()))
+        # The victim's request streamed nothing, so a survivor ran it again from its prompt.
+        _assert_answered(result["during_loss"])
+        assert "Running 1 requests of the lost ranks again" in output, output[-20000:]
     _assert_answered(result["after_loss"])
 
     before_kill, kill_marker, after_kill = output.partition(KILL_MARKER)

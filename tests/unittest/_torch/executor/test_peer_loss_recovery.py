@@ -53,6 +53,9 @@ WORLD_SIZE = 4
 FAILED_RANK = 2
 SURVIVORS = (0, 1, 3)
 ADMITTED = frozenset({frozenset({1}), frozenset({FAILED_RANK}), frozenset({3})})
+# One host per rank: losing FAILED_RANK loses its whole host. On SHARED_HOSTS it shares its host with rank 3.
+OWN_HOSTS = tuple(f"host{rank}" for rank in range(WORLD_SIZE))
+SHARED_HOSTS = ("host0", "host0", "host1", "host1")
 
 
 class _FakeClient:
@@ -134,10 +137,17 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
 
 
 def _recovery(
-    client, rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE, admitted=ADMITTED
+    client,
+    rank=1,
+    failed=frozenset({FAILED_RANK}),
+    world_size=WORLD_SIZE,
+    admitted=ADMITTED,
+    hosts=None,
 ):
     executor = _executor(rank, failed, world_size)
-    recovery = PeerLossRecovery(executor, client, admitted)
+    if hosts is None:
+        hosts = tuple(f"host{r}" for r in range(world_size))
+    recovery = PeerLossRecovery(executor, client, admitted, hosts)
     recovery._join_device_work = Mock()
     recovery._watch = Mock(failed=False)
     executor.discard_interrupted_steps = Mock()
@@ -250,7 +260,7 @@ def test_kv_cache_quota_cut_suspends_the_active_caches_around_the_resize():
 
 
 def test_a_node_loss_recovers_every_rank_in_one_transaction():
-    """Losing node 1 (ranks 4-7) masks all four ranks and fails the requests each one served."""
+    """Losing node 1 (ranks 4-7) masks all four ranks and runs the requests each one served again."""
     node = frozenset({4, 5, 6, 7})
     client = _FakeClient(_happy_replies(failed=(4, 5, 6, 7), survivors=(0, 1, 2, 3)))
     recovery = _recovery(client, rank=0, failed=node, world_size=8, admitted=ADMITTED | {node})
@@ -272,7 +282,8 @@ def test_a_node_loss_recovers_every_rank_in_one_transaction():
         [4, 5, 6, 7], ["placement"]
     )
     assert engine.moe_execution_state.health.get_failed_ranks() == node
-    assert sorted(request_id for request_id, _ in sent[-1]) == [11, 12]
+    assert sent[-1] == []
+    assert sorted(item.id for item in recovery._executor.request_accumulated) == [11, 12]
     assert list(recovery._request_owners) == [13]
 
 
@@ -896,14 +907,12 @@ def test_an_error_of_any_sequence_ends_the_request(sequence_id):
     assert recovery._request_owners == {} and recovery._parent_ids == {}
 
 
-def test_recovery_fails_requests_owned_by_departed_rank():
-    """Rank 0 fails the requests whose KV cache left with the departed rank, once."""
+def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
+    """Its whole host was lost, which a request cannot cause, and nothing reached the client: a survivor runs it
+    again."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
-    item_12 = Mock(id=12, child_req_ids=None)
-    recovery._request_owners = {
-        11: (FAILED_RANK, Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)),
-        12: (3, item_12),
-    }
+    lost, kept = Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, lost), 12: (3, kept)}
     recovery._executor.active_requests.append(
         Mock(is_child=False, py_request_id=12, is_attention_dp_dummy=False)
     )
@@ -911,27 +920,62 @@ def test_recovery_fails_requests_owned_by_departed_rank():
 
     recovery._recover(_interrupted())
 
+    assert sent[-1] == []
+    assert recovery._executor.request_accumulated[:1] == [lost]
+    assert recovery._request_owners == {12: (3, kept)}
+
+
+@pytest.mark.parametrize("streamed", [True, False])
+def test_recovery_fails_a_departed_rank_request_that_streamed_or_lost_its_rank_alone(streamed):
+    """Streamed tokens cannot be taken back; after its rank alone failed, the request may be what crashed it, and a
+    second loss is not recoverable."""
+    recovery = _recovery(
+        _FakeClient(_happy_replies()), rank=0, hosts=OWN_HOSTS if streamed else SHARED_HOSTS
+    )
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, item)}
+    if streamed:
+        recovery._delivered.add(11)
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
     ((request_id, response),) = sent[-1]
     assert request_id == 11 and response.client_id == "c11"
     assert f"rank {FAILED_RANK} failed" in response.error_msg
-    assert recovery._request_owners == {12: (3, item_12)}
+    assert ("streamed" in response.error_msg) == streamed
+    assert recovery._request_owners == {}
+    assert recovery._executor.request_accumulated == []
 
 
-def test_rank0_reports_how_many_requests_the_departed_rank_was_serving():
-    """The authority's status counts the requests a loss failed; rank 0 routed them all."""
+def test_rank0_tracks_requests_that_delivered_a_response():
+    recovery = _recovery(_FakeClient([]), rank=0)
+    recovery.requests_routed({FAILED_RANK: [_queued(11), _queued(12)]})
+    partial = LlmResponse(request_id=11, result=Mock(is_final=False))
+    recovery.responses_gathered([(11, partial), (11, partial)])
+    assert recovery._delivered == {11}
+    recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
+    assert recovery._delivered == set() and set(recovery._request_owners) == {12}
+
+
+@pytest.mark.parametrize("hosts, failed_requests", [(OWN_HOSTS, 1), (SHARED_HOSTS, 2)])
+def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(hosts, failed_requests):
+    """The authority's status counts the requests a loss failed: those that had streamed, and after a single-rank
+    loss also those that delivered nothing."""
     client = _FakeClient(_happy_replies())
-    recovery = _recovery(client, rank=0)
+    recovery = _recovery(client, rank=0, hosts=hosts)
     recovery._request_owners = {
         11: (FAILED_RANK, Mock(id=11, child_req_ids=None)),
         12: (FAILED_RANK, Mock(id=12, child_req_ids=None)),
         13: (1, Mock(id=13, child_req_ids=None)),
     }
+    recovery._delivered.add(11)
     _sent_responses(recovery)
 
     recovery._recover(_interrupted())
 
     (installed,) = [message for message in client.sent if isinstance(message, Installed)]
-    assert installed.failed_requests == 2
+    assert installed.failed_requests == failed_requests
 
 
 def test_recovery_readmits_requests_that_never_reached_their_rank():
