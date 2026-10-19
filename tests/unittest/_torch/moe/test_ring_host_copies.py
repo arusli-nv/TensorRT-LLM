@@ -2,10 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """EPLB host copies of a subset of the experts, as WideEP fault tolerance keeps them in a ring of nodes."""
 
-import errno
-import os
 import threading
-import uuid
 from unittest.mock import Mock, patch
 
 import pytest
@@ -23,7 +20,10 @@ pytestmark = pytest.mark.cpu_only
 
 def _sharer(local_rank, local_size, expert_count=8, expert_ids=None):
     comm = Mock(Get_rank=Mock(return_value=local_rank), Get_size=Mock(return_value=local_size))
-    return HostMoeTensorSharer(0, expert_count, comm, expert_ids)
+    sharer = HostMoeTensorSharer(0, expert_count, comm)
+    if expert_ids is not None:
+        sharer.keep_experts(expert_ids)
+    return sharer
 
 
 @pytest.mark.parametrize("expert_count, local_size", [(8, 4), (10, 4), (3, 4)])
@@ -48,22 +48,6 @@ def test_sharer_splits_the_experts_it_holds_over_the_node_s_ranks():
         sharer.pre_register_host_tensor_with_shape(7, "w", torch.float32, (4,))
     with pytest.raises(AssertionError):
         sharer.share_host_tensor_with_shape(0, "w", torch.zeros(4))
-
-
-def test_a_full_dev_shm_fails_with_an_error_and_leaves_no_segment(monkeypatch):
-    sharer = _sharer(0, 1, 2)
-    sharer.set_shared_memory_base_name(f"test_ring_{uuid.uuid4().hex[:8]}")
-    for expert in range(2):
-        sharer.share_host_tensor_with_shape(expert, "w", torch.zeros(64))
-
-    def full(fd, offset, length):
-        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-
-    monkeypatch.setattr(os, "posix_fallocate", full)
-    with pytest.raises(RuntimeError, match="/dev/shm has no room for the 512 bytes"):
-        sharer.finalize_layer_weights()
-    assert sharer.own_shm is None
-    assert not os.path.exists(f"/dev/shm/{sharer.get_shared_memory_name()}")
 
 
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
@@ -132,10 +116,11 @@ def test_a_node_shares_the_home_experts_of_the_next_node(monkeypatch, ep_rank, h
     assert layer.home_ranks.tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
     # Node a (ranks 0, 2) keeps node b's (ranks 1, 3) experts and the other way round.
     assert layer.host_copy_ranks == ([1, 3] if ep_rank == 0 else [0, 2])
-    sharer.assert_called_once_with(0, _EXPERTS, load_balancer.shared_mpi_comm, held)
-    # Setting the weights again after loading keeps the sharer.
+    sharer.assert_called_once_with(0, _EXPERTS, load_balancer.shared_mpi_comm)
+    sharer.return_value.keep_experts.assert_called_once_with(held)
+    # Setting the weights again after loading keeps the experts.
     layer.set_initial_weight_assignments(_ASSIGNMENTS)
-    assert sharer.call_count == 1
+    assert sharer.return_value.keep_experts.call_count == 1
 
 
 def test_an_expert_whose_copy_node_is_lost_too_is_not_restored(monkeypatch):

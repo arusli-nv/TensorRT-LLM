@@ -240,7 +240,7 @@ class PeerLossRecovery(RecoveryHook):
         self.survives_own_loss = False
         self._timeout_s = fault_tolerance_config().recovery_timeout_s
         self._shrink_timeout_s = fault_tolerance_config().shrink_timeout_s()
-        # Restores copy experts from another node's host copies (see _stage_restored_slots).
+        # Restores copy experts from another node's host copies (_stage_ring_restore).
         self._ring_host_copies = fault_tolerance_config().host_copies == "ring"
         # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
@@ -371,12 +371,12 @@ class PeerLossRecovery(RecoveryHook):
                 "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
             )
         if config.host_copies == "ring":
-            # Every admitted loss needs a copy plan: each expert weight fits half the workspace.
-            workspace_bytes = engine.moe_execution_state.staging_workspace().size(1)
-            for domain in domains:
-                load_balancer.restore_copy_plan(
-                    domain, load_balancer.recovery_placements(domain), workspace_bytes
-                )
+            # Restores stage each expert weight through half the workspace; restore_copy_plan checks it fits.
+            load_balancer.restore_copy_plan(
+                [],
+                load_balancer.current_placements(),
+                engine.moe_execution_state.staging_workspace().size(1),
+            )
         recoverable = tuple(domains)
         dist.enable_peer_loss_recovery()
         client, admitted = _register(dist.rank, recoverable)
@@ -828,12 +828,11 @@ class PeerLossRecovery(RecoveryHook):
                         f"authority proposed {proposal}"
                     )
                 generation = proposal.generation
-                copy_plan = None
-                if self._ring_host_copies:
-                    copy_plan = load_balancer.restore_copy_plan(
-                        failed, placements, engine.moe_execution_state.staging_workspace().size(1)
-                    )
-                    self._stage_restored_slots(load_balancer, copy_plan)
+                copy_plan = (
+                    self._stage_ring_restore(load_balancer, failed, placements)
+                    if self._ring_host_copies
+                    else None
+                )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
                 client.send(ready)
@@ -1046,20 +1045,12 @@ class PeerLossRecovery(RecoveryHook):
             RecoveryInterrupted: Another survivor failed during the broadcast.
             RuntimeError: Rank 0's placements do not have this rank's shape.
         """
-        from mpi4py import MPI
-
-        from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
-
         dist = self._executor.dist
         own = load_balancer.current_placements()
-        try:
-            base = dist.broadcast_among_survivors(own if dist.rank == 0 else None, root=0)
-        except MPI.Exception as error:
-            if not is_mpi_peer_failure(error):
-                raise
-            raise RecoveryInterrupted(
-                f"Rank {dist.rank}: a survivor failed while rank 0 sent its placement"
-            ) from error
+        base = self._among_survivors(
+            "rank 0 sent its placement",
+            lambda: dist.broadcast_among_survivors(own if dist.rank == 0 else None, root=0),
+        )
         if np.asarray(base).shape != np.asarray(own).shape:
             raise RuntimeError(
                 f"Rank 0's placement has shape {np.asarray(base).shape}, expected {np.asarray(own).shape}"
@@ -1103,43 +1094,45 @@ class PeerLossRecovery(RecoveryHook):
             f"{(time.monotonic() - start) * 1e3:.1f} ms"
         )
 
-    def _stage_restored_slots(
-        self, load_balancer: "MoeLoadBalancer", copy_plan: np.ndarray
-    ) -> None:
-        """Copy the experts this plan restores into the survivors' slots, through their workspaces (ring host copies).
+    def _stage_ring_restore(
+        self, load_balancer: "MoeLoadBalancer", failed: frozenset, placements: List[np.ndarray]
+    ) -> np.ndarray:
+        """Copy the experts ``placements`` restores from the ring host copies into their slots; the copy plan.
 
-        After Propose: the failed ranks are fenced and every survivor joined its
-        device work before sending Stopped, so no all-to-all uses the
-        workspaces until the install rearms them. The slots are routed only
-        once the placement is installed; a plan abandoned for a further loss
-        leaves them unrouted.
+        After Propose the failed ranks are fenced and no all-to-all runs until the install rearms the workspaces.
+        """
+        start = time.monotonic()
+        workspace = self._executor.model_engine.moe_execution_state.staging_workspace()
+        copy_plan = load_balancer.restore_copy_plan(failed, placements, workspace.size(1))
+        self._among_survivors(
+            "restored experts were copied",
+            lambda: load_balancer.stage_restored_slots(
+                copy_plan, workspace, self._executor.dist.barrier_among_survivors
+            ),
+        )
+        logger.info(
+            f"Staged {len(copy_plan)} expert weights in {(time.monotonic() - start) * 1e3:.1f} ms"
+        )
+        return copy_plan
+
+    def _among_survivors(self, what: str, collective: Callable[[], _T]) -> _T:
+        """``collective()`` among the survivors.
 
         Raises:
-            RecoveryInterrupted: Another survivor failed during the copies.
+            RecoveryInterrupted: Another survivor failed while ``what``.
         """
         from mpi4py import MPI
 
         from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
 
-        dist = self._executor.dist
-        start = time.monotonic()
         try:
-            load_balancer.stage_restored_slots(
-                copy_plan,
-                self._executor.model_engine.moe_execution_state.staging_workspace(),
-                dist.barrier_among_survivors,
-            )
+            return collective()
         except MPI.Exception as error:
             if not is_mpi_peer_failure(error):
                 raise
             raise RecoveryInterrupted(
-                f"Rank {dist.rank}: a survivor failed while restored experts were copied"
+                f"Rank {self._executor.dist.rank}: a survivor failed while {what}"
             ) from error
-        chunks = int(copy_plan[-1, 0]) + 1 if len(copy_plan) else 0
-        logger.info(
-            f"Copied {len(copy_plan)} restored expert weights from the ring host copies in {chunks} chunks "
-            f"in {(time.monotonic() - start) * 1e3:.1f} ms"
-        )
 
     def _join_device_work(self, deadline: float) -> None:
         """Wait for all work on this device, on any stream, up to ``deadline``."""

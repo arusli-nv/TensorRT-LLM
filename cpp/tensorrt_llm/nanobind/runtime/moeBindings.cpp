@@ -123,8 +123,7 @@ void initMoeBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
             nb::arg("layer_rank_expert_ids"), nb::arg("slots_loaded") = false,
-            "Mark dead EP ranks and install a new placement per layer, loading changed local slots from host weights "
-            "(slots_loaded: the caller loaded them)",
+            "Mark dead EP ranks and install a new placement per layer, loading changed local slots from host weights",
             nb::call_guard<nb::gil_scoped_release>())
         .def("quiesce", &tr::MoeLoadBalancer::quiesce, nb::arg("timeout_ms"),
             "Wait until started iterations and weight updates are done; false on timeout",

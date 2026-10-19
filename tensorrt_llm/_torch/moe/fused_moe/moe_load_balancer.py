@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
-import errno
 import gc
 import hashlib
 import os
@@ -11,7 +10,7 @@ import threading
 import time
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -107,18 +106,13 @@ class HostMoeTensorSharer:
     A class representing a host tensor sharer.
     """
 
-    def __init__(self,
-                 layer_id: int,
-                 expert_count: int,
-                 shared_mpi_comm: MPI.Comm,
-                 expert_ids: Optional[Sequence[int]] = None):
+    def __init__(self, layer_id: int, expert_count: int,
+                 shared_mpi_comm: MPI.Comm):
         """
         Initialize a HostMoeTensorSharer instance.
 
         Args:
             shared_mpi_comm: The MPI communicator for shared memory
-            expert_ids: The experts whose host copies the node keeps (default: all), split over its ranks in
-                contiguous runs.
         """
         self.shared_mpi_comm = shared_mpi_comm
         self.layer_id = layer_id
@@ -128,10 +122,7 @@ class HostMoeTensorSharer:
         self.local_rank = self.shared_mpi_comm.Get_rank()
         self.local_size = self.shared_mpi_comm.Get_size()
 
-        self.expert_ids = list(
-            range(expert_count)) if expert_ids is None else sorted(expert_ids)
-        # The experts this rank loads and writes to its shared memory.
-        self.own_expert_ids = self.rank_expert_ids(self.local_rank)
+        self.keep_experts(range(expert_count))
 
         self.name_info = {}  # key is weight name, value is (dtype, shape)
         self.host_weights = {}
@@ -143,6 +134,12 @@ class HostMoeTensorSharer:
         self.names = []
 
         self.loaded_shared_weights = []
+
+    def keep_experts(self, expert_ids: Iterable[int]) -> None:
+        """Keep host copies of ``expert_ids`` only (before any is shared), split over the node's ranks in runs."""
+        self.expert_ids = sorted(expert_ids)
+        # The experts this rank loads and writes to its shared memory.
+        self.own_expert_ids = self.rank_expert_ids(self.local_rank)
 
     def rank_expert_ids(self, local_rank: int) -> List[int]:
         """The experts local rank ``local_rank`` of the node loads and shares."""
@@ -271,7 +268,6 @@ class HostMoeTensorSharer:
             shm = shared_memory.SharedMemory(name=shm_name,
                                              create=True,
                                              size=total_size)
-        self._reserve(shm, total_size)
         self.own_shm = shm
 
         offset = 0
@@ -302,24 +298,6 @@ class HostMoeTensorSharer:
         self.loaded_shared_weights = []
 
         gc.collect()
-
-    def _reserve(self, shm: shared_memory.SharedMemory, size: int) -> None:
-        """Allocate the pages of ``shm`` now, so a full /dev/shm fails here with an error instead of SIGBUS later.
-
-        Raises:
-            RuntimeError: /dev/shm has no room for ``size`` bytes.
-        """
-        try:
-            os.posix_fallocate(shm._fd, 0, size)
-        except OSError as error:
-            if error.errno != errno.ENOSPC:
-                raise
-            shm.close()
-            shm.unlink()
-            raise RuntimeError(
-                f"/dev/shm has no room for the {size} bytes of EPLB host copies of MoE layer {self.layer_id} "
-                f"on local rank {self.local_rank} ({len(self.own_expert_ids)} experts); free or enlarge /dev/shm"
-            ) from error
 
     def finalize_host_tensor_sharing(self, add_host_weight_fn: Callable = None):
         """
@@ -413,8 +391,7 @@ class SingleLayerMoeLoadBalancer:
             slot_count_per_rank: the number of slots per rank, ``ghost_slot_count`` of them last.
             ghost_slot_count: slots per rank appended after online EPLB's own for WideEP peer-loss recovery; they
                 start empty and EPLB's updates fill one only once a restore loaded an expert into it.
-            host_copy_ranks: with ring host copies (WideEP peer-loss recovery), the EP ranks whose home experts'
-                host copies this node keeps; None: every expert's.
+            host_copy_ranks: with ring host copies, the EP ranks whose home experts' host copies this node keeps.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -425,15 +402,12 @@ class SingleLayerMoeLoadBalancer:
         self.repeated_count = repeated_count
         self.slot_count_per_rank = slot_count_per_rank
         self.ghost_slot_count = ghost_slot_count
-        self.shared_mpi_comm = shared_mpi_comm
-        self.shared_memory_base_name = None
-        self.host_copy_ranks = host_copy_ranks
-        # With ring host copies, created once the initial placement names the experts' home ranks.
+        layer_id = self.single_layer_load_balancer_impl.get_layer_id()
         self.host_tensor_sharer = HostMoeTensorSharer(
-            self.get_layer_idx(), expert_count, shared_mpi_comm
-        ) if self.host_copies and host_copy_ranks is None else None
-        # Ring host copies: per expert, its home EP rank (see _without_replicas), and the host copies this node
-        # keeps by (expert, weight name); restores copy them from here, not from the native host weights.
+            layer_id, expert_count,
+            shared_mpi_comm) if self.host_copies else None
+        self.host_copy_ranks = host_copy_ranks
+        # Ring host copies: per expert, its home EP rank, and this node's copies by (expert, weight name).
         self.home_ranks: Optional[np.ndarray] = None
         self.ring_host_weights: Dict[Tuple[int, str], torch.Tensor] = {}
         # (local slot, weight name) -> the slot's weight tensor.
@@ -502,8 +476,7 @@ class SingleLayerMoeLoadBalancer:
         Args:
             shared_memory_base_name: The base name for the shared memory
         """
-        self.shared_memory_base_name = shared_memory_base_name
-        if self.host_tensor_sharer is not None:
+        if self.host_copies:
             self.host_tensor_sharer.set_shared_memory_base_name(
                 shared_memory_base_name)
 
@@ -533,14 +506,6 @@ class SingleLayerMoeLoadBalancer:
         moe_weight = _tensor_to_weight(t)
         self._add_weight_slot(local_slot_id, name, moe_weight)
         self.weight_slots[(local_slot_id, name)] = t
-
-    def slot_weight_bytes(self) -> List[int]:
-        """The bytes of each weight of a slot, by weight name in sorted order."""
-        sizes = {
-            name: t.numel() * t.element_size()
-            for (slot, name), t in self.weight_slots.items() if slot == 0
-        }
-        return [sizes[name] for name in sorted(sizes)]
 
     def _add_raw_host_weight_for_unmap(self,
                                        raw_weight_tensors: List[torch.Tensor]):
@@ -574,10 +539,6 @@ class SingleLayerMoeLoadBalancer:
         host_weight = _tensor_to_weight(t)
         self._add_host_weight(expert_id, name, host_weight)
 
-    def _keep_ring_host_weight(self, expert_id: int, name: str,
-                               t: torch.Tensor):
-        self.ring_host_weights[(expert_id, name)] = t
-
     def with_ghost_slots(self, eplb_assignments: List[int]) -> List[int]:
         """``eplb_assignments`` (the expert of each EPLB slot) with each rank's ghost slots appended.
 
@@ -608,24 +569,18 @@ class SingleLayerMoeLoadBalancer:
         self.single_layer_load_balancer_impl.set_initial_weight_assignments(
             initial_weight_assignments)
         self.initial_weight_assignments = list(initial_weight_assignments)
-        if self.host_copy_ranks is not None and self.host_tensor_sharer is None:
-            self._share_ring_host_copies()
-
-    def _share_ring_host_copies(self) -> None:
-        """Keep host copies of the experts whose home rank is in ``host_copy_ranks``."""
-        placement = _without_replicas(
-            np.asarray(self.initial_weight_assignments,
-                       dtype=np.int32).reshape(-1, self.slot_count_per_rank))
-        ranks, _ = np.nonzero(placement >= 0)
-        self.home_ranks = np.empty(self.expert_count, dtype=np.int64)
-        self.home_ranks[placement[placement >= 0]] = ranks
-        held = np.flatnonzero(np.isin(self.home_ranks, self.host_copy_ranks))
-        self.host_tensor_sharer = HostMoeTensorSharer(self.get_layer_idx(),
-                                                      self.expert_count,
-                                                      self.shared_mpi_comm,
-                                                      held.tolist())
-        self.host_tensor_sharer.set_shared_memory_base_name(
-            self.shared_memory_base_name)
+        if self.host_copy_ranks is not None and self.home_ranks is None:
+            # Ring host copies: keep the experts whose home rank is in host_copy_ranks.
+            placement = _without_replicas(
+                np.asarray(initial_weight_assignments,
+                           dtype=np.int32).reshape(-1,
+                                                   self.slot_count_per_rank))
+            ranks, _ = np.nonzero(placement >= 0)
+            self.home_ranks = np.empty(self.expert_count, dtype=np.int64)
+            self.home_ranks[placement[placement >= 0]] = ranks
+            self.host_tensor_sharer.keep_experts(
+                np.flatnonzero(np.isin(self.home_ranks,
+                                       self.host_copy_ranks)).tolist())
 
     def add_to_migrate_weight_fn(self,
                                  fn: Callable,
@@ -673,7 +628,8 @@ class SingleLayerMoeLoadBalancer:
         if self.host_copies:
             self.host_tensor_sharer.finalize_host_tensor_sharing(
                 self._add_host_weight_from_tensor if self.host_copy_ranks is
-                None else self._keep_ring_host_weight)
+                None else lambda expert_id, name, t: self.ring_host_weights.
+                update({(expert_id, name): t}))
 
     def start_wait_gpu_stage(self):
         """
@@ -909,7 +865,7 @@ class SingleLayerMoeLoadBalancer:
         Clean up the resources before C++ shutdown and barrier
         """
         if self.host_copies:
-            # The host copies kept here are views of the shared memory, which closes only without them.
+            # Views of the shared memory, which closes only without them.
             self.ring_host_weights.clear()
             self.host_tensor_sharer.pre_shutdown_cleanup()
 
@@ -970,30 +926,19 @@ def restore_lost_experts(placement: np.ndarray,
     return unplaced
 
 
-def ring_copy_nodes(hosts: Sequence[str]) -> List[Tuple[int, ...]]:
-    """Per rank, the ranks of the node that keeps the host copies of the rank's home experts (ring host copies).
-
-    Nodes are the distinct ``hosts`` (per rank, the host it runs on) ordered by
-    their first rank; node i's copies live on node i - 1, the first node's on
-    the last.
-
-    Raises:
-        ValueError: Every rank runs on one node, which has no other node to keep its copies.
-    """
-    nodes: Dict[str, List[int]] = {}
-    for rank, host in enumerate(hosts):
-        nodes.setdefault(host, []).append(rank)
+def ring_copy_nodes(hosts: List[str]) -> List[Tuple[int, ...]]:
+    """Per rank (``hosts``: its host), the ranks of the node keeping its home experts' copies: the node before
+    its own in first-rank order, the last node for the first."""
+    nodes = list(dict.fromkeys(hosts))
     if len(nodes) < 2:
         raise ValueError(
             "Ring host copies (FaultToleranceConfig.host_copies=ring) keep each node's experts on another "
             f"node, but all {len(hosts)} ranks run on one node")
-    index = {host: i for i, host in enumerate(nodes)}
-    node_ranks = [tuple(ranks) for ranks in nodes.values()]
-    return [node_ranks[index[host] - 1] for host in hosts]
-
-
-# Restored expert weights are staged at offsets of this alignment in a workspace.
-_STAGING_ALIGNMENT = 256
+    copy_nodes = {
+        host: tuple(rank for rank, h in enumerate(hosts) if h == previous)
+        for host, previous in zip(nodes, nodes[-1:] + nodes[:-1])
+    }
+    return [copy_nodes[host] for host in hosts]
 
 
 class MoeLoadBalancer:
@@ -1047,7 +992,7 @@ class MoeLoadBalancer:
             raise ValueError(
                 "FaultToleranceConfig.host_copies=ring applies to a static EPLB placement; online EPLB keeps "
                 "every expert's host copy on every node")
-        # Ring host copies: per EP rank, the ranks of the node that keeps its home experts' host copies.
+        # Ring host copies: per EP rank, ring_copy_nodes.
         self.copy_nodes = self._gather_copy_nodes() if ring else None
 
     def __del__(self):
@@ -1082,7 +1027,6 @@ class MoeLoadBalancer:
                    default=0)
 
     def _gather_copy_nodes(self) -> List[Tuple[int, ...]]:
-        """``ring_copy_nodes`` of the hosts the ranks run on; collective."""
         return ring_copy_nodes(tensorrt_llm.mpi_comm().allgather(
             socket.gethostname()))
 
@@ -1314,14 +1258,15 @@ class MoeLoadBalancer:
                 set(range(layer.expert_count)) -
                 set(placement[placement >= 0].tolist()))
             if lost and layer.host_copies:
-                # With ring host copies, an expert whose copy node is lost too has no copy left.
-                restorable = lost if self.copy_nodes is None else [
-                    expert for expert in lost
-                    if self._copy_ranks(layer, expert, dead)
+                # Ring host copies: an expert whose copy node is lost too has no copy left.
+                uncopied = [
+                    expert for expert in lost if self.copy_nodes is not None
+                    and not self._copy_ranks(layer, expert, dead)
                 ]
-                lost = [expert for expert in lost if expert not in restorable
-                        ] + restore_lost_experts(
-                            placement, restorable, dead, empty_last=ghosts_last)
+                lost = uncopied + restore_lost_experts(
+                    placement, [e for e in lost if e not in uncopied],
+                    dead,
+                    empty_last=ghosts_last)
             if lost:
                 missing[layer.get_layer_idx()] = lost
             placements.append(placement)
@@ -1332,7 +1277,7 @@ class MoeLoadBalancer:
 
     def _copy_ranks(self, layer: "SingleLayerMoeLoadBalancer", expert: int,
                     dead: Iterable[int]) -> List[int]:
-        """With ring host copies, the live ranks of the node that keeps ``expert``'s host copy."""
+        """The live ranks of the node that keeps ``expert``'s ring host copy."""
         return [
             rank for rank in self.copy_nodes[layer.home_ranks[expert]]
             if rank not in dead
@@ -1342,8 +1287,7 @@ class MoeLoadBalancer:
     def placement_digest(dead_ranks: Iterable[int],
                          placements: List[np.ndarray],
                          copy_plan: Optional[np.ndarray] = None) -> str:
-        """A digest of ``placements``, ``dead_ranks`` and ``copy_plan``: ranks that agree on it route identically
-        and copy the restored experts alike."""
+        """A digest of ``placements``, ``dead_ranks`` and ``copy_plan``: ranks that agree on it route and restore alike."""
         digest = hashlib.sha256(
             np.asarray(sorted(set(dead_ranks)), dtype=np.int64).tobytes())
         for placement in placements:
@@ -1356,100 +1300,76 @@ class MoeLoadBalancer:
     def restore_copy_plan(self, dead_ranks: Iterable[int],
                           placements: List[np.ndarray],
                           workspace_bytes: int) -> np.ndarray:
-        """With ring host copies, how installing ``placements`` copies each restored expert into its slot.
+        """Ring host copies: rows (chunk, layer, target, slot, expert, weight by sorted name, source, workspace
+        offset, bytes) that load the slots ``placements`` changes, in chunk order; the same on every rank.
 
-        Each slot that ``placements`` loads gets its expert from a live rank of
-        the node that keeps the expert's host copy, round-robin over that
-        node's live ranks in (layer, target rank, slot) order. The source copies
-        each weight from host memory into the target's NVLinkOneSided workspace
-        (``workspace_bytes`` per rank), the target from there into the slot.
-        Copies run in chunks; per target, a chunk's weights fill at most half
-        the workspace, the halves alternating between chunks. Every rank
-        computes the same plan from the same inputs.
-
-        Returns:
-            One row per weight: (chunk, layer, target rank, local slot, expert,
-            weight index in sorted name order, source rank, workspace offset,
-            bytes), in chunk order.
-
-        Raises:
-            ValueError: A weight does not fit in half the workspace.
+        Sources take turns over the live ranks of the expert's copy node. Per target, a chunk fills at most half
+        the workspace (``workspace_bytes`` per rank), alternating halves; ValueError if a weight does not fit.
         """
         dead = sorted(set(dead_ranks))
-        capacity = workspace_bytes // 2 // _STAGING_ALIGNMENT * _STAGING_ALIGNMENT
+        half = workspace_bytes // 2
         chunk = np.zeros(self.ep_size, dtype=np.int64)
         used = np.zeros(self.ep_size, dtype=np.int64)
         turns: Dict[Tuple[int, ...], int] = {}
         rows = []
         for layer_idx, (layer, placement) in enumerate(
                 zip(self.single_layer_load_balancers, placements)):
+            sizes = [
+                t.nbytes for (slot, _), t in sorted(layer.weight_slots.items())
+                if slot == 0
+            ]
+            if max(sizes) > half:
+                raise ValueError(
+                    f"A {max(sizes)}-byte expert weight of MoE layer {layer.get_layer_idx()} does not fit in "
+                    f"half the {workspace_bytes}-byte NVLinkOneSided workspace that ring host copies stage through"
+                )
             loaded = (placement != self._masked_placement(
                 layer, dead)) & (placement >= 0)
-            sizes = layer.slot_weight_bytes()
             for target, slot in zip(*np.nonzero(loaded)):
                 expert = int(placement[target, slot])
-                node = self.copy_nodes[layer.home_ranks[expert]]
                 live = self._copy_ranks(layer, expert, dead)
-                source = live[turns.get(node, 0) % len(live)]
-                turns[node] = turns.get(node, 0) + 1
+                node = self.copy_nodes[layer.home_ranks[expert]]
+                turns[node] = turns.get(node, -1) + 1
                 for weight, size in enumerate(sizes):
-                    if size > capacity:
-                        raise ValueError(
-                            f"A {size}-byte expert weight of MoE layer {layer.get_layer_idx()} does not fit in "
-                            f"half the {workspace_bytes}-byte NVLinkOneSided workspace that ring host copies "
-                            "stage restores through")
-                    if used[target] + size > capacity:
+                    if used[target] + size > half:
                         chunk[target] += 1
                         used[target] = 0
-                    rows.append(
-                        (chunk[target], layer_idx, target, slot, expert, weight,
-                         source, chunk[target] % 2 * capacity + used[target],
-                         size))
-                    used[target] += -(-size //
-                                      _STAGING_ALIGNMENT) * _STAGING_ALIGNMENT
+                    rows.append((chunk[target], layer_idx, target, slot, expert,
+                                 weight, live[turns[node] % len(live)],
+                                 chunk[target] % 2 * half + used[target], size))
+                    used[target] += HostMoeTensorSharer.align_size(size)
         plan = np.array(rows, dtype=np.int64).reshape(-1, 9)
         return plan[np.argsort(plan[:, 0], kind="stable")]
 
     def stage_restored_slots(self, copy_plan: np.ndarray,
                              workspace: torch.Tensor,
                              barrier: Callable[[], None]) -> None:
-        """Copy the restored experts of ``copy_plan`` (``restore_copy_plan``) into their slots through ``workspace``.
+        """Copy the experts of ``copy_plan`` into their slots through ``workspace`` ([ep_size, bytes] uint8, idle).
 
-        ``workspace`` ([ep_size, bytes] uint8: every rank's NVLinkOneSided
-        workspace as this device maps it) must be idle on every rank until all
-        ranks return. Per chunk, this rank copies the weights it sources from
-        host memory into the targets' workspaces, waits in ``barrier`` (every
-        live rank's) and copies the weights it receives into its slots. A
-        chunk's writes use the other half of a workspace than the reads of the
-        chunk before, and each rank finishes its copies before the barrier, so
-        no write meets a read. The slots stay unrouted until the placement is
-        installed.
+        Per chunk: write the weights this rank sources into the targets' workspaces, ``barrier`` (all live
+        ranks), copy those it receives into its slots. Alternating halves keep writes off the last chunk's reads.
         """
+        layers = self.single_layer_load_balancers
         names = [
             sorted({name
-                    for _, name in layer.weight_slots})
-            for layer in self.single_layer_load_balancers
+                    for _, name in layer.weight_slots}) for layer in layers
         ]
         stream = torch.cuda.current_stream()
-        for chunk in range(int(copy_plan[-1, 0]) + 1 if len(copy_plan) else 0):
-            rows = copy_plan[copy_plan[:, 0] == chunk]
-            for _, layer_idx, target, _, expert, weight, _, offset, size in rows[
-                    rows[:, 6] == self.ep_rank].tolist():
-                layer = self.single_layer_load_balancers[layer_idx]
-                host = layer.ring_host_weights[(expert,
-                                                names[layer_idx][weight])]
-                workspace[target, offset:offset + size].copy_(
-                    host.reshape(-1).view(torch.uint8))
+        for chunk in range(int(copy_plan[:, 0].max(initial=-1)) + 1):
+            rows = copy_plan[copy_plan[:, 0] == chunk].tolist()
+            for _, i, target, _, expert, weight, source, offset, size in rows:
+                if source == self.ep_rank:
+                    host = layers[i].ring_host_weights[(expert,
+                                                        names[i][weight])]
+                    workspace[target, offset:offset + size].copy_(
+                        host.reshape(-1).view(torch.uint8))
             stream.synchronize()
             barrier()
-            for _, layer_idx, _, slot, _, weight, _, offset, size in rows[
-                    rows[:, 2] == self.ep_rank].tolist():
-                layer = self.single_layer_load_balancers[layer_idx]
-                layer.weight_slots[(slot,
-                                    names[layer_idx][weight])].reshape(-1).view(
-                                        torch.uint8).copy_(
-                                            workspace[self.ep_rank,
-                                                      offset:offset + size])
+            for _, i, target, slot, _, weight, _, offset, size in rows:
+                if target == self.ep_rank:
+                    dst = layers[i].weight_slots[(slot, names[i][weight])]
+                    dst.reshape(-1).view(torch.uint8).copy_(
+                        workspace[target, offset:offset + size])
         stream.synchronize()
 
     def restore_backing_bytes(self, placements: List[np.ndarray]) -> int:
@@ -1490,7 +1410,7 @@ class MoeLoadBalancer:
             self.load_balancer_impl.reconfigure_mask_only(dead)
             return
         start = time.monotonic()
-        # Ring host copies: stage_restored_slots already loaded the slots.
+        # Ring host copies: stage_restored_slots loaded the slots.
         self.load_balancer_impl.restore_placement(
             dead, [placement.tolist() for placement in placements],
             slots_loaded=self.copy_nodes is not None)

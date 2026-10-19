@@ -1888,16 +1888,17 @@ def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(
     recovery = _ring_recovery(monkeypatch, _FakeClient([]))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
-    plan = np.zeros((1, 9), dtype=np.int64)
+    load_balancer.restore_copy_plan.return_value = np.zeros((1, 9), dtype=np.int64)
+    failed = frozenset({FAILED_RANK})
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
     with pytest.raises(RecoveryInterrupted):
-        recovery._stage_restored_slots(load_balancer, plan)
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"])
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
-        recovery._stage_restored_slots(load_balancer, plan)
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"])
 
 
-def test_create_checks_a_copy_plan_for_every_domain_with_ring_host_copies(monkeypatch):
+def test_create_checks_the_staging_workspace_fits_with_ring_host_copies(monkeypatch):
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(
         peer_loss_recovery,
@@ -1914,5 +1915,8 @@ def test_create_checks_a_copy_plan_for_every_domain_with_ring_host_copies(monkey
         PeerLossRecovery.create(executor)
     load_balancer.restore_copy_plan.side_effect = None
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
-    # Ranks 1-3 and node b (ranks 2, 3), checked once per create.
-    assert load_balancer.restore_copy_plan.call_count == 1 + 4
+    workspace_bytes = executor.model_engine.moe_execution_state.staging_workspace().size(1)
+    load_balancer.restore_copy_plan.assert_called_with(
+        [], load_balancer.current_placements(), workspace_bytes
+    )
+    assert load_balancer.restore_copy_plan.call_count == 2

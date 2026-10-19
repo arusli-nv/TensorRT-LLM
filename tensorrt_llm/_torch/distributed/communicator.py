@@ -1099,17 +1099,8 @@ class MPIDist(Distributed):
         return survivor_comm.bcast(obj, root=live_ranks.index(root))
 
     def barrier_among_survivors(self) -> None:
-        """Wait for every survivor on the communicator that :meth:`shrink`
-        built, before it is installed.
-
-        Raises:
-            RuntimeError: :meth:`shrink` has not run.
-            MPI.Exception: Another survivor failed, or the communicator was
-                revoked (see ``is_mpi_peer_failure``).
-        """
-        if self._shrunk is None:
-            raise RuntimeError(
-                "barrier_among_survivors requires a prior shrink()")
+        """Barrier over the survivor communicator that :meth:`shrink` built
+        (``MPI.Exception`` if a survivor failed, see ``is_mpi_peer_failure``)."""
         self._shrunk[0].Barrier()
 
     def _world_comm(self) -> MPI.Comm:

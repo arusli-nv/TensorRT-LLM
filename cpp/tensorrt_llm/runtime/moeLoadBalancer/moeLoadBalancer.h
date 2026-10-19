@@ -211,8 +211,6 @@ private:
     std::vector<int> computeMaskOnlyReplicaCounts(std::vector<uint8_t> const& deadRankMask) const;
     std::vector<int> computeReplicaCounts(
         std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
-    // slotsLoaded: the caller already copied the experts into the local slots that change, so no host weights
-    // are needed and none are loaded.
     void validatePlacement(std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds,
         bool slotsLoaded) const;
     void installPlacement(
@@ -235,8 +233,8 @@ private:
     void copyPlacementInfoToGpu();
     void copyPlacementInfoToGpuByCpu();
     // Loads the local slots whose expert changed in mCpuPlacementInfo from the host copies, by GPU memcpy or the
-    // copy threads (unless loadSlots is false: the caller loaded them), then publishes the placement to routing.
-    void loadAndPublishPlacement(bool loadSlots = true);
+    // copy threads, then publishes the placement to routing.
+    void loadAndPublishPlacement();
     void updateWeightsRoutine();
 
     int64_t mLastUpdateTaskId = -1;
@@ -330,8 +328,8 @@ public:
     // should bind to python
     // Mark deadRanks dead and install a new placement per layer ([epSize][slotCountPerRank] expert ids, -1 = an
     // empty slot that routing skips; dead ranks' rows are ignored), loading the local slots that get a new expert
-    // from EPLB's host weights, or with slotsLoaded, publishing slots the caller already loaded (no host weights
-    // needed). Every layer is validated before any changes; only while no iteration runs.
+    // from EPLB's host weights (with slotsLoaded, the caller loaded them). Every layer is validated before any
+    // changes; only while no iteration runs.
     void restorePlacement(std::vector<int> const& deadRanks,
         std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds, bool slotsLoaded = false);
 

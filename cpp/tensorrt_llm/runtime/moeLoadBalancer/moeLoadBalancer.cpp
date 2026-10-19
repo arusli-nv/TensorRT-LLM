@@ -713,7 +713,12 @@ void SingleLayerMoeLoadBalancer::installPlacement(
             }
         }
     }
-    loadAndPublishPlacement(!slotsLoaded);
+    if (slotsLoaded)
+    {
+        // The local slots already hold their new experts: nothing to load.
+        mCpuPlacementInfo.oldRankExpertIds[mMetaInfo.epRank] = mCpuPlacementInfo.rankExpertIds[mMetaInfo.epRank];
+    }
+    loadAndPublishPlacement();
 }
 
 void SingleLayerMoeLoadBalancer::appendLoadedSlotRanges(
@@ -774,28 +779,22 @@ void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpuByCpu()
     std::fill_n(mStatisticInfo.expertLoadFactor, mMetaInfo.expertCount, 0.0f);
 }
 
-void SingleLayerMoeLoadBalancer::loadAndPublishPlacement(bool loadSlots)
+void SingleLayerMoeLoadBalancer::loadAndPublishPlacement()
 {
     prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
     if (mMoeLoadBalancer->mUseGpuMemcpy)
     {
-        if (loadSlots)
-        {
-            mWeightUpdater->updateWeights(&mCpuPlacementInfo);
-        }
+        mWeightUpdater->updateWeights(&mCpuPlacementInfo);
         copyPlacementInfoToGpu();
         TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
         TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
     }
     else
     {
-        if (loadSlots)
-        {
-            mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
-                [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
-            mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
-            mLastUpdateTaskId = -1;
-        }
+        mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
+            [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
+        mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
+        mLastUpdateTaskId = -1;
         copyPlacementInfoToGpuByCpu();
     }
 }
@@ -953,7 +952,7 @@ void HostMemoryMoeWeightUpdater::finalizeHostWeight()
 void HostMemoryMoeWeightUpdater::finalizeWeights()
 {
     finalizeWeightSlot();
-    // Without host weights, only restores whose caller loads the slots change them (restorePlacement's slotsLoaded).
+    // Without host weights, only restorePlacement with slotsLoaded changes the slots.
     if (!mHostWeights.empty())
     {
         finalizeHostWeight();
@@ -1032,7 +1031,6 @@ void HostMemoryMoeWeightUpdater::updateWeights(
     tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo, int rank, int size)
 {
     // PrintUpdateInfo(mMetaInfo, placementCpuInfo);
-    TLLM_CHECK_WITH_INFO(hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
     bool useGpu = mLayerLoadBalancer->mMoeLoadBalancer->mUseGpuMemcpy;
     for (int slotId = 0; slotId < mMetaInfo.slotCountPerRank; ++slotId)
     {

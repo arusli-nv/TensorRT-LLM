@@ -53,11 +53,9 @@ class FaultToleranceConfig(StrictBaseModel):
     )
     host_copies: Literal["full", "ring"] = Field(
         default="full",
-        description="Which experts' host copies each node keeps in /dev/shm for restores, with a static "
-        "placement: ``full`` (every expert) or ``ring`` (only the next node's home experts, so with N nodes a "
-        "node holds 1/N of the copies). With ``ring``, a rank of the node that holds an expert's copy copies it "
-        "into the restoring rank's NVLinkOneSided workspace, which copies it into its slot. ``ring`` needs at "
-        "least two nodes; online EPLB keeps every expert's host copy on every node and rejects it.",
+        description="With a static placement, the experts each node keeps host copies of for restores: ``full`` "
+        "(every expert) or ``ring`` (the next node's home experts; restores stage them through the NVLinkOneSided "
+        "workspace). ``ring`` needs two nodes and no online EPLB.",
     )
     failure_domain: Literal["rank", "node"] = Field(
         default="node",
