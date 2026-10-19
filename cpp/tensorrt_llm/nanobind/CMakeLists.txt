@@ -18,6 +18,7 @@ set(SRCS
     kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
+    runtime/heartbeatSender.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
     runtime/peerFailureWatch.cpp

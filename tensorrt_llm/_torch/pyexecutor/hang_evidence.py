@@ -4,7 +4,10 @@
 
 Each worker's reporter thread sends the authority a heartbeat (its executor
 iteration, and whether the executor waits on something outside its rank) and
-the all-to-all waits of its device that last longer than a threshold. The
+the all-to-all waits of its device that last longer than a threshold. A native
+thread (``HeartbeatSender``) also sends a heartbeat with the iteration of the last
+finished step, without the Python interpreter lock, so that a rank whose Python
+threads are starved still counts as alive. The
 device waits come from the rank's all-to-all progress row: its current round
 (``flag_val``) and the completion flags its peers write into its workspace.
 The row is copied to host memory on a side stream, so it is read whether the
@@ -14,7 +17,8 @@ authority's ``Fence``: of its own rank (its main thread is stuck, this thread
 still runs) by killing its process; of another rank (whose whole process may be
 stopped) after a grace period, by asking the MPI runtime to kill that rank's
 process (``pmix_fence``) on a separate thread, so that heartbeats keep flowing
-while the runtime answers.
+while the runtime answers. On the authority's ``Restart`` (every rank stalled) it
+ends its process with ``STALLED_EXIT_CODE``.
 """
 
 from __future__ import annotations
@@ -31,8 +35,15 @@ import torch
 
 from tensorrt_llm._torch.distributed.pmix_fence import PmixUnavailable, kill_rank
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_GRACE_S
-from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat
+from tensorrt_llm.executor.recovery.client import AUTHORITY_ENV, load_key
+from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_GRACE_S, STALLED_EXIT_CODE
+from tensorrt_llm.executor.recovery.protocol import (
+    DeviceWait,
+    Fence,
+    Heartbeat,
+    Restart,
+    datagram_address,
+)
 from tensorrt_llm.logger import logger
 
 __all__ = [
@@ -40,6 +51,7 @@ __all__ = [
     "ProgressRow",
     "ProgressRowReader",
     "lagging_peers",
+    "start_native_heartbeat",
 ]
 
 _FLAG_MASK = 0xFFFFFFFF
@@ -124,6 +136,28 @@ class ProgressRowReader:
         return row
 
 
+def start_native_heartbeat(rank: int, interval_s: float):
+    """Start this process's native heartbeat to the authority the environment names; None if it cannot.
+
+    Returns:
+        The running ``HeartbeatSender``: publish each finished step's iteration to it, and stop it.
+    """
+    endpoint = os.environ[AUTHORITY_ENV]
+    if not endpoint.startswith("tcp://"):
+        return None
+    try:
+        from tensorrt_llm.bindings.internal.runtime import HeartbeatSender
+
+        host, port = datagram_address(endpoint)
+        return HeartbeatSender(host, port, load_key(), rank, os.getpid(), interval_s)
+    except (ImportError, RuntimeError) as error:
+        logger.warning(
+            f"Rank {rank}: no native heartbeat ({error}); a rank whose Python threads are starved may look "
+            "stopped to the recovery authority"
+        )
+        return None
+
+
 class HangEvidenceReporter:
     """Background thread sending heartbeats and long device waits to the authority.
 
@@ -180,6 +214,8 @@ class HangEvidenceReporter:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        """Send the first heartbeat, so that the authority watches this rank before it serves, then report."""
+        self._heartbeat()
         self._thread = threading.Thread(target=self._run, name="hang_evidence", daemon=True)
         self._thread.start()
 
@@ -188,8 +224,14 @@ class HangEvidenceReporter:
         if self._thread is not None:
             self._thread.join()
 
-    def _fence(self, now: float) -> None:
+    def _obey(self, now: float) -> None:
         while (message := self._receive()) is not None:
+            if isinstance(message, Restart):
+                logger.error(
+                    f"Rank {self._rank}: {message.reason}; ending the process with exit code "
+                    f"{STALLED_EXIT_CODE}"
+                )
+                os._exit(STALLED_EXIT_CODE)
             if not isinstance(message, Fence):
                 continue
             if message.rank == self._rank:
@@ -214,6 +256,17 @@ class HangEvidenceReporter:
             )
             self._runtime_fence.start()
 
+    def _heartbeat(self) -> None:
+        self._send(
+            Heartbeat(
+                rank=self._rank,
+                iteration=int(self._iteration()),
+                waiting=bool(self._waiting()),
+                host=self._host,
+                pid=self._pid,
+            )
+        )
+
     def _kill_rank(self, rank: int) -> None:
         try:
             kill_rank(self._pmix_ranks[rank])
@@ -229,17 +282,9 @@ class HangEvidenceReporter:
                 logger.warning(f"Rank {self._rank}: hang evidence reporting failed: {error}")
 
     def poll(self, now: float) -> None:
-        """Carry out fences, then send a heartbeat and any change in the device waits worth reporting."""
-        self._fence(now)
-        self._send(
-            Heartbeat(
-                rank=self._rank,
-                iteration=int(self._iteration()),
-                waiting=bool(self._waiting()),
-                host=self._host,
-                pid=self._pid,
-            )
-        )
+        """Carry out the authority's commands, then send a heartbeat and the device-wait changes worth reporting."""
+        self._obey(now)
+        self._heartbeat()
         row = self._read_row()
         if row is not None:
             self._last_row, self._row_time = row, now

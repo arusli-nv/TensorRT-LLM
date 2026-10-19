@@ -5,7 +5,9 @@
 Messages travel as two ZeroMQ frames: a JSON payload and its HMAC-SHA256 tag over the
 worker's routing id and the payload, with a key shared by the authority and every
 worker. A frame replayed on another connection fails authentication and is dropped;
-the authority refuses a second connection with a routing id in use. Traffic is not
+the authority refuses a second connection with a routing id in use. A worker's native
+heartbeat travels as one UDP datagram: the payload, then its tag over the empty routing
+id, which no ZeroMQ connection has. Traffic is not
 encrypted. Payloads are JSON rather than the pickles of ``ipc.ZeroMqQueue``, so neither side
 unpickles network input, and the authority addresses each worker through a ROUTER.
 """
@@ -27,17 +29,22 @@ __all__ = [
     "Installed",
     "MAX_MESSAGE_BYTES",
     "Message",
+    "NativeHeartbeat",
     "Propose",
     "ProtocolError",
     "Ready",
     "Register",
     "Registered",
+    "Restart",
     "Status",
     "StatusQuery",
     "Stopped",
     "authenticate",
+    "datagram_address",
     "decode",
+    "decode_datagram",
     "encode",
+    "encode_datagram",
 ]
 
 # Upper bound on a message on either side; real messages are a few hundred bytes.
@@ -142,6 +149,21 @@ class Heartbeat:
 
 
 @dataclass(frozen=True)
+class NativeHeartbeat:
+    """Worker's native thread -> authority, as a UDP datagram: process ``pid`` of ``rank`` runs.
+
+    Sent without the Python interpreter lock, so it keeps arriving while the worker's Python
+    threads are starved. ``beat`` counts the process's datagrams; ``iteration`` is the
+    executor iteration of its last finished step.
+    """
+
+    rank: int
+    pid: int
+    beat: int
+    iteration: int
+
+
+@dataclass(frozen=True)
 class DeviceWait:
     """Worker -> authority: this rank's device has waited ``waited_ms`` on ``peer``; 0 clears."""
 
@@ -160,6 +182,16 @@ class Fence:
 
     rank: int
     pid: int
+
+
+@dataclass(frozen=True)
+class Restart:
+    """Authority -> each worker's evidence connection: every rank stalled with no rank to blame.
+
+    The worker ends its process with ``STALLED_EXIT_CODE`` so that the deployment is restarted.
+    """
+
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -200,8 +232,10 @@ Message = (
     | Commit
     | Abort
     | Heartbeat
+    | NativeHeartbeat
     | DeviceWait
     | Fence
+    | Restart
     | StatusQuery
     | Status
 )
@@ -264,3 +298,33 @@ def decode(payload: bytes) -> Message:
     return cls(
         **{name: _field_value(name, fields[name].type, value) for name, value in body.items()}
     )
+
+
+# Datagrams are signed for the empty routing id: no ZeroMQ routing id is empty, so neither replays as the other.
+_DATAGRAM_ROUTE = b""
+_TAG_BYTES = hashlib.sha256().digest_size
+
+
+def encode_datagram(message: Message, key: bytes) -> bytes:
+    """Serialize ``message`` into one datagram: the payload, then its HMAC tag."""
+    payload, tag = encode(message, key, _DATAGRAM_ROUTE)
+    return payload + tag
+
+
+def decode_datagram(datagram: bytes, key: bytes) -> NativeHeartbeat | None:
+    """The native heartbeat in ``datagram``, or None if it does not authenticate or is not one."""
+    payload, tag = datagram[:-_TAG_BYTES], datagram[-_TAG_BYTES:]
+    if not payload or not authenticate([payload, tag], key, _DATAGRAM_ROUTE):
+        return None
+    try:
+        message = decode(payload)
+    except ProtocolError:
+        return None
+    return message if isinstance(message, NativeHeartbeat) else None
+
+
+def datagram_address(endpoint: str) -> tuple[str, int]:
+    """The UDP host and port of the authority's ``tcp://host:port`` endpoint: the same port number."""
+    host, _, port = endpoint.removeprefix("tcp://").rpartition(":")
+    host = host.strip("[]")
+    return ("0.0.0.0" if host == "*" else host), int(port)

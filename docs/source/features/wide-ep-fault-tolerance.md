@@ -30,7 +30,8 @@ every other request continues.
    ```
    The authority's messages are authenticated but not encrypted, and any host that can reach its port can
    disrupt recovery: never bind it to a public interface or reuse a key across jobs. Without `--endpoint` it
-   binds to localhost (single-node jobs).
+   binds to localhost (single-node jobs). With hang detection on, it also receives the workers' native
+   heartbeats as UDP datagrams on the same port number: let UDP reach it.
 2. Launch the server under `mpirun --with-ft ulfm` with the ob1 transport and the same key:
    ```bash
    export TLLM_FAULT_TOLERANCE_MODE=1
@@ -61,8 +62,8 @@ every other request continues.
 | `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `borrowed` (default) are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
 | `recovery_timeout_s` | How long a worker's recovery may take before the job stops (default 30) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20; below `recovery_timeout_s`) |
-| `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (default off) |
-| `hang_confirm_s` | How long the evidence of a hang must hold before it is confirmed (default 30; above the slowest legitimate step) |
+| `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a stall of every rank as terminal (default off) |
+| `hang_confirm_s` | How long the evidence of a hang or a stall must hold before it is confirmed (default 30; above the slowest legitimate step) |
 | `hang_suspect_s`, `heartbeat_s`, `heartbeat_timeout_s` | Device wait reported after (default 2 s); heartbeat interval (default 1 s, at most 2 s); a worker without a heartbeat this long counts as missing (default 5 s) |
 
 A confirmed hung rank is fenced by its own evidence thread (its process ends itself), else, 1 s later, by
@@ -70,13 +71,14 @@ another rank asking the MPI runtime to kill it (PMIx job control of that one pro
 ends its process group and the job keeps running), else by the authority's `--fence-command` (a
 `{host}`/`{pid}` template, run without a shell, 5 s later); its loss then recovers as any other.
 
-Fault tolerance ends a worker process in exactly these places, always with SIGKILL so that no handler,
-atexit code or MPI finalization of a broken process runs:
+Fault tolerance ends a worker process in exactly these places, with SIGKILL so that no handler, atexit
+code or MPI finalization of a broken process runs, except the last, which exits with code 75:
 - a rank whose serving loop fails with an error that leaves it unusable (for example a sticky CUDA error)
   kills itself, so that the survivors recover from its loss (`PyExecutor` event loop);
 - a rank the authority confirmed hung kills itself from its evidence thread (`hang_evidence`);
 - another rank has the MPI runtime kill a hung rank that could not (`pmix_fence`, PMIx job control);
-- the authority's `--fence-command`, if configured.
+- the authority's `--fence-command`, if configured;
+- every rank, when the authority found every rank stalled with no rank to blame (`hang_evidence`).
 
 At startup rank 0 logs which ranks' and nodes' loss the job can recover from. A configuration that recovery does
 not support is refused at startup with the requirement it misses.
@@ -101,7 +103,8 @@ survives depends on its spare slots).
 Not covered: rank 0, a loss after the survivors installed a recovery and before it committed, a further loss
 the remaining slots cannot cover, a rank that hangs without
 dying unless hang detection is on, a stall that every rank shares (a deadlock or desync with no single
-culprit, which the executor's own hang detection, `hang_detection_timeout`, ends), losses beyond one failure
+culprit: with hang detection on it is reported, see below, else the executor's own hang detection,
+`hang_detection_timeout`, ends it), losses beyond one failure
 domain (for example a fault that takes down several hosts or a whole NVLink domain), the authority itself,
 and other errors in the serving loop, which end the job as without fault tolerance. A job that lost a rank
 ends with a non-zero exit status at shutdown.
@@ -123,14 +126,29 @@ Timeouts (see the settings above):
 | What | How long |
 |---|---|
 | A dead process | detected when its TCP connections close, in milliseconds |
-| A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured from a SIGSTOP to serving again at DEP32: 10.6 / 15.9 / 36.7 s with `hang_confirm_s` 3 / 10 / 30 |
+| A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, or `heartbeat_timeout_s` (5 s) until a stopped rank's heartbeat counts as missing, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured from a SIGSTOP to serving again at DEP32 under an earlier rule: 10.6 / 15.9 / 36.7 s with `hang_confirm_s` 3 / 10 / 30 |
+| A stall of every rank | `hang_confirm_s` (30 s) from its start until the deployment is reported terminal and every worker exits with code 75 |
 | A recovery | `recovery_timeout_s` (30 s) at the workers, `authority_timeout_s` (20 s) at the authority; a recovery takes milliseconds after detection |
+
+How a hang is judged. Each worker sends heartbeats twice: from a native thread, which runs without the Python
+interpreter lock and reports the iteration of the last finished step, and from a Python thread, which also
+reports whether the rank waits on the host (a collective, or new requests) and which peers its device has
+waited on in an all-to-all for `hang_suspect_s`. A rank is fenced only when, for `hang_confirm_s`, every peer
+whose heartbeat arrives waits on it (its device waits on that rank, or it waits on the host while that rank
+does not or sends no heartbeat) and the rank finished no step; any finished step restarts the window. A rank
+whose own device waits on another rank is not blamed. When no rank finished a step and every rank's device
+waited on a peer for `hang_confirm_s`, with no single rank waited on by all, no fence can help: the
+authority reports the deployment terminal (`/health` 503 `terminal`, the reason in `/fault_tolerance`) and
+every worker exits with code 75 so that the orchestrator restarts it. An idle deployment, or one whose ranks
+all stall on the host between steps, reports no device waits and matches neither rule. Nothing is decided
+while fewer than half the ranks' heartbeats arrive.
 
 `hang_confirm_s` must exceed the slowest legitimate step plus host stalls (page-cache or file-system stalls of
 up to a minute were observed under load): a shorter value fences a slow but healthy rank. That includes a rank
 whose serving loop is starved of the Python interpreter lock (for example by a CPU-bound thread in the same
-process): its loop stops advancing while its peers wait for it, which looks like a hang. A rank is confirmed only once
-its iteration has not advanced for `heartbeat_timeout_s` plus `hang_confirm_s` (any step restarts the window).
+process): its native heartbeat keeps it known to be alive, but if it finishes no step for `hang_confirm_s` while
+its peers wait for it, it is fenced like a hung rank. Without the native heartbeat (the UDP datagrams cannot
+reach the authority) the Python heartbeat alone is used, and a starved rank whose heartbeat stops looks stopped.
 
 ## Not supported together with fault tolerance
 
@@ -179,7 +197,7 @@ What an orchestrator should do with these signals:
   capacity and the full protection back.
 - `terminal`, a `/health` that stops answering, or a server process that exits: the loss was not recoverable
   (rank 0, more than one failure domain at once, a further loss the remaining slots cannot cover, a failed
-  recovery). Move traffic to another replica,
+  recovery), or every rank stalled (the workers then exit with code 75). Move traffic to another replica,
   have clients retry their failed requests there, and restart the deployment.
 - `unprotected`: keep serving, alert, and check the authority.
 

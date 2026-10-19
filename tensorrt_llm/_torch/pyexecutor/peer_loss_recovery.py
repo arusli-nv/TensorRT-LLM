@@ -226,6 +226,8 @@ class PeerLossRecovery(RecoveryHook):
         self._uncommitted_steps: Deque[PreparedStep] = collections.deque()
         self._peer_failed = threading.Event()
         self._watch: Optional[PeerFailureWatch] = None
+        # The native heartbeat (HeartbeatSender) while hang detection reports.
+        self._heartbeat = None
         # Response gathers are numbered identically on every rank. A rank can
         # complete the rooted gathers of an iteration before rank 0 does, but
         # not pass the iteration's allgather, so each rank keeps its last
@@ -419,6 +421,9 @@ class PeerLossRecovery(RecoveryHook):
             if reporter is not None:
                 reporter.stop()
                 self._hang_client.close()
+            if self._heartbeat is not None:
+                self._heartbeat.stop()
+                self._heartbeat = None
             self._watch.stop()
 
     def _own_loss_covered(self) -> bool:
@@ -435,7 +440,7 @@ class PeerLossRecovery(RecoveryHook):
         from tensorrt_llm.executor.recovery.client import RecoveryClient
 
         from ..distributed.pmix_fence import pmix_ranks
-        from .hang_evidence import HangEvidenceReporter, ProgressRowReader
+        from .hang_evidence import HangEvidenceReporter, ProgressRowReader, start_native_heartbeat
 
         config = fault_tolerance_config()
         if not config.hang_detection:
@@ -458,7 +463,11 @@ class PeerLossRecovery(RecoveryHook):
             receive=client.receive,
             pmix_ranks=pmix_ranks(mpi_comm()),
         )
+        # The reporter's first heartbeat names this process, whose native heartbeats the authority then accepts.
         reporter.start()
+        self._heartbeat = start_native_heartbeat(executor.dist.rank, config.heartbeat_s)
+        if self._heartbeat is not None:
+            self._heartbeat.publish(executor.iter_counter)
         return reporter
 
     def _watch_peer_failures(self) -> None:
@@ -530,6 +539,8 @@ class PeerLossRecovery(RecoveryHook):
         if self.peer_failed:
             raise HostCollectiveInterrupted("MoE all-to-all", frozenset())
         self._uncommitted_steps.popleft()
+        if self._heartbeat is not None:
+            self._heartbeat.publish(self._executor.iter_counter)
 
     # Request and response hooks
 

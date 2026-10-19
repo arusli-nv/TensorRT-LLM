@@ -18,6 +18,7 @@ import enum
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -39,20 +40,24 @@ from .protocol import (
     Install,
     Installed,
     Message,
+    NativeHeartbeat,
     Propose,
     ProtocolError,
     Ready,
     Register,
     Registered,
+    Restart,
     Status,
     StatusQuery,
     Stopped,
     authenticate,
+    datagram_address,
     decode,
+    decode_datagram,
     encode,
 )
 
-__all__ = ["Phase", "RecoveryAuthority", "main", "router_socket", "serve"]
+__all__ = ["Phase", "RecoveryAuthority", "datagram_socket", "main", "router_socket", "serve"]
 
 Outbound = list[tuple[bytes, Message]]
 
@@ -101,7 +106,8 @@ class RecoveryAuthority:
             report the same recoverable domains; a domain with rank 0 is never admitted.
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
-        hang_monitor: Judges the workers' heartbeats and device waits; None ignores them.
+        hang_monitor: Judges the workers' heartbeats and device waits; None ignores them. A stall of every
+            rank it reports aborts (terminal) and has every worker end with ``STALLED_EXIT_CODE``.
         fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason,
             host and pid): called if the rank's loss has not started a recovery
             ``COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
@@ -139,8 +145,10 @@ class RecoveryAuthority:
         self._failed_during_recovery: frozenset[int] = frozenset()
         self._ready: dict[int, str] = {}
         self._installed: set[int] = set()
-        # Rank -> (route of its evidence connection, host), from its heartbeats.
-        self._evidence: dict[int, tuple[bytes, str]] = {}
+        # Rank -> (route of its evidence connection, host, pid), from its heartbeats.
+        self._evidence: dict[int, tuple[bytes, str, int]] = {}
+        # Rank -> the last native heartbeat accepted from its process.
+        self._beats: dict[int, int] = {}
         # The fence command's deadline and target, while the workers' fencing is under way.
         self._command_fence: tuple[float, HungRank] | None = None
         # Monotonic times at which the current recovery entered STOPPING, PREPARING and INSTALLING.
@@ -157,10 +165,12 @@ class RecoveryAuthority:
         """Apply ``message`` received from ``route`` at monotonic time ``now``."""
         if isinstance(message, StatusQuery):
             return [(route, self.status())]
-        if isinstance(message, (Heartbeat, DeviceWait)):
-            # Evidence, not protocol: a worker sends it from its own connection, at any time.
+        if isinstance(message, (Heartbeat, NativeHeartbeat, DeviceWait)):
+            # Evidence, not protocol: a worker sends it from its own connection or its native thread, at any time.
             if isinstance(message, Heartbeat):
-                self._evidence[message.rank] = (route, message.host)
+                self._evidence[message.rank] = (route, message.host, message.pid)
+            elif isinstance(message, NativeHeartbeat) and not self._accept(message):
+                return []
             self._observe(message, now)
             return []
         if self.phase is Phase.ABORTED:
@@ -211,9 +221,27 @@ class RecoveryAuthority:
             hung = self.hang_monitor.check(now)
             if hung is not None:
                 return self._on_hung(hung, now)
+            stalled = self.hang_monitor.all_stalled(now)
+            if stalled is not None:
+                return self._on_stalled(stalled)
         return []
 
-    def _observe(self, message: Heartbeat | DeviceWait, now: float) -> None:
+    def _accept(self, message: NativeHeartbeat) -> bool:
+        """Whether a native heartbeat is new and from the process its rank's evidence connection announced.
+
+        A replayed datagram repeats an old ``beat``; one from another process has another ``pid``.
+        """
+        known = self._evidence.get(message.rank)
+        if (
+            known is None
+            or known[2] != message.pid
+            or message.beat <= self._beats.get(message.rank, 0)
+        ):
+            return False
+        self._beats[message.rank] = message.beat
+        return True
+
+    def _observe(self, message: Heartbeat | NativeHeartbeat | DeviceWait, now: float) -> None:
         # During a recovery every rank waits by design; evidence counts only while serving.
         if self.hang_monitor is None or self.phase not in (Phase.SERVING, Phase.RECOVERED):
             return
@@ -221,6 +249,8 @@ class RecoveryAuthority:
             self.hang_monitor.heartbeat(
                 message.rank, message.iteration, message.waiting, now, message.host, message.pid
             )
+        elif isinstance(message, NativeHeartbeat):
+            self.hang_monitor.heartbeat(message.rank, message.iteration, None, now)
         else:
             self.hang_monitor.device_wait(
                 message.rank, message.peer, message.waited_ms / 1000.0, now
@@ -250,6 +280,12 @@ class RecoveryAuthority:
         if self._fence is not None:
             self._command_fence = (now + COMMAND_FENCE_GRACE_S, hung)
         return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
+
+    def _on_stalled(self, stalled: str) -> Outbound:
+        """End a deployment whose every rank stalled: terminal, and every worker exits for a restart."""
+        reason = f"every rank stalled ({stalled}); the deployment must restart"
+        outbound = self.abort(reason)
+        return outbound + [(route, Restart(reason)) for route, _, _ in self._evidence.values()]
 
     def reject(self, reason: str, route: bytes) -> Outbound:
         """Refuse a message that does not decode to its sender alone, in every phase.
@@ -467,6 +503,7 @@ def serve(
     key: bytes,
     stop: threading.Event,
     poll_interval: float = 0.1,
+    datagrams: socket.socket | None = None,
 ) -> None:
     """Drive ``authority`` from a bound ROUTER ``socket`` until ``stop`` is set.
 
@@ -480,11 +517,20 @@ def serve(
         key: HMAC key shared with the workers.
         stop: Event that ends the loop.
         poll_interval: Seconds between deadline checks while no frame arrives.
+        datagrams: UDP socket from :func:`datagram_socket` receiving the workers' native
+            heartbeats; datagrams that do not authenticate are dropped.
     """
     last_rejection = -_REJECTION_LOG_INTERVAL_S
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+    if datagrams is not None:
+        poller.register(datagrams.fileno(), zmq.POLLIN)
     while not stop.is_set():
         outbound = authority.expire(time.monotonic())
-        if socket.poll(int(poll_interval * 1000)):
+        ready = dict(poller.poll(int(poll_interval * 1000)))
+        if datagrams is not None and datagrams.fileno() in ready:
+            outbound += _receive_datagrams(authority, datagrams, key, time.monotonic())
+        if socket in ready:
             route, *frames = socket.recv_multipart()
             rejection = None
             if not authenticate(frames, key, route):
@@ -509,6 +555,43 @@ def serve(
     if authority.phase in (Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING):
         for route, message in authority.abort("the recovery authority stopped"):
             socket.send_multipart([route, *encode(message, key, route)])
+
+
+def _receive_datagrams(
+    authority: RecoveryAuthority, datagrams: socket.socket, key: bytes, now: float
+) -> Outbound:
+    """Apply every native heartbeat waiting on ``datagrams`` at monotonic time ``now``."""
+    outbound = []
+    while True:
+        try:
+            datagram = datagrams.recv(MAX_MESSAGE_BYTES)
+        except BlockingIOError:
+            return outbound
+        message = decode_datagram(datagram, key)
+        if message is not None:
+            outbound += authority.handle(b"", message, now)
+
+
+def datagram_socket(endpoint: str) -> socket.socket | None:
+    """Return a non-blocking UDP socket bound to the host and port of ``endpoint``, or None if it cannot bind.
+
+    Without it the authority judges the workers from their Python heartbeats alone.
+    """
+    if not endpoint.startswith("tcp://"):
+        return None
+    host, port = datagram_address(endpoint)
+    datagrams = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        datagrams.bind((host, port))
+    except OSError as error:
+        datagrams.close()
+        logger.warning(
+            f"Recovery authority: cannot receive native heartbeats on UDP {host}:{port} ({error}); "
+            "judging the workers from their Python heartbeats alone"
+        )
+        return None
+    datagrams.setblocking(False)
+    return datagrams
 
 
 def router_socket(context: zmq.Context, endpoint: str) -> zmq.Socket:
@@ -581,14 +664,17 @@ def main(argv: list[str] | None = None) -> None:
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
+    datagrams = datagram_socket(args.endpoint) if hang_monitor is not None else None
     context = zmq.Context()
-    socket = router_socket(context, args.endpoint)
+    router = router_socket(context, args.endpoint)
     try:
-        serve(authority, socket, key, stop)
+        serve(authority, router, key, stop, datagrams=datagrams)
     finally:
         # Let a final Abort reach the workers.
-        socket.close(linger=_CLOSE_LINGER_MS)
+        router.close(linger=_CLOSE_LINGER_MS)
         context.term()
+        if datagrams is not None:
+            datagrams.close()
 
 
 if __name__ == "__main__":

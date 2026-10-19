@@ -702,6 +702,12 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
     monkeypatch.setattr(
         hang_evidence.HangEvidenceReporter, "stop", lambda self: stopped.append(self)
     )
+    heartbeats = []
+    monkeypatch.setattr(
+        hang_evidence,
+        "start_native_heartbeat",
+        lambda rank, interval_s: heartbeats.append(Mock()) or heartbeats[-1],
+    )
     monkeypatch.setattr(
         client_module.RecoveryClient,
         "from_env",
@@ -724,6 +730,10 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
     )
     recovery.run(Mock(return_value=None))
     assert len(started) == 1 and stopped == started and closed == [1]
+    # The native heartbeat runs beside the reporter, from the executor's iteration on.
+    (heartbeat,) = heartbeats
+    heartbeat.publish.assert_called_once()
+    heartbeat.stop.assert_called_once()
 
 
 def test_only_an_admitted_serving_rank_outside_recovery_exits_alone():

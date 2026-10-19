@@ -4,6 +4,8 @@
 
 import os
 import signal
+import socket
+import time
 
 import pytest
 import torch
@@ -15,7 +17,15 @@ from tensorrt_llm._torch.pyexecutor.hang_evidence import (
     ProgressRowReader,
     lagging_peers,
 )
-from tensorrt_llm.executor.recovery.protocol import DeviceWait, Fence, Heartbeat
+from tensorrt_llm.executor.recovery import protocol
+from tensorrt_llm.executor.recovery.config import STALLED_EXIT_CODE
+from tensorrt_llm.executor.recovery.protocol import (
+    DeviceWait,
+    Fence,
+    Heartbeat,
+    NativeHeartbeat,
+    Restart,
+)
 
 RANKS = (0, 1, 2, 3)
 
@@ -124,6 +134,58 @@ def test_a_fenced_rank_ends_its_own_process(monkeypatch):
     reporter, killed, _ = _fence_reporter(monkeypatch, [Fence(0, os.getpid())])
     reporter.poll(0.0)
     assert killed == [(os.getpid(), signal.SIGKILL)]
+
+
+def test_a_restart_ends_the_process_with_the_stalled_exit_code(monkeypatch):
+    exits = []
+    monkeypatch.setattr(hang_evidence.os, "_exit", exits.append)
+    reporter, killed, _ = _fence_reporter(monkeypatch, [Restart("every rank stalled")])
+    reporter.poll(0.0)
+    assert exits == [STALLED_EXIT_CODE] and killed == []
+
+
+def test_the_first_heartbeat_is_sent_before_the_rank_serves():
+    """A rank stopped right after it starts serving must already be known to the authority."""
+    r = _Reporter([], heartbeat_s=60.0)
+    r.reporter.start()
+    try:
+        assert r.sent == [Heartbeat(0, 42, False, r.reporter._host, os.getpid())]
+    finally:
+        r.reporter.stop()
+
+
+def test_the_native_heartbeat_keeps_arriving_while_python_is_starved():
+    """``HeartbeatSender`` sends from a native thread while this thread holds the interpreter lock."""
+    runtime = pytest.importorskip("tensorrt_llm.bindings.internal.runtime")
+    if not hasattr(runtime, "HeartbeatSender"):
+        pytest.skip("the bindings were built without HeartbeatSender")
+    key = b"k" * 32
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    sender = runtime.HeartbeatSender(
+        "127.0.0.1", receiver.getsockname()[1], key, 3, os.getpid(), 0.05
+    )
+    try:
+        sender.publish(17)
+        # Busy-wait without releasing the lock: no other Python thread runs meanwhile.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            pass
+    finally:
+        sender.stop()
+    receiver.setblocking(False)
+    beats = []
+    while True:
+        try:
+            datagram = receiver.recv(protocol.MAX_MESSAGE_BYTES)
+        except BlockingIOError:
+            break
+        beats.append(protocol.decode_datagram(datagram, key))
+    receiver.close()
+    assert len(beats) >= 10 and all(isinstance(beat, NativeHeartbeat) for beat in beats)
+    assert [beat.beat for beat in beats] == list(range(1, len(beats) + 1))
+    assert {(beat.rank, beat.pid) for beat in beats} == {(3, os.getpid())}
+    assert beats[-1].iteration == 17
 
 
 def test_another_rank_has_the_runtime_end_a_hung_rank_after_the_grace(monkeypatch):

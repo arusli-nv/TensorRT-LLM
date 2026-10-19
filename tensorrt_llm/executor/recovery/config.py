@@ -21,7 +21,7 @@ from pydantic import ConfigDict, Field, PositiveFloat, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
-__all__ = ["CONFIG_ENV", "FaultToleranceConfig", "fault_tolerance_config"]
+__all__ = ["CONFIG_ENV", "STALLED_EXIT_CODE", "FaultToleranceConfig", "fault_tolerance_config"]
 
 CONFIG_ENV = "TLLM_FAULT_TOLERANCE_CONFIG"
 # A worker asks the MPI runtime to kill a hung rank this long after it received the authority's Fence, unless the
@@ -32,6 +32,9 @@ RUNTIME_FENCE_CALL_S = 2.0
 # How long the workers' own fencing gets before the authority's fence command runs: a heartbeat interval until
 # the workers receive the Fence, then the runtime fence's grace and call.
 COMMAND_FENCE_GRACE_S = 5.0
+# The exit code of a worker the authority told that every rank stalled with no rank to blame (EX_TEMPFAIL): the
+# deployment must restart.
+STALLED_EXIT_CODE = 75
 
 
 class FaultToleranceConfig(StrictBaseModel):
@@ -63,7 +66,7 @@ class FaultToleranceConfig(StrictBaseModel):
     hang_detection: bool = Field(
         default=False,
         description="Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and "
-        "fences it.",
+        "fences it, or reports a stall of every rank as terminal.",
     )
     hang_suspect_s: PositiveFloat = Field(
         default=2.0, description="A worker reports a device wait after this long."
@@ -98,8 +101,16 @@ class FaultToleranceConfig(StrictBaseModel):
         return self
 
     def hang_resolution_s(self) -> float:
-        """The longest a confirmed hang can take until a fence ends the hung rank (before recovery starts)."""
-        return self.hang_suspect_s + self.hang_confirm_s + COMMAND_FENCE_GRACE_S
+        """The longest a hang or a stall of every rank can take until it is acted on (before recovery starts).
+
+        Peers wait on a hung rank once their device wait is reported or its heartbeat is missing; the evidence
+        must then hold for ``hang_confirm_s``, and the fence command runs last.
+        """
+        return (
+            max(self.hang_suspect_s, self.heartbeat_timeout_s)
+            + self.hang_confirm_s
+            + COMMAND_FENCE_GRACE_S
+        )
 
     def digest(self) -> str:
         """A short hash of these settings; the workers and the authority must hold the same one."""

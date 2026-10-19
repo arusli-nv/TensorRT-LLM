@@ -64,8 +64,11 @@ def test_invalid_settings_are_refused(load, text, match):
 
 
 def test_hang_resolution_bounds_confirm_and_fence():
-    config = FaultToleranceConfig(hang_suspect_s=2, hang_confirm_s=10)
-    assert config.hang_resolution_s() == 2 + 10 + config_module.COMMAND_FENCE_GRACE_S
+    config = FaultToleranceConfig(hang_suspect_s=2, hang_confirm_s=10, heartbeat_timeout_s=5)
+    # The longer of a device wait being reported and a heartbeat counting as missing, then the window.
+    assert config.hang_resolution_s() == 5 + 10 + config_module.COMMAND_FENCE_GRACE_S
+    config = FaultToleranceConfig(hang_suspect_s=8, hang_confirm_s=10, heartbeat_timeout_s=5)
+    assert config.hang_resolution_s() == 8 + 10 + config_module.COMMAND_FENCE_GRACE_S
 
 
 def test_every_field_has_a_description():
