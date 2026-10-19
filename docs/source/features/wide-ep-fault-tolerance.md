@@ -147,7 +147,7 @@ whose heartbeat arrives waits on it (its device waits on that rank, or it waits 
 does not or sends no heartbeat) and the rank finished no step; any finished step restarts the window. A rank
 whose own device waits on another rank is not blamed. When no rank finished a step and every rank's device
 waited on a peer for `hang_confirm_s`, with no single rank waited on by all, no fence can help: the
-authority reports the deployment terminal (`/health` 503 `terminal`, the reason in `/fault_tolerance`) and
+authority reports the deployment terminal (`/health` 503 `terminal`, with the reason) and
 every worker exits with code 75 so that the orchestrator restarts it. An idle deployment, or one whose ranks
 all stall on the host between steps, reports no device waits and matches neither rule. Nothing is decided
 while fewer than half the ranks' heartbeats arrive.
@@ -209,9 +209,10 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
 server serves: `healthy` (no loss), `degraded` (serving after a recovery) or `unprotected` (the authority did not
 answer, so a loss would end the job: alert, but keep serving). It returns 503 with the state while `starting`,
 `recovering`, `terminal` (a recovery aborted: restart the deployment) or `unknown` (the authority reported a
-state this server does not know, for example from a different version). `GET /fault_tolerance` returns that state with the membership generation, live and failed ranks
-(sorted), the number of recoveries, the last recovery's stop / agree / install durations in milliseconds,
-and the number of requests the losses failed.
+state this server does not know, for example from a different version). While the authority answers, the body
+also carries the membership generation, live and failed ranks (sorted), the number of recoveries, the last
+recovery's stop / agree / install durations in milliseconds, the number of requests the losses failed and, once
+terminal, the reason.
 
 What an orchestrator should do with these signals:
 - `degraded`: the deployment serves with fewer GPUs and survives a further loss only while its remaining slots
@@ -223,7 +224,7 @@ What an orchestrator should do with these signals:
   have clients retry their failed requests there, and restart the deployment.
 - `unprotected`: keep serving, alert, and check the authority.
 
-`/fault_tolerance` only reports. There is no control action: no drain, no retry of a lost rank on the same
+`/health` only reports. There is no control action: no drain, no retry of a lost rank on the same
 GPUs and no scale-down request; drain a deployment by stopping traffic to it at the load balancer.
 
 ## How well each part is tested

@@ -96,7 +96,6 @@ from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
 from tensorrt_llm.serve.extensions.kimi_k3 import dynamic_tool_dicts
 from tensorrt_llm.serve.fault_tolerance_status import (SERVING_STATES,
                                                        RecoveryStatusProbe,
-                                                       health_state,
                                                        status_body)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
@@ -859,8 +858,7 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_embedding_batcher()
             self.register_embedding_routes()
         else:
-            # WideEP peer-loss recovery: the recovery authority's state, for /health and
-            # /fault_tolerance.
+            # WideEP peer-loss recovery: the recovery authority's state, for /health.
             self._recovery_status = RecoveryStatusProbe.from_env()
             self.register_routes()
 
@@ -1255,10 +1253,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
-        if getattr(self, "_recovery_status", None) is not None:
-            self.app.add_api_route("/fault_tolerance",
-                                   self.fault_tolerance_status,
-                                   methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
@@ -1677,20 +1671,17 @@ class OpenAIServer(_VideoRoutesMixin):
             base64.b64encode(state).decode("utf-8")
         })
 
-    async def fault_tolerance_status(self) -> JSONResponse:
-        status = await asyncio.to_thread(self._recovery_status.status)
-        return JSONResponse(content=status_body(status))
-
     async def health(self) -> Response:
         if self._check_health():
             probe = getattr(self, "_recovery_status", None)
             if probe is not None:
-                # Starting, recovering or terminal: not serving, so load balancers move on. Serving states
-                # (healthy, degraded, unprotected) return 200 with the state, for alerting.
-                state = health_state(await asyncio.to_thread(probe.status))
+                # Starting, recovering or terminal: not serving, so load
+                # balancers move on. Serving states (healthy, degraded,
+                # unprotected) return 200. The body is for alerting.
+                body = status_body(await asyncio.to_thread(probe.status))
                 return JSONResponse(
-                    status_code=200 if state in SERVING_STATES else 503,
-                    content={"state": state})
+                    status_code=200 if body["state"] in SERVING_STATES else 503,
+                    content=body)
             return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the

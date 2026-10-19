@@ -380,11 +380,14 @@ def test_authority_lost_while_serving(tmp_path: Path):
                 assert mpirun.poll() is None, mpirun_log.read_text(errors="replace")[-20000:]
                 assert time.monotonic() < deadline, "trtllm-serve did not become healthy"
                 try:
-                    if _get(f"{base_url}/health") == (200, {"state": "healthy"}):
+                    health = _get(f"{base_url}/health")
+                    if health[0] == 200 and health[1].get("state") == "healthy":
                         break
                 except (urllib.error.URLError, ConnectionError, TimeoutError):
                     pass
                 time.sleep(5)
+            # The authority's details ride on /health while it answers.
+            assert health[1]["recoveries"] == 0 and health[1]["failed_ranks"] == [], health
             _assert_completions(base_url, model)
 
             authority.kill()
@@ -393,8 +396,8 @@ def test_authority_lost_while_serving(tmp_path: Path):
             while (health := _get(f"{base_url}/health"))[1].get("state") != "unprotected":
                 assert time.monotonic() < deadline, health
                 time.sleep(1)
+            # No details without an answer: nothing stale is reported.
             assert health == (200, {"state": "unprotected"}), health
-            assert _get(f"{base_url}/fault_tolerance") == (200, {"state": "unprotected"})
             _assert_completions(base_url, model)
         finally:
             if mpirun is not None and mpirun.poll() is None:

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fault-tolerance state for the server's health and status endpoints.
+"""Fault-tolerance state for the server's health endpoint.
 
 The recovery authority is the only holder of the committed state, so the server asks it rather than
 deriving the state itself. Asking changes nothing on the authority. If it does not answer, the state is
@@ -49,7 +49,7 @@ def health_state(status: Optional[Status]) -> str:
 
 
 def status_body(status: Optional[Status]) -> dict:
-    """JSON body of the fault-tolerance status endpoint."""
+    """JSON body of ``/health``: the state, and the authority's details when it answered."""
     body = {"state": health_state(status)}
     if status is not None:
         body.update(
