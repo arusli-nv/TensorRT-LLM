@@ -40,6 +40,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Ready,
     Stopped,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 
 pytestmark = pytest.mark.cpu_only
 
@@ -163,6 +164,32 @@ def test_recovery_runs_protocol_and_installs_in_order():
     # The placements installed are the ones whose digest went out with Ready.
     load_balancer.placement_digest.assert_called_once_with(failed, ["placement"])
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
+
+
+def test_kv_cache_quota_cut_suspends_the_active_caches_around_the_resize():
+    executor = PyExecutor.__new__(PyExecutor)
+    mgr = Mock()
+    mgr.impl.get_quota.return_value = 10 << 30
+    mgr.impl.resize.return_value = True
+    mgr.is_request_active.side_effect = lambda request_id: request_id == 1
+    requests = [Mock(py_request_id=1), Mock(py_request_id=2)]
+    executor.kv_cache_manager = mgr
+    executor.active_requests = requests
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
+    executor._read_kv_cache_capacity = Mock(return_value={})
+
+    assert executor.shrink_kv_cache_quota(1 << 30)
+    mgr.suspend_request.assert_called_once_with(requests[0])
+    mgr.impl.resize.assert_called_once_with(GPU_LEVEL, 9 << 30)
+    mgr.resume_request.assert_called_once_with(requests[0])
+    # More than the whole quota: nothing to resize.
+    assert not executor.shrink_kv_cache_quota(10 << 30)
+    assert mgr.impl.resize.call_count == 1
+    # A failed resize still resumes the suspended requests.
+    mgr.impl.resize.side_effect = RuntimeError("resize")
+    with pytest.raises(RuntimeError, match="resize"):
+        executor.shrink_kv_cache_quota(1 << 30)
+    assert mgr.resume_request.call_count == mgr.suspend_request.call_count == 3
 
 
 def test_a_node_loss_recovers_every_rank_in_one_transaction():

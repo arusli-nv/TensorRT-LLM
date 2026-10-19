@@ -55,7 +55,7 @@ from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL, OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
@@ -5586,6 +5586,51 @@ class PyExecutor:
 
         # Rebalancing can change the number of primary blocks.
         self._kv_cache_capacity = self._read_kv_cache_capacity()
+
+    def shrink_kv_cache_quota(self, nbytes: int) -> bool:
+        """Return ``nbytes`` of the KV cache's device memory to the driver; False if it cannot.
+
+        Pages that no longer fit move to the host tier. Only while the model is
+        idle: no forward in flight and every step committed or discarded.
+
+        Raises:
+            RuntimeError: Remote-tail attention DP's reserved execution row
+                could not resume.
+        """
+        mgr = self.kv_cache_manager
+        paused = [
+            req for req in self.active_requests
+            if mgr.is_request_active(req.py_request_id)
+        ]
+        for req in paused:
+            mgr.suspend_request(req)
+        paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
+        remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
+        try:
+            quota = mgr.impl.get_quota(GPU_LEVEL)
+            shrunk = nbytes < quota and mgr.impl.resize(GPU_LEVEL,
+                                                        quota - nbytes)
+        finally:
+            # As in _rebalance_kv_pools_now, the reserved execution row resumes
+            # first. A request that cannot resume stays suspended until the
+            # scheduler resumes it.
+            if remote_tail_adp:
+                self._resume_padding_dummies_after_rebalance(
+                    mgr, paused_dummies)
+            for req in paused:
+                mgr.resume_request(req)
+            if not remote_tail_adp:
+                self._resume_padding_dummies_after_rebalance(
+                    mgr, paused_dummies)
+            self._kv_cache_capacity = self._read_kv_cache_capacity()
+        if remote_tail_adp:
+            dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
+                0)
+            if dummy is None or not mgr.is_request_active(dummy.py_request_id):
+                raise RuntimeError(
+                    "Shrinking the KV cache lost the reserved conditional "
+                    "attention-DP execution row")
+        return shrunk
 
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.
