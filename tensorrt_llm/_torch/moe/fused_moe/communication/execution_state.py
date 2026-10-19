@@ -46,6 +46,7 @@ class MoeExecutionState:
         self._workspaces: dict[int, tuple[MnnvlMemory, Callable[[], None]]] = {}
         # Bound layers: (EP rank, reset of the layer's dispatch/combine state machine).
         self._layers: list[tuple[int, Callable[[], None]]] = []
+        self.progress_comm: NVLinkOneSided | None = None
 
     @classmethod
     def for_model(cls, model: torch.nn.Module) -> MoeExecutionState:
@@ -78,6 +79,8 @@ class MoeExecutionState:
                 "WideEP recovery requires one shared EPGroupHealth for all MoE layers"
             )
         state = cls(comm.ep_group_health, comm.workspace.device)
+        # Hang detection reads the all-to-all progress of one workspace; every layer runs every round.
+        state.progress_comm = comm
         for comm in comms.values():
             comm.bind_execution_state(state)
         return state

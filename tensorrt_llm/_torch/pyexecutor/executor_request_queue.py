@@ -108,6 +108,8 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        # Whether the serving loop blocks waiting for new requests (read by hang detection).
+        self.waiting_for_requests = False
         self.admission_state = RequestAdmissionState.RUNNING
         self._pending_sleep_tags: frozenset[str] = frozenset()
         self._parked_tags: frozenset[str] = frozenset()
@@ -330,7 +332,11 @@ class ExecutorRequestQueue:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
                 # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
+                self.waiting_for_requests = True
+                try:
+                    items.append(self.request_queue.get(timeout=timeout_secs))
+                finally:
+                    self.waiting_for_requests = False
             else:
                 # if not empty or don't want to wait, just return all items in queue
                 while True:
