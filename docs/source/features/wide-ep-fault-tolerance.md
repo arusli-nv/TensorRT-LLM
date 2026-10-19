@@ -15,9 +15,14 @@ had delivered nothing yet, else end with a retryable error; every other request 
   reads the receive slots in place; layers on other backends (for example a BF16 MTP layer) get a compact
   copy of their hidden states.
 - An EPLB load balancer (`moe_config.load_balancer` with `num_slots` above the number of experts), static
-  (`layer_updates_per_iter: 0`) or online. Its per-node host copies of every expert (with `host_copies: ring`,
-  of the next node's) restore the experts of a lost rank into extra slots; rank 0 is never recoverable. With online EPLB the survivors adopt rank 0's
-  placement during the recovery and restart the update rotation together.
+  (`layer_updates_per_iter: 0`) or online. Host copies of the experts in `/dev/shm` restore the experts of a
+  lost rank into extra slots; rank 0 is never recoverable. Online EPLB keeps every expert's copy on every node; the
+  survivors adopt rank 0's placement during the recovery and restart the update rotation together. A static
+  placement keeps on each node only the home experts of the next node (nodes in order of their first rank, the
+  last node keeping the first's; a single node keeps its own), about `1/N` of the copies with `N` nodes. A restore
+  copies each expert from a GPU of that node into the restoring rank's NVLinkOneSided workspace and from there
+  into its slot, in chunks of half the workspace; losing a node together with the node that keeps its copies is
+  not recoverable.
 - Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4.1 or later.
 
 ## Running

@@ -13,7 +13,6 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     ring_copy_nodes,
 )
-from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -69,17 +68,14 @@ def test_ring_keeps_each_node_s_copies_on_the_node_before_it():
     assert ring_copy_nodes(["a", "b"]) == [(1,), (0,)]
 
 
-def test_ring_needs_a_second_node():
-    with pytest.raises(ValueError, match="all 4 ranks run on one node"):
-        ring_copy_nodes(["a"] * 4)
+def test_a_single_node_keeps_its_own_copies():
+    assert ring_copy_nodes(["a"] * 4) == [(0, 1, 2, 3)] * 4
 
 
 def _ring_load_balancer(monkeypatch, ep_rank=0, layers=1, layer_updates_per_iter=0):
-    """A static-placement MoeLoadBalancer with ring host copies over native layers showing _PLACEMENT."""
+    """A MoeLoadBalancer with WideEP peer-loss recovery over native layers showing _PLACEMENT; with a static
+    placement (no ``layer_updates_per_iter``) it keeps ring host copies."""
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(
-        f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig(host_copies="ring")
-    )
     monkeypatch.setattr(MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_HOSTS))
     monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: 2)
     with (
@@ -103,9 +99,11 @@ def _ring_load_balancer(monkeypatch, ep_rank=0, layers=1, layer_updates_per_iter
     return load_balancer, sharer
 
 
-def test_online_eplb_rejects_ring_host_copies(monkeypatch):
-    with pytest.raises(ValueError, match="applies to a static EPLB placement"):
-        _ring_load_balancer(monkeypatch, layer_updates_per_iter=1)
+def test_online_eplb_keeps_every_expert_s_host_copy(monkeypatch):
+    load_balancer, sharer = _ring_load_balancer(monkeypatch, layer_updates_per_iter=1)
+    (layer,) = load_balancer.single_layer_load_balancers
+    assert load_balancer.copy_nodes is None and layer.host_copy_ranks is None
+    sharer.return_value.keep_experts.assert_not_called()
 
 
 @pytest.mark.parametrize("ep_rank, held", [(0, [2, 3, 6, 7]), (1, [0, 1, 4, 5])])

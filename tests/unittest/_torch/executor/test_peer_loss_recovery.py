@@ -116,6 +116,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
         departed if r in failed else value for r in range(world_size)
     ]
     engine = Mock()
+    engine.moe_load_balancer.is_static_routing.return_value = True
     engine.moe_load_balancer.recovery_placements.return_value = ["placement"]
     engine.moe_load_balancer.restore_backing_bytes.return_value = 0
     engine.moe_load_balancer.placement_digest.return_value = "digest"
@@ -190,8 +191,10 @@ def test_recovery_runs_protocol_and_installs_in_order():
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     # A static placement needs no agreed base.
     load_balancer.recovery_placements.assert_called_once_with(failed, None)
-    # The placements installed are the ones whose digest went out with Ready.
-    load_balancer.placement_digest.assert_called_once_with(failed, ["placement"], None)
+    # The placements installed are the ones whose digest went out with Ready, with their ring copy plan.
+    load_balancer.placement_digest.assert_called_once_with(
+        failed, ["placement"], load_balancer.restore_copy_plan.return_value
+    )
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
@@ -1650,6 +1653,7 @@ def test_create_accepts_online_eplb(monkeypatch):
     executor = _supported_executor()
     executor.model_engine.moe_load_balancer.is_static_routing.return_value = False
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    executor.model_engine.moe_load_balancer.restore_copy_plan.assert_not_called()
 
 
 def test_create_accepts_the_dsa_kv_cache_manager(monkeypatch):
@@ -1824,6 +1828,11 @@ def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():
 
     broadcast.assert_called_once_with(None, root=0)
     load_balancer.recovery_placements.assert_called_once_with(frozenset({FAILED_RANK}), rank0)
+    # Online EPLB restores from its full host copies: nothing to stage.
+    load_balancer.stage_restored_slots.assert_not_called()
+    load_balancer.placement_digest.assert_called_once_with(
+        frozenset({FAILED_RANK}), ["placement"], None
+    )
 
 
 def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(monkeypatch):
@@ -1842,21 +1851,12 @@ def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(m
         recovery._rank0_placements(load_balancer)
 
 
-def _ring_recovery(monkeypatch, client):
-    monkeypatch.setattr(
-        peer_loss_recovery,
-        "fault_tolerance_config",
-        lambda: FaultToleranceConfig(host_copies="ring"),
-    )
-    return _recovery(client)
-
-
 def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_plan(monkeypatch):
     """The copies run once the failed ranks are fenced (Propose) and before Ready, whose digest covers them."""
     import numpy as np
 
     client = _FakeClient(_happy_replies(generation=1))
-    recovery = _ring_recovery(monkeypatch, client)
+    recovery = _recovery(client)
     engine = recovery._executor.model_engine
     load_balancer = engine.moe_load_balancer
     plan = np.zeros((1, 9), dtype=np.int64)
@@ -1885,7 +1885,7 @@ def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(
     import numpy as np
     from mpi4py import MPI
 
-    recovery = _ring_recovery(monkeypatch, _FakeClient([]))
+    recovery = _recovery(_FakeClient([]))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
     load_balancer.restore_copy_plan.return_value = np.zeros((1, 9), dtype=np.int64)
@@ -1900,11 +1900,6 @@ def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(
 
 def test_create_checks_the_staging_workspace_fits_with_ring_host_copies(monkeypatch):
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(
-        peer_loss_recovery,
-        "fault_tolerance_config",
-        lambda: FaultToleranceConfig(host_copies="ring"),
-    )
     monkeypatch.setattr(
         peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )

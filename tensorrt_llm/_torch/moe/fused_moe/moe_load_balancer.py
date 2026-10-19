@@ -928,12 +928,8 @@ def restore_lost_experts(placement: np.ndarray,
 
 def ring_copy_nodes(hosts: List[str]) -> List[Tuple[int, ...]]:
     """Per rank (``hosts``: its host), the ranks of the node keeping its home experts' copies: the node before
-    its own in first-rank order, the last node for the first."""
+    its own in first-rank order, the last node for the first (a single node keeps its own)."""
     nodes = list(dict.fromkeys(hosts))
-    if len(nodes) < 2:
-        raise ValueError(
-            "Ring host copies (FaultToleranceConfig.host_copies=ring) keep each node's experts on another "
-            f"node, but all {len(hosts)} ranks run on one node")
     copy_nodes = {
         host: tuple(rank for rank, h in enumerate(hosts) if h == previous)
         for host, previous in zip(nodes, nodes[-1:] + nodes[:-1])
@@ -986,14 +982,10 @@ class MoeLoadBalancer:
         self._largest_loss = self._gather_largest_loss() if (
             self.is_dynamic_routing()
             and peer_loss_recovery_enabled()) else None
-        ring = peer_loss_recovery_enabled() and fault_tolerance_config(
-        ).host_copies == "ring"
-        if ring and self.is_dynamic_routing():
-            raise ValueError(
-                "FaultToleranceConfig.host_copies=ring applies to a static EPLB placement; online EPLB keeps "
-                "every expert's host copy on every node")
-        # Ring host copies: per EP rank, ring_copy_nodes.
-        self.copy_nodes = self._gather_copy_nodes() if ring else None
+        # Ring host copies, with a static placement: per EP rank, ring_copy_nodes. Online EPLB keeps every
+        # expert's host copy on every node.
+        self.copy_nodes = self._gather_copy_nodes() if (
+            self.is_static_routing() and peer_loss_recovery_enabled()) else None
 
     def __del__(self):
         if not self.is_shutdown:

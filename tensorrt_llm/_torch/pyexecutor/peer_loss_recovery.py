@@ -240,8 +240,6 @@ class PeerLossRecovery(RecoveryHook):
         self.survives_own_loss = False
         self._timeout_s = fault_tolerance_config().recovery_timeout_s
         self._shrink_timeout_s = fault_tolerance_config().shrink_timeout_s()
-        # Restores copy experts from another node's host copies (_stage_ring_restore).
-        self._ring_host_copies = fault_tolerance_config().host_copies == "ring"
         # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
@@ -370,8 +368,8 @@ class PeerLossRecovery(RecoveryHook):
                 f"serve every expert without each domain; the survivors cannot after losing {uncovered[0]} "
                 "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
             )
-        if config.host_copies == "ring":
-            # Restores stage each expert weight through half the workspace; restore_copy_plan checks it fits.
+        if load_balancer.is_static_routing():
+            # Ring host copies: restores stage each weight through half the workspace; restore_copy_plan checks it.
             load_balancer.restore_copy_plan(
                 [],
                 load_balancer.current_placements(),
@@ -829,9 +827,7 @@ class PeerLossRecovery(RecoveryHook):
                     )
                 generation = proposal.generation
                 copy_plan = (
-                    self._stage_ring_restore(load_balancer, failed, placements)
-                    if self._ring_host_copies
-                    else None
+                    None if online else self._stage_ring_restore(load_balancer, failed, placements)
                 )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)

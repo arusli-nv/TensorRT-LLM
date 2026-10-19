@@ -51,12 +51,6 @@ class FaultToleranceConfig(StrictBaseModel):
         "after them as that takes. A restore fills them only where replicas cannot, and EPLB's updates use a "
         "slot once a restore filled it.",
     )
-    host_copies: Literal["full", "ring"] = Field(
-        default="full",
-        description="With a static placement, the experts each node keeps host copies of for restores: ``full`` "
-        "(every expert) or ``ring`` (the next node's home experts; restores stage them through the NVLinkOneSided "
-        "workspace). ``ring`` needs two nodes and no online EPLB.",
-    )
     failure_domain: Literal["rank", "node"] = Field(
         default="node",
         description="The largest loss to recover from: every rank of one host (rank 0's excluded), or one rank. "

@@ -52,10 +52,12 @@ def test_static_routing_keeps_host_copies_only_with_peer_loss_recovery(recovery)
             return_value=recovery,
         ),
         patch("tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.HostMoeTensorSharer"),
+        patch.object(MoeLoadBalancer, "_gather_copy_nodes", return_value=[(1, 3), (0, 2)] * 2),
     ):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
         layer = load_balancer.add_layer(EXPERTS, 2, SLOTS_PER_RANK)
-    # Routing stays static either way; only the host copies (and loadable slots) follow recovery.
+    # Routing stays static either way; only the host copies (ring ones) and loadable slots follow recovery.
+    assert (load_balancer.copy_nodes is not None) == recovery
     assert layer.is_static_routing()
     assert layer.need_load_shared_weights() == recovery
     assert (layer.host_tensor_sharer is not None) == recovery
