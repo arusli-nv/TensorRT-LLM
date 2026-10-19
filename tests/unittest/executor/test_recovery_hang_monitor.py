@@ -89,6 +89,59 @@ def test_stuck_host_loop_while_peers_wait_is_hung():
     assert hung is not None and hung.rank == 2 and "loop stopped" in hung.reason
 
 
+def test_a_step_restarts_the_confirm_window():
+    """Rank 2 steps once just before each window would close; its peers wait the whole time."""
+    monitor = _monitor()
+    iteration = 0
+    for now in range(0, 60):
+        if now % 12 == 11:  # within HB_TIMEOUT + CONFIRM of the previous step
+            iteration += 1
+        _beat(monitor, float(now), iterations={2: iteration}, waiting=(0, 1, 3))
+        assert monitor.check(float(now)) is None, now
+
+
+def test_a_frozen_iteration_while_peers_wait_is_confirmed_after_the_window():
+    """Heartbeats keep arriving (a device hang or deadlock), the iteration does not move."""
+    monitor = _monitor()
+    hung, now = None, -1.0
+    while hung is None and now < 100:
+        now += 1.0
+        _beat(monitor, now, iterations={2: 7}, waiting=(0, 1, 3))
+        hung = monitor.check(now)
+    assert hung is not None and hung.rank == 2 and "loop stopped at iteration 7" in hung.reason
+    # Stalled once the iteration is older than the heartbeat timeout, confirmed CONFIRM later.
+    assert now == pytest.approx(HB_TIMEOUT + 1 + CONFIRM)
+
+
+def test_a_step_just_before_the_heartbeats_stop_does_not_delay_the_confirmation():
+    monitor = _monitor()
+    _beat(monitor, 0.0, iterations={2: 0})
+    monitor.heartbeat(2, 1, False, 1.0)  # its last heartbeat reports a step
+    hung, now = None, 0.0
+    while hung is None and now < 100:
+        now += 1.0
+        for rank in (0, 1, 3):
+            monitor.heartbeat(rank, int(now), False, now)
+        hung = monitor.check(now)
+    assert hung is not None and hung.rank == 2 and "no heartbeat" in hung.reason
+    assert now == pytest.approx(1 + HB_TIMEOUT + 1 + CONFIRM)
+
+
+def test_a_starved_rank_that_still_steps_is_never_confirmed():
+    """Its heartbeats arrive late and its iteration advances slowly; its peers wait on it on the device."""
+    monitor = _monitor()
+    _beat(monitor, 0.0, iterations={2: 0})
+    for waiter in (0, 1):
+        monitor.device_wait(waiter, 2, 1.0, 0.0)
+    for now in range(1, 120):
+        t = float(now)
+        for rank in (0, 1, 3):
+            monitor.heartbeat(rank, now, True, t)
+        if now % 5 == 0:  # a heartbeat every 5 s (> HB_TIMEOUT), a step every other one
+            monitor.heartbeat(2, now // 10, False, t)
+        assert monitor.check(t) is None, now
+
+
 def test_device_waits_need_two_witnesses_and_point_at_the_chain_head():
     monitor = _monitor()
     _beat(monitor, 0.0)

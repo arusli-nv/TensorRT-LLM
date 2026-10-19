@@ -55,6 +55,11 @@ class HangMonitor:
       and no device waits point at another rank: a heartbeat thread starved while
       its rank waits on a hung peer must not make that rank the suspect.
 
+    Any advance of the rank's iteration restarts the window: the first two rules need
+    an iteration unchanged for ``heartbeat_timeout_s``, and the third ends with the next
+    heartbeat, which carries the iteration. So a rank is confirmed only after no step
+    for ``heartbeat_timeout_s + confirm_s``; a slow rank stepping within that is not.
+
     ``confirm_s`` must exceed the slowest legitimate step plus host stalls, so a
     slow rank is never confirmed. A rank is watched from its first heartbeat on, so
     workers that send none are never suspected. Each rank is confirmed at most once.

@@ -122,7 +122,8 @@ Timeouts (see the settings above):
 `hang_confirm_s` must exceed the slowest legitimate step plus host stalls (page-cache or file-system stalls of
 up to a minute were observed under load): a shorter value fences a slow but healthy rank. That includes a rank
 whose serving loop is starved of the Python interpreter lock (for example by a CPU-bound thread in the same
-process): its loop stops advancing while its peers wait for it, which looks like a hang.
+process): its loop stops advancing while its peers wait for it, which looks like a hang. A rank is confirmed only once
+its iteration has not advanced for `heartbeat_timeout_s` plus `hang_confirm_s` (any step restarts the window).
 
 ## Not supported together with fault tolerance
 
