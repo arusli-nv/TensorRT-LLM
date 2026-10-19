@@ -440,10 +440,17 @@ def test_install_survivors_requires_shrink(dist):
         dist.install_survivors()
 
 
-def test_shrink_only_once(dist):
+def test_a_loss_after_a_recovery_shrinks_the_installed_survivors(dist):
+    dist.revoke()
     _install(dist)
-    with pytest.raises(RuntimeError):
-        dist.shrink()
+    installed = dist._survivor_comm
+    installed.failed = (3,)
+    # Revoking releases the survivors waiting on the installed communicator.
+    dist.revoke()
+    assert installed.Is_revoked()
+    assert _install(dist) == frozenset({FAILED, 3})
+    assert dist.live_ranks == (0, 1)
+    assert dist.allgather("me", departed=None) == ["rank0", "me", None, None]
 
 
 def test_shrink_again_before_install_drops_a_peer_lost_during_recovery(dist):

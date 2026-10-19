@@ -93,19 +93,26 @@ The loss, with the NVLink fabric healthy, of either:
   DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, that is 320 slots.
 
 Several such ranks lost together, or one more during a recovery (before the survivors install the new
-communicator), are recovered as one loss if the survivors' slots still hold every expert.
+communicator), are recovered as one loss if the survivors' slots still hold every expert. A further loss after a
+recovery is recovered the same way: the survivors recover again as long as their slots still hold every expert
+without every rank lost so far (startup checks only one failure domain, so how many further losses a deployment
+survives depends on its spare slots).
 
-Not covered: rank 0, a loss after a recovery or after the survivors installed, a rank that hangs without
+Not covered: rank 0, a loss after the survivors installed a recovery and before it committed, a further loss
+the remaining slots cannot cover, a rank that hangs without
 dying unless hang detection is on, a stall that every rank shares (a deadlock or desync with no single
 culprit, which the executor's own hang detection, `hang_detection_timeout`, ends), losses beyond one failure
 domain (for example a fault that takes down several hosts or a whole NVLink domain), the authority itself,
 and other errors in the serving loop, which end the job as without fault tolerance. A job that lost a rank
 ends with a non-zero exit status at shutdown.
 
-A deployment recovers once: after a recovery it serves `degraded`, a lost rank never rejoins, and a further
-loss ends the job. A request that was running on a lost single rank is not run again by the server, because it
-may be what crashed the rank. If a client retries a request that crashes a rank every time, the retry's crash
-is a further loss and ends the deployment; the server does not recognize the retried request.
+After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
+(and may take more of the KV cache for restored experts). A request that was running on a lost rank and had
+delivered nothing runs again once on a survivor, even if it was pinned to the lost rank with
+`attention_dp_relax=False` (a new request pinned to a lost rank fails with "Attention DP rank N is not
+serving"). Because it may be what crashed the rank, a request that loses its rank a second time is not run again: it fails with a retryable error. If a re-run or retried request that crashes
+every rank it runs on lands on rank 0, or on a rank whose loss the remaining slots cannot cover, its crash ends the
+deployment; the server does not recognize a client's retry of a failed request.
 
 Failure model: a failing rank stops (it dies, or it hangs and is fenced). A rank that keeps running but
 computes wrong results (for example silent memory corruption) is not detected: the survivors keep its
@@ -143,10 +150,10 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
 - Survivors detect the loss within milliseconds and resume serving well under a second later. A step
   that was running finishes first, so under heavy prefill a recovery takes up to the length of one step
   (`max_num_tokens` bounds it).
-- After a node loss, the requests its ranks were serving that had delivered nothing yet (every non-streaming
-  request, and a streaming one before its first token) run again from their prompt on a survivor. After the loss
-  of a single rank they do not: the request may be what crashed the rank, and the survivors cannot recover from
-  a second loss. Those, and requests that had streamed tokens, end with a retryable error. Non-streaming requests get an error
+- The requests the lost ranks were serving that had delivered nothing yet (every non-streaming request, and a
+  streaming one before its first token) run again from their prompt on a survivor, once. A request that already
+  ran again and loses its rank a second time may be what crashes them: it is not run again. Those, and requests
+  that had streamed tokens, end with a retryable error. Non-streaming requests get an error
   response. Streaming `/v1/completions` and `/v1/chat/completions` responses end with an SSE `error` event
   followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that
@@ -164,13 +171,15 @@ answer, so a loss would end the job: alert, but keep serving). It returns 503 wi
 `recovering`, `terminal` (a recovery aborted: restart the deployment) or `unknown` (the authority reported a
 state this server does not know, for example from a different version). `GET /fault_tolerance` returns that state with the membership generation, live and failed ranks
 (sorted), the number of recoveries, the last recovery's stop / agree / install durations in milliseconds,
-and the number of requests the loss failed.
+and the number of requests the losses failed.
 
 What an orchestrator should do with these signals:
-- `degraded`: the deployment serves with fewer GPUs and cannot survive another loss. Restart it (or replace it
-  with a fresh replica) when convenient to get the capacity and the protection back.
+- `degraded`: the deployment serves with fewer GPUs and survives a further loss only while its remaining slots
+  hold every expert without it. Restart it (or replace it with a fresh replica) when convenient to get the
+  capacity and the full protection back.
 - `terminal`, a `/health` that stops answering, or a server process that exits: the loss was not recoverable
-  (rank 0, more than one failure domain, a second loss, a failed recovery). Move traffic to another replica,
+  (rank 0, more than one failure domain at once, a further loss the remaining slots cannot cover, a failed
+  recovery). Move traffic to another replica,
   have clients retry their failed requests there, and restart the deployment.
 - `unprotected`: keep serving, alert, and check the authority.
 
@@ -184,7 +193,8 @@ or without the overlap scheduler) and the authority's recovery protocol are test
 kills under load at DEP32.
 These are tested only in single runs or at small scale so far, so treat them as less mature: the loss of a whole
 host, `borrowed` extra slots, hang detection and fencing, online EPLB, KV block reuse, MTP, and the `/health`
-states.
+states. A further loss after a recovery, and re-running a request once after the loss of a single rank, are
+tested only by unit tests so far.
 
 ## Cost
 

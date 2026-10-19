@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Keep a WideEP PyExecutor serving after one peer process or a whole node dies."""
+"""Keep a WideEP PyExecutor serving after peer processes or whole nodes die, one loss after another."""
 
 import collections
 import dataclasses
@@ -176,7 +176,7 @@ class RecoveryHook:
 
 
 class PeerLossRecovery(RecoveryHook):
-    """Recovers a PyExecutor from the loss of one failure domain: a peer process or a whole node.
+    """Recovers a PyExecutor from the loss of failure domains (a peer process or a whole node), one after another.
 
     Survivors discard the steps the loss interrupted (two under the overlap
     scheduler), agree on the new
@@ -184,7 +184,9 @@ class PeerLossRecovery(RecoveryHook):
     ``Ready`` -> ``Install`` -> ``Installed`` -> ``Commit``) and resume the
     same requests on their original CUDA graphs: the departed ranks are masked
     out of host collectives, EPLB routing and the MoE dispatch/combine
-    descriptor. Requests the departed attention-DP ranks were serving fail.
+    descriptor. A further loss after a recovery recovers the same way while the
+    survivors' slots still serve every expert. Requests the departed attention-DP
+    ranks were serving run again once or fail (see ``_deliver_responses``).
     A failure raises into the executor's terminal path.
 
     The executor calls :meth:`step_prepared` after reserving a step's
@@ -206,17 +208,15 @@ class PeerLossRecovery(RecoveryHook):
         executor: "PyExecutor",
         client: "RecoveryClient",
         admitted: frozenset,
-        hosts: Sequence[str] = (),
     ) -> None:
         self._executor = executor
-        # The host of each rank: a lost rank's undelivered requests run again only when its whole host was lost.
-        self._hosts = tuple(hosts)
         self._client = client
         # Failure domains (rank sets) whose loss the survivors recover from.
         self._recoverable = admitted
         self._admitted = frozenset({executor.dist.rank}) in admitted
         # Whether the survivors can recover if this rank exits: only while the
-        # serving loop watches peers, and never during or after a recovery.
+        # serving loop watches peers, never during a recovery, and after one only
+        # while their slots cover its loss too.
         self.survives_own_loss = False
         self._timeout_s = fault_tolerance_config().recovery_timeout_s
         # KV cache bytes given to the borrowed slots of the plan being prepared (returned if it is abandoned).
@@ -242,6 +242,8 @@ class PeerLossRecovery(RecoveryHook):
         self._parent_ids: Dict[int, int] = {}
         # On rank 0: the owned requests that delivered a response.
         self._delivered: Set[int] = set()
+        # On rank 0: the owned requests already run again after a loss of their rank; a second loss fails them.
+        self._rerun: Set[int] = set()
         if executor.dist.rank == 0:
             self._request_owners = {}
         # Requests rank 0 fetched but failed to broadcast because a peer loss interrupted it.
@@ -344,7 +346,7 @@ class PeerLossRecovery(RecoveryHook):
                 "WideEP peer-loss recovery covers the loss of one of "
                 f"{sorted(sorted(domain) for domain in admitted)}"
             )
-        return cls(executor, client, admitted, hosts)
+        return cls(executor, client, admitted)
 
     def validate_request(self, request: LlmRequest) -> None:
         """Reject a request whose state a discarded step would change.
@@ -412,11 +414,20 @@ class PeerLossRecovery(RecoveryHook):
                         hang_detector.checkpoint()
                         self.survives_own_loss = False
                         self._recover(error)
+                        self.survives_own_loss = self._own_loss_covered()
         finally:
             if reporter is not None:
                 reporter.stop()
                 self._hang_client.close()
             self._watch.stop()
+
+    def _own_loss_covered(self) -> bool:
+        """Whether the survivors could recover if this rank were lost too, after the ranks lost so far."""
+        if not self._admitted:
+            return False
+        dist = self._executor.dist
+        lost = frozenset(range(dist.world_size)) - frozenset(dist.live_ranks) | {dist.rank}
+        return self._executor.model_engine.moe_load_balancer.covers_loss_of(lost)
 
     def _start_hang_evidence(self) -> Optional["HangEvidenceReporter"]:
         """Start reporting heartbeats and long all-to-all waits to the authority, if enabled."""
@@ -545,7 +556,7 @@ class PeerLossRecovery(RecoveryHook):
             # a loss nor keep its entry.
             for item in items:
                 if item.is_canceled_request:
-                    self._forget(item.id)
+                    self._retire(item.id)
             self._broadcast_control_items = [
                 item
                 for item in items
@@ -591,7 +602,7 @@ class PeerLossRecovery(RecoveryHook):
             # Results carry the request id; an error can carry a sequence's own id.
             request_id = self._parent_ids.get(response.request_id, response.request_id)
             if response.has_error() or (response.result is not None and response.result.is_final):
-                self._forget(request_id)
+                self._retire(request_id)
             elif request_id in self._request_owners:
                 self._delivered.add(request_id)
 
@@ -599,6 +610,11 @@ class PeerLossRecovery(RecoveryHook):
         """Ids of the requests this rank answered in responses not yet delivered."""
         pending = [response for _, contribution in self._gathers for response in contribution]
         return {request_id for request_id, _ in pending + buffered}
+
+    def _retire(self, request_id: int) -> None:
+        """Forget a request that ended (finished, failed or cancelled), with its rerun mark."""
+        self._forget(request_id)
+        self._rerun.discard(request_id)
 
     def _forget(self, request_id: int) -> None:
         self._delivered.discard(request_id)
@@ -616,7 +632,8 @@ class PeerLossRecovery(RecoveryHook):
     def _recover(self, error: HostCollectiveInterrupted) -> None:
         """Continue serving without the departed peers, or raise.
 
-        The failed set is the one ULFM's shrink agrees on (see ``_check_recoverable``). A peer
+        The failed set is the one ULFM's shrink agrees on (see ``_check_recoverable``): every rank
+        lost so far, so a loss after an earlier recovery is checked and planned without them all. A peer
         that fails after the shrink and before ``Install`` joins it: the survivors shrink again
         and plan anew. A peer that fails after ``Install`` is not recovered: the survivors'
         collectives or the authority's deadline end the job. Every round shares the first
@@ -753,8 +770,7 @@ class PeerLossRecovery(RecoveryHook):
         logger.warning(
             f"Rank {rank}: resumed serving without ranks {list(failed_ranks)} at membership "
             f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
-            f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain and "
-            "a further loss is not recoverable"
+            f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain"
         )
 
     def _watch_survivors(self, further_loss: threading.Event) -> Optional[PeerFailureWatch]:
@@ -915,16 +931,9 @@ class PeerLossRecovery(RecoveryHook):
         if self._request_owners is None:
             return 0
         return sum(
-            owner in failed
-            and (request_id in self._delivered or not self._lost_with_host(owner, failed))
+            owner in failed and (request_id in self._delivered or request_id in self._rerun)
             for request_id, (owner, _) in self._request_owners.items()
         )
-
-    def _lost_with_host(self, rank: int, failed: frozenset) -> bool:
-        """Whether every rank on ``rank``'s host is in ``failed`` (False if the hosts are unknown)."""
-        if not self._hosts:
-            return False
-        return all(r in failed for r, host in enumerate(self._hosts) if host == self._hosts[rank])
 
     def _requeue_unscheduled_requests(self, served: List[Optional[Set[int]]]) -> None:
         """Admit again the requests that were received but never scheduled.
@@ -968,8 +977,8 @@ class PeerLossRecovery(RecoveryHook):
         gathers rank 0 did not process, and the ``buffered`` error responses it
         held for the next synchronized flush, then terminates the requests they
         finished. Rank 0 also takes over the requests that were running on a departed
-        attention-DP rank, whose KV cache left with it: after a node loss those that delivered
-        nothing run again from their prompt; the others fail.
+        attention-DP rank, whose KV cache left with it: those that delivered nothing run again
+        from their prompt, once; the others fail.
         """
         executor = self._executor
         processed = executor.dist.broadcast(self._last_processed_gather, root=0)
@@ -998,19 +1007,25 @@ class PeerLossRecovery(RecoveryHook):
         self._undelivered_terminations += buffered_terminations
         rerun = []
         if self._request_owners is not None:
-            # A request that delivered nothing runs again from its prompt on a survivor when its rank was lost
-            # with its whole host, which a request cannot cause (only rank 0's own parts are redelivered, so what
-            # it delivered is known now). After a loss of its rank alone it may be what crashed the rank, and the
-            # survivors cannot recover from another loss, so it fails, as does one that streamed tokens.
+            # A request that delivered nothing runs again from its prompt on a survivor (only rank 0's own parts
+            # are redelivered, so what it delivered is known now), once: it may be what crashed its rank, so one
+            # that loses its rank again fails, as does one that streamed tokens.
             for request_id, (owner, item) in list(self._request_owners.items()):
                 if owner not in failed:
                     continue
                 streamed = request_id in self._delivered
+                quarantined = request_id in self._rerun
                 self._forget(request_id)
-                if not streamed and self._lost_with_host(owner, failed):
+                if not streamed and not quarantined:
+                    self._rerun.add(request_id)
+                    _relax_attention_dp_pin(item)
                     rerun.append(item)
                     continue
-                reason = "had streamed tokens" if streamed else "may have caused that failure"
+                reason = (
+                    "had streamed tokens"
+                    if streamed
+                    else "had already run again after an earlier failure of its rank"
+                )
                 responses.append(
                     (
                         request_id,
@@ -1060,6 +1075,16 @@ class PeerLossRecovery(RecoveryHook):
             self._executor.readmit_requests(missing)
 
 
+def _relax_attention_dp_pin(item: "RequestQueueItem") -> None:
+    """Let a request strictly pinned to a lost rank run again on any survivor.
+
+    The request was accepted while its rank served; a new request pinned to a lost rank still fails.
+    """
+    params = getattr(item.request, "py_scheduling_params", None)
+    if params is not None and not params.attention_dp_relax:
+        item.request.py_scheduling_params = dataclasses.replace(params, attention_dp_relax=True)
+
+
 def install_recovery_placement(
     state: "MoeExecutionState",
     load_balancer: "MoeLoadBalancer",
@@ -1067,7 +1092,7 @@ def install_recovery_placement(
     placements: List["np.ndarray"],
     own_rank: int,
 ) -> None:
-    """Serve without ``failed_ranks``: route MoE traffic by ``placements``, then mask the ranks.
+    """Serve without ``failed_ranks`` (every rank lost so far): route MoE traffic by ``placements``, then mask them.
 
     ``placements`` come from ``MoeLoadBalancer.recovery_placements``: resident
     replicas, plus experts restored into survivors' slots from host weights.
@@ -1079,15 +1104,14 @@ def install_recovery_placement(
     leaves the state mixed and ends the job.
 
     Raises:
-        RuntimeError: A rank is ``own_rank`` or had already failed.
+        RuntimeError: A rank is ``own_rank``, or every rank had already failed.
         ValueError: A rank is out of range.
     """
     failed = sorted(set(failed_ranks))
-    for rank in failed:
-        if rank == own_rank:
-            raise RuntimeError(f"EP rank {rank} is this rank")
-        if not state.health.is_active(rank):
-            raise RuntimeError(f"EP rank {rank} is already failed")
+    if own_rank in failed:
+        raise RuntimeError(f"EP rank {own_rank} is this rank")
+    if not any(state.health.is_active(rank) for rank in failed):
+        raise RuntimeError(f"EP ranks {failed} are already failed")
     load_balancer.install_recovery_placement(failed, placements)
     for rank in failed:
         state.health.mark_failed(rank)

@@ -355,12 +355,42 @@ def test_a_loss_after_install_aborts():
     _assert_aborted(authority.handle(_route(0), Stopped(0, (FAILED, 3)), 2.0), authority)
 
 
-def test_second_loss_after_recovery_aborts():
+def _recovered_without_failed() -> RecoveryAuthority:
     authority = _registered()
     _report(authority, Stopped, failed_ranks=(FAILED,))
     _report(authority, Ready, generation=1, placement_digest="digest")
     _report(authority, Installed, generation=1)
-    _assert_aborted(authority.handle(_route(0), Stopped(0, (1,)), 5.0), authority)
+    assert authority.phase is Phase.RECOVERED
+    return authority
+
+
+def test_a_further_loss_after_a_recovery_recovers_again():
+    """Rank 1 is lost after the recovery without rank 2: a second recovery commits generation 2.
+
+    The survivors report both ranks; the recovery has its own deadline and stage durations.
+    """
+    authority = _recovered_without_failed()
+    lost = (1, FAILED)
+    authority.handle(_route(0), Stopped(0, lost), 50.0)
+    assert authority.phase is Phase.STOPPING and authority.deadline == pytest.approx(60.0)
+    out = authority.handle(_route(3), Stopped(3, lost), 50.5)
+    assert out == [(_route(rank), Propose(2, lost, (0, 3))) for rank in (0, 3)]
+    out = _report(authority, Ready, (0, 3), now=51.0, generation=2, placement_digest="digest2")
+    assert out == [(_route(rank), Install(2)) for rank in (0, 3)]
+    out = _report(authority, Installed, (0, 3), now=51.25, generation=2, failed_requests=1)
+    assert out == [(_route(rank), Commit(2)) for rank in (0, 3)]
+    assert authority.phase is Phase.RECOVERED and authority.deadline is None
+    assert authority.status() == Status(
+        "RECOVERED", 2, (0, 3), lost, 2, (500_000, 500_000, 250_000), 2, ""
+    )
+
+
+@pytest.mark.parametrize(
+    "failed", [(1,), (FAILED,), (0, FAILED)], ids=["omits_departed", "no_new_rank", "rank0"]
+)
+def test_a_further_loss_report_that_is_not_a_superset_or_takes_rank0_aborts(failed):
+    authority = _recovered_without_failed()
+    _assert_aborted(authority.handle(_route(1), Stopped(1, failed), 5.0), authority)
 
 
 def test_wire_roundtrip_and_authentication():

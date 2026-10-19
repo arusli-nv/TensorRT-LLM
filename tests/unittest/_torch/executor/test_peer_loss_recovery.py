@@ -28,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
 from tensorrt_llm.executor.recovery.client import (
     RecoveryAborted,
@@ -46,6 +46,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Stopped,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -53,9 +54,6 @@ WORLD_SIZE = 4
 FAILED_RANK = 2
 SURVIVORS = (0, 1, 3)
 ADMITTED = frozenset({frozenset({1}), frozenset({FAILED_RANK}), frozenset({3})})
-# One host per rank: losing FAILED_RANK loses its whole host. On SHARED_HOSTS it shares its host with rank 3.
-OWN_HOSTS = tuple(f"host{rank}" for rank in range(WORLD_SIZE))
-SHARED_HOSTS = ("host0", "host0", "host1", "host1")
 
 
 class _FakeClient:
@@ -98,7 +96,11 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
     executor = PyExecutor.__new__(PyExecutor)
     executor.iter_counter = 0
     events = []
-    dist = Mock(rank=rank, live_ranks=tuple(r for r in range(world_size) if r not in failed))
+    dist = Mock(
+        rank=rank,
+        world_size=world_size,
+        live_ranks=tuple(r for r in range(world_size) if r not in failed),
+    )
     dist.revoke.side_effect = lambda: events.append("revoke")
     dist.shrink.side_effect = lambda: events.append("shrink") or failed
     dist.install_survivors.side_effect = lambda: events.append("survivors")
@@ -142,12 +144,9 @@ def _recovery(
     failed=frozenset({FAILED_RANK}),
     world_size=WORLD_SIZE,
     admitted=ADMITTED,
-    hosts=None,
 ):
     executor = _executor(rank, failed, world_size)
-    if hosts is None:
-        hosts = tuple(f"host{r}" for r in range(world_size))
-    recovery = PeerLossRecovery(executor, client, admitted, hosts)
+    recovery = PeerLossRecovery(executor, client, admitted)
     recovery._join_device_work = Mock()
     recovery._watch = Mock(failed=False)
     executor.discard_interrupted_steps = Mock()
@@ -329,6 +328,42 @@ def test_a_loss_during_the_recovery_the_slots_cannot_serve_fails_closed():
     recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = False
     with pytest.raises(RuntimeError, match="not recoverable"):
         recovery._recover(_interrupted())
+
+
+@pytest.mark.parametrize("covered", [True, False])
+def test_a_loss_after_a_recovery_recovers_only_while_the_slots_cover_every_lost_rank(covered):
+    """After the recovery without rank 2 committed, rank 3 is lost: the survivors shrink the installed communicator
+    and recover without both at generation 2 if their slots still serve every expert, else fail closed."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, failed=lost)
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.covers_loss_of.return_value = covered
+    recovery._recover(_interrupted())
+
+    if not covered:
+        with pytest.raises(RuntimeError, match="not recoverable"):
+            recovery._recover(_interrupted(lost))
+        load_balancer.covers_loss_of.assert_called_with(lost)
+        return
+    recovery._recover(_interrupted(lost))
+    assert client.sent[3:] == [
+        Stopped(rank=1, failed_ranks=(FAILED_RANK, 3)),
+        Ready(rank=1, generation=2, placement_digest="digest"),
+        Installed(rank=1, generation=2),
+    ]
+    load_balancer.recovery_placements.assert_called_with(lost, None)
+    load_balancer.install_recovery_placement.assert_called_with([FAILED_RANK, 3], ["placement"])
+    assert recovery._executor.model_engine.moe_execution_state.health.get_failed_ranks() == lost
+    # The watch is armed again after each recovery.
+    assert recovery._executor._events.count("watch") == 2
 
 
 def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
@@ -703,11 +738,24 @@ def test_only_an_admitted_serving_rank_outside_recovery_exits_alone():
     recovery.run(Mock(side_effect=lambda: seen.append(recovery.survives_own_loss)))
     assert seen == [True]
 
-    recovery = _recovery(_FakeClient([]))
-    recovery._recover = Mock()
-    recovery.run(Mock(side_effect=[_interrupted(), None]))
-    # A second loss is terminal, so this rank no longer exits alone.
-    assert not recovery.survives_own_loss
+    # After a recovery, only while the survivors' slots also cover this rank's loss.
+    for covered in (True, False):
+        recovery = _recovery(_FakeClient([]))
+        recovery._recover = Mock()
+        load_balancer = recovery._executor.model_engine.moe_load_balancer
+        load_balancer.covers_loss_of.return_value = covered
+        loops = iter([_interrupted(), None])
+
+        def event_loop():
+            error = next(loops)
+            if error is not None:
+                raise error
+            seen.append(recovery.survives_own_loss)
+
+        seen = []
+        recovery.run(event_loop)
+        load_balancer.covers_loss_of.assert_called_once_with(frozenset({FAILED_RANK, 1}))
+        assert seen == [covered]
 
 
 @pytest.mark.parametrize(
@@ -937,8 +985,7 @@ def test_an_error_of_any_sequence_ends_the_request(sequence_id):
 
 
 def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
-    """Its whole host was lost, which a request cannot cause, and nothing reached the client: a survivor runs it
-    again."""
+    """Nothing reached the client: a survivor runs it again, once, after the loss of its rank alone too."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     lost, kept = Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)
     recovery._request_owners = {11: (FAILED_RANK, lost), 12: (3, kept)}
@@ -952,19 +999,53 @@ def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
     assert sent[-1] == []
     assert recovery._executor.request_accumulated[:1] == [lost]
     assert recovery._request_owners == {12: (3, kept)}
+    # Marked as run again until it ends.
+    assert recovery._rerun == {11}
+    recovery.requests_routed({1: [lost]})
+    recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
+    assert recovery._rerun == set() and recovery._request_owners == {12: (3, kept)}
+
+
+def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor():
+    """The request was accepted while its rank served: it runs again on a survivor. A new request pinned to the
+    departed rank still fails."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+
+    def pinned(request_id):
+        params = SchedulingParams(attention_dp_rank=FAILED_RANK, attention_dp_relax=False)
+        request = Mock(py_scheduling_params=params, num_input_tokens=4)
+        return Mock(id=request_id, request=request, child_req_ids=None)
+
+    lost, new = pinned(11), pinned(12)
+    recovery._request_owners = {11: (FAILED_RANK, lost)}
+    _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    assert recovery._executor.request_accumulated[:1] == [lost]
+    assert lost.request.py_scheduling_params == SchedulingParams(
+        attention_dp_rank=FAILED_RANK, attention_dp_relax=True
+    )
+    states = [RankState(rank=rank) for rank in SURVIVORS]
+    routable, unservable = DefaultADPRouter.split_unservable_requests([lost, new], states)
+    assert routable == [lost] and unservable == [new]
+    router = DefaultADPRouter(dist=Mock(tp_rank=0, tp_size=WORLD_SIZE, has_cp_helix=False))
+    routed, _ = router.route_requests(states, routable, 8)
+    assert set(routed) == set(SURVIVORS)
+    assert [req for reqs in routed.values() for req in reqs] == [lost]
 
 
 @pytest.mark.parametrize("streamed", [True, False])
-def test_recovery_fails_a_departed_rank_request_that_streamed_or_lost_its_rank_alone(streamed):
-    """Streamed tokens cannot be taken back; after its rank alone failed, the request may be what crashed it, and a
-    second loss is not recoverable."""
-    recovery = _recovery(
-        _FakeClient(_happy_replies()), rank=0, hosts=OWN_HOSTS if streamed else SHARED_HOSTS
-    )
+def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_again(streamed):
+    """Streamed tokens cannot be taken back; a request that already ran again after its rank failed, and lost its
+    new rank too, may be what crashes them: it is quarantined."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
     recovery._request_owners = {11: (FAILED_RANK, item)}
     if streamed:
         recovery._delivered.add(11)
+    else:
+        recovery._rerun.add(11)
     sent = _sent_responses(recovery)
 
     recovery._recover(_interrupted())
@@ -973,8 +1054,40 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_lost_its_rank_a
     assert request_id == 11 and response.client_id == "c11"
     assert f"rank {FAILED_RANK} failed" in response.error_msg
     assert ("streamed" in response.error_msg) == streamed
-    assert recovery._request_owners == {}
+    assert ("already run again" in response.error_msg) != streamed
+    assert recovery._request_owners == {} and recovery._rerun == set()
     assert recovery._executor.request_accumulated == []
+
+
+def test_a_request_run_again_fails_when_it_loses_its_rank_again():
+    """Rank 2's request runs again on rank 3 after the first recovery; rank 3 is lost next: the request fails, and
+    the deployment recovers a second time without both ranks."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, item)}
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+    assert recovery._executor.request_accumulated == [item]
+    recovery._executor.request_accumulated.clear()
+    recovery.requests_routed({3: [item]})
+
+    recovery._recover(_interrupted(lost))
+
+    ((request_id, response),) = sent[-1]
+    assert request_id == 11 and "already run again" in response.error_msg
+    assert recovery._executor.request_accumulated == []
+    assert [m.generation for m in client.sent if isinstance(m, Installed)] == [1, 2]
 
 
 def test_rank0_tracks_requests_that_delivered_a_response():
@@ -987,12 +1100,14 @@ def test_rank0_tracks_requests_that_delivered_a_response():
     assert recovery._delivered == set() and set(recovery._request_owners) == {12}
 
 
-@pytest.mark.parametrize("hosts, failed_requests", [(OWN_HOSTS, 1), (SHARED_HOSTS, 2)])
-def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(hosts, failed_requests):
-    """The authority's status counts the requests a loss failed: those that had streamed, and after a single-rank
-    loss also those that delivered nothing."""
+@pytest.mark.parametrize("ran_again, failed_requests", [(False, 1), (True, 2)])
+def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(ran_again, failed_requests):
+    """The authority's status counts the requests a loss failed: those that had streamed, and those that had
+    already run again once."""
     client = _FakeClient(_happy_replies())
-    recovery = _recovery(client, rank=0, hosts=hosts)
+    recovery = _recovery(client, rank=0)
+    if ran_again:
+        recovery._rerun.add(12)
     recovery._request_owners = {
         11: (FAILED_RANK, Mock(id=11, child_req_ids=None)),
         12: (FAILED_RANK, Mock(id=12, child_req_ids=None)),
@@ -1370,8 +1485,13 @@ def test_install_recovery_placement_reroutes_before_masking():
     with pytest.raises(RuntimeError, match="already failed"):
         install(state, load_balancer, {FAILED_RANK}, own_rank=0)
     with pytest.raises(RuntimeError, match="this rank"):
-        install(state, load_balancer, {0}, own_rank=0)
+        install(state, load_balancer, {0, 3}, own_rank=0)
     assert events == [] and health.get_failed_ranks() == frozenset({FAILED_RANK})
+
+    # A loss after a recovery installs every rank lost so far.
+    install(state, load_balancer, {FAILED_RANK, 3}, own_rank=0)
+    assert health.get_failed_ranks() == frozenset({FAILED_RANK, 3})
+    assert events == [("routed", [FAILED_RANK, 3]), ("mask", (0b0011, 0, 0, 0))]
 
 
 def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():

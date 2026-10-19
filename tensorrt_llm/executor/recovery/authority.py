@@ -61,7 +61,7 @@ _REJECTION_LOG_INTERVAL_S = 10.0
 
 
 class Phase(enum.Enum):
-    """Progress of the deployment through registration and one recovery."""
+    """Progress of the deployment through registration and its recoveries."""
 
     REGISTERING = enum.auto()
     SERVING = enum.auto()
@@ -82,11 +82,12 @@ class _Violation(Exception):
 
 
 class RecoveryAuthority:
-    """State machine for recovering from the loss of one admitted failure domain.
+    """State machine for recovering from the loss of admitted failure domains, one recovery after another.
 
     A failure domain is a set of worker ranks lost together: a single rank or a whole
-    node. A loss recovers only if every survivor reports the same failed set and that
-    set is an admitted domain.
+    node. A loss recovers only if every survivor reports the same failed set (every rank
+    lost so far) and that set is a union of admitted domains; the survivors check that
+    their slots still serve every expert without it.
 
     The authority performs no I/O: ``handle`` and ``expire`` return the messages to
     send as ``(routing_id, message)`` pairs. A protocol violation during registration or
@@ -197,8 +198,11 @@ class RecoveryAuthority:
         if self._command_fence is not None and now >= self._command_fence[0]:
             hung = self._command_fence[1]
             self._command_fence = None
-            # A recovery under way means the workers' fencing worked.
-            if self.phase is Phase.SERVING:
+            # A recovery without the rank means the workers' fencing worked.
+            if hung.rank not in self.failed_ranks and self.phase in (
+                Phase.SERVING,
+                Phase.RECOVERED,
+            ):
                 logger.error(
                     f"Recovery authority: rank {hung.rank} survived its fence; running the fence command"
                 )
@@ -230,9 +234,10 @@ class RecoveryAuthority:
         starts a recovery.
         """
         where = f"rank {hung.rank} (pid {hung.pid} on {hung.host or 'unknown host'})"
-        # After a recovery, a further loss is not recoverable: report only.
         recoverable = (
-            self.phase is Phase.SERVING and frozenset({hung.rank}) in self.admitted_domains
+            self.phase in (Phase.SERVING, Phase.RECOVERED)
+            and hung.rank not in self.failed_ranks
+            and frozenset({hung.rank}) in self.admitted_domains
         )
         if not recoverable or not hung.pid:
             logger.error(f"Recovery authority: {where} is hung ({hung.reason}); not fencing it")
@@ -337,14 +342,21 @@ class RecoveryAuthority:
         failed = frozenset(message.failed_ranks)
         if message.rank in failed:
             raise _Violation(f"rank {message.rank} reported its own loss")
-        if self.phase is Phase.SERVING:
+        if self.phase is Phase.SERVING or (
+            self.phase is Phase.RECOVERED and failed > self.failed_ranks
+        ):
+            # A further loss after a recovery reports every rank lost so far.
             self._admissible(failed)
-            self.failed_ranks = failed
             if self.hang_monitor is not None:
-                for rank in failed:
+                for rank in failed - self.failed_ranks:
                     self.hang_monitor.remove(rank)
+            self.failed_ranks = failed
             self.deadline = now + self.recovery_timeout
             self._stage_starts = [now]
+            self._replans = 0
+            self._stopped.clear()
+            self._ready.clear()
+            self._installed.clear()
             self._enter(Phase.STOPPING)
         elif self.phase in (Phase.STOPPING, Phase.PREPARING) and failed > self.failed_ranks:
             self._replan(failed)

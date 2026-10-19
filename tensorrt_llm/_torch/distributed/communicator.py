@@ -999,19 +999,20 @@ class MPIDist(Distributed):
         the survivor communicator without using it yet, and returns the same
         failed set on every survivor. Called again before
         :meth:`install_survivors` (another peer failed during the recovery), it
-        shrinks the survivor communicator it built and returns every rank
-        failed so far.
+        shrinks the survivor communicator it built; after it (a loss after a
+        recovery), the installed one. Returns every rank failed so far.
 
         Raises:
-            RuntimeError: Recovery is not enabled, or a recovery already
-                installed its survivors.
+            RuntimeError: Recovery is not enabled.
         """
         if self._host_world is None:
             raise RuntimeError("shrink() requires enable_peer_loss_recovery()")
-        if self._live_ranks is not None:
-            raise RuntimeError(
-                "A peer loss after a recovery is not recoverable")
-        comm = self._tp_comm if self._shrunk is None else self._shrunk[0]
+        if self._shrunk is not None:
+            comm = self._shrunk[0]
+        elif self._live_ranks is not None:
+            comm = self._survivor_comm
+        else:
+            comm = self._tp_comm
         survivor_comm = comm.Shrink()
         live_ranks = mpi_world_ranks(survivor_comm.Get_group())
         self._shrunk = (survivor_comm, live_ranks)
@@ -1025,8 +1026,8 @@ class MPIDist(Distributed):
         per logical rank, with the caller's ``departed`` for failed ranks.
 
         The communicator it replaces is not freed: freeing one with failed
-        members is not guaranteed to be local, and a loss after it is installed
-        is terminal.
+        members is not guaranteed to be local. A later loss shrinks the
+        installed communicator again (see :meth:`shrink`).
 
         Raises:
             RuntimeError: :meth:`shrink` has not run.

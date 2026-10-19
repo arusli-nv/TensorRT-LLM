@@ -311,16 +311,24 @@ def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery
     assert fenced == []
 
 
-def test_after_a_recovery_a_hung_rank_is_only_reported():
+def test_after_a_recovery_a_hung_rank_that_has_not_departed_is_fenced():
+    """A further loss recovers too, so a hung admitted rank is fenced after a recovery as before it."""
     fenced = []
     authority = _serving_authority(fenced)
-    authority.phase = Phase.RECOVERED  # one loss per job: a second one cannot be recovered
-    authority.handle(b"heartbeat", Heartbeat(2, 0, False, "node", 102), 0.0)
-    for now in range(1, 40):
-        for rank in (0, 1, 3):
-            authority.handle(
-                b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
-            )
+    authority.phase = Phase.RECOVERED
+    fences = _hang_rank_2(authority, 60)
+    assert [message for _, message in next(iter(fences.values()))] == [Fence(2, 102)] * 3
+    assert [rank for rank, *_ in fenced] == [2]
+
+
+def test_the_fence_command_is_skipped_once_the_hung_rank_departed():
+    fenced = []
+    authority = _serving_authority(fenced)
+    confirmed = next(iter(_hang_rank_2(_serving_authority([]), 60)))
+    _hang_rank_2(authority, confirmed + 1)
+    # The hung rank's loss recovered within the grace: the authority serves again, without it.
+    authority.phase, authority.failed_ranks = Phase.RECOVERED, frozenset({2})
+    for now in range(confirmed + 1, confirmed + 10):
         authority.expire(float(now))
     assert fenced == []
 
