@@ -24,27 +24,24 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace tensorrt_llm::runtime
 {
 
-// Device storage for an EPLB slot tensor whose empty slots hold no device memory until a restore fills them.
-// The tensor is one virtual address range, tiled by mappings of whole chunks of the VMM granularity (the driver
-// maps only whole allocations). Each mapping is a CUDAVirtualMemoryChunk. The chunks that lie wholly inside empty
-// slots map scratch memory shared by every range of the process (one allocation each of 1, 2, 4 and 8 chunks, freed
-// with the last range), so an access that strays into an empty slot reads or writes scratch instead of faulting;
-// back() maps device memory behind them. CudaVirtualMemoryManager is not used: it releases and re-materializes whole
-// allocations by tag, which would leave holes under captured CUDA graphs, and it cannot swap the mapping of part of a
-// range.
+// Device storage for an EPLB slot tensor whose empty (ghost) slots hold no device memory until a restore fills them.
+// The tensor is one virtual address range that stays fully mapped for the life of the process (CUDA graphs capture
+// its address). Chunks of the VMM granularity that lie wholly inside empty slots form ghost pieces, cut at slot
+// boundaries. While released, a piece maps scratch memory shared by every range of the process (one allocation each
+// of 1, 2, 4 and 8 chunks), so an access that strays into a ghost slot reads or writes scratch instead of faulting.
+// Each piece is an entry of the process's CudaVirtualMemoryManager under its own tag (ghost/<range>/<first chunk>),
+// added released; materializing it maps device memory in place of its scratch, releasing it maps scratch back. The
+// other chunks of the range are mapped to their own device memory at allocate().
 //
-// Every operation leaves the range fully mapped, even when a CUDA call fails: on an error, back() and
-// releasePending() map scratch over whatever they unmapped before rethrowing. A failed allocate() releases every
-// mapping, device memory and the address range it made.
-//
-// The instance is shared by every MoeLoadBalancer of the process, so the backing that back() maps is pending for
-// the owner that asked for it: keepPending() and releasePending() act on that owner's backing only.
+// The instance is shared by every MoeLoadBalancer of the process, so the pieces that back() materializes are pending
+// for the owner that asked for them: keepPending() and releasePending() act on that owner's pieces only.
 class GhostSlotMemory
 {
 public:
@@ -62,9 +59,10 @@ public:
     // Device bytes that back(ranges) would allocate.
     size_t unbackedBytes(std::vector<Range> const& ranges);
 
-    // Maps device memory behind every unbacked chunk that overlaps ranges (ranges outside these allocations are
-    // ignored). All memory is allocated first: if that fails, nothing changed. The new backing is pending until
-    // keepPending(owner). Only while no kernel uses the slots.
+    // Materializes every released ghost piece that overlaps ranges (ranges outside these allocations are ignored).
+    // If one fails, the pieces materialized before it are released again and the manager's entry of the failed one
+    // is added again: every piece is back on scratch. The new backing is pending until keepPending(owner). Only
+    // while no kernel uses the slots.
     void back(std::vector<Range> const& ranges, Owner owner);
     // Returns owner's pending backing to scratch (a plan that was abandoned); the device bytes it freed.
     size_t releasePending(Owner owner);
@@ -73,43 +71,45 @@ public:
 
 private:
     struct Scratch;
+    class ScratchSwap;
 
-    // Chunks [first, first + count) of an allocation, mapped to scratch or to their own device memory.
+    // Chunks [first, first + count) of an allocation, at address, all inside the same empty slots.
     struct Piece
     {
+        CUdeviceptr address;
+        size_t first;
         size_t count;
-        bool scratch;
-        Owner pendingOwner; // nullptr unless back() mapped it and its owner has not kept or released it
-        CUDAVirtualMemoryChunk mapping;
+        std::string tag;
+        bool backed;
     };
 
     struct Allocation
     {
-        // Declared first so that it is freed after the pieces are unmapped.
+        // Declared first so that it is freed after the chunks are unmapped.
         std::shared_ptr<void> reservation;
         size_t size;
-        std::map<size_t, Piece> pieces; // first chunk -> piece; the pieces tile the range
+        std::vector<Piece> pieces;                    // the ghost pieces, by first chunk
+        std::vector<CUDAVirtualMemoryChunk> resident; // the other chunks, mapped to their own device memory
     };
 
     GhostSlotMemory() = default;
 
-    // The scratch chunks overlapping ranges, by allocation base, each list sorted and unique.
-    std::map<CUdeviceptr, std::vector<size_t>> unbackedChunks(std::vector<Range> const& ranges) const;
     CUmemAllocationProp allocationProp() const;
-    Piece mapPiece(CUdeviceptr address, size_t count, CUDAVirtualMemoryChunk::CreatorPtr creator, bool scratch,
-        Owner pendingOwner) const;
-    // Maps chunks [first, first + count) of the allocation at base to scratch, in pieces of at most 8 chunks.
-    void mapScratch(CUdeviceptr base, Allocation& allocation, size_t first, size_t count) const;
-    // Unmaps a piece, then maps scratch over its chunks.
-    void toScratch(CUdeviceptr base, Allocation& allocation, std::map<size_t, Piece>::iterator piece) const;
-    // Best effort after an error: maps scratch over every chunk that no piece covers.
-    void coverHoles(CUdeviceptr base, Allocation& allocation) const noexcept;
+    // The released pieces overlapping ranges, each once.
+    std::vector<Piece*> unbackedPieces(std::vector<Range> const& ranges);
+    // Device memory mapped at [address, address + size).
+    CUDAVirtualMemoryChunk mapResident(CUdeviceptr address, size_t size) const;
+    // Adds the released manager entry of a piece whose scratch is mapped.
+    void addPiece(Piece const& piece) const;
+    // Removes the manager entry of a piece and unmaps its scratch; errors are logged.
+    void dropPiece(Piece const& piece) const noexcept;
 
     std::mutex mMutex;
     std::map<CUdeviceptr, Allocation> mAllocations;
+    std::map<Owner, std::vector<Piece*>> mPending; // owner -> pieces back() materialized, not yet kept or released
     int mDevice = -1;
     size_t mGranularity = 0;
-    std::map<size_t, std::shared_ptr<Scratch>> mScratch; // chunks -> scratch allocation
+    std::shared_ptr<Scratch> mScratch; // while any allocation exists
 };
 
 } // namespace tensorrt_llm::runtime

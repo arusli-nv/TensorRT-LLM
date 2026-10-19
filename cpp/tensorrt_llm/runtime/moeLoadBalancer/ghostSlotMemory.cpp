@@ -21,10 +21,12 @@
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/runtime/memoryCounters.h"
+#include "tensorrt_llm/common/stringUtils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cuda_runtime_api.h>
+#include <exception>
 #include <utility>
 
 namespace tensorrt_llm::runtime
@@ -65,91 +67,64 @@ struct MapConfigurator : CUDAVirtualMemoryChunk::Configurator
     CUmemAccessDesc mDesc;
 };
 
-// Device memory created ahead of its mapping, so that a restore allocates everything before it unmaps anything.
-// It is the creator of its mapping, which releases it; memory that is never mapped is released with this object.
-class DeviceMemory : public CUDAVirtualMemoryChunk::Creator
-{
-public:
-    DeviceMemory(CUmemAllocationProp const& prop, size_t size)
-        : mSize(size)
-    {
-        TLLM_CU_CHECK(cuMemCreate(&mHandle, size, &prop, 0));
-        MemoryCounters::getInstance().allocate(MemoryType::kGPU, size);
-    }
-
-    DeviceMemory(DeviceMemory const&) = delete;
-    DeviceMemory& operator=(DeviceMemory const&) = delete;
-
-    ~DeviceMemory() override
-    {
-        if (mHandle != 0)
-        {
-            cuMemRelease(mHandle);
-            MemoryCounters::getInstance().deallocate(MemoryType::kGPU, mSize);
-        }
-    }
-
-    CUmemGenericAllocationHandle create() override
-    {
-        TLLM_CHECK_WITH_INFO(mHandle != 0, "Ghost slot memory is mapped once");
-        return mHandle;
-    }
-
-    void release(CUmemGenericAllocationHandle handle, bool) override
-    {
-        mHandle = 0;
-        MemoryCounters::getInstance().deallocate(MemoryType::kGPU, mSize);
-        TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
-    }
-
-private:
-    CUmemGenericAllocationHandle mHandle = 0;
-    size_t mSize;
-};
-
-// Lists [first, first + count) runs of consecutive chunks.
-std::vector<std::pair<size_t, size_t>> runsOf(std::vector<size_t> const& chunks)
+// Splits chunks into runs of the scratch sizes, largest first: (first chunk, count) each.
+std::vector<std::pair<size_t, size_t>> scratchRuns(size_t chunks)
 {
     std::vector<std::pair<size_t, size_t>> runs;
-    for (size_t chunk : chunks)
+    for (size_t first = 0; first < chunks;)
     {
-        if (!runs.empty() && runs.back().first + runs.back().second == chunk)
+        size_t count = kMaxScratchChunks;
+        while (count > chunks - first)
         {
-            ++runs.back().second;
+            count /= 2;
         }
-        else
-        {
-            runs.emplace_back(chunk, 1);
-        }
+        runs.emplace_back(first, count);
+        first += count;
     }
     return runs;
 }
+
+// Releases a chunk that materialize() left mapped in full or in part; errors are logged.
+void releaseLogged(CUDAVirtualMemoryChunk& chunk) noexcept
+{
+    auto const status = chunk.status();
+    if (status == CUDAVirtualMemoryChunk::INVALID || status == CUDAVirtualMemoryChunk::RELEASED)
+    {
+        return;
+    }
+    try
+    {
+        chunk.release();
+    }
+    catch (std::exception const& error)
+    {
+        TLLM_LOG_ERROR("Releasing ghost slot memory failed: %s", error.what());
+    }
+}
 } // namespace
 
-// A scratch allocation, shared by every mapping of it and released with the last one.
+// The scratch allocations of 1, 2, 4 and 8 chunks, shared by every piece and released with the last one.
 struct GhostSlotMemory::Scratch
 {
-    // A mapping's creator: hands out the shared handle and keeps the allocation alive.
-    struct Creator : CUDAVirtualMemoryChunk::Creator
+    Scratch(CUmemAllocationProp const& prop, size_t chunkBytes)
+        : granularity(chunkBytes)
     {
-        explicit Creator(std::shared_ptr<Scratch> scratch)
-            : mScratch(std::move(scratch))
+        access.location = prop.location;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        try
         {
+            for (size_t chunks = 1; chunks <= kMaxScratchChunks; chunks *= 2)
+            {
+                CUmemGenericAllocationHandle handle{};
+                TLLM_CU_CHECK(cuMemCreate(&handle, chunks * chunkBytes, &prop, 0));
+                handles.emplace(chunks, handle);
+            }
         }
-
-        CUmemGenericAllocationHandle create() override
+        catch (...)
         {
-            return mScratch->handle;
+            release();
+            throw;
         }
-
-        void release(CUmemGenericAllocationHandle, bool) override {}
-
-        std::shared_ptr<Scratch> mScratch;
-    };
-
-    Scratch(CUmemAllocationProp const& prop, size_t size)
-    {
-        TLLM_CU_CHECK(cuMemCreate(&handle, size, &prop, 0));
     }
 
     Scratch(Scratch const&) = delete;
@@ -157,10 +132,112 @@ struct GhostSlotMemory::Scratch
 
     ~Scratch()
     {
-        cuMemRelease(handle);
+        release();
     }
 
-    CUmemGenericAllocationHandle handle = 0;
+    void release() noexcept
+    {
+        for (auto const& [chunks, handle] : handles)
+        {
+            cuMemRelease(handle);
+        }
+        handles.clear();
+    }
+
+    // Maps scratch over chunks [0, chunks) at address, every run it can; throws the first error.
+    void map(CUdeviceptr address, size_t chunks) const
+    {
+        CUresult error = CUDA_SUCCESS;
+        for (auto const& [first, count] : scratchRuns(chunks))
+        {
+            CUdeviceptr const at = address + first * granularity;
+            size_t const bytes = count * granularity;
+            CUresult result = cuMemMap(at, bytes, 0, handles.at(count), 0);
+            if (result == CUDA_SUCCESS)
+            {
+                result = cuMemSetAccess(at, bytes, &access, 1);
+                if (result != CUDA_SUCCESS)
+                {
+                    cuMemUnmap(at, bytes);
+                }
+            }
+            error = error == CUDA_SUCCESS ? result : error;
+        }
+        TLLM_CU_CHECK_FREE_RESOURCE(error);
+    }
+
+    // Unmaps what map(address, chunks) mapped, every run it can; throws the first error.
+    void unmap(CUdeviceptr address, size_t chunks) const
+    {
+        CUresult error = CUDA_SUCCESS;
+        for (auto const& [first, count] : scratchRuns(chunks))
+        {
+            CUresult const result = cuMemUnmap(address + first * granularity, count * granularity);
+            error = error == CUDA_SUCCESS ? result : error;
+        }
+        TLLM_CU_CHECK_FREE_RESOURCE(error);
+    }
+
+    size_t granularity;
+    CUmemAccessDesc access{};
+    std::map<size_t, CUmemGenericAllocationHandle> handles; // chunks -> allocation
+};
+
+// The first configurator of a piece's manager entry: setup() unmaps the piece's scratch before the piece's own
+// memory is mapped, teardown() maps the scratch back after that memory is unmapped. Every release, rollback and
+// eviction of the entry thus ends with the piece on scratch.
+class GhostSlotMemory::ScratchSwap : public CUDAVirtualMemoryChunk::Configurator
+{
+public:
+    ScratchSwap(std::shared_ptr<Scratch> scratch, CUdeviceptr address, size_t chunks)
+        : mScratch(std::move(scratch))
+        , mAddress(address)
+        , mChunks(chunks)
+    {
+    }
+
+    void setup(CUmemGenericAllocationHandle) override
+    {
+        try
+        {
+            mScratch->unmap(mAddress, mChunks);
+        }
+        catch (...)
+        {
+            // Map back the runs that were unmapped (the runs still mapped fail to map again).
+            try
+            {
+                mScratch->map(mAddress, mChunks);
+            }
+            catch (std::exception const&)
+            {
+            }
+            throw;
+        }
+    }
+
+    void teardown(CUmemGenericAllocationHandle, bool destructing) override
+    {
+        try
+        {
+            mScratch->map(mAddress, mChunks);
+        }
+        catch (std::exception const& error)
+        {
+            if (!destructing)
+            {
+                throw;
+            }
+            // A destructor must not throw.
+            TLLM_LOG_ERROR(
+                "Ghost slot memory at %p left unmapped: %s", reinterpret_cast<void*>(mAddress), error.what());
+        }
+    }
+
+private:
+    std::shared_ptr<Scratch> mScratch;
+    CUdeviceptr mAddress;
+    size_t mChunks;
 };
 
 GhostSlotMemory& GhostSlotMemory::getInstance()
@@ -179,84 +256,46 @@ CUmemAllocationProp GhostSlotMemory::allocationProp() const
     return prop;
 }
 
-GhostSlotMemory::Piece GhostSlotMemory::mapPiece(CUdeviceptr address, size_t count,
-    CUDAVirtualMemoryChunk::CreatorPtr creator, bool scratch, Owner pendingOwner) const
+CUDAVirtualMemoryChunk GhostSlotMemory::mapResident(CUdeviceptr address, size_t size) const
 {
-    CUmemAccessDesc access{};
-    access.location = allocationProp().location;
-    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     CUDAVirtualMemoryChunk::Configurators configurators;
-    configurators.push_back(std::make_unique<MapConfigurator>(address, count * mGranularity, access));
-    Piece piece{count, scratch, pendingOwner, CUDAVirtualMemoryChunk(std::move(creator), std::move(configurators))};
+    configurators.push_back(std::make_unique<MapConfigurator>(address, size, mScratch->access));
+    CUDAVirtualMemoryChunk chunk(std::make_unique<LocalCreator<>>(allocationProp(), size), std::move(configurators));
     try
     {
-        piece.mapping.materialize();
+        chunk.materialize();
     }
     catch (...)
     {
-        // Undo what materialize() did; an error of the undo must not hide the original one.
-        try
-        {
-            piece.mapping.release();
-        }
-        catch (std::exception const& error)
-        {
-            TLLM_LOG_ERROR("Releasing a ghost slot mapping after a failed map failed: %s", error.what());
-        }
+        releaseLogged(chunk);
         throw;
     }
-    return piece;
+    return chunk;
 }
 
-void GhostSlotMemory::mapScratch(CUdeviceptr base, Allocation& allocation, size_t first, size_t count) const
+void GhostSlotMemory::addPiece(Piece const& piece) const
 {
-    while (count > 0)
-    {
-        size_t piece = kMaxScratchChunks;
-        while (piece > count)
-        {
-            piece /= 2;
-        }
-        allocation.pieces.emplace(first,
-            mapPiece(base + first * mGranularity, piece, std::make_unique<Scratch::Creator>(mScratch.at(piece)),
-                /*scratch=*/true, /*pendingOwner=*/nullptr));
-        first += piece;
-        count -= piece;
-    }
+    size_t const bytes = piece.count * mGranularity;
+    CUDAVirtualMemoryChunk::Configurators configurators;
+    configurators.push_back(std::make_unique<ScratchSwap>(mScratch, piece.address, piece.count));
+    configurators.push_back(std::make_unique<MapConfigurator>(piece.address, bytes, mScratch->access));
+    getVirtualMemoryManager().add(piece.address, piece.tag,
+        CUDAVirtualMemoryChunk(std::make_unique<LocalCreator<>>(allocationProp(), bytes), std::move(configurators)));
 }
 
-void GhostSlotMemory::toScratch(CUdeviceptr base, Allocation& allocation, std::map<size_t, Piece>::iterator piece) const
+void GhostSlotMemory::dropPiece(Piece const& piece) const noexcept
 {
-    size_t const first = piece->first;
-    size_t const count = piece->second.count;
-    piece->second.mapping.release();
-    allocation.pieces.erase(piece);
-    mapScratch(base, allocation, first, count);
-}
-
-void GhostSlotMemory::coverHoles(CUdeviceptr base, Allocation& allocation) const noexcept
-{
-    size_t const chunks = allocation.size / mGranularity;
-    size_t chunk = 0;
+    // A backed piece maps its scratch back as it is released.
+    auto chunk = getVirtualMemoryManager().remove(piece.address);
+    releaseLogged(chunk);
     try
     {
-        while (chunk < chunks)
-        {
-            auto const next = allocation.pieces.lower_bound(chunk);
-            if (next != allocation.pieces.end() && next->first == chunk)
-            {
-                chunk += next->second.count;
-                continue;
-            }
-            size_t const end = next == allocation.pieces.end() ? chunks : next->first;
-            mapScratch(base, allocation, chunk, end - chunk);
-            chunk = end;
-        }
+        mScratch->unmap(piece.address, piece.count);
     }
     catch (std::exception const& error)
     {
-        TLLM_LOG_ERROR("Ghost slot memory at %p left chunks from %zu unmapped: %s", reinterpret_cast<void*>(base),
-            chunk, error.what());
+        TLLM_LOG_ERROR("Unmapping the scratch of ghost slot memory at %p failed: %s",
+            reinterpret_cast<void*>(piece.address), error.what());
     }
 }
 
@@ -278,35 +317,33 @@ void* GhostSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<int
         mGranularity = granularity;
         mDevice = device;
     }
-    if (mScratch.empty())
+    if (!mScratch)
     {
-        // Every scratch size up front, so that a restore needs no memory beyond what unbackedBytes() reports.
-        std::map<size_t, std::shared_ptr<Scratch>> scratch;
-        for (size_t chunks = 1; chunks <= kMaxScratchChunks; chunks *= 2)
-        {
-            scratch.emplace(chunks, std::make_shared<Scratch>(allocationProp(), chunks * mGranularity));
-        }
-        mScratch = std::move(scratch);
+        // Allocated up front, so that a restore needs no memory beyond what unbackedBytes() reports.
+        mScratch = std::make_shared<Scratch>(allocationProp(), mGranularity);
     }
-    std::vector<bool> empty(slotCount, false);
+    size_t const slots = static_cast<size_t>(slotCount);
+    std::vector<bool> empty(slots, false);
     for (int slot : emptySlots)
     {
         TLLM_CHECK_WITH_INFO(slot >= 0 && slot < slotCount, "Empty slot %d is not in [0, %d)", slot, slotCount);
         empty[slot] = true;
     }
-    size_t const bytes = slotBytes * slotCount;
+    size_t const bytes = slotBytes * slots;
     size_t const chunks = common::divUp(bytes, mGranularity);
-    std::vector<bool> unbacked(chunks);
+    // Per chunk: the empty slot holding all its bytes (slots past the last slot), -1 if a byte is in a backed slot,
+    // or a value of its own below -1 if it spans several empty slots. A run of one value is a piece.
+    std::vector<int64_t> slotOf(chunks);
     for (size_t chunk = 0; chunk < chunks; ++chunk)
     {
-        // Unbacked if every byte of the chunk is in an empty slot or past the last slot.
-        size_t pos = chunk * mGranularity;
-        size_t const end = pos + mGranularity;
-        while (pos < end && pos < bytes && empty[pos / slotBytes])
+        size_t const first = std::min(chunk * mGranularity / slotBytes, slots);
+        size_t const last = std::min(((chunk + 1) * mGranularity - 1) / slotBytes, slots);
+        bool ghost = true;
+        for (size_t slot = first; slot <= last && ghost; ++slot)
         {
-            pos = (pos / slotBytes + 1) * slotBytes;
+            ghost = slot == slots || empty[slot];
         }
-        unbacked[chunk] = pos >= end || pos >= bytes;
+        slotOf[chunk] = !ghost ? -1 : first == last ? static_cast<int64_t>(first) : -2 - static_cast<int64_t>(chunk);
     }
 
     CUdeviceptr base = 0;
@@ -314,48 +351,44 @@ void* GhostSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<int
     Allocation allocation{
         std::shared_ptr<void>(reinterpret_cast<void*>(base),
             [size = chunks * mGranularity](void* ptr) { cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size); }),
-        chunks * mGranularity, {}};
-    auto const prop = allocationProp();
+        chunks * mGranularity, {}, {}};
     try
     {
         for (size_t chunk = 0; chunk < chunks;)
         {
             size_t run = chunk;
-            while (run < chunks && unbacked[run] == unbacked[chunk])
+            while (run < chunks && slotOf[run] == slotOf[chunk])
             {
                 ++run;
             }
-            if (unbacked[chunk])
+            CUdeviceptr const address = base + chunk * mGranularity;
+            if (slotOf[chunk] == -1)
             {
-                mapScratch(base, allocation, chunk, run - chunk);
+                allocation.resident.push_back(mapResident(address, (run - chunk) * mGranularity));
             }
             else
             {
-                allocation.pieces.emplace(chunk,
-                    mapPiece(base + chunk * mGranularity, run - chunk,
-                        std::make_unique<DeviceMemory>(prop, (run - chunk) * mGranularity), /*scratch=*/false,
-                        /*pendingOwner=*/nullptr));
+                auto const& piece = allocation.pieces.emplace_back(Piece{address, chunk, run - chunk,
+                    common::fmtstr("ghost/%llx/%zu", static_cast<unsigned long long>(base), chunk), false});
+                mScratch->map(piece.address, piece.count);
+                addPiece(piece);
             }
             chunk = run;
         }
     }
     catch (...)
     {
-        // Unmap what was mapped; the reservation is freed with the allocation.
-        for (auto& [first, piece] : allocation.pieces)
+        for (auto const& piece : allocation.pieces)
         {
-            try
-            {
-                piece.mapping.release();
-            }
-            catch (std::exception const& error)
-            {
-                TLLM_LOG_ERROR("Unmapping ghost slot memory after a failed allocation failed: %s", error.what());
-            }
+            dropPiece(piece);
+        }
+        for (auto& chunk : allocation.resident)
+        {
+            releaseLogged(chunk);
         }
         if (mAllocations.empty())
         {
-            mScratch.clear();
+            mScratch.reset();
         }
         throw;
     }
@@ -372,28 +405,33 @@ void GhostSlotMemory::free(void* ptr) noexcept
         TLLM_LOG_ERROR("%p is not ghost slot memory", ptr);
         return;
     }
-    for (auto& [first, piece] : it->second.pieces)
+    CUdeviceptr const base = it->first;
+    auto& allocation = it->second;
+    for (auto& [owner, pieces] : mPending)
     {
-        try
-        {
-            piece.mapping.release();
-        }
-        catch (std::exception const& error)
-        {
-            TLLM_LOG_ERROR("Unmapping ghost slot memory at %p failed: %s", ptr, error.what());
-        }
+        pieces.erase(std::remove_if(pieces.begin(), pieces.end(),
+                         [&](Piece const* piece) { return piece->address - base < allocation.size; }),
+            pieces.end());
+    }
+    for (auto const& piece : allocation.pieces)
+    {
+        dropPiece(piece);
+    }
+    for (auto& chunk : allocation.resident)
+    {
+        releaseLogged(chunk);
     }
     mAllocations.erase(it);
     if (mAllocations.empty())
     {
         // The last mapping of the scratch is gone: release it too.
-        mScratch.clear();
+        mScratch.reset();
     }
 }
 
-std::map<CUdeviceptr, std::vector<size_t>> GhostSlotMemory::unbackedChunks(std::vector<Range> const& ranges) const
+std::vector<GhostSlotMemory::Piece*> GhostSlotMemory::unbackedPieces(std::vector<Range> const& ranges)
 {
-    std::map<CUdeviceptr, std::vector<size_t>> chunks;
+    std::vector<Piece*> pieces;
     for (auto const& [ptr, size] : ranges)
     {
         auto const start = reinterpret_cast<CUdeviceptr>(ptr);
@@ -403,127 +441,114 @@ std::map<CUdeviceptr, std::vector<size_t>> GhostSlotMemory::unbackedChunks(std::
             continue;
         }
         --it;
-        auto const& [base, allocation] = *it;
+        auto& [base, allocation] = *it;
         if (start >= base + allocation.size)
         {
             continue;
         }
         size_t const lo = (start - base) / mGranularity;
         size_t const hi = (std::min<size_t>(start - base + size, allocation.size) - 1) / mGranularity;
-        auto piece = allocation.pieces.upper_bound(lo);
-        --piece; // the piece holding chunk lo: the pieces tile the range
-        for (; piece != allocation.pieces.end() && piece->first <= hi; ++piece)
+        for (auto& piece : allocation.pieces)
         {
-            if (piece->second.scratch)
+            if (!piece.backed && piece.first <= hi && piece.first + piece.count > lo)
             {
-                for (size_t chunk = std::max(lo, piece->first);
-                     chunk < std::min(hi + 1, piece->first + piece->second.count); ++chunk)
-                {
-                    chunks[base].push_back(chunk);
-                }
+                pieces.push_back(&piece);
             }
         }
     }
-    for (auto& [base, list] : chunks)
-    {
-        std::sort(list.begin(), list.end());
-        list.erase(std::unique(list.begin(), list.end()), list.end());
-    }
-    return chunks;
+    std::sort(pieces.begin(), pieces.end(), [](Piece const* a, Piece const* b) { return a->address < b->address; });
+    pieces.erase(std::unique(pieces.begin(), pieces.end()), pieces.end());
+    return pieces;
 }
 
 size_t GhostSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    size_t count = 0;
-    for (auto const& [base, list] : unbackedChunks(ranges))
+    size_t chunks = 0;
+    for (auto const* piece : unbackedPieces(ranges))
     {
-        count += list.size();
+        chunks += piece->count;
     }
-    return count * mGranularity;
+    return chunks * mGranularity;
 }
 
 void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
 {
     TLLM_CHECK_WITH_INFO(owner != nullptr, "Pending slot backing needs an owner");
     std::lock_guard<std::mutex> lock(mMutex);
-
-    // Device memory for every run first: if that fails, nothing changed.
-    struct Run
-    {
-        CUdeviceptr base;
-        size_t first;
-        size_t count;
-        std::unique_ptr<DeviceMemory> memory;
-    };
-
-    std::vector<Run> runs;
-    auto const prop = allocationProp();
-    for (auto const& [base, chunks] : unbackedChunks(ranges))
-    {
-        for (auto const& [first, count] : runsOf(chunks))
-        {
-            runs.push_back({base, first, count, std::make_unique<DeviceMemory>(prop, count * mGranularity)});
-        }
-    }
-
-    CUdeviceptr base = 0;
+    auto& manager = getVirtualMemoryManager();
+    auto const pieces = unbackedPieces(ranges);
+    size_t done = 0;
     try
     {
-        for (auto& run : runs)
+        for (; done < pieces.size(); ++done)
         {
-            base = run.base;
-            auto& allocation = mAllocations.at(run.base);
-            // The scratch pieces overlapping the run: unmap them, map the run, map scratch over the rest.
-            auto piece = std::prev(allocation.pieces.upper_bound(run.first));
-            size_t const lo = piece->first;
-            size_t hi = lo;
-            while (piece != allocation.pieces.end() && piece->first < run.first + run.count)
-            {
-                hi = piece->first + piece->second.count;
-                piece->second.mapping.release();
-                piece = allocation.pieces.erase(piece);
-            }
-            allocation.pieces.emplace(run.first,
-                mapPiece(run.base + run.first * mGranularity, run.count, std::move(run.memory),
-                    /*scratch=*/false, owner));
-            mapScratch(run.base, allocation, lo, run.first - lo);
-            mapScratch(run.base, allocation, run.first + run.count, hi - run.first - run.count);
+            TLLM_CHECK_WITH_INFO(manager.materializeWithTag(pieces[done]->tag) == 1,
+                "Ghost slot memory %s has no released manager entry", pieces[done]->tag.c_str());
         }
     }
     catch (...)
     {
-        coverHoles(base, mAllocations.at(base));
+        // The manager dropped the entry that failed (its piece is on scratch): add it again, released. Then
+        // release the pieces materialized before it.
+        try
+        {
+            addPiece(*pieces[done]);
+        }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_ERROR("Ghost slot memory %s cannot be backed again: %s", pieces[done]->tag.c_str(), error.what());
+        }
+        while (done-- > 0)
+        {
+            try
+            {
+                manager.releaseWithTag(pieces[done]->tag);
+            }
+            catch (std::exception const& error)
+            {
+                TLLM_LOG_ERROR("Releasing ghost slot memory %s failed: %s", pieces[done]->tag.c_str(), error.what());
+            }
+        }
         throw;
+    }
+    auto& pending = mPending[owner];
+    for (auto* piece : pieces)
+    {
+        piece->backed = true;
+        pending.push_back(piece);
     }
 }
 
 size_t GhostSlotMemory::releasePending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
+    auto const it = mPending.find(owner);
+    if (it == mPending.end())
+    {
+        return 0;
+    }
+    auto const pieces = std::move(it->second);
+    mPending.erase(it);
+    auto& manager = getVirtualMemoryManager();
+    std::exception_ptr error;
     size_t chunks = 0;
-    for (auto& [base, allocation] : mAllocations)
+    for (auto* piece : pieces)
     {
         try
         {
-            for (auto piece = allocation.pieces.begin(); piece != allocation.pieces.end();)
-            {
-                if (owner == nullptr || piece->second.pendingOwner != owner)
-                {
-                    ++piece;
-                    continue;
-                }
-                size_t const next = piece->first + piece->second.count;
-                chunks += piece->second.count;
-                toScratch(base, allocation, piece);
-                piece = allocation.pieces.lower_bound(next);
-            }
+            manager.releaseWithTag(piece->tag);
         }
         catch (...)
         {
-            coverHoles(base, allocation);
-            throw;
+            error = std::current_exception();
         }
+        piece->backed = false;
+        chunks += piece->count;
+    }
+    if (error)
+    {
+        std::rethrow_exception(error);
     }
     return chunks * mGranularity;
 }
@@ -531,16 +556,7 @@ size_t GhostSlotMemory::releasePending(Owner owner)
 void GhostSlotMemory::keepPending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    for (auto& [base, allocation] : mAllocations)
-    {
-        for (auto& [first, piece] : allocation.pieces)
-        {
-            if (piece.pendingOwner == owner)
-            {
-                piece.pendingOwner = nullptr;
-            }
-        }
-    }
+    mPending.erase(owner);
 }
 
 } // namespace tensorrt_llm::runtime

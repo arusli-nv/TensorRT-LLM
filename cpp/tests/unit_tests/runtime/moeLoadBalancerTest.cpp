@@ -761,8 +761,8 @@ TEST(GhostSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
     EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
     memory.free(base);
 
-    // Adjacent empty slots 1 and 2 share scratch pieces (chunks 4-7 and 8-9); backing slot 1 splits the piece it
-    // shares with slot 2, whose chunks stay unbacked.
+    // Adjacent empty slots 1 and 2 are pieces of their own (chunks 4-6 and 7-9): backing slot 1 leaves slot 2's
+    // chunks unbacked.
     base = static_cast<uint8_t*>(memory.allocate(slotBytes, 4, {1, 2}));
     EXPECT_EQ(memory.unbackedBytes({slot(1), slot(2)}), 6 * gran);
     memory.back({slot(1)}, &owner);
@@ -893,6 +893,75 @@ TEST(GhostSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
     memory.free(range);
     EXPECT_EQ(MemoryCounters::getInstance().getGpu(), gpuBytes);
     EXPECT_LT(leaked(), 4 * gran);
+}
+
+TEST(GhostSlotMemoryTest, SleepTagsNeverTouchGhostEntries)
+{
+    // Sleep and wakeup release and materialize entries of the process's CudaVirtualMemoryManager by tag. Ghost pieces
+    // have tags of their own: a backed slot keeps its memory and contents, an empty one stays on scratch.
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    auto& memory = GhostSlotMemory::getInstance();
+    auto* base = static_cast<uint8_t*>(memory.allocate(gran, 3, {1, 2}));
+    GhostSlotMemory::Range const slot1{base + gran, gran};
+    GhostSlotMemory::Range const slot2{base + 2 * gran, gran};
+    int const owner = 0;
+    memory.back({slot1}, &owner);
+    memory.keepPending(&owner);
+    TLLM_CUDA_CHECK(cudaMemset(base + gran, 7, gran));
+    auto& manager = getVirtualMemoryManager();
+    for (char const* tag : {"model", "model_weights", "kv_cache", "ghost", "ghost/"})
+    {
+        EXPECT_EQ(manager.releaseWithTag(tag), 0u) << tag;
+        EXPECT_EQ(manager.materializeWithTag(tag), 0u) << tag;
+    }
+    EXPECT_EQ(memory.unbackedBytes({slot1}), 0u);
+    EXPECT_EQ(memory.unbackedBytes({slot2}), gran);
+    std::vector<uint8_t> host(gran);
+    TLLM_CUDA_CHECK(cudaMemcpy(host.data(), base + gran, gran, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(host.begin(), host.end(), [](uint8_t b) { return b == 7; }));
+    TLLM_CUDA_CHECK(cudaMemset(base + 2 * gran, 1, gran)); // scratch: no fault
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    memory.free(base);
+}
+
+TEST(GhostSlotMemoryTest, FailedPieceIsDroppedAndEndsOnScratch)
+{
+    // A piece whose memory cannot be allocated is dropped by the manager (a bad handle): its range stays on scratch,
+    // the piece is added again (a later restore retries it), and freeing the range leaves no memory behind.
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    auto& memory = GhostSlotMemory::getInstance();
+    auto& manager = getVirtualMemoryManager();
+    auto freeDeviceBytes = []
+    {
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        size_t freeBytes = 0, totalBytes = 0;
+        TLLM_CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        return std::make_pair(freeBytes, totalBytes);
+    };
+    // A first range settles what the driver keeps for the process.
+    memory.free(memory.allocate(gran, 2, {1}));
+    auto const [freeBefore, totalBytes] = freeDeviceBytes();
+    auto const gpuBytes = MemoryCounters::getInstance().getGpu();
+    // Larger than the whole device: its memory can never be allocated.
+    size_t const hugeBytes = (totalBytes / gran + 1) * gran;
+    auto* huge = static_cast<uint8_t*>(memory.allocate(hugeBytes, 1, {0}));
+    GhostSlotMemory::Range const slot{huge, hugeBytes};
+    int const owner = 0;
+    manager.retrieveBadHandles();
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        EXPECT_THROW(memory.back({slot}, &owner), tensorrt_llm::common::TllmException);
+        EXPECT_EQ(manager.retrieveBadHandles(), std::vector<uintptr_t>{reinterpret_cast<uintptr_t>(huge)});
+        EXPECT_EQ(memory.unbackedBytes({slot}), hugeBytes);
+        EXPECT_EQ(memory.releasePending(&owner), 0u);
+    }
+    TLLM_CUDA_CHECK(cudaMemset(huge, 1, hugeBytes)); // every chunk still maps scratch
+    memory.free(huge);
+    EXPECT_EQ(MemoryCounters::getInstance().getGpu(), gpuBytes);
+    auto const freeAfter = freeDeviceBytes().first;
+    EXPECT_LT(freeAfter >= freeBefore ? size_t{0} : freeBefore - freeAfter, 4 * gran);
 }
 
 TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindAGhostSlot)
