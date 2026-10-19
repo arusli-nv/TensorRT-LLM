@@ -505,7 +505,8 @@ namespace
 {
 
 // One layer on EP rank 0 of 4 with 2 slots per rank; experts 2 and 3 live only on rank 2. Every expert's host
-// weight is filled with expertId + 1 and every local slot starts with its expert's values.
+// weight is filled with expertId + 1 and every local slot starts with its expert's values. With borrowSlot1, the
+// slots are one borrowed range (BorrowedSlotMemory) whose slot 1 maps no memory.
 class RestorePlacementLayer
 {
 public:
@@ -513,28 +514,36 @@ public:
     static constexpr int kEpSize = 4;
     static constexpr int kSlotCountPerRank = 2;
     static constexpr int kDeadRank = 2;
-    static constexpr int kWeightElems = 256;
 
-    explicit RestorePlacementLayer(bool withHostWeights, int layerUpdatesPerIter = 1)
+    explicit RestorePlacementLayer(
+        bool withHostWeights, int layerUpdatesPerIter = 1, size_t weightElems = 256, bool borrowSlot1 = false)
         : mLoadBalancer(/*epRank=*/0, kEpSize, layerUpdatesPerIter)
+        , mWeightElems(weightElems)
     {
         mLoadBalancer.setUseGpuMemcpy(true);
         mLayer = mLoadBalancer.AddLayer(kExpertCount, /*topK=*/2, kSlotCountPerRank);
         std::vector<int> const initialAssignments{0, 1, 0, 1, 2, 3, 0, 1};
+        size_t const bytes = mWeightElems * sizeof(float);
         for (int expertId = 0; withHostWeights && expertId < kExpertCount; ++expertId)
         {
             float* host = nullptr;
-            TLLM_CUDA_CHECK(cudaMallocHost(&host, kWeightElems * sizeof(float)));
-            std::fill_n(host, kWeightElems, static_cast<float>(expertId + 1));
+            TLLM_CUDA_CHECK(cudaMallocHost(&host, bytes));
+            std::fill_n(host, mWeightElems, static_cast<float>(expertId + 1));
             mHostWeights.push_back(host);
             mLayer->addSingleHostWeight(expertId, "w", weight(host));
         }
+        if (borrowSlot1)
+        {
+            mBorrowed = static_cast<float*>(BorrowedSlotMemory::getInstance().allocate(bytes, kSlotCountPerRank, {1}));
+        }
         for (int slotId = 0; withHostWeights && slotId < kSlotCountPerRank; ++slotId)
         {
-            float* slot = nullptr;
-            TLLM_CUDA_CHECK(cudaMalloc(&slot, kWeightElems * sizeof(float)));
-            TLLM_CUDA_CHECK(cudaMemcpy(
-                slot, mHostWeights[initialAssignments[slotId]], kWeightElems * sizeof(float), cudaMemcpyHostToDevice));
+            float* slot = mBorrowed ? mBorrowed + slotId * mWeightElems : nullptr;
+            if (!mBorrowed)
+            {
+                TLLM_CUDA_CHECK(cudaMalloc(&slot, bytes));
+            }
+            TLLM_CUDA_CHECK(cudaMemcpy(slot, mHostWeights[initialAssignments[slotId]], bytes, cudaMemcpyHostToDevice));
             mSlots.push_back(slot);
             mLayer->addSingleWeightSlot(slotId, "w", weight(slot));
         }
@@ -549,16 +558,22 @@ public:
         {
             cudaFreeHost(host);
         }
+        if (mBorrowed)
+        {
+            BorrowedSlotMemory::getInstance().free(mBorrowed);
+            return;
+        }
         for (auto* slot : mSlots)
         {
             cudaFree(slot);
         }
     }
 
-    float slotValue(int slotId) const
+    // The slot's value at element elem (default: the first).
+    float slotValue(int slotId, size_t elem = 0) const
     {
         float value = 0;
-        TLLM_CUDA_CHECK(cudaMemcpy(&value, mSlots[slotId], sizeof(float), cudaMemcpyDeviceToHost));
+        TLLM_CUDA_CHECK(cudaMemcpy(&value, mSlots[slotId] + elem, sizeof(float), cudaMemcpyDeviceToHost));
         return value;
     }
 
@@ -566,18 +581,20 @@ public:
     std::shared_ptr<SingleLayerMoeLoadBalancer> mLayer;
 
 private:
-    static MoeWeight weight(float* ptr)
+    MoeWeight weight(float* ptr) const
     {
         MoeWeight w;
         w.mWeightPtr = ptr;
         w.mHeight = 1;
-        w.mWidth = kWeightElems * sizeof(float);
+        w.mWidth = mWeightElems * sizeof(float);
         w.mPitch = w.mWidth;
         return w;
     }
 
+    size_t mWeightElems;
     std::vector<float*> mHostWeights;
     std::vector<float*> mSlots;
+    float* mBorrowed = nullptr;
 };
 
 size_t vmmGranularity()
@@ -833,6 +850,68 @@ TEST(BorrowedSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
     TLLM_CUDA_CHECK(cudaMemset(small.get(), 1, 2 * gran));
     TLLM_CUDA_CHECK(cudaMemset(huge.get(), 1, hugeBytes));
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+TEST(BorrowedSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
+{
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    auto& memory = BorrowedSlotMemory::getInstance();
+    auto freeDeviceBytes = []
+    {
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        size_t freeBytes = 0, totalBytes = 0;
+        TLLM_CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        return freeBytes;
+    };
+    // A first range settles what the driver keeps for the process.
+    memory.free(memory.allocate(gran, 2, {1}));
+    size_t const freeBefore = freeDeviceBytes();
+    auto const gpuBytes = MemoryCounters::getInstance().getGpu();
+    // Device bytes used since; under the 15 chunks of scratch, as the driver may keep some page tables.
+    auto leaked = [&]
+    {
+        size_t const now = freeDeviceBytes();
+        return now >= freeBefore ? 0 : freeBefore - now;
+    };
+
+    // The scratch is freed with the last range: freeing it gives back every byte, scratch included.
+    void* range = memory.allocate(gran, 2, {1});
+    EXPECT_LT(freeDeviceBytes(), freeBefore);
+    memory.free(range);
+    EXPECT_LT(leaked(), 4 * gran);
+
+    // Slots of three quarters of the free memory: slot 0 maps its own memory and slot 1 maps scratch before the
+    // memory of slot 2 fails to allocate. The failed allocation unmaps both and releases all the memory it made.
+    size_t const slotBytes = freeBefore / 4 * 3 / gran * gran;
+    EXPECT_THROW(memory.allocate(slotBytes, 3, {1}), tensorrt_llm::common::TllmException);
+    EXPECT_EQ(MemoryCounters::getInstance().getGpu(), gpuBytes);
+    EXPECT_LT(leaked(), 4 * gran);
+    // The same layout with slot 2 empty fits.
+    range = memory.allocate(slotBytes, 3, {1, 2});
+    TLLM_CUDA_CHECK(cudaMemset(range, 1, 3 * slotBytes));
+    memory.free(range);
+    EXPECT_EQ(MemoryCounters::getInstance().getGpu(), gpuBytes);
+    EXPECT_LT(leaked(), 4 * gran);
+}
+
+TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindABorrowedSlot)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    size_t const elems = 2 * gran / sizeof(float);
+    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*borrowSlot1=*/true);
+    setup.mLoadBalancer.restorePlacement({}, {{{0, -1}, {0, 1}, {2, 3}, {0, 1}}});
+
+    // Losing rank 2: expert 2 goes into the borrowed slot, which first gets its two chunks.
+    std::vector<std::vector<int>> const placement{{0, 2}, {3, 1}, {-1, -1}, {0, 1}};
+    EXPECT_EQ(setup.mLoadBalancer.restoreBackingBytes({placement}), static_cast<int64_t>(2 * gran));
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    EXPECT_EQ(setup.mLoadBalancer.restoreBackingBytes({placement}), 0);
+    EXPECT_EQ(setup.slotValue(1), 3.0f);
+    EXPECT_EQ(setup.slotValue(1, elems - 1), 3.0f);
+    EXPECT_EQ(setup.slotValue(0, elems - 1), 1.0f);
 }
 
 // Iteration control parameter structure

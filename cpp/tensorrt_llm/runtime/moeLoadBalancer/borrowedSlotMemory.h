@@ -33,13 +33,15 @@ namespace tensorrt_llm::runtime
 // Device storage for an EPLB slot tensor whose empty slots hold no device memory until a restore fills them.
 // The tensor is one virtual address range, tiled by mappings of whole chunks of the VMM granularity (the driver
 // maps only whole allocations). Each mapping is a CUDAVirtualMemoryChunk. The chunks that lie wholly inside empty
-// slots map scratch memory shared by the whole process (one allocation each of 1, 2, 4 and 8 chunks), so an access
-// that strays into an empty slot reads or writes scratch instead of faulting; back() maps device memory behind
-// them. CudaVirtualMemoryManager is not used: it releases and re-materializes whole allocations by tag, which
-// would leave holes under captured CUDA graphs, and it cannot swap the mapping of part of a range.
+// slots map scratch memory shared by every range of the process (one allocation each of 1, 2, 4 and 8 chunks, freed
+// with the last range), so an access that strays into an empty slot reads or writes scratch instead of faulting;
+// back() maps device memory behind them. CudaVirtualMemoryManager is not used: it releases and re-materializes whole
+// allocations by tag, which would leave holes under captured CUDA graphs, and it cannot swap the mapping of part of a
+// range.
 //
 // Every operation leaves the range fully mapped, even when a CUDA call fails: on an error, back() and
-// releasePending() map scratch over whatever they unmapped before rethrowing.
+// releasePending() map scratch over whatever they unmapped before rethrowing. A failed allocate() releases every
+// mapping, device memory and the address range it made.
 //
 // The instance is shared by every MoeLoadBalancer of the process, so the backing that back() maps is pending for
 // the owner that asked for it: keepPending() and releasePending() act on that owner's backing only.

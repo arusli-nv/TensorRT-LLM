@@ -147,6 +147,24 @@ def test_extra_slots_mode_rejects_an_unknown_mode(monkeypatch):
         extra_slots_mode()
 
 
+@pytest.mark.parametrize("ep_rank, borrowed", [(0, [1]), (2, [1])])
+def test_borrowed_mode_borrows_the_slots_that_empty_mode_empties(monkeypatch, ep_rank, borrowed):
+    """Before the weights move to their final storage, each layer learns its slots that will be empty."""
+    monkeypatch.setenv(EXTRA_SLOTS_ENV, "borrowed")
+    load_balancer = _load_balancer(_REDUNDANT, host_weights=True)
+    load_balancer.ep_rank = ep_rank
+    layer = load_balancer.single_layer_load_balancers[0]
+    layer.initial_weight_assignments = [expert for rank in _REDUNDANT for expert in rank]
+    with patch(
+        "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.peer_loss_recovery_enabled",
+        return_value=True,
+    ):
+        load_balancer.register_weight_slots_after_to_cuda()
+    assert layer.borrowed_slots == borrowed
+    # Borrowed slots are not host accessible: restores copy on the GPU.
+    load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_called_once_with(True)
+
+
 def test_with_host_weights_lost_experts_are_restored():
     load_balancer = _load_balancer(_SOLE_REPLICAS, host_weights=True)
     assert all(load_balancer.covers_loss_of([rank]) for rank in range(WORLD_SIZE))

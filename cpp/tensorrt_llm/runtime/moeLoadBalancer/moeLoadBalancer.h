@@ -85,6 +85,8 @@ public:
     virtual void finalizeWeights();
     virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) = 0;
     virtual bool hasHostWeights() const = 0;
+    // The device bytes of every weight of localSlotId.
+    void appendSlotRanges(int localSlotId, std::vector<BorrowedSlotMemory::Range>& ranges) const;
 
 protected:
     void finalizeWeightSlot();
@@ -211,6 +213,9 @@ private:
     void validatePlacement(
         std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
     void installPlacement(std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds);
+    // The device bytes of the local slots that installing rankExpertIds loads.
+    void appendLoadedSlotRanges(
+        std::vector<std::vector<int>> const& rankExpertIds, std::vector<BorrowedSlotMemory::Range>& ranges) const;
     // Rejects replica counts the captured routing kernel cannot serve (see routesEachExpertToOneSlot).
     void checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const;
 
@@ -327,6 +332,21 @@ public:
     bool quiesce(int64_t timeoutMs);
 
     // should bind to python
+    // Device memory that restorePlacement(layerRankExpertIds) must map behind the local slots it loads (borrowed
+    // slot storage, see BorrowedSlotMemory). Only while no iteration runs.
+    int64_t restoreBackingBytes(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
+
+    // should bind to python
+    // Maps that memory ahead of the restore; it stays reserved for the placement until restorePlacement installs
+    // it. Only while no iteration runs.
+    void backRestoredSlots(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
+
+    // should bind to python
+    // Returns the memory mapped for a placement that was never installed (a recovery that planned again); the
+    // device bytes freed. Only while no iteration runs.
+    int64_t releaseUninstalledBacking();
+
+    // should bind to python
     // Restart the layer update rotation from the update plan's first entry and clear every layer's load factors,
     // so ranks that ran different numbers of iterations update the same layers from the same statistics again.
     // Only while quiesced.
@@ -341,6 +361,9 @@ public:
 private:
     friend class SingleLayerMoeLoadBalancer;
     friend class HostMemoryMoeWeightUpdater;
+
+    std::vector<BorrowedSlotMemory::Range> loadedSlotRanges(
+        std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds) const;
 
     void startThreads();
 

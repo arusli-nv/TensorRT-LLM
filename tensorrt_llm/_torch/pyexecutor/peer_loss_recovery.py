@@ -63,10 +63,16 @@ FailureDomain = Tuple[int, ...]
 StepChange = Tuple[LlmRequest, int, LlmRequestState]
 _T = TypeVar("_T")
 _GATHER_HISTORY = 8
+# Free device memory left after borrowed slots are mapped: the KV cache rounds its quota to its chunk size per pool.
+_BORROW_MARGIN_BYTES = 256 << 20
 
 
 def _recovery_timeout_s() -> float:
     return float(os.environ.get(_RECOVERY_TIMEOUT_ENV, _RECOVERY_TIMEOUT_DEFAULT_S))
+
+
+def _free_device_bytes() -> int:
+    return torch.cuda.mem_get_info()[0]
 
 
 def _encode_placements(placements: List[np.ndarray]) -> str:
@@ -655,6 +661,9 @@ class PeerLossRecovery(RecoveryHook):
         # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery it cannot
         # complete reaches every survivor as Abort rather than as a timeout here.
         deadline = time.monotonic() + self._timeout_s
+        # A static placement needs nothing from the authority: its restore's memory is mapped while the authority
+        # gathers the survivors' Stopped.
+        placements = None if online else self._restore_placements(load_balancer, failed, None)
         proposal = client.wait(Propose, deadline)
         if (
             proposal.failed_ranks != failed_ranks
@@ -667,10 +676,9 @@ class PeerLossRecovery(RecoveryHook):
             )
         generation = proposal.generation
 
-        base = None
-        if online:
+        if placements is None:
             base = _decode_placements(proposal.base_placement, load_balancer.current_placements())
-        placements = load_balancer.recovery_placements(failed, base)
+            placements = self._restore_placements(load_balancer, failed, base)
         placement_digest = load_balancer.placement_digest(failed, placements)
         client.send(Ready(rank=rank, generation=generation, placement_digest=placement_digest))
         _expect_generation(client.wait(Install, deadline), generation)
@@ -709,6 +717,42 @@ class PeerLossRecovery(RecoveryHook):
             f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
             f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain and "
             "a further loss is not recoverable"
+        )
+
+    def _restore_placements(
+        self, load_balancer: "MoeLoadBalancer", failed: frozenset, base: Optional[List[np.ndarray]]
+    ) -> List[np.ndarray]:
+        """The placements to serve without ``failed``, with memory mapped behind the borrowed slots they load.
+
+        Before Ready, so a rank that cannot get the memory aborts the recovery before anything changes.
+        """
+        placements = load_balancer.recovery_placements(failed, base)
+        self._back_restored_slots(load_balancer, placements)
+        return placements
+
+    def _back_restored_slots(
+        self, load_balancer: "MoeLoadBalancer", placements: List[np.ndarray]
+    ) -> None:
+        """Map device memory behind the borrowed slots the restore loads, taken from the KV cache if need be."""
+        need = load_balancer.restore_backing_bytes(placements)
+        if not need:
+            return
+        start = time.monotonic()
+        short = need + _BORROW_MARGIN_BYTES - _free_device_bytes()
+        if short > 0:
+            # Memory the caching allocator holds for no tensor goes first (empty_cache synchronizes and is slow).
+            torch.cuda.empty_cache()
+            short = need + _BORROW_MARGIN_BYTES - _free_device_bytes()
+        if short > 0:
+            if not self._executor.shrink_kv_cache_quota(short):
+                raise RuntimeError(
+                    f"The KV cache could not give up {short} bytes for the restored expert slots"
+                )
+            logger.warning(f"Gave {short} bytes of the KV cache to the restored expert slots")
+        load_balancer.back_restored_slots(placements)
+        logger.info(
+            f"Mapped {need} bytes behind borrowed expert slots in "
+            f"{(time.monotonic() - start) * 1e3:.1f} ms"
         )
 
     def _join_device_work(self, deadline: float) -> None:

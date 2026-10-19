@@ -697,6 +697,20 @@ void SingleLayerMoeLoadBalancer::installPlacement(
     }
 }
 
+void SingleLayerMoeLoadBalancer::appendLoadedSlotRanges(
+    std::vector<std::vector<int>> const& rankExpertIds, std::vector<BorrowedSlotMemory::Range>& ranges) const
+{
+    auto const& current = mCpuPlacementInfo.oldRankExpertIds[mMetaInfo.epRank];
+    for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
+    {
+        int const expertId = rankExpertIds[mMetaInfo.epRank][localSlotId];
+        if (expertId != -1 && expertId != current[localSlotId])
+        {
+            mWeightUpdater->appendSlotRanges(localSlotId, ranges);
+        }
+    }
+}
+
 cudaStream_t SingleLayerMoeLoadBalancer::getStream() const
 {
     return mMoeLoadBalancer->mStream;
@@ -806,6 +820,15 @@ void MoeWeightUpdaterBase::addSingleWeightSlot(
             = tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().getHostPtr(weightSlot.mWeightPtr);
     }
     mWeightSlots[name][localSlotId] = weightSlot;
+}
+
+void MoeWeightUpdaterBase::appendSlotRanges(int localSlotId, std::vector<BorrowedSlotMemory::Range>& ranges) const
+{
+    for (auto const& [name, slots] : mWeightSlots)
+    {
+        auto const& slot = slots[localSlotId];
+        ranges.emplace_back(slot.mWeightPtr, (slot.mHeight - 1) * slot.mPitch + slot.mWidth);
+    }
 }
 
 void MoeWeightUpdaterBase::finalizeWeightSlot()
@@ -1233,6 +1256,7 @@ void MoeLoadBalancer::restorePlacement(
     {
         mLayers[i]->validatePlacement(candidateDeadRankMask, layerRankExpertIds[i]);
     }
+    BorrowedSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
     // Static placement never started the copy threads; start() is a no-op once they run.
     mMultiThreadWorker->start();
     for (size_t i = 0; i < mLayers.size(); ++i)
@@ -1243,6 +1267,43 @@ void MoeLoadBalancer::restorePlacement(
         std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
         mDeadRankMask = candidateDeadRankMask;
     }
+    // The memory mapped for this placement now serves it. If an install above throws, the recovery fails closed
+    // and the process ends, so the pending memory is never released under installed experts.
+    BorrowedSlotMemory::getInstance().keepPending(this);
+}
+
+std::vector<BorrowedSlotMemory::Range> MoeLoadBalancer::loadedSlotRanges(
+    std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds) const
+{
+    TLLM_CHECK_WITH_INFO(layerRankExpertIds.size() == mLayers.size(), "Got placements for %ld layers, expected %ld",
+        static_cast<long>(layerRankExpertIds.size()), static_cast<long>(mLayers.size()));
+    std::vector<BorrowedSlotMemory::Range> ranges;
+    for (size_t i = 0; i < mLayers.size(); ++i)
+    {
+        mLayers[i]->appendLoadedSlotRanges(layerRankExpertIds[i], ranges);
+    }
+    return ranges;
+}
+
+int64_t MoeLoadBalancer::restoreBackingBytes(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds)
+{
+    std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
+    TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot inspect slots while an iteration is active.");
+    return static_cast<int64_t>(BorrowedSlotMemory::getInstance().unbackedBytes(loadedSlotRanges(layerRankExpertIds)));
+}
+
+void MoeLoadBalancer::backRestoredSlots(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds)
+{
+    std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
+    TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot back slots while an iteration is active.");
+    BorrowedSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
+}
+
+int64_t MoeLoadBalancer::releaseUninstalledBacking()
+{
+    std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
+    TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot release slot memory while an iteration is active.");
+    return static_cast<int64_t>(BorrowedSlotMemory::getInstance().releasePending(this));
 }
 
 bool MoeLoadBalancer::quiesce(int64_t timeoutMs)

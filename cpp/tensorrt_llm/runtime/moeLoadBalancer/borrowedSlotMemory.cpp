@@ -66,7 +66,8 @@ struct MapConfigurator : CUDAVirtualMemoryChunk::Configurator
 };
 
 // Device memory created ahead of its mapping, so that a restore allocates everything before it unmaps anything.
-class DeviceMemory
+// It is the creator of its mapping, which releases it; memory that is never mapped is released with this object.
+class DeviceMemory : public CUDAVirtualMemoryChunk::Creator
 {
 public:
     DeviceMemory(CUmemAllocationProp const& prop, size_t size)
@@ -76,17 +77,10 @@ public:
         MemoryCounters::getInstance().allocate(MemoryType::kGPU, size);
     }
 
-    DeviceMemory(DeviceMemory&& other) noexcept
-        : mHandle(std::exchange(other.mHandle, 0))
-        , mSize(other.mSize)
-    {
-    }
-
     DeviceMemory(DeviceMemory const&) = delete;
     DeviceMemory& operator=(DeviceMemory const&) = delete;
-    DeviceMemory& operator=(DeviceMemory&&) = delete;
 
-    ~DeviceMemory()
+    ~DeviceMemory() override
     {
         if (mHandle != 0)
         {
@@ -95,38 +89,20 @@ public:
         }
     }
 
-    // The creator that owns the memory from now on.
-    CUDAVirtualMemoryChunk::CreatorPtr creator() &&
+    CUmemGenericAllocationHandle create() override
     {
-        return std::make_unique<Owner>(std::exchange(mHandle, 0), mSize);
+        TLLM_CHECK_WITH_INFO(mHandle != 0, "Borrowed slot memory is mapped once");
+        return mHandle;
+    }
+
+    void release(CUmemGenericAllocationHandle handle, bool) override
+    {
+        mHandle = 0;
+        MemoryCounters::getInstance().deallocate(MemoryType::kGPU, mSize);
+        TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
     }
 
 private:
-    struct Owner : CUDAVirtualMemoryChunk::Creator
-    {
-        Owner(CUmemGenericAllocationHandle handle, size_t size)
-            : mHandle(handle)
-            , mSize(size)
-        {
-        }
-
-        CUmemGenericAllocationHandle create() override
-        {
-            TLLM_CHECK_WITH_INFO(mHandle != 0, "Borrowed slot memory is mapped once");
-            return mHandle;
-        }
-
-        void release(CUmemGenericAllocationHandle handle, bool) override
-        {
-            mHandle = 0;
-            MemoryCounters::getInstance().deallocate(MemoryType::kGPU, mSize);
-            TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
-        }
-
-        CUmemGenericAllocationHandle mHandle;
-        size_t mSize;
-    };
-
     CUmemGenericAllocationHandle mHandle = 0;
     size_t mSize;
 };
@@ -300,15 +276,18 @@ void* BorrowedSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<
         prop.location.id = device;
         size_t granularity = 0;
         TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        mGranularity = granularity;
+        mDevice = device;
+    }
+    if (mScratch.empty())
+    {
         // Every scratch size up front, so that a restore needs no memory beyond what unbackedBytes() reports.
         std::map<size_t, std::shared_ptr<Scratch>> scratch;
         for (size_t chunks = 1; chunks <= kMaxScratchChunks; chunks *= 2)
         {
-            scratch.emplace(chunks, std::make_shared<Scratch>(prop, chunks * granularity));
+            scratch.emplace(chunks, std::make_shared<Scratch>(allocationProp(), chunks * mGranularity));
         }
         mScratch = std::move(scratch);
-        mGranularity = granularity;
-        mDevice = device;
     }
     std::vector<bool> empty(slotCount, false);
     for (int slot : emptySlots)
@@ -355,7 +334,7 @@ void* BorrowedSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<
             {
                 allocation.pieces.emplace(chunk,
                     mapPiece(base + chunk * mGranularity, run - chunk,
-                        DeviceMemory(prop, (run - chunk) * mGranularity).creator(), /*scratch=*/false,
+                        std::make_unique<DeviceMemory>(prop, (run - chunk) * mGranularity), /*scratch=*/false,
                         /*pendingOwner=*/nullptr));
             }
             chunk = run;
@@ -374,6 +353,10 @@ void* BorrowedSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<
             {
                 TLLM_LOG_ERROR("Unmapping borrowed slot memory after a failed allocation failed: %s", error.what());
             }
+        }
+        if (mAllocations.empty())
+        {
+            mScratch.clear();
         }
         throw;
     }
@@ -402,6 +385,11 @@ void BorrowedSlotMemory::free(void* ptr) noexcept
         }
     }
     mAllocations.erase(it);
+    if (mAllocations.empty())
+    {
+        // The last mapping of the scratch is gone: release it too.
+        mScratch.clear();
+    }
 }
 
 std::map<CUdeviceptr, std::vector<size_t>> BorrowedSlotMemory::unbackedChunks(std::vector<Range> const& ranges) const
@@ -467,7 +455,7 @@ void BorrowedSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
         CUdeviceptr base;
         size_t first;
         size_t count;
-        DeviceMemory memory;
+        std::unique_ptr<DeviceMemory> memory;
     };
 
     std::vector<Run> runs;
@@ -476,7 +464,7 @@ void BorrowedSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
     {
         for (auto const& [first, count] : runsOf(chunks))
         {
-            runs.push_back({base, first, count, DeviceMemory(prop, count * mGranularity)});
+            runs.push_back({base, first, count, std::make_unique<DeviceMemory>(prop, count * mGranularity)});
         }
     }
 
@@ -498,7 +486,7 @@ void BorrowedSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
                 piece = allocation.pieces.erase(piece);
             }
             allocation.pieces.emplace(run.first,
-                mapPiece(run.base + run.first * mGranularity, run.count, std::move(run.memory).creator(),
+                mapPiece(run.base + run.first * mGranularity, run.count, std::move(run.memory),
                     /*scratch=*/false, owner));
             mapScratch(run.base, allocation, lo, run.first - lo);
             mapScratch(run.base, allocation, run.first + run.count, hi - run.first - run.count);

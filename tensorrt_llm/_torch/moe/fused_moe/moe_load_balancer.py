@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ctypes
 import gc
 import hashlib
 import os
@@ -26,18 +27,67 @@ from tensorrt_llm.mapping import Mapping
 
 # "empty": under WideEP peer-loss recovery, EPLB slots beyond one per expert
 # are not routed to while healthy and receive a lost rank's experts;
+# "borrowed": as "empty", and those slots hold no device memory until a
+# restore loads them (the KV cache can use it meanwhile);
 # "replicas": they keep serving replicas (a loss reroutes to them, or restores
 # into them).
 EXTRA_SLOTS_ENV = "TLLM_FAULT_TOLERANCE_EXTRA_SLOTS"
 
 
 def extra_slots_mode() -> str:
-    """The ``TLLM_FAULT_TOLERANCE_EXTRA_SLOTS`` mode: ``replicas`` (default) or ``empty``."""
+    """The ``TLLM_FAULT_TOLERANCE_EXTRA_SLOTS`` mode: ``replicas`` (default), ``empty`` or ``borrowed``."""
     mode = os.environ.get(EXTRA_SLOTS_ENV, "replicas")
-    if mode not in ("replicas", "empty"):
+    if mode not in ("replicas", "empty", "borrowed"):
         raise ValueError(
-            f"{EXTRA_SLOTS_ENV} must be 'replicas' or 'empty', got {mode!r}")
+            f"{EXTRA_SLOTS_ENV} must be 'replicas', 'empty' or 'borrowed', got {mode!r}"
+        )
     return mode
+
+
+# madvise(2) advice that builds this process's page-table entries for resident pages (Linux 5.14+).
+_MADV_POPULATE_READ = 22
+
+
+def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
+    """Map the pages of host copies that other local ranks wrote, off the startup path.
+
+    Without it, the first copy from a segment page-faults on every page: a
+    restore's GPU copies of 1.4 GB took ~400 ms instead of ~35 ms. Best effort:
+    older kernels reject the advice and the faults come back.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    spans = [(np.frombuffer(segment.buf,
+                            dtype=np.uint8).ctypes.data, segment.size)
+             for segment in segments]
+
+    def populate() -> None:
+        for address, size in spans:
+            if libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(size),
+                            _MADV_POPULATE_READ):
+                logger.debug("Prefaulting EPLB host copies failed: "
+                             f"{os.strerror(ctypes.get_errno())}")
+                return
+
+    threading.Thread(target=populate,
+                     name="eplb_host_copy_populate",
+                     daemon=True).start()
+
+
+def _without_replicas(placement: np.ndarray) -> np.ndarray:
+    """``placement`` ([ep_size, slots_per_rank] expert ids) with -1 for every replica beyond an expert's first.
+
+    The kept replica is the one with the lowest local slot (an expert's home
+    slot), ties to the lowest rank.
+    """
+    placement = placement.copy()
+    seen = set()
+    for slot, rank in np.ndindex(placement.shape[::-1]):
+        expert = int(placement[rank, slot])
+        if expert in seen:
+            placement[rank, slot] = -1
+        elif expert >= 0:
+            seen.add(expert)
+    return placement
 
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
@@ -294,6 +344,7 @@ class HostMoeTensorSharer:
                 add_host_weight_fn(key[0], key[1], t)
 
         self.host_weights.clear()
+        _populate_in_background(self.imported_shms)
 
     def pre_shutdown_cleanup(self):
         """
@@ -356,6 +407,9 @@ class SingleLayerMoeLoadBalancer:
             shared_mpi_comm) if self.host_copies else None
         self.register_weight_fns = []
         self.to_migrate_weight_fns = []
+        # Local slots whose storage maps no memory until a restore (borrowed extra slots), or None.
+        self.borrowed_slots: Optional[List[int]] = None
+        self.initial_weight_assignments: Optional[List[int]] = None
 
         shared_rank = shared_mpi_comm.Get_rank()
         shared_size = shared_mpi_comm.Get_size()
@@ -496,6 +550,7 @@ class SingleLayerMoeLoadBalancer:
         """
         self.single_layer_load_balancer_impl.set_initial_weight_assignments(
             initial_weight_assignments)
+        self.initial_weight_assignments = list(initial_weight_assignments)
 
     def add_to_migrate_weight_fn(self,
                                  fn: Callable,
@@ -514,7 +569,11 @@ class SingleLayerMoeLoadBalancer:
         self.register_weight_fns.append((fn, args, kwargs))
 
     def make_tensor_host_accessible(self, wt: torch.Tensor):
-        torch.ops.trtllm.migrate_to_host_accessible(wt)
+        if self.borrowed_slots is None:
+            torch.ops.trtllm.migrate_to_host_accessible(wt)
+        else:
+            # Restores load these slots with GPU copies, so they need not be host accessible.
+            torch.ops.trtllm.moe_borrow_slot_storage(wt, self.borrowed_slots)
         torch.cuda.empty_cache()
 
     def register_weight_slots_after_to_cuda(self):
@@ -947,8 +1006,26 @@ class MoeLoadBalancer:
         """
         Register weights after model has been moved to cuda, should be invoked after model.to("cuda") and before finalize_model.
         """
+        if peer_loss_recovery_enabled() and extra_slots_mode() in (
+                "empty", "borrowed") and not self.is_static_routing():
+            raise ValueError(
+                f"{EXTRA_SLOTS_ENV}={extra_slots_mode()} needs a static EPLB placement; online EPLB fills the "
+                "extra slots")
+        if self._borrows_extra_slots():
+            # Borrowed slots are not host accessible: restores copy on the GPU.
+            self.set_use_gpu_memcpy(True)
+            for layer in self.single_layer_load_balancers:
+                placement = np.asarray(layer.initial_weight_assignments,
+                                       dtype=np.int32).reshape(
+                                           self.ep_size, -1)
+                own = _without_replicas(placement)[self.ep_rank]
+                layer.borrowed_slots = np.flatnonzero(own < 0).tolist()
         for layer in self.single_layer_load_balancers:
             layer.register_weight_slots_after_to_cuda()
+
+    def _borrows_extra_slots(self) -> bool:
+        return (peer_loss_recovery_enabled()
+                and extra_slots_mode() == "borrowed")
 
     def finalize_model(self):
         """
@@ -962,11 +1039,8 @@ class MoeLoadBalancer:
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
-        if peer_loss_recovery_enabled() and extra_slots_mode() == "empty":
-            if not self.is_static_routing():
-                raise ValueError(
-                    f"{EXTRA_SLOTS_ENV}=empty needs a static EPLB placement; online EPLB fills the extra slots"
-                )
+        if peer_loss_recovery_enabled() and extra_slots_mode() in ("empty",
+                                                                   "borrowed"):
             # Before warmup, so autotuning and CUDA graph capture see the
             # healthy routing.
             emptied = self.empty_replica_slots()
@@ -1089,6 +1163,24 @@ class MoeLoadBalancer:
             digest.update(placement.tobytes())
         return digest.hexdigest()
 
+    def restore_backing_bytes(self, placements: List[np.ndarray]) -> int:
+        """Device memory that installing ``placements`` maps behind borrowed slots (0 without them)."""
+        return self.load_balancer_impl.restore_backing_bytes(
+            [placement.tolist() for placement in placements])
+
+    def back_restored_slots(self, placements: List[np.ndarray]) -> None:
+        """Map device memory behind the borrowed slots that installing ``placements`` loads.
+
+        All or nothing: raises if the memory cannot be allocated. Only while no
+        iteration runs.
+        """
+        self.load_balancer_impl.back_restored_slots(
+            [placement.tolist() for placement in placements])
+
+    def release_uninstalled_backing(self) -> int:
+        """Unmap what ``back_restored_slots`` mapped for placements never installed; the bytes freed."""
+        return self.load_balancer_impl.release_uninstalled_backing()
+
     def install_recovery_placement(self, dead_ranks: Iterable[int],
                                    placements: List[np.ndarray]) -> None:
         """Serve with ``placements`` (from ``recovery_placements``) without ``dead_ranks``.
@@ -1118,23 +1210,16 @@ class MoeLoadBalancer:
         """Stop routing to every replica beyond an expert's first, leaving those slots empty for restores.
 
         Routing then uses one slot per expert, as a placement without spare
-        slots does; the slot buffers stay allocated (CUDA graphs keep their
-        addresses). The kept replica is the one with the lowest local slot
-        (an expert's home slot), ties to the lowest rank. Needs host copies,
-        to fill the slots later. Returns the number of slots emptied.
+        slots does; the slot buffers keep their addresses (CUDA graphs
+        captured them; borrowed slots map no memory). Which replica stays:
+        ``_without_replicas``. Needs host copies, to fill the slots later.
+        Returns the number of slots emptied.
         """
-        placements = []
-        for layer in self.single_layer_load_balancers:
-            placement = np.asarray(layer.get_old_rank_expert_ids(),
-                                   dtype=np.int32)
-            seen = set()
-            for slot, rank in np.ndindex(placement.shape[::-1]):
-                expert = int(placement[rank, slot])
-                if expert in seen:
-                    placement[rank, slot] = -1
-                elif expert >= 0:
-                    seen.add(expert)
-            placements.append(placement)
+        placements = [
+            _without_replicas(
+                np.asarray(layer.get_old_rank_expert_ids(), dtype=np.int32))
+            for layer in self.single_layer_load_balancers
+        ]
         emptied = sum(int((p < 0).sum()) for p in placements)
         if emptied:
             self.load_balancer_impl.restore_placement(

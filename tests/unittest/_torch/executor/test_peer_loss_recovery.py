@@ -94,6 +94,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
     ]
     engine = Mock()
     engine.moe_load_balancer.recovery_placements.return_value = ["placement"]
+    engine.moe_load_balancer.restore_backing_bytes.return_value = 0
     engine.moe_load_balancer.placement_digest.return_value = "digest"
     engine.moe_load_balancer.install_recovery_placement.side_effect = (
         lambda failed, placements: events.append(("placement", frozenset(failed)))
@@ -164,6 +165,36 @@ def test_recovery_runs_protocol_and_installs_in_order():
     # The placements installed are the ones whose digest went out with Ready.
     load_balancer.placement_digest.assert_called_once_with(failed, ["placement"])
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
+
+
+def test_borrowed_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypatch):
+    """Borrowed slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
+    recovery = _recovery(_FakeClient([]))
+    executor = recovery._executor
+    executor.shrink_kv_cache_quota = Mock(return_value=True)
+    load_balancer = Mock()
+    need = 1 << 30
+    load_balancer.restore_backing_bytes.return_value = need
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: 4 << 30)
+    recovery._back_restored_slots(load_balancer, ["placement"])
+    executor.shrink_kv_cache_quota.assert_not_called()
+    load_balancer.back_restored_slots.assert_called_once_with(["placement"])
+
+    free = 512 << 20
+    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: free)
+    recovery._back_restored_slots(load_balancer, ["placement"])
+    executor.shrink_kv_cache_quota.assert_called_once_with(
+        need + peer_loss_recovery._BORROW_MARGIN_BYTES - free
+    )
+
+    # A KV cache that cannot shrink ends the recovery before any slot changes.
+    executor.shrink_kv_cache_quota.return_value = False
+    load_balancer.back_restored_slots.reset_mock()
+    with pytest.raises(RuntimeError, match="could not give up"):
+        recovery._back_restored_slots(load_balancer, ["placement"])
+    load_balancer.back_restored_slots.assert_not_called()
 
 
 def test_kv_cache_quota_cut_suspends_the_active_caches_around_the_resize():

@@ -48,7 +48,7 @@ every other request continues.
 | `TLLM_FAULT_TOLERANCE_AUTHORITY` | The authority's address; required to recover |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key (64 hex characters) for authority messages |
 | `TLLM_FAULT_TOLERANCE_RECOVERY_TIMEOUT_S` | How long a recovery may take before the job stops (default 30) |
-| `TLLM_FAULT_TOLERANCE_EXTRA_SLOTS` | EPLB slots beyond one per expert: `replicas` (default) serve replicas; `empty` are not routed to while healthy and take a lost rank's experts |
+| `TLLM_FAULT_TOLERANCE_EXTRA_SLOTS` | EPLB slots beyond one per expert: `replicas` (default) serve replicas; `empty` are not routed to while healthy and take a lost rank's experts; `borrowed` are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it); `empty` and `borrowed` need a static EPLB placement |
 | `TLLM_FAULT_TOLERANCE_HANG_DETECTION=1` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (set on workers and authority) |
 | `TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S` | How long the evidence of a hang must hold before it is confirmed (default 30; above the slowest legitimate step) |
 | `TLLM_FAULT_TOLERANCE_HANG_SUSPECT_S`, `TLLM_FAULT_TOLERANCE_HEARTBEAT_S` | Device wait reported after (default 2 s); heartbeat interval (default 1 s) |
