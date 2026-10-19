@@ -286,7 +286,16 @@ def fused_moe(
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
     swiglu_clamp_after_silu: bool = False,
+    input_source_tokens: int = 0,
+    input_slot_tokens: int = 0,
 ) -> List[torch.Tensor]:
+    """Cutlass fused MoE.
+
+    With ``input_source_tokens`` > 0 the rows of ``input`` are fixed per-source
+    slots of ``input_slot_tokens`` rows (WideEP dispatch receive slots): routing
+    token ``s * input_source_tokens + i`` reads input row
+    ``s * input_slot_tokens + i``. The routing and the output are in token order.
+    """
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -297,7 +306,8 @@ def fused_moe(
     else:
         assert tuner_num_tokens is None
         assert tuner_top_k is None
-        tuner_input = input
+        # Profiling needs the token count only; source slots hold more rows.
+        tuner_input = input[:token_selected_experts.size(0)]
         tuner_top_k = token_selected_experts.size(1)
 
     # allocate workspace for profiling
@@ -352,6 +362,10 @@ def fused_moe(
 
     lora_active = (fc1_lora_ranks is not None) or (fc1_slot_lora_ranks
                                                    is not None)
+    if input_source_tokens and (min_latency_mode or lora_active):
+        raise RuntimeError(
+            "Input rows in source slots are not supported in min-latency mode or with LoRA."
+        )
     if min_latency_mode and lora_active:
         # Mirror the C++ rejection so the error surfaces before the kernel allocates anything.
         raise RuntimeError(
@@ -387,6 +401,8 @@ def fused_moe(
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
     run_moe_args.append(swiglu_clamp_after_silu)
+    if not min_latency_mode:
+        run_moe_args += [input_source_tokens, input_slot_tokens]
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:
@@ -461,8 +477,10 @@ def _(input: torch.Tensor,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       token_to_slot: Optional[torch.Tensor] = None,
-      swiglu_clamp_after_silu: bool = False):
-    seq_len = input.shape[0]
+      swiglu_clamp_after_silu: bool = False,
+      input_source_tokens: int = 0,
+      input_slot_tokens: int = 0):
+    seq_len = token_selected_experts.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
         # fc2_expert_weights: [num_experts, inter_size, hidden_size]

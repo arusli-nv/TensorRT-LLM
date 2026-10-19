@@ -955,6 +955,12 @@ class CutlassFusedMoE(MoEImplBase):
     def supports_moe_output_in_alltoall_workspace(self):
         return True
 
+    def supports_dispatch_receive_slots(self) -> bool:
+        # The unquantized path (for example a BF16 MTP layer) reads its input
+        # rows in one place, the row expansion, which maps each token to its
+        # slot row; the routing it sorts and finalizes is compact.
+        return not self.has_any_quant and not self._moe_lora_enabled
+
     def _tuner_shapes(
         self,
         ctx: MoERunContext,
@@ -1081,6 +1087,12 @@ class CutlassFusedMoE(MoEImplBase):
         lora_kwargs = self._extract_moe_lora_tensors(lora_params)
         if lora_kwargs is None:
             lora_kwargs = {}
+        # Under WideEP peer-loss recovery x is the dispatch receive slots.
+        source_slot_kwargs = {}
+        if plan.source_slots is not None:
+            source_slot_kwargs = dict(
+                input_source_tokens=plan.source_slots.source_tokens,
+                input_slot_tokens=plan.source_slots.slot_tokens)
 
         result = torch.ops.trtllm.fused_moe(
             x,
@@ -1130,6 +1142,7 @@ class CutlassFusedMoE(MoEImplBase):
             # (per-tensor FP8 otherwise).
             use_mxfp8_weight_scaling=self.has_mxfp8,
             **lora_kwargs,
+            **source_slot_kwargs,
         )
         # When moe_output is provided, the result is written in-place and
         # fused_moe returns empty list to avoid aliasing constraint violation.

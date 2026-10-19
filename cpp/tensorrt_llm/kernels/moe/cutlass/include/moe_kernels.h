@@ -250,6 +250,21 @@ struct MOEParallelismConfig
     }
 };
 
+//! Input rows held in fixed per-source slots, as the MoE all-to-all dispatch receives them under WideEP fault
+//! tolerance: routing token t = s * sourceTokens + i reads input row s * slotTokens + i. sourceTokens == 0: the input
+//! rows are the routing tokens.
+struct MoeInputSourceSlots
+{
+    int64_t sourceTokens = 0;
+    int64_t slotTokens = 0;
+
+    //! The input row of routing token \p token.
+    __host__ __device__ int64_t inputRow(int64_t token) const
+    {
+        return sourceTokens > 0 ? token + token / sourceTokens * (slotTokens - sourceTokens) : token;
+    }
+};
+
 enum class MoeGemmId : int
 {
     Undefined = 0,
@@ -546,7 +561,7 @@ public:
         int const experts_per_token, char* workspace_ptr, void* final_output, int* unpermuted_row_to_permuted_row,
         MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
         bool use_deepseek_fp8_block_scale, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
-        cudaStream_t stream)
+        cudaStream_t stream, MoeInputSourceSlots input_source_slots)
         = 0;
 
     // Aliases for profiling the gemms
@@ -715,7 +730,7 @@ public:
         int const experts_per_token, char* workspace_ptr, void* final_output, int* unpermuted_row_to_permuted_row,
         MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
         bool use_deepseek_fp8_block_scale, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
-        cudaStream_t stream) override;
+        cudaStream_t stream, MoeInputSourceSlots input_source_slots) override;
 
     // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
     static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,

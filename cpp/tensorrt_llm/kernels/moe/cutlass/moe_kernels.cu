@@ -1396,7 +1396,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
     float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
-    int64_t const num_experts_per_node, InputActivationsType const* prequant_scales = nullptr)
+    int64_t const num_experts_per_node, InputActivationsType const* prequant_scales,
+    MoeInputSourceSlots const input_source_slots)
 {
     static_assert(BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE || !PRE_QUANT_AWQ,
         "AWQ and Block Scaling are mutually exclusive");
@@ -1456,8 +1457,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         int64_t const source_k_rank = unpermuted_row / num_tokens;
         int64_t const source_row = unpermuted_row % num_tokens;
 
-        auto const* source_row_ptr
-            = reinterpret_cast<DataElem const*>(unpermuted_input + source_row * hidden_size / ELEM_PER_BYTE);
+        auto const* source_row_ptr = reinterpret_cast<DataElem const*>(
+            unpermuted_input + input_source_slots.inputRow(source_row) * hidden_size / ELEM_PER_BYTE);
         // Cast first to handle when this is FP4
         auto* dest_row_ptr
             = reinterpret_cast<OutputElem*>(permuted_output) + permuted_row * hidden_size / ELEM_PER_THREAD;
@@ -1604,8 +1605,11 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     int const num_experts_per_node, QuantParams const& quant_params, bool use_per_expert_act_scale,
     int64_t* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
-    void const* prequant_scales, cudaStream_t stream)
+    void const* prequant_scales, cudaStream_t stream, MoeInputSourceSlots input_source_slots)
 {
+    // Input scales are laid out for input rows that are the routing tokens.
+    TLLM_CHECK_WITH_INFO(input_source_slots.sourceTokens == 0 || input_sf == nullptr,
+        "Input rows in source slots cannot carry input scaling factors");
 #ifdef ENABLE_FP4
     TLLM_CHECK_WITH_INFO(
         (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) || !use_per_expert_act_scale,
@@ -1684,7 +1688,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
         permuted_row_to_unpermuted_row, num_rows, hidden_size, k, quant_params.fp4.fc1.act_global_scale,
         use_per_expert_act_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
-        num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales));
+        num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales), input_source_slots);
 }
 
 struct Fp8BlockScaleActOutput
@@ -1757,7 +1761,7 @@ void padEmptyFp8BlockScaleMoeInput(T* permuted_input, int64_t const* expert_firs
         QuantParams const& quant_params, bool use_per_expert_act_scale, int64_t* expert_first_token_offset,            \
         TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                                                \
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,                   \
-        void const* prequant_scales, cudaStream_t stream)
+        void const* prequant_scales, cudaStream_t stream, MoeInputSourceSlots input_source_slots)
 
 // Instantiate the data types that are used by the external pytorch op
 INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
@@ -4399,7 +4403,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int const experts_per_token, char* workspace_ptr, void* final_output_void, int* unpermuted_row_to_permuted_row,
     MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
     bool use_deepseek_fp8_block_scale, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
-    cudaStream_t stream)
+    cudaStream_t stream, MoeInputSourceSlots input_source_slots)
 {
     static constexpr bool int_scales_required
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value || use_wfp4a16;
@@ -4440,6 +4444,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     TLLM_CHECK(unpermuted_row_to_permuted_row);
     TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
     TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
+    // Only the plain row expansion reads the input through the source-slot remap.
+    TLLM_CHECK_WITH_INFO(input_source_slots.sourceTokens == 0
+            || (!min_latency_mode && !use_lora && !use_w4afp8 && !use_fused_block_scale_quant && input_sf == nullptr),
+        "Input rows in source slots need the plain row expansion: no min-latency mode, LoRA, W4AFP8, fused FP8 "
+        "block-scale quantization or input scaling factors");
 
     if (quant_params.mxfpxActFc1WeightScale())
     {
@@ -4672,7 +4681,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size, experts_per_token,
                 num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
                 fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
-                (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
+                (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr, stream,
+                input_source_slots);
         }
 
         int64_t* gemm_expert_first_token_offset = expert_first_token_offset_;

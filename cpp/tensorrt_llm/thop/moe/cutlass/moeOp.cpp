@@ -558,7 +558,10 @@ public:
         torch::optional<torch::Tensor> const& gated_slot_lora_ranks = torch::nullopt,
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs = torch::nullopt,
         torch::optional<torch::Tensor> const& token_to_slot = torch::nullopt,
-        bool const swiglu_clamp_after_silu = false)
+        bool const swiglu_clamp_after_silu = false,
+        // Input rows in fixed per-source slots (WideEP fault tolerance): routing token s * input_source_tokens + i
+        // is input row s * input_slot_tokens + i. 0: the input rows are the routing tokens.
+        int64_t const input_source_tokens = 0, int64_t const input_slot_tokens = 0)
     {
         EagerMoeWorkspaceScope::registerCurrent(this, input.get_device());
         std::lock_guard<std::mutex> lock(mMutex);
@@ -614,12 +617,25 @@ public:
                 "fc2_expert_biases should match fc2_expert_weights output shape.");
         }
 
-        TORCH_CHECK(input.sizes()[0] == token_selected_experts.sizes()[0],
-            "input and token_selected_experts must have the same num tokens.");
+        int64_t const num_rows = token_selected_experts.sizes()[0];
+        if (input_source_tokens > 0)
+        {
+            TORCH_CHECK(input_source_tokens <= input_slot_tokens && num_rows % input_source_tokens == 0,
+                "Input source slots need 0 < input_source_tokens <= input_slot_tokens and whole sources.");
+            TORCH_CHECK(input.sizes()[0] == num_rows / input_source_tokens * input_slot_tokens,
+                "input must hold one slot of input_slot_tokens rows per source.");
+            TORCH_CHECK(!input_sf.has_value(), "Input rows in source slots cannot carry input scaling factors.");
+        }
+        else
+        {
+            TORCH_CHECK(input_slot_tokens == 0, "input_slot_tokens needs input_source_tokens.");
+            TORCH_CHECK(
+                input.sizes()[0] == num_rows, "input and token_selected_experts must have the same num tokens.");
+        }
         if (token_final_scales)
         {
             TORCH_CHECK(token_final_scales.value().dim() == 2, "token_selected_experts_probs must be 2D.");
-            TORCH_CHECK(input.sizes()[0] == token_final_scales.value().sizes()[0],
+            TORCH_CHECK(num_rows == token_final_scales.value().sizes()[0],
                 "input and token_selected_experts_probs must have the same num tokens.");
             TORCH_CHECK(token_selected_experts.sizes()[1] == token_final_scales.value().sizes()[1],
                 "token_selected_experts and token_final_scales must have the same number of experts per token.");
@@ -662,7 +678,6 @@ public:
         }
 
         int experts_per_token = token_selected_experts.sizes()[1];
-        int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         if (mUseINT8WoqPerChannel)
@@ -865,8 +880,10 @@ public:
             unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, lora_active,
-            lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream,
+            kernels::MoeInputSourceSlots{input_source_tokens, input_slot_tokens});
 #else
+        TORCH_CHECK(input_source_tokens == 0, "Input rows in source slots need the OSS Cutlass MoE runner.");
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
@@ -1096,7 +1113,7 @@ public:
             unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream, /*input_source_slots=*/{});
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,

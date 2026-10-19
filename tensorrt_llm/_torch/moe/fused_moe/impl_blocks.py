@@ -87,8 +87,9 @@ class MoEExecutionContractMixin:
     def supports_dispatch_receive_slots(self) -> bool:
         """Whether ``run_moe`` can read NVLinkOneSided's fixed receive slots in place.
 
-        WideEP peer-loss recovery hands the experts the receive slots instead
-        of a compact copy, and refuses backends that answer ``False``.
+        WideEP peer-loss recovery hands the experts the receive slots, or a
+        compact copy of the hidden states (and scales) to backends that answer
+        ``False``.
         """
         return False
 

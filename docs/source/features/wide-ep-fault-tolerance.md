@@ -12,8 +12,8 @@ had delivered nothing yet, else end with a retryable error; every other request 
   KV Cache Manager V2 or its DSA sparse-attention variant (KV block reuse is supported: a step's context blocks become reusable only once the step
   is accepted, so an interrupted step publishes none), the default attention-DP router.
 - NVLinkOneSided all-to-all. The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`)
-  reads the receive slots in place; layers on other backends (for example a BF16 MTP layer) get a compact
-  copy of their hidden states.
+  and the Cutlass backend for unquantized layers without LoRA (for example a BF16 MTP layer) read the receive
+  slots in place; layers on other backends get a compact copy of their hidden states.
 - An EPLB load balancer (`moe_config.load_balancer` with `num_slots` above the number of experts), static
   (`layer_updates_per_iter: 0`) or online. Host copies of the experts in `/dev/shm` restore the experts of a
   lost rank into extra slots; rank 0 is never recoverable. Online EPLB keeps every expert's copy on every node; the

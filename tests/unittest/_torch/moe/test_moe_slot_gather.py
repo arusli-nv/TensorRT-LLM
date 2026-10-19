@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FC1 reads the dispatch receive slots in place exactly as it reads a compact copy.
+"""The MoE backends read the dispatch receive slots in place exactly as they read a compact copy.
 
-Under WideEP peer-loss recovery NVLinkOneSided hands the CuteDSL NVFP4 experts its fixed
-receive slots (source s's token i at row s * capacity + i) instead of a compact copy
-(row s * runtime_rows + i); the FC1 gather kernel maps each token to its slot row.
+Under WideEP peer-loss recovery NVLinkOneSided hands the experts its fixed receive slots
+(source s's token i at row s * capacity + i) instead of a compact copy (row s * runtime_rows + i);
+the CuteDSL NVFP4 FC1 gather and the Cutlass row expansion map each token to its slot row.
 """
 
 import pytest
@@ -93,3 +93,74 @@ def test_fc1_reads_the_receive_slots_like_a_compact_copy() -> None:
     torch.testing.assert_close(
         slot_c_sf.view(torch.uint8)[:valid_sf], c_sf.view(torch.uint8)[:valid_sf], rtol=0, atol=0
     )
+
+
+def _cutlass_bf16(inputs, experts, weights, w3_w1, w2, use_fused_finalize, **slots):
+    (out,) = torch.ops.trtllm.fused_moe(
+        inputs,
+        experts,
+        weights,
+        w3_w1,
+        None,
+        w2,
+        None,
+        torch.bfloat16,
+        quant_scales=[],
+        use_fused_finalize=use_fused_finalize,
+        **slots,
+    )
+    return out
+
+
+@pytest.mark.parametrize("use_fused_finalize", [False, True])
+@pytest.mark.parametrize("capacity", [_RUNTIME, _CAPACITY])
+def test_cutlass_reads_bf16_hidden_states_in_the_receive_slots(
+    use_fused_finalize: bool, capacity: int
+) -> None:
+    """The Cutlass MoE expands each token's input row from its source's slot."""
+    torch.manual_seed(0)
+    tokens, hidden, inter_size, num_experts, top_k = _EP * _RUNTIME, 256, 128, 8, 2
+    experts = torch.randint(0, num_experts, (tokens, top_k), dtype=torch.int32, device="cuda")
+    experts.view(_EP, _RUNTIME, top_k)[1, _RUNTIME // 2 :] = -1  # rows a source did not send
+    experts.view(_EP, _RUNTIME, top_k)[3] = -1  # a source that sent nothing
+    weights = torch.rand(tokens, top_k, dtype=torch.float32, device="cuda")
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    # The slots hold every source's sent rows at a fixed offset; rows no token reads are NaN.
+    slot_x = torch.full((_EP * capacity, hidden), float("nan"), dtype=torch.bfloat16, device="cuda")
+    slot_view, x_view = slot_x.view(_EP, capacity, hidden), x.view(_EP, _RUNTIME, hidden)
+    for source, sent in enumerate((_RUNTIME, _RUNTIME // 2, _RUNTIME, 0)):
+        slot_view[source, :sent] = x_view[source, :sent]
+    w3_w1 = (
+        torch.randn(num_experts, 2 * inter_size, hidden, dtype=torch.bfloat16, device="cuda") / 16
+    )
+    w2 = torch.randn(num_experts, hidden, inter_size, dtype=torch.bfloat16, device="cuda") / 16
+
+    expected = _cutlass_bf16(x, experts, weights, w3_w1, w2, use_fused_finalize)
+    actual = _cutlass_bf16(
+        slot_x,
+        experts,
+        weights,
+        w3_w1,
+        w2,
+        use_fused_finalize,
+        input_source_tokens=_RUNTIME,
+        input_slot_tokens=capacity,
+    )
+    assert not actual.isnan().any()
+    if use_fused_finalize:
+        # The fused finalize may add a row's contributions in another order.
+        torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=1e-2)
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_cutlass_rejects_inconsistent_input_slots() -> None:
+    experts = torch.zeros((8, 1), dtype=torch.int32, device="cuda")
+    weights = torch.ones((8, 1), dtype=torch.float32, device="cuda")
+    x = torch.zeros((12, 128), dtype=torch.bfloat16, device="cuda")
+    w3_w1 = torch.zeros((2, 128, 128), dtype=torch.bfloat16, device="cuda")
+    w2 = torch.zeros((2, 128, 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="one slot of input_slot_tokens rows per source"):
+        _cutlass_bf16(
+            x, experts, weights, w3_w1, w2, False, input_source_tokens=4, input_slot_tokens=5
+        )
