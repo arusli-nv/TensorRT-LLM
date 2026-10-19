@@ -9,7 +9,7 @@ every other request continues.
 ## Requirements
 
 - Attention data parallelism with expert parallelism over the whole world (DEP), PyTorch backend,
-  KV Cache Manager V2 (KV block reuse is supported: a step's context blocks become reusable only once the step
+  KV Cache Manager V2 or its DSA sparse-attention variant (KV block reuse is supported: a step's context blocks become reusable only once the step
   is accepted, so an interrupted step publishes none), the default attention-DP router.
 - NVLinkOneSided all-to-all. The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`)
   reads the receive slots in place; layers on other backends (for example a BF16 MTP layer) get a compact
@@ -58,7 +58,7 @@ every other request continues.
 | Setting | Meaning |
 |---|---|
 | `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
-| `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `empty` (default) are not routed to while healthy and take a lost rank's experts; `borrowed` are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
+| `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `empty` (default) are not routed to while healthy and take a lost rank's experts; `borrowed` are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
 | `recovery_timeout_s` | How long a worker's recovery may take before the job stops (default 30) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20; below `recovery_timeout_s`) |
 | `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it (default off) |
@@ -96,9 +96,16 @@ Several such ranks lost together, or one more during a recovery (before the surv
 communicator), are recovered as one loss if the survivors' slots still hold every expert.
 
 Not covered: rank 0, a loss after a recovery or after the survivors installed, a rank that hangs without
-dying unless hang detection is on, the authority itself, and other errors in the serving loop, which end
-the job as without fault tolerance. A job that lost a rank ends with a
-non-zero exit status at shutdown.
+dying unless hang detection is on, a stall that every rank shares (a deadlock or desync with no single
+culprit, which the executor's own hang detection, `hang_detection_timeout`, ends), losses beyond one failure
+domain (for example a fault that takes down several hosts or a whole NVLink domain), the authority itself,
+and other errors in the serving loop, which end the job as without fault tolerance. A job that lost a rank
+ends with a non-zero exit status at shutdown.
+
+A deployment recovers once: after a recovery it serves `degraded`, a lost rank never rejoins, and a further
+loss ends the job. A request that was running on a lost single rank is not run again by the server, because it
+may be what crashed the rank. If a client retries a request that crashes a rank every time, the retry's crash
+is a further loss and ends the deployment; the server does not recognize the retried request.
 
 Failure model: a failing rank stops (it dies, or it hangs and is fenced). A rank that keeps running but
 computes wrong results (for example silent memory corruption) is not detected: the survivors keep its
@@ -113,7 +120,9 @@ Timeouts (see the settings above):
 | A recovery | `recovery_timeout_s` (30 s) at the workers, `authority_timeout_s` (20 s) at the authority; a recovery takes milliseconds after detection |
 
 `hang_confirm_s` must exceed the slowest legitimate step plus host stalls (page-cache or file-system stalls of
-up to a minute were observed under load): a shorter value fences a slow but healthy rank.
+up to a minute were observed under load): a shorter value fences a slow but healthy rank. That includes a rank
+whose serving loop is starved of the Python interpreter lock (for example by a CPU-bound thread in the same
+process): its loop stops advancing while its peers wait for it, which looks like a hang.
 
 ## Not supported together with fault tolerance
 
@@ -156,8 +165,29 @@ state this server does not know, for example from a different version). `GET /fa
 (sorted), the number of recoveries, the last recovery's stop / agree / install durations in milliseconds,
 and the number of requests the loss failed.
 
+What an orchestrator should do with these signals:
+- `degraded`: the deployment serves with fewer GPUs and cannot survive another loss. Restart it (or replace it
+  with a fresh replica) when convenient to get the capacity and the protection back.
+- `terminal`, a `/health` that stops answering, or a server process that exits: the loss was not recoverable
+  (rank 0, more than one failure domain, a second loss, a failed recovery). Move traffic to another replica,
+  have clients retry their failed requests there, and restart the deployment.
+- `unprotected`: keep serving, alert, and check the authority.
+
+`/fault_tolerance` only reports. There is no control action: no drain, no retry of a lost rank on the same
+GPUs and no scale-down request; drain a deployment by stopping traffic to it at the load balancer.
+
+## How well each part is tested
+
+The whole feature is experimental. The loss of a single rank's process (with replica or empty extra slots, with
+or without the overlap scheduler) and the authority's recovery protocol are tested most, including repeated
+kills under load at DEP32.
+These are tested only in single runs or at small scale so far, so treat them as less mature: the loss of a whole
+host, `borrowed` extra slots, hang detection and fencing, online EPLB, KV block reuse, MTP, and the `/health`
+states.
+
 ## Cost
 
-Fault tolerance lowers healthy throughput, most at low load. Most of the cost is the MPI transport that ULFM
-requires (Open MPI's ob1 over TCP instead of UCX) for the executor's host collectives; the mechanism itself
-(the rank mask, the abort polling and the fixed receive slots) costs less.
+Fault tolerance lowers healthy throughput, most at low load. The cost has two sources: the MPI transport that
+ULFM requires (Open MPI's ob1 over TCP instead of UCX) for the executor's host collectives, and the mechanism
+itself (the rank mask, the abort polling and the fixed receive slots). Their shares have not been measured
+separately yet.
