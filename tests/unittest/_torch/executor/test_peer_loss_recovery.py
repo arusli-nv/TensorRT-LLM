@@ -39,6 +39,8 @@ from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
+    Fence,
+    Fenced,
     Install,
     Installed,
     Propose,
@@ -402,6 +404,70 @@ def test_a_shrink_beyond_its_timeout_fails_closed():
     recovery._join_device_work.assert_not_called()
     assert client.sent == []
     assert "survivors" not in recovery._executor._events
+
+
+def test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan():
+    client = _FakeClient([Fence(FAILED_RANK, 0), *_happy_replies()])
+    recovery = _recovery(client, rank=0)
+    recovery._end_departed_rank = Mock(return_value="")
+    recovery._recover(_interrupted())
+    recovery._end_departed_rank.assert_called_once_with(FAILED_RANK)
+    assert client.sent[:3] == [
+        Stopped(rank=0, failed_ranks=(FAILED_RANK,)),
+        Fenced(rank=0, target=FAILED_RANK, error=""),
+        Ready(rank=0, generation=1, placement_digest="digest"),
+    ]
+
+
+def test_a_departed_rank_the_runtime_cannot_end_is_reported_and_the_recovery_ends():
+    client = _FakeClient([Fence(FAILED_RANK, 0), Abort("departed rank 2 could not be fenced")])
+    recovery = _recovery(client, rank=0)
+    recovery._end_departed_rank = Mock(return_value="PMIx refused to kill rank 2")
+    with pytest.raises(RecoveryAborted, match="could not be fenced"):
+        recovery._recover(_interrupted())
+    assert client.sent[-1] == Fenced(
+        rank=0, target=FAILED_RANK, error="PMIx refused to kill rank 2"
+    )
+    assert "survivors" not in recovery._executor._events
+
+
+@pytest.mark.parametrize("outcome", ["ended", "refused", "no answer"])
+def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch, outcome):
+    from tensorrt_llm import _utils
+    from tensorrt_llm._torch.distributed import pmix_fence
+    from tensorrt_llm.executor.recovery import config
+
+    killed, release = [], threading.Event()
+
+    def kill_rank(rank):
+        killed.append(rank)
+        if outcome == "refused":
+            raise RuntimeError("PMIx refused to kill rank 12")
+        if outcome == "no answer":
+            release.wait()
+
+    monkeypatch.setattr(_utils, "mpi_comm", lambda: None)
+    # The rank in the MPI runtime differs from the rank in the session communicator.
+    monkeypatch.setattr(pmix_fence, "pmix_ranks", lambda comm: (10, 11, 12, 13))
+    monkeypatch.setattr(pmix_fence, "kill_rank", kill_rank)
+    monkeypatch.setattr(config, "RUNTIME_FENCE_CALL_S", 0.1)
+    recovery = _recovery(_FakeClient([]), rank=0)
+    try:
+        error = recovery._end_departed_rank(FAILED_RANK)
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "rank_fence":
+                thread.join(timeout=5)
+    assert killed == [12]
+    assert (
+        error
+        == {
+            "ended": "",
+            "refused": "PMIx refused to kill rank 12",
+            "no answer": "the MPI runtime did not answer within 0.1s",
+        }[outcome]
+    )
 
 
 def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
@@ -881,7 +947,11 @@ def test_recovery_aborts_collectives_and_delivers_only_after_commit():
     )
     client_wait = client.wait
     client.wait = lambda message_type, deadline, **kwargs: (
-        events.append(message_type.__name__) or client_wait(message_type, deadline, **kwargs)
+        events.extend(
+            t.__name__
+            for t in (message_type if isinstance(message_type, tuple) else (message_type,))
+        )
+        or client_wait(message_type, deadline, **kwargs)
     )
     executor._enqueue_responses = lambda responses: events.append("deliver")
 

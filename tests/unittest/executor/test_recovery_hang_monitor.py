@@ -20,6 +20,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Fence,
     Heartbeat,
     NativeHeartbeat,
+    Propose,
     Register,
     Restart,
     Sent,
@@ -323,6 +324,16 @@ def test_authority_fences_a_hung_rank_through_itself_and_another_rank_then_the_c
     # The workers could not end it (no recovery started): the fence command, once, after the grace.
     assert [(rank, host, pid) for rank, _, host, pid in fenced] == [(2, "node", 102)]
     assert authority.phase is Phase.SERVING
+
+
+def test_a_rank_the_fence_command_ended_is_not_fenced_again_before_the_proposal():
+    fenced = []
+    authority = _serving_authority(fenced)
+    _hang_rank_2(authority, 60)
+    assert [rank for rank, *_ in fenced] == [2]
+    for rank in PEERS:
+        out = authority.handle(f"rank-{rank}".encode(), Stopped(rank, (2,)), 60.0)
+    assert out == [(f"rank-{rank}".encode(), Propose(1, (2,), PEERS)) for rank in PEERS]
 
 
 def test_the_fence_command_is_skipped_once_the_hung_rank_s_loss_starts_a_recovery():

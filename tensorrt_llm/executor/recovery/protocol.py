@@ -20,6 +20,7 @@ __all__ = [
     "Commit",
     "DeviceWait",
     "Fence",
+    "Fenced",
     "Heartbeat",
     "Install",
     "Installed",
@@ -171,11 +172,22 @@ class Fence:
     """Authority -> a worker's evidence connection: end the worker process ``pid`` of the hung ``rank``.
 
     Sent to the hung rank itself (its evidence thread kills its own process) and to another
-    rank (which has the MPI runtime kill ``rank``'s process after a grace period).
+    rank (which has the MPI runtime kill ``rank``'s process after a grace period). During a
+    recovery, sent to rank 0's recovery connection for a departed rank not known to be dead:
+    rank 0 has the MPI runtime kill it at once and answers ``Fenced``; ``pid`` is 0 if unknown.
     """
 
     rank: int
     pid: int
+
+
+@dataclass(frozen=True)
+class Fenced:
+    """Rank 0 -> authority: the MPI runtime ended departed rank ``target``, or ``error`` says why not."""
+
+    rank: int
+    target: int
+    error: str
 
 
 @dataclass(frozen=True)
@@ -229,6 +241,7 @@ Message = (
     | NativeHeartbeat
     | DeviceWait
     | Fence
+    | Fenced
     | Restart
     | StatusQuery
     | Status

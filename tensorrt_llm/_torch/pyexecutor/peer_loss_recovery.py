@@ -40,7 +40,7 @@ from .scheduler.adp_router import DefaultADPRouter
 
 if TYPE_CHECKING:
     from tensorrt_llm.executor.recovery.client import RecoveryClient
-    from tensorrt_llm.executor.recovery.protocol import Commit, Install
+    from tensorrt_llm.executor.recovery.protocol import Commit, Install, Propose
 
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
@@ -743,7 +743,7 @@ class PeerLossRecovery(RecoveryHook):
                 # placement travels among the survivors, not through the authority: it can exceed a message.
                 base = self._rank0_placements(load_balancer) if online else None
                 placements = self._restore_placements(load_balancer, failed, base)
-                proposal = client.wait(Propose, deadline, interrupt=further_loss, skip=skip)
+                proposal = self._wait_for_proposal(deadline, further_loss, skip)
                 if (
                     proposal.failed_ranks != failed_ranks
                     or rank not in proposal.survivors
@@ -804,6 +804,57 @@ class PeerLossRecovery(RecoveryHook):
             f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
             f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain"
         )
+
+    def _wait_for_proposal(
+        self,
+        deadline: float,
+        interrupt: threading.Event,
+        skip: Optional[Callable[[object], bool]],
+    ) -> "Propose":
+        """Wait for the authority's plan; on rank 0, first end each failed rank it asks to fence.
+
+        The authority asks for every failed rank it does not know to be dead: the survivors' agreement may
+        rest on a failure detector's suspicion, and a stopped process must not run on beside the survivors.
+        """
+        from tensorrt_llm.executor.recovery.protocol import Fence, Fenced, Propose
+
+        while True:
+            message = self._client.wait((Propose, Fence), deadline, interrupt=interrupt, skip=skip)
+            if isinstance(message, Propose):
+                return message
+            error = self._end_departed_rank(message.rank)
+            self._client.send(
+                Fenced(rank=self._executor.dist.rank, target=message.rank, error=error)
+            )
+
+    def _end_departed_rank(self, rank: int) -> str:
+        """Have the MPI runtime kill ``rank``'s process (a no-op if it ended); return why it could not, or ''."""
+        from tensorrt_llm._utils import mpi_comm
+        from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_CALL_S
+
+        from ..distributed.pmix_fence import PmixUnavailable, kill_rank, pmix_ranks
+
+        target = pmix_ranks(mpi_comm())[rank]
+        errors: List[str] = []
+
+        def kill() -> None:
+            try:
+                kill_rank(target)
+            except (PmixUnavailable, RuntimeError) as error:
+                errors.append(str(error))
+
+        # The runtime may never answer; the thread is then left blocked and the recovery aborts.
+        thread = threading.Thread(target=kill, name="departed_rank_fence", daemon=True)
+        thread.start()
+        thread.join(RUNTIME_FENCE_CALL_S)
+        if thread.is_alive():
+            return f"the MPI runtime did not answer within {RUNTIME_FENCE_CALL_S}s"
+        if errors:
+            return errors[0]
+        logger.warning(
+            f"Rank {self._executor.dist.rank}: the MPI runtime ended departed rank {rank}"
+        )
+        return ""
 
     def _watch_survivors(self, further_loss: threading.Event) -> Optional[PeerFailureWatch]:
         """Set ``further_loss`` when another survivor fails before Install (at once if one already did)."""

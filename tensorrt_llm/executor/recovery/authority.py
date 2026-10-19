@@ -37,6 +37,7 @@ from .protocol import (
     Commit,
     DeviceWait,
     Fence,
+    Fenced,
     Heartbeat,
     Install,
     Installed,
@@ -91,7 +92,10 @@ class RecoveryAuthority:
     A failure domain is a set of worker ranks lost together: a single rank or a whole
     node. A loss recovers only if every survivor reports the same failed set (every rank
     lost so far) and that set is a union of admitted domains; the survivors check that
-    their slots still serve every expert without it.
+    their slots still serve every expert without it. The survivors' agreement on the failed
+    set may rest on a failure detector's suspicion (a stopped process is alive), so before
+    proposing, the authority has rank 0 end through the MPI runtime every failed rank it has
+    not fenced itself, and aborts if one cannot be ended.
 
     The authority performs no I/O: ``handle`` and ``expire`` return the messages to
     send as ``(routing_id, message)`` pairs. A protocol violation during registration or
@@ -153,6 +157,9 @@ class RecoveryAuthority:
         self._beats: dict[int, int] = {}
         # The fence command's deadline and target, while the workers' fencing is under way.
         self._command_fence: tuple[float, HungRank] | None = None
+        # Failed ranks known to be ended (a fence that succeeded), and those rank 0 is fencing before Propose.
+        self._fenced: set[int] = set()
+        self._fencing: set[int] = set()
         # Monotonic times at which the current recovery entered STOPPING, PREPARING and INSTALLING.
         self._stage_starts: list[float] = []
         self._recovery_stage_us: tuple[int, ...] = ()
@@ -271,6 +278,7 @@ class RecoveryAuthority:
                     f"Recovery authority: rank {hung.rank} survived its fence; running the fence command"
                 )
                 self._fence(hung)
+                self._fenced.add(hung.rank)
         if self.hang_monitor is not None and self.phase in (Phase.SERVING, Phase.RECOVERED):
             hung = self.hang_monitor.check(now)
             if hung is not None:
@@ -368,7 +376,7 @@ class RecoveryAuthority:
         worker = self._workers[route]
         if self.phase is Phase.REGISTERING:
             raise _Violation(f"{message} before registration completed")
-        if not isinstance(message, (Stopped, Ready, Installed)):
+        if not isinstance(message, (Stopped, Ready, Installed, Fenced)):
             raise _Violation(f"unexpected {message} from rank {worker.rank}")
         if message.rank in self._failed_during_recovery and isinstance(message, (Stopped, Ready)):
             # Sent before the rank failed; it was already queued behind the survivors' reports.
@@ -379,6 +387,8 @@ class RecoveryAuthority:
             return self._on_stopped(message, now)
         if isinstance(message, Ready):
             return self._on_ready(message, now)
+        if isinstance(message, Fenced):
+            return self._on_fenced(message, now)
         return self._on_installed(message, now)
 
     def _on_register(self, route: bytes, message: Register) -> Outbound:
@@ -458,9 +468,38 @@ class RecoveryAuthority:
         self._record(self._stopped, message)
         if len(self._stopped) < len(self.survivors):
             return []
+        self._fencing = set(self.failed_ranks - self._fenced)
+        if self._fencing:
+            # Rank 0 is never lost. A pid only names the process in the log; the runtime ends the rank.
+            return [
+                (self._routes[0], Fence(rank=rank, pid=self._evidence.get(rank, (b"", "", 0))[2]))
+                for rank in sorted(self._fencing)
+            ]
+        return self._propose(now)
+
+    def _on_fenced(self, message: Fenced, now: float) -> Outbound:
+        """Propose once rank 0 ended every failed rank not known to be dead; abort if one could not be ended."""
+        if message.rank != 0 or message.target not in self.failed_ranks:
+            raise _Violation(f"unexpected {message}: rank 0 fences failed ranks only")
+        if message.error:
+            # Its process may still run and write into the survivors' memory: recovering is not safe.
+            return self.abort(
+                f"departed rank {message.target} could not be fenced: {message.error}"
+            )
+        logger.info(f"Recovery authority: departed rank {message.target} fenced")
+        self._fenced.add(message.target)
+        if message.target not in self._fencing:
+            # A second answer: a further loss restarted the round after the first request.
+            return []
+        self._fencing.discard(message.target)
+        if self._fencing or len(self._stopped) < len(self.survivors):
+            return []
+        return self._propose(now)
+
+    def _propose(self, now: float) -> Outbound:
         self._stage_starts.append(now)
         self._enter(Phase.PREPARING)
-        proposal = Propose(self.generation + 1, tuple(sorted(failed)), self.survivors)
+        proposal = Propose(self.generation + 1, tuple(sorted(self.failed_ranks)), self.survivors)
         return self._to_survivors(proposal)
 
     def _admissible(self, failed: frozenset[int]) -> None:
@@ -485,6 +524,7 @@ class RecoveryAuthority:
         self.failed_ranks = failed
         self._replans += 1
         self._stopped.clear()
+        self._fencing.clear()
         self._ready.clear()
         self._stage_starts = self._stage_starts[:1]
         if self.phase is not Phase.STOPPING:

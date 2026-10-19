@@ -26,6 +26,8 @@ from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConf
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
+    Fence,
+    Fenced,
     Heartbeat,
     Install,
     Installed,
@@ -79,6 +81,17 @@ def _report(authority, message_type, ranks=SURVIVORS, now=1.0, **fields):
     out = []
     for rank in ranks:
         out = authority.handle(_route(rank), message_type(rank, **fields), now)
+    return _fence_departed(authority, out, now)
+
+
+def _fence_departed(authority, out, now):
+    """Rank 0 answers the authority's request to fence departed ranks: the runtime ended each."""
+    fences = [message for _, message in out if isinstance(message, Fence)]
+    if not fences:
+        return out
+    assert [route for route, _ in out] == [_route(0)] * len(fences)
+    for fence in fences:
+        out = authority.handle(_route(0), Fenced(0, fence.rank, ""), now)
     return out
 
 
@@ -383,11 +396,51 @@ def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
     assert authority.handle(_route(1), Ready(1, 1, "digest"), 2.0) == []
     assert authority.handle(_route(1), Stopped(1, (FAILED,)), 2.0) == []
     out = authority.handle(_route(1), Stopped(1, lost), 2.0)
+    # Rank 2 was fenced in the first round; only rank 3 is asked for.
+    assert out == [(_route(0), Fence(3, 0))]
+    out = _fence_departed(authority, out, 2.0)
     assert out == [(_route(rank), Propose(1, lost, (0, 1))) for rank in (0, 1)]
     _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
     out = _report(authority, Installed, (0, 1), generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
     assert authority.phase is Phase.RECOVERED and authority.survivors == (0, 1)
+
+
+def test_a_departed_rank_not_known_dead_is_fenced_before_the_proposal():
+    """The survivors may agree on a failure detector's suspicion: rank 0 ends the rank before any plan."""
+    authority = _registered()
+    authority.handle(b"evidence-2", Heartbeat(FAILED, 0, False, "node", 4242), 0.5)
+    authority.handle(_route(1), Stopped(1, (FAILED,)), 1.0)
+    out = authority.handle(_route(3), Stopped(3, (FAILED,)), 1.0)
+    assert out == []
+    out = authority.handle(_route(0), Stopped(0, (FAILED,)), 1.0)
+    assert out == [(_route(0), Fence(FAILED, 4242))]
+    assert authority.phase is Phase.STOPPING
+    out = authority.handle(_route(0), Fenced(0, FAILED, ""), 1.25)
+    assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
+    assert authority.phase is Phase.PREPARING
+
+
+def test_a_departed_rank_that_cannot_be_fenced_aborts_the_recovery():
+    authority = _registered()
+    for rank in SURVIVORS:
+        authority.handle(_route(rank), Stopped(rank, (FAILED,)), 1.0)
+    out = authority.handle(_route(0), Fenced(0, FAILED, "PMIx refused to kill rank 2"), 1.25)
+    _assert_aborted(out, authority)
+    assert "could not be fenced" in authority.abort_reason
+    assert not any(isinstance(message, Propose) for _, message in out)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [Fenced(1, FAILED, ""), Fenced(0, 3, "")],
+    ids=["not_rank0", "rank_that_did_not_fail"],
+)
+def test_a_fence_answer_from_another_rank_or_for_a_live_rank_aborts(message):
+    authority = _registered()
+    for rank in SURVIVORS:
+        authority.handle(_route(rank), Stopped(rank, (FAILED,)), 1.0)
+    _assert_aborted(authority.handle(_route(message.rank), message, 1.25), authority)
 
 
 def test_a_loss_during_the_recovery_that_takes_rank0_aborts():
@@ -423,6 +476,9 @@ def test_a_further_loss_after_a_recovery_recovers_again():
     authority.handle(_route(0), Stopped(0, lost), 50.0)
     assert authority.phase is Phase.STOPPING and authority.deadline == pytest.approx(60.0)
     out = authority.handle(_route(3), Stopped(3, lost), 50.5)
+    # Rank 2 was fenced in the first recovery; only rank 1 is asked for.
+    assert out == [(_route(0), Fence(1, 0))]
+    out = _fence_departed(authority, out, 50.5)
     assert out == [(_route(rank), Propose(2, lost, (0, 3))) for rank in (0, 3)]
     out = _report(authority, Ready, (0, 3), now=51.0, generation=2, placement_digest="digest2")
     assert out == [(_route(rank), Install(2)) for rank in (0, 3)]
@@ -467,6 +523,8 @@ def test_wire_roundtrip_and_authentication(tmp_path):
             Registered(((1,), NODE)),
             Stopped(1, NODE),
             Propose(3, NODE, (0, 1)),
+            Fence(2, 0),
+            Fenced(0, 2, "PMIx refused"),
             Abort("lost"),
             StatusQuery(),
             Status("RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),
@@ -614,11 +672,20 @@ def _register_clients(clients):
     return admitted
 
 
+def _wait_for_proposal(client, rank, deadline) -> Propose:
+    """Wait for the plan; rank 0 first answers each request to fence a departed rank."""
+    proposal = client.wait((Propose, Fence), deadline)
+    while isinstance(proposal, Fence):
+        client.send(Fenced(rank, proposal.rank, ""))
+        proposal = client.wait((Propose, Fence), deadline)
+    return proposal
+
+
 def _worker_recovery(client, rank, results) -> None:
     deadline = time.monotonic() + 10.0
     try:
         client.send(Stopped(rank, (FAILED,)))
-        proposal = client.wait(Propose, deadline)
+        proposal = _wait_for_proposal(client, rank, deadline)
         client.send(Ready(rank, proposal.generation, "digest"))
         client.wait(Install, deadline)
         client.send(Installed(rank, proposal.generation))
@@ -737,7 +804,7 @@ def _finish_recovery(clients) -> dict:
 
     def rank0():
         try:
-            proposal = clients[0].wait(Propose, time.monotonic() + 10.0)
+            proposal = _wait_for_proposal(clients[0], 0, time.monotonic() + 10.0)
             clients[0].send(Ready(0, proposal.generation, "digest"))
             clients[0].wait(Install, time.monotonic() + 10.0)
             clients[0].send(Installed(0, proposal.generation))
@@ -809,6 +876,34 @@ def test_only_fresh_messages_of_a_ranks_session_are_applied():
     _assert_aborted(
         authority.receive(_route(1), Sent(1, "s1", 6, Ready(1, 1, "d")), 1.0), authority
     )
+
+
+def test_a_fence_answer_is_applied_only_fresh_from_rank_0_s_protocol_stream():
+    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
+    domains = ((1,), NODE, (FAILED,))
+    for rank in range(WORLD):
+        authority.receive(
+            _route(rank), Sent(rank, f"s{rank}", 1, Register(rank, domains, DIGEST)), 0.0
+        )
+    for rank in SURVIVORS:
+        out = authority.receive(
+            _route(rank), Sent(rank, f"s{rank}", 2, Stopped(rank, (FAILED,))), 1.0
+        )
+    assert out == [(_route(0), Fence(FAILED, 0))]
+    # Applied, a successful answer would propose (and an error abort): each of these is dropped instead.
+    for route, sent in (
+        (_route(0), Sent(0, "s0", 2, Fenced(0, FAILED, ""))),  # a repeated sequence number
+        (_route(0), Sent(0, "other", 9, Fenced(0, FAILED, ""))),  # another session
+        (_route(1), Sent(1, "s1", 9, Fenced(0, FAILED, ""))),  # rank 1's envelope
+        (
+            b"evidence-0",
+            Sent(0, "s0", 1, Fenced(0, FAILED, "refused")),
+        ),  # stale on the protocol stream
+    ):
+        assert authority.receive(route, sent, 1.0) == [], sent
+        assert authority.phase is Phase.STOPPING
+    out = authority.receive(_route(0), Sent(0, "s0", 3, Fenced(0, FAILED, "")), 1.25)
+    assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
 
 
 def test_a_second_session_registering_a_rank_aborts():

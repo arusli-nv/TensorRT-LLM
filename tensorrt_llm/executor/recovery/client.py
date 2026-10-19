@@ -176,15 +176,15 @@ class RecoveryClient:
 
     def wait(
         self,
-        message_type: type[_M],
+        message_type: type[_M] | tuple[type, ...],
         deadline: float,
         interrupt: threading.Event | None = None,
         skip: Callable[[Message], bool] | None = None,
     ) -> _M:
-        """Block until a ``message_type`` message arrives.
+        """Block until a ``message_type`` message (or one of a tuple of types) arrives.
 
         Args:
-            message_type: Expected message class.
+            message_type: Expected message class, or a tuple of them.
             deadline: Absolute ``time.monotonic()`` value.
             interrupt: Checked every ``_INTERRUPT_POLL_S`` while waiting.
             skip: Messages it accepts are dropped (left over from an earlier round).
@@ -195,6 +195,11 @@ class RecoveryClient:
             RecoveryInterrupted: ``interrupt`` was set and no message was waiting.
             RecoveryError: Any other unexpected message arrived.
         """
+        expected = (
+            message_type.__name__
+            if isinstance(message_type, type)
+            else " or ".join(cls.__name__ for cls in message_type)
+        )
         while (remaining := deadline - time.monotonic()) > 0:
             interrupted = interrupt is not None and interrupt.is_set()
             if interrupt is not None:
@@ -202,18 +207,16 @@ class RecoveryClient:
             # Messages that arrived before the interrupt still count (e.g. an Install the other ranks act on).
             message = self._recv(0 if interrupted else remaining)
             if message is None and interrupted:
-                raise RecoveryInterrupted(
-                    f"Rank {self._rank} stopped waiting for {message_type.__name__}"
-                )
+                raise RecoveryInterrupted(f"Rank {self._rank} stopped waiting for {expected}")
             if message is None or (skip is not None and skip(message)):
                 continue
             if isinstance(message, Abort):
                 raise RecoveryAborted(f"Recovery aborted by authority: {message.reason}")
             if not isinstance(message, message_type):
-                raise RecoveryError(f"Expected {message_type.__name__}, received {message}")
+                raise RecoveryError(f"Expected {expected}, received {message}")
             return message
         raise RecoveryTimeout(
-            f"Rank {self._rank} timed out waiting for {message_type.__name__} from the recovery "
+            f"Rank {self._rank} timed out waiting for {expected} from the recovery "
             f"authority at {self._endpoint}"
         )
 
