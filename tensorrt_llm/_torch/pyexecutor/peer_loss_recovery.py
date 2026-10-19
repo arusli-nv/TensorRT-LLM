@@ -697,7 +697,7 @@ class PeerLossRecovery(RecoveryHook):
         dist.revoke()
         # Shrink is a ULFM agreement among survivors, so every survivor reports
         # the same failed set even if it only observed the revocation.
-        failed = dist.shrink()
+        failed = self._shrink()
         _check_deadline(
             started + self._shrink_timeout_s, "the survivors agreed on the failed ranks"
         )
@@ -829,32 +829,65 @@ class PeerLossRecovery(RecoveryHook):
 
     def _end_departed_rank(self, rank: int) -> str:
         """Have the MPI runtime kill ``rank``'s process (a no-op if it ended); return why it could not, or ''."""
+        return self._end_ranks([rank])[rank]
+
+    def _end_ranks(self, ranks: Iterable[int]) -> Dict[int, str]:
+        """Have the MPI runtime kill each of ``ranks`` at once, together bounded by ``RUNTIME_FENCE_CALL_S``.
+
+        Returns why each rank could not be ended, or '' for one that was (also a no-op for one that had ended).
+        """
         from tensorrt_llm._utils import mpi_comm
         from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_CALL_S
 
         from ..distributed.pmix_fence import PmixUnavailable, kill_rank, pmix_ranks
 
-        target = pmix_ranks(mpi_comm())[rank]
-        errors: List[str] = []
+        ranks = list(ranks)
+        if not ranks:
+            return {}
+        runtime_ranks = pmix_ranks(mpi_comm())
+        errors: Dict[int, str] = {}
 
-        def kill() -> None:
+        def kill(rank: int) -> None:
             try:
-                kill_rank(target)
+                kill_rank(runtime_ranks[rank])
             except (PmixUnavailable, RuntimeError) as error:
-                errors.append(str(error))
+                errors[rank] = str(error)
 
-        # The runtime may never answer; the thread is then left blocked and the recovery aborts.
-        thread = threading.Thread(target=kill, name="departed_rank_fence", daemon=True)
-        thread.start()
-        thread.join(RUNTIME_FENCE_CALL_S)
-        if thread.is_alive():
-            return f"the MPI runtime did not answer within {RUNTIME_FENCE_CALL_S}s"
-        if errors:
-            return errors[0]
-        logger.warning(
-            f"Rank {self._executor.dist.rank}: the MPI runtime ended departed rank {rank}"
-        )
-        return ""
+        # The runtime may never answer; such a thread is left blocked.
+        threads = {
+            rank: threading.Thread(target=kill, args=(rank,), name="rank_fence", daemon=True)
+            for rank in ranks
+        }
+        for thread in threads.values():
+            thread.start()
+        deadline = time.monotonic() + RUNTIME_FENCE_CALL_S
+        outcome = {}
+        for rank, thread in threads.items():
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                outcome[rank] = f"the MPI runtime did not answer within {RUNTIME_FENCE_CALL_S}s"
+            else:
+                outcome[rank] = errors.get(rank, "")
+                if not outcome[rank]:
+                    logger.warning(
+                        f"Rank {self._executor.dist.rank}: the MPI runtime ended failed rank {rank}"
+                    )
+        return outcome
+
+    def _shrink(self) -> frozenset:
+        """Agree with the other survivors on the failed ranks, once the ranks this rank sees failed are dead.
+
+        A rank Open MPI's failure detector declared failed may still be alive (a stopped process), and the
+        agreement does not complete until it ends; the detector's verdict counts as its failure, so it is ended
+        first. Every survivor does so for what it sees: the kills are idempotent, and one that fails leaves the
+        authority's fence before Propose to fail closed.
+        """
+        dist = self._executor.dist
+        reported = dist.reported_failed_ranks()
+        for rank, error in self._end_ranks(sorted(reported)).items():
+            if error:
+                logger.warning(f"Rank {dist.rank}: could not end failed rank {rank}: {error}")
+        return dist.shrink()
 
     def _watch_survivors(self, further_loss: threading.Event) -> Optional[PeerFailureWatch]:
         """Set ``further_loss`` when another survivor fails before Install (at once if one already did)."""
@@ -902,7 +935,7 @@ class PeerLossRecovery(RecoveryHook):
             watch.stop()
         _check_deadline(deadline, "shrinking the survivors again")
         self._executor.dist.revoke()
-        lost = self._executor.dist.shrink()
+        lost = self._shrink()
         self._check_recoverable(lost)
         logger.warning(
             f"Rank {self._executor.dist.rank}: ranks {sorted(lost - failed)} failed during the recovery; "

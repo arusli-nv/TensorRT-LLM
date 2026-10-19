@@ -992,6 +992,19 @@ class MPIDist(Distributed):
             if not comm.Is_revoked():
                 comm.Revoke()
 
+    def reported_failed_ranks(self) -> frozenset[int]:
+        """The ranks this process's ULFM view reports failed in its host communicator.
+
+        Local: no agreement with the other survivors (see :meth:`shrink`).
+
+        Raises:
+            RuntimeError: Recovery is not enabled.
+        """
+        if self._host_world is None:
+            raise RuntimeError(
+                "reported_failed_ranks() requires enable_peer_loss_recovery()")
+        return mpi_failed_ranks(self._world_comm())
+
     def shrink(self) -> frozenset[int]:
         """Agree with the other survivors on the failed ranks.
 

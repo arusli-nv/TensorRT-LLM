@@ -105,6 +105,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
     )
     dist.revoke.side_effect = lambda: events.append("revoke")
     dist.shrink.side_effect = lambda: events.append("shrink") or failed
+    dist.reported_failed_ranks.return_value = frozenset()
     dist.install_survivors.side_effect = lambda: events.append("survivors")
     dist.watch_peer_failures.side_effect = lambda callback, abort_word: events.append(
         "watch"
@@ -468,6 +469,62 @@ def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch,
             "no answer": "the MPI runtime did not answer within 0.1s",
         }[outcome]
     )
+
+
+def _runtime(monkeypatch, kill_rank):
+    """The MPI runtime: session rank r is runtime rank 10 + r; ``kill_rank`` ends a runtime rank."""
+    from tensorrt_llm import _utils
+    from tensorrt_llm._torch.distributed import pmix_fence
+
+    monkeypatch.setattr(_utils, "mpi_comm", lambda: None)
+    monkeypatch.setattr(pmix_fence, "pmix_ranks", lambda comm: (10, 11, 12, 13))
+    monkeypatch.setattr(pmix_fence, "kill_rank", kill_rank)
+
+
+def test_a_shrink_waiting_on_a_detector_reported_live_rank_completes_once_it_is_killed(monkeypatch):
+    """The failure detector declared rank 2 failed while its process is stopped: the agreement needs it dead."""
+    dead = threading.Event()
+    killed = []
+
+    def kill_rank(rank):
+        killed.append(rank)
+        dead.set()
+
+    _runtime(monkeypatch, kill_rank)
+    recovery = _recovery(_FakeClient(_happy_replies()))
+    dist = recovery._executor.dist
+    dist.reported_failed_ranks.return_value = frozenset({FAILED_RANK})
+
+    def shrink():
+        # The real agreement blocks until the reported rank's process has ended.
+        assert dead.wait(5.0), "the shrink waited on a live failed rank"
+        return frozenset({FAILED_RANK})
+
+    dist.shrink.side_effect = shrink
+    recovery._recover(_interrupted())
+    assert killed == [10 + FAILED_RANK]
+    assert dist.shrink.call_count == 1
+
+
+def test_ranks_that_cannot_be_ended_before_the_shrink_are_left_to_the_authority_s_fence(
+    monkeypatch,
+):
+    def kill_rank(rank):
+        raise RuntimeError(f"PMIx refused to kill rank {rank}")
+
+    _runtime(monkeypatch, kill_rank)
+    client = _FakeClient(_happy_replies())
+    recovery = _recovery(client)
+    recovery._executor.dist.reported_failed_ranks.return_value = frozenset({FAILED_RANK})
+    recovery._recover(_interrupted())
+    assert recovery._executor.dist.shrink.call_count == 1
+    assert isinstance(client.sent[-1], Installed)
+
+
+def test_nothing_is_killed_before_a_shrink_when_no_failure_is_reported(monkeypatch):
+    _runtime(monkeypatch, Mock(side_effect=AssertionError("nothing to kill")))
+    recovery = _recovery(_FakeClient(_happy_replies()))
+    recovery._recover(_interrupted())
 
 
 def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():

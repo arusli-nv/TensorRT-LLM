@@ -71,11 +71,12 @@ another rank asking the MPI runtime to kill it (PMIx job control of that one pro
 ends its process group and the job keeps running), else by the authority's `--fence-command` (a
 `{host}`/`{pid}` template, run without a shell, 5 s later); its loss then recovers as any other.
 
-The survivors' agreement on the failed ranks can rest on a suspicion: Open MPI's in-band failure detector
-declares a stopped process failed after its timeout, while the process still holds its GPU and its mappings
-of the survivors' memory. So before it proposes a plan, the authority has rank 0 ask the MPI runtime to kill
-every failed rank it has not fenced itself (a no-op for a process that already ended), and aborts the
-recovery if the runtime refuses or does not answer within 2 s.
+The survivors' agreement on the failed ranks can rest on Open MPI's in-band failure detector, which
+declares a stopped process failed after its timeout while the process still holds its GPU and its mappings
+of the survivors' memory, and the agreement does not complete until that process ends. So each survivor
+first has the MPI runtime kill the ranks its own MPI view reports failed, and before it proposes a plan, the
+authority has rank 0 kill every failed rank it has not fenced itself (a no-op for a process that already
+ended); it aborts the recovery if the runtime refuses or does not answer within 2 s.
 
 Fault tolerance ends a worker process in exactly these places, with SIGKILL so that no handler, atexit
 code or MPI finalization of a broken process runs, except the last, which exits with code 75:
@@ -83,7 +84,8 @@ code or MPI finalization of a broken process runs, except the last, which exits 
   kills itself, so that the survivors recover from its loss (`PyExecutor` event loop);
 - a rank the authority confirmed hung kills itself from its evidence thread (`hang_evidence`);
 - another rank has the MPI runtime kill a hung rank that could not (`pmix_fence`, PMIx job control);
-- rank 0 has the MPI runtime kill each failed rank before a recovery plan (`peer_loss_recovery`);
+- each survivor has the MPI runtime kill the ranks its MPI view reports failed before agreeing on them, and
+  rank 0 each failed rank before a recovery plan (`peer_loss_recovery`);
 - the authority's `--fence-command`, if configured;
 - every rank, when the authority found every rank stalled with no rank to blame (`hang_evidence`).
 
