@@ -157,6 +157,14 @@ process): its native heartbeat keeps it known to be alive, but if it finishes no
 its peers wait for it, it is fenced like a hung rank. Without the native heartbeat (the UDP datagrams cannot
 reach the authority) the Python heartbeat alone is used, and a starved rank whose heartbeat stops looks stopped.
 
+Two thresholds govern a silent or stuck rank. A process frozen as a whole (no thread runs, for example a
+stopped process or a host that stops scheduling it) is declared failed by Open MPI's in-band detector after
+`mpi_ft_detector_timeout` (5 s above); the recovery then fences it and continues without it. A process that is
+alive but makes no progress (a device hang, a deadlock, a host or interpreter-lock stall) keeps its native threads
+running, so the detector does not fire and only `hang_confirm_s` applies. At DEP32, a 10 s whole-process freeze
+cost the rank, while 45 s host stalls and interpreter-lock stalls cost nothing. Raise `mpi_ft_detector_timeout`
+to tolerate longer whole-process freezes, at the cost of detecting a dead host as much later.
+
 ## Not supported together with fault tolerance
 
 Speculative decoding: every method is accepted. A recovery discards the interrupted steps' draft tokens
