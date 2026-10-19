@@ -133,6 +133,22 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
     )
 
 
+@pytest.mark.parametrize("approx_max_load", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 7, 128, 8192])
+def test_grouped_gemm_inputs_helper_empty_local_experts(num_tokens: int, approx_max_load: bool):
+    """10 slots per rank of which 2 hold no expert profile like 8 slots per rank, all loaded."""
+    top_k, ep_size = 8, 32
+    with_empty = GroupedGemmInputsHelper(10 * ep_size, top_k, 10, 0, 128, num_empty_local_experts=2)
+    loaded = GroupedGemmInputsHelper(8 * ep_size, top_k, 8, 0, 128)
+
+    counts = with_empty.generate_num_tokens_per_expert(num_tokens, approx_max_load)
+    assert counts == loaded.generate_num_tokens_per_expert(num_tokens, approx_max_load) + [0, 0]
+    selected = with_empty.generate_token_selected_experts(num_tokens, counts)
+    assert (
+        selected.tolist() == loaded.generate_token_selected_experts(num_tokens, counts[:8]).tolist()
+    )
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("source_tokens,slot_tokens", [(1, 1), (3, 8), (8, 8), (100, 256)])
 def test_gather_helper_source_slot_rows(source_tokens: int, slot_tokens: int, tile_size: int):

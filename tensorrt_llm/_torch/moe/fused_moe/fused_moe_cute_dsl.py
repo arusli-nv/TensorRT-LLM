@@ -19,6 +19,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -301,12 +302,17 @@ def cute_dsl_nvfp4_grouped_gemm_ref(
 
 class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
 
-    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                 local_expert_offset: int):
+    def __init__(self,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 num_empty_local_experts: int = 0):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
+        self.num_empty_local_experts = num_empty_local_experts
 
     def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
         return input_shapes[0][0]
@@ -348,7 +354,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  use_direct_expert_metadata: bool = False,
                  use_locality_domain: bool = False,
                  workload_identity: Optional[Tuple] = None,
-                 prime_inner_tactics: bool = False):
+                 prime_inner_tactics: bool = False,
+                 num_empty_local_experts: int = 0):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -359,6 +366,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
         self.use_locality_domain = use_locality_domain
+        self.num_empty_local_experts = num_empty_local_experts
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -405,7 +413,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return [128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
-        key = self.unique_id()
+        key = (self.unique_id(), self.num_empty_local_experts)
         if key not in self.__class__.tuning_config_cache:
             if self.use_direct_expert_metadata:
                 # One tuning profile is shared by the 128- and 256-row
@@ -432,7 +440,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             else:
                 helper = CuteDslFusedMoENvfp4InputsHelper(
                     self.num_experts, self.top_k, self.num_local_experts,
-                    self.local_expert_offset)
+                    self.local_expert_offset, self.num_empty_local_experts)
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -1120,6 +1128,17 @@ class CuteDslFusedMoE(MoEImplBase):
             event.wait()
             self._pending_x_ready_event = None
 
+    def _tuning_num_empty_local_slots(self,
+                                      weight_view: NvFp4WeightView) -> int:
+        """While autotuning, how many local slots of ``weight_view`` hold no expert in the EPLB placement."""
+        if (self.layer_load_balancer is None
+                or not AutoTuner.get().is_tuning_mode):
+            return 0
+        placement = np.ravel(self.layer_load_balancer.get_old_rank_expert_ids())
+        start = weight_view.slot_start
+        local = placement[start:start + weight_view.expert_size_per_partition]
+        return int((local < 0).sum())
+
     def run_moe_nvfp4(
         self,
         x: torch.Tensor,
@@ -1262,6 +1281,8 @@ class CuteDslFusedMoE(MoEImplBase):
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
+            num_empty_local_experts=self._tuning_num_empty_local_slots(
+                weight_view),
         )
 
         if use_direct_expert_metadata:
@@ -1417,9 +1438,14 @@ class CuteDslFusedMoE(MoEImplBase):
         if source_slots is not None:
             gather_act_kwargs["source_tokens"] = source_slots.source_tokens
             gather_act_kwargs["slot_tokens"] = source_slots.slot_tokens
+        num_empty_local_experts = self._tuning_num_empty_local_slots(
+            weight_view)
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
+        else:
+            gather_act_kwargs[
+                "num_empty_local_experts"] = num_empty_local_experts
         gather_act_kwargs["activation_type"] = self.activation_type
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
@@ -1508,6 +1534,8 @@ class CuteDslFusedMoE(MoEImplBase):
                 finalize_inplace_kwargs["expert_capacity"] = (
                     deep_ep_expert_capacity
                     if use_count_native_expert_metadata else 0)
+                finalize_inplace_kwargs[
+                    "num_empty_local_experts"] = num_empty_local_experts
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:

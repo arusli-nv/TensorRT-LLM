@@ -224,13 +224,17 @@ class GroupedGemmInputsHelper:
                  num_local_experts: int,
                  local_expert_offset: int,
                  tile_size: int,
-                 seed: int = 515):
+                 seed: int = 515,
+                 num_empty_local_experts: int = 0):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
         self.tile_size = tile_size
         self.seed = seed
+        # Local slots holding no expert; the token profile leaves the last
+        # this many local experts without tokens.
+        self.num_empty_local_experts = num_empty_local_experts
         # Padding values should never be accessed.
         # Intentionally use a large padding value to expose issues early.
         self.pad_val = int(2e9)
@@ -345,16 +349,17 @@ class GroupedGemmInputsHelper:
         else:
             num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank)
 
+        num_active_experts = (self.num_local_experts -
+                              self.num_empty_local_experts)
         # A token can select each local expert at most once.
         max_num_tokens_on_curr_rank = num_tokens * min(self.top_k,
-                                                       self.num_local_experts)
+                                                       num_active_experts)
         num_tokens_on_curr_rank = min(max_num_tokens_on_curr_rank,
                                       num_tokens_on_curr_rank)
 
-        base, remainder = divmod(num_tokens_on_curr_rank,
-                                 self.num_local_experts)
+        base, remainder = divmod(num_tokens_on_curr_rank, num_active_experts)
         num_tokens_per_expert = [base + 1] * remainder + [base] * (
-            self.num_local_experts - remainder)
+            num_active_experts - remainder) + [0] * self.num_empty_local_experts
         assert len(num_tokens_per_expert) == self.num_local_experts
         assert sum(num_tokens_per_expert) == num_tokens_on_curr_rank
         return num_tokens_per_expert
@@ -3220,7 +3225,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      output_dtype: torch.dtype,
                      scaling_vector_size: int = 16,
-                     use_expert_counts: bool = False):
+                     use_expert_counts: bool = False,
+                     num_empty_local_experts: int = 0):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -3232,6 +3238,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
             self.use_expert_counts = use_expert_counts
+            self.num_empty_local_experts = num_empty_local_experts
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
@@ -3328,12 +3335,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = self.unique_id()
+            key = (self.unique_id(), self.num_empty_local_experts)
             if key not in self.__class__.tuning_config_cache:
-                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
-                                                 self.num_local_experts,
-                                                 self.local_expert_offset,
-                                                 self.tile_size)
+                helper = GroupedGemmInputsHelper(
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                    num_empty_local_experts=self.num_empty_local_experts)
                 if self.use_expert_counts:
                     self.__class__.tuning_config_cache[key] = TuningConfig(
                         dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3573,6 +3583,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        num_empty_local_experts: int = 0,
     ) -> None:
         tuner = AutoTuner.get()
         if expert_counts is None and expert_capacity != 0:
@@ -3595,7 +3606,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             output_dtype,
             scaling_vector_size,
-            use_expert_counts=expert_counts is not None)
+            use_expert_counts=expert_counts is not None,
+            num_empty_local_experts=num_empty_local_experts)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -3635,6 +3647,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        num_empty_local_experts: int = 0,
     ) -> None:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)
@@ -4076,7 +4089,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      situ_beta: Optional[float] = None,
                      situ_linear_beta: Optional[float] = None,
                      source_tokens: int = 0,
-                     slot_tokens: int = 0):
+                     slot_tokens: int = 0,
+                     num_empty_local_experts: int = 0):
             """Initialize the runner.
 
             Args:
@@ -4093,6 +4107,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ``source_tokens``. Token ``t`` is slot row
                     ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
                 slot_tokens: Rows of ``a`` per source rank; see ``source_tokens``.
+                num_empty_local_experts: Local slots holding no expert; the
+                    tuning profile gives the last this many no tokens.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -4113,6 +4129,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.use_expert_counts = use_expert_counts
             self.source_tokens = source_tokens
             self.slot_tokens = slot_tokens
+            self.num_empty_local_experts = num_empty_local_experts
             if source_tokens:
                 if use_expert_counts:
                     raise ValueError("Source slots and expert-count "
@@ -4220,9 +4237,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            # The source-slot geometry sizes the tuning inputs but not the
-            # tuned kernel, so it keys the config and not unique_id().
-            key = (self.unique_id(), self.source_tokens, self.slot_tokens)
+            # The source-slot geometry and the empty slots shape the tuning
+            # inputs but not the tuned kernel, so they key the config and not
+            # unique_id().
+            key = (self.unique_id(), self.source_tokens, self.slot_tokens,
+                   self.num_empty_local_experts)
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(
                     self.num_experts,
@@ -4246,6 +4265,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.num_local_experts,
                     self.local_expert_offset,
                     self.tile_size,
+                    num_empty_local_experts=self.num_empty_local_experts,
                 )
                 infer_a_rows = helper.infer_shape_num_tokens
                 if self.source_tokens:
@@ -4548,6 +4568,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         source_tokens: int = 0,
         slot_tokens: int = 0,
+        num_empty_local_experts: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -4590,7 +4611,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             source_tokens=source_tokens,
-            slot_tokens=slot_tokens)
+            slot_tokens=slot_tokens,
+            num_empty_local_experts=num_empty_local_experts)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -4633,6 +4655,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         source_tokens: int = 0,
         slot_tokens: int = 0,
+        num_empty_local_experts: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Meta-device shapes for the FC1 output and its block scales.
 
