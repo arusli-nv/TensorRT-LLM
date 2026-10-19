@@ -280,27 +280,18 @@ def test_ghost_slots_start_empty_and_unbacked(monkeypatch):
     load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_called_once_with(True)
 
 
-def test_restore_takes_replica_slots_before_ghost_slots():
-    # Rank 2 is dead; expert 0 has two replicas and ranks 0 and 3 keep a ghost slot each.
-    placement = np.array([[0, -1], [1, 0], [-1, -1], [3, -1]], dtype=np.int32)
-    assert restore_lost_experts(placement, [2, 4], [2], empty_last=True) == []
-    # Expert 2 takes rank 0's replica of expert 0; no replica is left for expert 4, which takes a ghost slot
-    # on rank 3, the rank that has not taken a restored expert yet.
-    assert placement.tolist() == [[2, -1], [1, 0], [-1, -1], [3, 4]]
-
-
 # Six experts on two EPLB slots per rank (experts 0 and 2 twice) and one ghost slot per rank.
 _MIXED = [[0, 1, -1], [2, 3, -1], [4, 5, -1], [0, 2, -1]]
 
 
-def test_mixed_mode_maps_ghost_slots_only_where_replicas_fall_short(monkeypatch):
+def test_mixed_mode_restores_into_ghost_slots_spread_over_ranks(monkeypatch):
     load_balancer = _online_load_balancer(
         monkeypatch, _MIXED, largest_loss=2, experts=6, eplb_slots=2
     )
     assert load_balancer.extra_slots_mode() == "replicas+ghost"
-    # Losing rank 2: its experts replace a replica each; no ghost slot is used.
+    # Losing rank 2: its experts take ghost slots on two ranks, one each, and every replica stays.
     (placement,) = load_balancer.recovery_placements([FAILED_RANK])
-    assert placement.tolist() == [[4, 1, -1], [5, 3, -1], [-1, -1, -1], [0, 2, -1]]
+    assert placement.tolist() == [[0, 1, 4], [2, 3, 5], [-1, -1, -1], [0, 2, -1]]
     # Losing the node of ranks 2 and 3 leaves no replica: the ghost slots take the lost experts.
     assert load_balancer.covers_loss_of(_NODE)
     (placement,) = load_balancer.recovery_placements(_NODE)

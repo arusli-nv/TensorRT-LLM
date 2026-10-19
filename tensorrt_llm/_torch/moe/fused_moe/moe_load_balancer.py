@@ -881,16 +881,13 @@ class SingleLayerMoeLoadBalancer:
 _current_moe_load_balancer = threading.local()
 
 
-def restore_lost_experts(placement: np.ndarray,
-                         lost: List[int],
-                         dead_ranks: Iterable[int],
-                         empty_last: bool = False) -> List[int]:
+def restore_lost_experts(placement: np.ndarray, lost: List[int],
+                         dead_ranks: Iterable[int]) -> List[int]:
     """Place each ``lost`` expert into a slot of a live rank in ``placement`` (``[ep_size, slots_per_rank]``
     expert ids, -1 = no expert), in place.
 
-    Empty slots of live ranks are taken first (with ``empty_last``, last:
-    ghost slots, which a restore must first map memory behind); otherwise the
-    slot of a replica of the expert with the most replicas (so no expert loses
+    Empty (ghost) slots of live ranks are taken first; otherwise the slot of a
+    replica of the expert with the most replicas (so no expert loses
     its last copy). Ties go to the rank that has taken the fewest restored
     experts so far, then the lowest rank and slot: a minimal change that
     spreads the loading across ranks and is the same on every rank.
@@ -914,9 +911,8 @@ def restore_lost_experts(placement: np.ndarray,
             continue
         ranks, slots, held, replicas = (a[free]
                                         for a in (ranks, slots, held, replicas))
-        empty = held < 0
-        best = np.lexsort((slots, ranks, restored_per_rank[ranks], -replicas,
-                           empty if empty_last else ~empty))[0]
+        best = np.lexsort(
+            (slots, ranks, restored_per_rank[ranks], -replicas, held >= 0))[0]
         rank, slot = ranks[best], slots[best]
         if held[best] >= 0:
             counts[held[best]] -= 1
@@ -1238,8 +1234,6 @@ class MoeLoadBalancer:
             raise ValueError(f"Base placement has {len(base)} layers, expected "
                              f"{len(self.single_layer_load_balancers)}")
         placements, missing = [], {}
-        # Online EPLB's replicas take lost experts before its ghost slots, which need memory mapped first.
-        ghosts_last = self.extra_slots_mode() == "replicas+ghost"
         for i, layer in enumerate(self.single_layer_load_balancers):
             if base is None:
                 placement = self._masked_placement(layer, dead)
@@ -1256,9 +1250,7 @@ class MoeLoadBalancer:
                     and not self._copy_ranks(layer, expert, dead)
                 ]
                 lost = uncopied + restore_lost_experts(
-                    placement, [e for e in lost if e not in uncopied],
-                    dead,
-                    empty_last=ghosts_last)
+                    placement, [e for e in lost if e not in uncopied], dead)
             if lost:
                 missing[layer.get_layer_idx()] = lost
             placements.append(placement)
