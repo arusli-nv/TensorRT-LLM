@@ -477,13 +477,13 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-// Fixed slots: copy one source's routed expert ids and router weights to the compact lists (see
-// DispatchKernelPointers::compact_expert_ids) as soon as that source's flag arrives. Runs in a CTA after every token
-// CTA, so its wait never holds an SM a token CTA needs. With EPLB statistics it also copies the source's row of the
-// gathered statistics to eplb_stats_out (0 for a masked source). An abort leaves the outputs partial; the step is
-// discarded.
+// Fixed slots: receive one source. Waits for that source's flag and writes source_valid_counts[source] (0 for a masked
+// source or when an abort releases the wait). With compact routing it then copies the source's routed expert ids and
+// router weights to the compact lists (see DispatchKernelPointers::compact_expert_ids), and with EPLB statistics the
+// source's row of the gathered statistics to eplb_stats_out (0 for a masked source). Runs in a CTA after every token
+// CTA, so its wait never holds an SM a token CTA needs. An abort leaves the outputs partial; the step is discarded.
 template <int TOP_K, bool ENABLE_EPLB>
-__device__ void compact_source_routing(DispatchKernelPointers const& ptrs, int source, int source_tokens, int rank_id,
+__device__ void receive_source(DispatchKernelPointers const& ptrs, int source, int source_tokens, int rank_id,
     int ep_size, int eplb_stats_num_experts)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
@@ -494,31 +494,37 @@ __device__ void compact_source_routing(DispatchKernelPointers const& ptrs, int s
     bool const active = is_rank_active(ptrs.active_rank_mask, source);
     if (threadIdx.x == 0)
     {
+        uint32_t const expected_value = *ptrs.flag_val;
+        int* const round_recv_count = ptrs.recv_counters[rank_id] + round_parity(expected_value) * ep_size + source;
         int count = 0;
-        if (active)
+        if (!active)
         {
-            uint32_t const expected_value = *ptrs.flag_val;
-            if (!wait_round_flag(&ptrs.completion_flags[rank_id][source], expected_value, ptrs.timeout_cycles,
-                    ptrs.abort, rank_id, source, "dispatch"))
-            {
-                count = -1;
-            }
-            else
-            {
-#if TLLM_MOE_A2A_COMPILE_SM90
-                asm volatile("fence.acquire.sys;");
-#else
-                asm volatile("fence.acq_rel.sys;");
-#endif
-                count = ptrs.recv_counters[rank_id][round_parity(expected_value) * ep_size + source];
-                count = count >= 0 && count <= source_tokens ? count : 0;
-            }
+            *round_recv_count = 0;
         }
+        else if (!wait_round_flag(&ptrs.completion_flags[rank_id][source], expected_value, ptrs.timeout_cycles,
+                     ptrs.abort, rank_id, source, "dispatch"))
+        {
+            count = -1;
+        }
+        else
+        {
+            // The source wrote its count and rows before releasing its flag, from another GPU: only a system-scope
+            // acquire orders the reads below after them.
+#if TLLM_MOE_A2A_COMPILE_SM90
+            asm volatile("fence.acquire.sys;");
+#else
+            asm volatile("fence.acq_rel.sys;");
+#endif
+            count = *round_recv_count;
+            // A count beyond the runtime capacity is corrupt: drop the source rather than read past its slot.
+            count = count >= 0 && count <= source_tokens ? count : 0;
+        }
+        ptrs.source_valid_counts[source] = count < 0 ? 0 : count;
         received = count;
     }
     __syncthreads();
     int const count = received;
-    if (count < 0)
+    if (count < 0 || ptrs.compact_expert_ids == nullptr)
     {
         return;
     }
@@ -577,7 +583,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         int const token_ctas = local_num_tokens > 0 ? local_num_tokens : 1;
         if (local_token_idx >= token_ctas)
         {
-            compact_source_routing<TOP_K, ENABLE_EPLB>(
+            receive_source<TOP_K, ENABLE_EPLB>(
                 ptrs, local_token_idx - token_ctas, max_tokens_per_rank, rank_id, ep_size, eplb_stats_num_experts);
             return;
         }
@@ -744,15 +750,10 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
             }
 
-            // A source counts as received only once this warp has seen its flag below; until then none of its rows
-            // may be read. An abort returns only the lane that was waiting; the step is then discarded.
-            int* const source_valid_counts = ENABLE_RANK_MASK ? ptrs.source_valid_counts : nullptr;
-            if (source_valid_counts != nullptr)
+            // With fixed slots the per-source CTAs wait for each source and publish its count.
+            if (ENABLE_RANK_MASK && ptrs.source_valid_counts != nullptr)
             {
-                for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-                {
-                    source_valid_counts[peer_rank] = 0;
-                }
+                return;
             }
 
             // Wait for all active peers to signal; skip dead ranks (otherwise we would
@@ -772,25 +773,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         ENABLE_RANK_MASK ? ptrs.abort : nullptr, rank_id, peer_rank, "dispatch"))
                 {
                     return;
-                }
-            }
-            if (source_valid_counts != nullptr)
-            {
-                // Each source wrote its count before releasing its flag; acquire them, then publish the rows readers
-                // may use. A count beyond the runtime capacity is corrupt: drop the source rather than read past its
-                // slot.
-#if TLLM_MOE_A2A_COMPILE_SM90
-                asm volatile("fence.acquire.sys;");
-#else
-                asm volatile("fence.acq_rel.sys;");
-#endif
-                for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-                {
-                    if (is_rank_active(ptrs.active_rank_mask, peer_rank))
-                    {
-                        int const count = round_recv_counters[peer_rank];
-                        source_valid_counts[peer_rank] = count >= 0 && count <= max_tokens_per_rank ? count : 0;
-                    }
                 }
             }
 #endif
@@ -1391,8 +1373,9 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     {
         grid_size = 1;
     }
-    if (compact_routing)
+    if (params.source_valid_counts != nullptr)
     {
+        // One receiving CTA per source (receive_source).
         grid_size += params.ep_size;
     }
 

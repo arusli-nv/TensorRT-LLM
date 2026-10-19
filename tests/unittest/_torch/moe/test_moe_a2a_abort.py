@@ -371,6 +371,54 @@ def test_compact_routing_copies_the_rows_each_source_sent(peer_active: bool) -> 
     assert rows[_CAPACITY:] == peer + [(-1, 0.0)] * (_CAPACITY - peer_rows)
 
 
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("local", [0, 5])
+def test_each_source_gets_its_own_valid_count(local: int, compact: bool) -> None:
+    """Is every source's count right: self, a peer with rows, a peer with none and a departed peer that arrived?"""
+    ep_size = 4
+    workspace, meta, experts, payload = _setup(ep_size, tokens=local)
+    weights = torch.ones((local, 1), device="cuda")
+    controls, abort = _rank_mask_controls(0b0111)
+    # Stand in for peers 1-3: each publishes its count and completion flag for the next round. Peer 3 has
+    # departed (masked out), so its arrival must not count.
+    expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
+    parity = ((expected_flag - 1) >> 1) & 1
+    peer_counts = {1: 3, 2: 0, 3: 2}
+    for peer, count in peer_counts.items():
+        counter = _offset(meta, "RECV_COUNTERS") + 4 * (parity * ep_size + peer)
+        _word(workspace, counter).fill_(count)
+        _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4 * peer).fill_(expected_flag)
+    payloads = [payload, experts, weights]
+    if compact:
+        _, counts, ids, _ = _compact_round(workspace, meta, experts, payloads, controls)
+    else:
+        counts = torch.full((ep_size,), -7, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.moe_a2a_dispatch(
+            experts,
+            payloads,
+            workspace,
+            meta,
+            _CAPACITY,
+            0,
+            ep_size,
+            1,
+            ep_size,
+            None,
+            **controls,
+            source_valid_counts=counts,
+        )
+    torch.cuda.synchronize()
+
+    assert counts.tolist() == [local, 3, 0, 0]
+    assert abort.tolist() == [0, 0]
+    departed_counter = _offset(meta, "RECV_COUNTERS") + 4 * (parity * ep_size + 3)
+    assert _word(workspace, departed_counter).item() == 0
+    if compact:
+        rows = ids.view(ep_size, _CAPACITY).tolist()
+        assert all(row == [-1] * _CAPACITY for row in rows[2:])
+        assert rows[0][local:] == [-1] * (_CAPACITY - local)
+
+
 @pytest.mark.parametrize(
     "extra,match",
     [

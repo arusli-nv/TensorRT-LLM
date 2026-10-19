@@ -142,12 +142,13 @@ struct DispatchKernelPointers
     MoeA2AAbortState* abort{nullptr};
     // Optional (rank-mask fence path): with slot_tokens > 0, source rank r writes token t of payload p at row
     // r * slot_tokens + t of recv_buffers[target][p], a fixed slot per source whatever the runtime batch, so a late
-    // write from a lost rank reaches only its own slot. source_valid_counts ([ep_size], local) then receives the rows
-    // each active source sent this round once its flag arrived, and 0 otherwise. When the round aborts, sources
-    // whose flags arrived may still get their counts: the caller discards an aborted step without reading them.
+    // write from a lost rank reaches only its own slot. One extra CTA per source waits for that source's flag and
+    // writes source_valid_counts[source] ([ep_size], local): the rows it sent this round, or 0 if it is masked or the
+    // round aborts first. Sources whose flags arrived before an abort keep their counts: the caller discards an
+    // aborted step without reading them.
     int slot_tokens{0};
     int* source_valid_counts{nullptr};
-    // Optional (fixed slots): one extra CTA per source copies the routed expert ids (payload compact_payload_index,
+    // Optional (fixed slots): the same per-source CTAs copy the routed expert ids (payload compact_payload_index,
     // int32 [TOP_K] per token) and router weights (the next payload, float [TOP_K]) of the rows that source sent to
     // compact [ep_size * max_tokens_per_rank, TOP_K] lists once its flag arrives; its other rows get -1 and 0.
     int32_t* compact_expert_ids{nullptr};

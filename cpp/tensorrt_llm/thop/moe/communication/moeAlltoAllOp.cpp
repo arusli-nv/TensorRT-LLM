@@ -586,8 +586,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // With source_valid_counts, each source rank owns a fixed slot of the static token capacity in every payload, so
     // graph-captured addresses stay valid for any runtime batch and a source's writes never reach another source's
     // rows. Readers learn from source_valid_counts which rows hold tokens, so expert ids are not sanitized, and EPLB
-    // statistics are read from eplb_stats_out, where the compact-routing CTAs copy each active source's row once its
-    // flag arrives.
+    // statistics are read from eplb_stats_out, where the per-source receiving CTAs copy each active source's row once
+    // its flag arrives.
     bool const fixedSlots = sourceValidCounts.has_value();
     TORCH_CHECK(
         !fixedSlots || (enableRankMask && !useCftCountedWrites), "source_valid_counts needs the rank-mask fence path");
