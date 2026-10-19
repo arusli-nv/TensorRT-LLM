@@ -405,6 +405,8 @@ void GhostSlotMemory::free(void* ptr) noexcept
         TLLM_LOG_ERROR("%p is not ghost slot memory", ptr);
         return;
     }
+    // Unlike cudaFree, cuMemUnmap does not wait for the work queued on the range: wait for it here.
+    TLLM_CUDA_CHECK_WARN(cudaDeviceSynchronize());
     CUdeviceptr const base = it->first;
     auto& allocation = it->second;
     for (auto& [owner, pieces] : mPending)

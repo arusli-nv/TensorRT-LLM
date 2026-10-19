@@ -53,7 +53,8 @@ public:
 
     // A range for slotCount slots of slotBytes each on the current device; the slots in emptySlots are not backed.
     void* allocate(size_t slotBytes, int slotCount, std::vector<int> const& emptySlots);
-    // Unmaps and releases the range; errors are logged (a tensor deleter must not throw).
+    // Waits for the device's work, then unmaps and releases the range; errors are logged (a tensor deleter must not
+    // throw).
     void free(void* ptr) noexcept;
 
     // Device bytes that back(ranges) would allocate.
