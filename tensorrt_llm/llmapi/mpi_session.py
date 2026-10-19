@@ -135,12 +135,14 @@ def _leave_degraded_world(clean: bool) -> NoReturn:
                                    lambda: world.Abort(1))
         watchdog.daemon = True
         watchdog.start()
+        status = 0
         try:
             mpi4py.MPI.Finalize()
         except mpi4py.MPI.Exception as e:
             print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
-            os._exit(1)
-        os._exit(0)
+            status = 1
+        watchdog.cancel()
+        os._exit(status)
     world.Abort(1)
 
 
