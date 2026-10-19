@@ -687,15 +687,16 @@ void SingleLayerMoeLoadBalancer::reconfigureMaskOnly(std::vector<uint8_t> const&
     TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
 }
 
-void SingleLayerMoeLoadBalancer::validatePlacement(
-    std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const
+void SingleLayerMoeLoadBalancer::validatePlacement(std::vector<uint8_t> const& deadRankMask,
+    std::vector<std::vector<int>> const& rankExpertIds, bool slotsLoaded) const
 {
     checkRoutingKernelServes(computeReplicaCounts(deadRankMask, rankExpertIds));
-    TLLM_CHECK_WITH_INFO(mWeightUpdater->hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
+    TLLM_CHECK_WITH_INFO(
+        slotsLoaded || mWeightUpdater->hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
 }
 
 void SingleLayerMoeLoadBalancer::installPlacement(
-    std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds)
+    std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds, bool slotsLoaded)
 {
     mCpuPlacementInfo.expertReplicaCount = computeReplicaCounts(deadRankMask, rankExpertIds);
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
@@ -712,7 +713,7 @@ void SingleLayerMoeLoadBalancer::installPlacement(
             }
         }
     }
-    loadAndPublishPlacement();
+    loadAndPublishPlacement(!slotsLoaded);
 }
 
 void SingleLayerMoeLoadBalancer::appendLoadedSlotRanges(
@@ -773,22 +774,28 @@ void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpuByCpu()
     std::fill_n(mStatisticInfo.expertLoadFactor, mMetaInfo.expertCount, 0.0f);
 }
 
-void SingleLayerMoeLoadBalancer::loadAndPublishPlacement()
+void SingleLayerMoeLoadBalancer::loadAndPublishPlacement(bool loadSlots)
 {
     prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
     if (mMoeLoadBalancer->mUseGpuMemcpy)
     {
-        mWeightUpdater->updateWeights(&mCpuPlacementInfo);
+        if (loadSlots)
+        {
+            mWeightUpdater->updateWeights(&mCpuPlacementInfo);
+        }
         copyPlacementInfoToGpu();
         TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
         TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
     }
     else
     {
-        mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
-            [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
-        mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
-        mLastUpdateTaskId = -1;
+        if (loadSlots)
+        {
+            mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
+                [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
+            mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
+            mLastUpdateTaskId = -1;
+        }
         copyPlacementInfoToGpuByCpu();
     }
 }
@@ -946,7 +953,11 @@ void HostMemoryMoeWeightUpdater::finalizeHostWeight()
 void HostMemoryMoeWeightUpdater::finalizeWeights()
 {
     finalizeWeightSlot();
-    finalizeHostWeight();
+    // Without host weights, only restores whose caller loads the slots change them (restorePlacement's slotsLoaded).
+    if (!mHostWeights.empty())
+    {
+        finalizeHostWeight();
+    }
 }
 
 void HostMemoryMoeWeightUpdater::copyWeights(MoeWeight const& src, MoeWeight const& dst, cudaStream_t stream)
@@ -1021,6 +1032,7 @@ void HostMemoryMoeWeightUpdater::updateWeights(
     tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo, int rank, int size)
 {
     // PrintUpdateInfo(mMetaInfo, placementCpuInfo);
+    TLLM_CHECK_WITH_INFO(hasHostWeights(), "Loading experts into slots needs EPLB's host weights");
     bool useGpu = mLayerLoadBalancer->mMoeLoadBalancer->mUseGpuMemcpy;
     for (int slotId = 0; slotId < mMetaInfo.slotCountPerRank; ++slotId)
     {
@@ -1256,8 +1268,8 @@ void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
     }
 }
 
-void MoeLoadBalancer::restorePlacement(
-    std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds)
+void MoeLoadBalancer::restorePlacement(std::vector<int> const& deadRanks,
+    std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds, bool slotsLoaded)
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot restore placement.");
@@ -1273,14 +1285,14 @@ void MoeLoadBalancer::restorePlacement(
     }
     for (size_t i = 0; i < mLayers.size(); ++i)
     {
-        mLayers[i]->validatePlacement(candidateDeadRankMask, layerRankExpertIds[i]);
+        mLayers[i]->validatePlacement(candidateDeadRankMask, layerRankExpertIds[i], slotsLoaded);
     }
     GhostSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
     // Static placement never started the copy threads; start() is a no-op once they run.
     mMultiThreadWorker->start();
     for (size_t i = 0; i < mLayers.size(); ++i)
     {
-        mLayers[i]->installPlacement(candidateDeadRankMask, layerRankExpertIds[i]);
+        mLayers[i]->installPlacement(candidateDeadRankMask, layerRankExpertIds[i], slotsLoaded);
     }
     {
         std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
