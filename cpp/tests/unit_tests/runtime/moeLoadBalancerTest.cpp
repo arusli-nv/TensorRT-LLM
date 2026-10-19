@@ -16,10 +16,15 @@
 
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <memory>
 
 using namespace tensorrt_llm::runtime;
 
@@ -575,6 +580,19 @@ private:
     std::vector<float*> mSlots;
 };
 
+size_t vmmGranularity()
+{
+    int device = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    size_t granularity = 0;
+    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    return granularity;
+}
+
 } // namespace
 
 TEST(MoeLoadBalancerRestoreTest, OneSlotPerExpertRoutingKeepsOneReplicaPerExpert)
@@ -668,6 +686,153 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsHostWeights)
     std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
     EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
         tensorrt_llm::common::TllmException);
+}
+
+TEST(BorrowedSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
+{
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    // Slots of 3.5 chunks: slot 1 owns chunks 4-6 whole (chunk 3 is shared with slot 0), slot 3 chunks 11-13.
+    size_t const slotBytes = 3 * gran + gran / 2;
+    auto& memory = BorrowedSlotMemory::getInstance();
+    auto* base = static_cast<uint8_t*>(memory.allocate(slotBytes, 4, {1, 3}));
+    auto slot = [&](int i) { return BorrowedSlotMemory::Range{base + i * slotBytes, slotBytes}; };
+    // Two load balancers: each keeps or releases only the backing it asked for.
+    int const owner = 0;
+    int const other = 0;
+    EXPECT_EQ(memory.unbackedBytes({slot(0)}), 0u);
+    EXPECT_EQ(memory.unbackedBytes({slot(1)}), 3 * gran);
+    EXPECT_EQ(memory.unbackedBytes({slot(1), slot(3), slot(1)}), 6 * gran);
+    EXPECT_EQ(memory.unbackedBytes({{&slotBytes, 1}}), 0u); // not borrowed memory
+
+    // Backed slots keep their bytes; the empty slots' whole chunks share scratch: chunks 4-6 and 11-13 each map a
+    // 2-chunk and a 1-chunk scratch allocation, so chunks 4 and 11 are the same memory.
+    TLLM_CUDA_CHECK(cudaMemset(base, 1, 4 * slotBytes));
+    TLLM_CUDA_CHECK(cudaMemset(base + 2 * slotBytes, 2, slotBytes));
+    TLLM_CUDA_CHECK(cudaMemset(base + 4 * gran, 7, gran));
+    uint8_t value = 0;
+    TLLM_CUDA_CHECK(cudaMemcpy(&value, base + 11 * gran, 1, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(value, 7);
+    TLLM_CUDA_CHECK(cudaMemcpy(&value, base, 1, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(value, 1);
+    TLLM_CUDA_CHECK(cudaMemcpy(&value, base + 2 * slotBytes, 1, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(value, 2);
+
+    memory.back({slot(1)}, &owner);
+    EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
+    EXPECT_EQ(memory.unbackedBytes({slot(3)}), 3 * gran);
+    TLLM_CUDA_CHECK(cudaMemset(base + slotBytes, 5, slotBytes));
+    TLLM_CUDA_CHECK(cudaMemset(base + 12 * gran, 9, gran));
+    std::vector<uint8_t> restored(slotBytes);
+    TLLM_CUDA_CHECK(cudaMemcpy(restored.data(), base + slotBytes, slotBytes, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(restored.begin(), restored.end(), [](uint8_t b) { return b == 5; }));
+
+    // Another owner's keep or release leaves it pending.
+    memory.keepPending(&other);
+    EXPECT_EQ(memory.releasePending(&other), 0u);
+    EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
+    // A plan abandoned before its install gives the memory back: slot 1 maps scratch again (chunk 4 is chunk 11).
+    EXPECT_EQ(memory.releasePending(&owner), 3 * gran);
+    EXPECT_EQ(memory.unbackedBytes({slot(1)}), 3 * gran);
+    TLLM_CUDA_CHECK(cudaMemset(base + 11 * gran, 3, 1));
+    TLLM_CUDA_CHECK(cudaMemcpy(&value, base + 4 * gran, 1, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(value, 3);
+    // An installed plan keeps it.
+    memory.back({slot(1)}, &owner);
+    memory.keepPending(&owner);
+    EXPECT_EQ(memory.releasePending(&owner), 0u);
+    EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
+    memory.free(base);
+
+    // Adjacent empty slots 1 and 2 share scratch pieces (chunks 4-7 and 8-9); backing slot 1 splits the piece it
+    // shares with slot 2, whose chunks stay unbacked.
+    base = static_cast<uint8_t*>(memory.allocate(slotBytes, 4, {1, 2}));
+    EXPECT_EQ(memory.unbackedBytes({slot(1), slot(2)}), 6 * gran);
+    memory.back({slot(1)}, &owner);
+    EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
+    EXPECT_EQ(memory.unbackedBytes({slot(2)}), 3 * gran);
+    TLLM_CUDA_CHECK(cudaMemset(base + slotBytes, 5, slotBytes));
+    TLLM_CUDA_CHECK(cudaMemset(base + 7 * gran, 9, 3 * gran));
+    TLLM_CUDA_CHECK(cudaMemcpy(restored.data(), base + slotBytes, slotBytes, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(restored.begin(), restored.end(), [](uint8_t b) { return b == 5; }));
+    memory.free(base);
+}
+
+TEST(BorrowedSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
+{
+    // The design's core claim: a CUDA graph captured over a borrowed slot keeps working while the memory behind
+    // it changes (scratch, then backed, then scratch again), without recapture.
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    auto& memory = BorrowedSlotMemory::getInstance();
+    auto* base = static_cast<uint8_t*>(memory.allocate(2 * gran, 2, {1}));
+    BorrowedSlotMemory::Range const slot1{base + 2 * gran, 2 * gran};
+    uint8_t* out = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&out, 2 * gran));
+    cudaStream_t stream = nullptr;
+    TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(out, base + 2 * gran, 2 * gran, cudaMemcpyDeviceToDevice, stream));
+    TLLM_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    TLLM_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+    auto replayAll = [&](uint8_t expected)
+    {
+        TLLM_CUDA_CHECK(cudaGraphLaunch(exec, stream));
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<uint8_t> host(2 * gran);
+        TLLM_CUDA_CHECK(cudaMemcpy(host.data(), out, host.size(), cudaMemcpyDeviceToHost));
+        return std::all_of(host.begin(), host.end(), [&](uint8_t b) { return b == expected; });
+    };
+    replayAll(0); // scratch: no fault, contents unspecified
+
+    int const owner = 0;
+    memory.back({slot1}, &owner);
+    TLLM_CUDA_CHECK(cudaMemset(base + 2 * gran, 7, 2 * gran));
+    EXPECT_TRUE(replayAll(7));
+    EXPECT_EQ(memory.releasePending(&owner), 2 * gran);
+    replayAll(0); // scratch again: still no fault
+    memory.back({slot1}, &owner);
+    TLLM_CUDA_CHECK(cudaMemset(base + 2 * gran, 9, 2 * gran));
+    EXPECT_TRUE(replayAll(9));
+
+    TLLM_CUDA_CHECK(cudaGraphExecDestroy(exec));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+    TLLM_CUDA_CHECK(cudaStreamDestroy(stream));
+    TLLM_CUDA_CHECK(cudaFree(out));
+    memory.keepPending(&owner);
+    memory.free(base);
+}
+
+TEST(BorrowedSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
+{
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    size_t const gran = vmmGranularity();
+    auto& memory = BorrowedSlotMemory::getInstance();
+    auto release = [](uint8_t* ptr) { BorrowedSlotMemory::getInstance().free(ptr); };
+    using Borrowed = std::unique_ptr<uint8_t, decltype(release)>;
+    // Empty slots map only the shared scratch, so neither range below uses device memory however large it is. The
+    // second is larger than the whole device: no backing for it can be allocated, whatever else uses the GPU, so
+    // backing both fails (after the first one's memory was allocated if the first range is processed first).
+    size_t freeBytes = 0, totalBytes = 0;
+    TLLM_CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+    size_t const hugeBytes = (totalBytes / gran + 1) * gran;
+    Borrowed small(static_cast<uint8_t*>(memory.allocate(gran, 2, {1})), release);
+    Borrowed huge(static_cast<uint8_t*>(memory.allocate(hugeBytes, 1, {0})), release);
+    BorrowedSlotMemory::Range const smallSlot{small.get() + gran, gran};
+    BorrowedSlotMemory::Range const hugeSlot{huge.get(), hugeBytes};
+    auto const gpuBytes = MemoryCounters::getInstance().getGpu();
+    int const owner = 0;
+    EXPECT_THROW(memory.back({smallSlot, hugeSlot}, &owner), tensorrt_llm::common::TllmException);
+    EXPECT_EQ(memory.unbackedBytes({smallSlot}), gran);
+    EXPECT_EQ(memory.unbackedBytes({hugeSlot}), hugeBytes);
+    EXPECT_EQ(MemoryCounters::getInstance().getGpu(), gpuBytes);
+    EXPECT_EQ(memory.releasePending(&owner), 0u);
+    // Every chunk of both ranges is still mapped (scratch): a full write does not fault.
+    TLLM_CUDA_CHECK(cudaMemset(small.get(), 1, 2 * gran));
+    TLLM_CUDA_CHECK(cudaMemset(huge.get(), 1, hugeBytes));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // Iteration control parameter structure

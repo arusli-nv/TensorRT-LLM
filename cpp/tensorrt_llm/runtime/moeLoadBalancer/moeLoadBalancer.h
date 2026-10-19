@@ -30,6 +30,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/borrowedSlotMemory.h"
 
 namespace tensorrt_llm::runtime
 {

@@ -201,6 +201,29 @@ void migrateToHostAccessible(at::Tensor& tensor)
         /*storage_offset=*/0, tensor.sizes().vec(), tensor.strides().vec());
 }
 
+// Moves an EPLB slot tensor ([local slots, ...], contiguous) to storage whose empty slots take no device memory
+// until a restore loads them (BorrowedSlotMemory). Their contents are not kept.
+void moeBorrowSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
+{
+    TORCH_CHECK(tensor.device().is_cuda() && tensor.is_contiguous() && tensor.dim() >= 1 && tensor.size(0) > 0,
+        "expects a contiguous CUDA tensor of slots");
+    size_t const byteSize = tensor.numel() * tensor.element_size();
+    int const slotCount = static_cast<int>(tensor.size(0));
+    void* devPtr = tensorrt_llm::runtime::BorrowedSlotMemory::getInstance().allocate(
+        byteSize / slotCount, slotCount, std::vector<int>(emptySlots.begin(), emptySlots.end()));
+    // Owned before the copy, so that a failed copy frees it.
+    c10::DataPtr dp(
+        devPtr, devPtr, [](void* ptr) { tensorrt_llm::runtime::BorrowedSlotMemory::getInstance().free(ptr); },
+        tensor.device());
+    // On the stream that produced the weights; finished before the old storage can be reused.
+    auto const stream = at::cuda::getCurrentCUDAStream();
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(devPtr, tensor.data_ptr(), byteSize, cudaMemcpyDeviceToDevice, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto storageImpl = c10::make_intrusive<c10::StorageImpl>(c10::StorageImpl::use_byte_size_t(), byteSize,
+        std::move(dp), c10::GetAllocator(tensor.device().type()), /*resizable=*/false);
+    tensor.set_(at::Storage(storageImpl), /*storage_offset=*/0, tensor.sizes().vec(), tensor.strides().vec());
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -277,9 +300,11 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("migrate_to_host_accessible(Tensor tensor) -> ()");
+    m.def("moe_borrow_slot_storage(Tensor tensor, int[] empty_slots) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("migrate_to_host_accessible", &tensorrt_llm::torch_ext::migrateToHostAccessible);
+    m.impl("moe_borrow_slot_storage", &tensorrt_llm::torch_ext::moeBorrowSlotStorage);
 }

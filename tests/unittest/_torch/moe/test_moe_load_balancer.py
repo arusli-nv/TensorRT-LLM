@@ -607,5 +607,22 @@ def test_shutdown_barrier_tolerates_a_lost_peer_only_during_recovery(
                 balancer._shared_barrier()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_borrowed_slot_storage_copies_after_the_producer_on_its_stream():
+    """The weights may still be written by a kernel on a non-default stream when their storage is borrowed."""
+    import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        weights = torch.zeros(4, 1 << 20, device="cuda")
+        torch.cuda._sleep(
+            50_000_000
+        )  # the producer is still busy when the storage is borrowed
+        weights.fill_(3.0)
+        torch.ops.trtllm.moe_borrow_slot_storage(weights, [1])
+    torch.cuda.synchronize()
+    assert weights[0].eq(3.0).all() and weights[2:].eq(3.0).all()
+
+
 if __name__ == '__main__':
     unittest.main()
