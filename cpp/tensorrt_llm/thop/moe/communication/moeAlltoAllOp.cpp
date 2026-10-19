@@ -513,6 +513,8 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
 //   - numExperts: Total number of routing slots (tokenSelectedExperts values are in [0, numExperts))
 //   - eplbStatsNumExperts: Number of experts used for EPLB stats (may be <= numExperts)
 //   - eplbLocalStats: [eplbStatsNumExperts] tensor containing local statistics for EPLB.
+//   - expertToSlot: (Optional) [num_routed_experts] device table of each expert's single slot. tokenSelectedExperts
+//   then holds expert ids; dispatch routes by their slots and sends the slot ids in payload expert_id_payload_index.
 //
 // Return values:
 //   - recvTensors: Vector of receive buffers (one tensor per payload), each [ep_size, runtimeMaxTokensPerRank,
@@ -531,7 +533,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
     torch::optional<torch::Tensor> abortState, torch::optional<torch::Tensor> sourceValidCounts,
     torch::optional<torch::Tensor> compactExpertIds, torch::optional<torch::Tensor> compactWeights,
-    torch::optional<torch::Tensor> eplbStatsOut)
+    torch::optional<torch::Tensor> eplbStatsOut, torch::optional<torch::Tensor> expertToSlot)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -561,13 +563,20 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // ceil/floor contiguous partitioning so ranks [0, numExperts % epSize)
     // own (numExperts / epSize + 1) experts and the rest own (numExperts / epSize).
 
-    // expert_id_payload_index names the routed expert ids for sanitization (with invalid_token_expert_id) or, with
-    // compact_expert_ids and compact_weights, for compact routing lists (the router weights are the next payload).
+    // expert_id_payload_index names the routed expert ids for sanitization (with invalid_token_expert_id), for
+    // compact routing lists (with compact_expert_ids and compact_weights; the router weights are the next payload), or
+    // the payload that carries the slot ids looked up in expert_to_slot.
     bool const sanitizeExpertIds = invalidTokenExpertId.has_value();
     bool const compactRouting = compactExpertIds.has_value();
     TORCH_CHECK(compactRouting == compactWeights.has_value(), "compact_expert_ids and compact_weights go together");
-    TORCH_CHECK(expertIdPayloadIndex.has_value() == (sanitizeExpertIds || compactRouting),
-        "expert_id_payload_index goes with invalid_token_expert_id or with compact_expert_ids");
+    TORCH_CHECK(expertIdPayloadIndex.has_value() == (sanitizeExpertIds || compactRouting || expertToSlot.has_value()),
+        "expert_id_payload_index goes with invalid_token_expert_id, compact_expert_ids or expert_to_slot");
+    if (expertToSlot.has_value())
+    {
+        CHECK_INPUT(expertToSlot.value(), torch::kInt32);
+        TORCH_CHECK(expertToSlot->dim() == 1 && expertToSlot->size(0) > 0 && expertToSlot->size(0) <= numExperts,
+            "expert_to_slot must be [num_routed_experts] with num_routed_experts <= num_experts (slots)");
+    }
     TORCH_CHECK(!(sanitizeExpertIds && compactRouting), "compact routing lists exclude expert-id sanitization");
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
@@ -833,6 +842,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.compact_expert_ids = compactRouting ? compactExpertIds->data_ptr<int32_t>() : nullptr;
     params.compact_weights = compactRouting ? compactWeights->data_ptr<float>() : nullptr;
     params.compact_payload_index = compactRouting ? expertIdPayloadIdx : 0;
+    params.expert_to_slot = expertToSlot.has_value() ? expertToSlot->data_ptr<int32_t>() : nullptr;
+    params.num_routed_experts = expertToSlot.has_value() ? static_cast<int>(expertToSlot->size(0)) : 0;
     if (eplbStatsOut.has_value())
     {
         torch::Tensor const& statsOut = eplbStatsOut.value();
@@ -1179,7 +1190,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "Tensor(b!)? source_valid_counts=None, "
         "Tensor(c!)? compact_expert_ids=None, "
         "Tensor(d!)? compact_weights=None, "
-        "Tensor(e!)? eplb_stats_out=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor(e!)? eplb_stats_out=None, "
+        "Tensor? expert_to_slot=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "

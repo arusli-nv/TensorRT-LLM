@@ -132,6 +132,13 @@ struct DispatchKernelPointers
     int expert_id_payload_index;
     int32_t invalid_expert_id;
 
+    // Optional (one slot per expert): expert_to_slot[e] is the global slot of expert e < num_routed_experts, read at
+    // execution time. token_selected_experts then holds expert ids: each (token, k) goes to the rank owning its
+    // expert's slot (an invalid id maps to slot num_experts and is not sent), and payload expert_id_payload_index
+    // carries these slot ids instead of its source rows.
+    int32_t const* expert_to_slot{nullptr};
+    int num_routed_experts{0};
+
     // Active-rank bitmask in device memory, read at execution time: bit i set => rank i is alive and participates
     // in this collective. Word w covers ranks 64*w..64*w+63 for w in [0, kRankMaskWords). Tokens routed to a masked
     // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped. Its address is fixed,
@@ -252,6 +259,10 @@ struct MoeA2ADispatchParams
     bool sanitize_expert_ids;
     int expert_id_payload_index;
     int32_t invalid_expert_id;
+
+    // Optional: see DispatchKernelPointers::expert_to_slot.
+    int32_t const* expert_to_slot{nullptr};
+    int num_routed_experts{0};
 
     // Whether to instantiate a kernel with active-rank checks.
     // This is a launch-lifetime mode, independent of future execution-abort handling.

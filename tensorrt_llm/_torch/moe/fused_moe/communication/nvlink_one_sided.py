@@ -1038,7 +1038,9 @@ class NVLinkOneSided(Communication):
                 committed membership for dispatch. Without an override, the committed mask and generation are
                 captured together; combine reuses that mask and fails closed if the generation changes first.
                 The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
-                artifact, not valid model output.
+                artifact, not valid model output. ``expert_to_slot`` (int32 [num_experts], device) is each expert's
+                single slot: ``token_selected_slots`` then holds expert ids, and the dispatch routes by and sends
+                their slot ids, read from the table at execution time.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales), each
@@ -1074,6 +1076,7 @@ class NVLinkOneSided(Communication):
         # take the received rows of each slot from the source valid counts instead.
         can_fuse_sanitize = can_use_cft_for_dispatch and state is None
 
+        expert_to_slot = kwargs.get("expert_to_slot")
         eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
@@ -1119,7 +1122,9 @@ class NVLinkOneSided(Communication):
                 self.num_experts,
                 eplb_local_stats,
                 can_use_cft_for_dispatch,
-                expert_id_payload_index if can_fuse_sanitize or compact_routing else None,
+                expert_id_payload_index
+                if can_fuse_sanitize or compact_routing or expert_to_slot is not None
+                else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 self._publish_rank_mask(active_rank_mask)
@@ -1127,6 +1132,7 @@ class NVLinkOneSided(Communication):
                 else state.active_rank_mask,
                 abort_state=None if state is None else state.abort,
                 source_valid_counts=source_valid_counts,
+                expert_to_slot=expert_to_slot,
                 **compact_routing,
             )
         )

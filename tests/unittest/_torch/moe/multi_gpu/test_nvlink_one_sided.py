@@ -945,3 +945,165 @@ def test_cft_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
             )
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ============================================================================
+# Dispatch routed through a one-slot-per-expert table
+# ============================================================================
+
+
+def _received_rows(recv: tuple, ep_size: int, capacity: int) -> list[tuple[torch.Tensor, ...]]:
+    """Each source's received (slot ids, weights, hidden) rows in weight order; receive order varies per run."""
+    x, _, slots, weights = recv
+    x, slots, weights = (t.view(ep_size, capacity, -1) for t in (x, slots, weights))
+    rows = []
+    for source in range(ep_size):
+        valid = (slots[source] >= 0).any(dim=1)
+        order = weights[source, valid, 0].argsort()
+        rows.append(tuple(t[source, valid][order] for t in (slots, weights, x)))
+    return rows
+
+
+def _run_slot_table_worker(mode: str) -> dict:
+    """Compare dispatch with ``expert_to_slot`` against dispatching the looked-up slot ids, eager and replayed."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import os
+
+    import torch
+
+    os.environ[FORCE_CFT_ENV] = {"fence": "0", "cft": "1"}[mode]
+    rank = MPI.COMM_WORLD.Get_rank()
+    ep_size = MPI.COMM_WORLD.Get_size()
+    torch.cuda.set_device(rank)
+    MnnvlMemory.initialize()
+    from tensorrt_llm.bindings import BuildInfo
+
+    cft_reason = None
+    if mode == "cft":
+        if not BuildInfo.CFT_COUNTED_WRITES:
+            cft_reason = "build was compiled against CUDA below 13.4"
+        elif not cft_driver_is_supported(_get_nvidia_driver_version()):
+            cft_reason = "CFT requires driver 615 or newer"
+        else:
+            cft_reason = _cft_device_support_reason()
+    reasons = MPI.COMM_WORLD.allgather((MnnvlMemory.supports_mnnvl(), cft_reason))
+    if not all(item[0] for item in reasons):
+        return {"skip": "NVLink one-sided is not supported on every participating GPU"}
+    if any(item[1] for item in reasons):
+        return {"skip": str(reasons)}
+
+    num_experts, slots_per_rank, top_k, hidden_size = 8, 3, 4, 512
+    num_slots = ep_size * slots_per_rank
+    counts = [5, 0, 3, 7][:ep_size]
+    capacity = max(counts)
+    # One slot per expert with empty slots left over; the second placement moves expert 0 to an
+    # empty slot on another rank, as a restore does.
+    generator = torch.Generator().manual_seed(0)
+    first = torch.randperm(num_slots, generator=generator)[:num_experts].int()
+    empty = [s for s in range(num_slots) if s not in first.tolist()]
+    second = first.clone()
+    second[0] = next(s for s in empty if s // slots_per_rank != int(first[0]) // slots_per_rank)
+    table = first.cuda()
+
+    count = counts[rank]
+    token = torch.arange(count, device="cuda", dtype=torch.int64)[:, None]
+    choice = torch.arange(top_k, device="cuda", dtype=torch.int64)[None, :]
+    experts = ((token * 3 + choice + rank) % num_experts).int()
+    if count > 0:
+        experts[0, 0] = 0  # Expert 0 moves between placements.
+        experts[-1, -1] = -1  # An invalid route maps to slot num_slots and is not sent.
+    weights = (rank * 1024 + token * top_k + choice + 1).float() / 65536
+    hidden = torch.randn(count, hidden_size, dtype=torch.bfloat16, device="cuda")
+
+    mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
+    comm = NVLinkOneSided(
+        mapping=mapping,
+        num_slots=num_slots,
+        top_k=top_k,
+        max_num_tokens_per_rank=capacity,
+        hidden_size=hidden_size,
+        dtype=torch.bfloat16,
+    )
+
+    def round_trip(use_table: bool) -> tuple:
+        if use_table:
+            recv = comm.dispatch(hidden, None, experts, weights, counts, expert_to_slot=table)
+        else:
+            # What route() produces with one slot per expert.
+            valid = (experts >= 0) & (experts < num_experts)
+            slots = torch.where(valid, table[experts.clamp(0, num_experts - 1)], num_slots).int()
+            recv = comm.dispatch(hidden, None, slots, weights, counts)
+        snapshot = tuple(None if t is None else t.clone() for t in recv)
+        owned = (recv[2] >= rank * slots_per_rank) & (recv[2] < (rank + 1) * slots_per_rank)
+        expert_out = torch.where(owned.any(dim=-1, keepdim=True), recv[0], 0)
+        combined = comm.combine(expert_out, all_rank_max_num_tokens=capacity)
+        return snapshot, combined.clone()
+
+    def mismatch(observed: tuple, expected: tuple) -> str | None:
+        observed_rows = _received_rows(observed[0], ep_size, capacity)
+        expected_rows = _received_rows(expected[0], ep_size, capacity)
+        for source, (got, want) in enumerate(zip(observed_rows, expected_rows, strict=True)):
+            for name, a, b in zip(("slots", "weights", "hidden"), got, want, strict=True):
+                if not torch.equal(a, b):
+                    return f"rank {rank}: {name} received from rank {source} differ"
+        if not torch.equal(observed[1], expected[1]):
+            return f"rank {rank}: combined outputs differ"
+        return None
+
+    try:
+        errors = []
+        MPI.COMM_WORLD.Barrier()
+        reference = round_trip(False)
+        errors.append(mismatch(round_trip(True), reference))
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = round_trip(True)
+        graph.replay()
+        errors.append(mismatch(replayed, reference))
+        # The graph reads the table at replay time: rewrite it in place.
+        table.copy_(second.cuda())
+        moved_reference = round_trip(False)
+        graph.replay()
+        errors.append(mismatch(replayed, moved_reference))
+        torch.cuda.synchronize()
+        moved = any(
+            not torch.equal(a[0], b[0])
+            for a, b in zip(
+                _received_rows(reference[0], ep_size, capacity),
+                _received_rows(moved_reference[0], ep_size, capacity),
+                strict=True,
+            )
+        )
+        MPI.COMM_WORLD.Barrier()
+        return {
+            "rank": rank,
+            "errors": [e for e in errors if e is not None],
+            "moved": moved,
+            "cft_capable": comm.can_use_cft_counted_writes,
+        }
+    finally:
+        comm.destroy()
+
+
+@pytest.mark.parametrize("mode", ["fence", "cft"])
+def test_dispatch_through_slot_table(mode: str) -> None:
+    """Dispatch with ``expert_to_slot`` sends and routes like dispatching route()'s slot ids, before and after the
+    table is rewritten in place under a replayed CUDA graph."""
+    ep_size = 4
+    if torch.cuda.device_count() < ep_size:
+        pytest.skip(f"requires {ep_size} GPUs")
+    env = {"TRTLLM_ENABLE_PDL": "1", "TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"}
+    executor = MPIPoolExecutor(ep_size, env=env)
+    try:
+        results = list(executor.map(_run_slot_table_worker, [mode] * ep_size))
+        skipped = [r["skip"] for r in results if "skip" in r]
+        if skipped:
+            pytest.skip(skipped[0])
+        if mode == "cft":
+            assert all(r["cft_capable"] for r in results)
+        assert [e for r in results for e in r["errors"]] == []
+        # Expert 0 changed ranks, so some receiver must see different slot ids.
+        assert any(r["moved"] for r in results)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)

@@ -295,8 +295,9 @@ __host__ __device__ constexpr uint32_t make_warp_lane_mask()
     return (NUM_LANES == 32) ? ~0U : ((1U << NUM_LANES) - 1U);
 }
 
+// Returns the id this lane routes by: the expert id, or with expert_to_slot its slot id.
 template <int TOP_K, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
-__device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
+__device__ __forceinline__ int route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
     int* topk_target_indices, uint32_t lane_mask)
 {
@@ -313,7 +314,12 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
 
     int const ep_base = num_experts / ep_size;
     int const ep_remainder = num_experts - ep_base * ep_size;
-    int const expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+    int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+    if (ptrs.expert_to_slot != nullptr)
+    {
+        expert_id
+            = expert_id >= 0 && expert_id < ptrs.num_routed_experts ? ptrs.expert_to_slot[expert_id] : num_experts;
+    }
     // Invalid experts have no destination, but their lanes still participate in warp collectives.
     bool const valid_expert = expert_id >= 0 && expert_id < num_experts;
     int const target_rank = valid_expert ? compute_target_rank_id(expert_id, ep_base, ep_remainder) : -1;
@@ -350,6 +356,7 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
         topk_target_ranks[k] = target_rank_to_store;
         topk_target_indices[k] = target_index_to_store;
     }
+    return expert_id;
 }
 
 // ============================================================================
@@ -618,11 +625,13 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         static_assert(TOP_K > 0 && TOP_K <= 32, "routing and destination setup require one warp");
         constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
         __shared__ uint8_t* destinations[kMaxPayloads][TOP_K];
+        // With expert_to_slot, the expert-id payload is sent from these routed slot ids.
+        __shared__ __align__(16) int32_t routed_ids[TOP_K];
         if (thread_idx < TOP_K)
         {
-            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts, ptrs,
-                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
-                kRoutingLaneMask);
+            routed_ids[thread_idx] = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(
+                token_selected_experts, ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks,
+                smem_topk_target_indices, kRoutingLaneMask);
             // Compact routing slots may be written by a different lane.
             __syncwarp(kRoutingLaneMask);
 
@@ -652,7 +661,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         {
             uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
             int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-            uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+            uint8_t const* src_ptr = ptrs.expert_to_slot != nullptr && payload_idx == ptrs.expert_id_payload_index
+                ? reinterpret_cast<uint8_t const*>(routed_ids)
+                : src_data + local_token_idx * bytes_per_token;
             vectorized_dispatch<TOP_K, USE_RANK_COMPACT_ROUTING>(
                 src_ptr, bytes_per_token, ep_size, destinations[payload_idx]);
         }
@@ -1010,10 +1021,11 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 
         // ---- Routing: map tokens to target ranks ----
         constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
+        int routed_id = 0;
         if (threadIdx.x < TOP_K)
         {
-            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts, ptrs,
-                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
+            routed_id = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts,
+                ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
                 kRoutingLaneMask);
         }
         __syncthreads();
@@ -1047,6 +1059,22 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             cft_barrier_wait_parity(tma_bar, 0);
         }
         __syncthreads();
+        if (ptrs.expert_to_slot != nullptr)
+        {
+            // Send the routed slot ids in place of the staged expert ids. The generic-proxy stores must be visible
+            // to the async proxy (s2g and fabric puts) that reads the staging buffer.
+            if (threadIdx.x < TOP_K)
+            {
+                int staged_offset = 0;
+                for (int p = 0; p < ptrs.expert_id_payload_index; p++)
+                {
+                    staged_offset += ptrs.payload_bytes_per_token[p];
+                }
+                reinterpret_cast<int32_t*>(smem_staging + staged_offset)[threadIdx.x] = routed_id;
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            }
+            __syncthreads();
+        }
 
         // Use a different warp to issue s2g if there are at least 2 warps, so the s2g and the
         // fabric puts overlap instead of serializing on one thread.
@@ -1342,9 +1370,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.le_counter_base = params.cft_le_counter_base;
         kernel_ptrs.dispatch_counter_baseline = params.cft_dispatch_counter_baseline;
         kernel_ptrs.sanitize_expert_ids = params.sanitize_expert_ids;
-        kernel_ptrs.expert_id_payload_index = params.expert_id_payload_index;
         kernel_ptrs.invalid_expert_id = params.invalid_expert_id;
     }
+    kernel_ptrs.expert_id_payload_index = params.expert_id_payload_index;
+    kernel_ptrs.expert_to_slot = params.expert_to_slot;
+    kernel_ptrs.num_routed_experts = params.num_routed_experts;
 
     kernel_ptrs.active_rank_mask = params.active_rank_mask;
     // The abort record, fixed slots and per-source valid counts belong to the rank-mask fence path.
