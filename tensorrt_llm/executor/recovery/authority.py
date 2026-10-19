@@ -16,7 +16,9 @@ A multi-node job binds it to the job's private network interface with
 import argparse
 import enum
 import os
+import shlex
 import signal
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -25,7 +27,7 @@ import zmq
 
 from ...logger import logger
 from .client import load_key
-from .hang_monitor import HangMonitor
+from .hang_monitor import HangMonitor, HungRank
 from .protocol import (
     MAX_MESSAGE_BYTES,
     Abort,
@@ -54,6 +56,7 @@ _CLOSE_LINGER_MS = 1000
 _REJECTION_LOG_INTERVAL_S = 10.0
 # Hang detection runs when the authority and the workers both have it enabled.
 HANG_DETECTION_ENV = "TLLM_FAULT_TOLERANCE_HANG_DETECTION"
+HANG_CONFIRM_ENV = "TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S"
 
 
 class Phase(enum.Enum):
@@ -95,9 +98,9 @@ class RecoveryAuthority:
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
         hang_monitor: Judges the workers' heartbeats and device waits; None ignores them.
-        fence: Called once with a recoverable rank the monitor confirms hung and the
-            reason; it must end that rank's process, whose loss then recovers as any
-            other. None only reports the hang.
+        fence: Called once with a recoverable rank the monitor confirms hung (rank,
+            reason, host and pid); it must end that process, whose loss then recovers
+            as any other. None only reports the hang.
     """
 
     def __init__(
@@ -105,7 +108,7 @@ class RecoveryAuthority:
         world_size: int,
         recovery_timeout: float = 20.0,
         hang_monitor: HangMonitor | None = None,
-        fence: Callable[[int, str], None] | None = None,
+        fence: Callable[[HungRank], None] | None = None,
     ) -> None:
         self.world_size = world_size
         self.recovery_timeout = recovery_timeout
@@ -145,28 +148,36 @@ class RecoveryAuthority:
         """Abort if the recovery deadline passed at monotonic time ``now``; act on a hung rank."""
         if self.deadline is not None and now >= self.deadline:
             return self.abort(f"recovery did not commit within {self.recovery_timeout}s")
-        if self.hang_monitor is not None and self.phase is Phase.SERVING:
+        if self.hang_monitor is not None and self.phase in (Phase.SERVING, Phase.RECOVERED):
             hung = self.hang_monitor.check(now)
             if hung is not None:
-                self._on_hung(hung.rank, hung.reason)
+                self._on_hung(hung)
         return []
 
     def _observe(self, message: Heartbeat | DeviceWait, now: float) -> None:
-        if self.hang_monitor is None or self.phase is not Phase.SERVING:
+        # During a recovery every rank waits by design; evidence counts only while serving.
+        if self.hang_monitor is None or self.phase not in (Phase.SERVING, Phase.RECOVERED):
             return
         if isinstance(message, Heartbeat):
-            self.hang_monitor.heartbeat(message.rank, message.iteration, message.waiting, now)
+            self.hang_monitor.heartbeat(
+                message.rank, message.iteration, message.waiting, now, message.host, message.pid
+            )
         else:
             self.hang_monitor.device_wait(
                 message.rank, message.peer, message.waited_ms / 1000.0, now
             )
 
-    def _on_hung(self, rank: int, reason: str) -> None:
-        if frozenset({rank}) not in self.admitted_domains or self._fence is None:
-            logger.error(f"Recovery authority: rank {rank} is hung ({reason}); not fencing it")
+    def _on_hung(self, hung: HungRank) -> None:
+        where = f"rank {hung.rank} (pid {hung.pid} on {hung.host or 'unknown host'})"
+        # After a recovery, a further loss is not recoverable: report only.
+        recoverable = (
+            self.phase is Phase.SERVING and frozenset({hung.rank}) in self.admitted_domains
+        )
+        if not recoverable or self._fence is None or not hung.pid:
+            logger.error(f"Recovery authority: {where} is hung ({hung.reason}); not fencing it")
             return
-        logger.error(f"Recovery authority: rank {rank} is hung ({reason}); fencing it")
-        self._fence(rank, reason)
+        logger.error(f"Recovery authority: {where} is hung ({hung.reason}); fencing it")
+        self._fence(hung)
 
     def abort(self, reason: str, route: bytes | None = None) -> Outbound:
         """Enter the terminal phase and tell every worker (and ``route``) why."""
@@ -284,6 +295,9 @@ class RecoveryAuthority:
         self.generation += 1
         self.deadline = None
         self._enter(Phase.RECOVERED)
+        if self.hang_monitor is not None:
+            # Evidence from before the recovery describes waits that no longer exist.
+            self.hang_monitor.reset()
         logger.info(
             f"Recovery authority: committed generation {self.generation} "
             f"without ranks {sorted(self.failed_ranks)}"
@@ -370,6 +384,26 @@ def router_socket(context: zmq.Context, endpoint: str) -> zmq.Socket:
     return socket
 
 
+def command_fence(template: str) -> Callable[[HungRank], None]:
+    """Fence a hung worker by running ``template`` with its ``{host}`` and ``{pid}`` filled in.
+
+    The command runs without a shell, detached from the authority's loop; a failure is
+    logged, and the rank stays hung until the executor's hang detector ends the job.
+    """
+    arguments = shlex.split(template)
+
+    def fence(hung: HungRank) -> None:
+        command = [arg.format(host=hung.host, pid=hung.pid) for arg in arguments]
+        try:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            logger.error(
+                f"Recovery authority: fencing rank {hung.rank} with {command} failed: {error}"
+            )
+
+    return fence
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the recovery authority until SIGINT or SIGTERM."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -385,12 +419,38 @@ def main(argv: list[str] | None = None) -> None:
         default=20.0,
         help="seconds from the first Stopped to Commit; keep below the workers' timeout",
     )
+    parser.add_argument(
+        "--hang-confirm-s",
+        type=float,
+        default=float(os.environ.get(HANG_CONFIRM_ENV, "30")),
+        help="seconds the evidence of a hung rank must hold before it is confirmed; must exceed "
+        f"the slowest legitimate step plus host stalls (default ${HANG_CONFIRM_ENV} or 30)",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout-s",
+        type=float,
+        default=5.0,
+        help="seconds without a worker heartbeat after which it counts as missing",
+    )
+    parser.add_argument(
+        "--fence-command",
+        default="",
+        help="command that kills a hung worker, with {host} and {pid} placeholders, run "
+        "without a shell, e.g. 'ssh {host} kill -KILL {pid}' or the deployment's node agent; "
+        "empty only reports hung ranks",
+    )
     args = parser.parse_args(argv)
     if "TLLM_LOG_LEVEL" not in os.environ:
         logger.set_level("info")
 
     key = load_key()
-    authority = RecoveryAuthority(args.world_size, args.recovery_timeout)
+    hang_monitor = None
+    if os.environ.get(HANG_DETECTION_ENV) == "1":
+        hang_monitor = HangMonitor(
+            tuple(range(args.world_size)), args.hang_confirm_s, args.heartbeat_timeout_s
+        )
+    fence = command_fence(args.fence_command) if args.fence_command else None
+    authority = RecoveryAuthority(args.world_size, args.recovery_timeout, hang_monitor, fence)
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())

@@ -14,10 +14,12 @@ __all__ = ["HangMonitor", "HungRank"]
 
 @dataclass(frozen=True)
 class HungRank:
-    """A rank the evidence shows hung, and why."""
+    """A rank the evidence shows hung, why, and the process to fence."""
 
     rank: int
     reason: str
+    host: str = ""
+    pid: int = 0
 
 
 @dataclass
@@ -34,6 +36,9 @@ class _RankEvidence:
     waiting: bool = False
     # Peer -> monotonic time since which this rank's device waits on it.
     device_waits: dict[int, float] = field(default_factory=dict)
+    # The worker process, from its heartbeats.
+    host: str = ""
+    pid: int = 0
 
 
 class HangMonitor:
@@ -41,11 +46,14 @@ class HangMonitor:
 
     A rank ``p`` is hung when, continuously for ``confirm_s``, one of these holds:
 
-    - its heartbeat is missing: the process is stopped or its host is unreachable;
-    - at least two other ranks report device waits on ``p``, and ``p`` reports none
-      of its own (otherwise ``p`` waits on the head of a chain);
+    - at least two other ranks report device waits on ``p``, ``p`` reports none of its
+      own (otherwise it waits on the head of a chain), and its iteration has not
+      advanced;
     - its iteration has not advanced, it is not waiting, and every other rank is
-      waiting: its host loop is stuck while its peers wait for it.
+      waiting: its host loop is stuck while its peers wait for it;
+    - its heartbeat is missing (the process is stopped or its host is unreachable),
+      and no device waits point at another rank: a heartbeat thread starved while
+      its rank waits on a hung peer must not make that rank the suspect.
 
     ``confirm_s`` must exceed the slowest legitimate step plus host stalls, so a
     slow rank is never confirmed. A rank is watched from its first heartbeat on, so
@@ -74,12 +82,15 @@ class HangMonitor:
         self._suspected_since: dict[int, float] = {}
         self._confirmed: set[int] = set()
 
-    def heartbeat(self, rank: int, iteration: int, waiting: bool, now: float) -> None:
-        """Record a heartbeat of ``rank`` at its executor ``iteration``."""
+    def heartbeat(
+        self, rank: int, iteration: int, waiting: bool, now: float, host: str = "", pid: int = 0
+    ) -> None:
+        """Record a heartbeat of ``rank`` (process ``pid`` on ``host``) at its executor ``iteration``."""
         if rank not in self._ranks:
             return
         evidence = self._evidence.setdefault(rank, _RankEvidence(heartbeat=now, progressed=now))
         evidence.heartbeat = now
+        evidence.host, evidence.pid = host, pid
         if iteration != evidence.iteration:
             evidence.iteration = iteration
             evidence.progressed = now
@@ -88,7 +99,7 @@ class HangMonitor:
     def device_wait(self, rank: int, peer: int, waited_s: float, now: float) -> None:
         """Record that ``rank``'s device has waited ``waited_s`` on ``peer``; 0 clears it."""
         evidence = self._evidence.get(rank)
-        if evidence is None or peer == rank:
+        if evidence is None or peer == rank or peer not in self._ranks:
             return
         if waited_s > 0:
             evidence.device_waits.setdefault(peer, now - waited_s)
@@ -103,6 +114,11 @@ class HangMonitor:
         for evidence in self._evidence.values():
             evidence.device_waits.pop(rank, None)
 
+    def reset(self) -> None:
+        """Forget all evidence, for example after a recovery changed what every rank waits on."""
+        self._evidence.clear()
+        self._suspected_since.clear()
+
     def check(self, now: float) -> HungRank | None:
         """Return a newly confirmed hung rank, or None."""
         for rank in sorted(self._evidence):
@@ -113,27 +129,30 @@ class HangMonitor:
             since = self._suspected_since.setdefault(rank, now)
             if now - since >= self.confirm_s and rank not in self._confirmed:
                 self._confirmed.add(rank)
-                return HungRank(rank, f"{reason} for {now - since:.1f}s")
+                evidence = self._evidence[rank]
+                return HungRank(
+                    rank, f"{reason} for {now - since:.1f}s", evidence.host, evidence.pid
+                )
         return None
 
     def _evidence_against(self, rank: int, now: float) -> str | None:
         evidence = self._evidence[rank]
-        others = [e for r, e in self._evidence.items() if r != rank]
+        others = {r: e for r, e in self._evidence.items() if r != rank}
         # Evidence holds only while most peers' heartbeats arrive: when they all stop, the authority has lost
         # its view of the deployment (its host stalled or its network was cut), not the ranks their progress.
-        fresh = sum(now - e.heartbeat <= self.heartbeat_timeout_s for e in others)
+        fresh = sum(now - e.heartbeat <= self.heartbeat_timeout_s for e in others.values())
         if 2 * fresh < len(others):
             return None
-        if now - evidence.heartbeat > self.heartbeat_timeout_s:
-            return "no heartbeat"
-        waiters = [e for e in others if rank in e.device_waits]
-        if len(waiters) >= 2 and not evidence.device_waits:
+        stalled = now - evidence.progressed > self.heartbeat_timeout_s
+        waiters = [e for e in others.values() if rank in e.device_waits]
+        if len(waiters) >= 2 and not evidence.device_waits and stalled:
             return f"{len(waiters)} ranks' devices wait on it"
-        if (
-            others
-            and not evidence.waiting
-            and now - evidence.progressed > self.heartbeat_timeout_s
-            and all(e.waiting for e in others)
-        ):
+        if others and not evidence.waiting and stalled and all(e.waiting for e in others.values()):
             return f"its loop stopped at iteration {evidence.iteration} while every peer waits"
+        if now - evidence.heartbeat > self.heartbeat_timeout_s:
+            witnessed = (
+                sum(r in e.device_waits for e in self._evidence.values()) >= 2 for r in others
+            )
+            if not evidence.device_waits and not any(witnessed):
+                return "no heartbeat"
         return None
