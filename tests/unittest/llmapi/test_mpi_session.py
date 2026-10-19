@@ -968,50 +968,208 @@ def test_server_stops_waiting_for_tasks_after_a_rank_departed(
     assert RemoteMpiCommSessionServer._live_worker_futures(futures) is futures
 
 
-@pytest.mark.cpu_only
-def test_degraded_server_fails_sync_tasks_and_ends_the_world_on_shutdown(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    from types import SimpleNamespace
+class _Queue:
 
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+
+    def get(self):
+        return self.messages.pop(0)
+
+    def put(self, obj):
+        self.sent.append(obj)
+
+
+def _degraded_server(monkeypatch: pytest.MonkeyPatch, messages,
+                     failed_ranks) -> tuple:
+    """A server whose world lost a rank once ``failed_ranks[0]`` is set."""
     from tensorrt_llm.llmapi import mpi_session
-    from tensorrt_llm.llmapi.mpi_session import RemoteTask
 
-    class _Queue:
-
-        def __init__(self, messages):
-            self.messages = list(messages)
-            self.sent = []
-
-        def get(self):
-            return self.messages.pop(0)
-
-        def put(self, obj):
-            self.sent.append(obj)
-
-    aborted = []
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
-    monkeypatch.setattr(mpi_session, "logging",
-                        SimpleNamespace(shutdown=lambda: None))
-    monkeypatch.setattr(
-        mpi_session, "mpi4py",
-        SimpleNamespace(MPI=SimpleNamespace(COMM_WORLD=SimpleNamespace(
-            Abort=aborted.append))))
+    left = []
+    monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks",
+                        lambda: failed_ranks[0])
+    monkeypatch.setattr(mpi_session, "_leave_degraded_world", left.append)
     monkeypatch.setattr(RemoteMpiCommSessionServer,
                         "_close_global_comm_executor",
                         staticmethod(lambda: None))
     server = RemoteMpiCommSessionServer.__new__(RemoteMpiCommSessionServer)
     server.addr = "test"
     server.session = Mock()
-    server.queue = _Queue([
+    server.queue = _Queue(messages)
+    return server, left
+
+
+@pytest.mark.cpu_only
+def test_degraded_server_fails_sync_tasks_and_finalizes_on_shutdown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.llmapi.mpi_session import RemoteTask
+
+    server, left = _degraded_server(monkeypatch, [
         RemoteTask(task=print, args=(), kwargs={}, sync=True),
         RemoteTask(task=print, args=(), kwargs={}, sync=False),
         None,
-    ])
+    ], [1])
 
     server.serve()
 
     assert len(server.queue.sent) == 1
     assert isinstance(server.queue.sent[0], RuntimeError)
     server.session.submit.assert_not_called()
-    # A world that lost a rank ends with a non-zero status.
-    assert aborted == [1]
+    # No task of rank 0 failed, so the world is finalized.
+    assert left == [True]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank0_error", [None, RuntimeError("rank 0 failed")])
+def test_degraded_server_ends_the_world_after_rank0_task_failed(
+        monkeypatch: pytest.MonkeyPatch, rank0_error) -> None:
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi import mpi_session
+    from tensorrt_llm.llmapi.mpi_session import RemoteTask
+
+    failed_ranks = [0]
+    rank0_future, worker_future = Future(), Future()
+
+    def submit(*args, **kwargs):
+        # A rank is lost while the task runs; its result never arrives.
+        failed_ranks[0] = 1
+        if rank0_error is None:
+            rank0_future.set_result(None)
+        else:
+            rank0_future.set_exception(rank0_error)
+        return [rank0_future, worker_future]
+
+    server, left = _degraded_server(monkeypatch, [
+        RemoteTask(task=print, args=(), kwargs={}, sync=False),
+        None,
+    ], failed_ranks)
+    server.session.submit.side_effect = submit
+    server.session.n_workers = 2
+    monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 2, raising=False)
+
+    server.serve()
+
+    assert left == [rank0_error is None]
+
+
+class _Exit(Exception):
+    """Stands in for ``os._exit``."""
+
+
+@pytest.fixture
+def _fake_world(monkeypatch: pytest.MonkeyPatch):
+    """Fake MPI for ``_leave_degraded_world``; records Abort, Finalize and the exit status."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    calls = SimpleNamespace(aborted=[], finalized=0, finalize=lambda: None)
+
+    def finalize():
+        calls.finalized += 1
+        calls.finalize()
+
+    def exit_(status):
+        raise _Exit(status)
+
+    world = SimpleNamespace(Abort=calls.aborted.append)
+    mpi = SimpleNamespace(COMM_WORLD=world,
+                          Finalize=finalize,
+                          Exception=_FakeMPIException)
+    monkeypatch.setattr(mpi_session,
+                        "mpi4py",
+                        SimpleNamespace(MPI=mpi),
+                        raising=False)
+    monkeypatch.setattr(mpi_session, "logging",
+                        SimpleNamespace(shutdown=lambda: None))
+    monkeypatch.setattr(mpi_session, "global_mpi_rank", lambda: 5)
+    monkeypatch.setattr(mpi_session.os, "_exit", exit_)
+    return calls
+
+
+@pytest.mark.cpu_only
+def test_leave_degraded_world_finalizes_after_a_clean_task(_fake_world):
+    from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
+
+    with pytest.raises(_Exit) as exited:
+        _leave_degraded_world(True)
+    assert exited.value.args == (0, )
+    assert _fake_world.finalized == 1 and _fake_world.aborted == []
+
+
+@pytest.mark.cpu_only
+def test_leave_degraded_world_aborts_after_a_failed_task(_fake_world):
+    from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
+
+    _leave_degraded_world(False)
+    assert _fake_world.finalized == 0 and _fake_world.aborted == [1]
+
+
+@pytest.mark.cpu_only
+def test_leave_degraded_world_exits_non_zero_when_finalize_fails(_fake_world):
+    from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
+
+    def fail():
+        raise _FakeMPIException(75)
+
+    _fake_world.finalize = fail
+    with pytest.raises(_Exit) as exited:
+        _leave_degraded_world(True)
+    assert exited.value.args == (1, )
+
+
+@pytest.mark.cpu_only
+def test_leave_degraded_world_aborts_a_finalize_that_does_not_end(
+        monkeypatch: pytest.MonkeyPatch, _fake_world):
+    from tensorrt_llm.llmapi import mpi_session
+
+    aborted = threading.Event()
+    monkeypatch.setattr(mpi_session, "_DEGRADED_FINALIZE_GRACE_S", 0.05)
+
+    def abort(code):
+        _fake_world.aborted.append(code)
+        aborted.set()
+
+    monkeypatch.setattr(mpi_session.mpi4py.MPI.COMM_WORLD, "Abort", abort)
+    # Finalize blocks until the world is aborted (a real Abort never returns).
+    _fake_world.finalize = lambda: aborted.wait(30)
+    with pytest.raises(_Exit):
+        mpi_session._leave_degraded_world(True)
+    assert _fake_world.aborted == [1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank, failed_ranks, fails, expected", [
+    (5, 1, False, [True]),
+    (5, 1, True, [False]),
+    (5, 0, False, []),
+    (0, 1, False, []),
+])
+def test_task_end_leaves_a_degraded_world_on_survivors(
+        monkeypatch: pytest.MonkeyPatch, rank, failed_ranks, fails,
+        expected) -> None:
+    """A survivor's task result cannot reach rank 0 after a loss, so the survivor leaves the world itself."""
+    from tensorrt_llm.llmapi import mpi_session
+
+    left = []
+    monkeypatch.setattr(mpi_session, "global_mpi_rank", lambda: rank)
+    monkeypatch.setattr(mpi_session, "mpi_rank", lambda: rank)
+    monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 8, raising=False)
+    monkeypatch.setattr(mpi_session, "mpi_barrier", lambda: None)
+    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: failed_ranks)
+    monkeypatch.setattr(mpi_session, "_leave_degraded_world", left.append)
+
+    def task():
+        if fails:
+            raise RuntimeError("task failed")
+        return "done"
+
+    if fails:
+        with pytest.raises(RuntimeError):
+            RemoteMpiCommSessionServer.task_wrapper((), task)
+    else:
+        assert RemoteMpiCommSessionServer.task_wrapper((), task) == "done"
+    assert left == expected

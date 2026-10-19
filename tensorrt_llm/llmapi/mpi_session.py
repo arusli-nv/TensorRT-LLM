@@ -16,7 +16,8 @@ from collections.abc import Callable
 from concurrent.futures import (BrokenExecutor, Future, ThreadPoolExecutor,
                                 as_completed)
 from concurrent.futures import wait as futures_wait
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
+from typing import (Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple,
+                    TypeVar)
 
 import zmq
 
@@ -102,6 +103,45 @@ def _is_departed_peer_failure(exc: BaseException) -> bool:
             time.sleep(0.01)
         return True
     return is_mpi_peer_failure(exc)
+
+
+# How long a process of an MPI world that lost a rank waits in MPI_Finalize for
+# the other survivors before it aborts the world.
+_DEGRADED_FINALIZE_GRACE_S = 120.0
+
+
+def _leave_degraded_world(clean: bool) -> NoReturn:
+    """End this process of an MPI world that lost a rank, once its task ended.
+
+    mpi4py.futures cannot release such a world: task results and its stop
+    message travel on communicators that include the lost rank, so each
+    process leaves on its own. After a clean task end it finalizes MPI with
+    the other survivors (ULFM's MPI_Finalize first agrees on the lost ranks)
+    and exits with status 0. After an error, or if finalizing takes longer
+    than ``_DEGRADED_FINALIZE_GRACE_S``, it ends the world with MPI_Abort.
+    """
+    world = mpi4py.MPI.COMM_WORLD
+    if clean:
+        logger.warning(f"Rank {global_mpi_rank()}: finalizing the MPI world, "
+                       "which lost a rank")
+    else:
+        logger.error(f"Rank {global_mpi_rank()}: ending the MPI world, which "
+                     "lost a rank, after its task failed")
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if clean:
+        watchdog = threading.Timer(_DEGRADED_FINALIZE_GRACE_S,
+                                   lambda: world.Abort(1))
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            mpi4py.MPI.Finalize()
+        except mpi4py.MPI.Exception as e:
+            print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
+            os._exit(1)
+        os._exit(0)
+    world.Abort(1)
 
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
@@ -991,8 +1031,11 @@ class RemoteMpiCommSessionServer():
         # wait for all ranks to start the task
         mpi_barrier()
 
+        clean = False
         try:
-            return task(*args, **kwargs)
+            result = task(*args, **kwargs)
+            clean = True
+            return result
         except Exception as e:
             print_colored(
                 f"MpiCommSession rank{mpi_rank()} task [{task}] failed with exception: {e}\n",
@@ -1004,6 +1047,9 @@ class RemoteMpiCommSessionServer():
                 f"MpiCommSession rank{mpi_rank()} task [{task}] finished\n",
                 "green")
             RemoteMpiCommSessionServer._finish_barrier()
+            # Rank 0 leaves from serve(), on the stop message.
+            if global_mpi_rank() != 0 and _num_failed_ranks():
+                _leave_degraded_world(clean)
 
     @staticmethod
     def _finish_barrier() -> None:
@@ -1045,6 +1091,7 @@ class RemoteMpiCommSessionServer():
         logger_debug(f"RemoteMpiCommSessionServer listening on {self.addr}\n",
                      "yellow")
         pending_futures = []
+        rank0_future: Optional[Future] = None
         while True:
             # Wait for any pending futures from previous tasks to complete
             # This ensures all ranks are ready before accepting the next task
@@ -1087,16 +1134,10 @@ class RemoteMpiCommSessionServer():
                     "green")
                 self.session.shutdown_abort()
                 if _num_failed_ranks():
-                    # mpi4py.futures cannot release a world that lost a rank,
-                    # so the requested shutdown ends it; the non-zero status
-                    # reports the lost rank to the launcher.
-                    logger.warning(
-                        "RemoteMpiCommSessionServer: ending the MPI world, "
-                        "which lost a rank")
-                    logging.shutdown()
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                    mpi4py.MPI.COMM_WORLD.Abort(1)
+                    _leave_degraded_world(
+                        rank0_future is None or
+                        (rank0_future.done() and not rank0_future.cancelled()
+                         and rank0_future.exception() is None))
                 self._close_global_comm_executor()
                 break
             elif _num_failed_ranks():
@@ -1117,6 +1158,7 @@ class RemoteMpiCommSessionServer():
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task
                 pending_futures = list(futures)
+                rank0_future = futures[0]
                 for rank, future in enumerate(futures):
                     if message.sync:
                         future.add_done_callback(self.mpi_future_callback)

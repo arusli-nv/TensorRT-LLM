@@ -115,8 +115,9 @@ dying unless hang detection is on, a stall that every rank shares (a deadlock or
 culprit: with hang detection on it is reported, see below, else the executor's own hang detection,
 `hang_detection_timeout`, ends it), losses beyond one failure
 domain (for example a fault that takes down several hosts or a whole NVLink domain), the authority itself,
-and other errors in the serving loop, which end the job as without fault tolerance. A job that lost a rank
-ends with a non-zero exit status at shutdown.
+and other errors in the serving loop, which end the job as without fault tolerance. A job that recovered
+from a loss still stops cleanly: stopping `trtllm-serve` finalizes MPI on the survivors and `mpirun` exits with
+status 0 (a survivor that does not finalize within 120 s ends the job with a non-zero status).
 
 After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
 (and may take more of the KV cache for restored experts). A request that was running on a lost rank and had
