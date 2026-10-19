@@ -97,6 +97,7 @@ def test_digest_is_stable_and_changes_with_any_field():
         "hang_confirm_s": 10.0,
         "heartbeat_s": 0.5,
         "heartbeat_timeout_s": 6.0,
+        "host_copies": "ring",
     }
     assert changed.keys() == FaultToleranceConfig.model_fields.keys()
     digests = {FaultToleranceConfig(**{name: value}).digest() for name, value in changed.items()}
