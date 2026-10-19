@@ -55,8 +55,8 @@ _REGISTRATION_TIMEOUT_S = 600.0
 Responses = List[Tuple[int, LlmResponse]]
 # A set of ranks lost together, as a sorted tuple: one rank or a whole node.
 FailureDomain = Tuple[int, ...]
-# A request and the context position and state it had before a step changed them.
-StepChange = Tuple[LlmRequest, int, LlmRequestState]
+# A request and the context position, state and draft tokens it had before a step changed them.
+StepChange = Tuple[LlmRequest, int, LlmRequestState, List[int]]
 _T = TypeVar("_T")
 _GATHER_HISTORY = 8
 # Free device memory left after borrowed slots are mapped: the KV cache rounds its quota to its chunk size per pool.
@@ -67,8 +67,8 @@ def _free_device_bytes() -> int:
     return torch.cuda.mem_get_info()[0]
 
 
-def _one_model_mtp_or_none(spec_config) -> bool:
-    """No speculative decoding, or one-model MTP with a linear draft (no dynamic tree)."""
+def _tested_spec_dec(spec_config) -> bool:
+    """No speculative decoding, or one-model MTP with a linear draft and no in-graph draft state."""
     if spec_config is None:
         return True
     mode = getattr(spec_config, "spec_dec_mode", None)
@@ -76,6 +76,8 @@ def _one_model_mtp_or_none(spec_config) -> bool:
         mode is not None
         and mode.is_mtp_eagle_one_model()
         and not getattr(spec_config, "use_dynamic_tree", False)
+        and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
+        and getattr(spec_config, "sa_config", None) is None
     )
 
 
@@ -258,11 +260,11 @@ class PeerLossRecovery(RecoveryHook):
     def create(cls, executor: "PyExecutor") -> RecoveryHook:
         """Return the recovery hook of ``executor``: the do-nothing :class:`RecoveryHook` when it is off.
 
-        The configuration must make a discarded step re-runnable: no
-        speculative decoding other than one-model MTP (its draft tokens come
-        from committed steps and its KV is the target's), no guided decoding,
-        beam search, KV connector or PEFT. Requests with occurrence penalties are rejected; a discarded
-        step can change the samples of a seeded request.
+        The configuration must make a discarded step re-runnable: no guided decoding, beam search, KV
+        connector or PEFT. Any speculative decoding method is accepted: a discard restores the draft tokens
+        and reverts the draft KV, and target verification keeps the output exact; a method other than
+        linear one-model MTP is untested and logs a warning. Requests with occurrence penalties are
+        rejected; a discarded step can change the samples of a seeded request.
 
         Raises:
             ValueError: Recovery is enabled for a configuration it does not
@@ -284,16 +286,14 @@ class PeerLossRecovery(RecoveryHook):
             "MPI executor": isinstance(dist, MPIDist),
             "expert TP 1": dist.mapping.moe_tp_size == 1,
             "DefaultADPRouter": type(executor.adp_router) is DefaultADPRouter,
-            "no speculative decoding but one-model MTP": executor.drafter is None
-            and executor.draft_model_engine is None
-            and _one_model_mtp_or_none(engine.spec_config),
             "no guided decoding": executor.guided_decoder is None,
             "no beam search": executor.max_beam_width == 1,
             "no KV cache transceiver": executor.kv_cache_transceiver is None,
             "no KV connector": executor.kv_connector_manager is None,
             # Managers whose step allocation and revert are KVCacheManagerV2's own (DSA keeps its indexer K
             # cache as another buffer of the same pages).
-            "KV Cache Manager V2": type(kv_cache_manager) in (KVCacheManagerV2, DSACacheManagerV2),
+            "KV Cache Manager V2": type(kv_cache_manager) in (KVCacheManagerV2, DSACacheManagerV2)
+            and isinstance(executor.draft_kv_cache_manager, (type(None), KVCacheManagerV2)),
             "no SWA scratch reuse": not getattr(
                 kv_cache_manager, "enable_swa_scratch_reuse", False
             ),
@@ -329,6 +329,17 @@ class PeerLossRecovery(RecoveryHook):
             raise ValueError(
                 "WideEP peer-loss recovery is enabled but the configuration "
                 f"lacks: {', '.join(unmet)}"
+            )
+        if dist.rank == 0 and not (
+            executor.drafter is None
+            and executor.draft_model_engine is None
+            and _tested_spec_dec(engine.spec_config)
+        ):
+            logger.warning(
+                "WideEP peer-loss recovery is untested with "
+                f"{type(engine.spec_config).__name__}: recovery discards drafts and reverts draft KV; "
+                "method-specific in-graph draft state (relaxed-acceptance delta, suffix automaton, "
+                "dynamic tree) is not reset and may lower acceptance after a recovery"
             )
         # Nodes from the hosts the ranks run on, not from the rank order (a launcher may map ranks round-robin).
         hosts = dist.allgather(socket.gethostname())
@@ -505,7 +516,14 @@ class PeerLossRecovery(RecoveryHook):
         Returns:
             The list into which the executor records each request change the step makes.
         """
-        step = PreparedStep(batch, self._executor.kv_cache_manager.context_capacities(batch))
+        # Sampling sets a finishing context request's draft tokens before the step is accepted.
+        changes = [
+            (r, r.context_current_position, r.state, r.py_draft_tokens)
+            for r in batch.context_requests
+        ]
+        step = PreparedStep(
+            batch, self._executor.kv_cache_manager.context_capacities(batch), changes
+        )
         self._uncommitted_steps.append(step)
         return step.changes
 

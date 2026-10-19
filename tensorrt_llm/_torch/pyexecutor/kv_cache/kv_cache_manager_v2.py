@@ -4337,9 +4337,11 @@ class KVCacheManagerV2(BaseResourceManager):
         suspends them), stay resident: the KV cache is left exactly as before
         the step. Generation requests give back the step's newest allocation.
         A cache a later step freed or suspended (cancellation, recompute) is
-        left alone: it is rebuilt when its request is scheduled again. Draft
-        KV, connectors and SWA scratch reuse are not reverted: peer-loss
-        recovery, the only caller, refuses them.
+        left alone: it is rebuilt when its request is scheduled again. A draft
+        pool is reverted by its own call: generation growth the paired
+        scheduler recorded is given back, and with empty ``context_capacities``
+        later context chunks keep their size. Connectors and SWA scratch reuse
+        are not reverted: peer-loss recovery, the only caller, refuses them.
         """
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:

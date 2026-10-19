@@ -152,8 +152,13 @@ reach the authority) the Python heartbeat alone is used, and a starved rank whos
 
 ## Not supported together with fault tolerance
 
-Refused at startup, with the requirement that is missing: speculative decoding other than one-model MTP
-(MTP with one predict layer and a linear draft is supported),
+Speculative decoding: every method is accepted. A recovery discards the interrupted steps' draft tokens
+and draft KV, and target verification keeps the output exact. Only one-model MTP with a linear draft is
+tested; other methods log a warning at startup, because per-slot draft state kept inside the CUDA graphs
+(the relaxed-acceptance delta, the suffix automaton, dynamic-tree state) is not reset: acceptance can drop
+after a recovery, and relaxed acceptance, lossy by design, can accept different tokens.
+
+Refused at startup, with the requirement that is missing:
 attention-DP balancing or a non-default attention-DP router, expert tensor parallelism, beam search, guided
 decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving) and
 connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder

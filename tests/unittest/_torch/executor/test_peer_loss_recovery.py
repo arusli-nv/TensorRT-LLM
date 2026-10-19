@@ -124,6 +124,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
     executor.executor_request_queue = Mock()
     executor.executor_request_queue.wake.side_effect = lambda: events.append("wake")
     executor.kv_cache_manager = Mock()
+    executor.draft_kv_cache_manager = None
     executor.active_requests = []
     executor.waiting_queue = FCFSWaitingQueue()
     executor.request_accumulated = []
@@ -646,7 +647,7 @@ def test_run_surfaces_a_failed_recovery_after_stopping_the_watch():
 def test_recovery_discards_the_steps_newest_first_after_joining_their_device_work():
     recovery = _recovery(_FakeClient(_happy_replies()))
     calls = []
-    older, newer = Mock(name="older"), Mock(name="newer")
+    older, newer = Mock(name="older", context_requests=[]), Mock(name="newer", context_requests=[])
     recovery.step_prepared(older)
     recovery.step_prepared(newer)
     recovery._join_device_work = lambda deadline: calls.append("join")
@@ -662,7 +663,7 @@ def test_recovery_discards_the_steps_newest_first_after_joining_their_device_wor
 
 def test_steps_commit_oldest_first_and_release_the_newest():
     recovery = _recovery(_FakeClient([]))
-    older, newer = Mock(name="older"), Mock(name="newer")
+    older, newer = Mock(name="older", context_requests=[]), Mock(name="newer", context_requests=[])
     recovery.step_prepared(older)
     recovery.step_prepared(newer)
     with pytest.raises(RuntimeError, match="order"):
@@ -809,7 +810,7 @@ def test_run_does_not_recover_during_kv_cache_estimation():
 @pytest.mark.parametrize("peer_failed", [False, True])
 def test_commit_step_waits_then_accepts_or_discards(peer_failed):
     recovery = _recovery(_FakeClient([]))
-    batch = Mock(name="batch")
+    batch = Mock(name="batch", context_requests=[])
     recovery.step_prepared(batch)
     sample_state = Mock()
     if peer_failed:
@@ -825,7 +826,7 @@ def test_commit_step_waits_then_accepts_or_discards(peer_failed):
 def test_commit_step_discards_a_step_whose_peer_failed_while_it_ran():
     """The flag is read after waiting for the step's device work, not before."""
     recovery = _recovery(_FakeClient([]))
-    batch = Mock(name="batch")
+    batch = Mock(name="batch", context_requests=[])
     recovery.step_prepared(batch)
     sample_state = Mock()
     sample_state.sampler_event.synchronize.side_effect = recovery._peer_failed.set
@@ -884,6 +885,7 @@ def test_a_failure_seen_only_by_the_watch_counts():
 def test_discard_returns_step_resources_and_padding_request():
     executor = _executor()
     executor.kv_cache_manager = Mock()
+    executor.draft_kv_cache_manager = Mock()
     executor.inflight_req_ids = Mock()
     executor._pending_adp_dummy_request = None
     step = PreparedStep(Mock(name="batch"), {7: 64})
@@ -894,6 +896,7 @@ def test_discard_returns_step_resources_and_padding_request():
     executor.discard_interrupted_steps([step])
 
     executor.kv_cache_manager.revert_prepare_resources.assert_called_once_with(step.batch, {7: 64})
+    executor.draft_kv_cache_manager.revert_prepare_resources.assert_called_once_with(step.batch, {})
     executor._terminate_request.assert_called_once_with(dummy)
     assert executor.active_requests == [request]
     assert executor.previous_batch is None and request.py_batch_idx is None
@@ -918,6 +921,30 @@ def test_discard_undoes_each_step_s_request_changes_newest_first():
 
     assert (request.context_current_position, request.state) == (0, "CONTEXT_INIT")
     assert executor._step_changes is None
+
+
+def test_discard_restores_the_draft_tokens_sampling_set():
+    """Sampling sets a finishing context request's draft tokens before its step is accepted."""
+    recovery = _recovery(_FakeClient([]))
+    executor = recovery._executor
+    executor.inflight_req_ids = Mock()
+    executor._pending_adp_dummy_request = None
+    drafts = []
+    request = Mock(
+        is_attention_dp_dummy=False,
+        context_current_position=64,
+        state="CONTEXT_INIT",
+        py_draft_tokens=drafts,
+    )
+    executor._step_changes = recovery.step_prepared(SimpleNamespace(context_requests=[request]))
+    request.py_draft_tokens = [1, 1]
+    executor._note_step_change(request)
+    request.context_current_position, request.state = 96, "GENERATION_IN_PROGRESS"
+
+    PyExecutor.discard_interrupted_steps(executor, reversed(recovery._uncommitted_steps))
+
+    assert request.py_draft_tokens is drafts
+    assert (request.context_current_position, request.state) == (64, "CONTEXT_INIT")
 
 
 def test_discard_before_prepare_releases_the_tentative_padding_request():
@@ -1268,6 +1295,7 @@ def _supported_executor():
             moe_load_balancer=load_balancer, moe_execution_state=Mock(), spec_config=None
         ),
         kv_cache_manager=kv_cache_manager,
+        draft_kv_cache_manager=None,
         resource_manager=Mock(get_resource_manager=Mock(return_value=None)),
         dist=Mock(
             spec=MPIDist,
@@ -1294,25 +1322,6 @@ def _supported_executor():
 @pytest.mark.parametrize(
     "unsupported, requirement",
     [
-        (lambda ex: setattr(ex, "drafter", Mock()), "no speculative decoding but one-model MTP"),
-        (
-            lambda ex: setattr(ex.model_engine, "spec_config", _spec_config(SpecMode.MTP)),
-            "no speculative decoding but one-model MTP",
-        ),
-        (
-            lambda ex: setattr(
-                ex.model_engine, "spec_config", _spec_config(SpecMode.EAGLE3_ONE_MODEL)
-            ),
-            "no speculative decoding but one-model MTP",
-        ),
-        (
-            lambda ex: setattr(
-                ex.model_engine,
-                "spec_config",
-                _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL, use_dynamic_tree=True),
-            ),
-            "no speculative decoding but one-model MTP",
-        ),
         (lambda ex: setattr(ex, "guided_decoder", Mock()), "no guided decoding"),
         (lambda ex: setattr(ex, "max_beam_width", 2), "no beam search"),
         (lambda ex: setattr(ex, "kv_connector_manager", Mock()), "no KV connector"),
@@ -1321,6 +1330,7 @@ def _supported_executor():
             lambda ex: setattr(ex, "kv_cache_manager", Mock()),
             "KV Cache Manager V2",
         ),
+        (lambda ex: setattr(ex, "draft_kv_cache_manager", Mock()), "KV Cache Manager V2"),
         (
             lambda ex: setattr(ex.resource_manager.get_resource_manager, "return_value", Mock()),
             "no PEFT",
@@ -1439,18 +1449,86 @@ def test_create_accepts_kv_block_reuse(monkeypatch):
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 
-def _spec_config(mode: "SpecMode", use_dynamic_tree: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(spec_dec_mode=mode, use_dynamic_tree=use_dynamic_tree)
+def _spec_config(mode: "SpecMode", **options) -> SimpleNamespace:
+    return SimpleNamespace(spec_dec_mode=mode, **options)
 
 
-def test_create_accepts_one_model_mtp(monkeypatch):
+@pytest.mark.parametrize(
+    "configure, warns",
+    [
+        (lambda ex: None, False),
+        (
+            lambda ex: setattr(
+                ex.model_engine, "spec_config", _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL)
+            ),
+            False,
+        ),
+        (lambda ex: setattr(ex.model_engine, "spec_config", _spec_config(SpecMode.MTP)), True),
+        (
+            lambda ex: setattr(
+                ex.model_engine, "spec_config", _spec_config(SpecMode.EAGLE3_ONE_MODEL)
+            ),
+            True,
+        ),
+        (
+            lambda ex: setattr(
+                ex.model_engine,
+                "spec_config",
+                _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL, use_dynamic_tree=True),
+            ),
+            True,
+        ),
+        (
+            lambda ex: setattr(
+                ex.model_engine,
+                "spec_config",
+                _spec_config(
+                    SpecMode.MTP_EAGLE_ONE_MODEL, use_relaxed_acceptance_for_thinking=True
+                ),
+            ),
+            True,
+        ),
+        (
+            lambda ex: setattr(
+                ex.model_engine,
+                "spec_config",
+                _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL, sa_config=Mock()),
+            ),
+            True,
+        ),
+        (lambda ex: setattr(ex.model_engine, "spec_config", _spec_config(SpecMode.NGRAM)), True),
+        (lambda ex: setattr(ex, "drafter", Mock()), True),
+    ],
+    ids=[
+        "none",
+        "one_model_mtp",
+        "mtp_vanilla",
+        "eagle3_one_model",
+        "dynamic_tree",
+        "relaxed_acceptance",
+        "suffix_automaton",
+        "ngram",
+        "drafter",
+    ],
+)
+def test_create_accepts_any_speculative_decoding_and_warns_when_untested(
+    monkeypatch, configure, warns
+):
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(
         peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )
+    warning = Mock()
+    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warning)
     executor = _supported_executor()
-    executor.model_engine.spec_config = _spec_config(SpecMode.MTP_EAGLE_ONE_MODEL)
+    configure(executor)
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    executor.dist.enable_peer_loss_recovery.assert_called_once()
+    if warns:
+        warning.assert_called_once()
+        assert "in-graph draft state" in warning.call_args.args[0]
+    else:
+        warning.assert_not_called()
 
 
 def test_create_registers_the_domains_whose_loss_the_placement_covers(monkeypatch):

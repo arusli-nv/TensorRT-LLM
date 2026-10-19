@@ -8691,20 +8691,27 @@ class PyExecutor:
         """Undo steps that a peer loss interrupted before their results applied.
 
         ``steps`` come newest first. Each step's request changes are undone and
-        the KV cache reserved for it is returned, as is the attention-DP padding
-        request, so that the steps' requests are scheduled again unchanged and
-        the loop restarts from host state.
+        the KV cache reserved for it, target and draft, is returned, as is the
+        attention-DP padding request, so that the steps' requests are scheduled
+        again unchanged and the loop restarts from host state.
         """
         self._finalize_adp_dummy_allocation(False)
         if self._recompute_unpaused is not None:
             self._pause_recompute_paused_requests(self._recompute_unpaused)
             self._recompute_unpaused = None
         for step in steps:
-            for request, position, state in reversed(step.changes):
+            for request, position, state, draft_tokens in reversed(
+                    step.changes):
                 request.context_current_position = position
                 request.state = state
+                request.py_draft_tokens = draft_tokens
             self.kv_cache_manager.revert_prepare_resources(
                 step.batch, step.context_capacities)
+            if self.draft_kv_cache_manager is not None:
+                # A draft context cache keeps its size: the step's rerun asks
+                # for the same capacity.
+                self.draft_kv_cache_manager.revert_prepare_resources(
+                    step.batch, {})
         self._terminate_attention_dp_dummy_requests()
         self._step_changes = None
         self.previous_batch = None
@@ -8717,7 +8724,8 @@ class PyExecutor:
         """Remember what the step being prepared changes on ``request``, so peer-loss recovery can undo it."""
         if self._step_changes is not None:
             self._step_changes.append(
-                (request, request.context_current_position, request.state))
+                (request, request.context_current_position, request.state,
+                 request.py_draft_tokens))
 
     def take_waiting_requests(self) -> List[RequestQueueItem]:
         """Remove and return the requests waiting to be scheduled."""

@@ -16,7 +16,7 @@ from tensorrt_llm.mapping import Mapping
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 
-def _real_kv_cache_manager(enable_block_reuse=False):
+def _real_kv_cache_manager(enable_block_reuse=False, **kwargs):
     return KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(max_tokens=1024, enable_block_reuse=enable_block_reuse),
         kv_cache_type=CacheTypeCpp.SELF,
@@ -29,6 +29,7 @@ def _real_kv_cache_manager(enable_block_reuse=False):
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=DataType.HALF,
         vocab_size=32000,
+        **kwargs,
     )
 
 
@@ -234,3 +235,60 @@ def test_discarded_later_chunk_keeps_the_committed_chunks_reusable(overlap):
         assert probe.context_current_position == 64
     finally:
         manager.shutdown()
+
+
+def test_a_draft_kv_pool_reverts_with_the_target_across_two_overlapped_steps():
+    """A paired draft pool gives back each discarded step's growth, newest first, as the target does.
+
+    The target's draft width grows between the two steps; the draft pool reserves its own width.
+    """
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+    from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, DFlashDecodingConfig
+
+    spec = DFlashDecodingConfig(max_draft_len=2, speculative_model="draft-model")
+    target = _real_kv_cache_manager(True, spec_config=spec, joint_kv_cache_reuse=True)
+    draft = _real_kv_cache_manager(True, spec_config=spec, is_draft=True, joint_kv_cache_reuse=True)
+    pools = (target, draft)
+    try:
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=4,
+            max_num_tokens=1024,
+            kv_cache_manager=target,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            draft_kv_cache_manager=draft,
+        )
+        request = _prompt_request(1, chunk_size=96)
+
+        def prepare_step():
+            output = scheduler.schedule_request([request], set())
+            batch = ScheduledRequests()
+            for scheduled in output.context_requests:
+                batch.append_context_request(scheduled)
+            batch.generation_requests = list(output.generation_requests)
+            for pool in pools:
+                pool.prepare_resources(batch)
+            return batch
+
+        prompt = prepare_step()
+        assert prompt.context_requests == [request]
+        request.move_to_next_context_chunk()
+        for pool in pools:
+            pool.update_context_resources(prompt)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        request.add_new_token(0, 0)
+        before = [_kv_state(pool) for pool in pools]
+
+        older = prepare_step()
+        request.py_draft_tokens = [1, 1]
+        newer = prepare_step()
+        assert older.generation_requests == newer.generation_requests == [request]
+        assert [_kv_state(pool) for pool in pools] != before
+
+        for batch in (newer, older):
+            for pool in pools:
+                pool.revert_prepare_resources(batch, {})
+        assert [_kv_state(pool) for pool in pools] == before
+        assert not draft._inflight_draft_lens and not target._inflight_draft_lens
+    finally:
+        for pool in pools:
+            pool.shutdown()
