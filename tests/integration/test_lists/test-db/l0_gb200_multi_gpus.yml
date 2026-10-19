@@ -102,6 +102,11 @@ l0_gb200_multi_gpus:
   - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[idle-overlap] TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[inflight-sync] TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[inflight-overlap] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_two_ranks_lost_together TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_rank_lost_during_recovery TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_borrowed_slots TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_hung_rank_fenced TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_authority_lost_while_serving TIMEOUT (45)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_OFF]

@@ -3,11 +3,11 @@
 """LLM API driver for the WideEP peer-loss recovery test.
 
 Runs on MPI rank 0 under ``trtllm-llmapi-launch``: serves DeepSeek-V3-Lite on EP4 with
-attention DP, SIGKILLs the worker process of one rank, keeps serving and writes what every
-request returned to ``--output``.
+attention DP, SIGKILLs (or SIGSTOPs) the worker processes of the victim ranks, keeps serving
+and writes what every request returned to ``--output``.
 
-- ``idle``: kill between two rounds of requests.
-- ``inflight``: kill while one request per attention-DP rank is decoding.
+- ``idle``: fault between two rounds of requests.
+- ``inflight``: fault while one request per attention-DP rank is decoding.
 """
 
 import argparse
@@ -37,18 +37,21 @@ PROMPTS = {
 }
 
 
-def placement() -> list[int]:
-    """Two replicas of every expert: rank r holds its own experts and those of rank r + 1."""
+def placement(replica_offset: int = 1) -> list[int]:
+    """Two replicas of every expert: rank r holds its own experts and those of rank r + offset.
+
+    Offset 1 survives the loss of any one rank; offset 2 also that of ranks 2 and 3 together.
+    """
     per_rank = NUM_EXPERTS // WORLD_SIZE
     slots = []
     for rank in range(WORLD_SIZE):
-        for owner in (rank, (rank + 1) % WORLD_SIZE):
+        for owner in (rank, (rank + replica_offset) % WORLD_SIZE):
             slots += range(owner * per_rank, (owner + 1) * per_rank)
     return slots
 
 
-def llm_kwargs(overlap: bool = False) -> dict:
-    slots = placement()
+def llm_kwargs(overlap: bool = False, replica_offset: int = 1) -> dict:
+    slots = placement(replica_offset)
     return dict(
         tensor_parallel_size=WORLD_SIZE,
         moe_expert_parallel_size=WORLD_SIZE,
@@ -128,17 +131,29 @@ def collect(pending: list) -> list[dict]:
     return rows
 
 
-def kill(rank: int) -> None:
-    pid = find_worker(rank)
-    print(f"{KILL_MARKER} rank={rank} pid={pid}", flush=True)
-    os.kill(pid, signal.SIGKILL)
+def fault(ranks: list[int], signum: signal.Signals) -> None:
+    pids = [find_worker(rank) for rank in ranks]
+    for rank, pid in zip(ranks, pids):
+        print(f"{KILL_MARKER} rank={rank} pid={pid} signal={signum.name}", flush=True)
+        os.kill(pid, signum)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", choices=("idle", "inflight"), required=True)
-    parser.add_argument("--victim", type=int, required=True)
+    parser.add_argument("--victims", type=int, nargs="+", required=True)
+    parser.add_argument(
+        "--also-lost",
+        type=int,
+        nargs="*",
+        default=[],
+        help="ranks that end themselves during the recovery (not served afterwards)",
+    )
+    parser.add_argument(
+        "--fault", choices=("kill", "stop"), default="kill", help="SIGKILL or SIGSTOP the victims"
+    )
+    parser.add_argument("--replica-offset", type=int, default=1, help="see placement()")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlap", action="store_true", help="run the overlap scheduler")
     args = parser.parse_args()
@@ -146,21 +161,23 @@ def main() -> None:
     from tensorrt_llm import LLM
 
     all_ranks = list(range(WORLD_SIZE))
-    survivors = [rank for rank in all_ranks if rank != args.victim]
+    lost = set(args.victims) | set(args.also_lost)
+    survivors = [rank for rank in all_ranks if rank not in lost]
+    signum = signal.SIGKILL if args.fault == "kill" else signal.SIGSTOP
     result = {}
-    llm = LLM(model=args.model, **llm_kwargs(args.overlap))
+    llm = LLM(model=args.model, **llm_kwargs(args.overlap, args.replica_offset))
     try:
         result["healthy"] = collect(submit(llm, all_ranks, SHORT_MAX_TOKENS))
         if args.mode == "idle":
             time.sleep(2)
-            kill(args.victim)
+            fault(args.victims, signum)
         else:
             probe_rank = survivors[0]
             pending = submit(llm, all_ranks, LONG_MAX_TOKENS, stream_rank=probe_rank)
             probe = dict(pending)[probe_rank]
             while len(next(probe).outputs[0].token_ids) < TOKENS_BEFORE_KILL:
                 pass
-            kill(args.victim)
+            fault(args.victims, signum)
             result["during_loss"] = collect(pending)
         result["after_loss"] = collect(submit(llm, survivors, SHORT_MAX_TOKENS))
     finally:
