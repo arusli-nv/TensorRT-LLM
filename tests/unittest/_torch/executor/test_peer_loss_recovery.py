@@ -3,6 +3,7 @@
 """Scheduler-side WideEP peer-loss recovery with fake distributed, model, and authority."""
 
 import functools
+import pickle
 import signal
 import threading
 import time
@@ -1299,6 +1300,56 @@ def test_rank0_tracks_requests_that_delivered_a_response():
     assert recovery._delivered == {11}
     recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
     assert recovery._delivered == set() and set(recovery._request_owners) == {12}
+
+
+def _response(request_id, is_final=False, error_msg=None):
+    result = None if error_msg else SimpleNamespace(is_final=is_final)
+    return LlmResponse(request_id=request_id, error_msg=error_msg, result=result)
+
+
+def test_rank0_keeps_its_books_from_the_notes_of_each_gathered_part():
+    """Each rank notes the requests its part finishes or first answers; rank 0 reads only those notes, with the
+    same outcome as reading every response."""
+    owner = _recovery(_FakeClient([]), rank=1)
+    steps = [
+        [(11, _response(11)), (12, _response(12)), (13, _response(13)), (23, _response(13))],
+        [
+            (11, _response(11)),
+            (12, _response(12, is_final=True)),
+            (23, _response(23, error_msg="boom")),
+        ],
+    ]
+    parts = [owner.gathering_responses(step) for step in steps]
+    assert [(part.finished, part.streaming) for part in parts] == [
+        ([], [11, 12, 13]),
+        ([12, 23], []),
+    ]
+    fast, scan = _recovery(_FakeClient([]), rank=0), _recovery(_FakeClient([]), rank=0)
+    for rank0 in (fast, scan):
+        rank0.requests_routed({1: [_queued(11), _queued(12), Mock(id=13, child_req_ids=[23])]})
+    for step, part in zip(steps, parts):
+        sent = pickle.loads(pickle.dumps(part))
+        assert sent == step and (sent.finished, sent.streaming) == (part.finished, part.streaming)
+        # Not iterable: rank 0 does not read the responses.
+        fast.responses_gathered(object(), [None, sent])
+        scan.responses_gathered(step)
+    for rank0 in (fast, scan):
+        assert (set(rank0._request_owners), rank0._delivered, rank0._parent_ids) == ({11}, {11}, {})
+
+
+def test_a_resent_part_notes_the_requests_it_answered_again():
+    """Rank 0 never read the notes of a gather a loss interrupted, so the resent part carries them again."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery.gathering_responses([(11, _response(11))])
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: 0
+    resent = []
+    recovery._executor._enqueue_responses = lambda responses: resent.append(
+        recovery.gathering_responses(responses)
+    )
+
+    recovery._recover(_interrupted())
+
+    assert resent[0].streaming == [11]
 
 
 @pytest.mark.parametrize("ran_again, failed_requests", [(False, 1), (True, 2)])

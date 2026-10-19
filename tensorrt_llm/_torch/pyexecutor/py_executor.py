@@ -9300,6 +9300,7 @@ class PyExecutor:
             self._maybe_record_hang_diagnostic_phase("response_enqueue_skipped")
             return
 
+        responses_list = None
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
                 responses = self._peer_loss_recovery.gathering_responses(
@@ -9337,7 +9338,7 @@ class PyExecutor:
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
-        self._peer_loss_recovery.responses_gathered(responses)
+        self._peer_loss_recovery.responses_gathered(responses, responses_list)
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:

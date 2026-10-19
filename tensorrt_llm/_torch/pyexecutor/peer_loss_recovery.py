@@ -119,6 +119,20 @@ def _register(
     return client, client.register(recoverable_domains, time.monotonic() + _REGISTRATION_TIMEOUT_S)
 
 
+class ResponseContribution(list):
+    """One rank's part of a response gather, with the request ids rank 0's bookkeeping needs.
+
+    ``finished``: ids of the responses that are an error or a final result. ``streaming``: ids of the
+    other responses whose request this rank had not answered yet. Rank 0 reads these instead of every
+    response it gathers.
+    """
+
+    def __init__(self, responses: Responses, finished: List[int], streaming: List[int]) -> None:
+        super().__init__(responses)
+        self.finished = finished
+        self.streaming = streaming
+
+
 @dataclasses.dataclass
 class PreparedStep:
     """A scheduled step that holds resources but whose results are not accepted yet.
@@ -170,7 +184,11 @@ class RecoveryHook:
     def gathering_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         return responses
 
-    def responses_gathered(self, responses: Iterable[Tuple[int, LlmResponse]]) -> None:
+    def responses_gathered(
+        self,
+        responses: Iterable[Tuple[int, LlmResponse]],
+        contributions: Optional[Sequence[Optional[Responses]]] = None,
+    ) -> None:
         pass
 
     def defer_terminations(self, requests: Iterable[LlmRequest]) -> None:
@@ -249,6 +267,8 @@ class PeerLossRecovery(RecoveryHook):
         self._delivered: Set[int] = set()
         # On rank 0: the owned requests already run again after a loss of their rank; a second loss fails them.
         self._rerun: Set[int] = set()
+        # Ids of the requests this rank answered, until their error or final result.
+        self._answering: Set[int] = set()
         if executor.dist.rank == 0:
             self._request_owners = {}
         # Requests rank 0 fetched but failed to broadcast because a peer loss interrupted it.
@@ -602,21 +622,66 @@ class PeerLossRecovery(RecoveryHook):
                 for child_id in item.child_req_ids or ():
                     self._parent_ids[child_id] = item.id
 
-    def gathering_responses(self, responses: Iterable[Tuple[int, LlmResponse]]) -> Responses:
-        """Keep this rank's part of a response gather for redelivery; returns it as a list."""
+    def gathering_responses(
+        self, responses: Iterable[Tuple[int, LlmResponse]]
+    ) -> ResponseContribution:
+        """Keep this rank's part of a response gather for redelivery; returns it with rank 0's notes."""
         responses = list(responses)
+        finished, streaming = [], []
+        answering = self._answering
+        for _, response in responses:
+            if not isinstance(response, LlmResponse):
+                continue
+            request_id = response.request_id
+            # LlmResponse.has_error() without the call: this runs for every response of every step.
+            if response.error_msg is not None or (
+                response.result is not None and response.result.is_final
+            ):
+                finished.append(request_id)
+                answering.discard(request_id)
+            elif request_id not in answering:
+                answering.add(request_id)
+                streaming.append(request_id)
+        contribution = ResponseContribution(responses, finished, streaming)
         self._gather_count += 1
-        self._gathers.append((self._gather_count, responses))
-        return responses
+        self._gathers.append((self._gather_count, contribution))
+        return contribution
 
-    def responses_gathered(self, responses: Iterable[Tuple[int, LlmResponse]]) -> None:
+    def responses_gathered(
+        self,
+        responses: Iterable[Tuple[int, LlmResponse]],
+        contributions: Optional[Sequence[Optional[Responses]]] = None,
+    ) -> None:
         """Note that rank 0 processed the last gather; forget finished requests.
 
         A result is final once every sequence of the request finished, and an
         error of any sequence ends the whole request.
+
+        Args:
+            responses: The gathered responses.
+            contributions: Per rank, its part of an attention-DP gather (None for a departed rank). Rank 0 reads
+                the notes of each ``ResponseContribution`` instead of its responses.
         """
         self._last_processed_gather = self._gather_count
-        self._forget_finished(responses)
+        if self._request_owners is None:
+            return
+        if contributions is None:
+            self._forget_finished(responses)
+            return
+        for contribution in contributions:
+            if isinstance(contribution, ResponseContribution):
+                self._note_responses(contribution.finished, contribution.streaming)
+            elif contribution is not None:
+                self._forget_finished(contribution)
+
+    def _note_responses(self, finished: Iterable[int], streaming: Iterable[int]) -> None:
+        """Retire the requests ``finished`` ends; note the owned ones ``streaming`` answered (rank 0)."""
+        for request_id in finished:
+            self._retire(self._parent_ids.get(request_id, request_id))
+        for request_id in streaming:
+            request_id = self._parent_ids.get(request_id, request_id)
+            if request_id in self._request_owners:
+                self._delivered.add(request_id)
 
     def _forget_finished(self, responses: Iterable[Tuple[int, LlmResponse]]) -> None:
         """Forget the owners of the requests these responses finish (rank 0)."""
@@ -1116,6 +1181,10 @@ class PeerLossRecovery(RecoveryHook):
             for response in contribution
         ]
         self._gathers.clear()
+        # Rank 0 did not read the notes of these parts: note their requests again when they are resent.
+        self._answering.difference_update(
+            response.request_id for _, response in responses if isinstance(response, LlmResponse)
+        )
         # A rank may have completed gathers rank 0 did not: number them like rank 0 from here on.
         self._gather_count = self._last_processed_gather = processed
         buffered_responses, buffered_terminations = buffered
