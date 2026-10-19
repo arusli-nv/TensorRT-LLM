@@ -112,6 +112,15 @@ class FaultToleranceConfig(StrictBaseModel):
             + COMMAND_FENCE_GRACE_S
         )
 
+    def shrink_timeout_s(self) -> float:
+        """The longest a survivor may wait from detecting a loss until the survivors agree on the failed ranks.
+
+        The agreement needs every survivor. One can detect a hung peer before the others (Open MPI's in-band
+        failure detector declares a stopped process failed within seconds), while the others stay blocked on
+        that peer until the authority confirms the hang and fences it.
+        """
+        return (self.hang_resolution_s() if self.hang_detection else 0.0) + self.recovery_timeout_s
+
     def digest(self) -> str:
         """A short hash of these settings; the workers and the authority must hold the same one."""
         settings = json.dumps(self.model_dump(mode="json"), sort_keys=True)

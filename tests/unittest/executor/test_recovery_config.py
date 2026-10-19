@@ -71,6 +71,13 @@ def test_hang_resolution_bounds_confirm_and_fence():
     assert config.hang_resolution_s() == 8 + 10 + config_module.COMMAND_FENCE_GRACE_S
 
 
+@pytest.mark.parametrize("hang_detection", [False, True])
+def test_the_shrink_may_wait_for_a_hung_peer_to_be_fenced(hang_detection):
+    config = FaultToleranceConfig(hang_detection=hang_detection, recovery_timeout_s=30)
+    fence = config.hang_resolution_s() if hang_detection else 0
+    assert config.shrink_timeout_s() == fence + 30
+
+
 def test_every_field_has_a_description():
     assert all(field.description for field in FaultToleranceConfig.model_fields.values())
 

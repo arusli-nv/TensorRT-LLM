@@ -128,7 +128,7 @@ Timeouts (see the settings above):
 | A dead process | detected when its TCP connections close, in milliseconds |
 | A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, or `heartbeat_timeout_s` (5 s) until a stopped rank's heartbeat counts as missing, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured from a SIGSTOP to serving again at DEP32 under an earlier rule: 10.6 / 15.9 / 36.7 s with `hang_confirm_s` 3 / 10 / 30 |
 | A stall of every rank | `hang_confirm_s` (30 s) from its start until the deployment is reported terminal and every worker exits with code 75 |
-| A recovery | `recovery_timeout_s` (30 s) at the workers, `authority_timeout_s` (20 s) at the authority; a recovery takes milliseconds after detection |
+| A recovery | `recovery_timeout_s` (30 s) at the workers from the survivors' agreement on the failed ranks, `authority_timeout_s` (20 s) at the authority; a recovery takes milliseconds after detection. The agreement waits for every survivor: up to the hang's resolution time (with hang detection) plus `recovery_timeout_s`, since a survivor can detect a stopped peer before the others, which stay blocked on it until it is fenced |
 
 How a hang is judged. Each worker sends heartbeats twice: from a native thread, which runs without the Python
 interpreter lock and reports the iteration of the last finished step, and from a Python thread, which also
@@ -162,8 +162,8 @@ Refused at startup, with the requirement that is missing:
 attention-DP balancing or a non-default attention-DP router, expert tensor parallelism, beam search, guided
 decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving) and
 connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder
-models, sleep/wake-up, a non-MPI executor (Ray, RPC), and a hang-detection timeout that is not above twice
-`recovery_timeout_s`.
+models, sleep/wake-up, a non-MPI executor (Ray, RPC), and a hang-detection timeout that is not above three times
+`recovery_timeout_s`, plus the hang's resolution time when hang detection is on (see the timeouts above).
 
 Rejected per request: repetition, presence and frequency penalties (their token counts cannot be rolled back
 when a step is discarded), and multimodal requests under the overlap scheduler.

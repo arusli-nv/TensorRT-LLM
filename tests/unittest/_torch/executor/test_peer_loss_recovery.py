@@ -367,6 +367,43 @@ def test_a_loss_after_a_recovery_recovers_only_while_the_slots_cover_every_lost_
     assert recovery._executor._events.count("watch") == 2
 
 
+def _slow_shrink(recovery, seconds):
+    """The first shrink returns after ``seconds``: a survivor blocked on a hung peer joins it once it is fenced."""
+
+    def shrink():
+        time.sleep(seconds)
+        return frozenset({FAILED_RANK})
+
+    recovery._executor.dist.shrink.side_effect = shrink
+
+
+def test_a_shrink_that_waits_for_a_fence_within_its_timeout_still_recovers():
+    """The shrink outlasts the recovery timeout; the recovery's deadline starts once the survivors agree."""
+    client = _FakeClient(_happy_replies())
+    recovery = _recovery(client)
+    recovery._timeout_s = 0.2
+    recovery._shrink_timeout_s = 2.0
+    _slow_shrink(recovery, 0.4)
+    joined = []
+    recovery._join_device_work = lambda deadline: joined.append(deadline - time.monotonic())
+    recovery._recover(_interrupted())
+    assert len(joined) == 1 and joined[0] > 0
+    assert isinstance(client.sent[-1], Installed) and not client.replies
+
+
+def test_a_shrink_beyond_its_timeout_fails_closed():
+    client = _FakeClient(_happy_replies())
+    recovery = _recovery(client)
+    recovery._timeout_s = 0.2
+    recovery._shrink_timeout_s = 0.3
+    _slow_shrink(recovery, 0.4)
+    with pytest.raises(RecoveryTimeout, match="the survivors agreed on the failed ranks"):
+        recovery._recover(_interrupted())
+    recovery._join_device_work.assert_not_called()
+    assert client.sent == []
+    assert "survivors" not in recovery._executor._events
+
+
 def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
     """A started shrink cannot be interrupted, so none starts once the deadline passed."""
     recovery = _recovery(_FakeClient([_FURTHER_LOSS]))
@@ -1362,6 +1399,17 @@ def test_create_rejects_configurations_a_discarded_step_cannot_rerun(
     with pytest.raises(ValueError, match=requirement):
         PeerLossRecovery.create(executor)
     executor.dist.enable_peer_loss_recovery.assert_not_called()
+
+
+def test_create_requires_the_hang_detector_to_outlast_a_shrink_waiting_for_a_fence(monkeypatch):
+    config = FaultToleranceConfig(hang_detection=True)
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(peer_loss_recovery, "fault_tolerance_config", lambda: config)
+    executor = _supported_executor()
+    # Above the hang's resolution plus a recovery, but not above the shrink plus a recovery's two waits.
+    executor.hang_detector.timeout = config.shrink_timeout_s() + config.recovery_timeout_s
+    with pytest.raises(ValueError, match="hang detection timeout above the shrink"):
+        PeerLossRecovery.create(executor)
 
 
 def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):

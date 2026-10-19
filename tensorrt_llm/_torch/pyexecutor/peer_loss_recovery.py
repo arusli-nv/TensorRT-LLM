@@ -221,6 +221,7 @@ class PeerLossRecovery(RecoveryHook):
         # while their slots cover its loss too.
         self.survives_own_loss = False
         self._timeout_s = fault_tolerance_config().recovery_timeout_s
+        self._shrink_timeout_s = fault_tolerance_config().shrink_timeout_s()
         # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
@@ -308,15 +309,11 @@ class PeerLossRecovery(RecoveryHook):
             "no LM head TP in attention DP": not dist.mapping.enable_lm_head_tp_in_adp,
             "no conversation manager": getattr(kv_cache_manager, "conversation_manager", None)
             is None,
-            # One recovery runs under one hang checkpoint and waits up to the
-            # recovery timeout twice: for the device, then for the authority.
-            "hang detection timeout above twice the recovery timeout": executor.hang_detector.timeout
-            > 2 * config.recovery_timeout_s,
-            # A hung peer stalls the survivors until it is confirmed and fenced; the executor's own hang
-            # detector must not end them first.
-            "hang detection timeout above the hang confirmation and a recovery": not config.hang_detection
-            or executor.hang_detector.timeout
-            > config.hang_resolution_s() + config.recovery_timeout_s,
+            # One recovery runs under one hang checkpoint: the survivors agree on the failed ranks (a hung
+            # peer stalls them until it is confirmed and fenced), then wait up to the recovery timeout twice:
+            # for the device, then for the authority. The executor's own hang detector must not end them first.
+            "hang detection timeout above the shrink and twice the recovery timeout": executor.hang_detector.timeout
+            > config.shrink_timeout_s() + 2 * config.recovery_timeout_s,
             "no sleep/wakeup": executor.llm_args.sleep_config is None,
             # Rebalancing applies a step's results outside the step loop and
             # votes with collectives that do not expect a departed rank.
@@ -665,14 +662,17 @@ class PeerLossRecovery(RecoveryHook):
         lost so far, so a loss after an earlier recovery is checked and planned without them all. A peer
         that fails after the shrink and before ``Install`` joins it: the survivors shrink again
         and plan anew. A peer that fails after ``Install`` is not recovered: the survivors'
-        collectives or the authority's deadline end the job. Every round shares the first
-        round's deadline.
+        collectives or the authority's deadline end the job.
+
+        The first shrink completes only once every survivor detected the loss: a survivor blocked on a
+        hung peer joins when the authority fences that peer. So the first shrink gets
+        ``shrink_timeout_s`` and the deadline starts when it returns; every round shares that deadline.
 
         The MPI calls (revoke, shrink, the survivor watch, rank 0's placement broadcast) cannot be
-        interrupted, so none of a further round starts after the deadline. One that never returns,
-        e.g. a shrink waiting for a hung survivor, is ended by the executor's hang detector, armed
-        for the whole recovery (see ``run``); the authority aborts the other survivors at its own
-        deadline.
+        interrupted, so none of a further round starts after the deadline, and a first shrink that
+        returns after its timeout ends the recovery. One that never returns is ended by the executor's
+        hang detector, armed for the whole recovery (see ``run``); the authority aborts the other
+        survivors at its own deadline.
         """
         from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
         from tensorrt_llm.executor.recovery.protocol import (
@@ -687,7 +687,6 @@ class PeerLossRecovery(RecoveryHook):
         executor = self._executor
         dist, engine, client = executor.dist, executor.model_engine, self._client
         started = time.monotonic()
-        deadline = started + self._timeout_s
         rank = dist.rank
         logger.warning(
             f"Rank {rank}: host collective interrupted ({error}); attempting peer-loss recovery"
@@ -699,6 +698,10 @@ class PeerLossRecovery(RecoveryHook):
         # Shrink is a ULFM agreement among survivors, so every survivor reports
         # the same failed set even if it only observed the revocation.
         failed = dist.shrink()
+        _check_deadline(
+            started + self._shrink_timeout_s, "the survivors agreed on the failed ranks"
+        )
+        deadline = time.monotonic() + self._timeout_s
         self._check_recoverable(failed)
         failed_ranks = tuple(sorted(failed))
         self._join_device_work(deadline)
