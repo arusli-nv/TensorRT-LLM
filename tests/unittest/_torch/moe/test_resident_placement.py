@@ -161,7 +161,7 @@ def test_borrowed_mode_borrows_the_slots_that_empty_mode_empties(monkeypatch, ep
     load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_called_once_with(True)
 
 
-@pytest.mark.parametrize("layer_updates_per_iter, mode", [(0, "empty"), (1, "replicas")])
+@pytest.mark.parametrize("layer_updates_per_iter, mode", [(0, "borrowed"), (1, "replicas")])
 def test_online_eplb_keeps_replicas_in_the_extra_slots(layer_updates_per_iter, mode):
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, layer_updates_per_iter)

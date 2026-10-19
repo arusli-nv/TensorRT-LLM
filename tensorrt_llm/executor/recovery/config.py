@@ -40,10 +40,11 @@ class FaultToleranceConfig(StrictBaseModel):
     model_config = ConfigDict(frozen=True)
 
     extra_slots: Literal["empty", "borrowed"] = Field(
-        default="empty",
-        description="EPLB slots beyond one per expert, with a static placement: ``empty`` (routing never uses "
-        "them; a restore fills them) or ``borrowed`` (also without device memory until a restore, the KV cache can "
-        "use it). Online EPLB keeps replicas in them; setting this with online EPLB is an error.",
+        default="borrowed",
+        description="EPLB slots beyond one per expert, with a static placement: ``borrowed`` (no device memory "
+        "until a restore maps it, so the KV cache keeps that memory while healthy) or ``empty`` (memory held, "
+        "routing never uses them; a restore fills them). Online EPLB keeps replicas in them; setting this with "
+        "online EPLB is an error.",
     )
     failure_domain: Literal["rank", "node"] = Field(
         default="node",

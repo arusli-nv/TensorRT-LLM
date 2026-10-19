@@ -29,7 +29,7 @@ def load(monkeypatch, tmp_path):
 def test_defaults_without_a_file(load):
     assert load() == FaultToleranceConfig()
     assert (
-        load().extra_slots == "empty"
+        load().extra_slots == "borrowed"
         and load().failure_domain == "node"
         and not load().hang_detection
     )
@@ -76,7 +76,7 @@ def test_digest_is_stable_and_changes_with_any_field():
     digest = FaultToleranceConfig().digest()
     assert digest == FaultToleranceConfig().digest() == FaultToleranceConfig(heartbeat_s=1).digest()
     changed = {
-        "extra_slots": "borrowed",
+        "extra_slots": "empty",
         "failure_domain": "rank",
         "recovery_timeout_s": 40.0,
         "authority_timeout_s": 10.0,
