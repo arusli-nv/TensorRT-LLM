@@ -550,18 +550,7 @@ void SingleLayerMoeLoadBalancer::maybeStartUpdateWeights()
 {
     if (mIterId >= 0 && mUpdateWeightsEnabled)
     {
-        mMoeLoadBalancer->addUpdateTask(
-            [this]
-            {
-                if (mMoeLoadBalancer->mUseGpuMemcpy)
-                {
-                    updateWeightsRoutine();
-                }
-                else
-                {
-                    updateWeightsRoutineByCpu();
-                }
-            });
+        mMoeLoadBalancer->addUpdateTask([this] { updateWeightsRoutine(); });
     }
 }
 
@@ -679,22 +668,7 @@ void SingleLayerMoeLoadBalancer::installPlacement(
             mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = rankDead ? -1 : rankExpertIds[rank][localSlotId];
         }
     }
-    prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
-    // The local slots whose expert changed are loaded from the host copies before routing switches to them.
-    if (mMoeLoadBalancer->mUseGpuMemcpy)
-    {
-        mWeightUpdater->updateWeights(&mCpuPlacementInfo);
-        copyPlacementInfoToGpu();
-        TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
-        TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
-    }
-    else
-    {
-        auto const taskId = mMoeLoadBalancer->addCopyTask(
-            [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
-        mMoeLoadBalancer->waitCopyTaskDone(taskId);
-        copyPlacementInfoToGpuByCpu();
-    }
+    loadAndPublishPlacement();
 }
 
 void SingleLayerMoeLoadBalancer::appendLoadedSlotRanges(
@@ -755,32 +729,32 @@ void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpuByCpu()
     std::fill_n(mStatisticInfo.expertLoadFactor, mMetaInfo.expertCount, 0.0f);
 }
 
+void SingleLayerMoeLoadBalancer::loadAndPublishPlacement()
+{
+    prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
+    if (mMoeLoadBalancer->mUseGpuMemcpy)
+    {
+        mWeightUpdater->updateWeights(&mCpuPlacementInfo);
+        copyPlacementInfoToGpu();
+        TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
+        TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
+    }
+    else
+    {
+        mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
+            [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
+        mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
+        mLastUpdateTaskId = -1;
+        copyPlacementInfoToGpuByCpu();
+    }
+}
+
 void SingleLayerMoeLoadBalancer::updateWeightsRoutine()
 {
     auto const deadRankMask = mMoeLoadBalancer->getDeadRankMaskSnapshot();
     doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask);
     doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask);
-    prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
-    mWeightUpdater->updateWeights(&mCpuPlacementInfo);
-    copyPlacementInfoToGpu();
-    TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
-    TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
-    std::unique_lock<std::mutex> lock(mUpdateWeightsMutex);
-    mUpdateWeightsDone = true;
-    mUpdateWeightsCondition.notify_one();
-}
-
-void SingleLayerMoeLoadBalancer::updateWeightsRoutineByCpu()
-{
-    auto const deadRankMask = mMoeLoadBalancer->getDeadRankMaskSnapshot();
-    doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask);
-    doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask);
-    prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
-    mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
-        [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
-    mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
-    mLastUpdateTaskId = -1;
-    copyPlacementInfoToGpuByCpu();
+    loadAndPublishPlacement();
     std::unique_lock<std::mutex> lock(mUpdateWeightsMutex);
     mUpdateWeightsDone = true;
     mUpdateWeightsCondition.notify_one();

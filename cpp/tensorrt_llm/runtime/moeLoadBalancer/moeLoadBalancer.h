@@ -230,8 +230,10 @@ private:
 
     void copyPlacementInfoToGpu();
     void copyPlacementInfoToGpuByCpu();
+    // Loads the local slots whose expert changed in mCpuPlacementInfo from the host copies, by GPU memcpy or the
+    // copy threads, then publishes the placement to routing.
+    void loadAndPublishPlacement();
     void updateWeightsRoutine();
-    void updateWeightsRoutineByCpu();
 
     int64_t mLastUpdateTaskId = -1;
 
