@@ -283,10 +283,16 @@ def test_rank_lost_during_recovery(tmp_path: Path):
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
-def test_restore_into_ghost_slots(tmp_path: Path):
-    """The extra slots hold no memory until rank 2 dies in decode; the restore maps memory behind them."""
+@pytest.mark.parametrize("eplb", ["static", "online"])
+def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
+    """The extra slots hold no memory until rank 2 dies in decode; the restore maps memory behind them.
+
+    Online EPLB over 80 slots (20 per rank) cannot hold the 72 experts on three ranks: each rank gets 4 ghost
+    slots after its EPLB slots, which the restore fills once the replicas are used up, and EPLB's updates serve on.
+    """
+    online_args = ["--online-slots", "80"] if eplb == "online" else []
     result, output, authority_text = _run_driver(
-        tmp_path, "inflight", [VICTIM], ft_config=dict(extra_slots="ghost")
+        tmp_path, "inflight", [VICTIM], *online_args, ft_config=dict(extra_slots="ghost")
     )
     after_kill = _assert_recovered(result, output, authority_text, "inflight", [VICTIM])
     assert "behind ghost expert slots" in after_kill, output[-20000:]

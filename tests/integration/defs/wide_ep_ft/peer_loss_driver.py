@@ -50,8 +50,19 @@ def placement(replica_offset: int = 1) -> list[int]:
     return slots
 
 
-def llm_kwargs(overlap: bool = False, replica_offset: int = 1) -> dict:
+def llm_kwargs(overlap: bool = False, replica_offset: int = 1, online_slots: int = 0) -> dict:
+    """With ``online_slots``, online EPLB over that many slots from its default placement."""
     slots = placement(replica_offset)
+    if online_slots:
+        load_balancer = dict(num_slots=online_slots, layer_updates_per_iter=1)
+    else:
+        load_balancer = dict(
+            num_slots=len(slots),
+            layer_updates_per_iter=0,
+            initial_global_assignments={
+                layer: slots for layer in range(FIRST_MOE_LAYER, NUM_LAYERS)
+            },
+        )
     return dict(
         tensor_parallel_size=WORLD_SIZE,
         moe_expert_parallel_size=WORLD_SIZE,
@@ -69,13 +80,7 @@ def llm_kwargs(overlap: bool = False, replica_offset: int = 1) -> dict:
             # CuteDSL NVFP4 reads the dispatch receive slots in place (other backends get a copy).
             backend="CUTEDSL",
             disable_finalize_fusion=True,
-            load_balancer=dict(
-                num_slots=len(slots),
-                layer_updates_per_iter=0,
-                initial_global_assignments={
-                    layer: slots for layer in range(FIRST_MOE_LAYER, NUM_LAYERS)
-                },
-            ),
+            load_balancer=load_balancer,
         ),
     )
 
@@ -154,6 +159,7 @@ def main() -> None:
         "--fault", choices=("kill", "stop"), default="kill", help="SIGKILL or SIGSTOP the victims"
     )
     parser.add_argument("--replica-offset", type=int, default=1, help="see placement()")
+    parser.add_argument("--online-slots", type=int, default=0, help="see llm_kwargs()")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlap", action="store_true", help="run the overlap scheduler")
     args = parser.parse_args()
@@ -165,7 +171,7 @@ def main() -> None:
     survivors = [rank for rank in all_ranks if rank not in lost]
     signum = signal.SIGKILL if args.fault == "kill" else signal.SIGSTOP
     result = {}
-    llm = LLM(model=args.model, **llm_kwargs(args.overlap, args.replica_offset))
+    llm = LLM(model=args.model, **llm_kwargs(args.overlap, args.replica_offset, args.online_slots))
     try:
         result["healthy"] = collect(submit(llm, all_ranks, SHORT_MAX_TOKENS))
         if args.mode == "idle":
