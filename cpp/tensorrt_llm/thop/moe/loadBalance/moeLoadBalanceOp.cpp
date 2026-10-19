@@ -168,6 +168,23 @@ torch::Tensor moeLoadBalanceRouting(
     return tokenRoutedSlotIds;
 }
 
+// The device expert -> slot table [expertCount] (a view, read at execution time and rewritten in place by placement
+// updates) while routesEachExpertToOneSlot(), else an empty tensor.
+torch::Tensor moeLoadBalanceOneSlotTable(int64_t singleLayerLoadBalancerPtr)
+{
+    TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
+    auto* loadBalancer
+        = reinterpret_cast<tensorrt_llm::runtime::SingleLayerMoeLoadBalancer*>(singleLayerLoadBalancerPtr);
+    auto const options = torch::dtype(torch::kInt32).device(torch::kCUDA);
+    if (!loadBalancer->routesEachExpertToOneSlot())
+    {
+        return torch::empty({0}, options);
+    }
+    // With one replica per expert, entry e of globalSlotIds is expert e's slot.
+    return torch::from_blob(loadBalancer->getGpuPlacementInfo().globalSlotIds,
+        {loadBalancer->getMetaInfo().expertCount}, options.device(torch::kCUDA, c10::cuda::current_device()));
+}
+
 void migrateToHostAccessible(at::Tensor& tensor)
 {
     TORCH_CHECK(tensor.device().is_cuda(), "only support CUDA Tensor");
@@ -297,6 +314,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_load_balance_routing", &tensorrt_llm::torch_ext::moeLoadBalanceRouting);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("moe_load_balance_one_slot_table(int single_layer_load_balancer_ptr) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("moe_load_balance_one_slot_table", &tensorrt_llm::torch_ext::moeLoadBalanceOneSlotTable);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

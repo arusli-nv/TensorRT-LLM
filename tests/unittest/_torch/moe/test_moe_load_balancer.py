@@ -480,6 +480,45 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Clean up
             balancer.shutdown()
 
+    def test_one_slot_table_is_what_routing_reads(self):
+        """A static one-slot placement exposes route()'s device table at a fixed address; dynamic routing none."""
+        torch.cuda.set_device(0)
+        ep_size, expert_count, top_k, slots_per_rank = 2, 4, 2, 2
+        num_slots = ep_size * slots_per_rank
+        for layer_updates_per_iter in (0, 1):
+            with self.subTest(layer_updates_per_iter=layer_updates_per_iter):
+                balancer = MoeLoadBalancer(0, ep_size, layer_updates_per_iter)
+                balancer.set_use_gpu_memcpy(True)
+                layer = balancer.add_layer(expert_count, top_k, slots_per_rank)
+                # Slot s holds expert [2, 0, 3, 1][s].
+                layer.set_initial_weight_assignments([2, 0, 3, 1])
+                balancer.finalize_model()
+                try:
+                    table = layer.one_slot_table()
+                    if layer_updates_per_iter:
+                        self.assertIsNone(table)
+                        continue
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(table.cpu(),
+                                               torch.tensor([1, 3, 0, 2],
+                                                            dtype=torch.int32),
+                                               rtol=0,
+                                               atol=0)
+                    experts = torch.tensor([[0, 1], [2, 3], [3, -1]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+                    expected = torch.where(experts >= 0,
+                                           table[experts.clamp(min=0)],
+                                           num_slots)
+                    torch.testing.assert_close(layer.route(experts),
+                                               expected,
+                                               rtol=0,
+                                               atol=0)
+                    self.assertEqual(layer.one_slot_table().data_ptr(),
+                                     table.data_ptr())
+                finally:
+                    balancer.shutdown()
+
 
 @pytest.fixture
 def mock_runtime() -> Iterator[MagicMock]:

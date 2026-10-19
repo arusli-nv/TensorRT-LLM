@@ -51,6 +51,7 @@ from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
@@ -525,6 +526,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_final_scales = None
 
         # ========== Step 3: EPLB - Update statistics and route ==========
+        expert_to_slot = None
         if moe.layer_load_balancer and token_selected_experts is not None:
             moe._load_balancer_done_wait_gpu_stage(is_first_call)
 
@@ -540,7 +542,18 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 ignore_allreduce=ignore_allreduce,
             )
 
-            token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            # With one slot per expert, NVLinkOneSided dispatch looks the slots up and sends them
+            # itself. ExpertStatistic and the calibrator read the slot ids here, so they keep route().
+            if (
+                self._is_using_nvlink_one_sided()
+                and ExpertStatistic.expert_statistic_obj is None
+                and get_calibrator().mode == CalibratorMode.NONE
+            ):
+                expert_to_slot = moe.layer_load_balancer.one_slot_table()
+            if expert_to_slot is None:
+                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            else:
+                token_selected_slots = token_selected_experts
         else:
             token_selected_slots = token_selected_experts
 
@@ -587,6 +600,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 moe.dummy_allreduce()
 
             dispatch_kwargs = dict(eplb_dispatch_kwargs)
+            if expert_to_slot is not None:
+                dispatch_kwargs["expert_to_slot"] = expert_to_slot
             # Only DeepEP.dispatch reads this; every other strategy absorbs it
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:

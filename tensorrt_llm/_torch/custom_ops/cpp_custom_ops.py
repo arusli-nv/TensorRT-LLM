@@ -869,6 +869,13 @@ def _register_fake():
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
 
+    @torch.library.register_fake("trtllm::moe_load_balance_one_slot_table")
+    def _(single_layer_load_balancer_ptr: int):
+        # Empty means "no table": traced code keeps the routing kernel.
+        return torch.empty((0, ),
+                           dtype=torch.int32,
+                           device=torch.device("cuda"))
+
     @torch.library.register_fake("trtllm::memset_expert_ids")
     def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
           max_token_count_per_rank: int, top_k: int, invalid_expert_id: int,

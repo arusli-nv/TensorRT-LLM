@@ -860,6 +860,17 @@ class SingleLayerMoeLoadBalancer:
             token_selected_experts, offset_by_ep_rank,
             self.single_layer_load_balancer_ptr)
 
+    def one_slot_table(self) -> Optional[torch.Tensor]:
+        """The device expert -> slot table [num_experts] while every expert has exactly one slot, else None.
+
+        ``route`` then reduces to this lookup. Its address is fixed and placement updates rewrite it in place, so
+        captured CUDA graphs read the current placement. Like ``route``, a call that returns a table commits the
+        layer to one slot per expert for every later placement.
+        """
+        table = torch.ops.trtllm.moe_load_balance_one_slot_table(
+            self.single_layer_load_balancer_ptr)
+        return table if table.numel() > 0 else None
+
     def py_pre_shutdown_cleanup(self):
         """
         Clean up the resources before C++ shutdown and barrier
