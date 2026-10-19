@@ -113,7 +113,7 @@ def test_empty_replica_slots_keeps_one_routed_slot_per_expert():
     assert load_balancer.empty_replica_slots() == 4
     # Slot 0 of every rank is kept (each expert's lowest local slot); every second copy is emptied.
     load_balancer.load_balancer_impl.restore_placement.assert_called_once_with(
-        [], [[[0, -1], [2, -1], [1, -1], [3, -1]]]
+        [], [[[0, -1], [2, -1], [1, -1], [3, -1]]], slots_loaded=True
     )
 
 
@@ -353,7 +353,9 @@ def test_install_masks_only_when_no_expert_moves():
     impl.restore_placement.assert_not_called()
 
     load_balancer.install_recovery_placement([1], load_balancer.recovery_placements([1]))
-    impl.restore_placement.assert_called_once_with([1], [[[2, 1], [-1, -1], [0, 3], [0, 1]]])
+    impl.restore_placement.assert_called_once_with(
+        [1], [[[2, 1], [-1, -1], [0, 3], [0, 1]]], slots_loaded=False
+    )
 
     load_balancer.in_iter = True
     with pytest.raises(RuntimeError, match="iteration is active"):

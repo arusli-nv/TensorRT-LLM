@@ -15,8 +15,8 @@ had delivered nothing yet, else end with a retryable error; every other request 
   reads the receive slots in place; layers on other backends (for example a BF16 MTP layer) get a compact
   copy of their hidden states.
 - An EPLB load balancer (`moe_config.load_balancer` with `num_slots` above the number of experts), static
-  (`layer_updates_per_iter: 0`) or online. Its per-node host copies of every expert restore the experts of a
-  lost rank into extra slots; rank 0 is never recoverable. With online EPLB the survivors adopt rank 0's
+  (`layer_updates_per_iter: 0`) or online. Its per-node host copies of every expert (with `host_copies: ring`,
+  of the next node's) restore the experts of a lost rank into extra slots; rank 0 is never recoverable. With online EPLB the survivors adopt rank 0's
   placement during the recovery and restart the update rotation together.
 - Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4.1 or later.
 

@@ -31,6 +31,7 @@ def test_defaults_without_a_file(load):
     assert (
         load().extra_slots == "ghost"
         and load().failure_domain == "node"
+        and load().host_copies == "full"
         and not load().hang_detection
     )
 
@@ -49,6 +50,7 @@ def test_file_fields_override_the_defaults(load):
     [
         ("extra_slots: replicas\n", "extra_slots"),
         ("failure_domain: rack\n", "failure_domain"),
+        ("host_copies: half\n", "host_copies"),
         ("spare_slots: empty\n", "spare_slots"),
         ("recovery_timeout_s: 10\nauthority_timeout_s: 20\n", "authority_timeout_s"),
         ("heartbeat_s: 5\n", "heartbeat_s"),

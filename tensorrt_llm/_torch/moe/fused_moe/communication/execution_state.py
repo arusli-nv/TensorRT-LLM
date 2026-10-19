@@ -91,6 +91,19 @@ class MoeExecutionState:
             memory.pin()
             self._workspaces[id(memory)] = (memory, reset_workspace)
 
+    def staging_workspace(self) -> torch.Tensor:
+        """The largest retained workspace, ``[ep_size, bytes]`` uint8 as this device maps every rank's part.
+
+        Idle between a peer loss's abort (once survivor work is joined and the
+        failed ranks are fenced) and :meth:`rearm`, which resets it; restores
+        stage expert weights through it then.
+        """
+        memory = max(
+            (memory for memory, _ in self._workspaces.values()),
+            key=lambda memory: memory.segment_size,
+        )
+        return memory.as_torch_strided_tensor(torch.uint8)
+
     def track_layer(self, ep_rank: int, reset_state: Callable[[], None]) -> None:
         """Record a bound layer's EP rank and the reset of its dispatch/combine state machine."""
         self._layers.append((ep_rank, reset_state))

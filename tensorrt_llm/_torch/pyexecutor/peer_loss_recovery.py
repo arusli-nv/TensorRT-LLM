@@ -240,6 +240,8 @@ class PeerLossRecovery(RecoveryHook):
         self.survives_own_loss = False
         self._timeout_s = fault_tolerance_config().recovery_timeout_s
         self._shrink_timeout_s = fault_tolerance_config().shrink_timeout_s()
+        # Restores copy experts from another node's host copies (see _stage_restored_slots).
+        self._ring_host_copies = fault_tolerance_config().host_copies == "ring"
         # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
@@ -368,6 +370,13 @@ class PeerLossRecovery(RecoveryHook):
                 f"serve every expert without each domain; the survivors cannot after losing {uncovered[0]} "
                 "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
             )
+        if config.host_copies == "ring":
+            # Every admitted loss needs a copy plan: each expert weight fits half the workspace.
+            workspace_bytes = engine.moe_execution_state.staging_workspace().size(1)
+            for domain in domains:
+                load_balancer.restore_copy_plan(
+                    domain, load_balancer.recovery_placements(domain), workspace_bytes
+                )
         recoverable = tuple(domains)
         dist.enable_peer_loss_recovery()
         client, admitted = _register(dist.rank, recoverable)
@@ -819,7 +828,13 @@ class PeerLossRecovery(RecoveryHook):
                         f"authority proposed {proposal}"
                     )
                 generation = proposal.generation
-                placement_digest = load_balancer.placement_digest(failed, placements)
+                copy_plan = None
+                if self._ring_host_copies:
+                    copy_plan = load_balancer.restore_copy_plan(
+                        failed, placements, engine.moe_execution_state.staging_workspace().size(1)
+                    )
+                    self._stage_restored_slots(load_balancer, copy_plan)
+                placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
                 client.send(ready)
                 install = client.wait(Install, deadline, interrupt=further_loss)
@@ -1086,6 +1101,44 @@ class PeerLossRecovery(RecoveryHook):
         logger.info(
             f"Mapped {need} bytes behind ghost expert slots in "
             f"{(time.monotonic() - start) * 1e3:.1f} ms"
+        )
+
+    def _stage_restored_slots(
+        self, load_balancer: "MoeLoadBalancer", copy_plan: np.ndarray
+    ) -> None:
+        """Copy the experts this plan restores into the survivors' slots, through their workspaces (ring host copies).
+
+        After Propose: the failed ranks are fenced and every survivor joined its
+        device work before sending Stopped, so no all-to-all uses the
+        workspaces until the install rearms them. The slots are routed only
+        once the placement is installed; a plan abandoned for a further loss
+        leaves them unrouted.
+
+        Raises:
+            RecoveryInterrupted: Another survivor failed during the copies.
+        """
+        from mpi4py import MPI
+
+        from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
+
+        dist = self._executor.dist
+        start = time.monotonic()
+        try:
+            load_balancer.stage_restored_slots(
+                copy_plan,
+                self._executor.model_engine.moe_execution_state.staging_workspace(),
+                dist.barrier_among_survivors,
+            )
+        except MPI.Exception as error:
+            if not is_mpi_peer_failure(error):
+                raise
+            raise RecoveryInterrupted(
+                f"Rank {dist.rank}: a survivor failed while restored experts were copied"
+            ) from error
+        chunks = int(copy_plan[-1, 0]) + 1 if len(copy_plan) else 0
+        logger.info(
+            f"Copied {len(copy_plan)} restored expert weights from the ring host copies in {chunks} chunks "
+            f"in {(time.monotonic() - start) * 1e3:.1f} ms"
         )
 
     def _join_device_work(self, deadline: float) -> None:

@@ -4,13 +4,19 @@
 
 import errno
 import os
+import threading
 import uuid
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    HostMoeTensorSharer,
+    MoeLoadBalancer,
+    ring_copy_nodes,
+)
+from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,3 +64,181 @@ def test_a_full_dev_shm_fails_with_an_error_and_leaves_no_segment(monkeypatch):
         sharer.finalize_layer_weights()
     assert sharer.own_shm is None
     assert not os.path.exists(f"/dev/shm/{sharer.get_shared_memory_name()}")
+
+
+_MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
+# A launcher that maps ranks round-robin: node "a" runs ranks 0 and 2, node "b" ranks 1 and 3.
+_HOSTS = ["a", "b", "a", "b"]
+_EXPERTS = 8
+# Two EPLB slots per rank and a ghost slot; the placement after FT emptied every replica.
+_PLACEMENT = [[0, 1, -1], [2, 3, -1], [4, 5, -1], [6, 7, -1]]
+# As MoE modules set it: (ep_rank * E // ep_size + local_slot) % E, ghost slots holding replicas until emptied.
+_ASSIGNMENTS = [0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 0]
+# Slot weights by name: w1 300 bytes, w2 200 bytes.
+_WEIGHTS = {"w1": (300, torch.uint8), "w2": (100, torch.float16)}
+
+
+def test_ring_keeps_each_node_s_copies_on_the_node_before_it():
+    hosts = ["b", "a", "b", "a", "c", "c"]
+    # Nodes by first rank: b (0, 2), a (1, 3), c (4, 5); b's copies live on c, a's on b, c's on a.
+    assert ring_copy_nodes(hosts) == [(4, 5), (0, 2), (4, 5), (0, 2), (1, 3), (1, 3)]
+    assert ring_copy_nodes(["a", "b"]) == [(1,), (0,)]
+
+
+def test_ring_needs_a_second_node():
+    with pytest.raises(ValueError, match="all 4 ranks run on one node"):
+        ring_copy_nodes(["a"] * 4)
+
+
+def _ring_load_balancer(monkeypatch, ep_rank=0, layers=1, layer_updates_per_iter=0):
+    """A static-placement MoeLoadBalancer with ring host copies over native layers showing _PLACEMENT."""
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig(host_copies="ring")
+    )
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_HOSTS))
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: 2)
+    with (
+        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
+        patch(f"{_MLB}.HostMoeTensorSharer") as sharer,
+    ):
+        load_balancer = MoeLoadBalancer(ep_rank, len(_HOSTS), layer_updates_per_iter)
+        load_balancer.load_balancer_impl.add_layer.side_effect = [
+            Mock(
+                get_layer_id=Mock(return_value=i),
+                get_old_rank_expert_ids=Mock(return_value=_PLACEMENT),
+            )
+            for i in range(layers)
+        ]
+        for _ in range(layers):
+            layer = load_balancer.add_layer(_EXPERTS, 2, 3)
+            layer.set_initial_weight_assignments(_ASSIGNMENTS)
+            for slot in range(3):
+                for name, (count, dtype) in _WEIGHTS.items():
+                    layer.weight_slots[(slot, name)] = torch.zeros(count, dtype=dtype)
+    return load_balancer, sharer
+
+
+def test_online_eplb_rejects_ring_host_copies(monkeypatch):
+    with pytest.raises(ValueError, match="applies to a static EPLB placement"):
+        _ring_load_balancer(monkeypatch, layer_updates_per_iter=1)
+
+
+@pytest.mark.parametrize("ep_rank, held", [(0, [2, 3, 6, 7]), (1, [0, 1, 4, 5])])
+def test_a_node_shares_the_home_experts_of_the_next_node(monkeypatch, ep_rank, held):
+    load_balancer, sharer = _ring_load_balancer(monkeypatch, ep_rank)
+    (layer,) = load_balancer.single_layer_load_balancers
+    # Home ranks: each expert's slot after the replicas are emptied.
+    assert layer.home_ranks.tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
+    # Node a (ranks 0, 2) keeps node b's (ranks 1, 3) experts and the other way round.
+    assert layer.host_copy_ranks == ([1, 3] if ep_rank == 0 else [0, 2])
+    sharer.assert_called_once_with(0, _EXPERTS, load_balancer.shared_mpi_comm, held)
+    # Setting the weights again after loading keeps the sharer.
+    layer.set_initial_weight_assignments(_ASSIGNMENTS)
+    assert sharer.call_count == 1
+
+
+def test_an_expert_whose_copy_node_is_lost_too_is_not_restored(monkeypatch):
+    load_balancer, _ = _ring_load_balancer(monkeypatch)
+    # Losing node b's rank 3: its experts' copies are on node a.
+    assert load_balancer.covers_loss_of([3])
+    # Experts 0 and 1 (home rank 0) have their copies on node b; with all of it lost too, nothing restores them.
+    with pytest.raises(ValueError, match=r"\{0: \[0, 1, 3, 6, 7\]\}"):
+        load_balancer.recovery_placements([0, 1, 3])
+
+
+def test_the_copy_plan_is_the_same_on_every_rank_and_spreads_sources(monkeypatch):
+    plans = []
+    for ep_rank in range(len(_HOSTS)):
+        load_balancer, _ = _ring_load_balancer(monkeypatch, ep_rank)
+        placements = load_balancer.recovery_placements([3])
+        plan = load_balancer.restore_copy_plan([3], placements, 2048)
+        plans.append((plan, load_balancer.placement_digest([3], placements, plan)))
+    assert all((plan == plans[0][0]).all() and digest == plans[0][1] for plan, digest in plans)
+    # Rank 3's experts 6 and 7 go to the ghost slots of ranks 0 and 1, copied by node a's ranks 0 and 2 in turn.
+    # Columns: chunk, layer, target, slot, expert, weight, source, offset, bytes.
+    assert plans[0][0].tolist() == [
+        [0, 0, 0, 2, 6, 0, 0, 0, 300],
+        [0, 0, 0, 2, 6, 1, 0, 512, 200],
+        [0, 0, 1, 2, 7, 0, 2, 0, 300],
+        [0, 0, 1, 2, 7, 1, 2, 512, 200],
+    ]
+    # Another plan digests differently.
+    assert load_balancer.placement_digest([3], placements, plan[:, ::-1].copy()) != plans[0][1]
+
+
+def test_the_copy_plan_alternates_workspace_halves_between_chunks(monkeypatch):
+    load_balancer, _ = _ring_load_balancer(monkeypatch, layers=2)
+    placements = load_balancer.recovery_placements([3])
+    # A 1024-byte workspace: chunks of 512 bytes, the second at offset 512, the third back at 0.
+    plan = load_balancer.restore_copy_plan([3], placements, 1024)
+    target_0 = plan[plan[:, 2] == 0]
+    assert target_0[:, [0, 1, 5, 7]].tolist() == [
+        [0, 0, 0, 0],
+        [1, 0, 1, 512],
+        [2, 1, 0, 0],
+        [3, 1, 1, 512],
+    ]
+    assert (plan[1:, 0] >= plan[:-1, 0]).all()
+    with pytest.raises(ValueError, match="300-byte expert weight of MoE layer 0 does not fit"):
+        load_balancer.restore_copy_plan([3], placements, 512)
+
+
+def _expected(layer_idx, expert, name):
+    count, dtype = _WEIGHTS[name]
+    generator = torch.Generator().manual_seed(layer_idx * 1000 + expert * 10 + len(name))
+    return torch.randint(0, 256, (count * dtype.itemsize,), dtype=torch.uint8, generator=generator)
+
+
+def test_staged_restores_load_every_slot_bit_exactly(monkeypatch):
+    """Survivor ranks as threads over one host-memory "workspace": copies, barriers and halves interleave."""
+    dead, survivors = [3], [0, 1, 2]
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
+    workspace = torch.zeros(len(_HOSTS), 1024, dtype=torch.uint8)
+    ranks = {}
+    for ep_rank in survivors:
+        load_balancer, _ = _ring_load_balancer(monkeypatch, ep_rank, layers=2)
+        for layer_idx, layer in enumerate(load_balancer.single_layer_load_balancers):
+            for expert in range(_EXPERTS):
+                if ep_rank in load_balancer.copy_nodes[layer.home_ranks[expert]]:
+                    for name in _WEIGHTS:
+                        layer.ring_host_weights[(expert, name)] = _expected(
+                            layer_idx, expert, name
+                        ).view(_WEIGHTS[name][1])
+        placements = load_balancer.recovery_placements(dead)
+        ranks[ep_rank] = (load_balancer, placements)
+    plan = ranks[0][0].restore_copy_plan(dead, ranks[0][1], workspace.size(1))
+    assert plan[-1, 0] >= 2
+    barrier = threading.Barrier(len(survivors))
+    errors = []
+
+    def run(load_balancer):
+        try:
+            load_balancer.stage_restored_slots(plan, workspace, lambda: barrier.wait(timeout=30))
+        except BaseException as error:  # noqa: BLE001 - re-raised by the test thread
+            errors.append(error)
+            barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(ranks[r][0],)) for r in survivors]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    for ep_rank in survivors:
+        load_balancer, placements = ranks[ep_rank]
+        for layer_idx, layer in enumerate(load_balancer.single_layer_load_balancers):
+            for slot in range(3):
+                expert = int(placements[layer_idx][ep_rank, slot])
+                if _PLACEMENT[ep_rank][slot] == expert:
+                    continue
+                for name in _WEIGHTS:
+                    loaded = layer.weight_slots[(slot, name)].view(torch.uint8)
+                    assert torch.equal(loaded, _expected(layer_idx, expert, name)), (ep_rank, slot)
+
+
+def test_ring_installs_the_staged_slots_without_loading_them(monkeypatch):
+    load_balancer, _ = _ring_load_balancer(monkeypatch)
+    load_balancer.install_recovery_placement([3], load_balancer.recovery_placements([3]))
+    _, kwargs = load_balancer.load_balancer_impl.restore_placement.call_args
+    assert kwargs == {"slots_loaded": True}

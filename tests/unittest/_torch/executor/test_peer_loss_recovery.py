@@ -191,7 +191,7 @@ def test_recovery_runs_protocol_and_installs_in_order():
     # A static placement needs no agreed base.
     load_balancer.recovery_placements.assert_called_once_with(failed, None)
     # The placements installed are the ones whose digest went out with Ready.
-    load_balancer.placement_digest.assert_called_once_with(failed, ["placement"])
+    load_balancer.placement_digest.assert_called_once_with(failed, ["placement"], None)
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
@@ -1840,3 +1840,79 @@ def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(m
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
         recovery._rank0_placements(load_balancer)
+
+
+def _ring_recovery(monkeypatch, client):
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "fault_tolerance_config",
+        lambda: FaultToleranceConfig(host_copies="ring"),
+    )
+    return _recovery(client)
+
+
+def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_plan(monkeypatch):
+    """The copies run once the failed ranks are fenced (Propose) and before Ready, whose digest covers them."""
+    import numpy as np
+
+    client = _FakeClient(_happy_replies(generation=1))
+    recovery = _ring_recovery(monkeypatch, client)
+    engine = recovery._executor.model_engine
+    load_balancer = engine.moe_load_balancer
+    plan = np.zeros((1, 9), dtype=np.int64)
+    load_balancer.restore_copy_plan.return_value = plan
+    workspace = engine.moe_execution_state.staging_workspace.return_value
+    sent_before_staging = []
+    load_balancer.stage_restored_slots.side_effect = lambda *args: sent_before_staging.append(
+        list(client.sent)
+    )
+
+    recovery._recover(_interrupted())
+
+    failed = frozenset({FAILED_RANK})
+    load_balancer.restore_copy_plan.assert_called_once_with(
+        failed, ["placement"], workspace.size.return_value
+    )
+    workspace.size.assert_called_with(1)
+    load_balancer.stage_restored_slots.assert_called_once_with(
+        plan, workspace, recovery._executor.dist.barrier_among_survivors
+    )
+    assert sent_before_staging == [[Stopped(rank=1, failed_ranks=(FAILED_RANK,))]]
+    load_balancer.placement_digest.assert_called_once_with(failed, ["placement"], plan)
+
+
+def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(monkeypatch):
+    import numpy as np
+    from mpi4py import MPI
+
+    recovery = _ring_recovery(monkeypatch, _FakeClient([]))
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
+    plan = np.zeros((1, 9), dtype=np.int64)
+    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
+    with pytest.raises(RecoveryInterrupted):
+        recovery._stage_restored_slots(load_balancer, plan)
+    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
+    with pytest.raises(MPI.Exception):
+        recovery._stage_restored_slots(load_balancer, plan)
+
+
+def test_create_checks_a_copy_plan_for_every_domain_with_ring_host_copies(monkeypatch):
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "fault_tolerance_config",
+        lambda: FaultToleranceConfig(host_copies="ring"),
+    )
+    monkeypatch.setattr(
+        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+    )
+    executor = _supported_executor()
+    load_balancer = executor.model_engine.moe_load_balancer
+    load_balancer.restore_copy_plan.side_effect = ValueError("does not fit")
+    with pytest.raises(ValueError, match="does not fit"):
+        PeerLossRecovery.create(executor)
+    load_balancer.restore_copy_plan.side_effect = None
+    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    # Ranks 1-3 and node b (ranks 2, 3), checked once per create.
+    assert load_balancer.restore_copy_plan.call_count == 1 + 4
