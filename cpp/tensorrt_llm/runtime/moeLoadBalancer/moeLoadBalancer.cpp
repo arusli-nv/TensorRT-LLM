@@ -62,31 +62,53 @@ bool isRankMasked(std::vector<uint8_t> const* deadRankMask, int rank)
     return deadRankMask != nullptr && ((*deadRankMask)[rank] != 0);
 }
 
-int getActiveSlotCount(
-    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<uint8_t> const* deadRankMask)
+bool isSlotUsable(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
+    std::vector<uint8_t> const* deadRankMask, std::vector<uint8_t> const* unusableSlotMask, int rank, int localSlotId)
+{
+    return !isRankMasked(deadRankMask, rank)
+        && (unusableSlotMask == nullptr || (*unusableSlotMask)[rank * metaInfo.slotCountPerRank + localSlotId] == 0);
+}
+
+// Per rank, the number of slots EPLB may fill.
+std::vector<int> getUsableSlotCounts(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
+    std::vector<uint8_t> const* deadRankMask, std::vector<uint8_t> const* unusableSlotMask)
 {
     TLLM_CHECK_WITH_INFO(deadRankMask == nullptr || static_cast<int>(deadRankMask->size()) == metaInfo.epSize,
         "deadRankMask size (%ld) must match epSize (%d)",
         deadRankMask == nullptr ? 0L : static_cast<long>(deadRankMask->size()), metaInfo.epSize);
+    TLLM_CHECK_WITH_INFO(unusableSlotMask == nullptr
+            || static_cast<int>(unusableSlotMask->size()) == metaInfo.epSize * metaInfo.slotCountPerRank,
+        "unusableSlotMask size (%ld) must match the slot count (%d)",
+        unusableSlotMask == nullptr ? 0L : static_cast<long>(unusableSlotMask->size()),
+        metaInfo.epSize * metaInfo.slotCountPerRank);
 
-    int activeRankCount = 0;
+    std::vector<int> usableSlotCounts(metaInfo.epSize, 0);
     for (int rank = 0; rank < metaInfo.epSize; ++rank)
     {
-        if (!isRankMasked(deadRankMask, rank))
+        for (int localSlotId = 0; localSlotId < metaInfo.slotCountPerRank; ++localSlotId)
         {
-            ++activeRankCount;
+            usableSlotCounts[rank]
+                += static_cast<int>(isSlotUsable(metaInfo, deadRankMask, unusableSlotMask, rank, localSlotId));
         }
     }
-    return activeRankCount * metaInfo.slotCountPerRank;
+    return usableSlotCounts;
+}
+
+int getActiveSlotCount(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
+    std::vector<uint8_t> const* deadRankMask, std::vector<uint8_t> const* unusableSlotMask)
+{
+    auto const usableSlotCounts = getUsableSlotCounts(metaInfo, deadRankMask, unusableSlotMask);
+    return std::accumulate(usableSlotCounts.begin(), usableSlotCounts.end(), 0);
 }
 
 } // namespace
 
 void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
-    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask)
+    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask,
+    std::vector<uint8_t> const* unusableSlotMask)
 {
     cpuPlacement->expertReplicaCount.resize(metaInfo.expertCount);
-    int totalSlotCount = getActiveSlotCount(metaInfo, deadRankMask);
+    int totalSlotCount = getActiveSlotCount(metaInfo, deadRankMask, unusableSlotMask);
     TLLM_CHECK_WITH_INFO(totalSlotCount >= metaInfo.expertCount,
         "Mask-only EPLB reconfigure would leave fewer active slots (%d) than experts (%d)", totalSlotCount,
         metaInfo.expertCount);
@@ -153,13 +175,15 @@ void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float
 }
 
 void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
-    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask)
+    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask,
+    std::vector<uint8_t> const* unusableSlotMask)
 {
     // This function only update these two vectors
     auto& rankExpertIds = cpuPlacement->rankExpertIds;
     auto& replicaCount = cpuPlacement->expertReplicaCount;
 
-    int totalSlotCount = getActiveSlotCount(metaInfo, deadRankMask);
+    auto const usableSlotCounts = getUsableSlotCounts(metaInfo, deadRankMask, unusableSlotMask);
+    int totalSlotCount = std::accumulate(usableSlotCounts.begin(), usableSlotCounts.end(), 0);
     // 1. Create all replica information
     std::vector<ReplicaInfo> allReplicas;
     allReplicas.reserve(totalSlotCount);
@@ -186,6 +210,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     // 3. Maintain Rank state and initialize Priority Queue
     std::vector<double> currentRankLoad(metaInfo.epSize, 0.0);
     std::vector<int> currentRankSlots(metaInfo.epSize, 0); // Tracks the count of assigned slots per rank
+    std::vector<int> nextLocalSlotId(metaInfo.epSize, 0);  // The first local slot not yet considered per rank
     for (int rank = 0; rank < metaInfo.epSize; ++rank)
     {
         std::fill_n(rankExpertIds[rank].begin(), metaInfo.slotCountPerRank, -1);
@@ -198,7 +223,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     // Initialize the priority queue with all ranks having 0 load
     for (int rank = 0; rank < metaInfo.epSize; ++rank)
     {
-        if (!isRankMasked(deadRankMask, rank))
+        if (usableSlotCounts[rank] > 0)
         {
             pq.push({0.0, rank});
         }
@@ -215,17 +240,22 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
         int bestRank = top.second;
         double currentLoad = top.first; // The load before adding this replica
 
-        int localSlotId = currentRankSlots[bestRank];
+        int localSlotId = nextLocalSlotId[bestRank];
+        while (!isSlotUsable(metaInfo, deadRankMask, unusableSlotMask, bestRank, localSlotId))
+        {
+            ++localSlotId;
+        }
         TLLM_CHECK_WITH_INFO(localSlotId < metaInfo.slotCountPerRank,
             "localSlotId=%d should be less than metaInfo.slotCountPerRank=%d", localSlotId, metaInfo.slotCountPerRank);
         rankExpertIds[bestRank][localSlotId] = replica.expertId;
+        nextLocalSlotId[bestRank] = localSlotId + 1;
 
         // Update rank state
         currentRankLoad[bestRank] = currentLoad + replica.slotSize; // Update load explicitly
         currentRankSlots[bestRank]++;                               // Increment the slot count for this rank
 
         // If the rank still has capacity, push it back into the queue with updated load
-        if (currentRankSlots[bestRank] < metaInfo.slotCountPerRank)
+        if (currentRankSlots[bestRank] < usableSlotCounts[bestRank])
         {
             pq.push({currentRankLoad[bestRank], bestRank});
         }
@@ -470,13 +500,21 @@ void SingleLayerMoeLoadBalancer::addSingleHostWeight(int expertId, std::string c
 void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments)
 {
     std::fill_n(mCpuPlacementInfo.expertReplicaCount.begin(), mMetaInfo.expertCount, 0);
+    mUnusableSlots.clear();
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
-            int expertId = initialWeightAssignments[rank * mMetaInfo.slotCountPerRank + localSlotId];
-            TLLM_CHECK_WITH_INFO(expertId >= 0 && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
+            int const globalSlotId = rank * mMetaInfo.slotCountPerRank + localSlotId;
+            int expertId = initialWeightAssignments[globalSlotId];
+            TLLM_CHECK_WITH_INFO(expertId >= -1 && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
             mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = expertId;
+            if (expertId == -1)
+            {
+                mUnusableSlots.resize(mMetaInfo.epSize * mMetaInfo.slotCountPerRank, 0);
+                mUnusableSlots[globalSlotId] = 1;
+                continue;
+            }
             mCpuPlacementInfo.expertReplicaCount[expertId]++;
         }
     }
@@ -665,7 +703,13 @@ void SingleLayerMoeLoadBalancer::installPlacement(
         bool const rankDead = deadRankMask[rank] != 0;
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
-            mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = rankDead ? -1 : rankExpertIds[rank][localSlotId];
+            int const expertId = rankDead ? -1 : rankExpertIds[rank][localSlotId];
+            mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = expertId;
+            // A slot that holds an expert holds memory, so EPLB's updates may fill it from now on.
+            if (expertId != -1 && !mUnusableSlots.empty())
+            {
+                mUnusableSlots[rank * mMetaInfo.slotCountPerRank + localSlotId] = 0;
+            }
         }
     }
     loadAndPublishPlacement();
@@ -752,8 +796,9 @@ void SingleLayerMoeLoadBalancer::loadAndPublishPlacement()
 void SingleLayerMoeLoadBalancer::updateWeightsRoutine()
 {
     auto const deadRankMask = mMoeLoadBalancer->getDeadRankMaskSnapshot();
-    doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask);
-    doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask);
+    auto const* unusableSlotMask = mUnusableSlots.empty() ? nullptr : &mUnusableSlots;
+    doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask, unusableSlotMask);
+    doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask, unusableSlotMask);
     loadAndPublishPlacement();
     std::unique_lock<std::mutex> lock(mUpdateWeightsMutex);
     mUpdateWeightsDone = true;

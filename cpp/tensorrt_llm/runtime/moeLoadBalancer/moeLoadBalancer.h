@@ -138,7 +138,8 @@ public:
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight);
 
     // set initial weight assignments for each slot
-    // index is the global slot id, value is the expert id
+    // index is the global slot id, value is the expert id; -1 leaves the slot empty and out of EPLB's updates until
+    // a restore loads an expert into it
     // should bind to python
     void setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments);
 
@@ -236,6 +237,10 @@ private:
     void updateWeightsRoutine();
 
     int64_t mLastUpdateTaskId = -1;
+
+    // Per global slot (rank * slotCountPerRank + localSlotId), 1 if EPLB's updates must leave it empty: the -1 slots
+    // of the initial assignment until a restore loads an expert into them. Empty: every slot is usable.
+    std::vector<uint8_t> mUnusableSlots;
 
     cudaEvent_t mUpdateWeightsDoneEvent = nullptr;
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo mMetaInfo;
@@ -436,10 +441,14 @@ private:
 };
 
 // functions exposed for testing
+// The planner fills every slot of the ranks deadRankMask leaves alive except the slots unusableSlotMask marks
+// (per global slot, rank * slotCountPerRank + localSlotId; nullptr: none), which it leaves -1.
 void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
-    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr);
+    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr,
+    std::vector<uint8_t> const* unusableSlotMask = nullptr);
 
 void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
-    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr);
+    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr,
+    std::vector<uint8_t> const* unusableSlotMask = nullptr);
 
 } // namespace tensorrt_llm::runtime

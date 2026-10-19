@@ -398,6 +398,123 @@ TEST(MoeLoadBalancerMaskOnlyTest, DynamicPlacementRejectsReplicaCountMismatch)
         tensorrt_llm::common::TllmException);
 }
 
+namespace
+{
+
+// doReplication then doPlacement on a fresh placement of metaInfo's shape.
+MoePlacementCpuInfo planPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
+    std::vector<float> expertLoadFactor, std::vector<uint8_t> const* deadRankMask,
+    std::vector<uint8_t> const* unusableSlotMask)
+{
+    MoePlacementCpuInfo cpuPlacement;
+    cpuPlacement.rankExpertIds.assign(metaInfo.epSize, std::vector<int>(metaInfo.slotCountPerRank, 99));
+    doReplication(metaInfo, expertLoadFactor.data(), &cpuPlacement, deadRankMask, unusableSlotMask);
+    doPlacement(metaInfo, expertLoadFactor.data(), &cpuPlacement, deadRankMask, unusableSlotMask);
+    return cpuPlacement;
+}
+
+} // namespace
+
+TEST(MoeLoadBalancerUnusableSlotTest, PlacementNeverFillsAnUnusableSlot)
+{
+    constexpr int kExpertCount = 4;
+    constexpr int kEpSize = 4;
+    constexpr int kSlotCountPerRank = 3;
+    constexpr int kGhostSlot = 2;
+    constexpr int kDeadRank = 2;
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo{
+        kExpertCount, /*topK=*/2, /*epRank=*/0, kEpSize, kSlotCountPerRank};
+    // The last slot of every rank is unusable, except on rank 1 (a ghost slot a restore backed).
+    std::vector<uint8_t> unusableSlotMask(kEpSize * kSlotCountPerRank, 0);
+    for (int rank = 0; rank < kEpSize; ++rank)
+    {
+        unusableSlotMask[rank * kSlotCountPerRank + kGhostSlot] = static_cast<uint8_t>(rank != 1);
+    }
+    std::vector<uint8_t> const deadRankMask{0, 0, 1, 0};
+
+    for (auto const* dead : {static_cast<std::vector<uint8_t> const*>(nullptr), &deadRankMask})
+    {
+        for (auto const& load : {std::vector<float>{8.0F, 4.0F, 2.0F, 1.0F}, std::vector<float>(kExpertCount, 0.0F)})
+        {
+            auto const placement = planPlacement(metaInfo, load, dead, &unusableSlotMask);
+            int const usableSlotCount = dead == nullptr ? 9 : 7;
+            int replicaSum = 0;
+            for (int replicaCount : placement.expertReplicaCount)
+            {
+                EXPECT_GE(replicaCount, 1);
+                replicaSum += replicaCount;
+            }
+            EXPECT_EQ(replicaSum, usableSlotCount);
+            std::vector<int> placedReplicas(kExpertCount, 0);
+            for (int rank = 0; rank < kEpSize; ++rank)
+            {
+                for (int slot = 0; slot < kSlotCountPerRank; ++slot)
+                {
+                    int const expertId = placement.rankExpertIds[rank][slot];
+                    bool const usable = !(dead != nullptr && rank == kDeadRank)
+                        && unusableSlotMask[rank * kSlotCountPerRank + slot] == 0;
+                    if (!usable)
+                    {
+                        EXPECT_EQ(expertId, -1) << "rank " << rank << " slot " << slot;
+                        continue;
+                    }
+                    ASSERT_GE(expertId, 0) << "rank " << rank << " slot " << slot;
+                    ASSERT_LT(expertId, kExpertCount);
+                    ++placedReplicas[expertId];
+                }
+            }
+            EXPECT_EQ(placedReplicas, placement.expertReplicaCount);
+        }
+    }
+
+    // Fewer usable slots than experts cannot be planned.
+    std::vector<uint8_t> const tooFew(kEpSize * kSlotCountPerRank, 1);
+    EXPECT_THROW(
+        planPlacement(metaInfo, {1.0F, 1.0F, 1.0F, 1.0F}, nullptr, &tooFew), tensorrt_llm::common::TllmException);
+    std::vector<uint8_t> const wrongSize(kEpSize, 0);
+    EXPECT_THROW(
+        planPlacement(metaInfo, {1.0F, 1.0F, 1.0F, 1.0F}, nullptr, &wrongSize), tensorrt_llm::common::TllmException);
+}
+
+TEST(MoeLoadBalancerUnusableSlotTest, AllUsableMaskPlacesExactlyAsNoMask)
+{
+    // The placement main's planner makes without a mask: replicas by load, each rank's slots filled in order.
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo small{/*expertCount=*/4, /*topK=*/2, /*epRank=*/0, /*epSize=*/2,
+        /*slotCountPerRank=*/3};
+    std::vector<uint8_t> const smallAllUsable(6, 0);
+    for (auto const* mask : {static_cast<std::vector<uint8_t> const*>(nullptr), &smallAllUsable})
+    {
+        auto const placement = planPlacement(small, {8.0F, 4.0F, 2.0F, 1.0F}, nullptr, mask);
+        EXPECT_EQ(placement.expertReplicaCount, (std::vector<int>{2, 2, 1, 1}));
+        EXPECT_EQ(placement.rankExpertIds, (std::vector<std::vector<int>>{{0, 1, 2}, {0, 1, 3}}));
+    }
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo{/*expertCount=*/16, /*topK=*/4, /*epRank=*/1,
+        /*epSize=*/8, /*slotCountPerRank=*/3};
+    std::vector<uint8_t> const allUsable(metaInfo.epSize * metaInfo.slotCountPerRank, 0);
+    std::vector<uint8_t> const deadRankMask{0, 0, 0, 1, 0, 0, 1, 0};
+    std::vector<std::vector<float>> loads{std::vector<float>(metaInfo.expertCount, 0.0F)};
+    for (int seed = 1; seed <= 3; ++seed)
+    {
+        std::vector<float> load(metaInfo.expertCount);
+        for (int expertId = 0; expertId < metaInfo.expertCount; ++expertId)
+        {
+            load[expertId] = static_cast<float>((expertId * 7 * seed + 3) % 11) + 0.5F * seed;
+        }
+        loads.push_back(load);
+    }
+    for (auto const* dead : {static_cast<std::vector<uint8_t> const*>(nullptr), &deadRankMask})
+    {
+        for (auto const& load : loads)
+        {
+            auto const withoutMask = planPlacement(metaInfo, load, dead, nullptr);
+            auto const withMask = planPlacement(metaInfo, load, dead, &allUsable);
+            EXPECT_EQ(withMask.expertReplicaCount, withoutMask.expertReplicaCount);
+            EXPECT_EQ(withMask.rankExpertIds, withoutMask.rankExpertIds);
+        }
+    }
+}
+
 TEST(MoeLoadBalancerMaskOnlyTest, ReconfigureMaskOnlyRemovesDeadRankSlots)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
@@ -504,9 +621,9 @@ TEST(MoeLoadBalancerMaskOnlyTest, ReconfigureMaskOnlyFailsClosedForLastReplica)
 namespace
 {
 
-// One layer on EP rank 0 of 4 with 2 slots per rank; experts 2 and 3 live only on rank 2. Every expert's host
-// weight is filled with expertId + 1 and every local slot starts with its expert's values. With ghostSlot1, the
-// slots are one ghost range (GhostSlotMemory) whose slot 1 maps no memory.
+// One layer on EP rank 0 of 4 with 2 slots per rank; by default experts 2 and 3 live only on rank 2. Every expert's
+// host weight is filled with expertId + 1 and every local slot starts with its expert's values (0 in a -1 slot).
+// With ghostSlot1, the slots are one ghost range (GhostSlotMemory) whose slot 1 maps no memory.
 class RestorePlacementLayer
 {
 public:
@@ -515,14 +632,13 @@ public:
     static constexpr int kSlotCountPerRank = 2;
     static constexpr int kDeadRank = 2;
 
-    explicit RestorePlacementLayer(
-        bool withHostWeights, int layerUpdatesPerIter = 1, size_t weightElems = 256, bool ghostSlot1 = false)
+    explicit RestorePlacementLayer(bool withHostWeights, int layerUpdatesPerIter = 1, size_t weightElems = 256,
+        bool ghostSlot1 = false, std::vector<int> const& initialAssignments = {0, 1, 0, 1, 2, 3, 0, 1})
         : mLoadBalancer(/*epRank=*/0, kEpSize, layerUpdatesPerIter)
         , mWeightElems(weightElems)
     {
         mLoadBalancer.setUseGpuMemcpy(true);
         mLayer = mLoadBalancer.AddLayer(kExpertCount, /*topK=*/2, kSlotCountPerRank);
-        std::vector<int> const initialAssignments{0, 1, 0, 1, 2, 3, 0, 1};
         size_t const bytes = mWeightElems * sizeof(float);
         for (int expertId = 0; withHostWeights && expertId < kExpertCount; ++expertId)
         {
@@ -543,7 +659,15 @@ public:
             {
                 TLLM_CUDA_CHECK(cudaMalloc(&slot, bytes));
             }
-            TLLM_CUDA_CHECK(cudaMemcpy(slot, mHostWeights[initialAssignments[slotId]], bytes, cudaMemcpyHostToDevice));
+            if (initialAssignments[slotId] < 0)
+            {
+                TLLM_CUDA_CHECK(cudaMemset(slot, 0, bytes));
+            }
+            else
+            {
+                TLLM_CUDA_CHECK(
+                    cudaMemcpy(slot, mHostWeights[initialAssignments[slotId]], bytes, cudaMemcpyHostToDevice));
+            }
             mSlots.push_back(slot);
             mLayer->addSingleWeightSlot(slotId, "w", weight(slot));
         }
@@ -567,6 +691,18 @@ public:
         {
             cudaFree(slot);
         }
+    }
+
+    // Runs one iteration whose EPLB update plans this layer from expertLoadFactor, and waits for it.
+    void runUpdate(int64_t iterId, std::vector<float> const& expertLoadFactor)
+    {
+        std::copy(expertLoadFactor.begin(), expertLoadFactor.end(), mLayer->getStatisticInfo()->expertLoadFactor);
+        mLoadBalancer.startIter(iterId, /*enableStatistic=*/true, /*enableUpdateWeights=*/true);
+        int statisticEnabled = 0;
+        moeWaitSignalForGpuStageForTest(mLayer->getSignal(), &statisticEnabled);
+        moeSetSignalForCpuStageForTest(mLayer->getSignal());
+        mLoadBalancer.endIter(iterId);
+        ASSERT_TRUE(mLoadBalancer.quiesce(/*timeoutMs=*/10000));
     }
 
     // The slot's value at element elem (default: the first).
@@ -981,6 +1117,53 @@ TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindAGhostSlot)
     EXPECT_EQ(setup.slotValue(1), 3.0f);
     EXPECT_EQ(setup.slotValue(1, elems - 1), 3.0f);
     EXPECT_EQ(setup.slotValue(0, elems - 1), 1.0f);
+}
+
+TEST(MoeLoadBalancerRestoreTest, UpdatesFillAGhostSlotOnlyOnceARestoreLoadedIt)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    // Slot 1 of every rank is a ghost slot: -1 from the start, outside EPLB's updates.
+    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, /*weightElems=*/256,
+        /*ghostSlot1=*/false, {0, -1, 1, -1, 2, -1, 3, -1});
+    auto* info = setup.mLayer->getPlacementCpuInfo();
+    std::vector<float> const load{1.0F, 2.0F, 3.0F, 4.0F};
+
+    // Four usable slots for four experts: the update moves experts between slots 0 and never writes a slot 1.
+    setup.runUpdate(0, load);
+    for (int rank = 0; rank < RestorePlacementLayer::kEpSize; ++rank)
+    {
+        EXPECT_GE(info->oldRankExpertIds[rank][0], 0) << "rank " << rank;
+        EXPECT_EQ(info->oldRankExpertIds[rank][1], -1) << "rank " << rank;
+    }
+    EXPECT_EQ(setup.slotValue(0), static_cast<float>(info->oldRankExpertIds[0][0] + 1));
+    EXPECT_EQ(setup.slotValue(1), 0.0F);
+
+    // Losing rank 2: its expert goes into rank 0's ghost slot, which then joins EPLB's updates.
+    auto placement = info->oldRankExpertIds;
+    int const lostExpert = placement[RestorePlacementLayer::kDeadRank][0];
+    placement[RestorePlacementLayer::kDeadRank] = {-1, -1};
+    placement[0][1] = lostExpert;
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    EXPECT_EQ(setup.slotValue(1), static_cast<float>(lostExpert + 1));
+    setup.mLoadBalancer.resetUpdateSchedule();
+
+    // Rank 0's two slots and slot 0 of ranks 1 and 3 hold the four experts; the other ghost slots stay empty.
+    setup.runUpdate(1, load);
+    EXPECT_GE(info->oldRankExpertIds[0][0], 0);
+    EXPECT_GE(info->oldRankExpertIds[0][1], 0);
+    EXPECT_EQ(info->oldRankExpertIds[RestorePlacementLayer::kDeadRank], (std::vector<int>{-1, -1}));
+    for (int rank : {1, 3})
+    {
+        EXPECT_GE(info->oldRankExpertIds[rank][0], 0) << "rank " << rank;
+        EXPECT_EQ(info->oldRankExpertIds[rank][1], -1) << "rank " << rank;
+    }
+    for (int expertId = 0; expertId < RestorePlacementLayer::kExpertCount; ++expertId)
+    {
+        EXPECT_EQ(info->placementInfoForGPU.expertReplicaCount[expertId], 1);
+    }
+    EXPECT_EQ(setup.slotValue(0), static_cast<float>(info->oldRankExpertIds[0][0] + 1));
+    EXPECT_EQ(setup.slotValue(1), static_cast<float>(info->oldRankExpertIds[0][1] + 1));
 }
 
 // Iteration control parameter structure
