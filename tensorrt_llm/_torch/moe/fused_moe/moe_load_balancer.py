@@ -389,8 +389,8 @@ class SingleLayerMoeLoadBalancer:
             shared_mpi_comm) if self.host_copies else None
         self.register_weight_fns = []
         self.to_migrate_weight_fns = []
-        # Local slots whose storage maps no memory until a restore (borrowed extra slots), or None.
-        self.borrowed_slots: Optional[List[int]] = None
+        # Local slots whose storage maps no memory until a restore (ghost extra slots), or None.
+        self.ghost_slots: Optional[List[int]] = None
         self.initial_weight_assignments: Optional[List[int]] = None
 
         shared_rank = shared_mpi_comm.Get_rank()
@@ -551,11 +551,11 @@ class SingleLayerMoeLoadBalancer:
         self.register_weight_fns.append((fn, args, kwargs))
 
     def make_tensor_host_accessible(self, wt: torch.Tensor):
-        if self.borrowed_slots is None:
+        if self.ghost_slots is None:
             torch.ops.trtllm.migrate_to_host_accessible(wt)
         else:
             # Restores load these slots with GPU copies, so they need not be host accessible.
-            torch.ops.trtllm.moe_borrow_slot_storage(wt, self.borrowed_slots)
+            torch.ops.trtllm.moe_ghost_slot_storage(wt, self.ghost_slots)
         torch.cuda.empty_cache()
 
     def register_weight_slots_after_to_cuda(self):
@@ -988,15 +988,15 @@ class MoeLoadBalancer:
         """
         Register weights after model has been moved to cuda, should be invoked after model.to("cuda") and before finalize_model.
         """
-        if self.extra_slots_mode() == "borrowed":
-            # Borrowed slots are not host accessible: restores copy on the GPU.
+        if self.extra_slots_mode() == "ghost":
+            # Ghost slots are not host accessible: restores copy on the GPU.
             self.set_use_gpu_memcpy(True)
             for layer in self.single_layer_load_balancers:
                 placement = np.asarray(layer.initial_weight_assignments,
                                        dtype=np.int32).reshape(
                                            self.ep_size, -1)
                 own = _without_replicas(placement)[self.ep_rank]
-                layer.borrowed_slots = np.flatnonzero(own < 0).tolist()
+                layer.ghost_slots = np.flatnonzero(own < 0).tolist()
         for layer in self.single_layer_load_balancers:
             layer.register_weight_slots_after_to_cuda()
 
@@ -1006,7 +1006,7 @@ class MoeLoadBalancer:
         ``replicas`` under online EPLB (a loss reroutes to them or restores
         into them). With a static placement, the fault-tolerance config's
         ``empty`` (not routed to while healthy; a restore fills them) or
-        ``borrowed`` (also without device memory until a restore maps it).
+        ``ghost`` (also without device memory until a restore maps it).
 
         Raises:
             ValueError: The config sets ``extra_slots`` for online EPLB, which fills the extra slots itself.
@@ -1034,7 +1034,7 @@ class MoeLoadBalancer:
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
-        if self.extra_slots_mode() in ("empty", "borrowed"):
+        if self.extra_slots_mode() in ("empty", "ghost"):
             # Before warmup, so autotuning and CUDA graph capture see the
             # healthy routing.
             emptied = self.empty_replica_slots()
@@ -1158,12 +1158,12 @@ class MoeLoadBalancer:
         return digest.hexdigest()
 
     def restore_backing_bytes(self, placements: List[np.ndarray]) -> int:
-        """Device memory that installing ``placements`` maps behind borrowed slots (0 without them)."""
+        """Device memory that installing ``placements`` maps behind ghost slots (0 without them)."""
         return self.load_balancer_impl.restore_backing_bytes(
             [placement.tolist() for placement in placements])
 
     def back_restored_slots(self, placements: List[np.ndarray]) -> None:
-        """Map device memory behind the borrowed slots that installing ``placements`` loads.
+        """Map device memory behind the ghost slots that installing ``placements`` loads.
 
         All or nothing: raises if the memory cannot be allocated. Only while no
         iteration runs.
@@ -1205,7 +1205,7 @@ class MoeLoadBalancer:
 
         Routing then uses one slot per expert, as a placement without spare
         slots does; the slot buffers keep their addresses (CUDA graphs
-        captured them; borrowed slots map no memory). Which replica stays:
+        captured them; ghost slots map no memory). Which replica stays:
         ``_without_replicas``. Needs host copies, to fill the slots later.
         Returns the number of slots emptied.
         """

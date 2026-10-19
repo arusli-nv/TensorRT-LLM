@@ -505,8 +505,8 @@ namespace
 {
 
 // One layer on EP rank 0 of 4 with 2 slots per rank; experts 2 and 3 live only on rank 2. Every expert's host
-// weight is filled with expertId + 1 and every local slot starts with its expert's values. With borrowSlot1, the
-// slots are one borrowed range (BorrowedSlotMemory) whose slot 1 maps no memory.
+// weight is filled with expertId + 1 and every local slot starts with its expert's values. With ghostSlot1, the
+// slots are one ghost range (GhostSlotMemory) whose slot 1 maps no memory.
 class RestorePlacementLayer
 {
 public:
@@ -516,7 +516,7 @@ public:
     static constexpr int kDeadRank = 2;
 
     explicit RestorePlacementLayer(
-        bool withHostWeights, int layerUpdatesPerIter = 1, size_t weightElems = 256, bool borrowSlot1 = false)
+        bool withHostWeights, int layerUpdatesPerIter = 1, size_t weightElems = 256, bool ghostSlot1 = false)
         : mLoadBalancer(/*epRank=*/0, kEpSize, layerUpdatesPerIter)
         , mWeightElems(weightElems)
     {
@@ -532,14 +532,14 @@ public:
             mHostWeights.push_back(host);
             mLayer->addSingleHostWeight(expertId, "w", weight(host));
         }
-        if (borrowSlot1)
+        if (ghostSlot1)
         {
-            mBorrowed = static_cast<float*>(BorrowedSlotMemory::getInstance().allocate(bytes, kSlotCountPerRank, {1}));
+            mGhost = static_cast<float*>(GhostSlotMemory::getInstance().allocate(bytes, kSlotCountPerRank, {1}));
         }
         for (int slotId = 0; withHostWeights && slotId < kSlotCountPerRank; ++slotId)
         {
-            float* slot = mBorrowed ? mBorrowed + slotId * mWeightElems : nullptr;
-            if (!mBorrowed)
+            float* slot = mGhost ? mGhost + slotId * mWeightElems : nullptr;
+            if (!mGhost)
             {
                 TLLM_CUDA_CHECK(cudaMalloc(&slot, bytes));
             }
@@ -558,9 +558,9 @@ public:
         {
             cudaFreeHost(host);
         }
-        if (mBorrowed)
+        if (mGhost)
         {
-            BorrowedSlotMemory::getInstance().free(mBorrowed);
+            GhostSlotMemory::getInstance().free(mGhost);
             return;
         }
         for (auto* slot : mSlots)
@@ -594,7 +594,7 @@ private:
     size_t mWeightElems;
     std::vector<float*> mHostWeights;
     std::vector<float*> mSlots;
-    float* mBorrowed = nullptr;
+    float* mGhost = nullptr;
 };
 
 size_t vmmGranularity()
@@ -705,22 +705,22 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsHostWeights)
         tensorrt_llm::common::TllmException);
 }
 
-TEST(BorrowedSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
+TEST(GhostSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
     // Slots of 3.5 chunks: slot 1 owns chunks 4-6 whole (chunk 3 is shared with slot 0), slot 3 chunks 11-13.
     size_t const slotBytes = 3 * gran + gran / 2;
-    auto& memory = BorrowedSlotMemory::getInstance();
+    auto& memory = GhostSlotMemory::getInstance();
     auto* base = static_cast<uint8_t*>(memory.allocate(slotBytes, 4, {1, 3}));
-    auto slot = [&](int i) { return BorrowedSlotMemory::Range{base + i * slotBytes, slotBytes}; };
+    auto slot = [&](int i) { return GhostSlotMemory::Range{base + i * slotBytes, slotBytes}; };
     // Two load balancers: each keeps or releases only the backing it asked for.
     int const owner = 0;
     int const other = 0;
     EXPECT_EQ(memory.unbackedBytes({slot(0)}), 0u);
     EXPECT_EQ(memory.unbackedBytes({slot(1)}), 3 * gran);
     EXPECT_EQ(memory.unbackedBytes({slot(1), slot(3), slot(1)}), 6 * gran);
-    EXPECT_EQ(memory.unbackedBytes({{&slotBytes, 1}}), 0u); // not borrowed memory
+    EXPECT_EQ(memory.unbackedBytes({{&slotBytes, 1}}), 0u); // not ghost memory
 
     // Backed slots keep their bytes; the empty slots' whole chunks share scratch: chunks 4-6 and 11-13 each map a
     // 2-chunk and a 1-chunk scratch allocation, so chunks 4 and 11 are the same memory.
@@ -775,15 +775,15 @@ TEST(BorrowedSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
     memory.free(base);
 }
 
-TEST(BorrowedSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
+TEST(GhostSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
 {
-    // The design's core claim: a CUDA graph captured over a borrowed slot keeps working while the memory behind
+    // The design's core claim: a CUDA graph captured over a ghost slot keeps working while the memory behind
     // it changes (scratch, then backed, then scratch again), without recapture.
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = BorrowedSlotMemory::getInstance();
+    auto& memory = GhostSlotMemory::getInstance();
     auto* base = static_cast<uint8_t*>(memory.allocate(2 * gran, 2, {1}));
-    BorrowedSlotMemory::Range const slot1{base + 2 * gran, 2 * gran};
+    GhostSlotMemory::Range const slot1{base + 2 * gran, 2 * gran};
     uint8_t* out = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&out, 2 * gran));
     cudaStream_t stream = nullptr;
@@ -822,23 +822,23 @@ TEST(BorrowedSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
     memory.free(base);
 }
 
-TEST(BorrowedSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
+TEST(GhostSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = BorrowedSlotMemory::getInstance();
-    auto release = [](uint8_t* ptr) { BorrowedSlotMemory::getInstance().free(ptr); };
-    using Borrowed = std::unique_ptr<uint8_t, decltype(release)>;
+    auto& memory = GhostSlotMemory::getInstance();
+    auto release = [](uint8_t* ptr) { GhostSlotMemory::getInstance().free(ptr); };
+    using Ghost = std::unique_ptr<uint8_t, decltype(release)>;
     // Empty slots map only the shared scratch, so neither range below uses device memory however large it is. The
     // second is larger than the whole device: no backing for it can be allocated, whatever else uses the GPU, so
     // backing both fails (after the first one's memory was allocated if the first range is processed first).
     size_t freeBytes = 0, totalBytes = 0;
     TLLM_CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
     size_t const hugeBytes = (totalBytes / gran + 1) * gran;
-    Borrowed small(static_cast<uint8_t*>(memory.allocate(gran, 2, {1})), release);
-    Borrowed huge(static_cast<uint8_t*>(memory.allocate(hugeBytes, 1, {0})), release);
-    BorrowedSlotMemory::Range const smallSlot{small.get() + gran, gran};
-    BorrowedSlotMemory::Range const hugeSlot{huge.get(), hugeBytes};
+    Ghost small(static_cast<uint8_t*>(memory.allocate(gran, 2, {1})), release);
+    Ghost huge(static_cast<uint8_t*>(memory.allocate(hugeBytes, 1, {0})), release);
+    GhostSlotMemory::Range const smallSlot{small.get() + gran, gran};
+    GhostSlotMemory::Range const hugeSlot{huge.get(), hugeBytes};
     auto const gpuBytes = MemoryCounters::getInstance().getGpu();
     int const owner = 0;
     EXPECT_THROW(memory.back({smallSlot, hugeSlot}, &owner), tensorrt_llm::common::TllmException);
@@ -852,11 +852,11 @@ TEST(BorrowedSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-TEST(BorrowedSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
+TEST(GhostSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = BorrowedSlotMemory::getInstance();
+    auto& memory = GhostSlotMemory::getInstance();
     auto freeDeviceBytes = []
     {
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
@@ -895,16 +895,16 @@ TEST(BorrowedSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
     EXPECT_LT(leaked(), 4 * gran);
 }
 
-TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindABorrowedSlot)
+TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindAGhostSlot)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
     size_t const elems = 2 * gran / sizeof(float);
-    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*borrowSlot1=*/true);
+    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*ghostSlot1=*/true);
     setup.mLoadBalancer.restorePlacement({}, {{{0, -1}, {0, 1}, {2, 3}, {0, 1}}});
 
-    // Losing rank 2: expert 2 goes into the borrowed slot, which first gets its two chunks.
+    // Losing rank 2: expert 2 goes into the ghost slot, which first gets its two chunks.
     std::vector<std::vector<int>> const placement{{0, 2}, {3, 1}, {-1, -1}, {0, 1}};
     EXPECT_EQ(setup.mLoadBalancer.restoreBackingBytes({placement}), static_cast<int64_t>(2 * gran));
     setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});

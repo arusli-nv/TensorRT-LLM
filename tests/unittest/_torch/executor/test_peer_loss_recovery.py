@@ -191,8 +191,8 @@ def test_recovery_runs_protocol_and_installs_in_order():
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
-def test_borrowed_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypatch):
-    """Borrowed slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
+def test_ghost_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypatch):
+    """Ghost slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
     recovery = _recovery(_FakeClient([]))
     executor = recovery._executor
     executor.resize_kv_cache_quota = Mock(return_value=True)
@@ -209,7 +209,7 @@ def test_borrowed_slots_take_kv_cache_memory_only_when_the_device_is_short(monke
     free = 512 << 20
     monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: free)
     recovery._back_restored_slots(load_balancer, ["placement"])
-    lent = need + peer_loss_recovery._BORROW_MARGIN_BYTES - free
+    lent = need + peer_loss_recovery._GHOST_MARGIN_BYTES - free
     executor.resize_kv_cache_quota.assert_called_once_with(-lent)
 
     # A plan abandoned for a further loss returns its slots' memory and the KV cache's share.

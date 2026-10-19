@@ -140,12 +140,12 @@ def test_recovery_placements_reject_a_base_with_another_layer_count():
         load_balancer.recovery_placements([FAILED_RANK], base=[])
 
 
-@pytest.mark.parametrize("ep_rank, borrowed", [(0, [1]), (2, [1])])
-def test_borrowed_mode_borrows_the_slots_that_empty_mode_empties(monkeypatch, ep_rank, borrowed):
+@pytest.mark.parametrize("ep_rank, ghost", [(0, [1]), (2, [1])])
+def test_ghost_mode_unbacks_the_slots_that_empty_mode_empties(monkeypatch, ep_rank, ghost):
     """Before the weights move to their final storage, each layer learns its slots that will be empty."""
     monkeypatch.setattr(
         "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.fault_tolerance_config",
-        lambda: FaultToleranceConfig(extra_slots="borrowed"),
+        lambda: FaultToleranceConfig(extra_slots="ghost"),
     )
     load_balancer = _load_balancer(_REDUNDANT, host_weights=True)
     load_balancer.ep_rank = ep_rank
@@ -156,12 +156,12 @@ def test_borrowed_mode_borrows_the_slots_that_empty_mode_empties(monkeypatch, ep
         return_value=True,
     ):
         load_balancer.register_weight_slots_after_to_cuda()
-    assert layer.borrowed_slots == borrowed
-    # Borrowed slots are not host accessible: restores copy on the GPU.
+    assert layer.ghost_slots == ghost
+    # Ghost slots are not host accessible: restores copy on the GPU.
     load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_called_once_with(True)
 
 
-@pytest.mark.parametrize("layer_updates_per_iter, mode", [(0, "borrowed"), (1, "replicas")])
+@pytest.mark.parametrize("layer_updates_per_iter, mode", [(0, "ghost"), (1, "replicas")])
 def test_online_eplb_keeps_replicas_in_the_extra_slots(layer_updates_per_iter, mode):
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, layer_updates_per_iter)
@@ -173,7 +173,7 @@ def test_online_eplb_keeps_replicas_in_the_extra_slots(layer_updates_per_iter, m
     assert load_balancer.extra_slots_mode() is None
 
 
-@pytest.mark.parametrize("extra_slots", ["empty", "borrowed"])
+@pytest.mark.parametrize("extra_slots", ["empty", "ghost"])
 def test_online_eplb_rejects_an_explicit_extra_slots_mode(extra_slots):
     from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 

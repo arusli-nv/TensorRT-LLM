@@ -202,8 +202,8 @@ void migrateToHostAccessible(at::Tensor& tensor)
 }
 
 // Moves an EPLB slot tensor ([local slots, ...], contiguous) to storage whose empty slots take no device memory
-// until a restore loads them (BorrowedSlotMemory). Their contents are not kept.
-void moeBorrowSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
+// until a restore loads them (GhostSlotMemory). Their contents are not kept.
+void moeGhostSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
 {
     // A repacked layout (e.g. DEEPGEMM's MN-major scales) is accepted if each slot fills one dense block.
     TORCH_CHECK(tensor.device().is_cuda() && tensor.is_non_overlapping_and_dense() && tensor.dim() >= 1
@@ -211,11 +211,11 @@ void moeBorrowSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
         "expects a CUDA tensor of slots, each one dense block");
     size_t const byteSize = tensor.numel() * tensor.element_size();
     int const slotCount = static_cast<int>(tensor.size(0));
-    void* devPtr = tensorrt_llm::runtime::BorrowedSlotMemory::getInstance().allocate(
+    void* devPtr = tensorrt_llm::runtime::GhostSlotMemory::getInstance().allocate(
         byteSize / slotCount, slotCount, std::vector<int>(emptySlots.begin(), emptySlots.end()));
     // Owned before the copy, so that a failed copy frees it.
     c10::DataPtr dp(
-        devPtr, devPtr, [](void* ptr) { tensorrt_llm::runtime::BorrowedSlotMemory::getInstance().free(ptr); },
+        devPtr, devPtr, [](void* ptr) { tensorrt_llm::runtime::GhostSlotMemory::getInstance().free(ptr); },
         tensor.device());
     // On the stream that produced the weights; finished before the old storage can be reused.
     auto const stream = at::cuda::getCurrentCUDAStream();
@@ -302,11 +302,11 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("migrate_to_host_accessible(Tensor tensor) -> ()");
-    m.def("moe_borrow_slot_storage(Tensor tensor, int[] empty_slots) -> ()");
+    m.def("moe_ghost_slot_storage(Tensor tensor, int[] empty_slots) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("migrate_to_host_accessible", &tensorrt_llm::torch_ext::migrateToHostAccessible);
-    m.impl("moe_borrow_slot_storage", &tensorrt_llm::torch_ext::moeBorrowSlotStorage);
+    m.impl("moe_ghost_slot_storage", &tensorrt_llm::torch_ext::moeGhostSlotStorage);
 }

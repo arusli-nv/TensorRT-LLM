@@ -625,8 +625,8 @@ def test_slot_rows_copies_a_repacked_slot_as_its_dense_block():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_borrowed_slot_storage_copies_after_the_producer_on_its_stream():
-    """The weights may still be written by a kernel on a non-default stream when their storage is borrowed."""
+def test_ghost_slot_storage_copies_after_the_producer_on_its_stream():
+    """The weights may still be written by a kernel on a non-default stream when their slots become ghost slots."""
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
 
     stream = torch.cuda.Stream()
@@ -634,9 +634,9 @@ def test_borrowed_slot_storage_copies_after_the_producer_on_its_stream():
         weights = torch.zeros(4, 1 << 20, device="cuda")
         torch.cuda._sleep(
             50_000_000
-        )  # the producer is still busy when the storage is borrowed
+        )  # the producer is still busy when the slots become ghost slots
         weights.fill_(3.0)
-        torch.ops.trtllm.moe_borrow_slot_storage(weights, [1])
+        torch.ops.trtllm.moe_ghost_slot_storage(weights, [1])
     torch.cuda.synchronize()
     assert weights[0].eq(3.0).all() and weights[2:].eq(3.0).all()
 

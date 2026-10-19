@@ -132,10 +132,10 @@ void initMoeBindings(nb::module_& m)
             "Restart the layer update rotation and clear the load factors (only while quiesced)",
             nb::call_guard<nb::gil_scoped_release>())
         .def("restore_backing_bytes", &tr::MoeLoadBalancer::restoreBackingBytes, nb::arg("layer_rank_expert_ids"),
-            "Device memory a restore of this placement maps behind borrowed slots",
+            "Device memory a restore of this placement maps behind ghost slots",
             nb::call_guard<nb::gil_scoped_release>())
         .def("back_restored_slots", &tr::MoeLoadBalancer::backRestoredSlots, nb::arg("layer_rank_expert_ids"),
-            "Map device memory behind the borrowed slots a restore of this placement loads",
+            "Map device memory behind the ghost slots a restore of this placement loads",
             nb::call_guard<nb::gil_scoped_release>())
         .def("release_uninstalled_backing", &tr::MoeLoadBalancer::releaseUninstalledBacking,
             "Return the memory mapped for a placement that was never installed; the bytes freed",

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "borrowedSlotMemory.h"
+#include "ghostSlotMemory.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
@@ -91,7 +91,7 @@ public:
 
     CUmemGenericAllocationHandle create() override
     {
-        TLLM_CHECK_WITH_INFO(mHandle != 0, "Borrowed slot memory is mapped once");
+        TLLM_CHECK_WITH_INFO(mHandle != 0, "Ghost slot memory is mapped once");
         return mHandle;
     }
 
@@ -127,7 +127,7 @@ std::vector<std::pair<size_t, size_t>> runsOf(std::vector<size_t> const& chunks)
 } // namespace
 
 // A scratch allocation, shared by every mapping of it and released with the last one.
-struct BorrowedSlotMemory::Scratch
+struct GhostSlotMemory::Scratch
 {
     // A mapping's creator: hands out the shared handle and keeps the allocation alive.
     struct Creator : CUDAVirtualMemoryChunk::Creator
@@ -163,14 +163,14 @@ struct BorrowedSlotMemory::Scratch
     CUmemGenericAllocationHandle handle = 0;
 };
 
-BorrowedSlotMemory& BorrowedSlotMemory::getInstance()
+GhostSlotMemory& GhostSlotMemory::getInstance()
 {
     // Never destroyed: CUDA may be torn down before static destructors run.
-    static auto* instance = new BorrowedSlotMemory;
+    static auto* instance = new GhostSlotMemory;
     return *instance;
 }
 
-CUmemAllocationProp BorrowedSlotMemory::allocationProp() const
+CUmemAllocationProp GhostSlotMemory::allocationProp() const
 {
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -179,7 +179,7 @@ CUmemAllocationProp BorrowedSlotMemory::allocationProp() const
     return prop;
 }
 
-BorrowedSlotMemory::Piece BorrowedSlotMemory::mapPiece(CUdeviceptr address, size_t count,
+GhostSlotMemory::Piece GhostSlotMemory::mapPiece(CUdeviceptr address, size_t count,
     CUDAVirtualMemoryChunk::CreatorPtr creator, bool scratch, Owner pendingOwner) const
 {
     CUmemAccessDesc access{};
@@ -201,14 +201,14 @@ BorrowedSlotMemory::Piece BorrowedSlotMemory::mapPiece(CUdeviceptr address, size
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Releasing a borrowed slot mapping after a failed map failed: %s", error.what());
+            TLLM_LOG_ERROR("Releasing a ghost slot mapping after a failed map failed: %s", error.what());
         }
         throw;
     }
     return piece;
 }
 
-void BorrowedSlotMemory::mapScratch(CUdeviceptr base, Allocation& allocation, size_t first, size_t count) const
+void GhostSlotMemory::mapScratch(CUdeviceptr base, Allocation& allocation, size_t first, size_t count) const
 {
     while (count > 0)
     {
@@ -225,8 +225,7 @@ void BorrowedSlotMemory::mapScratch(CUdeviceptr base, Allocation& allocation, si
     }
 }
 
-void BorrowedSlotMemory::toScratch(
-    CUdeviceptr base, Allocation& allocation, std::map<size_t, Piece>::iterator piece) const
+void GhostSlotMemory::toScratch(CUdeviceptr base, Allocation& allocation, std::map<size_t, Piece>::iterator piece) const
 {
     size_t const first = piece->first;
     size_t const count = piece->second.count;
@@ -235,7 +234,7 @@ void BorrowedSlotMemory::toScratch(
     mapScratch(base, allocation, first, count);
 }
 
-void BorrowedSlotMemory::coverHoles(CUdeviceptr base, Allocation& allocation) const noexcept
+void GhostSlotMemory::coverHoles(CUdeviceptr base, Allocation& allocation) const noexcept
 {
     size_t const chunks = allocation.size / mGranularity;
     size_t chunk = 0;
@@ -256,18 +255,18 @@ void BorrowedSlotMemory::coverHoles(CUdeviceptr base, Allocation& allocation) co
     }
     catch (std::exception const& error)
     {
-        TLLM_LOG_ERROR("Borrowed slot memory at %p left chunks from %zu unmapped: %s", reinterpret_cast<void*>(base),
+        TLLM_LOG_ERROR("Ghost slot memory at %p left chunks from %zu unmapped: %s", reinterpret_cast<void*>(base),
             chunk, error.what());
     }
 }
 
-void* BorrowedSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<int> const& emptySlots)
+void* GhostSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<int> const& emptySlots)
 {
     TLLM_CHECK_WITH_INFO(slotBytes > 0 && slotCount > 0, "No slots to allocate");
     std::lock_guard<std::mutex> lock(mMutex);
     int device = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
-    TLLM_CHECK_WITH_INFO(mDevice < 0 || mDevice == device, "Borrowed slot memory serves one device per process");
+    TLLM_CHECK_WITH_INFO(mDevice < 0 || mDevice == device, "Ghost slot memory serves one device per process");
     if (mDevice < 0)
     {
         CUmemAllocationProp prop{};
@@ -351,7 +350,7 @@ void* BorrowedSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<
             }
             catch (std::exception const& error)
             {
-                TLLM_LOG_ERROR("Unmapping borrowed slot memory after a failed allocation failed: %s", error.what());
+                TLLM_LOG_ERROR("Unmapping ghost slot memory after a failed allocation failed: %s", error.what());
             }
         }
         if (mAllocations.empty())
@@ -364,13 +363,13 @@ void* BorrowedSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<
     return reinterpret_cast<void*>(base);
 }
 
-void BorrowedSlotMemory::free(void* ptr) noexcept
+void GhostSlotMemory::free(void* ptr) noexcept
 {
     std::lock_guard<std::mutex> lock(mMutex);
     auto it = mAllocations.find(reinterpret_cast<CUdeviceptr>(ptr));
     if (it == mAllocations.end())
     {
-        TLLM_LOG_ERROR("%p is not borrowed slot memory", ptr);
+        TLLM_LOG_ERROR("%p is not ghost slot memory", ptr);
         return;
     }
     for (auto& [first, piece] : it->second.pieces)
@@ -381,7 +380,7 @@ void BorrowedSlotMemory::free(void* ptr) noexcept
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Unmapping borrowed slot memory at %p failed: %s", ptr, error.what());
+            TLLM_LOG_ERROR("Unmapping ghost slot memory at %p failed: %s", ptr, error.what());
         }
     }
     mAllocations.erase(it);
@@ -392,7 +391,7 @@ void BorrowedSlotMemory::free(void* ptr) noexcept
     }
 }
 
-std::map<CUdeviceptr, std::vector<size_t>> BorrowedSlotMemory::unbackedChunks(std::vector<Range> const& ranges) const
+std::map<CUdeviceptr, std::vector<size_t>> GhostSlotMemory::unbackedChunks(std::vector<Range> const& ranges) const
 {
     std::map<CUdeviceptr, std::vector<size_t>> chunks;
     for (auto const& [ptr, size] : ranges)
@@ -433,7 +432,7 @@ std::map<CUdeviceptr, std::vector<size_t>> BorrowedSlotMemory::unbackedChunks(st
     return chunks;
 }
 
-size_t BorrowedSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
+size_t GhostSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     size_t count = 0;
@@ -444,7 +443,7 @@ size_t BorrowedSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
     return count * mGranularity;
 }
 
-void BorrowedSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
+void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
 {
     TLLM_CHECK_WITH_INFO(owner != nullptr, "Pending slot backing needs an owner");
     std::lock_guard<std::mutex> lock(mMutex);
@@ -499,7 +498,7 @@ void BorrowedSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
     }
 }
 
-size_t BorrowedSlotMemory::releasePending(Owner owner)
+size_t GhostSlotMemory::releasePending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     size_t chunks = 0;
@@ -529,7 +528,7 @@ size_t BorrowedSlotMemory::releasePending(Owner owner)
     return chunks * mGranularity;
 }
 
-void BorrowedSlotMemory::keepPending(Owner owner)
+void GhostSlotMemory::keepPending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     for (auto& [base, allocation] : mAllocations)

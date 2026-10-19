@@ -29,16 +29,16 @@ def load(monkeypatch, tmp_path):
 def test_defaults_without_a_file(load):
     assert load() == FaultToleranceConfig()
     assert (
-        load().extra_slots == "borrowed"
+        load().extra_slots == "ghost"
         and load().failure_domain == "node"
         and not load().hang_detection
     )
 
 
 def test_file_fields_override_the_defaults(load):
-    config = load("extra_slots: borrowed\nhang_detection: true\nhang_confirm_s: 10\n")
+    config = load("extra_slots: ghost\nhang_detection: true\nhang_confirm_s: 10\n")
     assert (config.extra_slots, config.hang_detection, config.hang_confirm_s) == (
-        "borrowed",
+        "ghost",
         True,
         10.0,
     )

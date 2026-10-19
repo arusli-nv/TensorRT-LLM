@@ -59,8 +59,8 @@ FailureDomain = Tuple[int, ...]
 StepChange = Tuple[LlmRequest, int, LlmRequestState, List[int]]
 _T = TypeVar("_T")
 _GATHER_HISTORY = 8
-# Free device memory left after borrowed slots are mapped: the KV cache rounds its quota to its chunk size per pool.
-_BORROW_MARGIN_BYTES = 256 << 20
+# Free device memory left after ghost slots are mapped: the KV cache rounds its quota to its chunk size per pool.
+_GHOST_MARGIN_BYTES = 256 << 20
 
 
 def _free_device_bytes() -> int:
@@ -221,7 +221,7 @@ class PeerLossRecovery(RecoveryHook):
         # while their slots cover its loss too.
         self.survives_own_loss = False
         self._timeout_s = fault_tolerance_config().recovery_timeout_s
-        # KV cache bytes given to the borrowed slots of the plan being prepared (returned if it is abandoned).
+        # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
         # ahead of the one whose results it applies.
@@ -858,7 +858,7 @@ class PeerLossRecovery(RecoveryHook):
         return lost
 
     def _release_uninstalled_backing(self) -> None:
-        """Undo the borrowed-slot memory and KV cache cut of an abandoned plan; the next plan maps its own.
+        """Undo the ghost-slot memory and KV cache cut of an abandoned plan; the next plan maps its own.
 
         Raises:
             RuntimeError: The KV cache could not take back what it gave, as when it could not give it.
@@ -866,7 +866,7 @@ class PeerLossRecovery(RecoveryHook):
         released = self._executor.model_engine.moe_load_balancer.release_uninstalled_backing()
         lent, self._kv_lent = self._kv_lent, 0
         if released or lent:
-            logger.info(f"Released {released} bytes of an abandoned plan's borrowed slots")
+            logger.info(f"Released {released} bytes of an abandoned plan's ghost slots")
         if lent and not self._executor.resize_kv_cache_quota(lent):
             raise RuntimeError(
                 f"The KV cache could not take back {lent} bytes after a plan was abandoned"
@@ -902,7 +902,7 @@ class PeerLossRecovery(RecoveryHook):
     def _restore_placements(
         self, load_balancer: "MoeLoadBalancer", failed: frozenset, base: Optional[List[np.ndarray]]
     ) -> List[np.ndarray]:
-        """The placements to serve without ``failed``, with memory mapped behind the borrowed slots they load.
+        """The placements to serve without ``failed``, with memory mapped behind the ghost slots they load.
 
         Before Ready, so a rank that cannot get the memory aborts the recovery before anything changes.
         """
@@ -913,16 +913,16 @@ class PeerLossRecovery(RecoveryHook):
     def _back_restored_slots(
         self, load_balancer: "MoeLoadBalancer", placements: List[np.ndarray]
     ) -> None:
-        """Map device memory behind the borrowed slots the restore loads, taken from the KV cache if need be."""
+        """Map device memory behind the ghost slots the restore loads, taken from the KV cache if need be."""
         need = load_balancer.restore_backing_bytes(placements)
         if not need:
             return
         start = time.monotonic()
-        short = need + _BORROW_MARGIN_BYTES - _free_device_bytes()
+        short = need + _GHOST_MARGIN_BYTES - _free_device_bytes()
         if short > 0:
             # Memory the caching allocator holds for no tensor goes first (empty_cache synchronizes and is slow).
             torch.cuda.empty_cache()
-            short = need + _BORROW_MARGIN_BYTES - _free_device_bytes()
+            short = need + _GHOST_MARGIN_BYTES - _free_device_bytes()
         if short > 0:
             if not self._executor.resize_kv_cache_quota(-short):
                 raise RuntimeError(
@@ -932,7 +932,7 @@ class PeerLossRecovery(RecoveryHook):
             logger.warning(f"Gave {short} bytes of the KV cache to the restored expert slots")
         load_balancer.back_restored_slots(placements)
         logger.info(
-            f"Mapped {need} bytes behind borrowed expert slots in "
+            f"Mapped {need} bytes behind ghost expert slots in "
             f"{(time.monotonic() - start) * 1e3:.1f} ms"
         )
 

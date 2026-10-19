@@ -30,7 +30,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer/borrowedSlotMemory.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -86,7 +86,7 @@ public:
     virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) = 0;
     virtual bool hasHostWeights() const = 0;
     // The device bytes of every weight of localSlotId.
-    void appendSlotRanges(int localSlotId, std::vector<BorrowedSlotMemory::Range>& ranges) const;
+    void appendSlotRanges(int localSlotId, std::vector<GhostSlotMemory::Range>& ranges) const;
 
 protected:
     void finalizeWeightSlot();
@@ -215,7 +215,7 @@ private:
     void installPlacement(std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds);
     // The device bytes of the local slots that installing rankExpertIds loads.
     void appendLoadedSlotRanges(
-        std::vector<std::vector<int>> const& rankExpertIds, std::vector<BorrowedSlotMemory::Range>& ranges) const;
+        std::vector<std::vector<int>> const& rankExpertIds, std::vector<GhostSlotMemory::Range>& ranges) const;
     // Rejects replica counts the captured routing kernel cannot serve (see routesEachExpertToOneSlot).
     void checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const;
 
@@ -332,8 +332,8 @@ public:
     bool quiesce(int64_t timeoutMs);
 
     // should bind to python
-    // Device memory that restorePlacement(layerRankExpertIds) must map behind the local slots it loads (borrowed
-    // slot storage, see BorrowedSlotMemory). Only while no iteration runs.
+    // Device memory that restorePlacement(layerRankExpertIds) must map behind the local slots it loads (ghost
+    // slot storage, see GhostSlotMemory). Only while no iteration runs.
     int64_t restoreBackingBytes(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
 
     // should bind to python
@@ -362,7 +362,7 @@ private:
     friend class SingleLayerMoeLoadBalancer;
     friend class HostMemoryMoeWeightUpdater;
 
-    std::vector<BorrowedSlotMemory::Range> loadedSlotRanges(
+    std::vector<GhostSlotMemory::Range> loadedSlotRanges(
         std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds) const;
 
     void startThreads();

@@ -59,7 +59,7 @@ every other request continues.
 | Setting | Meaning |
 |---|---|
 | `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
-| `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `borrowed` (default) are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
+| `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `ghost` (default) are empty slots that hold no device memory until a restore maps it (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume). Online EPLB keeps serving replicas in them; setting `extra_slots` with online EPLB is an error |
 | `recovery_timeout_s` | How long a worker's recovery may take before the job stops (default 30) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20; below `recovery_timeout_s`) |
 | `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a stall of every rank as terminal (default off) |
@@ -92,7 +92,7 @@ The loss, with the NVLink fabric healthy, of either:
 - with `failure_domain: node` (the default), every rank on one host other than rank 0's (the ranks that report the same
   host name). The survivors must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and
   `K` ranks per host, `s * (N - K)` must be at least the number of experts, which startup checks. For
-  DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, that is 320 slots.
+  DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, that is 320 slots (320 = 256 active + 64 ghost).
 
 Several such ranks lost together, or one more during a recovery (before the survivors install the new
 communicator), are recovered as one loss if the survivors' slots still hold every expert. A further loss after a
@@ -215,7 +215,7 @@ The whole feature is experimental. The loss of a single rank's process (with rep
 or without the overlap scheduler) and the authority's recovery protocol are tested most, including repeated
 kills under load at DEP32.
 These are tested only in single runs or at small scale so far, so treat them as less mature: the loss of a whole
-host, `borrowed` extra slots, hang detection and fencing, online EPLB, KV block reuse, MTP, and the `/health`
+host, `ghost` extra slots, hang detection and fencing, online EPLB, KV block reuse, MTP, and the `/health`
 states. A further loss after a recovery, and re-running a request once after the loss of a single rank, are
 tested only by unit tests so far.
 

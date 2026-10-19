@@ -283,13 +283,13 @@ def test_rank_lost_during_recovery(tmp_path: Path):
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
-def test_restore_into_borrowed_slots(tmp_path: Path):
+def test_restore_into_ghost_slots(tmp_path: Path):
     """The extra slots hold no memory until rank 2 dies in decode; the restore maps memory behind them."""
     result, output, authority_text = _run_driver(
-        tmp_path, "inflight", [VICTIM], ft_config=dict(extra_slots="borrowed")
+        tmp_path, "inflight", [VICTIM], ft_config=dict(extra_slots="ghost")
     )
     after_kill = _assert_recovered(result, output, authority_text, "inflight", [VICTIM])
-    assert "behind borrowed expert slots" in after_kill, output[-20000:]
+    assert "behind ghost expert slots" in after_kill, output[-20000:]
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)

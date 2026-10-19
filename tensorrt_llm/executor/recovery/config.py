@@ -42,9 +42,9 @@ class FaultToleranceConfig(StrictBaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    extra_slots: Literal["empty", "borrowed"] = Field(
-        default="borrowed",
-        description="EPLB slots beyond one per expert, with a static placement: ``borrowed`` (no device memory "
+    extra_slots: Literal["empty", "ghost"] = Field(
+        default="ghost",
+        description="EPLB slots beyond one per expert, with a static placement: ``ghost`` (no device memory "
         "until a restore maps it, so the KV cache keeps that memory while healthy) or ``empty`` (memory held, "
         "routing never uses them; a restore fills them). Online EPLB keeps replicas in them; setting this with "
         "online EPLB is an error.",

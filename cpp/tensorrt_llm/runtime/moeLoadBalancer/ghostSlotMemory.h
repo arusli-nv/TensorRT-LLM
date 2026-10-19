@@ -45,14 +45,14 @@ namespace tensorrt_llm::runtime
 //
 // The instance is shared by every MoeLoadBalancer of the process, so the backing that back() maps is pending for
 // the owner that asked for it: keepPending() and releasePending() act on that owner's backing only.
-class BorrowedSlotMemory
+class GhostSlotMemory
 {
 public:
     using Range = std::pair<void const*, size_t>;
     // Whose pending backing it is (the MoeLoadBalancer that restores the slots).
     using Owner = void const*;
 
-    static BorrowedSlotMemory& getInstance();
+    static GhostSlotMemory& getInstance();
 
     // A range for slotCount slots of slotBytes each on the current device; the slots in emptySlots are not backed.
     void* allocate(size_t slotBytes, int slotCount, std::vector<int> const& emptySlots);
@@ -91,7 +91,7 @@ private:
         std::map<size_t, Piece> pieces; // first chunk -> piece; the pieces tile the range
     };
 
-    BorrowedSlotMemory() = default;
+    GhostSlotMemory() = default;
 
     // The scratch chunks overlapping ranges, by allocation base, each list sorted and unique.
     std::map<CUdeviceptr, std::vector<size_t>> unbackedChunks(std::vector<Range> const& ranges) const;
