@@ -141,9 +141,14 @@ def test_authority_fences_a_hung_recoverable_rank_once():
     for now in range(1, 40):
         for rank in (0, 1, 3):
             # Heartbeats come from each worker's own connection, not its protocol route.
-            assert authority.handle(b"heartbeat", Heartbeat(rank, now, False), float(now)) == []
+            assert (
+                authority.handle(
+                    b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
+                )
+                == []
+            )
         if now == 1:
-            authority.handle(b"heartbeat", Heartbeat(2, 0, False), 1.0)
+            authority.handle(b"heartbeat", Heartbeat(2, 0, False, "node", 102), 1.0)
         assert authority.expire(float(now)) == []
     assert [rank for rank, _ in fenced] == [2]
 
@@ -151,10 +156,12 @@ def test_authority_fences_a_hung_recoverable_rank_once():
 def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery():
     fenced = []
     authority = _serving_authority(fenced)
-    authority.handle(b"heartbeat", Heartbeat(0, 0, False), 0.0)
+    authority.handle(b"heartbeat", Heartbeat(0, 0, False, "node", 100), 0.0)
     for now in range(1, 40):
         for rank in (1, 2, 3):
-            authority.handle(b"heartbeat", Heartbeat(rank, now, False), float(now))
+            authority.handle(
+                b"heartbeat", Heartbeat(rank, now, False, "node", 100 + rank), float(now)
+            )
         authority.expire(float(now))
     assert fenced == []  # rank 0's loss is never recovered: reported only
 
@@ -170,7 +177,7 @@ def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery
 
 def test_evidence_messages_round_trip():
     key, route = b"k" * 32, b"rank-3-heartbeat"
-    for message in (Heartbeat(3, 1234, True), DeviceWait(1, 2, 2500)):
+    for message in (Heartbeat(3, 1234, True, "node-3", 4321), DeviceWait(1, 2, 2500)):
         frames = protocol.encode(message, key, route)
         assert protocol.authenticate(frames, key, route)
         assert protocol.decode(frames[0]) == message

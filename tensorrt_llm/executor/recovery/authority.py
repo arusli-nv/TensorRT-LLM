@@ -52,6 +52,8 @@ Outbound = list[tuple[bytes, Message]]
 
 _CLOSE_LINGER_MS = 1000
 _REJECTION_LOG_INTERVAL_S = 10.0
+# Hang detection runs when the authority and the workers both have it enabled.
+HANG_DETECTION_ENV = "TLLM_FAULT_TOLERANCE_HANG_DETECTION"
 
 
 class Phase(enum.Enum):

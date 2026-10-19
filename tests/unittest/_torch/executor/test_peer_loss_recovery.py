@@ -468,6 +468,39 @@ def test_run_recovers_and_resumes():
     hang_detector.__exit__.assert_called_once()
 
 
+def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import hang_evidence
+    from tensorrt_llm.executor.recovery import client as client_module
+
+    started, stopped, closed = [], [], []
+    monkeypatch.setattr(hang_evidence, "ProgressRowReader", lambda *args: Mock(read=lambda: None))
+    monkeypatch.setattr(
+        hang_evidence.HangEvidenceReporter, "start", lambda self: started.append(self)
+    )
+    monkeypatch.setattr(
+        hang_evidence.HangEvidenceReporter, "stop", lambda self: stopped.append(self)
+    )
+    monkeypatch.setattr(
+        client_module.RecoveryClient,
+        "from_env",
+        classmethod(lambda cls, rank: Mock(close=lambda: closed.append(rank))),
+    )
+    recovery = _recovery(_FakeClient([]))
+    recovery._executor.model_engine.moe_execution_state.progress_comm.progress_row_offsets.return_value = (
+        0,
+        64,
+        128,
+    )
+
+    monkeypatch.delenv(hang_evidence.HANG_DETECTION_ENV, raising=False)
+    recovery.run(Mock(return_value=None))
+    assert started == []
+
+    monkeypatch.setenv(hang_evidence.HANG_DETECTION_ENV, "1")
+    recovery.run(Mock(return_value=None))
+    assert len(started) == 1 and stopped == started and closed == [1]
+
+
 def test_only_an_admitted_serving_rank_outside_recovery_exits_alone():
     unadmitted = _recovery(_FakeClient([]), rank=0)
     unadmitted.run(Mock(return_value=None))

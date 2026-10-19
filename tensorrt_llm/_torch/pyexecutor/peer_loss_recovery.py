@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
     from .executor_request_queue import RequestQueueItem
+    from .hang_evidence import HangEvidenceReporter
     from .py_executor import PyExecutor
     from .sampler import SampleState
 
@@ -359,6 +360,7 @@ class PeerLossRecovery(RecoveryHook):
             return
         self._watch_peer_failures()
         self.survives_own_loss = self._admitted
+        reporter = self._start_hang_evidence()
         try:
             while True:
                 try:
@@ -372,7 +374,38 @@ class PeerLossRecovery(RecoveryHook):
                         self.survives_own_loss = False
                         self._recover(error)
         finally:
+            if reporter is not None:
+                reporter.stop()
+                self._hang_client.close()
             self._watch.stop()
+
+    def _start_hang_evidence(self) -> Optional["HangEvidenceReporter"]:
+        """Start reporting heartbeats and long all-to-all waits to the authority, if enabled."""
+        from tensorrt_llm.executor.recovery.client import RecoveryClient
+
+        from .hang_evidence import HangEvidenceReporter, ProgressRowReader
+
+        if not HangEvidenceReporter.enabled():
+            return None
+        executor = self._executor
+        comm = executor.model_engine.moe_execution_state.progress_comm
+        reader = ProgressRowReader(comm.workspace, comm.ep_rank, *comm.progress_row_offsets())
+        # Its own connection: the recovery client is used only by the serving thread.
+        client = self._hang_client = RecoveryClient.from_env(executor.dist.rank)
+        queue = executor.executor_request_queue
+        suspect_s, heartbeat_s = HangEvidenceReporter.intervals_from_env()
+        reporter = HangEvidenceReporter(
+            rank=executor.dist.rank,
+            send=client.send,
+            read_row=reader.read,
+            active_ranks=lambda: executor.dist.live_ranks,
+            iteration=lambda: executor.iter_counter,
+            waiting=lambda: executor.dist.in_host_collective or queue.waiting_for_requests,
+            suspect_s=suspect_s,
+            heartbeat_s=heartbeat_s,
+        )
+        reporter.start()
+        return reporter
 
     def _watch_peer_failures(self) -> None:
         # The watch thread sets its failed flag, then the kernels' abort
