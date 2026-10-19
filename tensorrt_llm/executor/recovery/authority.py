@@ -27,7 +27,8 @@ from collections.abc import Callable
 import zmq
 
 from ...logger import logger
-from .client import load_key
+from ..ipc import ZeroMqQueue
+from .client import load_key, unauthenticated
 from .config import COMMAND_FENCE_GRACE_S, CONFIG_ENV, FaultToleranceConfig, fault_tolerance_config
 from .hang_monitor import HangMonitor, HungRank
 from .protocol import (
@@ -42,22 +43,20 @@ from .protocol import (
     Message,
     NativeHeartbeat,
     Propose,
-    ProtocolError,
     Ready,
     Register,
     Registered,
     Restart,
+    Sent,
     Status,
     StatusQuery,
     Stopped,
-    authenticate,
     datagram_address,
-    decode,
     decode_datagram,
-    encode,
+    is_message,
 )
 
-__all__ = ["Phase", "RecoveryAuthority", "datagram_socket", "main", "router_socket", "serve"]
+__all__ = ["Phase", "RecoveryAuthority", "datagram_socket", "main", "router_queue", "serve"]
 
 Outbound = list[tuple[bytes, Message]]
 
@@ -98,8 +97,11 @@ class RecoveryAuthority:
     send as ``(routing_id, message)`` pairs. A protocol violation during registration or
     a recovery, an unrecoverable loss, or a recovery that does not commit within
     ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts
-    ``Abort``; a violation while serving, or a message that does not decode, is refused
-    to its sender alone. Its attributes are read-only for callers.
+    ``Abort``; a violation while serving, or an object that is not a message, is refused
+    to its sender alone. A message that no registered member can have sent on its route
+    (an unregistered route, or another rank than the route's) is dropped, and so is a
+    worker's message that :meth:`receive` finds stale (a replay). Its attributes are
+    read-only for callers.
 
     Args:
         world_size: Number of worker ranks that must register. Every worker must
@@ -155,6 +157,12 @@ class RecoveryAuthority:
         self._stage_starts: list[float] = []
         self._recovery_stage_us: tuple[int, ...] = ()
         self._failed_requests = 0
+        self._last_drop_log = -_REJECTION_LOG_INTERVAL_S
+        # Rank -> its process's session, from its Register; kept after the rank departs.
+        self._sessions: dict[int, str] = {}
+        # (rank, evidence?) -> the sequence number of the last message accepted on that stream. The
+        # protocol and the evidence travel on separate connections, ordered only within each.
+        self._sequences: dict[tuple[int, bool], int] = {}
 
     @property
     def survivors(self) -> tuple[int, ...]:
@@ -173,6 +181,8 @@ class RecoveryAuthority:
                 return []
             self._observe(message, now)
             return []
+        if reason := self._foreign(route, message):
+            return self._drop(route, message, reason, now)
         if self.phase is Phase.ABORTED:
             return [(route, Abort(self.abort_reason))]
         try:
@@ -187,6 +197,50 @@ class RecoveryAuthority:
             # or the plan is not one every survivor agrees on. Aborting stops every survivor now, before any
             # installs a plan, rather than at the deadline.
             return self.abort(str(violation), route)
+
+    def receive(self, route: bytes, sent: Sent, now: float) -> Outbound:
+        """Apply a worker's message received from ``route`` if it is fresh; drop it otherwise.
+
+        Fresh: it names the rank of the envelope, comes from the session that rank registered,
+        and its sequence number is above the last accepted from that rank's protocol messages
+        or evidence (``Heartbeat``, ``DeviceWait``), whichever it is. A ``Register`` from
+        another session is applied (a second process claiming a rank aborts as a duplicate);
+        its session becomes the rank's once the registration is accepted.
+        """
+        message = sent.message
+        session = self._sessions.get(sent.rank)
+        stream = (sent.rank, isinstance(message, (Heartbeat, DeviceWait)))
+        registers = isinstance(message, Register) and sent.session != session
+        if getattr(message, "rank", sent.rank) != sent.rank:
+            return self._drop(route, message, f"sent as rank {sent.rank}", now)
+        if not registers and (
+            sent.session != session or sent.seq <= self._sequences.get(stream, 0)
+        ):
+            return self._drop(route, message, "a stale or foreign message (a replay?)", now)
+        outbound = self.handle(route, message, now)
+        if registers:
+            if self._workers.get(route) is not message:
+                return outbound
+            self._sessions[sent.rank] = sent.session
+        self._sequences[stream] = sent.seq
+        return outbound
+
+    def _drop(self, route: bytes, message: Message, reason: str, now: float) -> Outbound:
+        # Rate-limited: a peer that floods replays must not flood the log.
+        if now - self._last_drop_log >= _REJECTION_LOG_INTERVAL_S:
+            self._last_drop_log = now
+            logger.warning(f"Recovery authority: dropped {message} from {route!r}: {reason}")
+        return []
+
+    def _foreign(self, route: bytes, message: Message) -> str | None:
+        """Why no registered member can have sent ``message`` on ``route``, or None if one can."""
+        if isinstance(message, Register) and self.phase is Phase.REGISTERING:
+            return None
+        worker = self._workers.get(route)
+        if worker is None:
+            return "unregistered route"
+        rank = getattr(message, "rank", worker.rank)
+        return None if rank == worker.rank else f"the route of rank {worker.rank}"
 
     def status(self) -> Status:
         """The recovery state, for observers; reading it changes nothing."""
@@ -288,7 +342,7 @@ class RecoveryAuthority:
         return outbound + [(route, Restart(reason)) for route, _, _ in self._evidence.values()]
 
     def reject(self, reason: str, route: bytes) -> Outbound:
-        """Refuse a message that does not decode to its sender alone, in every phase.
+        """Refuse an object that is not a protocol message to its sender alone, in every phase.
 
         It names no rank and no protocol step, so it changes no state; a recovery it holds
         up ends at the deadline.
@@ -311,12 +365,10 @@ class RecoveryAuthority:
     def _dispatch(self, route: bytes, message: Message, now: float) -> Outbound:
         if isinstance(message, Register):
             return self._on_register(route, message)
-        worker = self._workers.get(route)
-        if worker is None:
-            raise _Violation(f"{message} from unregistered peer")
+        worker = self._workers[route]
         if self.phase is Phase.REGISTERING:
             raise _Violation(f"{message} before registration completed")
-        if not isinstance(message, (Stopped, Ready, Installed)) or message.rank != worker.rank:
+        if not isinstance(message, (Stopped, Ready, Installed)):
             raise _Violation(f"unexpected {message} from rank {worker.rank}")
         if message.rank in self._failed_during_recovery and isinstance(message, (Stopped, Ready)):
             # Sent before the rank failed; it was already queued behind the survivors' reports.
@@ -499,30 +551,30 @@ class RecoveryAuthority:
 
 def serve(
     authority: RecoveryAuthority,
-    socket: zmq.Socket,
+    router: ZeroMqQueue,
     key: bytes,
     stop: threading.Event,
     poll_interval: float = 0.1,
     datagrams: socket.socket | None = None,
 ) -> None:
-    """Drive ``authority`` from a bound ROUTER ``socket`` until ``stop`` is set.
+    """Drive ``authority`` from a ROUTER ``router`` until ``stop`` is set.
 
-    Frames that fail HMAC authentication are dropped and authenticated frames that do
-    not decode are refused to their sender (see :meth:`RecoveryAuthority.reject`); neither
-    changes the authority's state. Stopping during a recovery aborts it.
+    Messages that fail HMAC authentication are dropped and authenticated objects that are
+    not protocol messages are refused to their sender (see :meth:`RecoveryAuthority.reject`);
+    neither changes the authority's state. Stopping during a recovery aborts it.
 
     Args:
         authority: State machine to drive.
-        socket: ROUTER socket from :func:`router_socket`.
+        router: ROUTER queue from :func:`router_queue`.
         key: HMAC key shared with the workers.
         stop: Event that ends the loop.
-        poll_interval: Seconds between deadline checks while no frame arrives.
+        poll_interval: Seconds between deadline checks while no message arrives.
         datagrams: UDP socket from :func:`datagram_socket` receiving the workers' native
             heartbeats; datagrams that do not authenticate are dropped.
     """
     last_rejection = -_REJECTION_LOG_INTERVAL_S
     poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)
+    poller.register(router.socket, zmq.POLLIN)
     if datagrams is not None:
         poller.register(datagrams.fileno(), zmq.POLLIN)
     while not stop.is_set():
@@ -530,31 +582,36 @@ def serve(
         ready = dict(poller.poll(int(poll_interval * 1000)))
         if datagrams is not None and datagrams.fileno() in ready:
             outbound += _receive_datagrams(authority, datagrams, key, time.monotonic())
-        if socket in ready:
-            route, *frames = socket.recv_multipart()
+        if router.socket in ready:
             rejection = None
-            if not authenticate(frames, key, route):
-                rejection = (
-                    "dropped a frame that failed authentication; is its key the authority's?"
-                )
+            try:
+                message = router.get()
+            except (RuntimeError, ValueError) as error:
+                if not unauthenticated(error):
+                    raise
+                rejection = f"dropped a message that failed authentication ({error}); is its key the authority's?"
             else:
-                try:
-                    message = decode(frames[0])
-                except ProtocolError as error:
-                    rejection = f"refused a frame that does not decode: {error}"
-                    outbound += authority.reject(str(error), route)
-                else:
+                # ZeroMqQueue.get() keeps the sender's routing id for replies.
+                route = router._last_identity
+                if type(message) is Sent and is_message(message.message):
+                    outbound += authority.receive(route, message, time.monotonic())
+                elif type(message) is StatusQuery:
                     outbound += authority.handle(route, message, time.monotonic())
-            # Rate-limited: a peer that floods bad frames must not flood the log.
+                else:
+                    rejection = (
+                        f"refused a {type(message).__name__} from {route!r}: not a recovery message"
+                    )
+                    outbound += authority.reject(rejection, route)
+            # Rate-limited: a peer that floods bad messages must not flood the log.
             if rejection and time.monotonic() - last_rejection >= _REJECTION_LOG_INTERVAL_S:
                 last_rejection = time.monotonic()
-                logger.warning(f"Recovery authority: {rejection} (from {route!r})")
+                logger.warning(f"Recovery authority: {rejection}")
         for route, message in outbound:
-            socket.send_multipart([route, *encode(message, key, route)])
+            router.put(message, routing_id=route)
     # A recovery in progress must not leave the survivors waiting out their deadline.
     if authority.phase in (Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING):
         for route, message in authority.abort("the recovery authority stopped"):
-            socket.send_multipart([route, *encode(message, key, route)])
+            router.put(message, routing_id=route)
 
 
 def _receive_datagrams(
@@ -594,18 +651,22 @@ def datagram_socket(endpoint: str) -> socket.socket | None:
     return datagrams
 
 
-def router_socket(context: zmq.Context, endpoint: str) -> zmq.Socket:
-    """Return a ROUTER bound at ``endpoint``; a second connection with a routing id in use is refused."""
-    socket = context.socket(zmq.ROUTER)
-    socket.setsockopt(zmq.LINGER, 0)
-    socket.setsockopt(zmq.MAXMSGSIZE, MAX_MESSAGE_BYTES)
-    socket.bind(endpoint)
+def router_queue(endpoint: str, key: bytes) -> ZeroMqQueue:
+    """Return a ROUTER queue bound at ``endpoint``; a second connection with a routing id in use is refused."""
+    router = ZeroMqQueue(
+        (endpoint, key),
+        socket_type=zmq.ROUTER,
+        is_server=True,
+        name="recovery-authority",
+        # The linger lets a final Abort reach the workers without letting close() hang on one that is gone.
+        socket_options={zmq.LINGER: _CLOSE_LINGER_MS, zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES},
+    )
     if "://*:" in endpoint or "0.0.0.0" in endpoint:
         logger.warning(
             f"Recovery authority listens on every interface ({endpoint}): any host that reaches this one can "
             "connect; bind the job's private interface and use a per-job key"
         )
-    return socket
+    return router
 
 
 def command_fence(template: str) -> Callable[[HungRank], None]:
@@ -665,14 +726,11 @@ def main(argv: list[str] | None = None) -> None:
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
     datagrams = datagram_socket(args.endpoint) if hang_monitor is not None else None
-    context = zmq.Context()
-    router = router_socket(context, args.endpoint)
+    router = router_queue(args.endpoint, key)
     try:
         serve(authority, router, key, stop, datagrams=datagrams)
     finally:
-        # Let a final Abort reach the workers.
-        router.close(linger=_CLOSE_LINGER_MS)
-        context.term()
+        router.close()
         if datagrams is not None:
             datagrams.close()
 

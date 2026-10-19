@@ -51,7 +51,8 @@ class ZeroMqQueue:
                  is_server: bool,
                  is_async: bool = False,
                  name: Optional[str] = None,
-                 use_hmac_encryption: bool = True):
+                 use_hmac_encryption: bool = True,
+                 socket_options: Optional[dict[int, Any]] = None):
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
@@ -60,6 +61,7 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            socket_options (dict[int, Any], optional): ZeroMQ socket options set before the socket binds or connects, e.g. {zmq.MAXMSGSIZE: 65536}. Defaults to None.
         '''
 
         if not use_hmac_encryption:
@@ -79,6 +81,8 @@ class ZeroMqQueue:
         self.name = name
         self.socket = self.context.socket(socket_type)
         self.socket.set_hwm(0)
+        for option, value in (socket_options or {}).items():
+            self.socket.setsockopt(option, value)
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None

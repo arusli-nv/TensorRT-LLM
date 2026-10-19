@@ -4,6 +4,7 @@
 
 import hashlib
 import hmac
+import pickle  # nosec B403
 import socket
 
 import pytest
@@ -21,6 +22,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     NativeHeartbeat,
     Register,
     Restart,
+    Sent,
     Stopped,
 )
 
@@ -477,9 +479,12 @@ def test_the_native_heartbeat_wire_format():
     assert protocol.encode_datagram(NativeHeartbeat(2, 4321, 3, 41), KEY) == payload + tag
     assert protocol.decode_datagram(payload + tag, b"y" * 32) is None
     assert protocol.decode_datagram(tag, KEY) is None
-    # A ZeroMQ frame of a connection does not authenticate as a datagram, nor any other message.
-    frames = protocol.encode(Heartbeat(2, 1, False, "node", 4321), KEY, b"rank-2")
-    assert protocol.decode_datagram(frames[0] + frames[1], KEY) is None
+    # A connection's message (a pickle, then its HMAC-SHA256 tag) does not authenticate as a datagram, nor a
+    # datagram as a connection's message; nor does any other message decode as a datagram.
+    data = pickle.dumps(NativeHeartbeat(2, 4321, 3, 41))
+    signed = data + hmac.new(KEY, data, hashlib.sha256).digest()
+    assert protocol.decode_datagram(signed, KEY) is None
+    assert hmac.new(KEY, payload, hashlib.sha256).digest() != tag
     other = protocol.encode_datagram(Heartbeat(2, 1, False, "node", 4321), KEY)
     assert protocol.decode_datagram(other, KEY) is None
     assert protocol.datagram_address("tcp://10.1.2.3:5555") == ("10.1.2.3", 5555)
@@ -488,12 +493,57 @@ def test_the_native_heartbeat_wire_format():
 
 
 def test_evidence_messages_round_trip():
-    key, route = KEY, b"rank-3-heartbeat"
     for message in (
         Heartbeat(3, 1234, True, "node-3", 4321),
         DeviceWait(1, 2, 2500),
         Restart("every rank stalled"),
     ):
-        frames = protocol.encode(message, key, route)
-        assert protocol.authenticate(frames, key, route)
-        assert protocol.decode(frames[0]) == message
+        assert protocol.is_message(message)
+        assert pickle.loads(pickle.dumps(message)) == message
+
+
+@pytest.mark.parametrize("replayed", [True, False], ids=["replayed", "sent_anew"])
+def test_a_replayed_device_wait_is_not_evidence(replayed):
+    """Every peer's device waits on rank 2 once, then clears it; rank 2 is healthy.
+
+    Replaying the captured waits from another connection must not fence rank 2. The control
+    sends the same waits anew, as fresh messages of the peers' sessions: those fence it.
+    """
+    fenced = []
+    authority = RecoveryAuthority(
+        len(RANKS),
+        hang_monitor=_monitor(),
+        fence=lambda hung: fenced.append(hung.rank),
+    )
+    seq = dict.fromkeys(RANKS, 1)
+    for rank in RANKS:
+        register = Register(rank, ((1,), (2,), (3,)), DIGEST)
+        authority.receive(f"rank-{rank}".encode(), Sent(rank, f"s{rank}", 1, register), 0.0)
+    assert authority.phase is Phase.SERVING
+
+    def send(rank, message, now):
+        seq[rank] += 1
+        sent = Sent(rank, f"s{rank}", seq[rank], message)
+        authority.receive(f"evidence-{rank}".encode(), sent, now)
+        return sent
+
+    outbound = []
+    for now in map(float, range(1, 60)):
+        for rank in RANKS:
+            send(rank, Heartbeat(rank, 0, False, "node", 100 + rank), now)
+        if now == 1:
+            captured = [send(rank, DeviceWait(rank, 2, 1000), now) for rank in PEERS]
+        elif now == 2:
+            for rank in PEERS:
+                send(rank, DeviceWait(rank, 2, 0), now)
+        elif replayed:
+            for sent in captured:
+                assert authority.receive(b"another-connection", sent, now) == []
+        else:
+            for rank in PEERS:
+                send(rank, DeviceWait(rank, 2, 1000), now)
+        outbound += authority.expire(now)
+    if replayed:
+        assert (outbound, fenced) == ([], [])
+    else:
+        assert (b"evidence-2", Fence(2, 102)) in outbound

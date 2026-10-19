@@ -170,7 +170,7 @@ private:
             static_cast<long long>(beat), static_cast<long long>(mIteration.load(std::memory_order_relaxed)),
             static_cast<long long>(mPid), mRank);
         std::string datagram(payload.data(), static_cast<std::size_t>(length));
-        // Signed like a ZeroMQ frame of the empty routing id: its length byte (0), then the payload.
+        // Signed over a zero byte, then the payload, so it never authenticates as a connection's message.
         Tag const tag = hmacSha256(mKey, std::string(1, '\0') + datagram);
         datagram.append(reinterpret_cast<char const*>(tag.data()), tag.size());
         if (::send(mSocket, datagram.data(), datagram.size(), MSG_DONTWAIT) < 0 && !mSendFailed)

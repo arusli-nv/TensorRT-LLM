@@ -8,7 +8,7 @@ deriving the state itself. Asking changes nothing on the authority. If it does n
 """
 
 import os
-import secrets
+import queue
 import threading
 import time
 from typing import Optional
@@ -16,15 +16,9 @@ from typing import Optional
 import zmq
 
 from tensorrt_llm._utils import peer_loss_recovery_enabled
-from tensorrt_llm.executor.recovery.client import AUTHORITY_ENV, load_key
-from tensorrt_llm.executor.recovery.protocol import (
-    ProtocolError,
-    Status,
-    StatusQuery,
-    authenticate,
-    decode,
-    encode,
-)
+from tensorrt_llm.executor.ipc import ZeroMqQueue
+from tensorrt_llm.executor.recovery.client import AUTHORITY_ENV, load_key, unauthenticated
+from tensorrt_llm.executor.recovery.protocol import MAX_MESSAGE_BYTES, Status, StatusQuery
 
 __all__ = ["SERVING_STATES", "RecoveryStatusProbe", "health_state", "status_body"]
 
@@ -89,21 +83,19 @@ class RecoveryStatusProbe:
     def __init__(
         self, endpoint: str, key: bytes, timeout_s: float = 0.5, max_age_s: float = 1.0
     ) -> None:
-        self._key = key
-        self._timeout_ms = int(timeout_s * 1000)
+        self._timeout_s = timeout_s
         self._max_age_s = max_age_s
         self._lock = threading.Lock()
         self._status: Optional[Status] = None
         self._status_time = float("-inf")
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.DEALER)
-        self._socket.setsockopt(zmq.LINGER, 0)
-        # While the authority is unreachable, a query fails at once instead of queueing behind earlier ones
-        # (a DEALER queues up to its high-water mark, then blocks the sender: /health would hang).
-        self._socket.setsockopt(zmq.IMMEDIATE, 1)
-        self._route = f"observer-{secrets.token_hex(8)}".encode()
-        self._socket.setsockopt(zmq.ROUTING_ID, self._route)
-        self._socket.connect(endpoint)
+        self._queue = ZeroMqQueue(
+            (endpoint, key),
+            socket_type=zmq.DEALER,
+            is_server=False,
+            name="recovery-status-probe",
+            # One query waits while the authority is unreachable; later ones fail at once instead of piling up.
+            socket_options={zmq.LINGER: 0, zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES, zmq.SNDHWM: 1},
+        )
 
     @classmethod
     def from_env(cls) -> "RecoveryStatusProbe | None":
@@ -123,34 +115,32 @@ class RecoveryStatusProbe:
             return self._status
 
     def _query(self) -> Optional[Status]:
-        # Answers to earlier queries that timed out may still be queued: drop them.
-        while self._socket.poll(0):
-            self._socket.recv_multipart()
-        deadline = time.monotonic() + self._timeout_ms / 1000
-        # IMMEDIATE refuses to queue before the connection is up (right after connect, or while the authority
-        # is down): wait for it within the timeout instead of failing the first query.
-        if not self._socket.poll(self._timeout_ms, zmq.POLLOUT):
-            return None
+        # Answers to earlier queries that timed out may still be queued: drop them, and any message that
+        # fails authentication.
+        while True:
+            try:
+                self._queue.drain()
+                break
+            except RuntimeError as error:
+                if not unauthenticated(error):
+                    raise
         try:
-            self._socket.send_multipart(
-                encode(StatusQuery(), self._key, self._route), flags=zmq.NOBLOCK
-            )
+            self._queue.put_nowait(StatusQuery())
         except zmq.Again:
             return None
+        deadline = time.monotonic() + self._timeout_s
         while (remaining := deadline - time.monotonic()) > 0:
-            if not self._socket.poll(int(remaining * 1000)):
-                break
-            frames = self._socket.recv_multipart()
-            if not authenticate(frames, self._key, self._route):
-                continue
             try:
-                message = decode(frames[0])
-            except ProtocolError:
+                message = self._queue.get(remaining)
+            except queue.Empty:
+                break
+            except RuntimeError as error:
+                if not unauthenticated(error):
+                    raise
                 continue
             if isinstance(message, Status):
                 return message
         return None
 
     def close(self) -> None:
-        self._socket.close()
-        self._context.term()
+        self._queue.close()

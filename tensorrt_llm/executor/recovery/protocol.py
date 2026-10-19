@@ -2,14 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Messages exchanged between the recovery authority and the workers.
 
-Messages travel as two ZeroMQ frames: a JSON payload and its HMAC-SHA256 tag over the
-worker's routing id and the payload, with a key shared by the authority and every
-worker. A frame replayed on another connection fails authentication and is dropped;
-the authority refuses a second connection with a routing id in use. A worker's native
-heartbeat travels as one UDP datagram: the payload, then its tag over the empty routing
-id, which no ZeroMQ connection has. Traffic is not
-encrypted. Payloads are JSON rather than the pickles of ``ipc.ZeroMqQueue``, so neither side
-unpickles network input, and the authority addresses each worker through a ROUTER.
+Connections carry them as ``ipc.ZeroMqQueue`` objects: pickles signed with HMAC-SHA256 under a key shared
+by the authority and every worker, verified before unpickling. A worker's native heartbeat travels as one UDP
+datagram: a JSON payload, then its HMAC-SHA256 tag over a zero byte and the payload, so neither form
+authenticates as the other. Traffic is not encrypted.
 """
 
 import dataclasses
@@ -31,20 +27,18 @@ __all__ = [
     "Message",
     "NativeHeartbeat",
     "Propose",
-    "ProtocolError",
     "Ready",
     "Register",
     "Registered",
     "Restart",
+    "Sent",
     "Status",
     "StatusQuery",
     "Stopped",
-    "authenticate",
     "datagram_address",
-    "decode",
     "decode_datagram",
-    "encode",
     "encode_datagram",
+    "is_message",
 ]
 
 # Upper bound on a message on either side; real messages are a few hundred bytes.
@@ -240,87 +234,63 @@ Message = (
     | Status
 )
 
-_MESSAGE_TYPES: dict[str, type] = {cls.__name__: cls for cls in typing.get_args(Message)}
 
+@dataclass(frozen=True)
+class Sent:
+    """Worker -> authority: ``message`` as message ``seq`` of ``rank``'s process ``session``.
 
-class ProtocolError(ValueError):
-    """An authenticated frame did not decode into a well-formed message."""
-
-
-def _tag(key: bytes, route: bytes, payload: bytes) -> bytes:
-    # ZeroMQ routing ids are at most 255 bytes, so one length byte keeps route and payload apart.
-    return hmac.new(key, bytes([len(route)]) + route + payload, hashlib.sha256).digest()
-
-
-def encode(message: Message, key: bytes, route: bytes) -> list[bytes]:
-    """Serialize ``message`` into ``[payload, hmac_tag]`` frames for the connection ``route``."""
-    body = dataclasses.asdict(message)
-    body["type"] = type(message).__name__
-    payload = json.dumps(body, sort_keys=True).encode()
-    return [payload, _tag(key, route, payload)]
-
-
-def authenticate(frames: list[bytes], key: bytes, route: bytes) -> bool:
-    """Return whether ``frames`` is a ``[payload, hmac_tag]`` pair signed with ``key`` for ``route``.
-
-    Binding the tag to the worker's routing id means a frame replayed on another connection fails.
+    ``session`` is random and fixed for the life of the process, announced with its ``Register``;
+    ``seq`` increases strictly over the process's messages. The authority drops a message whose
+    session is not its rank's or whose ``seq`` is not above the last it accepted from that rank's
+    connection of the same kind (protocol or evidence), so a replayed message changes nothing,
+    whatever connection carries it.
     """
-    if len(frames) != 2:
-        return False
-    return hmac.compare_digest(_tag(key, route, frames[0]), frames[1])
+
+    rank: int
+    session: str
+    seq: int
+    message: Message
 
 
-def _field_value(name: str, value_type: type, value):
-    """Check a decoded JSON value of field ``name`` against ``value_type``; lists become tuples."""
-    if typing.get_origin(value_type) is tuple:
-        (item_type, _) = typing.get_args(value_type)
-        if isinstance(value, list):
-            return tuple(_field_value(name, item_type, item) for item in value)
-    elif type(value) is value_type:
-        return value
-    raise ProtocolError(f"field {name} has invalid value {value!r}")
-
-
-def decode(payload: bytes) -> Message:
-    """Deserialize an authenticated payload.
-
-    Raises:
-        ProtocolError: The payload is not a well-formed message.
-    """
-    try:
-        body = json.loads(payload)
-        cls = _MESSAGE_TYPES[body.pop("type")]
-    except (KeyError, TypeError, AttributeError, ValueError, RecursionError) as error:
-        raise ProtocolError(f"malformed recovery message: {error!r}") from error
-    fields = {field.name: field for field in dataclasses.fields(cls)}
-    if body.keys() != fields.keys():
-        raise ProtocolError(f"{cls.__name__} fields mismatch: {sorted(body)}")
-    return cls(
-        **{name: _field_value(name, fields[name].type, value) for name, value in body.items()}
-    )
-
-
-# Datagrams are signed for the empty routing id: no ZeroMQ routing id is empty, so neither replays as the other.
-_DATAGRAM_ROUTE = b""
+_MESSAGE_TYPES = typing.get_args(Message)
 _TAG_BYTES = hashlib.sha256().digest_size
 
 
+def is_message(obj: object) -> bool:
+    """Whether ``obj``, received from a connection, is one of the protocol's messages."""
+    return type(obj) in _MESSAGE_TYPES
+
+
+def _datagram_tag(key: bytes, payload: bytes) -> bytes:
+    return hmac.new(key, b"\x00" + payload, hashlib.sha256).digest()
+
+
 def encode_datagram(message: Message, key: bytes) -> bytes:
-    """Serialize ``message`` into one datagram: the payload, then its HMAC tag."""
-    payload, tag = encode(message, key, _DATAGRAM_ROUTE)
-    return payload + tag
+    """Serialize ``message`` into one datagram: the JSON payload, then its HMAC tag."""
+    body = dataclasses.asdict(message)
+    body["type"] = type(message).__name__
+    payload = json.dumps(body, sort_keys=True).encode()
+    return payload + _datagram_tag(key, payload)
 
 
 def decode_datagram(datagram: bytes, key: bytes) -> NativeHeartbeat | None:
     """The native heartbeat in ``datagram``, or None if it does not authenticate or is not one."""
     payload, tag = datagram[:-_TAG_BYTES], datagram[-_TAG_BYTES:]
-    if not payload or not authenticate([payload, tag], key, _DATAGRAM_ROUTE):
+    if not payload or not hmac.compare_digest(_datagram_tag(key, payload), tag):
         return None
     try:
-        message = decode(payload)
-    except ProtocolError:
+        body = json.loads(payload)
+    except (ValueError, RecursionError):
         return None
-    return message if isinstance(message, NativeHeartbeat) else None
+    fields = {field.name for field in dataclasses.fields(NativeHeartbeat)}
+    if (
+        not isinstance(body, dict)
+        or body.pop("type", None) != NativeHeartbeat.__name__
+        or body.keys() != fields
+        or any(type(value) is not int for value in body.values())
+    ):
+        return None
+    return NativeHeartbeat(**body)
 
 
 def datagram_address(endpoint: str) -> tuple[str, int]:

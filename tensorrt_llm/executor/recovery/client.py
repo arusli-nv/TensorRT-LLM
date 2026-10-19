@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Worker-side connection to the recovery authority."""
 
+import itertools
 import os
+import queue
 import secrets
 import threading
 import time
@@ -13,18 +15,9 @@ import zmq
 
 from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
 
+from ..ipc import ZeroMqQueue
 from .config import fault_tolerance_config
-from .protocol import (
-    MAX_MESSAGE_BYTES,
-    Abort,
-    Message,
-    ProtocolError,
-    Register,
-    Registered,
-    authenticate,
-    decode,
-    encode,
-)
+from .protocol import MAX_MESSAGE_BYTES, Abort, Message, Register, Registered, Sent, is_message
 
 __all__ = [
     "AUTHORITY_ENV",
@@ -35,13 +28,16 @@ __all__ = [
     "RecoveryInterrupted",
     "RecoveryTimeout",
     "load_key",
+    "unauthenticated",
 ]
 
 AUTHORITY_ENV = FAULT_TOLERANCE_AUTHORITY_ENV
 AUTHORITY_KEY_ENV = "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY"
 
 _MIN_KEY_BYTES = 16
-_SEND_TIMEOUT_MS = 5000
+# This process's session and the sequence of its messages, shared by all of its connections.
+_SESSION = secrets.token_hex(16)
+_SEQUENCE = itertools.count(1)
 # How often a wait with an interrupt checks it.
 _INTERRUPT_POLL_S = 0.005
 
@@ -66,6 +62,17 @@ def load_key() -> bytes:
     return key
 
 
+def unauthenticated(error: Exception) -> bool:
+    """Whether ``error``, raised by ``ZeroMqQueue.get()``, refuses a message that does not authenticate.
+
+    The queue raises RuntimeError when the HMAC does not verify, and on a ROUTER a ValueError when
+    the message is not one frame after the routing id; any other error is not the peer's.
+    """
+    if isinstance(error, RuntimeError):
+        return str(error) == "HMAC verification failed"
+    return isinstance(error, ValueError) and "values to unpack" in str(error)
+
+
 class RecoveryError(RuntimeError):
     """The recovery exchange failed; the caller must take the terminal path."""
 
@@ -85,8 +92,8 @@ class RecoveryInterrupted(Exception):
 class RecoveryClient:
     """DEALER connection of one worker rank to the recovery authority.
 
-    The socket identity is derived from the rank, so the authority recognizes the
-    worker after a reconnect. Not thread-safe: use each client from one thread at a
+    The routing id is derived from the rank and kept across reconnects, so the authority
+    recognizes the worker after one. Not thread-safe: use each client from one thread at a
     time.
 
     Args:
@@ -96,18 +103,19 @@ class RecoveryClient:
     """
 
     def __init__(self, endpoint: str, key: bytes, rank: int) -> None:
-        self._key = key
         self._rank = rank
         self._endpoint = endpoint
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.DEALER)
-        self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.setsockopt(zmq.SNDTIMEO, _SEND_TIMEOUT_MS)
-        self._socket.setsockopt(zmq.MAXMSGSIZE, MAX_MESSAGE_BYTES)
-        # Signed into every message, so a frame replayed on another connection fails authentication.
-        self._route = f"rank-{rank}-{secrets.token_hex(8)}".encode()
-        self._socket.setsockopt(zmq.ROUTING_ID, self._route)
-        self._socket.connect(endpoint)
+        self._queue = ZeroMqQueue(
+            (endpoint, key),
+            socket_type=zmq.DEALER,
+            is_server=False,
+            name=f"recovery-rank-{rank}",
+            socket_options={
+                zmq.LINGER: 0,
+                zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES,
+                zmq.ROUTING_ID: f"rank-{rank}-{secrets.token_hex(8)}".encode(),
+            },
+        )
 
     @classmethod
     def from_env(cls, rank: int) -> "RecoveryClient | None":
@@ -137,37 +145,32 @@ class RecoveryClient:
         return frozenset(map(frozenset, self.wait(Registered, deadline).admitted_domains))
 
     def send(self, message: Message) -> None:
-        """Send ``message`` to the authority.
-
-        Raises:
-            RecoveryError: The message could not be queued in time.
-        """
-        try:
-            self._socket.send_multipart(encode(message, self._key, self._route))
-        except zmq.Again as error:
-            raise RecoveryError(f"Timed out sending {message} to the authority") from error
+        """Queue ``message`` for the authority; never blocks (the queue has no high-water mark)."""
+        self._queue.put(Sent(self._rank, _SESSION, next(_SEQUENCE), message))
 
     def _recv(self, timeout: float) -> Message | None:
         """Return the next authority message, or None if none arrives within ``timeout`` s.
 
         Raises:
-            RecoveryError: A frame failed authentication or did not decode.
+            RecoveryError: A message failed authentication or is not a protocol message.
         """
-        if not self._socket.poll(max(1, int(timeout * 1000))):
-            return None
-        frames = self._socket.recv_multipart()
-        if not authenticate(frames, self._key, self._route):
-            raise RecoveryError("Received an unauthenticated frame from the authority")
         try:
-            return decode(frames[0])
-        except ProtocolError as error:
-            raise RecoveryError(f"Received a malformed message: {error}") from error
+            message = self._queue.get(timeout)
+        except queue.Empty:
+            return None
+        except RuntimeError as error:
+            if not unauthenticated(error):
+                raise
+            raise RecoveryError("Received an unauthenticated message from the authority") from error
+        if not is_message(message):
+            raise RecoveryError(f"Received a malformed message: {type(message).__name__}")
+        return message
 
     def receive(self) -> Message | None:
-        """Return an authority message already received, or None (waits at most 1 ms).
+        """Return an authority message already received, or None (does not wait).
 
         Raises:
-            RecoveryError: A frame failed authentication or did not decode.
+            RecoveryError: A message failed authentication or is not a protocol message.
         """
         return self._recv(0)
 
@@ -216,5 +219,4 @@ class RecoveryClient:
 
     def close(self) -> None:
         """Close the connection."""
-        self._socket.close()
-        self._context.term()
+        self._queue.close()

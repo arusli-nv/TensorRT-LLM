@@ -3,6 +3,7 @@
 """Recovery authority state machine, wire protocol, and client."""
 
 import hmac
+import pickle  # nosec B403
 import threading
 import time
 
@@ -10,6 +11,7 @@ import pytest
 import zmq
 
 from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.executor.recovery import authority as authority_module
 from tensorrt_llm.executor.recovery import client as recovery_client
 from tensorrt_llm.executor.recovery import protocol
@@ -24,12 +26,14 @@ from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConf
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
+    Heartbeat,
     Install,
     Installed,
     Propose,
     Ready,
     Register,
     Registered,
+    Sent,
     Status,
     StatusQuery,
     Stopped,
@@ -237,12 +241,10 @@ def test_a_recovery_completes_after_a_frame_that_does_not_decode():
         (_route(3), Stopped(3, (1,))),  # second distinct failure
         (_route(0), Stopped(0, (1, 3))),  # a different failed set (a larger one is a re-plan)
         (_route(FAILED), Stopped(FAILED, (FAILED,))),  # departed rank still talking
-        (_route(1), Stopped(3, (FAILED,))),  # rank spoofing
         (_route(1), Stopped(1, (FAILED,))),  # duplicate report
         (_route(1), Ready(1, 1, "digest")),  # Ready before Propose
         (_route(1), Commit(1)),  # authority-only message from a worker
         (_route(1), Register(1, RECOVERABLE, DIGEST)),  # registration after it completed
-        (b"stranger", Stopped(1, (FAILED,))),  # unregistered peer
     ],
 )
 def test_protocol_violations_abort(route, message):
@@ -251,6 +253,46 @@ def test_protocol_violations_abort(route, message):
     out = authority.handle(route, message, 1.0)
     _assert_aborted(out, authority)
     assert (route, Abort(authority.abort_reason)) in out
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [Phase.SERVING, Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING, Phase.RECOVERED],
+    ids=lambda phase: phase.name.lower(),
+)
+@pytest.mark.parametrize(
+    "route, message",
+    [
+        (b"stranger", Stopped(1, (FAILED,))),  # a member's report replayed on another connection
+        (b"stranger", Stopped(FAILED, (FAILED,))),
+        (b"stranger", Ready(1, 1, "d")),
+        (b"stranger", Installed(1, 1)),
+        (b"stranger", Register(1, RECOVERABLE, DIGEST)),
+        (b"stranger", Commit(1)),
+        (_route(1), Stopped(3, (FAILED,))),  # another rank's report on rank 1's route
+        (_route(1), Ready(3, 1, "d")),
+        (_route(1), Register(3, RECOVERABLE, DIGEST)),
+    ],
+    ids=lambda value: type(value).__name__ if not isinstance(value, bytes) else value.decode(),
+)
+def test_messages_no_member_can_send_on_their_route_are_dropped(phase, route, message):
+    """Messages are not bound to their connection, so these may be replays: they change nothing."""
+    authority = _in_phase(phase)
+    state = (authority.phase, authority.deadline, authority.failed_ranks, authority.generation)
+    assert authority.handle(route, message, 1.0) == []
+    assert (
+        authority.phase,
+        authority.deadline,
+        authority.failed_ranks,
+        authority.generation,
+    ) == state
+    if phase is Phase.STOPPING:
+        # The recovery still commits.
+        _report(authority, Stopped, SURVIVORS[1:], failed_ranks=(FAILED,))
+        _report(authority, Ready, generation=1, placement_digest="d")
+        assert _report(authority, Installed, generation=1) == [
+            (_route(rank), Commit(1)) for rank in SURVIVORS
+        ]
 
 
 def test_rank_reporting_its_own_loss_aborts():
@@ -290,6 +332,13 @@ def test_registration_violations_abort(route, message):
     authority = RecoveryAuthority(WORLD)
     authority.handle(_route(0), Register(0, RECOVERABLE, DIGEST), 0.0)
     _assert_aborted(authority.handle(route, message, 0.0), authority)
+
+
+def test_a_message_from_an_unregistered_route_during_registration_is_dropped():
+    authority = RecoveryAuthority(WORLD)
+    authority.handle(_route(0), Register(0, RECOVERABLE, DIGEST), 0.0)
+    assert authority.handle(b"stranger", Stopped(1, (FAILED,)), 0.0) == []
+    assert authority.phase is Phase.REGISTERING
 
 
 def test_registration_with_other_settings_is_refused():
@@ -393,26 +442,70 @@ def test_a_further_loss_report_that_is_not_a_superset_or_takes_rank0_aborts(fail
     _assert_aborted(authority.handle(_route(1), Stopped(1, failed), 5.0), authority)
 
 
-def test_wire_roundtrip_and_authentication():
-    route = _route(1)
-    for message in (
-        Register(1, ((1,), NODE), DIGEST),
-        Registered(((1,), NODE)),
-        Stopped(1, NODE),
-        Propose(3, NODE, (0, 1)),
-        Abort("lost"),
-        StatusQuery(),
-        Status("RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),
-        Status("SERVING", 0, (0, 1), (), 0, (), 0, ""),
-    ):
-        frames = protocol.encode(message, KEY, route)
-        assert protocol.authenticate(frames, KEY, route)
-        assert protocol.decode(frames[0]) == message
-    frames = protocol.encode(Install(1), KEY, route)
-    assert not protocol.authenticate(frames, b"x" * 32, route)
-    assert not protocol.authenticate([frames[0] + b" ", frames[1]], KEY, route)
-    # A frame replayed on another connection does not authenticate.
-    assert not protocol.authenticate(frames, KEY, _route(2))
+def _dealer(endpoint: str, key: bytes = KEY, options: dict | None = None) -> ZeroMqQueue:
+    return ZeroMqQueue(
+        (endpoint, key),
+        socket_type=zmq.DEALER,
+        is_server=False,
+        socket_options={zmq.LINGER: 0, **(options or {})},
+    )
+
+
+def _signed(obj, key: bytes = KEY) -> bytes:
+    """``obj`` as ``ZeroMqQueue`` sends it: its pickle, then the pickle's HMAC-SHA256 tag."""
+    data = pickle.dumps(obj)
+    return data + hmac.new(key, data, "sha256").digest()
+
+
+def test_wire_roundtrip_and_authentication(tmp_path):
+    endpoint = f"ipc://{tmp_path}/authority"
+    router = authority_module.router_queue(endpoint, KEY)
+    dealer = _dealer(endpoint)
+    try:
+        for message in (
+            Register(1, ((1,), NODE), DIGEST),
+            Registered(((1,), NODE)),
+            Stopped(1, NODE),
+            Propose(3, NODE, (0, 1)),
+            Abort("lost"),
+            StatusQuery(),
+            Status("RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),
+            Status("SERVING", 0, (0, 1), (), 0, (), 0, ""),
+        ):
+            dealer.put(message)
+            assert router.get(timeout=5.0) == message
+            router.put(message, routing_id=router._last_identity)
+            assert dealer.get(timeout=5.0) == message
+        stranger = _dealer(endpoint, b"x" * 32)
+        try:
+            stranger.put(Install(1))
+            with pytest.raises(RuntimeError, match="HMAC"):
+                router.get(timeout=5.0)
+        finally:
+            stranger.close()
+        # A tampered message does not authenticate either.
+        signed = _signed(Install(1))
+        dealer.socket.send(signed[:-33] + bytes([signed[-33] ^ 1]) + signed[-32:])
+        with pytest.raises(RuntimeError, match="HMAC"):
+            router.get(timeout=5.0)
+    finally:
+        dealer.close()
+        router.close()
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        "not a message",
+        {"type": "Install", "generation": 1},
+        Install,
+        type("Install", (Install,), {})(1),
+        None,
+    ],
+)
+def test_objects_that_are_not_messages_are_recognized(obj):
+    assert not protocol.is_message(obj)
+    assert protocol.is_message(Install(1))
 
 
 @pytest.mark.parametrize(
@@ -421,21 +514,21 @@ def test_wire_roundtrip_and_authentication():
         b"not json",
         b"[]",
         b'{"type": "Nope"}',
-        b'{"type": "Install"}',
-        b'{"type": "Install", "generation": "1"}',
-        b'{"type": "Install", "generation": true}',
-        b'{"type": "Install", "generation": 1, "extra": 0}',
-        b'{"type": "Propose", "generation": 1, "failed_ranks": [2], "survivors": [0, "1"]}',
-        b'{"type": "Propose", "generation": 1, "failed_ranks": 2, "survivors": [0, 1]}',
-        b'{"type": "Register", "rank": 1, "recoverable_domains": [1, 2]}',
-        b'{"type": "Register", "rank": 1, "recoverable_domains": [[1], [2, "3"]]}',
-        b'{"type": "Install", "generation": ' + b"9" * 5000 + b"}",
+        b'{"type": "NativeHeartbeat"}',
+        b'{"beat": 3, "iteration": 41, "pid": 4321, "rank": "2", "type": "NativeHeartbeat"}',
+        b'{"beat": 3, "iteration": 41, "pid": 4321, "rank": true, "type": "NativeHeartbeat"}',
+        b'{"beat": 3, "extra": 0, "iteration": 41, "pid": 4321, "rank": 2, "type": "NativeHeartbeat"}',
+        b'{"beat": 3, "iteration": [41], "pid": 4321, "rank": 2, "type": "NativeHeartbeat"}',
+        b'{"beat": 3, "iteration": 41, "pid": 4321, "rank": 2, "type": "Install"}',
+        b'{"beat": '
+        + b"9" * 5000
+        + b', "iteration": 41, "pid": 4321, "rank": 2, "type": "NativeHeartbeat"}',
         b"[" * 100000 + b"]" * 100000,
     ],
 )
-def test_malformed_payloads_are_rejected(payload):
-    with pytest.raises(protocol.ProtocolError):
-        protocol.decode(payload)
+def test_malformed_datagrams_are_rejected(payload):
+    tag = hmac.new(KEY, b"\x00" + payload, "sha256").digest()
+    assert protocol.decode_datagram(payload + tag, KEY) is None
 
 
 def test_load_key_validates_the_environment(monkeypatch):
@@ -477,18 +570,16 @@ def test_client_from_env(monkeypatch):
 def served(tmp_path):
     authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
     endpoint = f"ipc://{tmp_path}/authority"
-    context = zmq.Context()
-    socket = authority_module.router_socket(context, endpoint)
+    router = authority_module.router_queue(endpoint, KEY)
     stop = threading.Event()
     thread = threading.Thread(
-        target=authority_module.serve, args=(authority, socket, KEY, stop, 0.01), daemon=True
+        target=authority_module.serve, args=(authority, router, KEY, stop, 0.01), daemon=True
     )
     thread.start()
     yield authority, endpoint
     stop.set()
     thread.join(timeout=5)
-    socket.close()
-    context.term()
+    router.close()
 
 
 @pytest.fixture
@@ -570,7 +661,7 @@ def test_an_interrupted_wait_takes_a_message_that_already_arrived(clients):
     further_loss = threading.Event()
     further_loss.set()
     clients[1].send(Stopped(1, (3,)))
-    assert clients[0]._socket.poll(5000)
+    assert clients[0]._queue.poll(5)
     with pytest.raises(RecoveryAborted):
         clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_loss)
     with pytest.raises(RecoveryInterrupted):
@@ -580,11 +671,10 @@ def test_an_interrupted_wait_takes_a_message_that_already_arrived(clients):
 def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):
     authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
     endpoint = f"ipc://{tmp_path}/authority"
-    context = zmq.Context()
-    socket = authority_module.router_socket(context, endpoint)
+    router = authority_module.router_queue(endpoint, KEY)
     stop = threading.Event()
     thread = threading.Thread(
-        target=authority_module.serve, args=(authority, socket, KEY, stop, 0.01)
+        target=authority_module.serve, args=(authority, router, KEY, stop, 0.01)
     )
     thread.start()
     try:
@@ -602,8 +692,164 @@ def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):
     finally:
         stop.set()
         thread.join(timeout=5)
-        socket.close()
-        context.term()
+        router.close()
+
+
+def _captured(client) -> list:
+    """Record every object ``client`` puts on its connection: what a network observer captures."""
+    captured, put = [], client._queue.put
+    client._queue.put = lambda obj: (captured.append(obj), put(obj))[1]
+    return captured
+
+
+def _wait_for(authority, phase):
+    deadline = time.monotonic() + 5.0
+    while authority.phase is not phase:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def _replay(endpoint, captured, routing_id=None) -> Status:
+    """Send ``captured`` again from a new connection; return the status the authority answers next."""
+    options = {} if routing_id is None else {zmq.ROUTING_ID: routing_id}
+    # A routing id frees once the authority sees its old connection close: retry until it is accepted.
+    for _ in range(50):
+        replayer = _dealer(endpoint, options=options)
+        try:
+            replayer.put(StatusQuery())
+            if not replayer.poll(1):
+                continue
+            replayer.get()
+            for obj in captured:
+                replayer.socket.send(_signed(obj))
+            replayer.put(StatusQuery())
+            status = replayer.get(timeout=5.0)
+            assert isinstance(status, Status), status
+            return status
+        finally:
+            replayer.close()
+    raise AssertionError("the authority never accepted the replaying connection")
+
+
+def _finish_recovery(clients) -> dict:
+    """Rank 0 already reported; every survivor completes the recovery from rank ``FAILED``."""
+    results = {}
+
+    def rank0():
+        try:
+            proposal = clients[0].wait(Propose, time.monotonic() + 10.0)
+            clients[0].send(Ready(0, proposal.generation, "digest"))
+            clients[0].wait(Install, time.monotonic() + 10.0)
+            clients[0].send(Installed(0, proposal.generation))
+            results[0] = clients[0].wait(Commit, time.monotonic() + 10.0)
+        except RecoveryError as error:
+            results[0] = error
+
+    workers = [threading.Thread(target=rank0)] + [
+        threading.Thread(target=_worker_recovery, args=(clients[rank], rank, results))
+        for rank in SURVIVORS[1:]
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    return results
+
+
+def test_a_replayed_report_does_not_abort_a_recovery(served, clients):
+    """Rank 0's captured, authenticated messages sent again from another connection: the recovery commits."""
+    authority, endpoint = served
+    captured = _captured(clients[0])
+    _register_clients(clients)
+    clients[0].send(Stopped(0, (FAILED,)))
+    _wait_for(authority, Phase.STOPPING)
+    assert _replay(endpoint, captured).phase == "STOPPING"
+    assert _finish_recovery(clients) == {rank: Commit(1) for rank in SURVIVORS}
+    assert authority.phase is Phase.RECOVERED
+
+
+def test_a_departed_ranks_replayed_messages_are_dropped_on_its_own_route(served, clients):
+    """A rank departs; its captured messages come again on a connection with its routing id."""
+    authority, endpoint = served
+    captured = _captured(clients[FAILED])
+    _register_clients(clients)
+    routing_id = clients[FAILED]._queue.socket.getsockopt(zmq.ROUTING_ID)
+    clients[FAILED].close()
+    clients[0].send(Stopped(0, (FAILED,)))
+    _wait_for(authority, Phase.STOPPING)
+    # Accepted, its Register would abort: registration after it completed, from a departed rank.
+    assert _replay(endpoint, captured, routing_id).phase == "STOPPING"
+    assert _finish_recovery(clients) == {rank: Commit(1) for rank in SURVIVORS}
+    assert authority.phase is Phase.RECOVERED
+
+
+def test_only_fresh_messages_of_a_ranks_session_are_applied():
+    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
+    domains = ((1,), NODE, (FAILED,))
+    for rank in range(WORLD):
+        authority.receive(
+            _route(rank), Sent(rank, f"s{rank}", 1, Register(rank, domains, DIGEST)), 0.0
+        )
+    assert authority.phase is Phase.SERVING
+    assert authority.receive(_route(1), Sent(1, "s1", 5, Stopped(1, (FAILED,))), 1.0) == []
+    assert authority.phase is Phase.STOPPING
+    # Applied, a Ready before Propose would abort: each of these is dropped instead.
+    for sent in (
+        Sent(1, "s1", 4, Ready(1, 1, "d")),  # out of order
+        Sent(1, "s1", 5, Ready(1, 1, "d")),  # a repeated sequence number
+        Sent(1, "other", 9, Ready(1, 1, "d")),  # another session
+        Sent(3, "s3", 9, Ready(1, 1, "d")),  # another rank's envelope
+        Sent(1, "s1", 1, Register(1, domains, DIGEST)),  # the rank's own Register, replayed
+    ):
+        assert authority.receive(_route(1), sent, 1.0) == [], sent
+        assert authority.phase is Phase.STOPPING
+    # Evidence is a stream of its own (another connection): a lower sequence number there is fresh.
+    authority.receive(b"evidence-1", Sent(1, "s1", 2, Heartbeat(1, 0, True, "node", 101)), 1.0)
+    assert authority._sequences[(1, True)] == 2
+    _assert_aborted(
+        authority.receive(_route(1), Sent(1, "s1", 6, Ready(1, 1, "d")), 1.0), authority
+    )
+
+
+def test_a_second_session_registering_a_rank_aborts():
+    """Not a replay: two processes claim the rank."""
+    authority = RecoveryAuthority(WORLD)
+    authority.receive(_route(0), Sent(0, "s0", 1, Register(0, RECOVERABLE, DIGEST)), 0.0)
+    out = authority.receive(_route(1), Sent(0, "other", 1, Register(0, RECOVERABLE, DIGEST)), 0.0)
+    _assert_aborted(out, authority)
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("not an HMAC failure"), ValueError("not a frame count")]
+)
+def test_serve_raises_errors_other_than_authentication_failures(tmp_path, monkeypatch, error):
+    endpoint = f"ipc://{tmp_path}/authority"
+    router = authority_module.router_queue(endpoint, KEY)
+    dealer = _dealer(endpoint)
+    try:
+        dealer.put(StatusQuery())
+
+        def get(timeout=None):
+            raise error
+
+        monkeypatch.setattr(router, "get", get)
+        raised, stop = [], threading.Event()
+
+        def run():
+            try:
+                authority_module.serve(RecoveryAuthority(WORLD), router, KEY, stop, 0.01)
+            except (RuntimeError, ValueError) as caught:
+                raised.append(caught)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=5)
+        stop.set()
+        thread.join(timeout=5)
+        assert raised == [error]
+    finally:
+        dealer.close()
+        router.close()
 
 
 def test_frames_signed_with_another_key_are_dropped(served, make_client):
@@ -614,47 +860,48 @@ def test_frames_signed_with_another_key_are_dropped(served, make_client):
     assert authority.phase is Phase.SERVING
 
 
-def test_authenticated_malformed_frames_are_refused_without_ending_registration(
+def test_authenticated_objects_that_are_not_messages_are_refused_without_ending_registration(
     served, make_client
 ):
     authority, endpoint = served
-    context = zmq.Context()
-    socket = context.socket(zmq.DEALER)
-    socket.setsockopt(zmq.LINGER, 0)
-    route = b"malformed"
-    socket.setsockopt(zmq.ROUTING_ID, route)
-    socket.connect(endpoint)
-    payload = b'{"type": "Nope"}'
-    tag = hmac.new(KEY, bytes([len(route)]) + route + payload, "sha256").digest()
-    socket.send_multipart([payload, tag])
+    sender = _dealer(endpoint)
     try:
-        assert socket.poll(5000), "the sender was not refused"
-        frames = socket.recv_multipart()
-        assert protocol.authenticate(frames, KEY, route)
-        assert isinstance(protocol.decode(frames[0]), Abort)
+        sender.put({"type": "Nope"})
+        assert isinstance(sender.get(timeout=5.0), Abort), "the sender was not refused"
+        # A message of more than one frame is dropped without stopping the authority.
+        sender.socket.send_multipart([_signed(StatusQuery()), b"extra"])
+        sender.put(StatusQuery())
+        assert sender.get(timeout=5.0).phase == "REGISTERING"
     finally:
-        socket.close()
-        context.term()
+        sender.close()
     assert authority.phase is Phase.REGISTERING
     clients = {rank: make_client(endpoint, rank) for rank in range(WORLD)}
     assert _register_clients(clients) == {rank: {frozenset({FAILED})} for rank in range(WORLD)}
     assert authority.phase is Phase.SERVING
 
 
-def test_client_rejects_unauthenticated_frames(tmp_path):
+@pytest.mark.parametrize(
+    "reply, error",
+    [(_signed(Commit(1), b"x" * 32), "unauthenticated"), (_signed("Commit"), "malformed")],
+    ids=["another_key", "not_a_message"],
+)
+def test_client_rejects_unauthenticated_and_malformed_messages(tmp_path, reply, error):
     endpoint = f"ipc://{tmp_path}/fake"
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
+    router.setsockopt(zmq.LINGER, 0)
     router.bind(endpoint)
     client = RecoveryClient(endpoint, KEY, 0)
-    client.send(Stopped(0, (FAILED,)))
-    route, *_ = router.recv_multipart()
-    router.send_multipart([route, *protocol.encode(Commit(1), b"x" * 32, route)])
-    with pytest.raises(RecoveryError, match="unauthenticated"):
-        client.wait(Commit, time.monotonic() + 5.0)
-    client.close()
-    router.close()
-    context.term()
+    try:
+        client.send(Stopped(0, (FAILED,)))
+        route, _ = router.recv_multipart()
+        router.send_multipart([route, reply])
+        with pytest.raises(RecoveryError, match=error):
+            client.wait(Commit, time.monotonic() + 5.0)
+    finally:
+        client.close()
+        router.close()
+        context.term()
 
 
 def test_server_probe_reads_the_status_and_reports_unprotected_without_an_answer(served):
@@ -676,6 +923,23 @@ def test_server_probe_reads_the_status_and_reports_unprotected_without_an_answer
     finally:
         probe.close()
     assert authority.phase is Phase.REGISTERING
+
+
+def test_server_probe_answers_within_its_timeout_while_the_authority_is_down(tmp_path):
+    from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe
+
+    probe = RecoveryStatusProbe(f"ipc://{tmp_path}/down", KEY, timeout_s=0.5, max_age_s=0.0)
+    try:
+        start = time.monotonic()
+        assert probe.status() is None
+        assert time.monotonic() - start < 2.0
+        # The first query still waits to be sent: later ones fail at once rather than queue behind it.
+        for _ in range(3):
+            start = time.monotonic()
+            assert probe.status() is None
+            assert time.monotonic() - start < 0.25
+    finally:
+        probe.close()
 
 
 @pytest.mark.parametrize(
