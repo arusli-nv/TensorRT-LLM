@@ -523,8 +523,14 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
             asm volatile("fence.acq_rel.sys;");
 #endif
             count = *round_recv_count;
-            // A count beyond the runtime capacity is corrupt: drop the source rather than read past its slot.
-            count = count >= 0 && count <= source_tokens ? count : 0;
+            // A count beyond the runtime capacity is corrupt. Dropping a live source's tokens would silently change
+            // the output, so trap as on a timeout.
+            if (count < 0 || count > source_tokens)
+            {
+                printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id,
+                    count, source, source_tokens);
+                asm volatile("trap;" ::: "memory");
+            }
         }
         ptrs.source_valid_counts[source] = count < 0 ? 0 : count;
         received = count;

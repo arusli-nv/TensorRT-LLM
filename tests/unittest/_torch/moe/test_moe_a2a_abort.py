@@ -223,19 +223,21 @@ def test_valid_counts_skip_a_masked_source_even_if_it_arrived() -> None:
     assert counts.tolist() == [_CAPACITY, 0]
 
 
-@pytest.mark.parametrize("count,valid", [(3, 3), (_CAPACITY + 1, 0), (-5, 0)])
-def test_valid_counts_bound_the_received_count(count: int, valid: int) -> None:
-    """Does the dispatch only trust a peer's received count within [0, runtime tokens]?"""
-    workspace, meta, experts, payload = _setup(2)
-    controls, _ = _rank_mask_controls(3)
-    # Stand in for peer 1: signal the next dispatch round and publish its count.
+def _publish_peer_count(workspace: torch.Tensor, meta: torch.Tensor, count: int) -> None:
+    """Stand in for peer 1: signal the next dispatch round and publish its count."""
     expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
     parity = ((expected_flag - 1) >> 1) & 1
     _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(expected_flag)
     _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(count)
+
+
+def test_valid_counts_take_a_peer_s_received_count() -> None:
+    workspace, meta, experts, payload = _setup(2)
+    controls, _ = _rank_mask_controls(3)
+    _publish_peer_count(workspace, meta, 3)
     _, _, _, counts = _dispatch(workspace, meta, experts, [payload, experts], controls)
     torch.cuda.synchronize()
-    assert counts.tolist() == [_CAPACITY, valid]
+    assert counts.tolist() == [_CAPACITY, 3]
 
 
 def test_valid_counts_wait_for_a_source_that_arrives_late() -> None:
@@ -551,20 +553,46 @@ def _fence_timeout() -> None:
     raise AssertionError("dispatch completed without its peer")
 
 
-def test_fence_timeout_still_traps() -> None:
-    # The child traps on purpose, so it runs in a fresh interpreter, kept off the enclosing launcher's
-    # process-management interface.
+def _corrupt_count(count: int) -> None:
+    """Does a peer's received count outside [0, capacity] fail stop instead of dropping its tokens?"""
+    workspace, meta, experts, payload = _setup(2)
+    controls, _ = _rank_mask_controls(3)
+    _publish_peer_count(workspace, meta, count)
+    _dispatch(workspace, meta, experts, [payload, experts], controls)
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError:
+        print("corrupt count trapped", flush=True)
+        os._exit(0)
+    raise AssertionError("dispatch accepted a corrupt count")
+
+
+def _run_trapping_child(*args: str) -> str:
+    """Run this file's child with ``args``; it traps on purpose, so it runs in a fresh interpreter, kept off the
+    enclosing launcher's process-management interface. Returns its stdout."""
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)}
     try:
         result = subprocess.run(
-            [sys.executable, __file__], env=env, capture_output=True, text=True, timeout=300
+            [sys.executable, __file__, *args], env=env, capture_output=True, text=True, timeout=300
         )
     except subprocess.TimeoutExpired as error:
-        pytest.fail(f"Pending fence subprocess deadline: {error.stdout!r} {error.stderr!r}")
+        pytest.fail(f"Pending trapping subprocess deadline: {error.stdout!r} {error.stderr!r}")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "fence timeout trapped" in result.stdout, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_fence_timeout_still_traps() -> None:
+    assert "fence timeout trapped" in _run_trapping_child()
+
+
+@pytest.mark.parametrize("count", [_CAPACITY + 1, -5])
+def test_a_corrupt_received_count_traps(count: int) -> None:
+    assert "corrupt count trapped" in _run_trapping_child(str(count))
 
 
 if __name__ == "__main__":
-    _fence_timeout()
+    if len(sys.argv) > 1:
+        _corrupt_count(int(sys.argv[1]))
+    else:
+        _fence_timeout()
