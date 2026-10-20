@@ -919,7 +919,9 @@ class PeerLossRecovery(RecoveryHook):
                 generation = proposal.generation
                 self._log_phase("proposed", generation)
                 copy_plan = (
-                    None if online else self._stage_ring_restore(load_balancer, failed, placements, staged)
+                    None
+                    if online
+                    else self._stage_ring_restore(load_balancer, failed, placements, staged)
                 )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)

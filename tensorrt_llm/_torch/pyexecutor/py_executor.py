@@ -8835,8 +8835,7 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
-                self._peer_loss_recovery.step_outputs_appending(
-                    scheduled_batch)
+                self._peer_loss_recovery.step_outputs_appending(scheduled_batch)
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
                                batch_outputs["logits"], beam_width,

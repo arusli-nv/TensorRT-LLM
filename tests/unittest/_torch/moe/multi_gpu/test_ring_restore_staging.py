@@ -142,7 +142,9 @@ def _survivor(comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor) -> 
             assert torch.equal(loaded, expected), f"rank {comm.rank} slot {slot} {name}"
     row = workspace[comm.rank]
     for begin, end in (write for rank in _DEAD for write in write_ranges(rank)):
-        assert bool((row[begin:end] == 0xA5).all()), f"rank {comm.rank} staged into [{begin}, {end})"
+        assert bool((row[begin:end] == 0xA5).all()), (
+            f"rank {comm.rank} staged into [{begin}, {end})"
+        )
 
 
 def _worker(rank: int, port: int) -> None:

@@ -959,8 +959,9 @@ def _staging_room(half: List[Tuple[int, int]]) -> int:
         for begin, end in half)
 
 
-def _no_staging_room(row_bytes: int, halves: Tuple[List[Tuple[int, int]],
-                                                  List[Tuple[int, int]]]) -> str:
+def _no_staging_room(
+        row_bytes: int, halves: Tuple[List[Tuple[int, int]],
+                                      List[Tuple[int, int]]]) -> str:
     return (
         f"Ring host copies have {[_staging_room(half) for half in halves]} bytes per half of the {row_bytes}-byte "
         "NVLinkOneSided workspace rows to stage restores through, and need some in each; raise "
@@ -1337,12 +1338,13 @@ class MoeLoadBalancer:
         return digest.hexdigest()
 
     def restore_copy_plan(
-            self,
-            dead_ranks: Iterable[int],
-            placements: List[np.ndarray],
-            workspace_bytes: int,
-            write_ranges: Callable[[int], List[Tuple[int, int]]],
-            staged: Iterable[np.ndarray] = ()) -> np.ndarray:
+        self,
+        dead_ranks: Iterable[int],
+        placements: List[np.ndarray],
+        workspace_bytes: int,
+        write_ranges: Callable[[int], List[Tuple[int, int]]],
+        staged: Iterable[np.ndarray] = ()
+    ) -> np.ndarray:
         """Ring host copies: rows (chunk, layer, target, slot, expert, weight by sorted name, source, workspace
         offset, offset in the weight, bytes) that load the slots ``placements`` changes, in chunk order; the
         same on every rank.
@@ -1357,8 +1359,8 @@ class MoeLoadBalancer:
         writes = [r for rank in dead for r in write_ranges(rank)]
         late = [(row[2], row[7], row[7] + row[9]) for plan in staged
                 for row in plan.tolist() if row[6] in dead]
-        halves: Dict[int, Tuple[List[Tuple[int, int]],
-                                List[Tuple[int, int]]]] = {}
+        halves: Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int,
+                                                                  int]]]] = {}
         # Startup (no dead ranks) checks the room every rank's all-to-alls leave; each target's is checked below.
         worst = staging_halves(
             workspace_bytes,
@@ -1385,8 +1387,8 @@ class MoeLoadBalancer:
             for target, slot in zip(*np.nonzero(loaded)):
                 if target not in halves:
                     halves[target] = staging_halves(
-                        workspace_bytes, writes +
-                        [(b, e) for t, b, e in late if t == target])
+                        workspace_bytes,
+                        writes + [(b, e) for t, b, e in late if t == target])
                     if min(map(_staging_room, halves[target])) == 0:
                         raise ValueError(
                             _no_staging_room(workspace_bytes, halves[target]))
@@ -1405,9 +1407,9 @@ class MoeLoadBalancer:
                             cursor[target] = 0
                             continue
                         offset, length = piece
-                        rows.append((chunk[target], layer_idx, target, slot,
-                                     expert, weight, source, offset, done,
-                                     length))
+                        rows.append(
+                            (chunk[target], layer_idx, target, slot, expert,
+                             weight, source, offset, done, length))
                         cursor[target] = offset + length
                         done += length
         plan = np.array(rows, dtype=np.int64).reshape(-1, 10)

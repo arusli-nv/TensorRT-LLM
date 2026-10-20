@@ -674,13 +674,13 @@ class PyResult:
             self._generation_logits.checkpoint(),
             {
                 name: len(outputs)
-                for name, outputs in (self._additional_context_outputs
-                                      or {}).items()
+                for name, outputs in (
+                    self._additional_context_outputs or {}).items()
             },
             {
                 name: len(outputs)
-                for name, outputs in (self._additional_generation_outputs
-                                      or {}).items()
+                for name, outputs in (
+                    self._additional_generation_outputs or {}).items()
             },
         )
 

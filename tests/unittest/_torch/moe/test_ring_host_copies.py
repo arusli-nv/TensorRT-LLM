@@ -319,14 +319,17 @@ def _kernel_writes(meta, source):
     test_moe_a2a_late_writes.py checks it against what a killed rank's kernels actually write.
     """
     ep_size, capacity, top_k, experts = (
-        _field(meta, name) for name in ("EP_SIZE", "MAX_NUM_TOKENS", "TOP_K", "EPLB_STATS_NUM_EXPERTS")
+        _field(meta, name)
+        for name in ("EP_SIZE", "MAX_NUM_TOKENS", "TOP_K", "EPLB_STATS_NUM_EXPERTS")
     )
     payload_end = _field(meta, "DISPATCH_PAYLOAD_OFFSET") + _field(meta, "DISPATCH_PAYLOAD_SIZE")
     writes = []
     for activations in ([_HIDDEN * 2], [_HIDDEN], [_HIDDEN // 2, _HIDDEN // 16]):
         offset = _field(meta, "DISPATCH_PAYLOAD_OFFSET")
         for width in activations + [4 * top_k, 4 * top_k]:
-            writes.append((offset + source * capacity * width, offset + (source + 1) * capacity * width))
+            writes.append(
+                (offset + source * capacity * width, offset + (source + 1) * capacity * width)
+            )
             offset = (offset + ep_size * capacity * width + 127) // 128 * 128
         assert offset <= payload_end, "the layout cannot hold these payloads"
     recv = _field(meta, "RECV_COUNTERS_OFFSET")
@@ -341,12 +344,18 @@ def _kernel_writes(meta, source):
 @pytest.mark.parametrize(
     "ep_size, top_k, eplb_stats_num_experts", [(1, 1, None), (4, 2, 8), (8, 8, None), (72, 8, 256)]
 )
-def test_source_write_ranges_cover_every_write_of_the_source(ep_size, top_k, eplb_stats_num_experts):
+def test_source_write_ranges_cover_every_write_of_the_source(
+    ep_size, top_k, eplb_stats_num_experts
+):
     meta = _layout(ep_size, top_k, eplb_stats_num_experts)
     for source in range(ep_size):
         ranges = NVLinkOneSided.source_write_ranges(meta, source)
         for begin, end in _kernel_writes(meta, source):
-            assert begin == end or any(b <= begin and end <= e for b, e in ranges), (source, begin, end)
+            assert begin == end or any(b <= begin and end <= e for b, e in ranges), (
+                source,
+                begin,
+                end,
+            )
 
 
 # Two ghost slots per rank, so the survivors of a two-rank loss can hold every expert.

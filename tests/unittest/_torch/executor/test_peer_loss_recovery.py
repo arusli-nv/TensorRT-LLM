@@ -651,7 +651,7 @@ def test_recovery_reports_requests_it_already_answered_as_held():
 
     recovery._recover(_interrupted())
 
-    held, _iteration, _interrupted = reported[0]
+    held, _iteration, _ = reported[0]
     assert 3 in held
 
 

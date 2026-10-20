@@ -527,8 +527,8 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
             // the output, so trap as on a timeout.
             if (count < 0 || count > source_tokens)
             {
-                printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id,
-                    count, source, source_tokens);
+                printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id, count,
+                    source, source_tokens);
                 asm volatile("trap;" ::: "memory");
             }
         }
