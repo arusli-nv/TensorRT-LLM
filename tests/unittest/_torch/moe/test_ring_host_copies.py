@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """EPLB host copies of a subset of the experts, as WideEP fault tolerance keeps them in a ring of nodes."""
 
+import errno
 import functools
 import threading
 from multiprocessing import shared_memory
@@ -109,6 +110,28 @@ def test_a_layer_that_does_not_fit_in_shared_memory_fails_before_creating_it(mon
     try:
         sharer.finalize_layer_weights()
         assert sharer.own_shm is not None
+    finally:
+        sharer.pre_shutdown_cleanup()
+        sharer.post_shutdown_cleanup()
+
+
+def test_a_layer_the_node_s_ranks_together_overfill_shared_memory_with_fails_at_startup(
+    monkeypatch,
+):
+    """Each rank found room, but the tmpfs fills before this rank's pages are allocated."""
+    sharer = _sharer(0, 1, expert_count=1)
+    sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
+    sharer.share_host_tensor_with_shape(0, "w", torch.ones(4))
+
+    def full(fd, offset, length):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("os.posix_fallocate", full)
+    try:
+        with pytest.raises(RuntimeError, match=r"/dev/shm has .* MoE layer 0 needs"):
+            sharer.finalize_layer_weights()
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=sharer.get_shared_memory_name())
     finally:
         sharer.pre_shutdown_cleanup()
         sharer.post_shutdown_cleanup()

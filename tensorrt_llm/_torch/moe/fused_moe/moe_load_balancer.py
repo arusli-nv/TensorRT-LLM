@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import errno
 import gc
 import hashlib
 import os
@@ -37,15 +38,35 @@ _SHM_MOUNT = "/dev/shm"
 def _check_shm_space(required: int, layer_id: int) -> None:
     """Raise unless ``_SHM_MOUNT`` has ``required`` bytes free: a write past a full tmpfs is a SIGBUS."""
     stat = os.statvfs(_SHM_MOUNT)
+    if stat.f_bavail * stat.f_frsize < required:
+        raise _no_shm_space(required, layer_id)
+
+
+def _no_shm_space(required: int, layer_id: int) -> RuntimeError:
+    """The error that ``_SHM_MOUNT`` cannot hold this rank's ``required`` bytes of MoE layer ``layer_id``."""
+    stat = os.statvfs(_SHM_MOUNT)
     free = stat.f_bavail * stat.f_frsize
-    if free < required:
-        gib = 1 << 30
-        raise RuntimeError(
-            f"{_SHM_MOUNT} has {free / gib:.2f} GiB free of {stat.f_blocks * stat.f_frsize / gib:.2f} GiB, "
-            f"but this rank's part of the EPLB host copies of MoE layer {layer_id} needs {required / gib:.2f} GiB. "
-            f"Each node keeps in {_SHM_MOUNT} host copies of the experts it may load (with online EPLB, "
-            "every expert of every MoE layer); enlarge it, e.g. with docker run --shm-size or a "
-            "memory-backed emptyDir in Kubernetes")
+    gib = 1 << 30
+    return RuntimeError(
+        f"{_SHM_MOUNT} has {free / gib:.2f} GiB free of {stat.f_blocks * stat.f_frsize / gib:.2f} GiB, "
+        f"but this rank's part of the EPLB host copies of MoE layer {layer_id} needs {required / gib:.2f} GiB. "
+        f"Each node keeps in {_SHM_MOUNT} host copies of the experts it may load (with online EPLB, "
+        "every expert of every MoE layer); enlarge it, e.g. with docker run --shm-size or a "
+        "memory-backed emptyDir in Kubernetes")
+
+
+def _reserve_shm(shm: shared_memory.SharedMemory, layer_id: int) -> None:
+    """Allocate every page of ``shm`` now: the node's ranks, each of which found room, may together overfill
+    the tmpfs, which is then an error here rather than a SIGBUS on a later write."""
+    fd = os.open(os.path.join(_SHM_MOUNT, shm.name), os.O_RDWR)
+    try:
+        os.posix_fallocate(fd, 0, shm.size)
+    except OSError as error:
+        if error.errno != errno.ENOSPC:
+            raise
+        raise _no_shm_space(shm.size, layer_id) from error
+    finally:
+        os.close(fd)
 
 
 def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
@@ -287,6 +308,11 @@ class HostMoeTensorSharer:
                 ) from error
             self.own_shm = shm
             self.own_shm_linked = True
+            try:
+                _reserve_shm(shm, self.layer_id)
+            except RuntimeError:
+                self.unlink_shared_memory()
+                raise
 
         offset = 0
         for name in self.names:
