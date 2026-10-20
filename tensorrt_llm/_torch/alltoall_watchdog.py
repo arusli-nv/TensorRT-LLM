@@ -634,6 +634,12 @@ class AlltoAllWatchdog:
             )
             self._cv.notify_all()
 
+    def clear(self) -> None:
+        """Drop every queued phase, e.g. those of collectives an abort ended before they completed."""
+        with self._cv:
+            self._queue.clear()
+            self._cv.notify_all()
+
     def wait_until_idle(self, timeout_s: float) -> bool:
         """Wait until all queued phases complete or timeout handling clears them."""
         deadline = time.monotonic() + timeout_s
@@ -761,6 +767,10 @@ class AlltoAllWatchdog:
                 continue
 
             if time.monotonic() - watch.start_s >= self._timeout_s:
+                with self._cv:
+                    if not self._queue or self._queue[0] is not watch:
+                        # Cleared while it was polled.
+                        continue
                 try:
                     self._handle_timeout(watch, observed_flags, poll_timed_out=poll_timed_out)
                 except Exception as exc:  # noqa: BLE001 - keep watchdog failures visible.

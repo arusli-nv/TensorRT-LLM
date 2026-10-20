@@ -151,6 +151,28 @@ def test_watchdog_handles_signed_uint32_generation_boundaries() -> None:
     assert events == []
 
 
+def test_watchdog_clear_drops_phases_that_never_complete() -> None:
+    """After an abort and rearm, queued phases of the aborted collectives are dropped, not reported."""
+    reader = FakeCompletionFlagReader(ep_size=2)
+    events: list[AlltoAllWatchdogTimeout] = []
+
+    with AlltoAllWatchdog(
+        ep_size=2,
+        ep_rank=0,
+        completion_reader=reader,
+        timeout_s=0.2,
+        poll_interval_s=0.005,
+        on_timeout=events.append,
+    ) as watchdog:
+        watchdog.watch(phase="dispatch", expected_flag=1)
+        watchdog.watch(phase="combine", expected_flag=1)
+        watchdog.clear()
+        assert watchdog.wait_until_idle(timeout_s=0.01)
+        time.sleep(0.3)
+
+    assert events == []
+
+
 def test_watchdog_defaults_match_design_doc() -> None:
     reader = FakeCompletionFlagReader(ep_size=1)
     watchdog = AlltoAllWatchdog(ep_size=1, ep_rank=0, completion_reader=reader)

@@ -753,7 +753,7 @@ class NVLinkOneSided(Communication):
         self._execution_state = state
 
     def _reset_local_workspace(self) -> None:
-        """Return this rank's workspace row to its initial state.
+        """Return this rank's workspace row to its initial state, and drop the watchdog's queued phases.
 
         Same as initialization, without the barrier: the caller guarantees that
         no rank runs a collective on this workspace until every rank has reset.
@@ -761,6 +761,10 @@ class NVLinkOneSided(Communication):
         torch.ops.trtllm.moe_a2a_initialize(
             self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
         )
+        # Phases of aborted collectives never see their flags after the reset.
+        watchdog = self._alltoall_watchdog
+        if watchdog is not None:
+            watchdog.clear()
 
     def progress_row_offsets(self) -> Tuple[int, int, int]:
         """Byte offsets of ``flag_val`` and of the dispatch and combine completion flags in a
