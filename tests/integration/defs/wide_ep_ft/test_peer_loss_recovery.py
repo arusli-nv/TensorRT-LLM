@@ -34,6 +34,8 @@ SERVE_TIMEOUT_S = 1800
 TEARDOWN_TIMEOUT_S = 180
 # The server's view of the authority is at most 1 s old and a query waits 0.5 s.
 HEALTH_SETTLE_S = 30
+# Set to 1 where the image must provide ULFM: its absence then fails these tests instead of skipping them.
+REQUIRE_ULFM_ENV = "TLLM_REQUIRE_ULFM"
 # ULFM needs the ob1 PML and collectives without hcoll/ucc.
 MPIRUN = [
     "mpirun",
@@ -70,6 +72,8 @@ def _ulfm_unavailable_reason() -> str | None:
 def _model() -> Path:
     reason = _ulfm_unavailable_reason()
     if reason is not None:
+        if os.environ.get(REQUIRE_ULFM_ENV) == "1":
+            pytest.fail(f"{reason} ({REQUIRE_ULFM_ENV}=1)")
         pytest.skip(reason)
     model = Path(llm_models_root()) / "DeepSeek-V3-Lite" / "nvfp4_moe_only"
     if not model.exists():

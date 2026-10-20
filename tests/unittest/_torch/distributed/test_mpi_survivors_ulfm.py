@@ -22,6 +22,8 @@ pytestmark = pytest.mark.cpu_only
 WORLD_SIZE = 4
 VICTIM = 2
 _OK = "ULFM_SURVIVOR_OK"
+# Set to 1 where the image must provide ULFM: its absence then fails this test instead of skipping it.
+_REQUIRE_ULFM_ENV = "TLLM_REQUIRE_ULFM"
 
 
 def _ulfm_available() -> bool:
@@ -34,7 +36,16 @@ def _ulfm_available() -> bool:
     return "ftmpi" in info.stdout
 
 
-@pytest.mark.skipif(not _ulfm_available(), reason="requires Open MPI with ULFM and mpi4py>=4")
+@pytest.fixture
+def ulfm() -> None:
+    if not _ulfm_available():
+        reason = "requires Open MPI with ULFM and mpi4py>=4"
+        if os.environ.get(_REQUIRE_ULFM_ENV) == "1":
+            pytest.fail(f"{reason} ({_REQUIRE_ULFM_ENV}=1)")
+        pytest.skip(reason)
+
+
+@pytest.mark.usefixtures("ulfm")
 @pytest.mark.parametrize(
     "second_victim, frozen",
     [(None, False), (3, False), (None, True)],
