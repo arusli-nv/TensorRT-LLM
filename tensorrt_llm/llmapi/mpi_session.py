@@ -74,7 +74,7 @@ main()
 def _num_failed_ranks() -> int:
     """Number of processes ULFM reports failed in the world.
 
-    Zero when recovery is disabled or the MPI library cannot report failures.
+    Zero when recovery is disabled.
     """
     if not (ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled()):
         return 0

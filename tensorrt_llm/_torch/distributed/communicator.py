@@ -947,7 +947,8 @@ class MPIDist(Distributed):
         Raises:
             ValueError: The layout is unsupported.
             RuntimeError: The job was not launched with ULFM fault tolerance,
-                or MPI was not initialized with ``MPI_THREAD_MULTIPLE``.
+                the MPI library lacks the ULFM calls, or MPI was not
+                initialized with ``MPI_THREAD_MULTIPLE``.
         """
         mapping = self.mapping
         if not (mapping.enable_attention_dp and mapping.pp_size == 1
@@ -968,6 +969,14 @@ class MPIDist(Distributed):
         if MPI.Query_thread() != MPI.THREAD_MULTIPLE:
             raise RuntimeError(
                 "Peer-loss recovery requires MPI_THREAD_MULTIPLE")
+        try:
+            mpi_failed_ranks(mpi_comm())
+            mpi_comm().Is_revoked()
+        except NotImplementedError as error:
+            raise RuntimeError(
+                "Peer-loss recovery requires an MPI library with the ULFM "
+                "calls (MPIX_Comm_get_failed, MPIX_Comm_revoke, "
+                "MPIX_Comm_shrink); this one does not provide them") from error
         if self._host_world is None:
             self._host_world = mpi_comm().Dup()
             # Survivors must shrink the same communicator, so the TP

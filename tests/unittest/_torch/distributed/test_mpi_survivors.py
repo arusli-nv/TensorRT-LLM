@@ -232,6 +232,15 @@ def test_recovery_revokes_a_private_world_not_the_session_world(world, monkeypat
     assert private.revoke_calls == 1 and world.revoke_calls == 0
 
 
+def test_recovery_refuses_an_mpi_library_without_ulfm(world, monkeypatch):
+    def get_failed():
+        raise NotImplementedError
+
+    monkeypatch.setattr(world, "Get_failed", get_failed)
+    with pytest.raises(RuntimeError, match="ULFM calls"):
+        MPIDist(_mapping()).enable_peer_loss_recovery()
+
+
 def test_healthy_paths_return_compact_results(dist):
     assert dist.tp_allgather("me", small_payload=True) == ["rank0", "me", "rank2", "rank3"]
     rows = dist.tp_allgather_int64([5, 6])

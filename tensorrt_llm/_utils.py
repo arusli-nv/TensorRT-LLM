@@ -630,11 +630,12 @@ def mpi_world_ranks(group: "MPI.Group") -> tuple[int, ...]:
 def mpi_failed_ranks(comm: "MPI.Comm") -> frozenset[int]:
     """Ranks in ``mpi_comm()`` that ULFM reports failed in *comm*.
 
-    Empty when the MPI library cannot report failures.
+    Raises:
+        NotImplementedError: The MPI library cannot report failures (no ULFM).
     """
     try:
         failed_group = comm.Get_failed()
-    except (NotImplementedError, MPI.Exception):
+    except MPI.Exception:
         return frozenset()
     if failed_group.Get_size() == 0:
         failed_group.Free()
