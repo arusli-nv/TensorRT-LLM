@@ -583,7 +583,10 @@ def _run_trapping_child(*args: str) -> str:
 
 
 def test_fence_timeout_still_traps() -> None:
-    assert "fence timeout trapped" in _run_trapping_child()
+    output = _run_trapping_child()
+    # The kernel's own report, not just any device error.
+    assert "dispatch: rank 0 timed out waiting for rank 1 flag=" in output, output
+    assert "fence timeout trapped" in output, output
 
 
 @pytest.mark.parametrize("count", [_CAPACITY + 1, -5])
