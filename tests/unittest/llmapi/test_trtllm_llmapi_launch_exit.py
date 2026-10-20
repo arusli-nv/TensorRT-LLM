@@ -37,7 +37,9 @@ def _launcher_functions() -> str:
     return "\n".join(source)
 
 
-def _exit_with_worker_status(status: int, ft_mode: str | None, tmp_path: Path) -> int:
+def _exit_with_worker_status(
+    status: int, ft_mode: str | None, tmp_path: Path, authority: str | None = "tcp://host:5555"
+) -> int:
     workspace = tmp_path / "flashinfer"
     workspace.mkdir()
     script = "\n".join(
@@ -48,9 +50,15 @@ def _exit_with_worker_status(status: int, ft_mode: str | None, tmp_path: Path) -
             f"exit_with_worker_status {status}",
         ]
     )
-    env = {k: v for k, v in os.environ.items() if k != "TLLM_FAULT_TOLERANCE_MODE"}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("TLLM_FAULT_TOLERANCE_MODE", "TLLM_FAULT_TOLERANCE_AUTHORITY")
+    }
     if ft_mode is not None:
         env["TLLM_FAULT_TOLERANCE_MODE"] = ft_mode
+    if authority is not None:
+        env["TLLM_FAULT_TOLERANCE_AUTHORITY"] = authority
     result = subprocess.run(["bash", "-c", script], env=env, timeout=30)
     return result.returncode
 
@@ -75,6 +83,12 @@ def _exit_with_worker_status(status: int, ft_mode: str | None, tmp_path: Path) -
 )
 def test_exit_with_worker_status(status, ft_mode, expected_returncode, tmp_path):
     assert _exit_with_worker_status(status, ft_mode, tmp_path) == expected_returncode
+
+
+@pytest.mark.parametrize("status", [1, 137, 139])
+def test_detection_only_mode_ends_the_job_with_the_worker_status(status, tmp_path):
+    """Without an authority nothing recovers a lost rank, so its exit status ends the job as before."""
+    assert _exit_with_worker_status(status, "1", tmp_path, authority=None) == status
 
 
 def test_signal_exit_removes_temporary_workspace(tmp_path):

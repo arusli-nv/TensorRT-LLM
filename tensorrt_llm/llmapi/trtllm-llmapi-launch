@@ -171,7 +171,8 @@ function configure_flashinfer_workspace {
     done
 }
 
-# Exits with the worker's status. Under WideEP fault tolerance, any other abnormal end of the worker (killed, crashed
+# Exits with the worker's status. Under WideEP peer-loss recovery (fault-tolerance mode with an authority), any other
+# abnormal end of the worker (killed, crashed
 # by a signal such as SIGSEGV or SIGABRT, or a non-zero exit) is a lost rank: it instead ends this launcher by
 # SIGKILL, so that the MPI runtime sees an aborted process rather than an exit status. PRRTE survives aborted
 # processes, but a second non-zero exit status ends the whole job. The stalled exit code (75, every rank exits for a
@@ -179,7 +180,8 @@ function configure_flashinfer_workspace {
 function exit_with_worker_status {
     local status=$1
 
-    if [ "$TLLM_FAULT_TOLERANCE_MODE" = "1" ] && [ "$status" -ne 0 ] && [ "$status" -ne 75 ]; then
+    if [ "$TLLM_FAULT_TOLERANCE_MODE" = "1" ] && [ -n "$TLLM_FAULT_TOLERANCE_AUTHORITY" ] \
+        && [ "$status" -ne 0 ] && [ "$status" -ne 75 ]; then
         log_stderr "Rank${mpi_rank} worker ended with status $status; ending by SIGKILL so that its peers recover"
         remove_flashinfer_temporary_workspace
         trap - EXIT
