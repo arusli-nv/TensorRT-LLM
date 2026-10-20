@@ -7,7 +7,8 @@ treats ranks 0 and 2 as one node and ranks 1 and 3 as the other; ranks 1 and 3
 are lost. The survivors copy the lost experts from host memory into the
 target's workspace (their own or the peer's, over NVLink) and from there into
 the target's slots, in chunks of half of what the all-to-alls leave unwritten of the workspace, as a WideEP
-restore does: the bytes the lost ranks' all-to-alls may write still hold what they held before.
+restore does: the bytes the lost ranks' all-to-alls may write still hold what they held before. In the
+``lost_writing`` case the lost ranks keep dispatching into every rank's workspace while the survivors stage.
 """
 
 import functools
@@ -113,7 +114,38 @@ def _load_balancer(rank: int) -> MoeLoadBalancer:
     return load_balancer
 
 
-def _survivor(comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor) -> None:
+def _late_writer(comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor) -> None:
+    """Dispatch rows to every rank until both survivors have staged.
+
+    A pending abort request lets every dispatch push all its rows and then return instead of
+    waiting for its peers, so new NVLink writes are in flight throughout the staging.
+    """
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, comm.rank, _EP_SIZE, barrier=False)
+    controls = {
+        "enable_rank_mask": True,
+        "active_rank_mask": torch.tensor(
+            [(1 << _EP_SIZE) - 1, 0, 0, 0], dtype=torch.uint64, device="cuda"
+        ),
+        "abort_state": torch.tensor([1, 0], dtype=torch.int32).pin_memory(),
+    }
+    # Expert e lives on rank e.
+    experts = torch.arange(_TOKENS, dtype=torch.int32, device="cuda").view(_TOKENS, 1) % _EP_SIZE
+    payload = torch.full((_TOKENS, _HIDDEN * 2), 0xC3, dtype=torch.uint8, device="cuda")
+    payload = payload.view(torch.bfloat16)
+    valid_counts = torch.zeros(_EP_SIZE, dtype=torch.int32, device="cuda")
+    args = (experts, [payload, experts], workspace, meta, _TOKENS, comm.rank, _EP_SIZE, 1, _EP_SIZE)
+    while True:
+        for _ in range(16):
+            torch.ops.trtllm.moe_a2a_dispatch(*args, **controls, source_valid_counts=valid_counts)
+        torch.cuda.synchronize()
+        comm.store.set(f"writing/{comm.rank}", b"")
+        if comm.store.check([f"staged/{rank}" for rank in _SURVIVORS]):
+            return
+
+
+def _survivor(
+    comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor, lost_writing: bool
+) -> None:
     load_balancer = _load_balancer(comm.rank)
     placement = np.array(_PLACEMENT, dtype=np.int32)
     placement[_DEAD] = -1
@@ -128,10 +160,13 @@ def _survivor(comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor) -> 
         (2, 2),
     }
     assert plan[-1, 0] >= 2
+    if lost_writing:
+        comm.store.wait([f"writing/{rank}" for rank in _DEAD])
     workspace[comm.rank].fill_(0xA5)
     torch.cuda.synchronize()
     comm.survivor_barrier()
     load_balancer.stage_restored_slots(plan, workspace, comm.survivor_barrier)
+    comm.store.set(f"staged/{comm.rank}", b"")
     (layer,) = load_balancer.single_layer_load_balancers
     for slot, expert in enumerate(placement[comm.rank].tolist()):
         if _PLACEMENT[comm.rank][slot] == expert:
@@ -141,13 +176,16 @@ def _survivor(comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor) -> 
             expected = _host_copy(0, expert, name).view(torch.uint8)
             assert torch.equal(loaded, expected), f"rank {comm.rank} slot {slot} {name}"
     row = workspace[comm.rank]
-    for begin, end in (write for rank in _DEAD for write in write_ranges(rank)):
-        assert bool((row[begin:end] == 0xA5).all()), (
-            f"rank {comm.rank} staged into [{begin}, {end})"
-        )
+    lost_bytes = [row[begin:end] for rank in _DEAD for begin, end in write_ranges(rank)]
+    if lost_writing:
+        # The lost ranks' writes landed in this row after the fill, while it staged.
+        assert any(bool((data != 0xA5).any()) for data in lost_bytes), f"rank {comm.rank}"
+    else:
+        for data in lost_bytes:
+            assert bool((data == 0xA5).all()), f"rank {comm.rank} staged into a lost rank's range"
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, lost_writing: bool) -> None:
     store = TCPStore("127.0.0.1", port, is_master=False, timeout=_TIMEOUT)
     torch.cuda.set_device(rank)
     mapping = Mapping(_EP_SIZE, rank, _EP_SIZE, tp_size=_EP_SIZE, moe_ep_size=_EP_SIZE)
@@ -161,7 +199,9 @@ def _worker(rank: int, port: int) -> None:
     memory = MnnvlMemory(mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)]))
     workspace = memory.as_torch_strided_tensor(torch.uint8)
     if rank in _SURVIVORS:
-        _survivor(comm, workspace, meta)
+        _survivor(comm, workspace, meta, lost_writing)
+    elif lost_writing:
+        _late_writer(comm, workspace, meta)
     # The lost ranks keep their workspaces mapped until the survivors are done.
     comm.barrier()
 
@@ -175,7 +215,8 @@ def _mnnvl_skip_reason() -> str | None:
     return None
 
 
-def test_ring_restore_stages_through_peer_workspaces_bit_exactly() -> None:
+@pytest.mark.parametrize("lost_writing", [False, True], ids=["lost_idle", "lost_writing"])
+def test_ring_restore_stages_through_peer_workspaces_bit_exactly(lost_writing: bool) -> None:
     reason = _mnnvl_skip_reason()
     if reason:
         pytest.skip(reason)
@@ -183,7 +224,9 @@ def test_ring_restore_stages_through_peer_workspaces_bit_exactly() -> None:
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)}
     workers = [
-        subprocess.Popen([sys.executable, __file__, str(rank), str(store.port)], env=env)
+        subprocess.Popen(
+            [sys.executable, __file__, str(rank), str(store.port), str(int(lost_writing))], env=env
+        )
         for rank in range(_EP_SIZE)
     ]
     try:
@@ -198,4 +241,4 @@ def test_ring_restore_stages_through_peer_workspaces_bit_exactly() -> None:
 
 
 if __name__ == "__main__":
-    _worker(int(sys.argv[1]), int(sys.argv[2]))
+    _worker(int(sys.argv[1]), int(sys.argv[2]), bool(int(sys.argv[3])))
