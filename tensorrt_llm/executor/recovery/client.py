@@ -176,6 +176,19 @@ class RecoveryClient:
             raise RecoveryError(f"Received a malformed message: {type(message).__name__}")
         return message
 
+    def discard_pending(self) -> None:
+        """Drop every authority message already received: none belongs to a recovery that has not started.
+
+        One is left from serving (the refusal of a message) or from an earlier recovery. If the
+        authority aborted, it answers this rank's next message with ``Abort`` again.
+        """
+        while True:
+            try:
+                if self._recv(0) is None:
+                    return
+            except RecoveryError:
+                continue
+
     def receive(self) -> Message | None:
         """Return an authority message already received, or None (does not wait).
 

@@ -921,6 +921,8 @@ class PeerLossRecovery(RecoveryHook):
         # staged so far had the lost ranks copy.
         replans = 0
         staged: List[np.ndarray] = []
+        # What the authority sent while this rank served (a refusal) belongs to no recovery.
+        client.discard_pending()
         while True:
             if replans:
                 _check_deadline(deadline, "planning the recovery again")

@@ -714,6 +714,34 @@ def test_end_to_end_over_zmq(served, clients):
     assert authority.phase is Phase.RECOVERED
 
 
+def test_a_refusal_while_serving_does_not_abort_the_next_recovery(clients):
+    """Nobody reads the refusal while serving: the recovery discards it rather than take it for its Abort."""
+    _register_clients(clients)
+    clients[1].send(Ready(1, 1, "digest"))
+    assert clients[1]._queue.poll(5)
+    clients[1].discard_pending()
+    results = {}
+    workers = [
+        threading.Thread(target=_worker_recovery, args=(clients[rank], rank, results))
+        for rank in SURVIVORS
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert results == {rank: Commit(1) for rank in SURVIVORS}
+
+
+def test_a_discarded_abort_of_an_aborted_authority_comes_again(clients):
+    _register_clients(clients)
+    clients[1].send(Stopped(1, (3,)))  # rank 3 is not admitted
+    assert clients[0]._queue.poll(5)
+    clients[0].discard_pending()
+    clients[0].send(Stopped(0, (3,)))
+    with pytest.raises(RecoveryAborted):
+        clients[0].wait(Propose, time.monotonic() + 5.0)
+
+
 def test_a_connection_with_a_routing_id_in_use_takes_the_route_over(served, clients):
     """A worker whose connection died unnoticed reconnects with its routing id; the authority answers it."""
     _register_clients(clients)

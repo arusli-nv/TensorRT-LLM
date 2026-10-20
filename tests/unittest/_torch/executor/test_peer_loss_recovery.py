@@ -71,6 +71,9 @@ class _FakeClient:
     def send(self, message):
         self.sent.append(message)
 
+    def discard_pending(self):
+        pass
+
     def wait(self, message_type, deadline, interrupt=None, skip=None):
         assert deadline > time.monotonic()
         reply = self.replies.pop(0)
