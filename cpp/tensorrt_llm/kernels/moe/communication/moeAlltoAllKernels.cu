@@ -484,33 +484,50 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-// Loads src[i, i + 4) as one 16-byte access when all four words are valid, else word by word with fill past valid.
-__device__ __forceinline__ int4 load_words_or_fill(int32_t const* src, int i, int valid, int32_t fill)
+// Replaces the words of a 16-byte load at indices [i, i + 4) that are at or past valid with fill.
+__device__ __forceinline__ int4 fill_past_valid(int4 words, int i, int valid, int32_t fill)
 {
-    if (i + 4 <= valid)
-    {
-        return *reinterpret_cast<int4 const*>(src + i);
-    }
-    return make_int4(i < valid ? src[i] : fill, i + 1 < valid ? src[i + 1] : fill, i + 2 < valid ? src[i + 2] : fill,
-        i + 3 < valid ? src[i + 3] : fill);
+    return make_int4(i < valid ? words.x : fill, i + 1 < valid ? words.y : fill, i + 2 < valid ? words.z : fill,
+        i + 3 < valid ? words.w : fill);
 }
 
-// Copies the first valid words of ids and weights to their outputs and fills the rest of total with -1 and 0. Both
-// lists are loaded before either is stored, so a thread pays one memory round trip per step.
+// Copies the first valid words of ids and weights to their outputs and fills the rest of total with -1 and 0. The
+// 16-byte loads do not depend on valid, so they issue together with the caller's count load, and each thread issues
+// the loads of up to kCopySteps steps before their stores: a thread pays one memory round trip per kCopySteps steps.
 __device__ __forceinline__ void copy_compact_routing(
     int32_t* out_ids, int32_t* out_weights, int32_t const* ids, int32_t const* weights, int valid, int total)
 {
+    constexpr int kCopySteps = 4;
     bool const aligned = ((reinterpret_cast<uintptr_t>(out_ids) | reinterpret_cast<uintptr_t>(out_weights)
                               | reinterpret_cast<uintptr_t>(ids) | reinterpret_cast<uintptr_t>(weights))
                              & 15)
         == 0;
     int const vec_total = aligned ? total & ~3 : 0;
-    for (int i = threadIdx.x * 4; i < vec_total; i += blockDim.x * 4)
+    int const step = blockDim.x * 4;
+    for (int first = threadIdx.x * 4; first < vec_total; first += kCopySteps * step)
     {
-        int4 const id_words = load_words_or_fill(ids, i, valid, -1);
-        int4 const weight_words = load_words_or_fill(weights, i, valid, 0);
-        *reinterpret_cast<int4*>(out_ids + i) = id_words;
-        *reinterpret_cast<int4*>(out_weights + i) = weight_words;
+        int4 id_words[kCopySteps] = {};
+        int4 weight_words[kCopySteps] = {};
+#pragma unroll
+        for (int k = 0; k < kCopySteps; ++k)
+        {
+            int const i = first + k * step;
+            if (i < vec_total)
+            {
+                id_words[k] = *reinterpret_cast<int4 const*>(ids + i);
+                weight_words[k] = *reinterpret_cast<int4 const*>(weights + i);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < kCopySteps; ++k)
+        {
+            int const i = first + k * step;
+            if (i < vec_total)
+            {
+                *reinterpret_cast<int4*>(out_ids + i) = fill_past_valid(id_words[k], i, valid, -1);
+                *reinterpret_cast<int4*>(out_weights + i) = fill_past_valid(weight_words[k], i, valid, 0);
+            }
+        }
     }
     for (int i = vec_total + threadIdx.x; i < total; i += blockDim.x)
     {
@@ -519,6 +536,28 @@ __device__ __forceinline__ void copy_compact_routing(
         out_ids[i] = id;
         out_weights[i] = weight;
     }
+}
+
+// Returns the row count of a source that released its flag. A count beyond the runtime capacity is corrupt. Dropping
+// a live source's tokens would silently change the output, so trap as on a timeout. Two cases are an abort instead
+// (count 0): a source that stopped waiting under an abort can run a round ahead and write its count before this rank
+// resets that slot for the round (the count reads -1), and ranks that stop waiting can match a lost source's stale
+// flag.
+__device__ int checked_source_count(
+    DispatchKernelPointers const& ptrs, int count, int source, int source_tokens, int rank_id)
+{
+    if (count >= 0 && count <= source_tokens)
+    {
+        return count;
+    }
+    if (count == -1 || (ptrs.abort != nullptr && observe_abort(ptrs.abort)))
+    {
+        return 0;
+    }
+    printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id, count, source,
+        source_tokens);
+    asm volatile("trap;" ::: "memory");
+    return 0;
 }
 
 // Fixed slots: receive one source. Waits for that source's flag and writes source_valid_counts[source] (0 for a masked
@@ -534,85 +573,101 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-    __shared__ int received;
     bool const active = is_rank_active(ptrs.active_rank_mask, source);
+    __shared__ bool released;
+    __shared__ int const* count_slot;
     if (threadIdx.x == 0)
     {
         uint32_t const expected_value = *ptrs.flag_val;
         int* const round_recv_count = ptrs.recv_counters[rank_id] + round_parity(expected_value) * ep_size + source;
-        int count = 0;
+        bool arrived = false;
         if (!active)
         {
             *round_recv_count = 0;
         }
-        else if (!wait_round_flag(&ptrs.completion_flags[rank_id][source], expected_value, ptrs.timeout_cycles,
+        else if (wait_round_flag(&ptrs.completion_flags[rank_id][source], expected_value, ptrs.timeout_cycles,
                      ptrs.abort, rank_id, source, "dispatch"))
         {
-            count = -1;
-        }
-        else
-        {
             // The source wrote its count and rows before releasing its flag, from another GPU: only a system-scope
-            // acquire orders the reads below after them.
+            // acquire orders the reads below after them. The barrier extends it to every thread of the CTA.
 #if TLLM_MOE_A2A_COMPILE_SM90
             asm volatile("fence.acquire.sys;");
 #else
             asm volatile("fence.acq_rel.sys;");
 #endif
-            count = *round_recv_count;
-            // A count beyond the runtime capacity is corrupt. Dropping a live source's tokens would silently change
-            // the output, so trap as on a timeout. Two cases are an abort instead: a source that stopped waiting under
-            // an abort can run a round ahead and write its count before this rank resets that slot for the round
-            // (the count reads -1), and ranks that stop waiting can match a lost source's stale flag. Release the
-            // source as an aborted one.
-            if (count < 0 || count > source_tokens)
-            {
-                if (count == -1 || (ptrs.abort != nullptr && observe_abort(ptrs.abort)))
-                {
-                    count = -1;
-                }
-                else
-                {
-                    printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id,
-                        count, source, source_tokens);
-                    asm volatile("trap;" ::: "memory");
-                }
-            }
+            arrived = true;
         }
-        ptrs.source_valid_counts[source] = count < 0 ? 0 : count;
-        received = count;
+        released = arrived;
+        count_slot = round_recv_count;
     }
     __syncthreads();
-    bool const arrived = received >= 0;
-    int const count = arrived ? received : 0;
-    if (ptrs.compact_expert_ids == nullptr)
+    bool const arrived = released;
+    // Every thread reads the count, so it loads together with the rows below. An out-of-range count copies no rows;
+    // thread 0 then traps on it or releases the source as aborted.
+    int const raw_count = arrived ? *count_slot : 0;
+    bool const count_valid = arrived && raw_count >= 0 && raw_count <= source_tokens;
+    int const count = count_valid ? raw_count : 0;
+    if (ptrs.compact_expert_ids != nullptr)
     {
-        return;
-    }
-    if constexpr (ENABLE_EPLB)
-    {
-        // The source wrote its statistics row into this rank's gathered statistics before releasing its flag.
-        if (ptrs.eplb_stats_out != nullptr)
+        // The source wrote its statistics row into this rank's gathered statistics before releasing its flag. The row
+        // is loaded before the routing copy and stored after it, so its round trip overlaps the copy's.
+        constexpr int kStagedStats = 2;
+        [[maybe_unused]] int staged_stats[kStagedStats] = {};
+        [[maybe_unused]] int const* stats_row = nullptr;
+        if constexpr (ENABLE_EPLB)
         {
-            int const* row = ptrs.eplb_gathered_stats[rank_id] + source * eplb_stats_num_experts;
-            int* out = ptrs.eplb_stats_out + source * eplb_stats_num_experts;
-            for (int expert = threadIdx.x; expert < eplb_stats_num_experts; expert += blockDim.x)
+            if (ptrs.eplb_stats_out != nullptr && arrived)
             {
-                out[expert] = active && arrived ? row[expert] : 0;
+                stats_row = ptrs.eplb_gathered_stats[rank_id] + source * eplb_stats_num_experts;
+#pragma unroll
+                for (int k = 0; k < kStagedStats; ++k)
+                {
+                    int const expert = threadIdx.x + k * blockDim.x;
+                    if (expert < eplb_stats_num_experts)
+                    {
+                        staged_stats[k] = stats_row[expert];
+                    }
+                }
+            }
+        }
+        int64_t const slot_offset = static_cast<int64_t>(source) * ptrs.slot_tokens * TOP_K;
+        auto const* expert_ids
+            = static_cast<int32_t const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index]) + slot_offset;
+        auto const* weights
+            = static_cast<float const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index + 1]) + slot_offset;
+        int64_t const out_offset = static_cast<int64_t>(source) * source_tokens * TOP_K;
+        // Rows the source did not send get id -1 and weight 0.F (all-zero bits), so the weights copy as words.
+        static_assert(sizeof(float) == sizeof(int32_t), "router weights copy as 32-bit words");
+        copy_compact_routing(ptrs.compact_expert_ids + out_offset,
+            reinterpret_cast<int32_t*>(ptrs.compact_weights + out_offset), expert_ids,
+            reinterpret_cast<int32_t const*>(weights), count * TOP_K, source_tokens * TOP_K);
+        if constexpr (ENABLE_EPLB)
+        {
+            if (ptrs.eplb_stats_out != nullptr)
+            {
+                int* out = ptrs.eplb_stats_out + source * eplb_stats_num_experts;
+#pragma unroll
+                for (int k = 0; k < kStagedStats; ++k)
+                {
+                    int const expert = threadIdx.x + k * blockDim.x;
+                    if (expert < eplb_stats_num_experts)
+                    {
+                        out[expert] = count_valid ? staged_stats[k] : 0;
+                    }
+                }
+                for (int expert = threadIdx.x + kStagedStats * blockDim.x; expert < eplb_stats_num_experts;
+                     expert += blockDim.x)
+                {
+                    out[expert] = count_valid ? stats_row[expert] : 0;
+                }
             }
         }
     }
-    int64_t const slot_offset = static_cast<int64_t>(source) * ptrs.slot_tokens * TOP_K;
-    auto const* expert_ids
-        = static_cast<int32_t const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index]) + slot_offset;
-    auto const* weights
-        = static_cast<float const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index + 1]) + slot_offset;
-    int64_t const out_offset = static_cast<int64_t>(source) * source_tokens * TOP_K;
-    // Rows the source did not send get id -1 and weight 0.F (all-zero bits), so the weights copy as words.
-    static_assert(sizeof(float) == sizeof(int32_t), "router weights copy as 32-bit words");
-    copy_compact_routing(ptrs.compact_expert_ids + out_offset,
-        reinterpret_cast<int32_t*>(ptrs.compact_weights + out_offset), expert_ids,
-        reinterpret_cast<int32_t const*>(weights), count * TOP_K, source_tokens * TOP_K);
+    if (threadIdx.x == 0)
+    {
+        ptrs.source_valid_counts[source]
+            = arrived ? checked_source_count(ptrs, raw_count, source, source_tokens, rank_id) : 0;
+    }
 }
 
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
