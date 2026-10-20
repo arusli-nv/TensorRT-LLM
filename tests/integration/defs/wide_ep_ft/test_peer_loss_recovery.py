@@ -20,7 +20,7 @@ import pytest
 import yaml
 
 from ..conftest import llm_models_root
-from .peer_loss_driver import PROMPTS, SHORT_MAX_TOKENS, llm_kwargs
+from .peer_loss_driver import PROMPTS, RUN_TOKEN_ENV, SHORT_MAX_TOKENS, llm_kwargs
 
 VICTIM = 2
 WORLD_SIZE = 4
@@ -34,6 +34,9 @@ SERVE_TIMEOUT_S = 1800
 TEARDOWN_TIMEOUT_S = 180
 # The server's view of the authority is at most 1 s old and a query waits 0.5 s.
 HEALTH_SETTLE_S = 30
+# The authority imports TensorRT-LLM before it listens; another process may take its port first.
+AUTHORITY_START_TIMEOUT_S = 120
+AUTHORITY_START_ATTEMPTS = 3
 # Set to 1 where the image must provide ULFM: its absence then fails these tests instead of skipping them.
 REQUIRE_ULFM_ENV = "TLLM_REQUIRE_ULFM"
 # ULFM needs the ob1 PML and collectives without hcoll/ucc.
@@ -82,20 +85,52 @@ def _model() -> Path:
 
 
 def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    """A localhost port free for TCP and UDP (the authority takes both) when this returns."""
+    while True:
+        with socket.socket() as tcp, socket.socket(type=socket.SOCK_DGRAM) as udp:
+            tcp.bind(("127.0.0.1", 0))
+            port = tcp.getsockname()[1]
+            try:
+                udp.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+
+
+def _listens(pid: int, port: int) -> bool:
+    """Whether process ``pid`` holds a TCP socket listening on localhost ``port``."""
+    sockets = set()
+    for line in Path("/proc/net/tcp").read_text().splitlines()[1:]:
+        fields = line.split()
+        # Columns: index, local address:port (hex), remote, state (0A is LISTEN), ..., inode.
+        if fields[3] == "0A" and int(fields[1].split(":")[1], 16) == port:
+            sockets.add(f"socket:[{fields[9]}]")
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if os.readlink(fd) in sockets:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _fault_tolerance_env(tmp_path: Path, ft_config: dict | None, **extra: str) -> dict:
-    """The environment of the authority and every rank; ``ft_config`` becomes the FT config file."""
+    """The environment of the authority and every rank; ``ft_config`` becomes the FT config file.
+
+    ``_start_authority`` adds the authority's endpoint.
+    """
     # Ranks come from mpirun, not from an enclosing Slurm or PMIx launch.
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_MCA_ess", "PRTE_MCA_ras")
     env = dict(
         {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)},
         TLLM_FAULT_TOLERANCE_MODE="1",
-        TLLM_FAULT_TOLERANCE_AUTHORITY=f"tcp://127.0.0.1:{_free_port()}",
         TLLM_FAULT_TOLERANCE_AUTHORITY_KEY=secrets.token_hex(32),
+        # The driver faults only worker processes with this run's token.
+        **{RUN_TOKEN_ENV: secrets.token_hex(8)},
         # The fault-tolerant MoE all-to-all runs the NVLinkOneSided fence path.
         TRTLLM_FORCE_COMM_METHOD="NVLINK_ONE_SIDED",
         TLLM_LOG_LEVEL="info",
@@ -112,20 +147,33 @@ def _fault_tolerance_env(tmp_path: Path, ft_config: dict | None, **extra: str) -
 
 
 def _start_authority(env: dict, log) -> subprocess.Popen:
-    return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tensorrt_llm.executor.recovery.authority",
-            "--endpoint",
-            env["TLLM_FAULT_TOLERANCE_AUTHORITY"],
-            "--world-size",
-            str(WORLD_SIZE),
-        ],
-        env=dict(env, CUDA_VISIBLE_DEVICES=""),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
+    """Start the authority on a free port and set its endpoint in ``env`` once it listens there."""
+    for _ in range(AUTHORITY_START_ATTEMPTS):
+        port = _free_port()
+        endpoint = f"tcp://127.0.0.1:{port}"
+        authority = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tensorrt_llm.executor.recovery.authority",
+                "--endpoint",
+                endpoint,
+                "--world-size",
+                str(WORLD_SIZE),
+            ],
+            env=dict(env, CUDA_VISIBLE_DEVICES=""),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        deadline = time.monotonic() + AUTHORITY_START_TIMEOUT_S
+        while authority.poll() is None and time.monotonic() < deadline:
+            if _listens(authority.pid, port):
+                env["TLLM_FAULT_TOLERANCE_AUTHORITY"] = endpoint
+                return authority
+            time.sleep(0.5)
+        # Another process bound the port first, or the authority did not start.
+        _stop_authority(authority)
+    pytest.fail(f"The recovery authority did not listen after {AUTHORITY_START_ATTEMPTS} attempts")
 
 
 def _stop_authority(authority: subprocess.Popen) -> None:
@@ -357,8 +405,9 @@ def test_authority_lost_while_serving(tmp_path: Path):
     env = _fault_tolerance_env(tmp_path, None)
     config_path = tmp_path / "serve.yaml"
     config_path.write_text(yaml.safe_dump(llm_kwargs()))
-    port = _free_port()
-    base_url = f"http://127.0.0.1:{port}"
+    # The server binds a port of the kernel's choice and reports it here.
+    address_path = tmp_path / "serve_address"
+    base_url = None
     mpirun_log = tmp_path / "mpirun.log"
 
     with (
@@ -376,7 +425,9 @@ def test_authority_lost_while_serving(tmp_path: Path):
                     "--host",
                     "127.0.0.1",
                     "--port",
-                    str(port),
+                    "0",
+                    "--report_addr",
+                    str(address_path),
                     "--config",
                     str(config_path),
                 ],
@@ -389,12 +440,15 @@ def test_authority_lost_while_serving(tmp_path: Path):
             while True:
                 assert mpirun.poll() is None, mpirun_log.read_text(errors="replace")[-20000:]
                 assert time.monotonic() < deadline, "trtllm-serve did not become healthy"
-                try:
-                    health = _get(f"{base_url}/health")
-                    if health[0] == 200 and health[1].get("state") == "healthy":
-                        break
-                except (urllib.error.URLError, ConnectionError, TimeoutError):
-                    pass
+                if base_url is None and address_path.exists():
+                    base_url = f"http://{address_path.read_text().strip()}"
+                if base_url is not None:
+                    try:
+                        health = _get(f"{base_url}/health")
+                        if health[0] == 200 and health[1].get("state") == "healthy":
+                            break
+                    except (urllib.error.URLError, ConnectionError, TimeoutError):
+                        pass
                 time.sleep(5)
             # The authority's details ride on /health while it answers.
             assert health[1]["recoveries"] == 0 and health[1]["failed_ranks"] == [], health

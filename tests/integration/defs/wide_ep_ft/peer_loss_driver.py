@@ -8,6 +8,8 @@ and writes what every request returned to ``--output``.
 
 - ``idle``: fault between two rounds of requests.
 - ``inflight``: fault while one request per attention-DP rank is decoding.
+
+Only worker processes that carry this run's ``RUN_TOKEN_ENV`` value are faulted.
 """
 
 import argparse
@@ -18,6 +20,8 @@ import time
 from pathlib import Path
 
 KILL_MARKER = "PEER_LOSS_DRIVER_KILL"
+# Environment variable whose value marks the processes of one test run.
+RUN_TOKEN_ENV = "WIDEEP_FT_TEST_RUN_TOKEN"
 WORLD_SIZE = 4
 NUM_EXPERTS = 72
 FIRST_MOE_LAYER = 1
@@ -86,7 +90,9 @@ def llm_kwargs(overlap: bool = False, replica_offset: int = 1, online_slots: int
 
 
 def find_worker(rank: int) -> int:
-    """Return the pid of the local ``mgmn_worker_node`` process of MPI ``rank``."""
+    """Return the pid of this run's local ``mgmn_worker_node`` process of MPI ``rank``."""
+    run_token = f"{RUN_TOKEN_ENV}={os.environ[RUN_TOKEN_ENV]}".encode()
+    pids = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -95,9 +101,15 @@ def find_worker(rank: int) -> int:
             environ = (entry / "environ").read_bytes().split(b"\0")
         except OSError:
             continue
-        if b"mgmn_worker_node" in cmdline and f"OMPI_COMM_WORLD_RANK={rank}".encode() in environ:
-            return int(entry.name)
-    raise LookupError(f"No local worker process for rank {rank}")
+        if (
+            b"mgmn_worker_node" in cmdline
+            and run_token in environ
+            and f"OMPI_COMM_WORLD_RANK={rank}".encode() in environ
+        ):
+            pids.append(int(entry.name))
+    if len(pids) != 1:
+        raise LookupError(f"Expected one local worker process of rank {rank}, found {pids}")
+    return pids[0]
 
 
 def submit(llm, ranks, max_tokens: int, stream_rank: int | None = None) -> list:
