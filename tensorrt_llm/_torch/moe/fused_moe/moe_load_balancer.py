@@ -16,6 +16,7 @@ from multiprocessing import resource_tracker, shared_memory
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pynvml
 import torch
 from mpi4py import MPI
 
@@ -1330,9 +1331,17 @@ class MoeLoadBalancer:
             )
             mappings, mapped_bytes = _tbr.ghost_slot_memory_host_mappings()
             if mappings:
+                try:
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(
+                        f"GPU-{torch.cuda.get_device_properties(torch.cuda.current_device()).uuid}"
+                    )
+                    bar1 = f"{pynvml.nvmlDeviceGetBAR1MemoryInfo(handle).bar1Total / (1 << 30):.2f} GiB"
+                except pynvml.NVMLError as error:
+                    bar1 = f"unknown ({error})"
                 logger.info(
-                    f"Ghost slot memory: {mappings} GDRCopy host mappings of {mapped_bytes / (1 << 30):.2f} GiB on rank 0"
-                )
+                    f"Ghost slot memory: {mappings} GDRCopy host mappings of {mapped_bytes / (1 << 30):.2f} GiB "
+                    f"on rank 0, of a BAR1 of {bar1}")
         if mode is not None:
             for layer in self.single_layer_load_balancers:
                 local = np.asarray(
