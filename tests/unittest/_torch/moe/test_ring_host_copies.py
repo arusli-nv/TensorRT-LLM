@@ -31,7 +31,7 @@ def _sharer(local_rank, local_size, expert_count=8, expert_ids=None):
 
 
 @pytest.mark.parametrize("expert_count, local_size", [(8, 4), (10, 4), (3, 4)])
-def test_sharer_splits_every_expert_by_default_as_before(expert_count, local_size):
+def test_sharer_splits_every_expert_over_the_node_s_ranks_by_default(expert_count, local_size):
     for local_rank in range(local_size):
         sharer = _sharer(local_rank, local_size, expert_count)
         start = local_rank * expert_count // local_size

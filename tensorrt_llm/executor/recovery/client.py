@@ -21,8 +21,8 @@ from .protocol import MAX_MESSAGE_BYTES, Abort, Message, Register, Registered, S
 
 __all__ = [
     "AUTHORITY_ENV",
-    "CONNECTION_OPTIONS",
     "AUTHORITY_KEY_ENV",
+    "CONNECTION_OPTIONS",
     "RecoveryAborted",
     "RecoveryClient",
     "RecoveryError",
