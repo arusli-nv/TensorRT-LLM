@@ -29,6 +29,22 @@ from tensorrt_llm.mapping import Mapping
 
 # madvise(2) advice that builds this process's page-table entries for resident pages (Linux 5.14+).
 _MADV_POPULATE_READ = 22
+# Where multiprocessing.shared_memory keeps the EPLB host copies on Linux.
+_SHM_MOUNT = "/dev/shm"
+
+
+def _check_shm_space(required: int, layer_id: int) -> None:
+    """Raise unless ``_SHM_MOUNT`` has ``required`` bytes free: a write past a full tmpfs is a SIGBUS."""
+    stat = os.statvfs(_SHM_MOUNT)
+    free = stat.f_bavail * stat.f_frsize
+    if free < required:
+        gib = 1 << 30
+        raise RuntimeError(
+            f"{_SHM_MOUNT} has {free / gib:.2f} GiB free of {stat.f_blocks * stat.f_frsize / gib:.2f} GiB, "
+            f"but this rank's part of the EPLB host copies of MoE layer {layer_id} needs {required / gib:.2f} GiB. "
+            f"Each node keeps in {_SHM_MOUNT} host copies of the experts it may load (with online EPLB, "
+            "every expert of every MoE layer); enlarge it, e.g. with docker run --shm-size or a "
+            "memory-backed emptyDir in Kubernetes")
 
 
 def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
@@ -255,6 +271,7 @@ class HostMoeTensorSharer:
 
         # A rank of a node that holds fewer experts than it has ranks may share none.
         if total_size:
+            _check_shm_space(total_size, self.layer_id)
             shm_name = self.get_shared_memory_name()
             try:
                 shm = shared_memory.SharedMemory(name=shm_name,

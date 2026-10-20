@@ -81,6 +81,29 @@ def test_a_rank_that_shares_no_expert_creates_no_shared_memory():
             sharer.post_shutdown_cleanup()
 
 
+def test_a_layer_that_does_not_fit_in_shared_memory_fails_before_creating_it(monkeypatch):
+    # Two local ranks share four experts of 300 bytes aligned to 512: this rank's part needs 1024 bytes.
+    sharer = _sharer(0, 2, expert_count=4)
+    sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
+    for expert in range(4):
+        if expert in sharer.own_expert_ids:
+            sharer.share_host_tensor_with_shape(expert, "w", torch.zeros(300, dtype=torch.uint8))
+        else:
+            sharer.pre_register_host_tensor_with_shape(expert, "w", torch.uint8, (300,))
+    statvfs = Mock(return_value=Mock(f_bavail=1023, f_frsize=1, f_blocks=4096))
+    monkeypatch.setattr("os.statvfs", statvfs)
+    with pytest.raises(RuntimeError, match=r"/dev/shm has .* MoE layer 0 needs"):
+        sharer.finalize_layer_weights()
+    assert sharer.own_shm is None
+    statvfs.return_value.f_bavail = 1024
+    try:
+        sharer.finalize_layer_weights()
+        assert sharer.own_shm is not None
+    finally:
+        sharer.pre_shutdown_cleanup()
+        sharer.post_shutdown_cleanup()
+
+
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 # A launcher that maps ranks round-robin: node "a" runs ranks 0 and 2, node "b" ranks 1 and 3.
 _HOSTS = ["a", "b", "a", "b"]
