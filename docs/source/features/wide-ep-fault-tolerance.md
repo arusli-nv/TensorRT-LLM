@@ -56,8 +56,7 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
    on Open MPI's in-band failure detector on its own thread. It notices a dead or frozen process whose
    connections stay open (a stopped process, a frozen host) within about the timeout: a process silent at the
    OS level for more than 5 s is treated as failed. Without it, only closed connections and hang detection
-   reveal one. It showed no detectable healthy cost at DEP32 (resolved to about 3% at 128 requests per GPU). Open MPI marks it
-   experimental. Its unthreaded form can declare a slow-starting rank dead.
+   reveal one. Its healthy-path cost is being measured. Open MPI marks it experimental. Its unthreaded form can declare a slow-starting rank dead.
 
 | Variable | Meaning |
 |---|---|
@@ -69,7 +68,7 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
 | Setting | Meaning |
 |---|---|
 | `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
-| `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `ghost` (default) are empty slots that hold no device memory while healthy (the KV cache keeps it) and get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume). With online EPLB, its slots keep serving replicas; where they cannot hold every expert after the loss of a failure domain, each rank gets the missing slots of this kind after EPLB's own, and EPLB's updates use one once a restore filled it |
+| `extra_slots` | The slots beyond one per expert. The default depends on the deployment: `ghost` with a static EPLB placement, `empty` with online EPLB, whose weight updates would load ghost slot memory with GPU copies every iteration. `ghost` slots are empty slots that hold no device memory while healthy (the KV cache keeps it) and get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume); that is about one slot per rank per MoE layer, an estimated 1.4 GiB per GPU for DeepSeek-R1 NVFP4. With online EPLB, its slots keep serving replicas; where they cannot hold every expert after the loss of a failure domain, each rank gets the missing slots of this kind after EPLB's own, and EPLB's updates use one once a restore filled it. Do not combine online EPLB with `ghost`: its updates copy on the GPU every step |
 | `recovery_timeout_s` | How long a worker's recovery may take, including finishing a long step first, before the job stops (default 30 s) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20 s; must be below `recovery_timeout_s`) |
 | `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a hung rank 0 or a stall of every rank as terminal (default `false`) |
@@ -119,7 +118,7 @@ The loss, with the NVLink fabric healthy, of either:
   DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, that is 320 slots (320 = 256 active + 64 ghost,
   10 per rank): the survivors of one node's loss hold 280 slots. The 64 ghost slots cover one node, and up to
   6 lost GPUs in total over repeated losses (26 survivors hold 260 slots).
-  With online EPLB (`num_slots: 288`), fault tolerance adds one ghost slot per rank after EPLB's own: 320 in all.
+  With online EPLB (`num_slots: 288`), fault tolerance adds one empty slot per rank after EPLB's own by default: 320 in all.
 
 Several such ranks lost together, or one more during a recovery (before the survivors install the new
 communicator), are recovered as one loss if the survivors' slots still hold every expert. A further loss after a
@@ -143,8 +142,8 @@ Not covered (these fail closed: the job ends as without fault tolerance):
 
 The authority is not a single point of failure for serving: if it stops, the deployment keeps serving but
 unprotected (`/health` reports `unprotected`), and a rank loss then ends the job. A job that recovered
-from a loss still stops cleanly: stopping `trtllm-serve` finalizes MPI on the survivors and `mpirun` exits with
-status 0 (a survivor that does not finalize within 120 s ends the job with a non-zero status).
+from a loss still stops: stopping `trtllm-serve` finalizes MPI on each process, which waits at most 30 s for
+`MPI_Finalize` and then exits with its status.
 
 After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
 (and may take more of the KV cache for restored experts). A request re-run after its rank's loss (see below) runs
@@ -202,6 +201,8 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
 - Nothing restarts the authority, and the workers register only at startup: an authority started again
   reports `starting` (503) until the deployment restarts. Restart the authority only together with the job,
   with a new key, never under a running job.
+- Under ULFM, `MPI_Finalize` can hang, so a stop can take up to about 30 s longer than without fault
+  tolerance. Give the orchestrator's grace period room for it (Kubernetes' default is 30 s).
 - Stopping the job (`scancel`, deleting its pods) signals every rank; a rank signaled a moment after another may
   log a recovery attempt before it exits. The job ends anyway, with the status of the signal.
 - With ring host copies (online EPLB off), losing a node (or only its copy node) leaves the next node's
