@@ -488,7 +488,7 @@ __global__ void moeA2APrepareDispatchKernel(
 // source or when an abort releases the wait). With compact routing it then copies the source's routed expert ids and
 // router weights to the compact lists (see DispatchKernelPointers::compact_expert_ids), and with EPLB statistics the
 // source's row of the gathered statistics to eplb_stats_out (0 for a masked source). Runs in a CTA after every token
-// CTA, so its wait never holds an SM a token CTA needs. An abort leaves the outputs partial; the step is discarded.
+// CTA, so its wait never holds an SM a token CTA needs. A source an abort released gets a masked source's rows.
 template <int TOP_K, bool ENABLE_EPLB>
 __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, int source_tokens, int rank_id,
     int ep_size, int eplb_stats_num_experts)
@@ -530,8 +530,9 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
         received = count;
     }
     __syncthreads();
-    int const count = received;
-    if (count < 0 || ptrs.compact_expert_ids == nullptr)
+    bool const arrived = received >= 0;
+    int const count = arrived ? received : 0;
+    if (ptrs.compact_expert_ids == nullptr)
     {
         return;
     }
@@ -544,7 +545,7 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
             int* out = ptrs.eplb_stats_out + source * eplb_stats_num_experts;
             for (int expert = threadIdx.x; expert < eplb_stats_num_experts; expert += blockDim.x)
             {
-                out[expert] = active ? row[expert] : 0;
+                out[expert] = active && arrived ? row[expert] : 0;
             }
         }
     }

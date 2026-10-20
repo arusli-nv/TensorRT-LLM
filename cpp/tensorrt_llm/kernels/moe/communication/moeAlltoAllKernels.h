@@ -162,8 +162,8 @@ struct DispatchKernelPointers
     float* compact_weights{nullptr};
     int compact_payload_index{0};
     // Optional (fixed slots with EPLB statistics): [ep_size, eplb_stats_num_experts], local. The same CTAs copy each
-    // active source's row of the gathered statistics here once its flag arrives (0 for a masked source), so readers
-    // never see a lost rank's late writes into the gathered buffer.
+    // active source's row of the gathered statistics here once its flag arrives (0 for a masked or aborted source),
+    // so readers never see a lost rank's late writes into the gathered buffer.
     int* eplb_stats_out{nullptr};
 
     // Host-selected wait budget in clock64() cycles.
