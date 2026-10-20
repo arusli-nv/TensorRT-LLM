@@ -7,7 +7,7 @@ attention DP, SIGKILLs (or SIGSTOPs) the worker processes of the victim ranks, k
 and writes what every request returned to ``--output``.
 
 - ``idle``: fault between two rounds of requests.
-- ``inflight``: fault while one request per attention-DP rank is decoding.
+- ``inflight``: fault while ``--per-rank`` requests per attention-DP rank are decoding.
 
 Only worker processes that carry this run's ``RUN_TOKEN_ENV`` value are faulted.
 """
@@ -112,7 +112,8 @@ def find_worker(rank: int) -> int:
     return pids[0]
 
 
-def submit(llm, ranks, max_tokens: int, stream_rank: int | None = None) -> list:
+def submit(llm, ranks, max_tokens: int, stream_index: int | None = None) -> list:
+    """Submit ``PROMPTS[rank]`` pinned to each attention-DP rank of ``ranks``; stream the one at ``stream_index``."""
     from tensorrt_llm import SamplingParams
     from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -123,13 +124,13 @@ def submit(llm, ranks, max_tokens: int, stream_rank: int | None = None) -> list:
             llm.generate_async(
                 PROMPTS[rank][0],
                 params,
-                streaming=rank == stream_rank,
+                streaming=index == stream_index,
                 scheduling_params=SchedulingParams(
                     attention_dp_rank=rank, attention_dp_relax=False
                 ),
             ),
         )
-        for rank in ranks
+        for index, rank in enumerate(ranks)
     ]
 
 
@@ -173,6 +174,9 @@ def main() -> None:
     )
     parser.add_argument("--replica-offset", type=int, default=1, help="see placement()")
     parser.add_argument("--online-slots", type=int, default=0, help="see llm_kwargs()")
+    parser.add_argument(
+        "--per-rank", type=int, default=1, help="in-flight requests per attention-DP rank"
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlap", action="store_true", help="run the overlap scheduler")
     args = parser.parse_args()
@@ -191,9 +195,10 @@ def main() -> None:
             time.sleep(2)
             fault(args.victims, signum)
         else:
-            probe_rank = survivors[0]
-            pending = submit(llm, all_ranks, LONG_MAX_TOKENS, stream_rank=probe_rank)
-            probe = dict(pending)[probe_rank]
+            ranks = [rank for rank in all_ranks for _ in range(args.per_rank)]
+            probe_index = ranks.index(survivors[0])
+            pending = submit(llm, ranks, LONG_MAX_TOKENS, stream_index=probe_index)
+            probe = pending[probe_index][1]
             while len(next(probe).outputs[0].token_ids) < TOKENS_BEFORE_KILL:
                 pass
             fault(args.victims, signum)

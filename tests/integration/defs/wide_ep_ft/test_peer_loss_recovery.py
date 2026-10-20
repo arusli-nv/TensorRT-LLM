@@ -261,23 +261,26 @@ def _assert_answered(rows: list[dict]) -> None:
 
 
 def _assert_recovered(
-    result: dict, output: str, authority_text: str, mode: str, lost: list[int]
+    result: dict, output: str, authority_text: str, mode: str, lost: list[int], per_rank: int = 1
 ) -> str:
     """Every request answered, the survivors resumed without ``lost`` and nothing was rebuilt.
 
-    Returns the mpirun log from the first fault on.
+    ``per_rank`` is the driver's in-flight requests per attention-DP rank. Returns the mpirun log
+    from the first fault on.
     """
     _assert_answered(result["healthy"])
     healthy_ids = {row["rank"]: row["token_ids"] for row in result["healthy"]}
     if mode == "inflight":
         # The lost ranks' requests streamed nothing, so the survivors ran them again from their prompts.
         _assert_answered(result["during_loss"])
-        # A survivor's request decoded its first tokens before the loss, alone on its rank as in
-        # the healthy round: the same greedy tokens.
-        for row in result["during_loss"]:
-            if row["rank"] not in lost:
-                assert row["token_ids"][:SHORT_MAX_TOKENS] == healthy_ids[row["rank"]], row
-        assert f"Running {len(lost)} requests of the lost ranks again" in output, output[-20000:]
+        if per_rank == 1:
+            # A survivor's request decoded its first tokens before the loss, alone on its rank as in
+            # the healthy round: the same greedy tokens.
+            for row in result["during_loss"]:
+                if row["rank"] not in lost:
+                    assert row["token_ids"][:SHORT_MAX_TOKENS] == healthy_ids[row["rank"]], row
+        rerun = f"Running {len(lost) * per_rank} requests of the lost ranks again"
+        assert rerun in output, output[-20000:]
     _assert_answered(result["after_loss"])
     # Replicas and restored slots hold the lost experts' exact weights, and every survivor again decodes
     # its prompt alone: the same greedy tokens as in the healthy round.
@@ -302,6 +305,17 @@ def _assert_recovered(
 def test_peer_loss_recovery(mode: str, overlap: bool, tmp_path: Path):
     result, output, authority_text = _run_driver(tmp_path, mode, [VICTIM], overlap=overlap)
     _assert_recovered(result, output, authority_text, mode, [VICTIM])
+
+
+@pytest.mark.skip_less_device(WORLD_SIZE)
+@pytest.mark.skip_device_not_contain(["GB200"])
+def test_peer_loss_recovery_under_load(tmp_path: Path):
+    """Rank 2 dies while 32 requests decode, a full batch of 8 on every attention-DP rank."""
+    per_rank = 8
+    result, output, authority_text = _run_driver(
+        tmp_path, "inflight", [VICTIM], "--per-rank", str(per_rank)
+    )
+    _assert_recovered(result, output, authority_text, "inflight", [VICTIM], per_rank)
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)

@@ -103,6 +103,7 @@ l0_gb200_multi_gpus:
   - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[idle-overlap] TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[inflight-sync] TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[inflight-overlap] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery_under_load TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_two_ranks_lost_together TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_rank_lost_during_recovery TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_ghost_slots[static] TIMEOUT (45)
