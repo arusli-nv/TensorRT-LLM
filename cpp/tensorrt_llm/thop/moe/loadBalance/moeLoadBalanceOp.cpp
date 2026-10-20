@@ -219,8 +219,9 @@ void migrateToHostAccessible(at::Tensor& tensor)
 }
 
 // Moves an EPLB slot tensor ([local slots, ...], contiguous) to storage whose empty slots take no device memory
-// until a restore loads them (GhostSlotMemory). Their contents are not kept.
-void moeGhostSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
+// until a restore loads them (GhostSlotMemory), on memory that CPU copies load if hostAccessible. Their contents are
+// not kept.
+void moeGhostSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots, bool hostAccessible)
 {
     // A repacked layout (e.g. DEEPGEMM's MN-major scales) is accepted if each slot fills one dense block.
     TORCH_CHECK(tensor.device().is_cuda() && tensor.is_non_overlapping_and_dense() && tensor.dim() >= 1
@@ -229,7 +230,7 @@ void moeGhostSlotStorage(at::Tensor& tensor, at::IntArrayRef emptySlots)
     size_t const byteSize = tensor.numel() * tensor.element_size();
     int const slotCount = static_cast<int>(tensor.size(0));
     void* devPtr = tensorrt_llm::runtime::GhostSlotMemory::getInstance().allocate(
-        byteSize / slotCount, slotCount, std::vector<int>(emptySlots.begin(), emptySlots.end()));
+        byteSize / slotCount, slotCount, std::vector<int>(emptySlots.begin(), emptySlots.end()), hostAccessible);
     // Owned before the copy, so that a failed copy frees it.
     c10::DataPtr dp(
         devPtr, devPtr, [](void* ptr) { tensorrt_llm::runtime::GhostSlotMemory::getInstance().free(ptr); },
@@ -329,7 +330,7 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("migrate_to_host_accessible(Tensor tensor) -> ()");
-    m.def("moe_ghost_slot_storage(Tensor tensor, int[] empty_slots) -> ()");
+    m.def("moe_ghost_slot_storage(Tensor tensor, int[] empty_slots, bool host_accessible=False) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

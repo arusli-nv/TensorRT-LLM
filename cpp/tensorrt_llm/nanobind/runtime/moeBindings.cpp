@@ -17,9 +17,11 @@
 
 #include "moeBindings.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <vector>
 
@@ -145,6 +147,11 @@ void initMoeBindings(nb::module_& m)
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
         "If current system support host accessible device memory");
+    m.def("is_ghost_slot_memory_host_accessible", &tr::GhostSlotMemory::hostAccessibleSupported,
+        "Whether ghost slot memory can be host accessible without the managed memory fallback, for CPU copies");
+    m.def(
+        "ghost_slot_memory_host_mappings", [] { return tr::GhostSlotMemory::getInstance().hostMappings(); },
+        "The host mappings (GDRCopy pins where GPU memory is not a NUMA node) of ghost slot memory and their bytes");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, nb::arg("meta_info"), nb::arg("expert_load_factor"),

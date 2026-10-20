@@ -91,7 +91,10 @@ public:
 protected:
     void finalizeWeightSlot();
     bool mWeightSlotsFinalized = false;
+    // With CPU copies, a slot holds its host-accessible address, except a slot in ghost slot memory: its host mapping
+    // changes as restores back it, so it keeps its device address (the weight is in mDeviceAddressedSlots).
     std::map<std::string, std::vector<MoeWeight>> mWeightSlots;
+    std::set<std::string> mDeviceAddressedSlots;
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo mMetaInfo;
     SingleLayerMoeLoadBalancer* mLayerLoadBalancer;
 };
@@ -116,7 +119,7 @@ public:
 
 private:
     static void copyWeights(MoeWeight const& src, MoeWeight const& dst, cudaStream_t stream);
-    static void copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size);
+    static void copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size, bool dstDeviceAddressed);
     void finalizeHostWeight();
     bool mHostWeightsFinalized = false;
     std::map<std::string, std::vector<MoeWeight>> mHostWeights;

@@ -16,6 +16,7 @@
  */
 
 #include "ghostSlotMemory.h"
+#include "hostAccessibleDeviceAllocator.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cuda_runtime_api.h>
 #include <exception>
+#include <iterator>
 #include <utility>
 
 namespace tensorrt_llm::runtime
@@ -36,10 +38,13 @@ namespace
 {
 constexpr size_t kMaxScratchChunks = 8;
 
+// Read-write access for the device, and for the host on the GPU's NUMA node.
+using AccessDescs = std::vector<CUmemAccessDesc>;
+
 // Maps a handle at a fixed address; unlike UnicastConfigurator, a failed access grant does not leave it mapped.
 struct MapConfigurator : CUDAVirtualMemoryChunk::Configurator
 {
-    MapConfigurator(CUdeviceptr address, size_t size, CUmemAccessDesc const& desc)
+    MapConfigurator(CUdeviceptr address, size_t size, AccessDescs const& desc)
         : mAddress(address)
         , mSize(size)
         , mDesc(desc)
@@ -49,7 +54,7 @@ struct MapConfigurator : CUDAVirtualMemoryChunk::Configurator
     void setup(CUmemGenericAllocationHandle handle) override
     {
         TLLM_CU_CHECK(cuMemMap(mAddress, mSize, 0, handle, 0));
-        CUresult const result = cuMemSetAccess(mAddress, mSize, &mDesc, 1);
+        CUresult const result = cuMemSetAccess(mAddress, mSize, mDesc.data(), mDesc.size());
         if (result != CUDA_SUCCESS)
         {
             cuMemUnmap(mAddress, mSize);
@@ -64,7 +69,31 @@ struct MapConfigurator : CUDAVirtualMemoryChunk::Configurator
 
     CUdeviceptr mAddress;
     size_t mSize;
-    CUmemAccessDesc mDesc;
+    AccessDescs mDesc;
+};
+
+// Records a mapped handle with HostAccessibleDeviceAllocator, so that CPU copies reach it, and forgets it before the
+// handle is unmapped.
+struct HostAccessConfigurator : CUDAVirtualMemoryChunk::Configurator
+{
+    HostAccessConfigurator(CUdeviceptr address, size_t size)
+        : mAddress(address)
+        , mSize(size)
+    {
+    }
+
+    void setup(CUmemGenericAllocationHandle) override
+    {
+        HostAccessibleDeviceAllocator::getInstance().registerHostAccessible(reinterpret_cast<void*>(mAddress), mSize);
+    }
+
+    void teardown(CUmemGenericAllocationHandle, bool) override
+    {
+        HostAccessibleDeviceAllocator::getInstance().unregisterHostAccessible(reinterpret_cast<void*>(mAddress));
+    }
+
+    CUdeviceptr mAddress;
+    size_t mSize;
 };
 
 // Splits chunks into runs of the scratch sizes, largest first: (first chunk, count) each.
@@ -106,11 +135,10 @@ void releaseLogged(CUDAVirtualMemoryChunk& chunk) noexcept
 // The scratch allocations of 1, 2, 4 and 8 chunks, shared by every piece and released with the last one.
 struct GhostSlotMemory::Scratch
 {
-    Scratch(CUmemAllocationProp const& prop, size_t chunkBytes)
+    Scratch(CUmemAllocationProp const& prop, size_t chunkBytes, AccessDescs accessDescs)
         : granularity(chunkBytes)
+        , access(std::move(accessDescs))
     {
-        access.location = prop.location;
-        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         try
         {
             for (size_t chunks = 1; chunks <= kMaxScratchChunks; chunks *= 2)
@@ -155,7 +183,7 @@ struct GhostSlotMemory::Scratch
             CUresult result = cuMemMap(at, bytes, 0, handles.at(count), 0);
             if (result == CUDA_SUCCESS)
             {
-                result = cuMemSetAccess(at, bytes, &access, 1);
+                result = cuMemSetAccess(at, bytes, access.data(), access.size());
                 if (result != CUDA_SUCCESS)
                 {
                     cuMemUnmap(at, bytes);
@@ -179,7 +207,7 @@ struct GhostSlotMemory::Scratch
     }
 
     size_t granularity;
-    CUmemAccessDesc access{};
+    AccessDescs access; // of every mapping of the ranges
     std::map<size_t, CUmemGenericAllocationHandle> handles; // chunks -> allocation
 };
 
@@ -247,19 +275,93 @@ GhostSlotMemory& GhostSlotMemory::getInstance()
     return *instance;
 }
 
+bool GhostSlotMemory::hostAccessibleSupported()
+{
+    if (HostAccessibleDeviceAllocator::gpuMemoryNumaId() >= 0)
+    {
+        return true;
+    }
+    // Tried once per process (one device): GDRCopy maps one chunk as allocate() would map each of its allocations.
+    static bool const gdrMapsChunks = []
+    {
+        if (!HostAccessibleDeviceAllocator::isSupportedWithoutManagedFallback())
+        {
+            return false;
+        }
+        int device = -1;
+        TLLM_CUDA_CHECK(cudaGetDevice(&device));
+        int rdmaWithVmm = 0;
+        TLLM_CU_CHECK(
+            cuDeviceGetAttribute(&rdmaWithVmm, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, device));
+        if (rdmaWithVmm == 0)
+        {
+            return false;
+        }
+        auto& allocator = HostAccessibleDeviceAllocator::getInstance();
+        allocator.IncRefCount();
+        bool mapped = true;
+        try
+        {
+            CUmemAllocationProp prop{};
+            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = device;
+            prop.allocFlags.gpuDirectRDMACapable = 1;
+            size_t size = 0;
+            TLLM_CU_CHECK(cuMemGetAllocationGranularity(&size, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+            CUdeviceptr address = 0;
+            TLLM_CU_CHECK(cuMemAddressReserve(&address, size, size, 0, 0));
+            // Declared first so that it is freed after the chunk is released.
+            std::shared_ptr<void> const reservation(reinterpret_cast<void*>(address),
+                [size](void* ptr) { cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size); });
+            AccessDescs access(1);
+            access[0].location = prop.location;
+            access[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            CUDAVirtualMemoryChunk::Configurators configurators;
+            configurators.push_back(std::make_unique<MapConfigurator>(address, size, access));
+            configurators.push_back(std::make_unique<HostAccessConfigurator>(address, size));
+            CUDAVirtualMemoryChunk chunk(std::make_unique<LocalCreator<false>>(prop, size), std::move(configurators));
+            chunk.materialize(); // released by its destructor
+        }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_WARNING("Ghost slot memory stays in device memory: GDRCopy cannot map it: %s", error.what());
+            mapped = false;
+        }
+        allocator.DecRefCount();
+        return mapped;
+    }();
+    return gdrMapsChunks;
+}
+
 CUmemAllocationProp GhostSlotMemory::allocationProp() const
 {
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = mDevice;
+    prop.location.type = mNumaId < 0 ? CU_MEM_LOCATION_TYPE_DEVICE : CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    prop.location.id = mNumaId < 0 ? mDevice : mNumaId;
+    // Device memory that the host reaches only through GDRCopy.
+    prop.allocFlags.gpuDirectRDMACapable = mHostAccessible && mNumaId < 0;
     return prop;
+}
+
+void GhostSlotMemory::releaseScratch() noexcept
+{
+    mScratch.reset();
+    if (mHostAccessible)
+    {
+        HostAccessibleDeviceAllocator::getInstance().DecRefCount();
+    }
 }
 
 CUDAVirtualMemoryChunk GhostSlotMemory::mapResident(CUdeviceptr address, size_t size) const
 {
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<MapConfigurator>(address, size, mScratch->access));
+    if (mHostAccessible)
+    {
+        configurators.push_back(std::make_unique<HostAccessConfigurator>(address, size));
+    }
     CUDAVirtualMemoryChunk chunk(std::make_unique<LocalCreator<>>(allocationProp(), size), std::move(configurators));
     try
     {
@@ -279,6 +381,11 @@ void GhostSlotMemory::addPiece(Piece const& piece) const
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<ScratchSwap>(mScratch, piece.address, piece.count));
     configurators.push_back(std::make_unique<MapConfigurator>(piece.address, bytes, mScratch->access));
+    if (mHostAccessible)
+    {
+        // Pinned only while backed: no CPU copy writes a ghost slot on scratch.
+        configurators.push_back(std::make_unique<HostAccessConfigurator>(piece.address, bytes));
+    }
     getVirtualMemoryManager().add(piece.address, piece.tag,
         CUDAVirtualMemoryChunk(std::make_unique<LocalCreator<>>(allocationProp(), bytes), std::move(configurators)));
 }
@@ -299,29 +406,55 @@ void GhostSlotMemory::dropPiece(Piece const& piece) const noexcept
     }
 }
 
-void* GhostSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<int> const& emptySlots)
+void* GhostSlotMemory::allocate(
+    size_t slotBytes, int slotCount, std::vector<int> const& emptySlots, bool onHostAccessibleMemory)
 {
     TLLM_CHECK_WITH_INFO(slotBytes > 0 && slotCount > 0, "No slots to allocate");
+    TLLM_CHECK_WITH_INFO(
+        !onHostAccessibleMemory || hostAccessibleSupported(), "Ghost slot memory cannot be host accessible here");
     std::lock_guard<std::mutex> lock(mMutex);
     int device = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     TLLM_CHECK_WITH_INFO(mDevice < 0 || mDevice == device, "Ghost slot memory serves one device per process");
-    if (mDevice < 0)
+    if (!mScratch)
     {
-        CUmemAllocationProp prop{};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id = device;
+        mDevice = device;
+        mHostAccessible = onHostAccessibleMemory;
+        mNumaId = onHostAccessibleMemory ? HostAccessibleDeviceAllocator::gpuMemoryNumaId() : -1;
+        auto const prop = allocationProp();
         size_t granularity = 0;
         TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
         mGranularity = granularity;
-        mDevice = device;
+        AccessDescs access(mNumaId < 0 ? 1 : 2);
+        for (auto& desc : access)
+        {
+            desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            desc.location.id = mDevice;
+            desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        }
+        if (mNumaId >= 0)
+        {
+            access.back().location.type = CU_MEM_LOCATION_TYPE_HOST;
+            access.back().location.id = 0;
+        }
+        if (mHostAccessible)
+        {
+            // Initialized while host-accessible ranges exist, to record them.
+            HostAccessibleDeviceAllocator::getInstance().IncRefCount();
+        }
+        try
+        {
+            // Allocated up front, so that a restore needs no memory beyond what unbackedBytes() reports.
+            mScratch = std::make_shared<Scratch>(prop, mGranularity, std::move(access));
+        }
+        catch (...)
+        {
+            releaseScratch();
+            throw;
+        }
     }
-    if (!mScratch)
-    {
-        // Allocated up front, so that a restore needs no memory beyond what unbackedBytes() reports.
-        mScratch = std::make_shared<Scratch>(allocationProp(), mGranularity);
-    }
+    TLLM_CHECK_WITH_INFO(onHostAccessibleMemory == mHostAccessible,
+        "Ghost slot memory ranges that exist at once are all host accessible or all not");
     size_t const slots = static_cast<size_t>(slotCount);
     std::vector<bool> empty(slots, false);
     for (int slot : emptySlots)
@@ -388,7 +521,7 @@ void* GhostSlotMemory::allocate(size_t slotBytes, int slotCount, std::vector<int
         }
         if (mAllocations.empty())
         {
-            mScratch.reset();
+            releaseScratch();
         }
         throw;
     }
@@ -427,7 +560,7 @@ void GhostSlotMemory::free(void* ptr) noexcept
     if (mAllocations.empty())
     {
         // The last mapping of the scratch is gone: release it too.
-        mScratch.reset();
+        releaseScratch();
     }
 }
 
@@ -559,6 +692,38 @@ void GhostSlotMemory::keepPending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     mPending.erase(owner);
+}
+
+std::pair<size_t, size_t> GhostSlotMemory::hostMappings()
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    size_t count = 0;
+    size_t chunks = 0;
+    for (auto const& [base, allocation] : mAllocations)
+    {
+        count += allocation.resident.size();
+        chunks += allocation.size / mGranularity;
+        for (auto const& piece : allocation.pieces)
+        {
+            if (piece.backed)
+            {
+                ++count;
+            }
+            else
+            {
+                chunks -= piece.count;
+            }
+        }
+    }
+    return mHostAccessible ? std::make_pair(count, chunks * mGranularity) : std::make_pair(size_t{0}, size_t{0});
+}
+
+bool GhostSlotMemory::contains(void const* ptr)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const address = reinterpret_cast<CUdeviceptr>(ptr);
+    auto const next = mAllocations.upper_bound(address);
+    return next != mAllocations.begin() && address < std::prev(next)->first + std::prev(next)->second.size;
 }
 
 } // namespace tensorrt_llm::runtime

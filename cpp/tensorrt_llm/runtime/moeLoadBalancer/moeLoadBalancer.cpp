@@ -838,7 +838,11 @@ void MoeWeightUpdaterBase::addSingleWeightSlot(
     }
     TLLM_CHECK_WITH_INFO(mWeightSlots[name][localSlotId].mWeightPtr == nullptr,
         "localSlotId=%d, name=%s already added.", localSlotId, name.c_str());
-    if (!gpuAccess)
+    if (!gpuAccess && GhostSlotMemory::getInstance().contains(weightSlot.mWeightPtr))
+    {
+        mDeviceAddressedSlots.insert(name);
+    }
+    else if (!gpuAccess)
     {
         // if using cpu copy, change to host accessible pointer.
         weightSlot.mWeightPtr
@@ -975,10 +979,23 @@ void HostMemoryMoeWeightUpdater::copyWeights(MoeWeight const& src, MoeWeight con
     }
 }
 
-void HostMemoryMoeWeightUpdater::copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size)
+void HostMemoryMoeWeightUpdater::copyWeightsCpu(
+    MoeWeight const& src, MoeWeight const& dst, int rank, int size, bool dstDeviceAddressed)
 {
     TLLM_CHECK(src.mWeightPtr != nullptr && dst.mWeightPtr != nullptr);
     TLLM_CHECK(src.mHeight == dst.mHeight && src.mWidth == dst.mWidth);
+    auto& allocator = HostAccessibleDeviceAllocator::getInstance();
+    auto const copyRow = [&](char* to, char const* from, size_t bytes)
+    {
+        if (dstDeviceAddressed)
+        {
+            allocator.memcpyToDeviceAddress(to, from, bytes);
+        }
+        else
+        {
+            allocator.memcpyToDevice(to, from, bytes);
+        }
+    };
     char* srcPtr = static_cast<char*>(src.mWeightPtr);
     char* dstPtr = static_cast<char*>(dst.mWeightPtr);
     size_t singleCopySize, copyCount, srcPitch, dstPitch;
@@ -1000,16 +1017,14 @@ void HostMemoryMoeWeightUpdater::copyWeightsCpu(MoeWeight const& src, MoeWeight 
     size_t threadCopyCount = fullCopyCount / size;
     for (size_t i = rank * threadCopyCount; i < (rank + 1) * threadCopyCount; i++)
     {
-        HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(
-            dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
+        copyRow(dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
     }
     size_t threadStartOffset = rank * singleCopySize / size;
     size_t threadEndOffset = (rank + 1) * singleCopySize / size;
     size_t threadCopySize = threadEndOffset - threadStartOffset;
     for (size_t i = fullCopyCount; i < copyCount && threadCopySize > 0; i++)
     {
-        HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(
-            dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
+        copyRow(dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
     }
 }
 
@@ -1056,7 +1071,7 @@ void HostMemoryMoeWeightUpdater::updateWeights(
             }
             else
             {
-                copyWeightsCpu(hostWeight, slotWeight, rank, size);
+                copyWeightsCpu(hostWeight, slotWeight, rank, size, mDeviceAddressedSlots.count(name) > 0);
             }
         }
     }
