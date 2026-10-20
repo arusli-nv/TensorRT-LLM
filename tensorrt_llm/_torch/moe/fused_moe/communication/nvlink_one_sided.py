@@ -1046,6 +1046,42 @@ class NVLinkOneSided(Communication):
             self._workspace_state["source_valid_counts"] = counts
         return counts
 
+    def _bound_layout(
+        self, runtime_max_tokens_per_rank: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, DispatchSourceSlots]:
+        """The compact expert ids and router weights a bound dispatch writes, each
+        [ep_size * runtime_max_tokens_per_rank, top_k], and its receive-slot layout.
+
+        Shared by every layer of this workspace, like the receive slots: a dispatch's lists are read by that
+        layer's routing before the next dispatch. The lists are views of buffers for the largest token count,
+        allocated with the source valid counts before any CUDA graph capture; captured graphs keep their addresses.
+        """
+        layouts = self._workspace_state.setdefault("bound_layouts", {})
+        layout = layouts.get(runtime_max_tokens_per_rank)
+        if layout is None:
+            valid_counts = self._source_valid_counts()
+            buffers = self._workspace_state.get("compact_routing")
+            if buffers is None:
+                shape = (self.ep_size * self.max_num_tokens_per_rank, self.top_k)
+                device = valid_counts.device
+                buffers = (
+                    torch.empty(shape, dtype=torch.int32, device=device),
+                    torch.empty(shape, dtype=torch.float32, device=device),
+                )
+                self._workspace_state["compact_routing"] = buffers
+            rows = self.ep_size * runtime_max_tokens_per_rank
+            layout = (
+                buffers[0][:rows],
+                buffers[1][:rows],
+                DispatchSourceSlots(
+                    valid_counts=valid_counts,
+                    source_tokens=runtime_max_tokens_per_rank,
+                    slot_tokens=self.max_num_tokens_per_rank,
+                ),
+            )
+            layouts[runtime_max_tokens_per_rank] = layout
+        return layout
+
     def dispatch_source_slots(self) -> Optional[DispatchSourceSlots]:
         """The receive-slot layout of the last dispatch, or None when not bound to an execution state."""
         return self._dispatch_state.get("source_slots")
@@ -1128,17 +1164,18 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
-        source_valid_counts = None if state is None else self._source_valid_counts()
         # Bound execution: the dispatch also copies each source's routed expert ids and router weights to
         # compact lists once that source's rows have arrived, for the routing sort.
         compact_routing = {}
+        source_slots = None
         if state is not None:
             if token_final_scales is None:
                 raise ValueError("bound dispatch needs the router weights to compact the routing")
-            rows = (self.ep_size * runtime_max_tokens_per_rank, self.top_k)
+            compact_expert_ids, compact_weights, source_slots = self._bound_layout(
+                runtime_max_tokens_per_rank
+            )
             compact_routing = dict(
-                compact_expert_ids=token_selected_slots.new_empty(rows),
-                compact_weights=token_final_scales.new_empty(rows, dtype=torch.float32),
+                compact_expert_ids=compact_expert_ids, compact_weights=compact_weights
             )
             if eplb_local_stats is not None:
                 # The same CTAs copy each active source's statistics row (0 for a lost rank's).
@@ -1167,7 +1204,7 @@ class NVLinkOneSided(Communication):
                 if state is None
                 else state.active_rank_mask,
                 abort_state=None if state is None else state.abort,
-                source_valid_counts=source_valid_counts,
+                source_valid_counts=None if source_slots is None else source_slots.valid_counts,
                 expert_to_slot=expert_to_slot,
                 **compact_routing,
             )
@@ -1188,15 +1225,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
-        self._dispatch_state["source_slots"] = (
-            None
-            if state is None
-            else DispatchSourceSlots(
-                valid_counts=source_valid_counts,
-                source_tokens=runtime_max_tokens_per_rank,
-                slot_tokens=self.max_num_tokens_per_rank,
-            )
-        )
+        self._dispatch_state["source_slots"] = source_slots
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
