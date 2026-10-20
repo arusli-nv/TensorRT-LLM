@@ -129,15 +129,16 @@ survives depends on its spare slots).
 
 Not covered (these fail closed: the job ends as without fault tolerance):
 - rank 0, which runs the server's coordination;
-- the death of a host itself (power loss, kernel panic, or its Open MPI daemon ending): Open MPI's launcher ends
-  the job when it loses a daemon. `failure_domain: node` covers the loss of every rank process of a host that
-  stays up;
+- the death of a host itself (power loss, kernel panic, or its Open MPI daemon ending): whether and how fast it
+  ends the job depends on Open MPI's runtime (PRRTE). `failure_domain: node` covers the loss of every rank
+  process of a host that stays up;
 - a fault that takes down a GPU device, the NVLink fabric, several hosts or a rack;
 - a further loss after the survivors installed a recovery and before it committed (a loss before the install
   re-plans the recovery, see above), and a further loss the remaining slots cannot cover;
-- a rank that hangs without dying unless hang detection is on, and a stall that every rank shares (a deadlock
-  or desync with no single culprit: with hang detection on it is reported, see below, else the executor's own
-  hang detection, `hang_detection_timeout`, ends it);
+- a rank that hangs without dying, unless hang detection is on and the hang is in the MoE all-to-alls, and a
+  stall that every rank shares (a deadlock or desync with no single culprit: with hang detection on it is
+  reported, see below). These end the job only through the executor's hang detection (`hang_detection_timeout`,
+  300 s by default) or the MoE communication timeout;
 - other errors in the serving loop.
 
 The authority is not a single point of failure for serving: if it stops, the deployment keeps serving but
@@ -195,12 +196,9 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
 
 ## Known limits
 
-- A hang outside the MoE all-to-alls, or any hang with `hang_detection` off, ends the job only through the
-  executor's hang detection (`hang_detection_timeout`, 300 s by default) or the MoE communication timeout.
 - Two ranks hung at once are not confirmed (no single rank is waited on by every peer); they end the job
-  through the same timeouts.
+  through the executor's hang detection or the MoE communication timeout.
 - A fenced process stuck in the GPU driver may not exit when killed, which can stall the job's shutdown.
-- Whether and how fast the death of a host or its Open MPI (PRRTE) daemon ends the job depends on PRRTE.
 - Nothing restarts the authority, and the workers register only at startup: an authority started again
   reports `starting` (503) until the deployment restarts. Restart the authority only together with the job,
   with a new key, never under a running job.
@@ -269,7 +267,8 @@ state this server does not know, for example from a different version). The JSON
 the authority answers it also has `generation` (the membership generation), `live_ranks` and `failed_ranks`
 (sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `agree` and `install` durations),
 `failed_requests` (requests the losses failed). The reason a recovery aborted is only in the authority's log:
-`/health` is not authenticated. An `unprotected` body has only `state`. If the engine itself failed, `/health` returns 503 as without fault tolerance.
+`/health` is not authenticated. An `unprotected` body has only `state`. If the engine itself failed, `/health`
+returns 503 as without fault tolerance.
 
 What an orchestrator should do with these signals:
 - `degraded`: the deployment serves with fewer GPUs and survives a further loss only while its remaining slots
