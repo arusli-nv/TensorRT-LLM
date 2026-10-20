@@ -63,6 +63,10 @@ Outbound = list[tuple[bytes, Message]]
 
 _CLOSE_LINGER_MS = 1000
 _REJECTION_LOG_INTERVAL_S = 10.0
+# Bounds on what unauthenticated peers can queue, so a flood cannot starve the loop's deadlines and messages:
+# datagrams handled per pass, and messages queued per connection.
+_MAX_DATAGRAMS_PER_PASS = 256
+_ROUTER_RCVHWM = 1024
 
 
 class Phase(enum.Enum):
@@ -666,16 +670,17 @@ def serve(
 def _receive_datagrams(
     authority: RecoveryAuthority, datagrams: socket.socket, key: bytes, now: float
 ) -> Outbound:
-    """Apply every native heartbeat waiting on ``datagrams`` at monotonic time ``now``."""
+    """Apply up to ``_MAX_DATAGRAMS_PER_PASS`` native heartbeats waiting on ``datagrams`` at time ``now``."""
     outbound = []
-    while True:
+    for _ in range(_MAX_DATAGRAMS_PER_PASS):
         try:
             datagram = datagrams.recv(MAX_MESSAGE_BYTES)
         except BlockingIOError:
-            return outbound
+            break
         message = decode_datagram(datagram, key)
         if message is not None:
             outbound += authority.handle(b"", message, now)
+    return outbound
 
 
 def datagram_socket(endpoint: str) -> socket.socket | None:
@@ -708,7 +713,11 @@ def router_queue(endpoint: str, key: bytes) -> ZeroMqQueue:
         is_server=True,
         name="recovery-authority",
         # The linger lets a final Abort reach the workers without letting close() hang on one that is gone.
-        socket_options={zmq.LINGER: _CLOSE_LINGER_MS, zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES},
+        socket_options={
+            zmq.LINGER: _CLOSE_LINGER_MS,
+            zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES,
+            zmq.RCVHWM: _ROUTER_RCVHWM,
+        },
     )
     if "://*:" in endpoint or "0.0.0.0" in endpoint:
         logger.warning(

@@ -518,6 +518,8 @@ def test_wire_roundtrip_and_authentication(tmp_path):
     router = authority_module.router_queue(endpoint, KEY)
     dealer = _dealer(endpoint)
     try:
+        # Unlike ZeroMqQueue's default, a connection cannot queue without bound.
+        assert router.socket.getsockopt(zmq.RCVHWM) == authority_module._ROUTER_RCVHWM
         for message in (
             Register(1, ((1,), NODE), DIGEST),
             Registered(((1,), NODE)),

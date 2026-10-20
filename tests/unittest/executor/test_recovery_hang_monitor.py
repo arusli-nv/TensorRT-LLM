@@ -499,6 +499,21 @@ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced(
         sender.close()
 
 
+def test_a_datagram_flood_yields_to_the_loop(monkeypatch):
+    monkeypatch.setattr(authority_module, "_MAX_DATAGRAMS_PER_PASS", 2)
+    authority = _serving_authority([])
+    receiver, sender = _datagrams()
+    try:
+        for _ in range(3):
+            sender.send(b"forged")
+        assert _drain(authority, receiver, 0.0) == []
+        # The third waits for the next pass.
+        assert receiver.recv(16) == b"forged"
+    finally:
+        receiver.close()
+        sender.close()
+
+
 def test_the_native_heartbeat_wire_format():
     """The datagram ``HeartbeatSender`` (C++) builds: its JSON payload, then HMAC-SHA256 over a zero byte and it."""
     payload = b'{"beat": 3, "iteration": 41, "pid": 4321, "rank": 2, "type": "NativeHeartbeat"}'
