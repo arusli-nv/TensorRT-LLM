@@ -672,6 +672,8 @@ class NVLinkOneSided(Communication):
         self._rank_mask_record: Optional[torch.Tensor] = None
         self._rank_mask_words: Optional[Tuple[int, ...]] = None
         self._execution_state: "MoeExecutionState | None" = None
+        # Bound dispatches' gathered EPLB statistics, [ep_size, eplb_stats_num_experts]; see _eplb_stats_out.
+        self._eplb_stats_out_buffer: Optional[torch.Tensor] = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -1086,6 +1088,20 @@ class NVLinkOneSided(Communication):
             layouts[runtime_max_tokens_per_rank] = layout
         return layout
 
+    def _eplb_stats_out(self, eplb_local_stats: torch.Tensor) -> torch.Tensor:
+        """Where a bound dispatch of this layer copies each source's EPLB statistics row.
+
+        One buffer per layer: the layer's statistic update reads it before the layer's next dispatch, which
+        follows that update in stream order (the next ``get_local_statistic_tensor`` waits for the balancer's
+        stream). Kept only if allocated outside CUDA graph capture.
+        """
+        out = self._eplb_stats_out_buffer
+        if out is None:
+            out = eplb_local_stats.new_empty((self.ep_size, eplb_local_stats.size(0)))
+            if not torch.cuda.is_current_stream_capturing():
+                self._eplb_stats_out_buffer = out
+        return out
+
     def dispatch_source_slots(self) -> Optional[DispatchSourceSlots]:
         """The receive-slot layout of the last dispatch, or None when not bound to an execution state."""
         return self._dispatch_state.get("source_slots")
@@ -1183,9 +1199,7 @@ class NVLinkOneSided(Communication):
             )
             if eplb_local_stats is not None:
                 # The same CTAs copy each active source's statistics row (0 for a lost rank's).
-                compact_routing["eplb_stats_out"] = eplb_local_stats.new_empty(
-                    (self.ep_size, eplb_local_stats.size(0))
-                )
+                compact_routing["eplb_stats_out"] = self._eplb_stats_out(eplb_local_stats)
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,

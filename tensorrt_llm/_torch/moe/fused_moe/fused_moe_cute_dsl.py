@@ -1262,12 +1262,13 @@ class CuteDslFusedMoE(MoEImplBase):
             ]
 
         # Under WideEP peer-loss recovery x and x_sf are the dispatch receive
-        # slots, more rows than tokens. Tune on as many rows as tokens:
-        # profiling only needs their shapes.
+        # slots, more rows than tokens (the routing has one row per token).
+        # Tune on as many rows as tokens: profiling only needs their shapes.
         tuner_inputs = inputs
         if source_slots is not None:
-            tuner_inputs = [tensor[:num_tokens]
-                            for tensor in inputs[:4]] + inputs[4:]
+            tuner_inputs = list(inputs)
+            tuner_inputs[0] = x[:num_tokens]
+            tuner_inputs[3] = x_sf[:num_tokens]
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=forward_impl,
