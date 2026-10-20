@@ -1892,7 +1892,7 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
     recovery = _recovery(client)
     engine = recovery._executor.model_engine
     load_balancer = engine.moe_load_balancer
-    plan = np.zeros((1, 9), dtype=np.int64)
+    plan = np.zeros((1, 10), dtype=np.int64)
     load_balancer.restore_copy_plan.return_value = plan
     workspace = engine.moe_execution_state.staging_workspace.return_value
     sent_before_staging = []
@@ -1908,6 +1908,7 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
         ["placement"],
         workspace.size.return_value,
         engine.moe_execution_state.staging_write_ranges,
+        [plan],
     )
     workspace.size.assert_called_with(1)
     load_balancer.stage_restored_slots.assert_called_once_with(
@@ -1924,14 +1925,21 @@ def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(
     recovery = _recovery(_FakeClient([]))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
-    load_balancer.restore_copy_plan.return_value = np.zeros((1, 9), dtype=np.int64)
+    plans = [np.zeros((1, 10), dtype=np.int64), np.ones((1, 10), dtype=np.int64)]
+    load_balancer.restore_copy_plan.side_effect = plans
     failed = frozenset({FAILED_RANK})
+    staged = []
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
     with pytest.raises(RecoveryInterrupted):
-        recovery._stage_ring_restore(load_balancer, failed, ["placement"])
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"], staged)
+    # The interrupted plan's copies may still be in flight: the next plan keeps off them.
+    assert staged == [plans[0]]
+    write_ranges = recovery._executor.model_engine.moe_execution_state.staging_write_ranges
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
-        recovery._stage_ring_restore(load_balancer, failed, ["placement"])
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"], staged)
+    _, _, _, ranges, passed = load_balancer.restore_copy_plan.call_args.args
+    assert ranges is write_ranges and passed is staged and staged == plans
 
 
 def test_create_checks_the_staging_workspace_fits_with_ring_host_copies(monkeypatch):

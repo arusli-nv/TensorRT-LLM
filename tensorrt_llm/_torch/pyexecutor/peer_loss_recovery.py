@@ -369,8 +369,8 @@ class PeerLossRecovery(RecoveryHook):
                 "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
             )
         if load_balancer.is_static_routing():
-            # Ring host copies: restores stage each weight through half of what all-to-alls leave unwritten of
-            # the workspace; restore_copy_plan checks it.
+            # Ring host copies: restores stage weights through what all-to-alls leave unwritten of the
+            # workspace; restore_copy_plan checks that some is left.
             state = engine.moe_execution_state
             load_balancer.restore_copy_plan(
                 [],
@@ -792,8 +792,10 @@ class PeerLossRecovery(RecoveryHook):
         online = not load_balancer.is_static_routing()
         if online and not load_balancer.quiesce(max(0.0, deadline - time.monotonic())):
             raise RuntimeError("EPLB weight updates did not finish within the recovery timeout")
-        # Until Install, a further loss restarts the plan with every rank lost so far.
+        # Until Install, a further loss restarts the plan with every rank lost so far, off the bytes the plans
+        # staged so far had the lost ranks copy.
         replans = 0
+        staged: List[np.ndarray] = []
         while True:
             if replans:
                 _check_deadline(deadline, "planning the recovery again")
@@ -830,7 +832,7 @@ class PeerLossRecovery(RecoveryHook):
                     )
                 generation = proposal.generation
                 copy_plan = (
-                    None if online else self._stage_ring_restore(load_balancer, failed, placements)
+                    None if online else self._stage_ring_restore(load_balancer, failed, placements, staged)
                 )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
@@ -1104,19 +1106,25 @@ class PeerLossRecovery(RecoveryHook):
         )
 
     def _stage_ring_restore(
-        self, load_balancer: "MoeLoadBalancer", failed: frozenset, placements: List[np.ndarray]
+        self,
+        load_balancer: "MoeLoadBalancer",
+        failed: frozenset,
+        placements: List[np.ndarray],
+        staged: List[np.ndarray],
     ) -> np.ndarray:
-        """Copy the experts ``placements`` restores from the ring host copies into their slots; the copy plan.
+        """Copy the experts ``placements`` restores from the ring host copies into their slots; the copy plan,
+        appended to ``staged`` (this recovery's plans) before any copy starts.
 
         After Propose the failed ranks are fenced and no all-to-all runs until the install rearms the workspaces;
-        the plan keeps off the bytes their all-to-alls still in flight may write.
+        the plan keeps off the bytes their all-to-alls or their copies of ``staged`` may still write.
         """
         start = time.monotonic()
         state = self._executor.model_engine.moe_execution_state
         workspace = state.staging_workspace()
         copy_plan = load_balancer.restore_copy_plan(
-            failed, placements, workspace.size(1), state.staging_write_ranges
+            failed, placements, workspace.size(1), state.staging_write_ranges, staged
         )
+        staged.append(copy_plan)
         self._among_survivors(
             "restored experts were copied",
             lambda: load_balancer.stage_restored_slots(
@@ -1124,7 +1132,7 @@ class PeerLossRecovery(RecoveryHook):
             ),
         )
         logger.info(
-            f"Staged {len(copy_plan)} expert weights in {(time.monotonic() - start) * 1e3:.1f} ms"
+            f"Staged {len(copy_plan)} expert weight pieces in {(time.monotonic() - start) * 1e3:.1f} ms"
         )
         return copy_plan
 

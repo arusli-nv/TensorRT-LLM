@@ -6,6 +6,7 @@ import functools
 import threading
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -183,12 +184,12 @@ def test_the_copy_plan_is_the_same_on_every_rank_and_spreads_sources(monkeypatch
         plans.append((plan, load_balancer.placement_digest([3], placements, plan)))
     assert all((plan == plans[0][0]).all() and digest == plans[0][1] for plan, digest in plans)
     # Rank 3's experts 6 and 7 go to the ghost slots of ranks 0 and 1, copied by node a's ranks 0 and 2 in turn.
-    # Columns: chunk, layer, target, slot, expert, weight, source, offset, bytes.
+    # Columns: chunk, layer, target, slot, expert, weight, source, offset, offset in the weight, bytes.
     assert plans[0][0].tolist() == [
-        [0, 0, 0, 2, 6, 0, 0, 0, 300],
-        [0, 0, 0, 2, 6, 1, 0, 512, 200],
-        [0, 0, 1, 2, 7, 0, 2, 0, 300],
-        [0, 0, 1, 2, 7, 1, 2, 512, 200],
+        [0, 0, 0, 2, 6, 0, 0, 0, 0, 300],
+        [0, 0, 0, 2, 6, 1, 0, 512, 0, 200],
+        [0, 0, 1, 2, 7, 0, 2, 0, 0, 300],
+        [0, 0, 1, 2, 7, 1, 2, 512, 0, 200],
     ]
     # Another plan digests differently.
     assert load_balancer.placement_digest([3], placements, plan[:, ::-1].copy()) != plans[0][1]
@@ -197,18 +198,23 @@ def test_the_copy_plan_is_the_same_on_every_rank_and_spreads_sources(monkeypatch
 def test_the_copy_plan_alternates_workspace_halves_between_chunks(monkeypatch):
     load_balancer, _ = _ring_load_balancer(monkeypatch, layers=2)
     placements = load_balancer.recovery_placements([3])
-    # A 1024-byte workspace: chunks of 512 bytes, the second at offset 512, the third back at 0.
+    # A 1024-byte workspace: halves of 512 bytes. A weight the rest of a half cannot take continues in the next
+    # chunk, in the other half.
     plan = load_balancer.restore_copy_plan([3], placements, 1024, _no_writes)
     target_0 = plan[plan[:, 2] == 0]
-    assert target_0[:, [0, 1, 5, 7]].tolist() == [
-        [0, 0, 0, 0],
-        [1, 0, 1, 512],
-        [2, 1, 0, 0],
-        [3, 1, 1, 512],
+    # Columns: chunk, layer, weight, offset, offset in the weight, bytes.
+    assert target_0[:, [0, 1, 5, 7, 8, 9]].tolist() == [
+        [0, 0, 0, 0, 0, 300],
+        [1, 0, 1, 512, 0, 200],
+        [1, 1, 0, 768, 0, 256],
+        [2, 1, 0, 0, 256, 44],
+        [2, 1, 1, 256, 0, 200],
     ]
     assert (plan[1:, 0] >= plan[:-1, 0]).all()
-    with pytest.raises(ValueError, match="300-byte expert weight of MoE layer 0 does not fit"):
-        load_balancer.restore_copy_plan([3], placements, 512, _no_writes)
+    # 256 bytes: the second half has no aligned room.
+    room = r"\[128, 0\] bytes per half .* TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB"
+    with pytest.raises(ValueError, match=room):
+        load_balancer.restore_copy_plan([3], placements, 256, _no_writes)
 
 
 def test_the_copy_plan_refuses_to_load_a_routed_slot(monkeypatch):
@@ -309,6 +315,8 @@ def _kernel_writes(meta, source):
     ids and router weights), moeA2ADispatchOp places each payload's ``[ep_size, capacity]`` rows in turn,
     cacheline aligned; the kernels write the source's rows, its receive count of either parity, its dispatch and
     combine completion flags and its EPLB statistics row. A fence combine only reads peers' combine input.
+    The payload rows only check that source_write_ranges is a superset of this reading of the op;
+    test_moe_a2a_late_writes.py checks it against what a killed rank's kernels actually write.
     """
     ep_size, capacity, top_k, experts = (
         _field(meta, name) for name in ("EP_SIZE", "MAX_NUM_TOKENS", "TOP_K", "EPLB_STATS_NUM_EXPERTS")
@@ -370,16 +378,61 @@ def test_the_copy_plan_never_stages_where_a_dead_rank_writes(
         plans.append(load_balancer.restore_copy_plan(dead, placements, row_bytes, write_ranges))
     plan = plans[0]
     assert all((other == plan).all() for other in plans)
-    # Every lost expert's weights, in more than one chunk per target, so the halves alternate.
-    assert len(plan) == 2 * 2 * 2 * len(dead) and plan[:, 0].max() >= 1
+    # More than one chunk per target, so the halves alternate.
+    assert plan[:, 0].max() >= 1
+    _assert_pieces_load_every_weight(plan, 2 * 2 * len(dead))
     dead_writes = [
         (begin, end) for rank in dead for begin, end in _kernel_writes(meta, rank) if begin < end
     ]
+    _assert_staged_apart(plan, row_bytes, lambda target: dead_writes)
+
+
+def _assert_pieces_load_every_weight(plan, slots):
+    """Each weight of each of ``slots`` loaded slots is staged whole, in consecutive pieces."""
+    pieces = {}
+    for row in plan.tolist():
+        pieces.setdefault((row[1], row[2], row[3], row[5]), []).append((row[8], row[9]))
+    assert len(pieces) == 2 * slots
+    for (_, _, _, weight), parts in pieces.items():
+        starts = [0] + list(np.cumsum([size for _, size in sorted(parts)]))
+        assert [start for start, _ in sorted(parts)] == starts[:-1]
+        assert starts[-1] == [300, 200][weight]
+
+
+def _assert_staged_apart(plan, row_bytes, taken):
+    """Every row of ``plan`` lies in the row and outside ``taken(target)``; rows of a target's chunk and of the
+    chunk before it (still being read) never share a byte."""
     rows = plan.tolist()
-    for i, (chunk, _, target, _, _, _, _, offset, size) in enumerate(rows):
+    for i, (chunk, _, target, _, _, _, _, offset, _, size) in enumerate(rows):
         assert 0 <= offset and offset + size <= row_bytes
-        assert not any(offset < end and begin < offset + size for begin, end in dead_writes)
-        # Rows of a target's chunk and of the chunk before (still being read) never share a byte.
+        assert not any(offset < end and begin < offset + size for begin, end in taken(target))
         for j, other in enumerate(rows):
             if j != i and other[2] == target and other[0] in (chunk - 1, chunk):
-                assert other[7] + other[8] <= offset or offset + size <= other[7]
+                assert other[7] + other[9] <= offset or offset + size <= other[7]
+
+
+def test_a_replan_keeps_off_the_copies_a_rank_lost_while_staging_was_given(monkeypatch):
+    meta = _layout(len(_HOSTS), 1, None)
+    row_bytes = _field(meta, "WORKSPACE_SIZE")
+    write_ranges = functools.partial(NVLinkOneSided.source_write_ranges, meta)
+    load_balancer, _ = _ring_load_balancer(
+        monkeypatch, layers=2, placement=_GHOSTS_PLACEMENT, assignments=_GHOSTS_ASSIGNMENTS
+    )
+    first = load_balancer.restore_copy_plan(
+        [3], load_balancer.recovery_placements([3]), row_bytes, write_ranges
+    )
+    # Rank 2 sourced copies of the first plan, then is lost while they may still be in flight.
+    late = first[first[:, 6] == 2].tolist()
+    assert late
+    placements = load_balancer.recovery_placements([2, 3])
+
+    def late_copies(target):
+        return [(row[7], row[7] + row[9]) for row in late if row[2] == target]
+
+    plan = load_balancer.restore_copy_plan([2, 3], placements, row_bytes, write_ranges, [first])
+    _assert_pieces_load_every_weight(plan, 2 * 2 * 2)
+    _assert_staged_apart(plan, row_bytes, late_copies)
+    # Without the first plan, the new plan would stage over those copies.
+    unaware = load_balancer.restore_copy_plan([2, 3], placements, row_bytes, write_ranges)
+    with pytest.raises(AssertionError):
+        _assert_staged_apart(unaware, row_bytes, late_copies)

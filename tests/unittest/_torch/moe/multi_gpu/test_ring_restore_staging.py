@@ -46,8 +46,8 @@ _EXPERTS = 8
 _PLACEMENT = [[0, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1]]
 # Per slot: w1 3 MiB of bytes, w2 1.5 MiB of bfloat16 (sizes of real expert weights' order of magnitude).
 _WEIGHTS = {"w1": (3 << 20, torch.uint8), "w2": (768 << 10, torch.bfloat16)}
-# The workspace of a bound layer with 128 tokens per rank: about 3.5 MiB per half, so w1 and w2 of one expert
-# never share a chunk and each target reads from both halves.
+# The workspace of a bound layer with 128 tokens per rank: halves of about 3.5 MiB, so weights continue across
+# chunks and each target reads from both halves.
 _TOKENS, _HIDDEN = 128, 7168
 _TIMEOUT = timedelta(seconds=300)
 
