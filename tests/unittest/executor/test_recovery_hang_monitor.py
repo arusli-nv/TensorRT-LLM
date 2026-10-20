@@ -385,6 +385,21 @@ def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
     assert launched == [["ssh", "node-7", "kill", "-KILL", "4242"]]
 
 
+@pytest.mark.parametrize(
+    "host, pid",
+    [("-oProxyCommand=x", 4242), ("node 7", 4242), ("node;7", 4242), ("", 4242), ("node-7", "-1")],
+)
+def test_command_fence_refuses_a_host_or_pid_that_is_not_plain(host, pid, monkeypatch):
+    launched = []
+    monkeypatch.setattr(
+        authority_module.subprocess, "Popen", lambda command, **kwargs: launched.append(command)
+    )
+    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", host, pid))
+    assert launched == []
+    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", "fd00::7", 9))
+    assert launched == [["ssh", "fd00::7", "kill", "-KILL", "9"]]
+
+
 def test_authority_ends_the_deployment_when_rank_zero_hangs():
     """Rank 0's loss is never recovered: its confirmed hang is terminal and every worker exits for a restart."""
     fenced = []

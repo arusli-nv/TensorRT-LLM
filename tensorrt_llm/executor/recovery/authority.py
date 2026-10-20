@@ -15,7 +15,9 @@ A multi-node job binds it to the job's private network interface with
 
 import argparse
 import enum
+import ipaddress
 import os
+import re
 import shlex
 import signal
 import socket
@@ -67,6 +69,7 @@ _REJECTION_LOG_INTERVAL_S = 10.0
 # datagrams handled per pass, and messages queued per connection.
 _MAX_DATAGRAMS_PER_PASS = 256
 _ROUTER_RCVHWM = 1024
+_HOSTNAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
 
 
 class Phase(enum.Enum):
@@ -726,15 +729,31 @@ def router_queue(endpoint: str, key: bytes) -> ZeroMqQueue:
     return router
 
 
+def _plain_host(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return _HOSTNAME.fullmatch(host) is not None
+    return True
+
+
 def command_fence(template: str) -> Callable[[HungRank], None]:
     """Fence a hung worker by running ``template`` with its ``{host}`` and ``{pid}`` filled in.
 
     The command runs without a shell, detached from the authority's loop; a failure is
-    logged, and the rank stays hung until the executor's hang detector ends the job.
+    logged, and the rank stays hung until the executor's hang detector ends the job. The
+    worker reports its host and pid, so the command runs only for a plain hostname or IP
+    address and a positive pid: nothing the command could take as an option.
     """
     arguments = shlex.split(template)
 
     def fence(hung: HungRank) -> None:
+        if not (_plain_host(hung.host) and type(hung.pid) is int and hung.pid > 0):
+            logger.error(
+                f"Recovery authority: not fencing rank {hung.rank} with the fence command: "
+                f"host {hung.host!r} or pid {hung.pid!r} is not plain"
+            )
+            return
         command = [arg.format(host=hung.host, pid=hung.pid) for arg in arguments]
         try:
             subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
