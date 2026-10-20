@@ -10,3 +10,8 @@ with MPICommExecutor(COMM_WORLD) as executor:
         raise RuntimeError(f"rank{COMM_WORLD.rank} should not have executor")
 
 logging.warning(f"worker rank{COMM_WORLD.rank} quited")
+
+from tensorrt_llm.llmapi.mpi_session import \
+    exit_fault_tolerant_process  # noqa: E402
+
+exit_fault_tolerant_process()

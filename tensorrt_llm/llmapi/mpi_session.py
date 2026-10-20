@@ -110,9 +110,60 @@ def _is_departed_peer_failure(exc: BaseException) -> bool:
     return is_mpi_peer_failure(exc)
 
 
-# How long a process of an MPI world that lost a rank waits in MPI_Finalize for
-# the other survivors before it aborts the world.
-_DEGRADED_FINALIZE_GRACE_S = 120.0
+# How long a process of a fault-tolerant MPI world waits in MPI_Finalize before
+# it exits without it.
+_FINALIZE_GRACE_S = 30.0
+
+
+def _finalize_and_exit(status: int) -> NoReturn:
+    """Finalize MPI, then end this process with *status*.
+
+    ULFM's MPI_Finalize can block for good, and it holds every process that
+    reached it; after ``_FINALIZE_GRACE_S`` this process exits with *status*
+    without it. A native timer, which needs no GIL, exits with status 1 if
+    that cannot run. Exit handlers do not run, so the peer-failure watch they
+    would stop is stopped first.
+    """
+    recovery = sys.modules.get(
+        "tensorrt_llm._torch.pyexecutor.peer_loss_recovery")
+    if recovery is not None:
+        recovery.stop_startup_watch()
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    def give_up() -> None:
+        print(
+            f"Rank {global_mpi_rank()}: MPI_Finalize did not end within "
+            f"{_FINALIZE_GRACE_S:.0f} s; exiting with status {status} without it",
+            file=sys.stderr,
+            flush=True)
+        os._exit(status)
+
+    watchdog = threading.Timer(_FINALIZE_GRACE_S, give_up)
+    watchdog.daemon = True
+    watchdog.start()
+    # The Timer needs the GIL, which MPI_Finalize may hold.
+    faulthandler.dump_traceback_later(2 * _FINALIZE_GRACE_S, exit=True)
+    try:
+        mpi4py.MPI.Finalize()
+    except mpi4py.MPI.Exception as e:
+        print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
+        status = status or 1
+    faulthandler.cancel_dump_traceback_later()
+    watchdog.cancel()
+    watchdog.join()
+    os._exit(status)
+
+
+def exit_fault_tolerant_process(status: int = 0) -> None:
+    """End this process through a bounded MPI_Finalize under peer-loss recovery.
+
+    With recovery enabled, exits with *status* (see ``_finalize_and_exit``);
+    otherwise returns.
+    """
+    if ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled():
+        _finalize_and_exit(status)
 
 
 def _leave_degraded_world(clean: bool) -> NoReturn:
@@ -122,39 +173,19 @@ def _leave_degraded_world(clean: bool) -> NoReturn:
     message travel on communicators that include the lost rank, so each
     process leaves on its own. After a clean task end it finalizes MPI with
     the other survivors (ULFM's MPI_Finalize first agrees on the lost ranks)
-    and exits with status 0. After an error, or if finalizing takes longer
-    than ``_DEGRADED_FINALIZE_GRACE_S``, it ends the world with MPI_Abort. A
-    native timer, which needs no GIL, ends the process if that cannot run.
+    and exits with status 0 (see ``_finalize_and_exit``). After an error it
+    ends the world with MPI_Abort.
     """
-    world = mpi4py.MPI.COMM_WORLD
     if clean:
         logger.warning(f"Rank {global_mpi_rank()}: finalizing the MPI world, "
                        "which lost a rank")
-    else:
-        logger.error(f"Rank {global_mpi_rank()}: ending the MPI world, which "
-                     "lost a rank, after its task failed")
+        _finalize_and_exit(0)
+    logger.error(f"Rank {global_mpi_rank()}: ending the MPI world, which "
+                 "lost a rank, after its task failed")
     logging.shutdown()
     sys.stdout.flush()
     sys.stderr.flush()
-    if clean:
-        watchdog = threading.Timer(_DEGRADED_FINALIZE_GRACE_S,
-                                   lambda: world.Abort(1))
-        watchdog.daemon = True
-        watchdog.start()
-        # The Timer needs the GIL, which MPI_Finalize may hold.
-        faulthandler.dump_traceback_later(2 * _DEGRADED_FINALIZE_GRACE_S,
-                                          exit=True)
-        status = 0
-        try:
-            mpi4py.MPI.Finalize()
-        except mpi4py.MPI.Exception as e:
-            print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
-            status = 1
-        faulthandler.cancel_dump_traceback_later()
-        watchdog.cancel()
-        watchdog.join()
-        os._exit(status)
-    world.Abort(1)
+    mpi4py.MPI.COMM_WORLD.Abort(1)
 
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
@@ -306,6 +337,7 @@ class MPINodeState:
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
     """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+
     e.g. mpirun -np 4 python script.py
     """
     if ENABLE_MULTI_DEVICE:
