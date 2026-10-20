@@ -9333,7 +9333,8 @@ class PyExecutor:
                     for resp in responses_list:
                         if resp is None:
                             continue
-                        if isinstance(resp, tuple) and resp:
+                        if (isinstance(resp, tuple) and len(resp) == 3
+                                and isinstance(resp[0], list)):
                             # A peer-loss-recovery ResponseContribution:
                             # (responses, finished, streaming), or ().
                             resp = resp[0]
