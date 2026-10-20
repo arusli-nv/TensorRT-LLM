@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftManager.h"
@@ -165,8 +166,9 @@ inline uint64_t const* resolveActiveRankMask(
     return static_cast<uint64_t const*>(t.const_data_ptr());
 }
 
-// Return the address of the abort record (a MoeA2AAbortState in pinned host memory, as an int32 tensor of two
-// elements), which kernels read through unified addressing, or nullptr without one.
+// Return the device address of the abort record (a MoeA2AAbortState in pinned host memory, as an int32 tensor of
+// two elements), or nullptr without one. Registered host memory is not always readable through its host address,
+// so the mapped device address is looked up, once per record.
 inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torch::optional<torch::Tensor> const& abort)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2AAbortState;
@@ -179,7 +181,15 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torc
     TORCH_CHECK(t.is_cpu() && t.is_pinned(), "abort_state must be in pinned host memory");
     TORCH_CHECK(t.scalar_type() == torch::kInt32 && t.dim() == 1 && t.numel() == kWords && t.is_contiguous(),
         "abort_state must be a contiguous int32 tensor of ", kWords, " elements");
-    return reinterpret_cast<MoeA2AAbortState*>(t.data_ptr<int32_t>());
+    void* host = t.data_ptr();
+    thread_local void* cachedHost = nullptr;
+    thread_local void* cachedDevice = nullptr;
+    if (host != cachedHost)
+    {
+        TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&cachedDevice, host, 0));
+        cachedHost = host;
+    }
+    return static_cast<MoeA2AAbortState*>(cachedDevice);
 }
 
 // All offsets and capacities are per rank. Payload capacities are padded so

@@ -1433,7 +1433,7 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def device_visible_host_zeros(size: int, dtype: torch.dtype) -> torch.Tensor:
-    """Zeros in pinned host memory, which kernels read through its mapped address."""
+    """Zeros in pinned host memory; kernels read it at its mapped device address."""
     return torch.zeros(size, dtype=dtype).pin_memory()
 
 
