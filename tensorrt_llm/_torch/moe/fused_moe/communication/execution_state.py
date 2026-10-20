@@ -59,12 +59,21 @@ class MoeExecutionState:
         Raises:
             RuntimeError: The model has no NVLinkOneSided layer, or the layers
                 do not share one EPGroupHealth.
+            ValueError: A layer cannot dispatch float32 router weights, which
+                bound dispatch compacts for the routing sort.
         """
         from ..configurable_moe import ConfigurableMoE  # imports this package
 
         comms = {}
         for module in model.modules():
             if isinstance(module, ConfigurableMoE) and isinstance(module.comm, NVLinkOneSided):
+                scales_dtype = module.backend.input_requirement.routing_scales_dtype
+                if module.apply_router_weight_on_input or scales_dtype not in (None, torch.float32):
+                    raise ValueError(
+                        "WideEP recovery requires float32 router weights in the dispatch; "
+                        f"{type(module.backend).__name__} with apply_router_weight_on_input="
+                        f"{module.apply_router_weight_on_input} does not dispatch them"
+                    )
                 comms[id(module.comm)] = module.comm
         if not comms:
             raise RuntimeError("WideEP recovery requires NVLinkOneSided MoE communication")

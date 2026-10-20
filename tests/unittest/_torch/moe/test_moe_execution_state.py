@@ -219,6 +219,26 @@ def test_for_model_refuses_models_it_cannot_bind() -> None:
         MoeExecutionState.for_model(torch.nn.Linear(1, 1))
 
 
+@pytest.mark.parametrize(
+    "fold_weights, scales_dtype", [(True, torch.float32), (False, torch.bfloat16)]
+)
+def test_for_model_refuses_layers_without_float32_router_weights(
+    fold_weights: bool, scales_dtype: torch.dtype
+) -> None:
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(moe)
+    moe.comm = _frontend(EPGroupHealth(2))
+    moe.apply_router_weight_on_input = fold_weights
+    moe.backend = SimpleNamespace(
+        input_requirement=SimpleNamespace(routing_scales_dtype=scales_dtype)
+    )
+    with pytest.raises(ValueError, match="float32 router weights"):
+        MoeExecutionState.for_model(moe)
+    assert moe.comm._execution_state is None
+
+
 @pytest.mark.parametrize("reads_slots", [True, False])
 def test_backends_get_the_slots_or_a_compact_copy(reads_slots: bool) -> None:
     comm = _frontend(EPGroupHealth(2))
