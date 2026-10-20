@@ -1231,22 +1231,23 @@ class MoeLoadBalancer:
     def extra_slots_mode(self) -> Optional[str]:
         """What WideEP peer-loss recovery keeps in the EPLB slots beyond one per expert; None without it.
 
-        With a static placement, the fault-tolerance config's ``extra_slots``:
-        ``empty`` (not routed to while healthy; a restore fills them) or
-        ``ghost`` (also without device memory until a restore maps it). Online
+        With a static placement, the fault-tolerance config's ``extra_slots``
+        (default ``ghost``): ``empty`` (not routed to while healthy; a restore
+        fills them) or ``ghost`` (also without device memory until a restore
+        maps it). Online
         EPLB keeps ``replicas`` in them (a loss reroutes to them or restores
         into them); where its slots cannot hold every expert after a failure,
-        ``replicas+empty`` or ``replicas+ghost``: the ghost slots appended to
-        each rank are ``extra_slots`` slots too.
+        ``replicas+empty`` (the default) or ``replicas+ghost``: the ghost slots
+        appended to each rank are ``extra_slots`` slots too.
         """
         if not peer_loss_recovery_enabled():
             return None
-        config = fault_tolerance_config()
+        extra_slots = fault_tolerance_config().extra_slots
         if self.is_static_routing():
-            return config.extra_slots
+            return extra_slots or "ghost"
         if any(layer.ghost_slot_count
                for layer in self.single_layer_load_balancers):
-            return f"replicas+{config.extra_slots}"
+            return f"replicas+{extra_slots or 'empty'}"
         return "replicas"
 
     def finalize_model(self):

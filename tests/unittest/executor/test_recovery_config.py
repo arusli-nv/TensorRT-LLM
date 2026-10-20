@@ -29,7 +29,7 @@ def load(monkeypatch, tmp_path):
 def test_defaults_without_a_file(load):
     assert load() == FaultToleranceConfig()
     assert (
-        load().extra_slots == "ghost"
+        load().extra_slots is None
         and load().failure_domain == "node"
         and not load().hang_detection
     )
