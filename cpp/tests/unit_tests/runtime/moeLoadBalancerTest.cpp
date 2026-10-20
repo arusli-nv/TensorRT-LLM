@@ -747,30 +747,19 @@ void* allocateGhost(size_t slotBytes, int slotCount, std::vector<int> const& emp
     return GhostSlotMemory::getInstance().allocate(slotBytes, slotCount, emptySlots, hostAccessible());
 }
 
-// What LocalCreator books for ghost slot memory: pinned bytes on the GPU's NUMA node, GPU bytes otherwise.
+// What LocalCreator books for ghost slot memory: GPU bytes.
 size_t bookedBytes()
 {
-    auto const& counters = MemoryCounters::getInstance();
-    return hostAccessible() && HostAccessibleDeviceAllocator::gpuMemoryNumaId() >= 0 ? counters.getPinned()
-                                                                                     : counters.getGpu();
+    return MemoryCounters::getInstance().getGpu();
 }
 
 size_t vmmGranularity()
 {
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    int const numaId = hostAccessible() ? HostAccessibleDeviceAllocator::gpuMemoryNumaId() : -1;
-    if (numaId >= 0)
-    {
-        prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-        prop.location.id = numaId;
-    }
-    else
-    {
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        TLLM_CUDA_CHECK(cudaGetDevice(&prop.location.id));
-        prop.allocFlags.gpuDirectRDMACapable = hostAccessible();
-    }
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    TLLM_CUDA_CHECK(cudaGetDevice(&prop.location.id));
+    prop.allocFlags.gpuDirectRDMACapable = hostAccessible();
     size_t granularity = 0;
     TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     return granularity;
@@ -1151,8 +1140,7 @@ TEST(GhostSlotMemoryTest, FailedPieceIsDroppedAndEndsOnScratch)
 
 TEST(GhostSlotMemoryTest, CpuWritesReachResidentAndBackedSlots)
 {
-    // On the GPU's NUMA node the host writes at the device address; elsewhere GDRCopy maps each resident run and
-    // each backed piece. A backed slot spans several of them.
+    // GDRCopy maps each resident run and each backed piece. A backed slot spans several of them.
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     if (!hostAccessible())
     {

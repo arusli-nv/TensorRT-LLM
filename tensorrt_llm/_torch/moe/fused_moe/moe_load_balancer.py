@@ -117,8 +117,8 @@ _ghost_host_accessible: Optional[bool] = None
 
 
 def _ghost_slot_memory_host_accessible() -> bool:
-    """Whether ghost slot memory can be host accessible on every rank (GPU memory on a NUMA node, or GDRCopy), so
-    that CPU copies load it as they load online EPLB's other slots.
+    """Whether GDRCopy can map ghost slot memory for the host on every rank (never where GPU memory is a NUMA node),
+    so that CPU copies load it as they load online EPLB's other slots.
 
     The first call is collective: MoeLoadBalancer.register_weight_slots_after_to_cuda makes it on every rank.
     """
@@ -1331,8 +1331,8 @@ class MoeLoadBalancer:
             mappings, mapped_bytes = _tbr.ghost_slot_memory_host_mappings()
             if mappings:
                 logger.info(
-                    f"Ghost slot memory: {mappings} host mappings of {mapped_bytes / (1 << 30):.2f} GiB on rank 0 "
-                    "(GDRCopy pins where GPU memory is not a NUMA node)")
+                    f"Ghost slot memory: {mappings} GDRCopy host mappings of {mapped_bytes / (1 << 30):.2f} GiB on rank 0"
+                )
         if mode is not None:
             for layer in self.single_layer_load_balancers:
                 local = np.asarray(

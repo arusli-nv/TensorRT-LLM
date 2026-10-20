@@ -39,7 +39,7 @@ namespace
 {
 constexpr size_t kMaxScratchChunks = 8;
 
-// Read-write access for the device, and for the host on the GPU's NUMA node.
+// Read-write access for the device.
 using AccessDescs = std::vector<CUmemAccessDesc>;
 
 // Maps a handle at a fixed address; unlike UnicastConfigurator, a failed access grant does not leave it mapped.
@@ -97,34 +97,24 @@ struct HostAccessConfigurator : CUDAVirtualMemoryChunk::Configurator
     size_t mSize;
 };
 
-// The allocation of ghost slot memory on device: on the NUMA node numaId if >= 0, else device memory, GPUDirect RDMA
-// capable if host accessible (GDRCopy maps it).
-CUmemAllocationProp slotMemoryProp(int device, int numaId, bool hostAccessible)
+// The allocation of ghost slot memory: device memory, GPUDirect RDMA capable if host accessible (GDRCopy maps it).
+CUmemAllocationProp slotMemoryProp(int device, bool hostAccessible)
 {
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = numaId < 0 ? CU_MEM_LOCATION_TYPE_DEVICE : CU_MEM_LOCATION_TYPE_HOST_NUMA;
-    prop.location.id = numaId < 0 ? device : numaId;
-    prop.allocFlags.gpuDirectRDMACapable = hostAccessible && numaId < 0;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    prop.allocFlags.gpuDirectRDMACapable = hostAccessible;
     return prop;
 }
 
-// Read-write access for device, and for the host where the memory is on the NUMA node numaId (>= 0).
-AccessDescs slotMemoryAccess(int device, int numaId)
+AccessDescs slotMemoryAccess(int device)
 {
-    AccessDescs access(numaId < 0 ? 1 : 2);
-    for (auto& desc : access)
-    {
-        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        desc.location.id = device;
-        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    }
-    if (numaId >= 0)
-    {
-        access.back().location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA; // the host's access to HOST_NUMA memory
-        access.back().location.id = numaId;
-    }
-    return access;
+    CUmemAccessDesc desc{};
+    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id = device;
+    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    return {desc};
 }
 
 // Splits chunks into runs of the scratch sizes, largest first: (first chunk, count) each.
@@ -308,36 +298,38 @@ GhostSlotMemory& GhostSlotMemory::getInstance()
 
 bool GhostSlotMemory::hostAccessibleSupported()
 {
-    // Tried once per process (one device): one chunk is mapped for the host as allocate() would map each of its
-    // allocations, on the GPU's NUMA node or else through GDRCopy, and the host writes a pattern into it that the GPU
-    // reads back. A failure leaves ghost slot memory in device memory.
+    // Tried once per process (one device): one chunk is mapped for the host through GDRCopy as allocate() would map
+    // each of its allocations, and the host writes a pattern into it that the GPU reads back. A failure, or GPU memory
+    // that is a NUMA node, leaves ghost slot memory in device memory.
     static bool const supported = []
     {
         auto& allocator = HostAccessibleDeviceAllocator::getInstance();
-        int numaId = -1;
         bool referenced = false;
         bool mapped = false;
         try
         {
+            if (HostAccessibleDeviceAllocator::gpuMemoryNumaId() >= 0)
+            {
+                TLLM_LOG_INFO(
+                    "GPU memory is a NUMA node: ghost slot memory keeps device memory (host access on NUMA-mode GPUs "
+                    "is untested); online EPLB uses empty extra slots");
+                return false;
+            }
             if (!HostAccessibleDeviceAllocator::isSupportedWithoutManagedFallback())
             {
                 return false;
             }
-            numaId = HostAccessibleDeviceAllocator::gpuMemoryNumaId();
             allocator.IncRefCount();
             referenced = true;
             int device = -1;
             TLLM_CUDA_CHECK(cudaGetDevice(&device));
-            if (numaId < 0)
-            {
-                CUdevice cuDevice{};
-                TLLM_CU_CHECK(cuDeviceGet(&cuDevice, device));
-                int rdmaWithVmm = 0;
-                TLLM_CU_CHECK(cuDeviceGetAttribute(
-                    &rdmaWithVmm, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, cuDevice));
-                TLLM_CHECK_WITH_INFO(rdmaWithVmm != 0, "the GPU has no GPUDirect RDMA for virtual memory");
-            }
-            auto const prop = slotMemoryProp(device, numaId, /*hostAccessible=*/true);
+            CUdevice cuDevice{};
+            TLLM_CU_CHECK(cuDeviceGet(&cuDevice, device));
+            int rdmaWithVmm = 0;
+            TLLM_CU_CHECK(cuDeviceGetAttribute(
+                &rdmaWithVmm, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, cuDevice));
+            TLLM_CHECK_WITH_INFO(rdmaWithVmm != 0, "the GPU has no GPUDirect RDMA for virtual memory");
+            auto const prop = slotMemoryProp(device, /*hostAccessible=*/true);
             size_t size = 0;
             TLLM_CU_CHECK(cuMemGetAllocationGranularity(&size, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
             CUdeviceptr address = 0;
@@ -346,7 +338,7 @@ bool GhostSlotMemory::hostAccessibleSupported()
             std::shared_ptr<void> const reservation(reinterpret_cast<void*>(address),
                 [size](void* ptr) { cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size); });
             CUDAVirtualMemoryChunk::Configurators configurators;
-            configurators.push_back(std::make_unique<MapConfigurator>(address, size, slotMemoryAccess(device, numaId)));
+            configurators.push_back(std::make_unique<MapConfigurator>(address, size, slotMemoryAccess(device)));
             configurators.push_back(std::make_unique<HostAccessConfigurator>(address, size));
             CUDAVirtualMemoryChunk chunk(std::make_unique<LocalCreator<false>>(prop, size), std::move(configurators));
             chunk.materialize(); // released by its destructor
@@ -364,8 +356,8 @@ bool GhostSlotMemory::hostAccessibleSupported()
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_WARNING("Ghost slot memory stays in device memory: it cannot be mapped for the host (%s): %s",
-                numaId >= 0 ? "on the GPU's NUMA node" : "through GDRCopy", error.what());
+            TLLM_LOG_WARNING(
+                "Ghost slot memory stays in device memory: GDRCopy cannot map it for the host: %s", error.what());
         }
         if (referenced)
         {
@@ -378,7 +370,7 @@ bool GhostSlotMemory::hostAccessibleSupported()
 
 CUmemAllocationProp GhostSlotMemory::allocationProp() const
 {
-    return slotMemoryProp(mDevice, mNumaId, mHostAccessible);
+    return slotMemoryProp(mDevice, mHostAccessible);
 }
 
 void GhostSlotMemory::releaseScratch() noexcept
@@ -456,12 +448,11 @@ void* GhostSlotMemory::allocate(
     {
         mDevice = device;
         mHostAccessible = onHostAccessibleMemory;
-        mNumaId = onHostAccessibleMemory ? HostAccessibleDeviceAllocator::gpuMemoryNumaId() : -1;
         auto const prop = allocationProp();
         size_t granularity = 0;
         TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
         mGranularity = granularity;
-        auto access = slotMemoryAccess(mDevice, mNumaId);
+        auto access = slotMemoryAccess(mDevice);
         if (mHostAccessible)
         {
             // Initialized while host-accessible ranges exist, to record them.

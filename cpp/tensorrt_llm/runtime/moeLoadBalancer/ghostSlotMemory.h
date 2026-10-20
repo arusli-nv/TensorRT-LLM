@@ -32,9 +32,9 @@ namespace tensorrt_llm::runtime
 {
 
 // Device storage for an EPLB slot tensor whose empty (ghost) slots hold no device memory until a restore fills them.
-// It is device memory that GPU copies load or, on request where hostAccessibleSupported(), memory that CPU copies load
-// through HostAccessibleDeviceAllocator: on the GPU's NUMA node, which the host reaches at the same address, or else
-// GPUDirect RDMA capable device memory that GDRCopy pins and maps for the host while it is mapped.
+// It is device memory that GPU copies load or, on request where hostAccessibleSupported(), GPUDirect RDMA capable
+// device memory that CPU copies load through HostAccessibleDeviceAllocator, which GDRCopy pins and maps for the host
+// while it is mapped. Where GPU memory is a NUMA node, it is device memory only.
 // The tensor is one virtual address range that stays fully mapped for the life of the process (CUDA graphs capture
 // its address). Chunks of the VMM granularity that lie wholly inside empty slots form ghost pieces, cut at slot
 // boundaries. While released, a piece maps scratch memory shared by every range of the process (one allocation each
@@ -56,8 +56,7 @@ public:
 
     static GhostSlotMemory& getInstance();
 
-    // Whether allocate() can place memory that CPU copies load, without HostAccessibleDeviceAllocator's managed memory
-    // fallback.
+    // Whether allocate() can place memory that CPU copies load through GDRCopy: false where GPU memory is a NUMA node.
     static bool hostAccessibleSupported();
 
     // A range for slotCount slots of slotBytes each on the current device; the slots in emptySlots are not backed. The
@@ -84,8 +83,8 @@ public:
     // Whether ptr is inside one of these ranges.
     bool contains(void const* ptr);
 
-    // The host mappings of host-accessible ranges (each resident run and backed piece: one GDRCopy pin where GPU
-    // memory is not a NUMA node) and the bytes they map.
+    // The host mappings of host-accessible ranges (each resident run and backed piece: one GDRCopy pin) and the bytes
+    // they map.
     std::pair<size_t, size_t> hostMappings();
 
 private:
@@ -130,9 +129,8 @@ private:
     std::map<Owner, std::vector<Piece*>> mPending; // owner -> pieces back() materialized, not yet kept or released
     int mDevice = -1;
     bool mHostAccessible = false;                  // of the ranges that exist
-    int mNumaId = -1; // the NUMA node of mDevice's memory where the host reaches it at the same address
     size_t mGranularity = 0;
-    std::shared_ptr<Scratch> mScratch; // while any allocation exists
+    std::shared_ptr<Scratch> mScratch;             // while any allocation exists
 };
 
 } // namespace tensorrt_llm::runtime
