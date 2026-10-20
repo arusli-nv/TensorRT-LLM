@@ -145,6 +145,7 @@ class HostMoeTensorSharer:
         self.host_weights = {}
 
         self.own_shm = None
+        self.own_shm_linked = False
         self.imported_shms = []
 
         self.shared_tensors = {}
@@ -274,9 +275,8 @@ class HostMoeTensorSharer:
         if total_size:
             _check_shm_space(total_size, self.layer_id)
             shm_name = self.get_shared_memory_name()
-            if self.own_shm is not None:
-                # A weight reload shares the layer again under the same name.
-                self.own_shm.unlink()
+            # A weight reload shares the layer again under the same name.
+            self.unlink_shared_memory()
             try:
                 shm = shared_memory.SharedMemory(name=shm_name,
                                                  create=True,
@@ -286,6 +286,7 @@ class HostMoeTensorSharer:
                     f"EPLB shared memory {shm_name} already exists and this job did not create it"
                 ) from error
             self.own_shm = shm
+            self.own_shm_linked = True
 
         offset = 0
         for name in self.names:
@@ -327,6 +328,8 @@ class HostMoeTensorSharer:
 
             shm_name = self.get_shared_memory_name(rank)
             shm = shared_memory.SharedMemory(name=shm_name)
+            # Only the creator unlinks the name.
+            resource_tracker.unregister(shm._name, "shared_memory")
             self.imported_shms.append(shm)
 
             offset = 0
@@ -360,18 +363,26 @@ class HostMoeTensorSharer:
         """
         for shm in self.imported_shms:
             shm.close()
-            resource_tracker.unregister(shm._name, "shared_memory")
         self.imported_shms = None
         if self.own_shm:
             self.own_shm.close()
+
+    def unlink_shared_memory(self):
+        """Remove the name of this rank's segment, if it still has one.
+
+        Once every local rank mapped it, the memory lives on until the last
+        mapping goes, so ranks that are killed leave nothing in /dev/shm.
+        """
+        if self.own_shm_linked:
+            self.own_shm.unlink()
+            self.own_shm_linked = False
 
     def post_shutdown_cleanup(self):
         """
         Clean up the resources before C++ shutdown and barrier
         """
-        if self.own_shm:
-            self.own_shm.unlink()
-            self.own_shm = None
+        self.unlink_shared_memory()
+        self.own_shm = None
 
 
 class SingleLayerMoeLoadBalancer:
@@ -1210,6 +1221,12 @@ class MoeLoadBalancer:
         # All shared memory mapping after this barrier.
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
+        # Every rank mapped its peers' shared memory, which nothing opens by name again.
+        self.shared_mpi_comm.barrier()
+        for single_layer_load_balancer in self.single_layer_load_balancers:
+            if single_layer_load_balancer.host_copies:
+                single_layer_load_balancer.host_tensor_sharer.unlink_shared_memory(
+                )
         self.load_balancer_impl.finalize_model()
         mode = self.extra_slots_mode()
         if mode in ("empty", "ghost"):

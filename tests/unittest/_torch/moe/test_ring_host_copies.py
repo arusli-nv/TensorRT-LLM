@@ -75,6 +75,15 @@ def test_a_rank_that_shares_no_expert_creates_no_shared_memory():
                 lambda expert, name, t: weights.__setitem__(expert, t.tolist())
             )
             assert weights == {expert: [float(expert)] * 4 for expert in range(3)}
+        for sharer in sharers:
+            sharer.unlink_shared_memory()
+        # The names are gone; the mappings still hold the weights.
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=sharers[1].get_shared_memory_name())
+        # Local rank 0 maps local rank 3's segment, which holds expert 2, last.
+        assert (
+            bytes(sharers[0].imported_shms[-1].buf[:16]) == torch.full((4,), 2.0).numpy().tobytes()
+        )
     finally:
         for sharer in sharers:
             sharer.pre_shutdown_cleanup()
