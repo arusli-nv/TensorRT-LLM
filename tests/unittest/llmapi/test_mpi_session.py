@@ -1182,7 +1182,7 @@ def test_finalize_and_exit_stops_the_startup_watch_first(
                         "tensorrt_llm._torch.pyexecutor.peer_loss_recovery",
                         recovery)
     with pytest.raises(_Exit) as exited:
-        mpi_session._finalize_and_exit(0)
+        mpi_session._finalize_and_exit(0, "process end")
     assert exited.value.args == (0, )
     assert order == ["stop_startup_watch", "finalize"]
 

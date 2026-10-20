@@ -115,8 +115,8 @@ def _is_departed_peer_failure(exc: BaseException) -> bool:
 _FINALIZE_GRACE_S = 30.0
 
 
-def _finalize_and_exit(status: int) -> NoReturn:
-    """Finalize MPI, then end this process with *status*.
+def _finalize_and_exit(status: int, where: str) -> NoReturn:
+    """Finalize MPI (*where* names the exit path in the logs), then end this process with *status*.
 
     ULFM's MPI_Finalize can block for good, and it holds every process that
     reached it; after ``_FINALIZE_GRACE_S`` this process exits with *status*
@@ -134,7 +134,7 @@ def _finalize_and_exit(status: int) -> NoReturn:
 
     def give_up() -> None:
         print(
-            f"Rank {global_mpi_rank()}: MPI_Finalize did not end within "
+            f"Rank {global_mpi_rank()}: MPI_Finalize ({where}) did not end within "
             f"{_FINALIZE_GRACE_S:.0f} s; exiting with status {status} without it",
             file=sys.stderr,
             flush=True)
@@ -163,7 +163,7 @@ def exit_fault_tolerant_process(status: int = 0) -> None:
     otherwise returns.
     """
     if ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled():
-        _finalize_and_exit(status)
+        _finalize_and_exit(status, "process end")
 
 
 def _leave_degraded_world(clean: bool) -> NoReturn:
@@ -179,7 +179,7 @@ def _leave_degraded_world(clean: bool) -> NoReturn:
     if clean:
         logger.warning(f"Rank {global_mpi_rank()}: finalizing the MPI world, "
                        "which lost a rank")
-        _finalize_and_exit(0)
+        _finalize_and_exit(0, "degraded world")
     logger.error(f"Rank {global_mpi_rank()}: ending the MPI world, which "
                  "lost a rank, after its task failed")
     logging.shutdown()
