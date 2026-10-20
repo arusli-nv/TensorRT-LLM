@@ -484,6 +484,43 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
+// Loads src[i, i + 4) as one 16-byte access when all four words are valid, else word by word with fill past valid.
+__device__ __forceinline__ int4 load_words_or_fill(int32_t const* src, int i, int valid, int32_t fill)
+{
+    if (i + 4 <= valid)
+    {
+        return *reinterpret_cast<int4 const*>(src + i);
+    }
+    return make_int4(i < valid ? src[i] : fill, i + 1 < valid ? src[i + 1] : fill, i + 2 < valid ? src[i + 2] : fill,
+        i + 3 < valid ? src[i + 3] : fill);
+}
+
+// Copies the first valid words of ids and weights to their outputs and fills the rest of total with -1 and 0. Both
+// lists are loaded before either is stored, so a thread pays one memory round trip per step.
+__device__ __forceinline__ void copy_compact_routing(
+    int32_t* out_ids, int32_t* out_weights, int32_t const* ids, int32_t const* weights, int valid, int total)
+{
+    bool const aligned = ((reinterpret_cast<uintptr_t>(out_ids) | reinterpret_cast<uintptr_t>(out_weights)
+                              | reinterpret_cast<uintptr_t>(ids) | reinterpret_cast<uintptr_t>(weights))
+                             & 15)
+        == 0;
+    int const vec_total = aligned ? total & ~3 : 0;
+    for (int i = threadIdx.x * 4; i < vec_total; i += blockDim.x * 4)
+    {
+        int4 const id_words = load_words_or_fill(ids, i, valid, -1);
+        int4 const weight_words = load_words_or_fill(weights, i, valid, 0);
+        *reinterpret_cast<int4*>(out_ids + i) = id_words;
+        *reinterpret_cast<int4*>(out_weights + i) = weight_words;
+    }
+    for (int i = vec_total + threadIdx.x; i < total; i += blockDim.x)
+    {
+        int32_t const id = i < valid ? ids[i] : -1;
+        int32_t const weight = i < valid ? weights[i] : 0;
+        out_ids[i] = id;
+        out_weights[i] = weight;
+    }
+}
+
 // Fixed slots: receive one source. Waits for that source's flag and writes source_valid_counts[source] (0 for a masked
 // source or when an abort releases the wait). With compact routing it then copies the source's routed expert ids and
 // router weights to the compact lists (see DispatchKernelPointers::compact_expert_ids), and with EPLB statistics the
@@ -571,25 +608,11 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
     auto const* weights
         = static_cast<float const*>(ptrs.recv_buffers[rank_id][ptrs.compact_payload_index + 1]) + slot_offset;
     int64_t const out_offset = static_cast<int64_t>(source) * source_tokens * TOP_K;
-    // One token row per thread, its TOP_K loads issued together: one memory round trip per row.
-    for (int row = threadIdx.x; row < source_tokens; row += blockDim.x)
-    {
-        int32_t row_ids[TOP_K];
-        float row_weights[TOP_K];
-        bool const sent = row < count;
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
-        {
-            row_ids[k] = sent ? expert_ids[row * TOP_K + k] : -1;
-            row_weights[k] = sent ? weights[row * TOP_K + k] : 0.F;
-        }
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
-        {
-            ptrs.compact_expert_ids[out_offset + row * TOP_K + k] = row_ids[k];
-            ptrs.compact_weights[out_offset + row * TOP_K + k] = row_weights[k];
-        }
-    }
+    // Rows the source did not send get id -1 and weight 0.F (all-zero bits), so the weights copy as words.
+    static_assert(sizeof(float) == sizeof(int32_t), "router weights copy as 32-bit words");
+    copy_compact_routing(ptrs.compact_expert_ids + out_offset,
+        reinterpret_cast<int32_t*>(ptrs.compact_weights + out_offset), expert_ids,
+        reinterpret_cast<int32_t const*>(weights), count * TOP_K, source_tokens * TOP_K);
 }
 
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
