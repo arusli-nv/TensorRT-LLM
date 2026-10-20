@@ -239,8 +239,8 @@ and multimodal requests under the overlap scheduler.
   (`max_num_tokens` bounds it).
 - The requests the lost ranks were serving that had delivered nothing yet (every non-streaming request, and a
   streaming one before its first token) run again from their prompt on a survivor. A request is interrupted
-  once at most: one that an earlier loss interrupted (it ran again, or a survivor was running it) may be what
-  crashes the ranks, so it is quarantined, not continued. Quarantined requests, and streaming requests of the
+  once at most without progress: one that an earlier loss interrupted (it ran again, or a survivor was running
+  it) and that completed no step since may be what crashes the ranks, so it is quarantined, not continued. Quarantined requests, and streaming requests of the
   lost ranks that had already delivered tokens (they are not continued on a survivor), end with a retryable
   error. Non-streaming requests get HTTP 503 with `Retry-After: 1` and the error code `peer_loss_retryable`.
   Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE `error`

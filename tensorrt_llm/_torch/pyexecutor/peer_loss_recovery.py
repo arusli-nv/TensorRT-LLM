@@ -343,9 +343,13 @@ class PeerLossRecovery(RecoveryHook):
         self._parent_ids: Dict[int, int] = {}
         # On rank 0: the owned requests that delivered a response.
         self._delivered: Set[int] = set()
-        # On rank 0: the owned requests a loss interrupted once (in a discarded step, or on the lost rank); a
-        # second interruption fails them.
+        # On rank 0: the owned requests a loss interrupted (in a discarded step, or on the lost rank) and that have
+        # not committed a step since; another interruption fails them.
         self._interrupted: Set[int] = set()
+        # This rank's requests a loss interrupted, until one of their steps commits; then the ones that did, until
+        # the next recovery tells rank 0.
+        self._unprogressed: Set[int] = set()
+        self._progressed: Set[int] = set()
         # On rank 0: the owned requests whose cancellation was broadcast, until their final response.
         self._cancelled: Set[int] = set()
         # Ids of the requests this rank answered, until their error or final result.
@@ -699,11 +703,21 @@ class PeerLossRecovery(RecoveryHook):
         if self.peer_failed:
             raise HostCollectiveInterrupted("MoE all-to-all", frozenset())
         self._uncommitted_steps.popleft()
+        if self._unprogressed:
+            self._note_progress(batch)
         if self._first_step_pending:
             self._first_step_pending = False
             self._log_phase("first_step", self._generation)
         if self._heartbeat is not None:
             self._heartbeat.publish(self._executor.iter_counter)
+
+    def _note_progress(self, batch: ScheduledRequests) -> None:
+        """Note the interrupted requests whose step ``batch`` committed: a further loss may interrupt them again."""
+        for request in batch.all_requests():
+            request_id = request.parent_request_id if request.is_child else request.py_request_id
+            if request_id in self._unprogressed:
+                self._unprogressed.discard(request_id)
+                self._progressed.add(request_id)
 
     # Request and response hooks
 
@@ -1001,28 +1015,36 @@ class PeerLossRecovery(RecoveryHook):
         # What each survivor holds: the requests it serves and those it already answered (for example
         # rejected ones); none of them may be admitted again. A loss can stop survivors one iteration apart, so
         # they also resume from the same iteration count, which iteration-gated collectives assume. And the
-        # requests the loss interrupted.
+        # requests the loss interrupted, and those that committed a step since an earlier loss interrupted them.
         buffered = executor.take_buffered_responses()
         gathered = dist.allgather(
             (
                 executor.served_request_ids() | self._answered_request_ids(buffered[0]),
                 executor.iter_counter,
                 interrupted,
+                self._progressed,
             ),
             departed=None,
         )
+        self._progressed = set()
+        if self._request_owners is not None:
+            self._interrupted.difference_update(*(entry[3] for entry in gathered if entry))
         held = [entry and entry[0] for entry in gathered]
         executor.iter_counter = max(entry[1] for entry in gathered if entry)
         self._requeue_unscheduled_requests(held)
         rerun, failing = self._deliver_responses(
             failed, buffered, set().union(*(entry[2] for entry in gathered if entry))
         )
+        reran = set(dist.broadcast(rerun, root=0))
+        self._unprogressed = (
+            (self._unprogressed | interrupted) & executor.served_request_ids()
+        ) | reran
         self._readmit_undelivered_requests(failed, held)
         self._log_phase("resumed", generation)
         self._first_step_pending = rank == 0
         self._peer_failed.clear()
         self._watch_peer_failures()
-        requests = f"re-ran {rerun} requests and failed {failing}; " if rank == 0 else ""
+        requests = f"re-ran {len(rerun)} requests and failed {failing}; " if rank == 0 else ""
         logger.warning(
             f"Rank {rank}: resumed serving without ranks {list(failed_ranks)} at membership "
             f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
@@ -1393,7 +1415,7 @@ class PeerLossRecovery(RecoveryHook):
         failed: frozenset,
         buffered: Tuple[Responses, List[LlmRequest]],
         interrupted: Set[int],
-    ) -> Tuple[int, int]:
+    ) -> Tuple[List[int], int]:
         """Deliver what the interrupted gathers owed their clients.
 
         Collective over the survivors. Every survivor resends its parts of the
@@ -1402,12 +1424,13 @@ class PeerLossRecovery(RecoveryHook):
         finished. Rank 0 also takes over the requests that were running on a departed
         attention-DP rank, whose KV cache left with it: those that delivered nothing run again
         from their prompt; the others fail, and cancelled ones end cancelled. A request is
-        interrupted once at most: the survivors' ``interrupted`` requests (in the discarded steps)
-        and the departed ranks' requests that a loss interrupted before fail, as they may be what
-        crashes the ranks.
+        interrupted once at most without progress: the survivors' ``interrupted`` requests (in the
+        discarded steps) that a loss interrupted before and that committed no step since fail, as
+        they may be what crashes the ranks; so do the departed ranks' requests that a loss
+        interrupted before, whose steps since are not known.
 
         Returns:
-            How many requests run again and how many fail (on rank 0; zero elsewhere).
+            The ids of the requests that run again and how many fail (on rank 0; none elsewhere).
         """
         executor = self._executor
         quarantined = set()
@@ -1501,7 +1524,7 @@ class PeerLossRecovery(RecoveryHook):
         self._forget_finished(responses)
         if rerun:
             executor.readmit_requests(rerun)
-        return len(rerun), failed_requests
+        return [item.id for item in rerun], failed_requests
 
     def _readmit_undelivered_requests(
         self, failed: frozenset, held: Sequence[Optional[Set[int]]]
