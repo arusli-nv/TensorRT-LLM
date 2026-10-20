@@ -960,7 +960,7 @@ class PeerLossRecovery(RecoveryHook):
             engine.moe_execution_state, load_balancer, failed, placements, own_rank=rank
         )
         # The KV cache cut now serves the installed slots for good.
-        self._kv_lent = 0
+        kv_lent, self._kv_lent = self._kv_lent, 0
         if online:
             # Every survivor updates the same layers from the same statistics from here on.
             load_balancer.reset_update_schedule()
@@ -987,7 +987,7 @@ class PeerLossRecovery(RecoveryHook):
         held = [entry and entry[0] for entry in gathered]
         executor.iter_counter = max(entry[1] for entry in gathered if entry)
         self._requeue_unscheduled_requests(held)
-        self._deliver_responses(
+        rerun, failing = self._deliver_responses(
             failed, buffered, set().union(*(entry[2] for entry in gathered if entry))
         )
         self._readmit_undelivered_requests(failed, held)
@@ -995,10 +995,12 @@ class PeerLossRecovery(RecoveryHook):
         self._first_step_pending = rank == 0
         self._peer_failed.clear()
         self._watch_peer_failures()
+        requests = f"re-ran {rerun} requests and failed {failing}; " if rank == 0 else ""
         logger.warning(
             f"Rank {rank}: resumed serving without ranks {list(failed_ranks)} at membership "
             f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
-            f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain"
+            f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain; "
+            f"{requests}lent {kv_lent} bytes of the KV cache"
         )
 
     def _log_phase(self, name: str, generation: int) -> None:
@@ -1344,7 +1346,7 @@ class PeerLossRecovery(RecoveryHook):
         failed: frozenset,
         buffered: Tuple[Responses, List[LlmRequest]],
         interrupted: Set[int],
-    ) -> None:
+    ) -> Tuple[int, int]:
         """Deliver what the interrupted gathers owed their clients.
 
         Collective over the survivors. Every survivor resends its parts of the
@@ -1356,6 +1358,9 @@ class PeerLossRecovery(RecoveryHook):
         interrupted once at most: the survivors' ``interrupted`` requests (in the discarded steps)
         and the departed ranks' requests that a loss interrupted before fail, as they may be what
         crashes the ranks.
+
+        Returns:
+            How many requests run again and how many fail (on rank 0; zero elsewhere).
         """
         executor = self._executor
         quarantined = set()
@@ -1405,6 +1410,7 @@ class PeerLossRecovery(RecoveryHook):
         responses += buffered_responses
         self._undelivered_terminations += buffered_terminations
         rerun = []
+        failed_requests = len(quarantined) if self._request_owners is not None else 0
         if self._request_owners is not None:
             # A request that delivered nothing runs again from its prompt on a survivor (only rank 0's own parts
             # are redelivered, so what it delivered is known now), unless a loss interrupted it before: it may be
@@ -1429,6 +1435,7 @@ class PeerLossRecovery(RecoveryHook):
                     if streamed
                     else "an earlier peer loss had already interrupted"
                 )
+                failed_requests += 1
                 responses.append(
                     (
                         request_id,
@@ -1446,10 +1453,8 @@ class PeerLossRecovery(RecoveryHook):
         executor.publish_responses(responses, terminations)
         self._forget_finished(responses)
         if rerun:
-            logger.warning(
-                f"Running {len(rerun)} requests of the lost ranks again on the survivors"
-            )
             executor.readmit_requests(rerun)
+        return len(rerun), failed_requests
 
     def _readmit_undelivered_requests(
         self, failed: frozenset, held: Sequence[Optional[Set[int]]]

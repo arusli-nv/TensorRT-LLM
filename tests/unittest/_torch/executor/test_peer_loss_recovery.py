@@ -1326,10 +1326,12 @@ def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
     assert recovery._interrupted == set() and recovery._request_owners == {12: (3, kept)}
 
 
-def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor():
+def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor(monkeypatch):
     """The request was accepted while its rank served: it runs again on a survivor. A new request pinned to the
     departed rank still fails."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    warnings = []
+    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warnings.append)
 
     def pinned(request_id):
         params = SchedulingParams(attention_dp_rank=FAILED_RANK, attention_dp_relax=False)
@@ -1343,6 +1345,7 @@ def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor():
     recovery._recover(_interrupted())
 
     assert recovery._executor.request_accumulated[:1] == [lost]
+    assert "re-ran 1 requests and failed 0; lent 0 bytes of the KV cache" in warnings[-1]
     assert lost.request.py_scheduling_params == SchedulingParams(
         attention_dp_rank=FAILED_RANK, attention_dp_relax=True
     )
@@ -1356,10 +1359,14 @@ def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor():
 
 
 @pytest.mark.parametrize("streamed", [True, False])
-def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_again(streamed):
+def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_again(
+    monkeypatch, streamed
+):
     """Streamed tokens cannot be taken back; a request that already ran again after its rank failed, and lost its
     new rank too, may be what crashes them: it is quarantined."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    warnings = []
+    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warnings.append)
     item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
     recovery._request_owners = {11: (FAILED_RANK, item)}
     if streamed:
@@ -1376,6 +1383,7 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_aga
     assert is_peer_loss_retryable_message(response.error_msg)
     assert ("streamed" in response.error_msg) == streamed
     assert ("already interrupted" in response.error_msg) != streamed
+    assert "re-ran 0 requests and failed 1;" in warnings[-1]
     assert recovery._request_owners == {} and recovery._interrupted == set()
     assert recovery._executor.request_accumulated == []
 
