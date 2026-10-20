@@ -1159,12 +1159,25 @@ def test_leave_degraded_world_exits_cleanly_from_a_finalize_that_does_not_end(
             raise _Exit(status)
 
     monkeypatch.setattr(mpi_session.os, "_exit", exit_)
-    # Finalize blocks until the watchdog exits the process (a real exit never returns).
-    _fake_world.finalize = lambda: exited.wait(30)
+    finalizing = threading.Event()
+
+    def rank():
+        # No MPI call may run while MPI_Finalize does.
+        assert not finalizing.is_set()
+        return 5
+
+    monkeypatch.setattr(mpi_session, "global_mpi_rank", rank)
+
+    def finalize():
+        finalizing.set()
+        # Blocks until the watchdog exits the process (a real exit never returns).
+        exited.wait(30)
+
+    _fake_world.finalize = finalize
     with pytest.raises(_Exit):
         mpi_session._leave_degraded_world(True)
-    # The watchdog exited with the clean status, without aborting the world.
-    assert statuses[0] == 0 and _fake_world.aborted == []
+    # The watchdog exited with the clean status, without aborting the world or calling MPI.
+    assert statuses == [0, 0] and _fake_world.aborted == []
 
 
 @pytest.mark.cpu_only

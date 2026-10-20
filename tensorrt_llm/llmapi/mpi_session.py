@@ -131,10 +131,12 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
     logging.shutdown()
     sys.stdout.flush()
     sys.stderr.flush()
+    # Read before MPI_Finalize starts: no MPI call may run while it does.
+    rank = global_mpi_rank()
 
     def give_up() -> None:
         print(
-            f"Rank {global_mpi_rank()}: MPI_Finalize ({where}) did not end within "
+            f"Rank {rank}: MPI_Finalize ({where}) did not end within "
             f"{_FINALIZE_GRACE_S:.0f} s; exiting with status {status} without it",
             file=sys.stderr,
             flush=True)
