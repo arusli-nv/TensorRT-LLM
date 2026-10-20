@@ -34,6 +34,8 @@ from tensorrt_llm._torch.alltoall_watchdog import (
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import get_wide_ep_ft_options
 
+pytestmark = pytest.mark.cpu_only
+
 
 class FakeCompletionFlagReader:
     """Thread-safe completion flag reader for pure-Python watchdog tests."""
