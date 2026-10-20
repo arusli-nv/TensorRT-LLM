@@ -60,13 +60,17 @@ def _exit_with_worker_status(status: int, ft_mode: str | None, tmp_path: Path) -
     [
         (137, None, 137),  # FT off: plain exit status
         (143, "0", 143),
+        (1, "0", 1),
         (0, "1", 0),
-        (1, "1", 1),
-        (137, "1", -9),  # FT on, worker SIGKILLed: launcher dies by SIGKILL
-        (143, "1", -15),  # FT on, worker SIGTERMed: launcher dies by SIGTERM
-        (139, "1", 139),  # FT on, SIGSEGV: not re-raised
-        (134, "1", 134),  # FT on, SIGABRT: not re-raised
-        (255, "1", 255),  # FT on, not a signal
+        (75, "1", 75),  # FT on, every rank exits for a deployment restart: ends the job
+        # FT on, any other abnormal end of the worker (a lost rank): the launcher dies by SIGKILL.
+        (137, "1", -9),
+        (143, "1", -9),
+        (139, "1", -9),  # SIGSEGV
+        (134, "1", -9),  # SIGABRT
+        (135, "1", -9),  # SIGBUS
+        (1, "1", -9),  # e.g. a CUDA error
+        (255, "1", -9),
     ],
 )
 def test_exit_with_worker_status(status, ft_mode, expected_returncode, tmp_path):
