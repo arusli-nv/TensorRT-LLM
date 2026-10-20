@@ -839,6 +839,33 @@ def test_steps_commit_oldest_first_and_release_the_newest():
     assert not recovery._uncommitted_steps
 
 
+def test_rank0_logs_each_recovery_phase_once_in_order(monkeypatch):
+    logged = []
+    monkeypatch.setattr(peer_loss_recovery.logger, "info", logged.append)
+    recovery = _recovery(_FakeClient(_happy_replies(generation=1)), rank=0)
+    recovery._recover(_interrupted())
+    step = Mock(context_requests=[])
+    for _ in range(2):
+        recovery.step_prepared(step)
+        recovery.commit_step(step, Mock())
+
+    phases = [line.split()[2:4] for line in logged if line.startswith("WideEP recovery")]
+    assert phases == [
+        ["gen=1", f"phase={name}"]
+        for name in (
+            "detect",
+            "stopped",
+            "proposed",
+            "ready",
+            "install",
+            "installed",
+            "committed",
+            "resumed",
+            "first_token",
+        )
+    ]
+
+
 def test_run_recovers_and_resumes():
     recovery = _recovery(_FakeClient([]))
     error = _interrupted()

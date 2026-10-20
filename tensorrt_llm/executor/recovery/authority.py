@@ -486,7 +486,10 @@ class RecoveryAuthority:
             return self.abort(
                 f"departed rank {message.target} could not be fenced: {message.error}"
             )
-        logger.info(f"Recovery authority: departed rank {message.target} fenced")
+        logger.info(
+            f"Recovery authority: departed rank {message.target} fenced "
+            f"{(now - self._stage_starts[0]) * 1e3:.1f} ms into the recovery"
+        )
         self._fenced.add(message.target)
         if message.target not in self._fencing:
             # A second answer: a further loss restarted the round after the first request.
@@ -565,7 +568,11 @@ class RecoveryAuthority:
             self.hang_monitor.reset()
         logger.info(
             f"Recovery authority: committed generation {self.generation} "
-            f"without ranks {sorted(self.failed_ranks)}"
+            f"without ranks {sorted(self.failed_ranks)}; stage ms "
+            + ", ".join(
+                f"{stage}={us / 1e3:.1f}"
+                for stage, us in zip(("stop", "agree", "install"), self._recovery_stage_us)
+            )
         )
         return self._to_survivors(Commit(self.generation))
 
@@ -585,7 +592,10 @@ class RecoveryAuthority:
         return [(self._routes[rank], message) for rank in self.survivors]
 
     def _enter(self, phase: Phase) -> None:
-        logger.info(f"Recovery authority: {self.phase.name} -> {phase.name}")
+        generation = self.generation if phase is Phase.RECOVERED else self.generation + 1
+        logger.info(
+            f"Recovery authority: {self.phase.name} -> {phase.name} gen={generation} t={time.time():.3f}"
+        )
         self.phase = phase
 
 

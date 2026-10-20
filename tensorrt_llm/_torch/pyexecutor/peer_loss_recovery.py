@@ -242,6 +242,9 @@ class PeerLossRecovery(RecoveryHook):
         self._shrink_timeout_s = fault_tolerance_config().shrink_timeout_s()
         # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
+        # The last committed membership generation, and whether rank 0 still logs a recovery's first step.
+        self._generation = 0
+        self._first_step_pending = False
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
         # ahead of the one whose results it applies.
         self._uncommitted_steps: Deque[PreparedStep] = collections.deque()
@@ -584,6 +587,9 @@ class PeerLossRecovery(RecoveryHook):
         if self.peer_failed:
             raise HostCollectiveInterrupted("MoE all-to-all", frozenset())
         self._uncommitted_steps.popleft()
+        if self._first_step_pending:
+            self._first_step_pending = False
+            self._log_phase("first_token", self._generation)
         if self._heartbeat is not None:
             self._heartbeat.publish(self._executor.iter_counter)
 
@@ -763,6 +769,7 @@ class PeerLossRecovery(RecoveryHook):
         dist, engine, client = executor.dist, executor.model_engine, self._client
         started = time.monotonic()
         rank = dist.rank
+        self._log_phase("detect", self._generation + 1)
         logger.warning(
             f"Rank {rank}: host collective interrupted ({error}); attempting peer-loss recovery"
         )
@@ -812,6 +819,7 @@ class PeerLossRecovery(RecoveryHook):
 
             try:
                 client.send(Stopped(rank=rank, failed_ranks=failed_ranks))
+                self._log_phase("stopped", self._generation + 1)
                 # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery
                 # it cannot complete reaches every survivor as Abort rather than as a timeout here.
                 if not replans:
@@ -831,14 +839,17 @@ class PeerLossRecovery(RecoveryHook):
                         f"authority proposed {proposal}"
                     )
                 generation = proposal.generation
+                self._log_phase("proposed", generation)
                 copy_plan = (
                     None if online else self._stage_ring_restore(load_balancer, failed, placements, staged)
                 )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
                 client.send(ready)
+                self._log_phase("ready", generation)
                 install = client.wait(Install, deadline, interrupt=further_loss)
                 _expect_generation(install, generation)
+                self._log_phase("install", generation)
             except RecoveryInterrupted:
                 failed = self._shrink_again(survivor_watch, failed, deadline)
                 replans += 1
@@ -859,7 +870,10 @@ class PeerLossRecovery(RecoveryHook):
             load_balancer.reset_update_schedule()
         failed_requests = self._departed_requests(failed)
         client.send(Installed(rank=rank, generation=generation, failed_requests=failed_requests))
+        self._log_phase("installed", generation)
         _expect_generation(client.wait(Commit, deadline), generation)
+        self._generation = generation
+        self._log_phase("committed", generation)
 
         # What each survivor holds: the requests it serves and those it already answered (for example
         # rejected ones); none of them may be admitted again. A loss can stop survivors one iteration apart, so
@@ -877,6 +891,8 @@ class PeerLossRecovery(RecoveryHook):
         self._requeue_unscheduled_requests(held)
         self._deliver_responses(failed, buffered)
         self._readmit_undelivered_requests(failed, held)
+        self._log_phase("resumed", generation)
+        self._first_step_pending = rank == 0
         self._peer_failed.clear()
         self._watch_peer_failures()
         logger.warning(
@@ -884,6 +900,11 @@ class PeerLossRecovery(RecoveryHook):
             f"generation {generation}, {(time.monotonic() - started) * 1e3:.0f} ms after the "
             f"interruption, discarding {discarded} steps; {len(dist.live_ranks)} ranks remain"
         )
+
+    def _log_phase(self, name: str, generation: int) -> None:
+        """Log on rank 0 the wall-clock time the recovery to ``generation`` reached phase ``name``."""
+        if self._executor.dist.rank == 0:
+            logger.info(f"WideEP recovery gen={generation} phase={name} t={time.time():.3f}")
 
     def _wait_for_proposal(
         self,
