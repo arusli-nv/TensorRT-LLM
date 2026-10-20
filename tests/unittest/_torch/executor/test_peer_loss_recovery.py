@@ -1763,7 +1763,7 @@ def _supported_executor():
         ),
         (lambda ex: setattr(ex.dist.mapping, "moe_tp_size", 2), "expert TP 1"),
         (lambda ex: setattr(ex.model_engine, "moe_load_balancer", None), "an EPLB load balancer"),
-        (lambda ex: setattr(ex.hang_detector, "timeout", 60), "hang detection timeout"),
+        (lambda ex: setattr(ex.hang_detector, "timeout", 60), r"hang_detection_timeout \(60 s\)"),
         (lambda ex: setattr(ex, "dist", Mock(mapping=ex.dist.mapping)), "MPI executor"),
     ],
 )
@@ -1784,8 +1784,11 @@ def test_create_requires_the_hang_detector_to_outlast_a_shrink_waiting_for_a_fen
     monkeypatch.setattr(peer_loss_recovery, "fault_tolerance_config", lambda: config)
     executor = _supported_executor()
     # Above the hang's resolution plus a recovery, but not above the shrink plus a recovery's two waits.
-    executor.hang_detector.timeout = config.shrink_timeout_s() + config.recovery_timeout_s
-    with pytest.raises(ValueError, match="hang detection timeout above the shrink"):
+    executor.hang_detector.timeout = timeout = config.shrink_timeout_s() + config.recovery_timeout_s
+    minimum = config.shrink_timeout_s() + 2 * config.recovery_timeout_s
+    with pytest.raises(
+        ValueError, match=rf"hang_detection_timeout \({timeout} s\) above {minimum:g} s"
+    ):
         PeerLossRecovery.create(executor)
 
 

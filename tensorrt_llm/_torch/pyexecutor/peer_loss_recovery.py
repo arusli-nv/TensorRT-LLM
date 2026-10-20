@@ -33,6 +33,7 @@ from tensorrt_llm._utils import (
     peer_loss_recovery_enabled,
 )
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.executor.recovery.config import CONFIG_ENV as FAULT_TOLERANCE_CONFIG_ENV
 from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.executor.utils import peer_loss_retryable_message
 from tensorrt_llm.logger import logger
@@ -375,6 +376,7 @@ class PeerLossRecovery(RecoveryHook):
         load_balancer = engine.moe_load_balancer
         kv_cache_manager = executor.kv_cache_manager
         config = fault_tolerance_config()
+        min_hang_timeout_s = config.shrink_timeout_s() + 2 * config.recovery_timeout_s
         # MPIDist.enable_peer_loss_recovery() checks the pure attention-DP layout.
         requirements = {
             "MPI executor": isinstance(dist, MPIDist),
@@ -405,8 +407,9 @@ class PeerLossRecovery(RecoveryHook):
             # One recovery runs under one hang checkpoint: the survivors agree on the failed ranks (a hung
             # peer stalls them until it is confirmed and fenced), then wait up to the recovery timeout twice:
             # for the device, then for the authority. The executor's own hang detector must not end them first.
-            "hang detection timeout above the shrink and twice the recovery timeout": executor.hang_detector.timeout
-            > config.shrink_timeout_s() + 2 * config.recovery_timeout_s,
+            f"hang_detection_timeout ({executor.hang_detector.timeout} s) above {min_hang_timeout_s:g} s, the "
+            "shrink timeout plus twice recovery_timeout_s (lower the timeouts in "
+            f"{FAULT_TOLERANCE_CONFIG_ENV})": executor.hang_detector.timeout > min_hang_timeout_s,
             "no sleep/wakeup": executor.llm_args.sleep_config is None,
             # Rebalancing applies a step's results outside the step loop and
             # votes with collectives that do not expect a departed rank.
