@@ -216,8 +216,8 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
   ran again and loses its rank a second time may be what crashes them: it is quarantined, not run again. Those,
   and streaming requests that had already delivered tokens (they are not continued on a survivor), end with a
   retryable error. Non-streaming requests get an error
-  response. Streaming `/v1/completions` and `/v1/chat/completions` responses end with an SSE `error` event
-  followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
+  response. Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE
+  `error` event followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that
   never used the lost rank's experts.
 - No CUDA graphs are recaptured, so serving resumes at once without the lost GPUs.
