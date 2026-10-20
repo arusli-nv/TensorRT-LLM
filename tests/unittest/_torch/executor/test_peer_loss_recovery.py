@@ -1202,7 +1202,13 @@ def test_discard_drops_the_logits_and_additional_outputs_its_steps_appended(monk
         py_return_context_logits=True,
         py_return_generation_logits=True,
         py_additional_outputs=["hidden"],
+        sampling_config=Mock(
+            repetition_penalty=None, presence_penalty=None, frequency_penalty=None
+        ),
+        py_multimodal_data=None,
+        py_logits_post_processors=None,
     )
+    recovery.validate_request(request)
 
     def append(value):
         result.append_context_logits(torch.full((2, 8), value))

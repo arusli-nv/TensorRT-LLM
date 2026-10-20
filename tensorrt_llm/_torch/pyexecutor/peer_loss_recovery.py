@@ -310,6 +310,8 @@ class PeerLossRecovery(RecoveryHook):
         # Steps prepared and not yet committed, oldest first: two while the overlap scheduler runs a step
         # ahead of the one whose results it applies.
         self._uncommitted_steps: Deque[PreparedStep] = collections.deque()
+        # Whether a request admitted so far returns logits or additional outputs, which steps then checkpoint.
+        self._outputs_requested = False
         self._peer_failed = threading.Event()
         self._watch: Optional[PeerFailureWatch] = None
         # The native heartbeat (HeartbeatSender) while hang detection reports.
@@ -465,7 +467,8 @@ class PeerLossRecovery(RecoveryHook):
         return cls(executor, client, admitted)
 
     def validate_request(self, request: LlmRequest) -> None:
-        """Reject a request whose state a discarded step would change.
+        """Reject a request whose state a discarded step would change; note one that returns logits or
+        additional outputs.
 
         Raises:
             ValueError: The request uses occurrence penalties, whose counts a
@@ -488,6 +491,12 @@ class PeerLossRecovery(RecoveryHook):
             raise ValueError(
                 "Logits post-processors are not supported with WideEP peer-loss recovery"
             )
+        if (
+            request.py_return_context_logits
+            or request.py_return_generation_logits
+            or request.py_additional_outputs
+        ):
+            self._outputs_requested = True
 
     @property
     def peer_failed(self) -> bool:
@@ -639,7 +648,11 @@ class PeerLossRecovery(RecoveryHook):
     def step_outputs_appending(self, batch: ScheduledRequests) -> None:
         """Checkpoint the results to which ``batch``, the newest prepared step, appends logits or additional
         outputs, so that a discard drops them."""
-        if not self._uncommitted_steps or self._uncommitted_steps[-1].batch is not batch:
+        if (
+            not self._outputs_requested
+            or not self._uncommitted_steps
+            or self._uncommitted_steps[-1].batch is not batch
+        ):
             return
         self._uncommitted_steps[-1].results = [
             (request.py_result, request.py_result.checkpoint())
