@@ -588,7 +588,10 @@ def test_fence_timeout_still_traps() -> None:
 
 @pytest.mark.parametrize("count", [_CAPACITY + 1, -5])
 def test_a_corrupt_received_count_traps(count: int) -> None:
-    assert "corrupt count trapped" in _run_trapping_child(str(count))
+    output = _run_trapping_child(str(count))
+    # The kernel's own report, not just any device error.
+    assert f"received corrupt token count {count} from rank 1" in output, output
+    assert "corrupt count trapped" in output, output
 
 
 if __name__ == "__main__":
