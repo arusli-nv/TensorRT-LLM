@@ -38,7 +38,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._utils import FAULT_TOLERANCE_MODE_ENV, EnergyMonitor
+from tensorrt_llm._utils import EnergyMonitor, fault_tolerance_mode
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -1706,7 +1706,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 return JSONResponse(
                     status_code=200 if body["state"] in SERVING_STATES else 503,
                     content=body)
-            if os.environ.get(FAULT_TOLERANCE_MODE_ENV) == "1":
+            if fault_tolerance_mode():
                 # Detection only: a peer loss is not recovered.
                 return JSONResponse(content=status_body(None))
             return Response(status_code=200)

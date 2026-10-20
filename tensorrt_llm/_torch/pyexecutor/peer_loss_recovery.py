@@ -6,7 +6,6 @@ import atexit
 import collections
 import dataclasses
 import functools
-import os
 import socket
 import threading
 import time
@@ -30,6 +29,7 @@ import torch
 from tensorrt_llm._utils import (
     FAULT_TOLERANCE_AUTHORITY_ENV,
     FAULT_TOLERANCE_MODE_ENV,
+    fault_tolerance_mode,
     is_mpi_peer_failure,
     peer_loss_recovery_enabled,
 )
@@ -375,7 +375,7 @@ class PeerLossRecovery(RecoveryHook):
                 the registration.
         """
         if not peer_loss_recovery_enabled():
-            if os.environ.get(FAULT_TOLERANCE_MODE_ENV) == "1" and executor.dist.rank == 0:
+            if fault_tolerance_mode() and executor.dist.rank == 0:
                 logger.warning(
                     f"{FAULT_TOLERANCE_MODE_ENV}=1 without {FAULT_TOLERANCE_AUTHORITY_ENV}: the "
                     "WideEP rank mask and its cost are on, but a peer loss is not recovered; set "

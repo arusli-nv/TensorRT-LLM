@@ -23,7 +23,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
 )
-from tensorrt_llm._utils import FAULT_TOLERANCE_MODE_ENV
+from tensorrt_llm._utils import fault_tolerance_mode
 
 from .ep_group_health import EPGroupHealth
 
@@ -35,10 +35,6 @@ _POLL_INTERVAL_ENV = "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S"
 _HEALTH_KEY = "wide_ep_ft_ep_group_health"
 _TIMEOUT_KEY = "alltoall_watchdog_timeout_s"
 _POLL_INTERVAL_KEY = "alltoall_watchdog_poll_interval_s"
-
-
-def _env_enabled() -> bool:
-    return os.environ.get(FAULT_TOLERANCE_MODE_ENV) == "1"
 
 
 def _float_option(extra_attrs: dict, key: str, env_name: str, default: float) -> float:
@@ -66,7 +62,7 @@ def get_wide_ep_ft_options(
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
     health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
-    rank_mask_enabled = health is not None or _env_enabled()
+    rank_mask_enabled = health is not None or fault_tolerance_mode()
     if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)
         extra_attrs[_HEALTH_KEY] = health
