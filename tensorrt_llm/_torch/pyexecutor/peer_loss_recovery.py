@@ -1291,9 +1291,10 @@ class PeerLossRecovery(RecoveryHook):
         held for the next synchronized flush, then terminates the requests they
         finished. Rank 0 also takes over the requests that were running on a departed
         attention-DP rank, whose KV cache left with it: those that delivered nothing run again
-        from their prompt; the others fail, and cancelled ones end cancelled. A request is interrupted once at most: the
-        survivors' ``interrupted`` requests (in the discarded steps) and the departed ranks'
-        requests that a loss interrupted before fail, as they may be what crashes the ranks.
+        from their prompt; the others fail, and cancelled ones end cancelled. A request is
+        interrupted once at most: the survivors' ``interrupted`` requests (in the discarded steps)
+        and the departed ranks' requests that a loss interrupted before fail, as they may be what
+        crashes the ranks.
         """
         executor = self._executor
         quarantined = set()

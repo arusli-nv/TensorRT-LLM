@@ -1401,7 +1401,9 @@ def test_a_request_two_losses_interrupt_fails_whatever_ranks_were_lost():
     executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
     shrinks = iter([frozenset({FAILED_RANK}), lost])
     executor.dist.shrink.side_effect = lambda: next(shrinks)
-    recovery.requests_routed({1: [Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)]})
+    recovery.requests_routed(
+        {1: [Mock(id=request_id, child_req_ids=None) for request_id in (11, 12)]}
+    )
     failures = []
     executor.fail_requests = lambda request_ids, error_msg: failures.append(set(request_ids))
     _sent_responses(recovery)
