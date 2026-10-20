@@ -701,7 +701,7 @@ class PeerLossRecovery(RecoveryHook):
         self._uncommitted_steps.popleft()
         if self._first_step_pending:
             self._first_step_pending = False
-            self._log_phase("first_token", self._generation)
+            self._log_phase("first_step", self._generation)
         if self._heartbeat is not None:
             self._heartbeat.publish(self._executor.iter_counter)
 

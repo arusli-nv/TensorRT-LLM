@@ -882,7 +882,7 @@ def test_rank0_logs_each_recovery_phase_once_in_order(monkeypatch):
             "installed",
             "committed",
             "resumed",
-            "first_token",
+            "first_step",
         )
     ]
 

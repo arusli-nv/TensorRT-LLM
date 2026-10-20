@@ -368,7 +368,7 @@ class RecoveryAuthority:
         if self.phase is Phase.ABORTED:
             return [] if route is None else [(route, Abort(self.abort_reason))]
         logger.error(f"Recovery aborted in phase {self.phase.name}: {reason}")
-        self.phase = Phase.ABORTED
+        self._enter(Phase.ABORTED)
         self.deadline = None
         self.abort_reason = reason
         routes = list(self._workers)
@@ -418,7 +418,7 @@ class RecoveryAuthority:
             )
             return []
         self._admit()
-        self.phase = Phase.SERVING
+        self._enter(Phase.SERVING)
         registered = Registered(_sorted_domains(self.admitted_domains))
         return [(peer, registered) for peer in self._workers]
 
@@ -598,7 +598,10 @@ class RecoveryAuthority:
         return [(self._routes[rank], message) for rank in self.survivors]
 
     def _enter(self, phase: Phase) -> None:
-        generation = self.generation if phase is Phase.RECOVERED else self.generation + 1
+        # A recovery in progress, or aborted, is numbered by the generation it installs.
+        recovering = (Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING)
+        in_recovery = phase in recovering or (phase is Phase.ABORTED and self.phase in recovering)
+        generation = self.generation + 1 if in_recovery else self.generation
         logger.info(
             f"Recovery authority: {self.phase.name} -> {phase.name} gen={generation} t={time.time():.3f}"
         )
