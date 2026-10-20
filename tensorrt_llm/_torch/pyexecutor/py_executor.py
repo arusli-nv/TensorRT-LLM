@@ -8690,10 +8690,11 @@ class PyExecutor:
     def discard_interrupted_steps(self, steps: Iterable[PreparedStep]) -> None:
         """Undo steps that a peer loss interrupted before their results applied.
 
-        ``steps`` come newest first. Each step's request changes are undone and
-        the KV cache reserved for it, target and draft, is returned, as is the
-        attention-DP padding request, so that the steps' requests are scheduled
-        again unchanged and the loop restarts from host state.
+        ``steps`` come newest first. Each step's request changes, logits and
+        additional outputs are undone and the KV cache reserved for it, target
+        and draft, is returned, as is the attention-DP padding request, so that
+        the steps' requests are scheduled again unchanged and the loop restarts
+        from host state.
         """
         self._finalize_adp_dummy_allocation(False)
         if self._recompute_unpaused is not None:
@@ -8705,6 +8706,8 @@ class PyExecutor:
                 request.context_current_position = position
                 request.state = state
                 request.py_draft_tokens = draft_tokens
+            for result, checkpoint in step.results:
+                result.rollback(checkpoint)
             self.kv_cache_manager.revert_prepare_resources(
                 step.batch, step.context_capacities)
             if self.draft_kv_cache_manager is not None:
@@ -8832,6 +8835,8 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
+                self._peer_loss_recovery.step_outputs_appending(
+                    scheduled_batch)
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
                                batch_outputs["logits"], beam_width,

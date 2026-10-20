@@ -32,7 +32,7 @@ from tensorrt_llm.logger import logger
 from ..distributed.communicator import HostCollectiveInterrupted, MPIDist, PeerFailureWatch
 from .error_classification import classify_error
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .llm_request import LlmRequest, LlmRequestState, LlmResponse
+from .llm_request import LlmRequest, LlmRequestState, LlmResponse, PyResult
 from .resource_manager import ResourceManagerType
 from .sampler.penalties import has_occurrence_penalty
 from .scheduler import ScheduledRequests
@@ -138,12 +138,14 @@ class PreparedStep:
     """A scheduled step that holds resources but whose results are not accepted yet.
 
     ``context_capacities`` are its context requests' KV cache capacities before it (the KV cache manager's
-    ``context_capacities``); ``changes`` lists, in order, what each request had before the step changed it.
+    ``context_capacities``); ``changes`` lists, in order, what each request had before the step changed it;
+    ``results`` pairs each result the step appends logits or additional outputs to with its checkpoint.
     """
 
     batch: ScheduledRequests
     context_capacities: Dict[int, Optional[int]]
     changes: List[StepChange] = dataclasses.field(default_factory=list)
+    results: List[Tuple[PyResult, tuple]] = dataclasses.field(default_factory=list)
 
 
 class RecoveryHook:
@@ -170,6 +172,9 @@ class RecoveryHook:
         return None
 
     def step_released(self) -> None:
+        pass
+
+    def step_outputs_appending(self, batch: ScheduledRequests) -> None:
         pass
 
     def commit_step(self, batch: ScheduledRequests, sample_state: Optional["SampleState"]) -> None:
@@ -560,6 +565,19 @@ class PeerLossRecovery(RecoveryHook):
     def step_released(self) -> None:
         """Record that the newest prepared step returned its resources without running."""
         self._uncommitted_steps.pop()
+
+    def step_outputs_appending(self, batch: ScheduledRequests) -> None:
+        """Checkpoint the results to which ``batch``, the newest prepared step, appends logits or additional
+        outputs, so that a discard drops them."""
+        if not self._uncommitted_steps or self._uncommitted_steps[-1].batch is not batch:
+            return
+        self._uncommitted_steps[-1].results = [
+            (request.py_result, request.py_result.checkpoint())
+            for request in batch.all_requests()
+            if request.py_return_context_logits
+            or request.py_return_generation_logits
+            or request.py_additional_outputs
+        ]
 
     def commit_step(self, batch: ScheduledRequests, sample_state: Optional["SampleState"]) -> None:
         """Accept the oldest prepared step, ``batch``, unless a peer failed while it ran.

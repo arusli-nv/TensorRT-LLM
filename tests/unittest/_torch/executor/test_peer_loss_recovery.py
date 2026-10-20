@@ -15,13 +15,13 @@ import torch
 
 from tensorrt_llm._torch.distributed.communicator import HostCollectiveInterrupted, MPIDist
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.pyexecutor import peer_loss_recovery
+from tensorrt_llm._torch.pyexecutor import llm_request, peer_loss_recovery
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     CONTROL_REQUEST_ID,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
 from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
     PeerLossRecovery,
     PreparedStep,
@@ -1142,6 +1142,56 @@ def test_discard_restores_the_draft_tokens_sampling_set():
 
     assert request.py_draft_tokens is drafts
     assert (request.context_current_position, request.state) == (64, "CONTEXT_INIT")
+
+
+def test_discard_drops_the_logits_and_additional_outputs_its_steps_appended(monkeypatch):
+    """Sampling appends a step's logits and additional outputs before the step is accepted; its rerun appends
+    them again."""
+    monkeypatch.setattr(llm_request, "prefer_pinned", lambda: False)
+    recovery = _recovery(_FakeClient([]))
+    executor = recovery._executor
+    executor.inflight_req_ids = Mock()
+    executor._pending_adp_dummy_request = None
+    result = PyResult(
+        prompt_len=8,
+        max_new_tokens=4,
+        use_device_memory=False,
+        return_context_logits=True,
+        return_generation_logits=True,
+        additional_outputs=["hidden"],
+    )
+    request = Mock(
+        is_attention_dp_dummy=False,
+        py_result=result,
+        py_return_context_logits=True,
+        py_return_generation_logits=True,
+        py_additional_outputs=["hidden"],
+    )
+
+    def append(value):
+        result.append_context_logits(torch.full((2, 8), value))
+        result.append_generation_logits(torch.full((1, 1, 8), value))
+        result.transfer_remaining_device_logits()
+        result.append_additional_context_outputs("hidden", torch.full((2, 3), value))
+        result.append_additional_generation_outputs("hidden", torch.full((1, 1, 3), value))
+
+    append(1.0)
+    # Two uncommitted steps under the overlap scheduler.
+    for value in (2.0, 3.0):
+        batch = SimpleNamespace(context_requests=[], all_requests=lambda: [request])
+        recovery.step_prepared(batch)
+        recovery.step_outputs_appending(batch)
+        append(value)
+
+    PyExecutor.discard_interrupted_steps(executor, reversed(recovery._uncommitted_steps))
+
+    assert torch.equal(result.context_logits, torch.ones(2, 8))
+    assert torch.equal(result.generation_logits, torch.ones(1, 1, 8))
+    assert torch.equal(result.additional_context_outputs["hidden"], torch.ones(2, 3))
+    assert torch.equal(result.additional_generation_outputs["hidden"], torch.ones(1, 1, 3))
+    append(2.0)
+    assert result.context_logits.shape == (4, 8)
+    assert torch.equal(result.generation_logits[0, :, 0], torch.tensor([1.0, 2.0]))
 
 
 def test_discard_before_prepare_releases_the_tentative_padding_request():
