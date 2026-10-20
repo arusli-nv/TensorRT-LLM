@@ -124,8 +124,14 @@ def _ghost_slot_memory_host_accessible() -> bool:
     """
     global _ghost_host_accessible
     if _ghost_host_accessible is None:
-        ranks = tensorrt_llm.mpi_comm().allgather(
-            _tbr.is_ghost_slot_memory_host_accessible())
+        try:
+            accessible = _tbr.is_ghost_slot_memory_host_accessible()
+        except RuntimeError as error:
+            # Still joins the allgather, which every rank must reach.
+            logger.warning(
+                f"Ghost slot memory cannot be host accessible: {error}")
+            accessible = False
+        ranks = tensorrt_llm.mpi_comm().allgather(accessible)
         if any(ranks) and not all(ranks):
             logger.warning(
                 "Ghost slot memory stays in device memory on every rank: it cannot be host accessible on ranks "

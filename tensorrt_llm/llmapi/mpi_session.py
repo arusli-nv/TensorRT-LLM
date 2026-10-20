@@ -120,7 +120,12 @@ def _mpi_finalize() -> int:
     """MPI_Finalize through ctypes, which releases the GIL while it runs (mpi4py's call holds it), so that
     the timer thread of ``_finalize_and_exit`` can run. Returns the MPI error code.
     """
-    return ctypes.CDLL(mpi4py.MPI.__file__).MPI_Finalize()
+    try:
+        finalize = ctypes.CDLL(mpi4py.MPI.__file__).MPI_Finalize
+    except AttributeError:  # an mpi4py that loads MPI at run time: the GIL-free backstop still bounds it
+        mpi4py.MPI.Finalize()
+        return 0
+    return finalize()
 
 
 def _finalize_and_exit(status: int, where: str) -> NoReturn:
