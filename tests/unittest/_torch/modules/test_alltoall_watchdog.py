@@ -630,6 +630,50 @@ def test_workspace_coordinator_wraps_shared_generation() -> None:
         coordinator.release_watchdog(watchdog)
 
 
+def test_coordinator_watches_no_collective_under_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_state: dict[str, object] = {}
+    workspace = torch.zeros((2, 32), dtype=torch.uint8)
+    metainfo = torch.tensor([0, 4, 12], dtype=torch.int64)
+    metainfo_index = {
+        "FLAG_VAL_OFFSET_INDEX": 0,
+        "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+        "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+    }
+    coordinators = [
+        AlltoAllWatchdogCoordinator(
+            workspace_state=workspace_state,
+            workspace=workspace,
+            metainfo=metainfo,
+            metainfo_index=metainfo_index,
+            ep_rank=0,
+        )
+        for _ in range(2)
+    ]
+    events: list[AlltoAllWatchdogTimeout] = []
+    watchdog = coordinators[0].acquire_watchdog(
+        ep_size=2,
+        timeout_s=0.02,
+        poll_interval_s=0.005,
+        on_timeout=events.append,
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    try:
+        coordinators[1].watch_collective(None, "dispatch", None)
+        coordinators[0].watch_collective(watchdog, "dispatch", None)
+        coordinators[0].watch_collective(watchdog, "combine", None)
+        # Nothing is queued and the generation the next eager collective waits for is unchanged.
+        assert watchdog.wait_until_idle(timeout_s=0.0)
+        assert coordinators[0]._get_shared_state().generation == 0
+        time.sleep(0.05)
+        assert events == []
+    finally:
+        coordinators[0].release_watchdog(watchdog)
+
+
 def test_unmonitored_coordinator_advances_shared_generation() -> None:
     workspace_state: dict[str, object] = {}
     workspace = torch.zeros((2, 32), dtype=torch.uint8)

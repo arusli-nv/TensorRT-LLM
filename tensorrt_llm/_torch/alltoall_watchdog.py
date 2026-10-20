@@ -461,6 +461,9 @@ class AlltoAllWatchdogCoordinator:
         phase: str,
         active_rank_mask: torch.Tensor | None,
     ) -> None:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            # A captured collective runs no kernel, so no completion flag advances for it.
+            return
         if watchdog is None:
             state = self._find_shared_state()
             if state is not None:
