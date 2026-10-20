@@ -697,7 +697,7 @@ def test_gather_numbers_follow_rank0_after_a_recovery():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     for number in range(3):
         recovery.gathering_responses([(number, Mock())])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: 2
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: (2, set())
     _sent_responses(recovery)
 
     recovery._recover(_interrupted())
@@ -915,7 +915,7 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
         hang_evidence.HangEvidenceReporter, "start", lambda self: started.append(self)
     )
     monkeypatch.setattr(
-        hang_evidence.HangEvidenceReporter, "stop", lambda self: stopped.append(self)
+        hang_evidence.HangEvidenceReporter, "stop", lambda self: stopped.append(self) or True
     )
     heartbeats = []
     monkeypatch.setattr(
@@ -1634,7 +1634,7 @@ def test_a_resent_part_notes_the_requests_it_answered_again():
     """Rank 0 never read the notes of a gather a loss interrupted, so the resent part carries them again."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     recovery.gathering_responses([(11, _response(11))])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: 0
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: (0, set())
     resent = []
     recovery._executor._enqueue_responses = lambda responses: resent.append(
         recovery.gathering_responses(responses)
@@ -1729,7 +1729,7 @@ def test_recovery_resends_gathers_rank0_did_not_process(processed):
     first, second = [(5, Mock(name="first"))], [(6, Mock(name="second"))]
     recovery.gathering_responses(first)
     recovery.gathering_responses(second)
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: processed
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: (processed, set())
     finished = Mock(name="finished")
     recovery.defer_terminations([finished])
     order = []
@@ -1748,7 +1748,7 @@ def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     for number in range(peer_loss_recovery._GATHER_HISTORY + 1):
         recovery.gathering_responses([(number, Mock())])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: 0
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: (0, set())
     with pytest.raises(RuntimeError, match="no longer held"):
         recovery._recover(_interrupted())
 
@@ -1757,7 +1757,7 @@ def test_recovery_fails_closed_if_gather_numbers_diverged():
     """Rank 0 cannot have processed a gather this rank never made."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     recovery.gathering_responses([(5, Mock())])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: 2
+    recovery._executor.dist.broadcast.side_effect = lambda value, root: (2, set())
     with pytest.raises(RuntimeError, match="made only 1"):
         recovery._recover(_interrupted())
 
