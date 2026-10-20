@@ -142,6 +142,7 @@ def _leave_degraded_world(clean: bool) -> NoReturn:
             print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
             status = 1
         watchdog.cancel()
+        watchdog.join()
         os._exit(status)
     world.Abort(1)
 
