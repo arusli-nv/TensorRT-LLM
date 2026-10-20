@@ -5,6 +5,7 @@
 import importlib.metadata
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -260,35 +261,60 @@ def _assert_answered(rows: list[dict]) -> None:
         assert row["expected"] in row["text"], row
 
 
+def _assert_coherent(rows: list[dict]) -> None:
+    """Each answer reads as text: mostly printable and not one token repeated over and over."""
+    for row in rows:
+        text, token_ids = row["text"], row["token_ids"]
+        assert sum(c.isprintable() or c.isspace() for c in text) >= 0.9 * len(text), row
+        assert len(set(token_ids)) >= len(token_ids) // 2, row
+
+
+def _rerun_counts(output: str) -> tuple[int, int]:
+    """The requests rank 0 ran again and failed, summed over its recoveries."""
+    counts = [
+        tuple(map(int, match.groups()))
+        for line in output.splitlines()
+        if "Rank 0: resumed serving without ranks" in line
+        and (match := re.search(r"re-ran (\d+) requests and failed (\d+);", line))
+    ]
+    assert counts, "Rank 0 logged no resumed recovery"
+    return sum(c[0] for c in counts), sum(c[1] for c in counts)
+
+
 def _assert_recovered(
-    result: dict, output: str, authority_text: str, mode: str, lost: list[int], per_rank: int = 1
+    result: dict,
+    output: str,
+    authority_text: str,
+    mode: str,
+    lost: list[int],
+    per_rank: int = 1,
+    online_eplb: bool = False,
 ) -> str:
     """Every request answered, the survivors resumed without ``lost`` and nothing was rebuilt.
 
-    ``per_rank`` is the driver's in-flight requests per attention-DP rank. Returns the mpirun log
-    from the first fault on.
+    ``per_rank`` is the driver's in-flight requests per attention-DP rank; ``online_eplb`` whether
+    online EPLB moves experts between rounds. Returns the mpirun log from the first fault on.
     """
     _assert_answered(result["healthy"])
     healthy_ids = {row["rank"]: row["token_ids"] for row in result["healthy"]}
+    before_kill, kill_marker, after_kill = output.partition(KILL_MARKER)
+    assert kill_marker, "The driver did not fault a victim"
     if mode == "inflight":
         # The lost ranks' requests streamed nothing, so the survivors ran them again from their prompts.
         _assert_answered(result["during_loss"])
-        if per_rank == 1:
+        if per_rank == 1 and not online_eplb:
             # A survivor's request decoded its first tokens before the loss, alone on its rank as in
-            # the healthy round: the same greedy tokens.
+            # the healthy round and on the same expert placement: the same greedy tokens. Online
+            # EPLB may move experts between the rounds, which changes the reduction order.
             for row in result["during_loss"]:
                 if row["rank"] not in lost:
                     assert row["token_ids"][:SHORT_MAX_TOKENS] == healthy_ids[row["rank"]], row
-        rerun = f"Running {len(lost) * per_rank} requests of the lost ranks again"
-        assert rerun in output, output[-20000:]
+        assert _rerun_counts(after_kill) == (len(lost) * per_rank, 0), after_kill[-20000:]
     _assert_answered(result["after_loss"])
-    # Replicas and restored slots hold the lost experts' exact weights, and every survivor again decodes
-    # its prompt alone: the same greedy tokens as in the healthy round.
-    for row in result["after_loss"]:
-        assert row["token_ids"] == healthy_ids[row["rank"]], (row, healthy_ids[row["rank"]])
-
-    before_kill, kill_marker, after_kill = output.partition(KILL_MARKER)
-    assert kill_marker, "The driver did not fault a victim"
+    # Exact tokens are not asserted after the loss: the lost experts are served from other GPUs,
+    # which changes the reduction order and so may change greedy tokens. Each answer still holds its
+    # expected word and reads as text.
+    _assert_coherent(result["after_loss"])
     for rank in range(WORLD_SIZE):
         if rank not in lost:
             assert f"Rank {rank}: resumed serving without ranks {lost}" in after_kill, rank
@@ -373,7 +399,9 @@ def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
     result, output, authority_text = _run_driver(
         tmp_path, "inflight", [VICTIM], *online_args, ft_config=dict(extra_slots="ghost")
     )
-    after_kill = _assert_recovered(result, output, authority_text, "inflight", [VICTIM])
+    after_kill = _assert_recovered(
+        result, output, authority_text, "inflight", [VICTIM], online_eplb=eplb == "online"
+    )
     assert "behind ghost expert slots" in after_kill, output[-20000:]
 
 
