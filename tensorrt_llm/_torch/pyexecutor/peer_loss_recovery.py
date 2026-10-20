@@ -21,6 +21,7 @@ from typing import (
     Set,
     Tuple,
     TypeVar,
+    Union,
 )
 
 import numpy as np
@@ -76,6 +77,11 @@ if TYPE_CHECKING:
 _REGISTRATION_TIMEOUT_S = 600.0
 
 Responses = List[Tuple[int, LlmResponse]]
+# One rank's part of a response gather: ``(responses, finished, streaming)``, or ``()`` when it has no
+# responses. ``finished``: ids of the responses that are an error or a final result. ``streaming``: ids of
+# the other responses whose request this rank had not answered yet. Rank 0 reads these instead of every
+# response it gathers. A plain tuple keeps rank 0's unpickling of every part cheap.
+ResponseContribution = Union[Tuple[()], Tuple[Responses, List[int], List[int]]]
 # A set of ranks lost together, as a sorted tuple: one rank or a whole node.
 FailureDomain = Tuple[int, ...]
 # A request and the context position, state and draft tokens it had before a step changed them.
@@ -184,20 +190,6 @@ def stop_startup_watch() -> None:
     if _startup_watch is not None:
         _startup_watch.stop()
         _startup_watch = None
-
-
-class ResponseContribution(list):
-    """One rank's part of a response gather, with the request ids rank 0's bookkeeping needs.
-
-    ``finished``: ids of the responses that are an error or a final result. ``streaming``: ids of the
-    other responses whose request this rank had not answered yet. Rank 0 reads these instead of every
-    response it gathers.
-    """
-
-    def __init__(self, responses: Responses, finished: List[int], streaming: List[int]) -> None:
-        super().__init__(responses)
-        self.finished = finished
-        self.streaming = streaming
 
 
 @dataclasses.dataclass
@@ -785,10 +777,9 @@ class PeerLossRecovery(RecoveryHook):
             elif request_id not in answering:
                 answering.add(request_id)
                 streaming.append(request_id)
-        contribution = ResponseContribution(responses, finished, streaming)
         self._gather_count += 1
-        self._gathers.append((self._gather_count, contribution))
-        return contribution
+        self._gathers.append((self._gather_count, responses))
+        return (responses, finished, streaming) if responses else ()
 
     def responses_gathered(
         self,
@@ -803,7 +794,7 @@ class PeerLossRecovery(RecoveryHook):
         Args:
             responses: The gathered responses.
             contributions: Per rank, its part of an attention-DP gather (None for a departed rank). Rank 0 reads
-                the notes of each ``ResponseContribution`` instead of its responses.
+                the notes of each ``ResponseContribution`` tuple instead of its responses.
         """
         self._last_processed_gather = self._gather_count
         if self._request_owners is None:
@@ -812,8 +803,9 @@ class PeerLossRecovery(RecoveryHook):
             self._forget_finished(responses)
             return
         for contribution in contributions:
-            if isinstance(contribution, ResponseContribution):
-                self._note_responses(contribution.finished, contribution.streaming)
+            if isinstance(contribution, tuple):
+                if contribution:
+                    self._note_responses(contribution[1], contribution[2])
             elif contribution is not None:
                 self._forget_finished(contribution)
 

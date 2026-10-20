@@ -1617,21 +1617,47 @@ def test_rank0_keeps_its_books_from_the_notes_of_each_gathered_part():
         ],
     ]
     parts = [owner.gathering_responses(step) for step in steps]
-    assert [(part.finished, part.streaming) for part in parts] == [
+    assert [part[1:] for part in parts] == [
         ([], [11, 12, 13]),
         ([12, 23], []),
     ]
+    assert owner.gathering_responses([]) == ()
     fast, scan = _recovery(_FakeClient([]), rank=0), _recovery(_FakeClient([]), rank=0)
     for rank0 in (fast, scan):
         rank0.requests_routed({1: [_queued(11), _queued(12), Mock(id=13, child_req_ids=[23])]})
     for step, part in zip(steps, parts):
         sent = pickle.loads(pickle.dumps(part))
-        assert sent == step and (sent.finished, sent.streaming) == (part.finished, part.streaming)
+        assert type(sent) is tuple and sent == (step, *part[1:])
         # Not iterable: rank 0 does not read the responses.
-        fast.responses_gathered(object(), [None, sent])
+        fast.responses_gathered(object(), [None, (), sent])
         scan.responses_gathered(step)
     for rank0 in (fast, scan):
         assert (set(rank0._request_owners), rank0._delivered, rank0._parent_ids) == ({11}, {11}, {})
+
+
+def test_rank0_enqueues_the_responses_of_each_gathered_part():
+    """Rank 0 enqueues the responses of every non-empty part and still rejects a payload of another
+    collective."""
+    owner = _recovery(_FakeClient([]), rank=1)
+    first, second = [(11, _response(11))], [(12, _response(12, is_final=True))]
+    parts = [owner.gathering_responses(first), (), None, owner.gathering_responses(second)]
+    executor = PyExecutor.__new__(PyExecutor)
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    executor.enable_attention_dp, executor.gather_all_responses = True, False
+    executor.dist = Mock(rank=0, world_size=4)
+    executor.dist.mapping.tp_group = [0, 1, 2, 3]
+    executor.dist.tp_gather.return_value = parts
+    executor._peer_loss_recovery = Mock()
+    executor.response_cv = threading.Condition()
+    executor.responses, executor.result_wait_queues = {}, {}
+
+    PyExecutor._enqueue_responses(executor, [])
+
+    assert executor.responses == {11: [first[0][1]], 12: [second[0][1]]}
+    executor._peer_loss_recovery.responses_gathered.assert_called_once_with(first + second, parts)
+    executor.dist.tp_gather.return_value = [(), 3]
+    with pytest.raises(RuntimeError, match="collective desync"):
+        PyExecutor._enqueue_responses(executor, [])
 
 
 def test_a_resent_part_notes_the_requests_it_answered_again():
@@ -1648,7 +1674,7 @@ def test_a_resent_part_notes_the_requests_it_answered_again():
 
     recovery._recover(_interrupted())
 
-    assert resent[0].streaming == [11]
+    assert resent[0][2] == [11]
 
 
 @pytest.mark.parametrize("ran_again, failed_requests", [(False, 1), (True, 2)])

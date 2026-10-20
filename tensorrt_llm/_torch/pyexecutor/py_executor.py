@@ -9333,6 +9333,10 @@ class PyExecutor:
                     for resp in responses_list:
                         if resp is None:
                             continue
+                        if isinstance(resp, tuple) and resp:
+                            # A peer-loss-recovery ResponseContribution:
+                            # (responses, finished, streaming), or ().
+                            resp = resp[0]
                         if not isinstance(resp, (list, tuple)):
                             # A non-list contribution means the TP collective
                             # was matched against a *different* collective on
