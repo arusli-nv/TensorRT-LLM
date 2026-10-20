@@ -64,6 +64,7 @@ class FakeComm:
         self.bcast_roots = []
         self.barriers = 0
         self.free_count = 0
+        self.errhandler = None
 
     def _check(self) -> None:
         if self.error is not None:
@@ -80,6 +81,9 @@ class FakeComm:
 
     def Get_failed(self) -> FakeGroup:
         return FakeGroup(self.failed)
+
+    def Set_errhandler(self, errhandler) -> None:
+        self.errhandler = errhandler
 
     def Is_revoked(self) -> bool:
         return self.revoke_calls > 0
@@ -185,6 +189,7 @@ def fake_mpi(monkeypatch):
         INT64_T="int64",
         BYTE="byte",
         THREAD_MULTIPLE=3,
+        ERRORS_RETURN="errors_return",
         Query_thread=lambda: 3,
         Comm=SimpleNamespace(Revoke=None, Shrink=None, Get_failed=None),
     )
@@ -239,6 +244,21 @@ def test_recovery_refuses_an_mpi_library_without_ulfm(world, monkeypatch):
     monkeypatch.setattr(world, "Get_failed", get_failed)
     with pytest.raises(RuntimeError, match="ULFM calls"):
         MPIDist(_mapping()).enable_peer_loss_recovery()
+
+
+def test_recovery_communicators_return_errors(dist, world, native_watch, monkeypatch):
+    """A peer failure must raise in each communicator recovery uses, not abort the job."""
+
+    def fresh_dup():
+        return FakeComm(range(WORLD), ME)
+
+    monkeypatch.setattr(world, "Dup", fresh_dup)
+    comms = [dist._host_world, dist._tp_comm, dist.watch_peer_failures(lambda: None)._comm]
+    dist.revoke()
+    dist.shrink()
+    monkeypatch.setattr(dist._shrunk[0], "Dup", fresh_dup)
+    comms += [dist._shrunk[0], dist.watch_survivor_failures(lambda: None)._comm]
+    assert [comm.errhandler for comm in comms] == ["errors_return"] * len(comms)
 
 
 def test_healthy_paths_return_compact_results(dist):

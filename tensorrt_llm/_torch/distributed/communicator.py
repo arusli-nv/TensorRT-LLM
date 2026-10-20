@@ -98,6 +98,13 @@ def _is_transport_error(error: BaseException) -> bool:
                                          and isinstance(error, MPI.Exception))
 
 
+def _errors_return(comm: "MPI.Comm") -> "MPI.Comm":
+    """Return *comm* set to return errors: a peer failure in it must raise,
+    never abort the job."""
+    comm.Set_errhandler(MPI.ERRORS_RETURN)
+    return comm
+
+
 def _failure_evidence(comm: "MPI.Comm", timeout: float) -> frozenset[int]:
     """Failed ranks ULFM reports in *comm*, waiting up to *timeout* seconds
     unless *comm* is revoked first."""
@@ -978,10 +985,10 @@ class MPIDist(Distributed):
                 "calls (MPIX_Comm_get_failed, MPIX_Comm_revoke, "
                 "MPIX_Comm_shrink); this one does not provide them") from error
         if self._host_world is None:
-            self._host_world = mpi_comm().Dup()
+            self._host_world = _errors_return(mpi_comm().Dup())
             # Survivors must shrink the same communicator, so the TP
             # communicator, otherwise built on first use, exists from now on.
-            _ = self.tp_comm
+            _errors_return(self.tp_comm)
 
     def revoke(self) -> None:
         """Revoke the communicators host collectives run on so that every
@@ -1035,7 +1042,7 @@ class MPIDist(Distributed):
             comm = self._survivor_comm
         else:
             comm = self._tp_comm
-        survivor_comm = comm.Shrink()
+        survivor_comm = _errors_return(comm.Shrink())
         live_ranks = mpi_world_ranks(survivor_comm.Get_group())
         self._shrunk = (survivor_comm, live_ranks)
         return frozenset(range(self.mapping.world_size)) - frozenset(live_ranks)
@@ -1073,8 +1080,8 @@ class MPIDist(Distributed):
         (survivor) world: posts a receive that no peer matches on a private
         duplicate, which ULFM completes with a process-failure error.
         """
-        return PeerFailureWatch(self._world_comm().Dup(), on_failure,
-                                abort_word)
+        return PeerFailureWatch(_errors_return(self._world_comm().Dup()),
+                                on_failure, abort_word)
 
     def watch_survivor_failures(
             self, on_failure: Callable[[], None]) -> "PeerFailureWatch":
@@ -1089,7 +1096,8 @@ class MPIDist(Distributed):
         if self._shrunk is None:
             raise RuntimeError(
                 "watch_survivor_failures requires a prior shrink()")
-        return PeerFailureWatch(self._shrunk[0].Dup(), on_failure)
+        return PeerFailureWatch(_errors_return(self._shrunk[0].Dup()),
+                                on_failure)
 
     def broadcast_among_survivors(self, obj, root: int = 0):
         """Broadcast *obj* from logical rank *root* over the survivor
