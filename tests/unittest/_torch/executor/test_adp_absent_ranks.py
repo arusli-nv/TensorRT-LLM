@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
+from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
 
 pytestmark = pytest.mark.cpu_only
 
@@ -210,5 +211,6 @@ def test_fail_unservable_requests_responds_from_rank0_only():
             ((req_id, response),) = responses
             assert req_id == 7 and response.client_id == 11
             assert f"rank {FAILED_RANK} is not serving" in response.error_msg
+            assert is_peer_loss_retryable_message(response.error_msg)
         else:
             assert responses == []

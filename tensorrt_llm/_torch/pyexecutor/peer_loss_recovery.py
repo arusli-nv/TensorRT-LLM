@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.recovery.config import fault_tolerance_config
+from tensorrt_llm.executor.utils import peer_loss_retryable_message
 from tensorrt_llm.logger import logger
 
 from ..distributed.communicator import (
@@ -1356,8 +1357,10 @@ class PeerLossRecovery(RecoveryHook):
         )
         executor.fail_requests(
             quarantined,
-            "A peer loss interrupted this request a second time; it may be what crashes the "
-            "ranks, so it is not continued; retry it",
+            peer_loss_retryable_message(
+                "A peer loss interrupted this request a second time; it may be what crashes the "
+                "ranks, so it is not continued; retry it"
+            ),
         )
         # Every rank numbers the gathers alike because each calls them in the
         # same sequence, and rank 0 processes a gather only once every rank sent.
@@ -1416,7 +1419,7 @@ class PeerLossRecovery(RecoveryHook):
                         request_id,
                         LlmResponse(
                             request_id=request_id,
-                            error_msg=(
+                            error_msg=peer_loss_retryable_message(
                                 f"Attention DP rank {owner} failed while serving this request, "
                                 f"which {reason}; retry it"
                             ),

@@ -49,6 +49,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Ready,
     Stopped,
 )
+from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
 from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -1372,6 +1373,7 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_aga
     ((request_id, response),) = sent[-1]
     assert request_id == 11 and response.client_id == "c11"
     assert f"rank {FAILED_RANK} failed" in response.error_msg
+    assert is_peer_loss_retryable_message(response.error_msg)
     assert ("streamed" in response.error_msg) == streamed
     assert ("already interrupted" in response.error_msg) != streamed
     assert recovery._request_owners == {} and recovery._interrupted == set()
@@ -1465,6 +1467,7 @@ def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
     (call,) = executor._handle_errors.call_args_list
     assert call.kwargs["requests"] == [parent, child] and not call.kwargs["charge_budget"]
     assert "interrupted this request a second time" in call.args[0]
+    assert is_peer_loss_retryable_message(call.args[0])
 
 
 def test_rank0_tracks_requests_that_delivered_a_response():

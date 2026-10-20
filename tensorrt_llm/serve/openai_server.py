@@ -44,7 +44,9 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
+                                         PEER_LOSS_RETRYABLE_CODE,
+                                         is_context_length_exceeded_message,
+                                         is_peer_loss_retryable_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -265,11 +267,14 @@ def _stream_error_events(error: Exception) -> List[str]:
     The HTTP status is already committed by then, so the error travels as an
     ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
     """
+    message = str(error)
+    code = PEER_LOSS_RETRYABLE_CODE if is_peer_loss_retryable_message(
+        message) else None
     error_data = json.dumps({
         "error": {
-            "message": str(error),
+            "message": message,
             "type": "server_error",
-            "code": None,
+            "code": code,
             "param": None,
         }
     })
@@ -1189,17 +1194,24 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
+        # Over-length prompts and peer-loss failures are detected from the
+        # message text because they cross the executor IPC boundary as plain
+        # strings (RequestError), so no exception type survives to here.
         code: Union[int, str] = status_code.value
+        headers = None
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
+        elif is_peer_loss_retryable_message(message):
+            # Recovery from a peer loss takes about a second.
+            err_type = "ServiceUnavailableError"
+            status_code = HTTPStatus.SERVICE_UNAVAILABLE
+            code, headers = PEER_LOSS_RETRYABLE_CODE, {"Retry-After": "1"}
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=code)
         return JSONResponse(content=error_response.model_dump(),
-                            status_code=status_code.value)
+                            status_code=status_code.value,
+                            headers=headers)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(

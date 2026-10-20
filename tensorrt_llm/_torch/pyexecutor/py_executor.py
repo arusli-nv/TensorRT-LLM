@@ -46,6 +46,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
+from tensorrt_llm.executor.utils import peer_loss_retryable_message
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -6953,7 +6954,8 @@ class PyExecutor:
                     (item.id,
                      LlmResponse(
                          request_id=item.id,
-                         error_msg=f"Attention DP rank {target} is not serving",
+                         error_msg=peer_loss_retryable_message(
+                             f"Attention DP rank {target} is not serving"),
                          client_id=getattr(item.request, "client_id", None))))
         self._enqueue_responses(responses)
 
