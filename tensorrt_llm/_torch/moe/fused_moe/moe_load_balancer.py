@@ -1299,7 +1299,8 @@ class MoeLoadBalancer:
         offset, bytes) that load the slots ``placements`` changes, in chunk order; the same on every rank.
 
         Sources take turns over the live ranks of the expert's copy node. Per target, a chunk fills at most half
-        the workspace (``workspace_bytes`` per rank), alternating halves; ValueError if a weight does not fit.
+        the workspace (``workspace_bytes`` per rank), alternating halves.
+        ValueError if a weight does not fit or ``placements`` loads a slot that still routes an expert.
         """
         dead = sorted(set(dead_ranks))
         half = workspace_bytes // 2
@@ -1318,8 +1319,13 @@ class MoeLoadBalancer:
                     f"A {max(sizes)}-byte expert weight of MoE layer {layer.get_layer_idx()} does not fit in "
                     f"half the {workspace_bytes}-byte NVLinkOneSided workspace that ring host copies stage through"
                 )
-            loaded = (placement != self._masked_placement(
-                layer, dead)) & (placement >= 0)
+            masked = self._masked_placement(layer, dead)
+            loaded = (placement != masked) & (placement >= 0)
+            if (masked[loaded] >= 0).any():
+                # A re-plan reverts only ghost backing, so a routed slot staged over would keep stale weights.
+                raise ValueError(
+                    f"Ring host copies only restore into empty slots; MoE layer {layer.get_layer_idx()} "
+                    "would overwrite a routed one")
             for target, slot in zip(*np.nonzero(loaded)):
                 expert = int(placement[target, slot])
                 live = self._copy_ranks(layer, expert, dead)

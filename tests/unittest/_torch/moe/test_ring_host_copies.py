@@ -167,6 +167,15 @@ def test_the_copy_plan_alternates_workspace_halves_between_chunks(monkeypatch):
         load_balancer.restore_copy_plan([3], placements, 512)
 
 
+def test_the_copy_plan_refuses_to_load_a_routed_slot(monkeypatch):
+    load_balancer, _ = _ring_load_balancer(monkeypatch)
+    (placement,) = load_balancer.recovery_placements([3])
+    # Rank 0's slot 1 still routes expert 1.
+    placement[0, 1] = 6
+    with pytest.raises(ValueError, match="would overwrite a routed one"):
+        load_balancer.restore_copy_plan([3], [placement], 2048)
+
+
 def _expected(layer_idx, expert, name):
     count, dtype = _WEIGHTS[name]
     generator = torch.Generator().manual_seed(layer_idx * 1000 + expert * 10 + len(name))
