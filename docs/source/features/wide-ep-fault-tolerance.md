@@ -69,7 +69,7 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
 | `extra_slots` | With a static EPLB placement, the slots beyond one per expert: `ghost` (default) are empty slots that hold no device memory while healthy (the KV cache keeps it) and get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume). With online EPLB, its slots keep serving replicas; where they cannot hold every expert after the loss of a failure domain, each rank gets the missing slots of this kind after EPLB's own, and EPLB's updates use one once a restore filled it |
 | `recovery_timeout_s` | How long a worker's recovery may take, including finishing a long step first, before the job stops (default 30 s) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20 s; must be below `recovery_timeout_s`) |
-| `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a stall of every rank as terminal (default `false`) |
+| `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a hung rank 0 or a stall of every rank as terminal (default `false`) |
 | `hang_suspect_s` | How long a worker's device waits on a peer in an all-to-all before it reports the wait (default 2 s) |
 | `hang_confirm_s` | An alive but stuck rank is fenced only after every peer has waited on it, with the rank finishing no step, for this long; also how long a stall of every rank must last to be reported terminal (default 30 s; above the slowest legitimate step plus host stalls) |
 | `heartbeat_s` | Worker heartbeat interval (default 1 s, at most 2 s, below `heartbeat_timeout_s`) |
@@ -96,12 +96,13 @@ code or MPI finalization of a broken process runs, except the last, which exits 
 - each survivor has the MPI runtime kill the ranks its MPI view reports failed before agreeing on them, and
   rank 0 each failed rank before a recovery plan (`peer_loss_recovery`);
 - the authority's `--fence-command`, if configured;
-- every rank, when the authority found every rank stalled with no rank to blame (`hang_evidence`).
+- every rank, when the authority found every rank stalled with no rank to blame, or rank 0 hung (`hang_evidence`).
 
 At startup the workers register with the authority (it must be running), check that the survivors of each failure
 domain's loss can still serve every expert, and rank 0 logs which ranks' and nodes' loss the job can recover from.
 Startup fails closed: a configuration that recovery does not support, or slots that do not cover a failure domain,
-is refused with the requirement it misses.
+is refused with the requirement it misses, and the loss of a rank before serving starts (model loading, warmup, CUDA
+graph capture, KV cache estimation) ends the job (`MPI_Abort`).
 
 ## What is covered
 
@@ -158,7 +159,7 @@ Timeouts (see the settings above):
 |---|---|
 | A dead process | detected when its TCP connections close, in milliseconds |
 | A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, or `heartbeat_timeout_s` (5 s) until a stopped rank's heartbeat counts as missing, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured from a SIGSTOP to serving again at DEP32 under an earlier rule: 10.6 / 15.9 / 36.7 s with `hang_confirm_s` 3 / 10 / 30 |
-| A stall of every rank | `hang_confirm_s` (30 s) from its start until the deployment is reported terminal and every worker exits with code 75 |
+| A stall of every rank, or a hung rank 0 | `hang_confirm_s` (30 s) from its start until the deployment is reported terminal and every worker exits with code 75 |
 | A recovery | `recovery_timeout_s` (30 s) at the workers from the survivors' agreement on the failed ranks, `authority_timeout_s` (20 s) at the authority; a recovery takes milliseconds after detection. The agreement waits for every survivor: up to the hang's resolution time (with hang detection) plus `recovery_timeout_s`, since a survivor can detect a stopped peer before the others, which stay blocked on it until it is fenced |
 
 How a hang is judged. Each worker sends heartbeats twice: from a native thread, which runs without the Python
@@ -188,6 +189,17 @@ alive but makes no progress (a device hang, a deadlock, a host or interpreter-lo
 running, so the detector does not fire and only `hang_confirm_s` applies. At DEP32, a 10 s whole-process freeze
 cost the rank, while 45 s host stalls and interpreter-lock stalls cost nothing. Raise `mpi_ft_detector_timeout`
 to tolerate longer whole-process freezes, at the cost of detecting a dead host as much later.
+
+## Known limits
+
+- A hang outside the MoE all-to-alls, or any hang with `hang_detection` off, ends the job only through the
+  executor's hang detection (`hang_detection_timeout`, 300 s by default) or the MoE communication timeout.
+- Two ranks hung at once are not confirmed (no single rank is waited on by every peer); they end the job
+  through the same timeouts.
+- A fenced process stuck in the GPU driver may not exit when killed, which can stall the job's shutdown.
+- Whether and how fast the death of a host or its Open MPI (PRRTE) daemon ends the job depends on PRRTE.
+- Nothing restarts the authority, and the workers register only at startup: an authority started again
+  reports `starting` (503) until the deployment restarts.
 
 ## Not supported together with fault tolerance
 
