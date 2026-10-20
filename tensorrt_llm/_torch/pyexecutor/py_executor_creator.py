@@ -56,7 +56,7 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .peer_loss_recovery import watch_startup_peer_failures
+from .peer_loss_recovery import stop_startup_watch, watch_startup_peer_failures
 from .py_executor import PyExecutor
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -1359,7 +1359,7 @@ def create_py_executor(
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
 ) -> PyExecutor:
-    """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
+    """Create a PyExecutor; on failure stop the startup peer watch and roll back DWDP."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
         with monitor_executor_initialization(), _StartupTimer(
@@ -1373,6 +1373,8 @@ def create_py_executor(
                 resource_governor_queue=resource_governor_queue,
             )
     except BaseException:
+        # A rank that failed to build its executor never serves.
+        stop_startup_watch()
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):

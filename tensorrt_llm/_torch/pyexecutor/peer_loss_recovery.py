@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Keep a WideEP PyExecutor serving after peer processes or whole nodes die, one loss after another."""
 
+import atexit
 import collections
 import dataclasses
 import functools
@@ -59,6 +60,8 @@ from .scheduler import ScheduledRequests
 from .scheduler.adp_router import DefaultADPRouter
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
+
     from tensorrt_llm.executor.recovery.client import RecoveryClient
     from tensorrt_llm.executor.recovery.protocol import Commit, Install, Propose
 
@@ -156,19 +159,27 @@ def watch_startup_peer_failures(dist: Distributed) -> None:
     """
     global _startup_watch
     if _startup_watch is None and peer_loss_recovery_enabled() and isinstance(dist, MPIDist):
+        from tensorrt_llm._utils import mpi_comm
+
         # Checks ULFM and MPI_THREAD_MULTIPLE, which the watch thread needs.
         dist.enable_peer_loss_recovery()
-        _startup_watch = dist.watch_peer_failures(_end_job_before_serving)
+        # The watch thread has no thread-local communicator of its own.
+        _startup_watch = dist.watch_peer_failures(
+            functools.partial(_end_job_before_serving, mpi_comm())
+        )
+        # Python's exit handlers run before MPI finalizes, which must not race the watch thread.
+        atexit.register(stop_startup_watch)
 
 
-def _end_job_before_serving() -> None:
+def _end_job_before_serving(communicator: "MPI.Comm") -> None:
     from .hang_detector import propagate_hard_kill
 
     logger.error("A peer failed before serving started: ending the job")
-    propagate_hard_kill()
+    propagate_hard_kill(diagnostics=False, communicator=communicator)
 
 
-def _stop_startup_watch() -> None:
+def stop_startup_watch() -> None:
+    """Stop the watch of :func:`watch_startup_peer_failures`, if it runs."""
     global _startup_watch
     if _startup_watch is not None:
         _startup_watch.stop()
@@ -525,7 +536,7 @@ class PeerLossRecovery(RecoveryHook):
             event_loop()
             return
         self._watch_peer_failures()
-        _stop_startup_watch()
+        stop_startup_watch()
         self.survives_own_loss = self._admitted
         reporter = None
         try:

@@ -1086,21 +1086,44 @@ def test_a_failure_seen_only_by_the_watch_counts():
 
 def test_a_peer_failure_before_serving_ends_the_job(monkeypatch):
     """Nothing recovers a loss during startup, and under ULFM the runtime no longer ends the job."""
+    import tensorrt_llm._utils
     from tensorrt_llm._torch.pyexecutor import hang_detector
 
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(peer_loss_recovery, "_startup_watch", None)
+    monkeypatch.setattr(peer_loss_recovery, "atexit", Mock())
+    # The executor thread's communicator, not the watch thread's default.
+    executor_comm = Mock()
+    monkeypatch.setattr(tensorrt_llm._utils, "mpi_comm", lambda: executor_comm)
     kills = []
-    monkeypatch.setattr(hang_detector, "propagate_hard_kill", lambda: kills.append("kill"))
+    monkeypatch.setattr(hang_detector, "propagate_hard_kill", lambda **kwargs: kills.append(kwargs))
     dist = Mock(spec=MPIDist)
     peer_loss_recovery.watch_startup_peer_failures(dist)
     # Once per process: the final executor's creation does not watch again.
     peer_loss_recovery.watch_startup_peer_failures(dist)
     dist.enable_peer_loss_recovery.assert_called_once_with()
+    peer_loss_recovery.atexit.register.assert_called_once_with(
+        peer_loss_recovery.stop_startup_watch
+    )
     ((on_failure,), _) = dist.watch_peer_failures.call_args
     assert dist.watch_peer_failures.call_count == 1 and kills == []
+    monkeypatch.setattr(tensorrt_llm._utils, "mpi_comm", lambda: Mock())
     on_failure()
-    assert kills == ["kill"]
+    assert kills == [{"diagnostics": False, "communicator": executor_comm}]
+
+
+def test_a_failed_executor_creation_stops_the_startup_watch(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import py_executor_creator
+
+    startup = Mock()
+    monkeypatch.setattr(peer_loss_recovery, "_startup_watch", startup)
+    monkeypatch.setattr(
+        py_executor_creator, "_create_py_executor_impl", Mock(side_effect=RuntimeError("load"))
+    )
+    with pytest.raises(RuntimeError, match="load"):
+        py_executor_creator.create_py_executor(Mock())
+    startup.stop.assert_called_once_with()
+    assert peer_loss_recovery._startup_watch is None
 
 
 def test_serving_takes_over_from_the_startup_watch(monkeypatch):
