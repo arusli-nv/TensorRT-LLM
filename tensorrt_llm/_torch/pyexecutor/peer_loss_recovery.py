@@ -1117,9 +1117,18 @@ class PeerLossRecovery(RecoveryHook):
         return dist.shrink()
 
     def _watch_survivors(self, further_loss: threading.Event) -> Optional[PeerFailureWatch]:
-        """Set ``further_loss`` when another survivor fails before Install (at once if one already did)."""
+        """Set ``further_loss`` when another survivor fails before Install (at once if one already did).
+
+        The watch also revokes, which releases every survivor blocked in a survivor collective.
+        """
+        dist = self._executor.dist
+
+        def on_failure() -> None:
+            further_loss.set()
+            dist.revoke()
+
         try:
-            return self._executor.dist.watch_survivor_failures(further_loss.set)
+            return dist.watch_survivor_failures(on_failure)
         except Exception as error:  # noqa: BLE001 - only a peer failure is expected here
             if not is_mpi_peer_failure(error):
                 raise

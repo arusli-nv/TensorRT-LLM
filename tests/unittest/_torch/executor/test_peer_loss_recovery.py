@@ -332,6 +332,19 @@ def test_a_loss_during_the_recovery_plans_again_without_every_lost_rank():
     load_balancer.install_recovery_placement.assert_called_once_with(list(lost), ["placement"])
 
 
+def test_a_survivor_lost_during_the_recovery_releases_the_survivor_collectives():
+    """A survivor blocked in a survivor collective is released by the revocation, not only the event."""
+    recovery = _recovery(_FakeClient([]))
+    dist = recovery._executor.dist
+    further_loss = threading.Event()
+    recovery._watch_survivors(further_loss)
+    ((on_failure,), _) = dist.watch_survivor_failures.call_args
+    dist.revoke.assert_not_called()
+    on_failure()
+    assert further_loss.is_set()
+    dist.revoke.assert_called_once_with()
+
+
 def test_a_loss_during_the_recovery_the_slots_cannot_serve_fails_closed():
     client = _FakeClient([_FURTHER_LOSS])
     recovery = _recovery(client)
