@@ -26,13 +26,20 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.logger import logger
 
 from ..distributed.communicator import HostCollectiveInterrupted, MPIDist, PeerFailureWatch
 from .error_classification import classify_error
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .llm_request import LlmRequest, LlmRequestState, LlmResponse, PyResult
+from .llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    LlmResponse,
+    PyResult,
+    executor_request_to_llm_request,
+)
 from .resource_manager import ResourceManagerType
 from .sampler.penalties import has_occurrence_penalty
 from .scheduler import ScheduledRequests
@@ -277,6 +284,8 @@ class PeerLossRecovery(RecoveryHook):
         # On rank 0: the owned requests a loss interrupted once (in a discarded step, or on the lost rank); a
         # second interruption fails them.
         self._interrupted: Set[int] = set()
+        # On rank 0: the owned requests whose cancellation was broadcast, until their final response.
+        self._cancelled: Set[int] = set()
         # Ids of the requests this rank answered, until their error or final result.
         self._answering: Set[int] = set()
         if executor.dist.rank == 0:
@@ -634,11 +643,10 @@ class PeerLossRecovery(RecoveryHook):
             self._unbroadcast_requests = list(items)
             raise
         if self._request_owners is not None:
-            # A request cancelled while waiting ends without a response, as without FT: neither re-admit it after
-            # a loss nor keep its entry.
+            # Its rank answers a cancelled request with a final response; if the rank is lost first, recovery does.
             for item in items:
-                if item.is_canceled_request:
-                    self._retire(item.id)
+                if item.is_canceled_request and item.id in self._request_owners:
+                    self._cancelled.add(item.id)
             self._broadcast_control_items = [
                 item
                 for item in items
@@ -745,6 +753,7 @@ class PeerLossRecovery(RecoveryHook):
 
     def _forget(self, request_id: int) -> None:
         self._delivered.discard(request_id)
+        self._cancelled.discard(request_id)
         _, item = self._request_owners.pop(request_id, (None, None))
         if item is not None:
             for child_id in item.child_req_ids or ():
@@ -1230,7 +1239,9 @@ class PeerLossRecovery(RecoveryHook):
         if self._request_owners is None:
             return 0
         return sum(
-            owner in failed and (request_id in self._delivered or request_id in self._interrupted)
+            owner in failed
+            and request_id not in self._cancelled
+            and (request_id in self._delivered or request_id in self._interrupted)
             for request_id, (owner, _) in self._request_owners.items()
         )
 
@@ -1280,7 +1291,7 @@ class PeerLossRecovery(RecoveryHook):
         held for the next synchronized flush, then terminates the requests they
         finished. Rank 0 also takes over the requests that were running on a departed
         attention-DP rank, whose KV cache left with it: those that delivered nothing run again
-        from their prompt; the others fail. A request is interrupted once at most: the
+        from their prompt; the others fail, and cancelled ones end cancelled. A request is interrupted once at most: the
         survivors' ``interrupted`` requests (in the discarded steps) and the departed ranks'
         requests that a loss interrupted before fail, as they may be what crashes the ranks.
         """
@@ -1339,7 +1350,11 @@ class PeerLossRecovery(RecoveryHook):
                     continue
                 streamed = request_id in self._delivered
                 interrupted_before = request_id in self._interrupted
+                cancelled = request_id in self._cancelled
                 self._forget(request_id)
+                if cancelled:
+                    responses += _cancelled_responses(item)
+                    continue
                 if not streamed and not interrupted_before:
                     self._interrupted.add(request_id)
                     _relax_attention_dp_pin(item)
@@ -1397,6 +1412,16 @@ class PeerLossRecovery(RecoveryHook):
         if missing:
             logger.warning(f"Re-admitting {len(missing)} requests that never reached their rank")
             self._executor.readmit_requests(missing)
+
+
+def _cancelled_responses(item: "RequestQueueItem") -> Responses:
+    """The final responses, one per sequence, of a cancelled request whose rank was lost with its output."""
+    request = executor_request_to_llm_request(item.id, item.request, item.child_req_ids, False)
+    responses = []
+    for sequence in (request, *request.child_requests):
+        sequence.finish_by_reason(FinishReason.CANCELLED)
+        responses.append((sequence.py_request_id, sequence.create_response()))
+    return responses
 
 
 def _relax_attention_dp_pin(item: "RequestQueueItem") -> None:

@@ -31,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
+from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.executor.recovery.client import (
     RecoveryAborted,
     RecoveryInterrupted,
@@ -1532,12 +1533,33 @@ def test_recovery_readmits_requests_that_never_reached_their_rank():
     assert recovery._request_owners == {22: (1, delivered)}
 
 
-def test_a_request_cancelled_while_waiting_is_forgotten_not_readmitted():
-    """Cancelling a waiting request answers nothing: its owner entry must go with the cancel."""
-    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+def test_a_cancelled_request_is_tracked_until_its_rank_answers_it():
+    recovery = _recovery(_FakeClient([]), rank=0)
     recovery.requests_routed({3: [_queued(21)]})
     _broadcast(recovery, [RequestQueueItem(21, is_canceled_request=True)])
-    assert recovery._request_owners == {}
+    assert 21 in recovery._request_owners and recovery._cancelled == {21}
+    recovery.responses_gathered([(21, LlmResponse(request_id=21, result=Mock(is_final=True)))])
+    assert recovery._request_owners == {} and recovery._cancelled == set()
+
+
+def test_a_cancelled_request_of_a_departed_rank_ends_cancelled_not_run_again():
+    """Its rank was lost before it answered the cancellation; a caller waiting after abort() needs a final
+    response."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=4)
+    recovery.requests_routed({FAILED_RANK: [RequestQueueItem(11, request)]})
+    _broadcast(recovery, [RequestQueueItem(11, is_canceled_request=True)])
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    ((request_id, response),) = sent[-1]
+    assert request_id == 11 and not response.has_error()
+    response.result.deserialize()
+    assert response.result.is_final
+    assert response.result.finish_reasons == [trtllm.FinishReason.CANCELLED]
+    assert recovery._request_owners == {} and recovery._cancelled == set()
+    assert all(item.is_canceled_request for item in recovery._executor.request_accumulated)
 
 
 def test_survivors_join_departed_request_responses():

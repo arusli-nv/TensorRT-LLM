@@ -220,6 +220,7 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
   error. Non-streaming requests get an error
   response. Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE
   `error` event followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
+- A request of the lost ranks whose cancellation they had not answered yet ends cancelled.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that
   never used the lost rank's experts.
 - No CUDA graphs are recaptured, so serving resumes at once without the lost GPUs.
