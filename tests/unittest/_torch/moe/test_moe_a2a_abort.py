@@ -43,12 +43,17 @@ def _set_mask(controls: dict, mask: int) -> None:
 
 
 def _setup(
-    ep_size: int, tokens: int = _CAPACITY, eplb_stats_num_experts=None, extra_bytes: int = 32
+    ep_size: int,
+    tokens: int = _CAPACITY,
+    eplb_stats_num_experts=None,
+    extra_bytes: int = 32,
+    capacity: int = _CAPACITY,
+    top_k: int = 1,
 ) -> tuple[torch.Tensor, ...]:
     meta = NVLinkOneSided._make_workspace_layout(
         ep_size,
-        1,
-        _CAPACITY,
+        top_k,
+        capacity,
         _HIDDEN,
         torch.bfloat16,
         eplb_stats_num_experts,
@@ -59,7 +64,7 @@ def _setup(
     size = int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
     workspace = torch.zeros((ep_size, size), dtype=torch.uint8, device="cuda")
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, ep_size, barrier=False)
-    experts = torch.zeros((tokens, 1), dtype=torch.int32, device="cuda")
+    experts = torch.zeros((tokens, top_k), dtype=torch.int32, device="cuda")
     payload = torch.arange(tokens * _HIDDEN, dtype=torch.bfloat16, device="cuda")
     return workspace, meta, experts, payload.reshape(tokens, _HIDDEN)
 
@@ -357,21 +362,21 @@ def test_an_aborted_source_gets_a_masked_sources_rows() -> None:
     assert compact_weights[_CAPACITY:].view(-1).tolist() == [0.0] * _CAPACITY
 
 
-def _compact_round(workspace, meta, experts, payloads, controls):
+def _compact_round(workspace, meta, experts, payloads, controls, capacity=_CAPACITY):
     """Dispatch with compact routing lists (expert ids at payload 1, router weights at payload 2)."""
-    ep_size = workspace.size(0)
+    ep_size, top_k = workspace.size(0), experts.size(1)
     counts = torch.full((ep_size,), -7, dtype=torch.int32, device="cuda")
-    ids = torch.full((ep_size * _CAPACITY, 1), 99, dtype=torch.int32, device="cuda")
-    weights = torch.full((ep_size * _CAPACITY, 1), 9.0, device="cuda")
+    ids = torch.full((ep_size * capacity, top_k), 99, dtype=torch.int32, device="cuda")
+    weights = torch.full((ep_size * capacity, top_k), 9.0, device="cuda")
     received, *_ = torch.ops.trtllm.moe_a2a_dispatch(
         experts,
         payloads,
         workspace,
         meta,
-        _CAPACITY,
+        capacity,
         0,
         ep_size,
-        1,
+        top_k,
         ep_size,
         None,
         expert_id_payload_index=1,
@@ -383,37 +388,140 @@ def _compact_round(workspace, meta, experts, payloads, controls):
     return received, counts, ids, weights
 
 
+# With capacity * top_k not a multiple of 4, each source's rows end in a word-by-word tail, and source 1's rows
+# start off a 16-byte boundary, so they are copied word by word.
+@pytest.mark.parametrize("capacity,top_k", [(_CAPACITY, 1), (7, 3), (7, 6)])
 @pytest.mark.parametrize("peer_active", [True, False])
-def test_compact_routing_copies_the_rows_each_source_sent(peer_active: bool) -> None:
+def test_compact_routing_copies_the_rows_each_source_sent(
+    peer_active: bool, capacity: int, top_k: int
+) -> None:
     """The dispatch's compact lists hold each active source's sent rows, -1 / 0 elsewhere."""
-    local = 5
-    workspace, meta, experts, payload = _setup(2, tokens=local)
-    sent_ids = torch.arange(100, 100 + local, dtype=torch.int32, device="cuda").view(local, 1)
-    sent_weights = torch.arange(local, dtype=torch.float32, device="cuda").view(local, 1) + 0.5
+    local, peer_rows = 5, 3
+
+    def routing_rows(first_id: int, first_weight: float, rows: int) -> tuple[torch.Tensor, ...]:
+        n = rows * top_k
+        ids = torch.arange(first_id, first_id + n, dtype=torch.int32, device="cuda")
+        weights = torch.arange(n, dtype=torch.float32, device="cuda") + first_weight
+        return ids.view(rows, top_k), weights.view(rows, top_k)
+
+    workspace, meta, experts, payload = _setup(2, tokens=local, capacity=capacity, top_k=top_k)
+    sent_ids, sent_weights = routing_rows(100, 0.5, local)
     payloads = [payload, sent_ids, sent_weights]
     controls, _ = _rank_mask_controls(1)
     # A first round to learn where peer 1's slot rows live in rank 0's receive buffers.
-    received, *_ = _compact_round(workspace, meta, experts, payloads, controls)
+    received, *_ = _compact_round(workspace, meta, experts, payloads, controls, capacity)
     torch.cuda.synchronize()
-    # Stand in for peer 1: its 3 rows in its slot, then its count and completion flag for the next round.
-    received[1][1, :3] = torch.tensor([[200], [201], [202]], dtype=torch.int32, device="cuda")
-    received[2][1, :3] = torch.tensor([[7.0], [8.0], [9.0]], device="cuda")
+    # Stand in for peer 1: its rows in its slot, then its count and completion flag for the next round.
+    peer_ids, peer_weights = routing_rows(200, 7.0, peer_rows)
+    received[1][1, :peer_rows] = peer_ids
+    received[2][1, :peer_rows] = peer_weights
     expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
     parity = ((expected_flag - 1) >> 1) & 1
-    _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(3)
+    _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(peer_rows)
     _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(expected_flag)
     _set_mask(controls, 3 if peer_active else 1)
-    _, counts, ids, weights = _compact_round(workspace, meta, experts, payloads, controls)
+    _, counts, ids, weights = _compact_round(workspace, meta, experts, payloads, controls, capacity)
     torch.cuda.synchronize()
 
-    peer_rows = 3 if peer_active else 0
-    assert counts.tolist() == [local, peer_rows]
-    rows = list(zip(ids.view(-1).tolist(), weights.view(-1).tolist()))
-    # Rank 0's own tokens land in its slot in arrival order; each keeps its weight.
-    assert sorted(rows[:local]) == [(100 + i, i + 0.5) for i in range(local)]
-    assert rows[local:_CAPACITY] == [(-1, 0.0)] * (_CAPACITY - local)
-    peer = [(200, 7.0), (201, 8.0), (202, 9.0)][:peer_rows]
-    assert rows[_CAPACITY:] == peer + [(-1, 0.0)] * (_CAPACITY - peer_rows)
+    arrived = peer_rows if peer_active else 0
+    assert counts.tolist() == [local, arrived]
+    ids, weights = ids.view(2, capacity, top_k), weights.view(2, capacity, top_k)
+
+    def rows(source: int, first: int = 0, last: int = capacity) -> list:
+        return list(zip(ids[source, first:last].tolist(), weights[source, first:last].tolist()))
+
+    unsent = [([-1] * top_k, [0.0] * top_k)]
+    # Rank 0's own tokens land in its slot in arrival order; each keeps its weights.
+    assert sorted(rows(0, last=local)) == list(zip(sent_ids.tolist(), sent_weights.tolist()))
+    assert rows(0, first=local) == unsent * (capacity - local)
+    peer = list(zip(peer_ids.tolist(), peer_weights.tolist()))[:arrived]
+    assert rows(1) == peer + unsent * (capacity - arrived)
+
+
+def test_replay_reads_the_slot_table_and_mask_written_before_it() -> None:
+    """One captured dispatch routes by the expert -> slot table and the rank mask copied into their buffers before
+    each replay: it sends each token to its expert's current slot, with that slot id, and nothing to a masked peer."""
+    ep_size, num_slots = 2, 4  # Slots 0 and 1 live on rank 0, slots 2 and 3 on rank 1.
+    workspace, meta, _, payload = _setup(ep_size)
+    tokens = torch.arange(_CAPACITY, dtype=torch.int32, device="cuda").view(_CAPACITY, 1)
+    experts = tokens % 2
+    table = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    controls, abort = _rank_mask_controls(1)
+    counts = torch.zeros(ep_size, dtype=torch.int32, device="cuda")
+
+    def dispatch() -> list[torch.Tensor]:
+        received, *_ = torch.ops.trtllm.moe_a2a_dispatch(
+            experts,
+            [payload, experts, tokens],
+            workspace,
+            meta,
+            _CAPACITY,
+            0,
+            ep_size,
+            1,
+            num_slots,
+            None,
+            expert_id_payload_index=1,
+            **controls,
+            source_valid_counts=counts,
+            expert_to_slot=table,
+        )
+        return received
+
+    received = dispatch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dispatch()
+
+    def peer_word(offset: int) -> torch.Tensor:
+        return workspace[1, offset : offset + 4].view(torch.int32)
+
+    def peer_rows(tensor: torch.Tensor) -> torch.Tensor:
+        """Peer 1's copy of one of rank 0's int32 receive regions."""
+        offset = tensor.data_ptr() - workspace[0].data_ptr()
+        region = workspace[1, offset : offset + tensor.numel() * 4]
+        return region.view(torch.int32).view(tensor.shape)
+
+    def sent(slot_ids: torch.Tensor, token_ids: torch.Tensor) -> tuple[list, list]:
+        """The slot ids and tokens of source 0's first _CAPACITY // 2 rows, in token order."""
+        rows = _CAPACITY // 2
+        order = token_ids[0, :rows, 0].argsort()
+        return slot_ids[0, :rows, 0][order].tolist(), token_ids[0, :rows, 0][order].tolist()
+
+    # Expert 0 moves from slot 1 (rank 0) to slot 3 (rank 1) and expert 1 from slot 2 to slot 0; peer 1 is masked
+    # while it holds a routed slot. Even tokens choose expert 0, odd ones expert 1.
+    for slots, mask in (((1, 2), 1), ((3, 0), 3), ((1, 2), 1)):
+        table.copy_(torch.tensor(slots, dtype=torch.int32))
+        _set_mask(controls, mask)
+        expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
+        parity = ((expected_flag - 1) >> 1) & 1
+        if mask == 3:
+            # Peer 1 sends rank 0 nothing this round.
+            _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(0)
+            _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(expected_flag)
+        peer_before = workspace[1].clone()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        local = next(e for e in (0, 1) if slots[e] < 2)
+        assert counts.tolist() == [_CAPACITY // 2, 0]
+        assert sent(received[1], received[2]) == (
+            [slots[local]] * (_CAPACITY // 2),
+            list(range(local, _CAPACITY, 2)),
+        )
+        if mask == 1:
+            assert torch.equal(workspace[1], peer_before)
+        else:
+            remote = 1 - local
+            assert sent(peer_rows(received[1]), peer_rows(received[2])) == (
+                [slots[remote]] * (_CAPACITY // 2),
+                list(range(remote, _CAPACITY, 2)),
+            )
+            peer_count = peer_word(_offset(meta, "RECV_COUNTERS") + 4 * parity * 2)
+            assert peer_count.item() == _CAPACITY // 2
+            assert peer_word(_offset(meta, "DISPATCH_COMPLETION_FLAGS")).item() == expected_flag
+    assert abort.tolist() == [0, 0]
 
 
 @pytest.mark.parametrize("compact", [False, True])
