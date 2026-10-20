@@ -50,6 +50,7 @@ import torch
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm._utils import peer_loss_recovery_enabled
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
@@ -256,6 +257,21 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
+
+    def _dispatch_slot_table(self) -> Optional[torch.Tensor]:
+        """The expert -> slot table NVLinkOneSided dispatch looks the slots up in instead of route(), or None.
+
+        Only with peer-loss recovery and one slot per expert. ExpertStatistic and the calibrator read the slot
+        ids route() returns, so they keep it.
+        """
+        if not (
+            peer_loss_recovery_enabled()
+            and self._is_using_nvlink_one_sided()
+            and ExpertStatistic.expert_statistic_obj is None
+            and get_calibrator().mode == CalibratorMode.NONE
+        ):
+            return None
+        return self.moe.layer_load_balancer.one_slot_table()
 
     # ------------------------------------------------------------------
     # DeepGemm workspace allocation
@@ -542,14 +558,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 ignore_allreduce=ignore_allreduce,
             )
 
-            # With one slot per expert, NVLinkOneSided dispatch looks the slots up and sends them
-            # itself. ExpertStatistic and the calibrator read the slot ids here, so they keep route().
-            if (
-                self._is_using_nvlink_one_sided()
-                and ExpertStatistic.expert_statistic_obj is None
-                and get_calibrator().mode == CalibratorMode.NONE
-            ):
-                expert_to_slot = moe.layer_load_balancer.one_slot_table()
+            expert_to_slot = self._dispatch_slot_table()
             if expert_to_slot is None:
                 token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             else:

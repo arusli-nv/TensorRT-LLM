@@ -5,11 +5,13 @@
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
@@ -240,6 +242,22 @@ def test_backends_get_the_slots_or_a_compact_copy(reads_slots: bool) -> None:
         assert plan.source_slots is None
         assert compact_x.tolist() == x[[0, 1, 3, 4]].tolist()
         assert compact_sf.view(-1).tolist() == [0, 1, 3, 4]
+
+
+@pytest.mark.parametrize("recovery", [True, False])
+def test_dispatch_looks_up_the_slots_only_with_peer_loss_recovery(
+    monkeypatch, recovery: bool
+) -> None:
+    """Without peer-loss recovery the scheduler keeps route(): dispatch gets no slot table."""
+    monkeypatch.setattr(moe_scheduler, "peer_loss_recovery_enabled", lambda: recovery)
+    table = torch.zeros(2, dtype=torch.int32)
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        layer_load_balancer=Mock(one_slot_table=Mock(return_value=table))
+    )
+    scheduler._is_using_nvlink_one_sided = lambda: True
+    assert scheduler._dispatch_slot_table() is (table if recovery else None)
+    assert scheduler.moe.layer_load_balancer.one_slot_table.call_count == int(recovery)
 
 
 def test_compact_copy_is_contiguous_with_one_token_per_source() -> None:
