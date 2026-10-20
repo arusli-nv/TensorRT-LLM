@@ -108,6 +108,7 @@ l0_gb200_multi_gpus:
   - wide_ep_ft/test_peer_loss_recovery.py::test_rank_lost_during_recovery TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_ghost_slots[static] TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_ghost_slots[online] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_appended_empty_slots TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_hung_rank_fenced TIMEOUT (45)
   - wide_ep_ft/test_peer_loss_recovery.py::test_authority_lost_while_serving TIMEOUT (45)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]

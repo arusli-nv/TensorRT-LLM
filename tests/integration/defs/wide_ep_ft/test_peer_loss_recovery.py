@@ -407,6 +407,29 @@ def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
+def test_restore_into_appended_empty_slots(tmp_path: Path):
+    """Online EPLB's default extra slots are empty ones: each rank gets 4 after its 20 EPLB slots, holding memory
+    from startup, and the restore after rank 2 dies in decode loads them without mapping any.
+    """
+    result, output, authority_text = _run_driver(
+        tmp_path, "inflight", [VICTIM], "--online-slots", "80"
+    )
+    before_kill = output.partition(KILL_MARKER)[0]
+    assert (
+        "WideEP peer-loss recovery appends 4 empty slots per rank to online EPLB's 20"
+        in before_kill
+    ), output[-20000:]
+    after_kill = _assert_recovered(
+        result, output, authority_text, "inflight", [VICTIM], online_eplb=True
+    )
+    assert re.search(rf"Restored [1-9]\d* expert slots without ranks \[{VICTIM}\]", after_kill), (
+        after_kill[-20000:]
+    )
+    assert "behind ghost expert slots" not in after_kill, after_kill[-20000:]
+
+
+@pytest.mark.skip_less_device(WORLD_SIZE)
+@pytest.mark.skip_device_not_contain(["GB200"])
 def test_hung_rank_fenced(tmp_path: Path):
     """Rank 2 is SIGSTOPped in decode; the authority confirms the hang, the workers fence it, survivors resume."""
     result, output, authority_text = _run_driver(
