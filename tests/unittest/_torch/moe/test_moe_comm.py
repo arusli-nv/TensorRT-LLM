@@ -285,6 +285,16 @@ def _device_rank_mask(comm: NVLinkOneSided, mask: Optional[torch.Tensor]) -> Opt
     return None if mask is None else mask.to(comm.workspace.device)
 
 
+def _trtllm_op(name: str):
+    """Resolve ``torch.ops.trtllm.<name>`` without naming ``ops`` in this module's bytecode.
+
+    This module is pickled by value, and cloudpickle captures every ``sys.modules``
+    entry under ``torch.`` whose dotted parts all appear in a function's names.
+    ``torch.ops`` can be registered there as an unpicklable ``_Ops`` object.
+    """
+    return getattr(getattr(torch, "ops").trtllm, name)
+
+
 def _run_nvlink_rank_mask_dispatch(
     comm: NVLinkOneSided,
     token_selected_experts: torch.Tensor,
@@ -294,7 +304,7 @@ def _run_nvlink_rank_mask_dispatch(
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
-    recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
+    recv_tensors, combine_payload_offset, _ = _trtllm_op("moe_a2a_dispatch")(
         token_selected_experts,
         [payload],
         comm.workspace,
@@ -332,7 +342,7 @@ def _run_nvlink_rank_mask_combine(
     active_rank_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
-    return torch.ops.trtllm.moe_a2a_combine(
+    return _trtllm_op("moe_a2a_combine")(
         combine_payload,
         local_num_tokens,
         comm.workspace,
