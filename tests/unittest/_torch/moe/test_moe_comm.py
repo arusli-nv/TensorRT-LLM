@@ -1502,7 +1502,9 @@ def _worker_rank_mask_one_rank_masked(
             dtype=torch.int32,
             device="cuda",
         )
-        _, _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch(
+        # Every dispatch needs its combine: the next round's flag values and
+        # receive-counter bank assume the two alternate.
+        _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             masked_routes,
             _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank),
