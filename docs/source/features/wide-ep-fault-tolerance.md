@@ -208,6 +208,12 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
   log a recovery attempt before it exits. The job ends anyway, with the status of the signal.
 - With ring host copies (online EPLB off), losing a node (or only its copy node) leaves the next node's
   experts without host copies, so a later loss there is unrecoverable and ends the job.
+- With hang detection on, a network partition between the authority and a node's ranks (while the MPI network
+  between the ranks stays healthy) looks like a stopped process: their heartbeats stop, so they can be fenced
+  as hung, and if rank 0 is among them, the deployment restarts.
+- Open MPI's failure detector declares failed a peer it has not heard from for `mpi_ft_detector_timeout`
+  (5 s above), so a network hiccup longer than that costs a rank. Set it above the time the network takes to
+  recover from a link flap or route change.
 
 ## Not supported together with fault tolerance
 
