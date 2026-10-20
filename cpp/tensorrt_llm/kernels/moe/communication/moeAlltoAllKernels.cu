@@ -225,6 +225,28 @@ __device__ __forceinline__ bool is_rank_active(uint64_t const* mask, int rank)
     return (mask[rank >> 6] >> (rank & 63)) & 1ULL;
 }
 
+// Register copy of the active-rank bitmask, for kernels that read it before their grid dependency wait.
+__device__ __forceinline__ void load_rank_mask_words(uint64_t const* mask, uint64_t (&words)[kRankMaskWords])
+{
+#pragma unroll
+    for (int w = 0; w < kRankMaskWords; ++w)
+    {
+        words[w] = mask[w];
+    }
+}
+
+// is_rank_active on a register copy; selects the word without dynamic indexing so `words` stays in registers.
+__device__ __forceinline__ bool is_rank_active_in_words(uint64_t const (&words)[kRankMaskWords], int rank)
+{
+    uint64_t word = words[0];
+#pragma unroll
+    for (int w = 1; w < kRankMaskWords; ++w)
+    {
+        word = (rank >> 6) == w ? words[w] : word;
+    }
+    return (word >> (rank & 63)) & 1ULL;
+}
+
 // Each A2A round uses two consecutive flag values: 2N + 1 for dispatch and
 // 2N + 2 for combine. Subtracting one and dividing by two maps both values
 // to round N; the low bit selects the alternating counter bank.
@@ -1853,6 +1875,17 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
             return;
     }
 
+    // Read by the first warp. The mask is rewritten only while no collective runs, so it is read before the grid
+    // dependency wait.
+    uint64_t rank_mask[kRankMaskWords] = {};
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        if (threadIdx.x < warpSize)
+        {
+            load_rank_mask_words(ptrs.active_rank_mask, rank_mask);
+        }
+    }
+
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
@@ -1876,7 +1909,7 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!is_rank_active_in_words(rank_mask, peer_rank))
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
@@ -1895,7 +1928,7 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         {
             if constexpr (ENABLE_RANK_MASK)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                if (!is_rank_active_in_words(rank_mask, peer_rank))
                     continue;
             }
             if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
