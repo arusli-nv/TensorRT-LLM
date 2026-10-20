@@ -979,17 +979,19 @@ class PeerLossRecovery(RecoveryHook):
 
         Recoverable: an admitted domain (one rank or a whole node), or a union of admitted domains whose experts
         the survivors' slots can still serve, whether those ranks failed together or one during the other's
-        recovery.
+        recovery. Online EPLB placements can differ among survivors until rank 0's is agreed, so there
+        ``_restore_placements`` checks the slots, from that placement.
 
         Raises:
             RuntimeError: ``lost`` is not recoverable.
         """
         if lost in self._recoverable:
             return
+        load_balancer = self._executor.model_engine.moe_load_balancer
         if (
             not lost
             or not lost <= frozenset().union(*self._recoverable)
-            or not self._executor.model_engine.moe_load_balancer.covers_loss_of(lost)
+            or (load_balancer.is_static_routing() and not load_balancer.covers_loss_of(lost))
         ):
             raise RuntimeError(
                 f"The loss of ranks {sorted(lost)} is not recoverable: it includes a rank outside the "
@@ -1059,8 +1061,16 @@ class PeerLossRecovery(RecoveryHook):
         """The placements to serve without ``failed``, with memory mapped behind the ghost slots they load.
 
         Before Ready, so a rank that cannot get the memory aborts the recovery before anything changes.
+
+        Raises:
+            RuntimeError: The survivors' slots cannot serve every expert without ``failed``.
         """
-        placements = load_balancer.recovery_placements(failed, base)
+        try:
+            placements = load_balancer.recovery_placements(failed, base)
+        except ValueError as error:
+            raise RuntimeError(
+                f"The loss of ranks {sorted(failed)} is not recoverable: {error}"
+            ) from error
         self._back_restored_slots(load_balancer, placements)
         return placements
 

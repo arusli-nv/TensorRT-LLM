@@ -1837,6 +1837,37 @@ def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():
     )
 
 
+@pytest.mark.parametrize("covered", [True, False])
+def test_online_eplb_decides_recoverability_from_rank_0s_placement(covered):
+    """Under online EPLB a survivor's own placement may not cover a loss that rank 0's does (or the reverse):
+    every survivor decides from rank 0's placement, so they all recover or all fail closed."""
+    import numpy as np
+
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(_happy_replies(failed=tuple(sorted(lost)), survivors=(0, 1)))
+    recovery = _recovery(client, failed=lost)
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.is_static_routing.return_value = False
+    load_balancer.quiesce.return_value = True
+    load_balancer.covers_loss_of.return_value = not covered
+    rank0 = [np.ones((WORLD_SIZE, 2))]
+    load_balancer.current_placements.return_value = [np.zeros((WORLD_SIZE, 2))]
+    recovery._executor.dist.broadcast_among_survivors = Mock(return_value=rank0)
+    if not covered:
+        load_balancer.recovery_placements.side_effect = ValueError("No surviving replica")
+
+    if covered:
+        recovery._recover(_interrupted(lost))
+        load_balancer.install_recovery_placement.assert_called_once_with(
+            sorted(lost), ["placement"]
+        )
+    else:
+        with pytest.raises(RuntimeError, match="not recoverable"):
+            recovery._recover(_interrupted(lost))
+    load_balancer.covers_loss_of.assert_not_called()
+    load_balancer.recovery_placements.assert_called_once_with(lost, rank0)
+
+
 def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(monkeypatch):
     from mpi4py import MPI
 
