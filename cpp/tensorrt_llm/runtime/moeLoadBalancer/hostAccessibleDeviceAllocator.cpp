@@ -243,8 +243,10 @@ void HostAccessibleDeviceAllocator::shutdown()
 
 HostAccessibleDeviceAllocator& HostAccessibleDeviceAllocator::getInstance()
 {
-    static HostAccessibleDeviceAllocator instance;
-    return instance;
+    // Never destroyed: the process's CudaVirtualMemoryManager, destroyed after it, may still unregister backed ghost
+    // slot memory from its entries' teardown.
+    static auto* instance = new HostAccessibleDeviceAllocator;
+    return *instance;
 }
 
 void HostAccessibleDeviceAllocator::IncRefCount()
