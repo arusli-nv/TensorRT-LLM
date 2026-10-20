@@ -19,7 +19,6 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -28,7 +27,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...custom_ops.cute_dsl_custom_ops import (GroupedGemmInputsHelper,
+                                                loaded_slot_layout)
 from ...cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ...locality_domain.autotune import \
@@ -302,17 +302,12 @@ def cute_dsl_nvfp4_grouped_gemm_ref(
 
 class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
 
-    def __init__(self,
-                 num_experts: int,
-                 top_k: int,
-                 num_local_experts: int,
-                 local_expert_offset: int,
-                 num_empty_local_experts: int = 0):
+    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
+                 local_expert_offset: int):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
-        self.num_empty_local_experts = num_empty_local_experts
 
     def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
         return input_shapes[0][0]
@@ -355,7 +350,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  use_locality_domain: bool = False,
                  workload_identity: Optional[Tuple] = None,
                  prime_inner_tactics: bool = False,
-                 num_empty_local_experts: int = 0):
+                 num_extra_local_experts: int = 0):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -366,7 +361,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
         self.use_locality_domain = use_locality_domain
-        self.num_empty_local_experts = num_empty_local_experts
+        self.num_extra_local_experts = num_extra_local_experts
+        self.tuning_layout = loaded_slot_layout(num_experts, num_local_experts,
+                                                local_expert_offset,
+                                                num_extra_local_experts)
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -381,11 +379,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self):
+        num_experts, num_local_experts, local_expert_offset = (
+            self.tuning_layout)
         identity = (
-            self.num_experts,
+            num_experts,
             self.top_k,
-            self.num_local_experts,
-            self.local_expert_offset,
+            num_local_experts,
+            local_expert_offset,
             self.enable_finalize_fusion,
             self.enable_alltoall,
             self.output_dtype,
@@ -413,16 +413,18 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return [128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
-        key = (self.unique_id(), self.num_empty_local_experts)
+        key = (self.unique_id(), self.num_extra_local_experts)
         if key not in self.__class__.tuning_config_cache:
+            num_experts, num_local_experts, local_expert_offset = (
+                self.tuning_layout)
             if self.use_direct_expert_metadata:
                 # One tuning profile is shared by the 128- and 256-row
                 # tactics. Use the minimum tile size so its capacity buckets
                 # cover the union needed by both tactics; each kernel still
                 # rounds capacity to its selected tile size.
-                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
-                                                 self.num_local_experts,
-                                                 self.local_expert_offset, 128)
+                helper = GroupedGemmInputsHelper(num_experts, self.top_k,
+                                                 num_local_experts,
+                                                 local_expert_offset, 128)
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, helper.gen_expert_capacity_tuning_buckets,
@@ -438,9 +440,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                                           helper.infer_shape_input0_rows)),
                     use_cold_l2_cache=True)
             else:
+                # The profiled routing runs through forward_impl, so it
+                # selects the loaded slots by their real ids.
                 helper = CuteDslFusedMoENvfp4InputsHelper(
-                    self.num_experts, self.top_k, self.num_local_experts,
-                    self.local_expert_offset, self.num_empty_local_experts)
+                    num_experts, self.top_k, num_local_experts,
+                    self.local_expert_offset)
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -1128,16 +1132,12 @@ class CuteDslFusedMoE(MoEImplBase):
             event.wait()
             self._pending_x_ready_event = None
 
-    def _tuning_num_empty_local_slots(self,
-                                      weight_view: NvFp4WeightView) -> int:
-        """While autotuning, how many local slots of ``weight_view`` hold no expert in the EPLB placement."""
-        if (self.layer_load_balancer is None
-                or not AutoTuner.get().is_tuning_mode):
+    @property
+    def _num_extra_local_slots(self) -> int:
+        """Trailing local slots WideEP peer-loss recovery keeps without an expert while healthy."""
+        if self.layer_load_balancer is None:
             return 0
-        placement = np.ravel(self.layer_load_balancer.get_old_rank_expert_ids())
-        start = weight_view.slot_start
-        local = placement[start:start + weight_view.expert_size_per_partition]
-        return int((local < 0).sum())
+        return self.layer_load_balancer.extra_slot_count
 
     def run_moe_nvfp4(
         self,
@@ -1282,8 +1282,9 @@ class CuteDslFusedMoE(MoEImplBase):
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
-            num_empty_local_experts=self._tuning_num_empty_local_slots(
-                weight_view),
+            # Direct metadata lays rows out by every local slot.
+            num_extra_local_experts=(0 if use_direct_expert_metadata else
+                                     self._num_extra_local_slots),
         )
 
         if use_direct_expert_metadata:
@@ -1439,14 +1440,15 @@ class CuteDslFusedMoE(MoEImplBase):
         if source_slots is not None:
             gather_act_kwargs["source_tokens"] = source_slots.source_tokens
             gather_act_kwargs["slot_tokens"] = source_slots.slot_tokens
-        num_empty_local_experts = self._tuning_num_empty_local_slots(
-            weight_view)
+        # Count-native metadata lays rows out by every local slot.
+        num_extra_local_experts = (0 if use_count_native_expert_metadata else
+                                   self._num_extra_local_slots)
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
         else:
             gather_act_kwargs[
-                "num_empty_local_experts"] = num_empty_local_experts
+                "num_extra_local_experts"] = num_extra_local_experts
         gather_act_kwargs["activation_type"] = self.activation_type
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
@@ -1536,7 +1538,7 @@ class CuteDslFusedMoE(MoEImplBase):
                     deep_ep_expert_capacity
                     if use_count_native_expert_metadata else 0)
                 finalize_inplace_kwargs[
-                    "num_empty_local_experts"] = num_empty_local_experts
+                    "num_extra_local_experts"] = num_extra_local_experts
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:

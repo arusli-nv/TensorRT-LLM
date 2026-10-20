@@ -28,6 +28,7 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     GatherGroupedGemmInputsHelper,
     GroupedGemmInputsHelper,
     _get_sm107_nvfp4_default_mma_config,
+    loaded_slot_layout,
 )
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
@@ -42,6 +43,7 @@ from tensorrt_llm._torch.locality_domain_utils import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
+    CuteDslFusedMoENvfp4Runner,
     _expert_count_tile_plan,
     _LocalityDomainConcurrentTunableRunner,
     _runner_tactics_match_tile_size,
@@ -133,20 +135,107 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
     )
 
 
-@pytest.mark.parametrize("approx_max_load", [False, True])
-@pytest.mark.parametrize("num_tokens", [1, 7, 128, 8192])
-def test_grouped_gemm_inputs_helper_empty_local_experts(num_tokens: int, approx_max_load: bool):
-    """10 slots per rank of which 2 hold no expert profile like 8 slots per rank, all loaded."""
-    top_k, ep_size = 8, 32
-    with_empty = GroupedGemmInputsHelper(10 * ep_size, top_k, 10, 0, 128, num_empty_local_experts=2)
-    loaded = GroupedGemmInputsHelper(8 * ep_size, top_k, 8, 0, 128)
+# WideEP peer-loss recovery layouts of 10 slots per rank on 32 ranks: a static placement keeps
+# 2 slots per rank empty (8 loaded), online EPLB with 9 slots per rank gets 1 more (9 loaded).
+_EP_SIZE, _EP_RANK, _TOP_K = 32, 5, 8
+_EXTRA_SLOTS = [(2, 8), (1, 9)]
 
-    counts = with_empty.generate_num_tokens_per_expert(num_tokens, approx_max_load)
-    assert counts == loaded.generate_num_tokens_per_expert(num_tokens, approx_max_load) + [0, 0]
-    selected = with_empty.generate_token_selected_experts(num_tokens, counts)
-    assert (
-        selected.tolist() == loaded.generate_token_selected_experts(num_tokens, counts[:8]).tolist()
+
+@pytest.mark.parametrize("num_extra,num_loaded", _EXTRA_SLOTS)
+def test_loaded_slot_layout(num_extra: int, num_loaded: int):
+    assert loaded_slot_layout(320, 10, _EP_RANK * 10, num_extra) == (
+        _EP_SIZE * num_loaded,
+        num_loaded,
+        _EP_RANK * num_loaded,
     )
+    # Without extra slots the layout is kept, also an uneven partition.
+    assert loaded_slot_layout(257, 9, 18, 0) == (257, 9, 18)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 64, 96, 1024, 3072, 8192])
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("num_extra,num_loaded", _EXTRA_SLOTS)
+def test_grouped_gemm_inputs_helper_maps_rows_of_extra_slots(
+    num_extra: int, num_loaded: int, tile_size: int, num_tokens: int
+):
+    """Rows padded for every local slot map to the buckets of the loaded slots alone."""
+    layout = (_EP_SIZE * num_loaded, _TOP_K, num_loaded, _EP_RANK * num_loaded, tile_size)
+    loaded = GroupedGemmInputsHelper(*layout)
+    with_extra = GroupedGemmInputsHelper(*layout, num_extra_local_experts=num_extra)
+    all_slots = GroupedGemmInputsHelper(320, _TOP_K, 10, _EP_RANK * 10, tile_size)
+    rows = all_slots.get_max_num_permuted_tokens(num_tokens)
+    loaded_rows = loaded.get_max_num_permuted_tokens(num_tokens)
+
+    assert with_extra.map_to_tuning_buckets(rows) == loaded.map_to_tuning_buckets(loaded_rows)
+    assert with_extra.gen_tuning_buckets(rows) == loaded.gen_tuning_buckets(loaded_rows)
+
+
+@pytest.mark.parametrize("num_extra,num_loaded", _EXTRA_SLOTS)
+def test_cute_dsl_moe_runner_keys_extra_slots_as_loaded_layout(num_extra: int, num_loaded: int):
+    def runner(*layout, **kwargs):
+        return CuteDslFusedMoENvfp4Runner(lambda *args, **kwargs: None, *layout, **kwargs)
+
+    with_extra = runner(320, _TOP_K, 10, _EP_RANK * 10, num_extra_local_experts=num_extra)
+    loaded = runner(_EP_SIZE * num_loaded, _TOP_K, num_loaded, _EP_RANK * num_loaded)
+    assert with_extra.unique_id() == loaded.unique_id()
+    # The profiled routing runs through every local slot's kernels: it picks the loaded slots by
+    # their ids and splits the tokens as the loaded layout does.
+    helper = with_extra.get_tuning_config().inputs_pre_hook.__self__
+    assert (helper.num_experts, helper.num_local_experts, helper.local_expert_offset) == (
+        _EP_SIZE * num_loaded,
+        num_loaded,
+        _EP_RANK * 10,
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("num_tokens", [1, 64, 3072])
+@pytest.mark.parametrize("num_extra,num_loaded", _EXTRA_SLOTS)
+def test_cute_dsl_grouped_gemms_key_extra_slots_as_loaded_layout(
+    monkeypatch, num_extra: int, num_loaded: int, num_tokens: int
+):
+    """FC1 and FC2 over every local slot look tactics up under the loaded layout's key.
+
+    The tactics valid for the loaded layout stay valid for the rows of every local slot, which
+    are the kernel's shapes before and after a restore fills the extra slots.
+    """
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 100)
+    fc1 = cute_dsl_custom_ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner
+    fc2 = cute_dsl_custom_ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner
+    tile_size, n, k = 128, 4096, 7168
+
+    def tensor(*shape):
+        return torch.empty(*shape, device="meta")
+
+    def key_and_tactics(runner_cls, num_experts, num_local, num_extra_local=0):
+        layout = (num_experts, _TOP_K, num_local, _EP_RANK * num_local, tile_size)
+        rows = GroupedGemmInputsHelper(*layout).get_max_num_permuted_tokens(num_tokens)
+        b, b_sf = tensor(num_local, n, k // 2), tensor(num_local, n, k // 16)
+        alpha, one = tensor(num_local), tensor(1)
+        tile_idx, mn_limit = tensor(rows // tile_size), tensor(rows // tile_size)
+        permuted = tensor(rows)
+        if runner_cls is fc1:
+            runner = fc1(*layout, num_extra_local_experts=num_extra_local)
+            a, a_sf = tensor(num_tokens, k // 2), tensor(num_tokens, k // 16)
+            inputs = [a, b, a_sf, b_sf, alpha, tile_idx, mn_limit, permuted, one, one]
+        else:
+            runner = fc2(*layout, torch.bfloat16, num_extra_local_experts=num_extra_local)
+            a, a_sf = tensor(rows, k // 2), tensor(rows, k // 16)
+            c, scales = tensor(num_tokens, n), tensor(num_tokens, _TOP_K)
+            inputs = [a, b, a_sf, b_sf, alpha, c, tile_idx, mn_limit, permuted, one, scales]
+        tuner_inputs = cute_dsl_custom_ops._loaded_slot_tuner_inputs(
+            inputs, num_local, num_extra_local
+        )
+        key = AutoTuner.get().profiling_cache.get_cache_key(
+            "op", runner, tuple(t.size() for t in tuner_inputs), runner.get_tuning_config()
+        )
+        return key, set(runner.get_valid_tactics(inputs, OptimizationProfile()))
+
+    for runner_cls in (fc1, fc2):
+        key, tactics = key_and_tactics(runner_cls, 320, 10, num_extra)
+        loaded_key, loaded_tactics = key_and_tactics(runner_cls, _EP_SIZE * num_loaded, num_loaded)
+        assert key == loaded_key
+        assert loaded_tactics <= tactics
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])

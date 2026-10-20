@@ -493,6 +493,9 @@ class SingleLayerMoeLoadBalancer:
         self.to_migrate_weight_fns = []
         # Local slots whose storage maps no memory until a restore (ghost extra slots), or None.
         self.ghost_slots: Optional[List[int]] = None
+        # Trailing local slots WideEP peer-loss recovery keeps without an expert while healthy; set by finalize_model
+        # and kept after restores fill them.
+        self.extra_slot_count = 0
         self.initial_weight_assignments: Optional[List[int]] = None
         # The device expert -> slot table once one_slot_table returned it.
         self._one_slot_table: Optional[torch.Tensor] = None
@@ -1324,6 +1327,12 @@ class MoeLoadBalancer:
                 logger.info(
                     f"Ghost slot memory: {mappings} host mappings of {mapped_bytes / (1 << 30):.2f} GiB on rank 0 "
                     "(GDRCopy pins where GPU memory is not a NUMA node)")
+        if mode is not None:
+            for layer in self.single_layer_load_balancers:
+                local = np.asarray(
+                    layer.get_old_rank_expert_ids()[self.ep_rank])
+                # The slots after the last one holding an expert.
+                layer.extra_slot_count = int(np.argmax(local[::-1] >= 0))
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):

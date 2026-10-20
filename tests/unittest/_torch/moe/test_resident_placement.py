@@ -9,6 +9,7 @@ import pytest
 
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
+    _without_replicas,
     restore_lost_experts,
 )
 from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
@@ -301,8 +302,32 @@ def test_ghost_slots_start_empty_and_unbacked(monkeypatch, host_accessible):
     torch.ops.trtllm.moe_ghost_slot_storage.assert_called_once_with(weights, [1], host_accessible)
 
 
+def test_static_default_placement_keeps_the_trailing_slots_of_each_rank_empty():
+    """MoE's default placement of 320 slots for 256 experts on 32 ranks: 8 loaded, 2 empty per rank."""
+    ep_size, experts, slots_per_rank = 32, 256, 10
+    placement = np.array(
+        [
+            [(rank * experts // ep_size + slot) % experts for slot in range(slots_per_rank)]
+            for rank in range(ep_size)
+        ]
+    )
+    emptied = _without_replicas(placement)
+    assert (emptied[:, :8] == placement[:, :8]).all()
+    assert (emptied[:, 8:] == -1).all()
+
+
 # Six experts on two EPLB slots per rank (experts 0 and 2 twice) and one ghost slot per rank.
 _MIXED = [[0, 1, -1], [2, 3, -1], [4, 5, -1], [0, 2, -1]]
+
+
+def test_finalize_counts_the_extra_slots_autotuning_leaves_out(monkeypatch):
+    load_balancer = _online_load_balancer(
+        monkeypatch, _MIXED, largest_loss=2, experts=6, eplb_slots=2
+    )
+    (layer,) = load_balancer.single_layer_load_balancers
+    assert layer.extra_slot_count == 0
+    load_balancer.finalize_model()
+    assert layer.extra_slot_count == 1
 
 
 def test_mixed_mode_restores_into_ghost_slots_spread_over_ranks(monkeypatch):
