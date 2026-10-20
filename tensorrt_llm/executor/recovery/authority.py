@@ -684,9 +684,10 @@ def _receive_datagrams(
 
 
 def datagram_socket(endpoint: str) -> socket.socket | None:
-    """Return a non-blocking UDP socket bound to the host and port of ``endpoint``, or None if it cannot bind.
+    """Return a non-blocking UDP socket bound to the host and port of a ``tcp://`` ``endpoint``, else None.
 
-    Without it the authority judges the workers from their Python heartbeats alone.
+    Hang detection needs it to tell a rank whose Python is starved from a stopped one, so
+    a port it cannot bind is an error.
     """
     if not endpoint.startswith("tcp://"):
         return None
@@ -696,11 +697,9 @@ def datagram_socket(endpoint: str) -> socket.socket | None:
         datagrams.bind((host, port))
     except OSError as error:
         datagrams.close()
-        logger.warning(
-            f"Recovery authority: cannot receive native heartbeats on UDP {host}:{port} ({error}); "
-            "judging the workers from their Python heartbeats alone"
-        )
-        return None
+        raise RuntimeError(
+            f"Recovery authority: cannot receive native heartbeats on UDP {host}:{port}"
+        ) from error
     datagrams.setblocking(False)
     return datagrams
 

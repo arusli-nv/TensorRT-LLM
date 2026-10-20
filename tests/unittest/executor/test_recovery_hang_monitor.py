@@ -499,6 +499,16 @@ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced(
         sender.close()
 
 
+def test_an_authority_that_cannot_bind_its_datagram_port_fails():
+    taken = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        taken.bind(("127.0.0.1", 0))
+        with pytest.raises(RuntimeError, match="native heartbeats"):
+            authority_module.datagram_socket(f"tcp://127.0.0.1:{taken.getsockname()[1]}")
+    finally:
+        taken.close()
+
+
 def test_a_datagram_flood_yields_to_the_loop(monkeypatch):
     monkeypatch.setattr(authority_module, "_MAX_DATAGRAMS_PER_PASS", 2)
     authority = _serving_authority([])

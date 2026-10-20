@@ -39,7 +39,8 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
    The authority's messages are authenticated but not encrypted, and any host that can reach its port can
    disrupt recovery: never bind it to a public interface or reuse a key across jobs. Without `--endpoint` it
    binds to localhost (single-node jobs). With hang detection on, it also receives the workers' native
-   heartbeats as UDP datagrams on the same port number: let UDP reach it.
+   heartbeats as UDP datagrams on the same port number, and exits if it cannot bind that UDP port: let UDP
+   reach it.
 2. Launch the server under `mpirun --with-ft ulfm` with the ob1 transport and the same key:
    ```bash
    export TLLM_FAULT_TOLERANCE_MODE=1
