@@ -543,7 +543,7 @@ __device__ __forceinline__ void copy_compact_routing(
 // (count 0): a source that stopped waiting under an abort can run a round ahead and write its count before this rank
 // resets that slot for the round (the count reads -1), and ranks that stop waiting can match a lost source's stale
 // flag.
-__device__ int checked_source_count(
+__device__ __forceinline__ int checked_source_count(
     DispatchKernelPointers const& ptrs, int count, int source, int source_tokens, int rank_id)
 {
     if (count >= 0 && count <= source_tokens)

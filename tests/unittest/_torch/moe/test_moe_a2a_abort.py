@@ -390,13 +390,14 @@ def _compact_round(workspace, meta, experts, payloads, controls, capacity=_CAPAC
 
 # With capacity * top_k not a multiple of 4, each source's rows end in a word-by-word tail, and source 1's rows
 # start off a 16-byte boundary, so they are copied word by word.
-@pytest.mark.parametrize("capacity,top_k", [(_CAPACITY, 1), (7, 3), (7, 6)])
+# (520, 8): rows past the first 1024 words per CTA, so the copy's later load steps carry data.
+@pytest.mark.parametrize("capacity,top_k", [(_CAPACITY, 1), (7, 3), (7, 6), (520, 8)])
 @pytest.mark.parametrize("peer_active", [True, False])
 def test_compact_routing_copies_the_rows_each_source_sent(
     peer_active: bool, capacity: int, top_k: int
 ) -> None:
     """The dispatch's compact lists hold each active source's sent rows, -1 / 0 elsewhere."""
-    local, peer_rows = 5, 3
+    local, peer_rows = (300, 200) if capacity > _CAPACITY else (5, 3)
 
     def routing_rows(first_id: int, first_weight: float, rows: int) -> tuple[torch.Tensor, ...]:
         n = rows * top_k
