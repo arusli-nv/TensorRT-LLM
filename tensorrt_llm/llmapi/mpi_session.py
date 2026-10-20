@@ -74,11 +74,15 @@ main()
 def _num_failed_ranks() -> int:
     """Number of processes ULFM reports failed in the world.
 
-    Zero when recovery is disabled.
+    Zero when recovery is disabled or the MPI library cannot report failures.
     """
     if not (ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled()):
         return 0
-    return len(mpi_failed_ranks(mpi4py.MPI.COMM_WORLD))
+    try:
+        return len(mpi_failed_ranks(mpi4py.MPI.COMM_WORLD))
+    except NotImplementedError:
+        # A startup that refused such a library is torn down here; its error must surface.
+        return 0
 
 
 # How long a BrokenExecutor waits for ULFM to report the failed rank that

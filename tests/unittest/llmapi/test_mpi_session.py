@@ -981,6 +981,21 @@ class _Queue:
         self.sent.append(obj)
 
 
+@pytest.mark.cpu_only
+def test_no_failed_ranks_are_counted_when_mpi_cannot_report_them(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.llmapi import mpi_session
+
+    def no_ulfm(comm):
+        raise NotImplementedError("no ULFM")
+
+    monkeypatch.setattr(mpi_session, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(mpi_session, "mpi4py", Mock(), raising=False)
+    monkeypatch.setattr(mpi_session, "mpi_failed_ranks", no_ulfm)
+    assert mpi_session._num_failed_ranks() == 0
+
+
 def _degraded_server(monkeypatch: pytest.MonkeyPatch, messages,
                      failed_ranks) -> tuple:
     """A server whose world lost a rank once ``failed_ranks[0]`` is set."""
