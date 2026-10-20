@@ -898,16 +898,17 @@ class SingleLayerMoeLoadBalancer:
         """
         if self.updates_enabled:
             return None
-        if self._one_slot_table is None or torch.compiler.is_compiling():
+        if torch.compiler.is_compiling():
             # Traced code gets the op's empty fake, so it keeps the routing kernel.
-            table = torch.ops.trtllm.moe_load_balance_one_slot_table(
-                self.single_layer_load_balancer_ptr)
-            if table.numel() == 0:
-                return None
-            if torch.compiler.is_compiling():
-                return table
-            self._one_slot_table = table
+            return self._query_one_slot_table()
+        if self._one_slot_table is None:
+            self._one_slot_table = self._query_one_slot_table()
         return self._one_slot_table
+
+    def _query_one_slot_table(self) -> Optional[torch.Tensor]:
+        table = torch.ops.trtllm.moe_load_balance_one_slot_table(
+            self.single_layer_load_balancer_ptr)
+        return table if table.numel() > 0 else None
 
     def py_pre_shutdown_cleanup(self):
         """
