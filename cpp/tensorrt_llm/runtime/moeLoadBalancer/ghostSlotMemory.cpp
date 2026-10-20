@@ -207,7 +207,7 @@ struct GhostSlotMemory::Scratch
     }
 
     size_t granularity;
-    AccessDescs access; // of every mapping of the ranges
+    AccessDescs access;                                     // of every mapping of the ranges
     std::map<size_t, CUmemGenericAllocationHandle> handles; // chunks -> allocation
 };
 

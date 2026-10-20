@@ -752,7 +752,7 @@ size_t bookedBytes()
 {
     auto const& counters = MemoryCounters::getInstance();
     return hostAccessible() && HostAccessibleDeviceAllocator::gpuMemoryNumaId() >= 0 ? counters.getPinned()
-                                                                                      : counters.getGpu();
+                                                                                     : counters.getGpu();
 }
 
 size_t vmmGranularity()
@@ -1283,8 +1283,8 @@ TEST(MoeLoadBalancerRestoreTest, CpuCopiesLoadARestoredGhostSlotThroughEachMappi
     // piece it shares with the space past the slots (chunk 4); each is a mapping of its own.
     size_t const slotBytes = 2 * gran + gran / 4;
     size_t const elems = slotBytes / sizeof(float);
-    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*ghostSlot1=*/true,
-        {0, -1, 1, -1, 2, -1, 3, -1});
+    RestorePlacementLayer setup(
+        /*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*ghostSlot1=*/true, {0, -1, 1, -1, 2, -1, 3, -1});
     auto* info = setup.mLayer->getPlacementCpuInfo();
     auto expectSlotHolds = [&](int slotId, float value)
     {

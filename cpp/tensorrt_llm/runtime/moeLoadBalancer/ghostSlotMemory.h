@@ -129,8 +129,8 @@ private:
     std::map<CUdeviceptr, Allocation> mAllocations;
     std::map<Owner, std::vector<Piece*>> mPending; // owner -> pieces back() materialized, not yet kept or released
     int mDevice = -1;
-    bool mHostAccessible = false; // of the ranges that exist
-    int mNumaId = -1;             // the NUMA node of mDevice's memory where the host reaches it at the same address
+    bool mHostAccessible = false;                  // of the ranges that exist
+    int mNumaId = -1; // the NUMA node of mDevice's memory where the host reaches it at the same address
     size_t mGranularity = 0;
     std::shared_ptr<Scratch> mScratch; // while any allocation exists
 };
