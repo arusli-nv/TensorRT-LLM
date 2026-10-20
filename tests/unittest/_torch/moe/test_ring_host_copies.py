@@ -4,6 +4,7 @@
 
 import functools
 import threading
+from multiprocessing import shared_memory
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -102,6 +103,34 @@ def test_a_layer_that_does_not_fit_in_shared_memory_fails_before_creating_it(mon
     finally:
         sharer.pre_shutdown_cleanup()
         sharer.post_shutdown_cleanup()
+
+
+def test_a_sharer_leaves_a_segment_it_did_not_create_in_place():
+    sharer = _sharer(0, 1, expert_count=1)
+    sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
+    sharer.share_host_tensor_with_shape(0, "w", torch.ones(4))
+    other = shared_memory.SharedMemory(name=sharer.get_shared_memory_name(), create=True, size=8)
+    try:
+        other.buf[0] = 7
+        with pytest.raises(RuntimeError, match="did not create"):
+            sharer.finalize_layer_weights()
+        assert other.buf[0] == 7
+    finally:
+        other.close()
+        other.unlink()
+
+
+def test_load_balancers_name_their_shared_memory_apart(monkeypatch):
+    monkeypatch.setattr(
+        MoeLoadBalancer,
+        "_setup_mpi_comm",
+        lambda self: setattr(
+            self, "shared_mpi_comm", Mock(Get_rank=Mock(return_value=0), bcast=lambda token: token)
+        ),
+    )
+    with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
+        names = {MoeLoadBalancer(0, 1, 0, "base").shared_memory_base_name for _ in range(2)}
+    assert len(names) == 2 and all(name.startswith("base_") for name in names)
 
 
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
