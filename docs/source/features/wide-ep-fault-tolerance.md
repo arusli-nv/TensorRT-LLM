@@ -3,8 +3,9 @@
 Wide expert parallelism spreads a model's experts over many GPUs, so without fault tolerance the loss of
 one GPU's process ends the whole job. With fault tolerance on, the surviving ranks detect the loss, stop
 the step in flight, agree on who survived, route the lost rank's experts to their copies on other GPUs and
-keep serving on the same CUDA graphs. Requests the lost rank was serving run again once on a survivor if they
-had delivered nothing yet, else end with a retryable error; every other request continues.
+keep serving on the same CUDA graphs. Requests the lost rank was serving run again on a survivor if they
+had delivered nothing yet, else end with a retryable error; every other request continues. A request that a
+second loss interrupts ends with a retryable error, whichever ranks were lost.
 
 ## Requirements
 
@@ -212,10 +213,11 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
   that was running finishes first, so under heavy prefill a recovery takes up to the length of one step
   (`max_num_tokens` bounds it).
 - The requests the lost ranks were serving that had delivered nothing yet (every non-streaming request, and a
-  streaming one before its first token) run again from their prompt on a survivor, once. A request that already
-  ran again and loses its rank a second time may be what crashes them: it is quarantined, not run again. Those,
-  and streaming requests that had already delivered tokens (they are not continued on a survivor), end with a
-  retryable error. Non-streaming requests get an error
+  streaming one before its first token) run again from their prompt on a survivor. A request is interrupted
+  once at most: one that an earlier loss interrupted (it ran again, or a survivor was running it) may be what
+  crashes the ranks, so it is quarantined, not continued. Quarantined requests, and streaming requests of the
+  lost ranks that had already delivered tokens (they are not continued on a survivor), end with a retryable
+  error. Non-streaming requests get an error
   response. Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE
   `error` event followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that
@@ -257,8 +259,8 @@ or without the overlap scheduler) and the authority's recovery protocol are test
 kills under load at DEP32.
 These are tested only in single runs or at small scale so far, so treat them as less mature: the loss of a whole
 host, `ghost` extra slots, hang detection and fencing, online EPLB, KV block reuse, MTP, and the `/health`
-states. A further loss after a recovery, and re-running a request once after the loss of a single rank, are
-tested only by unit tests so far.
+states. A further loss after a recovery, re-running a request after the loss of a single rank, and quarantining
+a request a second loss interrupts are tested only by unit tests so far.
 
 ## Cost
 

@@ -211,7 +211,8 @@ class PeerLossRecovery(RecoveryHook):
     out of host collectives, EPLB routing and the MoE dispatch/combine
     descriptor. A further loss after a recovery recovers the same way while the
     survivors' slots still serve every expert. Requests the departed attention-DP
-    ranks were serving run again once or fail (see ``_deliver_responses``).
+    ranks were serving run again or fail, and a request a second loss interrupts
+    fails (see ``_deliver_responses``).
     A failure raises into the executor's terminal path.
 
     The executor calls :meth:`step_prepared` after reserving a step's
@@ -273,8 +274,9 @@ class PeerLossRecovery(RecoveryHook):
         self._parent_ids: Dict[int, int] = {}
         # On rank 0: the owned requests that delivered a response.
         self._delivered: Set[int] = set()
-        # On rank 0: the owned requests already run again after a loss of their rank; a second loss fails them.
-        self._rerun: Set[int] = set()
+        # On rank 0: the owned requests a loss interrupted once (in a discarded step, or on the lost rank); a
+        # second interruption fails them.
+        self._interrupted: Set[int] = set()
         # Ids of the requests this rank answered, until their error or final result.
         self._answering: Set[int] = set()
         if executor.dist.rank == 0:
@@ -737,9 +739,9 @@ class PeerLossRecovery(RecoveryHook):
         return {request_id for request_id, _ in pending + buffered}
 
     def _retire(self, request_id: int) -> None:
-        """Forget a request that ended (finished, failed or cancelled), with its rerun mark."""
+        """Forget a request that ended (finished, failed or cancelled), with its interruption mark."""
         self._forget(request_id)
-        self._rerun.discard(request_id)
+        self._interrupted.discard(request_id)
 
     def _forget(self, request_id: int) -> None:
         self._delivered.discard(request_id)
@@ -807,6 +809,12 @@ class PeerLossRecovery(RecoveryHook):
         self._join_device_work(deadline)
         # Only now can no kernel of the steps still write their KV blocks.
         discarded = len(self._uncommitted_steps)
+        interrupted = {
+            request.parent_request_id if request.is_child else request.py_request_id
+            for step in self._uncommitted_steps
+            for request in step.batch.all_requests()
+            if not request.is_dummy
+        }
         executor.discard_interrupted_steps(reversed(self._uncommitted_steps))
         self._uncommitted_steps.clear()
 
@@ -895,19 +903,23 @@ class PeerLossRecovery(RecoveryHook):
 
         # What each survivor holds: the requests it serves and those it already answered (for example
         # rejected ones); none of them may be admitted again. A loss can stop survivors one iteration apart, so
-        # they also resume from the same iteration count, which iteration-gated collectives assume.
+        # they also resume from the same iteration count, which iteration-gated collectives assume. And the
+        # requests the loss interrupted.
         buffered = executor.take_buffered_responses()
         gathered = dist.allgather(
             (
                 executor.served_request_ids() | self._answered_request_ids(buffered[0]),
                 executor.iter_counter,
+                interrupted,
             ),
             departed=None,
         )
         held = [entry and entry[0] for entry in gathered]
         executor.iter_counter = max(entry[1] for entry in gathered if entry)
         self._requeue_unscheduled_requests(held)
-        self._deliver_responses(failed, buffered)
+        self._deliver_responses(
+            failed, buffered, set().union(*(entry[2] for entry in gathered if entry))
+        )
         self._readmit_undelivered_requests(failed, held)
         self._log_phase("resumed", generation)
         self._first_step_pending = rank == 0
@@ -1218,7 +1230,7 @@ class PeerLossRecovery(RecoveryHook):
         if self._request_owners is None:
             return 0
         return sum(
-            owner in failed and (request_id in self._delivered or request_id in self._rerun)
+            owner in failed and (request_id in self._delivered or request_id in self._interrupted)
             for request_id, (owner, _) in self._request_owners.items()
         )
 
@@ -1256,7 +1268,10 @@ class PeerLossRecovery(RecoveryHook):
         )
 
     def _deliver_responses(
-        self, failed: frozenset, buffered: Tuple[Responses, List[LlmRequest]]
+        self,
+        failed: frozenset,
+        buffered: Tuple[Responses, List[LlmRequest]],
+        interrupted: Set[int],
     ) -> None:
         """Deliver what the interrupted gathers owed their clients.
 
@@ -1265,10 +1280,28 @@ class PeerLossRecovery(RecoveryHook):
         held for the next synchronized flush, then terminates the requests they
         finished. Rank 0 also takes over the requests that were running on a departed
         attention-DP rank, whose KV cache left with it: those that delivered nothing run again
-        from their prompt, once; the others fail.
+        from their prompt; the others fail. A request is interrupted once at most: the
+        survivors' ``interrupted`` requests (in the discarded steps) and the departed ranks'
+        requests that a loss interrupted before fail, as they may be what crashes the ranks.
         """
         executor = self._executor
-        processed = executor.dist.broadcast(self._last_processed_gather, root=0)
+        quarantined = set()
+        if self._request_owners is not None:
+            for request_id in interrupted:
+                if request_id not in self._request_owners:
+                    continue
+                if request_id in self._interrupted:
+                    quarantined.add(request_id)
+                else:
+                    self._interrupted.add(request_id)
+        processed, quarantined = executor.dist.broadcast(
+            (self._last_processed_gather, quarantined), root=0
+        )
+        executor.fail_requests(
+            quarantined,
+            "A peer loss interrupted this request a second time; it may be what crashes the "
+            "ranks, so it is not continued; retry it",
+        )
         # Every rank numbers the gathers alike because each calls them in the
         # same sequence, and rank 0 processes a gather only once every rank sent.
         if self._gather_count < processed:
@@ -1299,23 +1332,23 @@ class PeerLossRecovery(RecoveryHook):
         rerun = []
         if self._request_owners is not None:
             # A request that delivered nothing runs again from its prompt on a survivor (only rank 0's own parts
-            # are redelivered, so what it delivered is known now), once: it may be what crashed its rank, so one
-            # that loses its rank again fails, as does one that streamed tokens.
+            # are redelivered, so what it delivered is known now), unless a loss interrupted it before: it may be
+            # what crashed its rank. One that streamed tokens fails.
             for request_id, (owner, item) in list(self._request_owners.items()):
                 if owner not in failed:
                     continue
                 streamed = request_id in self._delivered
-                quarantined = request_id in self._rerun
+                interrupted_before = request_id in self._interrupted
                 self._forget(request_id)
-                if not streamed and not quarantined:
-                    self._rerun.add(request_id)
+                if not streamed and not interrupted_before:
+                    self._interrupted.add(request_id)
                     _relax_attention_dp_pin(item)
                     rerun.append(item)
                     continue
                 reason = (
                     "had streamed tokens"
                     if streamed
-                    else "had already run again after an earlier failure of its rank"
+                    else "an earlier peer loss had already interrupted"
                 )
                 responses.append(
                     (

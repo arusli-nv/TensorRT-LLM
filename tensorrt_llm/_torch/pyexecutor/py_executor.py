@@ -9282,6 +9282,18 @@ class PyExecutor:
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
+    def fail_requests(self, request_ids: Set[int], error_msg: str) -> None:
+        """Fail every sequence of the active requests ``request_ids`` with ``error_msg``."""
+        requests = [
+            request for request in self.active_requests
+            if (request.parent_request_id if request.is_child else request.
+                py_request_id) in request_ids
+        ]
+        if requests:
+            self._handle_errors(error_msg,
+                                requests=requests,
+                                charge_budget=False)
+
     def publish_responses(self, responses: Iterable[Tuple[int, LlmResponse]],
                           terminations: Iterable[LlmRequest]) -> None:
         """Enqueue ``responses``, then terminate the requests they finish.

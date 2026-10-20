@@ -610,7 +610,7 @@ def test_recovery_does_not_rebroadcast_a_request_a_survivor_started():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     executor = recovery._executor
     _broadcast(recovery, [_queued(3), _queued(4)], interrupted=True)
-    served = [(set(), 0), ({3}, 0), None, (set(), 0)]
+    served = [(set(), 0, set()), ({3}, 0, set()), None, (set(), 0, set())]
     executor.dist.allgather.side_effect = lambda value, departed: served
 
     recovery._recover(_interrupted())
@@ -626,10 +626,10 @@ def test_survivors_resume_from_the_same_iteration():
     executor = recovery._executor
     executor.iter_counter = 7
     executor.dist.allgather.side_effect = lambda value, departed: [
-        (set(), 8),
+        (set(), 8, set()),
         value,
         None,
-        (set(), 7),
+        (set(), 7, set()),
     ]
 
     recovery._recover(_interrupted())
@@ -650,7 +650,7 @@ def test_recovery_reports_requests_it_already_answered_as_held():
 
     recovery._recover(_interrupted())
 
-    held, _iteration = reported[0]
+    held, _iteration, _interrupted = reported[0]
     assert 3 in held
 
 
@@ -813,7 +813,10 @@ def test_run_surfaces_a_failed_recovery_after_stopping_the_watch():
 def test_recovery_discards_the_steps_newest_first_after_joining_their_device_work():
     recovery = _recovery(_FakeClient(_happy_replies()))
     calls = []
-    older, newer = Mock(name="older", context_requests=[]), Mock(name="newer", context_requests=[])
+    older, newer = (
+        Mock(name=name, context_requests=[], **{"all_requests.return_value": []})
+        for name in ("older", "newer")
+    )
     recovery.step_prepared(older)
     recovery.step_prepared(newer)
     recovery._join_device_work = lambda deadline: calls.append("join")
@@ -1283,11 +1286,11 @@ def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
     assert sent[-1] == []
     assert recovery._executor.request_accumulated[:1] == [lost]
     assert recovery._request_owners == {12: (3, kept)}
-    # Marked as run again until it ends.
-    assert recovery._rerun == {11}
+    # Marked as interrupted until it ends.
+    assert recovery._interrupted == {11}
     recovery.requests_routed({1: [lost]})
     recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
-    assert recovery._rerun == set() and recovery._request_owners == {12: (3, kept)}
+    assert recovery._interrupted == set() and recovery._request_owners == {12: (3, kept)}
 
 
 def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor():
@@ -1329,7 +1332,7 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_aga
     if streamed:
         recovery._delivered.add(11)
     else:
-        recovery._rerun.add(11)
+        recovery._interrupted.add(11)
     sent = _sent_responses(recovery)
 
     recovery._recover(_interrupted())
@@ -1338,8 +1341,8 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_aga
     assert request_id == 11 and response.client_id == "c11"
     assert f"rank {FAILED_RANK} failed" in response.error_msg
     assert ("streamed" in response.error_msg) == streamed
-    assert ("already run again" in response.error_msg) != streamed
-    assert recovery._request_owners == {} and recovery._rerun == set()
+    assert ("already interrupted" in response.error_msg) != streamed
+    assert recovery._request_owners == {} and recovery._interrupted == set()
     assert recovery._executor.request_accumulated == []
 
 
@@ -1369,9 +1372,65 @@ def test_a_request_run_again_fails_when_it_loses_its_rank_again():
     recovery._recover(_interrupted(lost))
 
     ((request_id, response),) = sent[-1]
-    assert request_id == 11 and "already run again" in response.error_msg
+    assert request_id == 11 and "already interrupted" in response.error_msg
     assert recovery._executor.request_accumulated == []
     assert [m.generation for m in client.sent if isinstance(m, Installed)] == [1, 2]
+
+
+def _interrupting(recovery, failed, interrupted):
+    """Report ``interrupted`` as the requests the loss interrupted on rank 1, which serves requests 11 and 12."""
+    recovery._executor.dist.allgather.side_effect = lambda value, departed: [
+        None if r in failed else ({11, 12}, 0, interrupted) if r == 1 else (set(), 0, set())
+        for r in range(WORLD_SIZE)
+    ]
+
+
+def test_a_request_two_losses_interrupt_fails_whatever_ranks_were_lost():
+    """A survivor's request runs on after a loss interrupts its step, but a second interruption fails it: it may
+    be what crashes the ranks. A request interrupted once runs on."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    executor = recovery._executor
+    executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    executor.dist.shrink.side_effect = lambda: next(shrinks)
+    recovery.requests_routed({1: [Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)]})
+    failures = []
+    executor.fail_requests = lambda request_ids, error_msg: failures.append(set(request_ids))
+    _sent_responses(recovery)
+
+    _interrupting(recovery, {FAILED_RANK}, {11})
+    recovery._recover(_interrupted())
+    assert failures == [set()] and recovery._interrupted == {11}
+
+    _interrupting(recovery, lost, {11, 12})
+    recovery._recover(_interrupted(lost))
+    assert failures[-1] == {11} and recovery._interrupted == {11, 12}
+    assert executor.request_accumulated == []
+
+
+def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
+    recovery = _recovery(_FakeClient([]), rank=1)
+    executor = recovery._executor
+    executor.dist.broadcast.side_effect = lambda value, root: (0, {11})
+    parent = Mock(is_child=False, py_request_id=11)
+    child = Mock(is_child=True, parent_request_id=11, py_request_id=21)
+    other = Mock(is_child=False, py_request_id=12)
+    executor.active_requests = [parent, child, other]
+    executor._handle_errors = Mock()
+    _sent_responses(recovery)
+
+    recovery._deliver_responses(frozenset({FAILED_RANK}), ([], []), set())
+
+    (call,) = executor._handle_errors.call_args_list
+    assert call.kwargs["requests"] == [parent, child] and not call.kwargs["charge_budget"]
+    assert "interrupted this request a second time" in call.args[0]
 
 
 def test_rank0_tracks_requests_that_delivered_a_response():
@@ -1441,7 +1500,7 @@ def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(ran_again
     client = _FakeClient(_happy_replies())
     recovery = _recovery(client, rank=0)
     if ran_again:
-        recovery._rerun.add(12)
+        recovery._interrupted.add(12)
     recovery._request_owners = {
         11: (FAILED_RANK, Mock(id=11, child_req_ids=None)),
         12: (FAILED_RANK, Mock(id=12, child_req_ids=None)),
@@ -1461,7 +1520,7 @@ def test_recovery_readmits_requests_that_never_reached_their_rank():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     torn, delivered = Mock(id=21, child_req_ids=None), Mock(id=22, child_req_ids=None)
     recovery._request_owners = {21: (3, torn), 22: (1, delivered)}
-    held = {1: ({22}, 0), 3: (set(), 0)}
+    held = {1: ({22}, 0, set()), 3: (set(), 0, set())}
     recovery._executor.dist.allgather.side_effect = lambda value, departed: [
         held.get(rank, value) for rank in range(WORLD_SIZE)
     ]
