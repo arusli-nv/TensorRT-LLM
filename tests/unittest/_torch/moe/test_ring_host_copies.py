@@ -531,6 +531,30 @@ def test_a_replan_keeps_off_the_copies_a_rank_lost_while_staging_was_given(monke
         _assert_staged_apart(unaware, row_bytes, late_copies)
 
 
+def test_a_replan_keeps_off_only_the_chunks_a_lost_rank_may_still_copy(monkeypatch):
+    load_balancer, _ = _ring_load_balancer(
+        monkeypatch, layers=2, placement=_GHOSTS_PLACEMENT, assignments=_GHOSTS_ASSIGNMENTS
+    )
+    row_bytes = 1024
+    first = load_balancer.restore_copy_plan(
+        [3], load_balancer.recovery_placements([3]), row_bytes, _no_writes
+    )
+    # Rank 2 copies into both halves of rank 1's row over chunks 0 to 2, then is lost.
+    assert sorted(set(first[first[:, 6] == 2][:, 0].tolist())) == [0, 1, 2]
+    placements = load_balancer.recovery_placements([2, 3])
+    with pytest.raises(ValueError, match=r"\[0, 0\] bytes per half"):
+        load_balancer.restore_copy_plan([2, 3], placements, row_bytes, _no_writes, [first])
+    # Only chunk 1's copies may still be in flight: the rest of the row stages the restore.
+    late = first[(first[:, 6] == 2) & (first[:, 0] == 1)].tolist()
+    plan = load_balancer.restore_copy_plan(
+        [2, 3], placements, row_bytes, _no_writes, [first], [(1, 1)]
+    )
+    _assert_pieces_load_every_weight(plan, 2 * 2 * 2)
+    _assert_staged_apart(
+        plan, row_bytes, lambda target: [(r[7], r[7] + r[9]) for r in late if r[2] == target]
+    )
+
+
 # DeepSeek-R1 at EP32 on eight nodes of four GPUs: 256 experts on 8 + 2 static EPLB slots per rank.
 _R1_EP, _R1_GPUS_PER_NODE, _R1_EXPERTS, _R1_SLOTS = 32, 4, 256, 10
 _R1_HOSTS = [f"node{rank // _R1_GPUS_PER_NODE}" for rank in range(_R1_EP)]

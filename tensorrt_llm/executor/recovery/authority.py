@@ -159,6 +159,10 @@ class RecoveryAuthority:
         self._failed_during_recovery: frozenset[int] = frozenset()
         # The failed ranks of each plan proposed in the current recovery, in order.
         self._proposed: list[tuple[int, ...]] = []
+        # Per plan proposed before the last: the first and last chunk its lost ranks' copies may still write.
+        self._in_flight: list[tuple[int, int]] = []
+        # Rank -> ring-restore staging barriers (entered, passed) it reported since the last Propose.
+        self._barriers: dict[int, tuple[int, int]] = {}
         self._ready: dict[int, str] = {}
         self._installed: set[int] = set()
         # Rank -> (route of its evidence connection, host, pid), from its heartbeats.
@@ -461,6 +465,8 @@ class RecoveryAuthority:
             self._stage_starts = [now]
             self._replans = 0
             self._proposed.clear()
+            self._in_flight.clear()
+            self._barriers.clear()
             self._stopped.clear()
             self._ready.clear()
             self._installed.clear()
@@ -468,13 +474,16 @@ class RecoveryAuthority:
         elif self.phase in (Phase.STOPPING, Phase.PREPARING) and failed > self.failed_ranks:
             self._replan(failed)
         elif self.phase is Phase.STOPPING and self._replans and failed < self.failed_ranks:
-            # Sent before its rank saw the further loss; the rank's next Stopped follows.
+            # Sent before its rank saw the further loss; the rank's next Stopped follows (and counts no barrier
+            # this one counted).
+            self._record_barriers(message)
             return []
         elif self.phase is not Phase.STOPPING:
             raise _Violation(f"{message} in phase {self.phase.name}")
         if failed != self.failed_ranks:
             raise _Violation(f"{message} conflicts with departed ranks {sorted(self.failed_ranks)}")
         self._record(self._stopped, message)
+        self._record_barriers(message)
         if len(self._stopped) < len(self.survivors):
             return []
         self._fencing = set(self.failed_ranks - self._fenced)
@@ -512,9 +521,28 @@ class RecoveryAuthority:
         self._stage_starts.append(now)
         self._enter(Phase.PREPARING)
         failed = tuple(sorted(self.failed_ranks))
-        proposal = Propose(self.generation + 1, failed, self.survivors, tuple(self._proposed))
+        if self._proposed:
+            # A lost rank copied a chunk only after every rank entered the barrier before it, and finished the
+            # copies of a chunk before entering its barrier.
+            entered, passed = zip(*(self._barriers.get(rank, (0, 0)) for rank in self.survivors))
+            self._in_flight.append((max(passed), min(entered)))
+        self._barriers.clear()
+        proposal = Propose(
+            self.generation + 1,
+            failed,
+            self.survivors,
+            tuple(self._proposed),
+            tuple(self._in_flight),
+        )
         self._proposed.append(failed)
         return self._to_survivors(proposal)
+
+    def _record_barriers(self, message: Stopped) -> None:
+        entered, passed = self._barriers.get(message.rank, (0, 0))
+        self._barriers[message.rank] = (
+            entered + message.barriers_entered,
+            passed + message.barriers_passed,
+        )
 
     def _admissible(self, failed: frozenset[int]) -> None:
         """Raise unless ``failed`` is a union of admitted domains; the survivors check that their slots cover it."""

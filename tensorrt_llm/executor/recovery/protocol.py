@@ -69,10 +69,16 @@ class Registered:
 
 @dataclass(frozen=True)
 class Stopped:
-    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) depart."""
+    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) depart.
+
+    ``barriers_entered`` and ``barriers_passed`` count the ring-restore staging barriers the worker entered and
+    passed since its previous ``Stopped``: for the plan proposed last, or none it staged.
+    """
 
     rank: int
     failed_ranks: tuple[int, ...]
+    barriers_entered: int = 0
+    barriers_passed: int = 0
 
 
 @dataclass(frozen=True)
@@ -103,12 +109,16 @@ class Propose:
 
     ``earlier_failed_ranks`` are the failed ranks of the plans proposed earlier in this recovery, in order:
     survivors may still be copying for them, and every survivor recomputes their plans to keep off those copies.
+    ``earlier_in_flight`` are, per earlier plan, the first and last chunk a lost rank's copies may still write:
+    a survivor passed the barriers of the chunks before, and none entered the barrier the chunk after waits on.
+    A plan without one may have copies of any chunk in flight.
     """
 
     generation: int
     failed_ranks: tuple[int, ...]
     survivors: tuple[int, ...]
     earlier_failed_ranks: tuple[tuple[int, ...], ...] = ()
+    earlier_in_flight: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)

@@ -5,6 +5,7 @@ import ctypes
 import errno
 import gc
 import hashlib
+import itertools
 import os
 import secrets
 import socket
@@ -12,7 +13,7 @@ import threading
 import time
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -1419,7 +1420,8 @@ class MoeLoadBalancer:
         placements: List[np.ndarray],
         workspace_bytes: int,
         write_ranges: Callable[[int], List[Tuple[int, int]]],
-        staged: Iterable[np.ndarray] = ()
+        staged: Iterable[np.ndarray] = (),
+        in_flight: Sequence[Tuple[int, int]] = ()
     ) -> np.ndarray:
         """Ring host copies: rows (chunk, layer, target, slot, expert, weight by sorted name, source, workspace
         offset, offset in the weight, bytes) that load the slots ``placements`` changes, in chunk order; the
@@ -1428,13 +1430,17 @@ class MoeLoadBalancer:
         Sources take turns over the live ranks of the expert's copy node. Per target, a chunk fills one of the
         ``staging_halves`` of its ``workspace_bytes`` row, alternating halves; a weight that does not fit
         continues in the next chunk. The halves leave out what ranks of ``dead_ranks`` may still write: their
-        all-to-alls' ``write_ranges`` and their rows of ``staged``, earlier plans whose copies may be in flight.
+        all-to-alls' ``write_ranges`` and their rows of ``staged``, earlier plans whose copies may be in flight:
+        per plan, those of the chunks ``in_flight`` gives (first, last), of any chunk for a plan beyond it.
         ValueError if a half has no room or ``placements`` loads a slot that still routes an expert.
         """
         dead = sorted(set(dead_ranks))
         writes = [r for rank in dead for r in write_ranges(rank)]
-        late = [(row[2], row[7], row[7] + row[9]) for plan in staged
-                for row in plan.tolist() if row[6] in dead]
+        bounds = itertools.chain(in_flight, itertools.repeat((0, float("inf"))))
+        late = [(row[2], row[7], row[7] + row[9])
+                for plan, (first, last) in zip(staged, bounds)
+                for row in plan.tolist()
+                if row[6] in dead and first <= row[0] <= last]
         halves: Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int,
                                                                   int]]]] = {}
         # Startup (no dead ranks) checks the room every rank's all-to-alls leave; each target's is checked below.

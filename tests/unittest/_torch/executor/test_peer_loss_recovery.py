@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 import torch
@@ -2237,9 +2237,12 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
     load_balancer.restore_copy_plan.return_value = plan
     workspace = engine.moe_execution_state.staging_workspace.return_value
     sent_before_staging = []
-    load_balancer.stage_restored_slots.side_effect = lambda *args: sent_before_staging.append(
-        list(client.sent)
-    )
+
+    def stage_restored_slots(copy_plan, staging_workspace, barrier):
+        sent_before_staging.append(list(client.sent))
+        barrier()
+
+    load_balancer.stage_restored_slots.side_effect = stage_restored_slots
 
     recovery._recover(_interrupted())
 
@@ -2250,11 +2253,13 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
         workspace.size.return_value,
         engine.moe_execution_state.staging_write_ranges,
         [],
+        (),
     )
     workspace.size.assert_called_with(1)
-    load_balancer.stage_restored_slots.assert_called_once_with(
-        plan, workspace, recovery._executor.dist.barrier_among_survivors
-    )
+    load_balancer.stage_restored_slots.assert_called_once_with(plan, workspace, ANY)
+    # The staging barriers are the survivors', counted for the next Stopped.
+    recovery._executor.dist.barrier_among_survivors.assert_called_once_with()
+    assert recovery._staging_barriers == [1, 1]
     assert sent_before_staging == [[Stopped(rank=1, failed_ranks=(FAILED_RANK,))]]
     load_balancer.placement_digest.assert_called_once_with(failed, ["placement"], plan)
 
@@ -2269,6 +2274,13 @@ def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
     with pytest.raises(RecoveryInterrupted):
         recovery._stage_ring_restore(load_balancer, failed, ["placement"], ())
+    # A barrier the loss interrupts counts as entered, not passed.
+    load_balancer.stage_restored_slots.side_effect = lambda plan, workspace, barrier: barrier()
+    recovery._executor.dist.barrier_among_survivors.side_effect = MPI.Exception(MPI.ERR_OTHER)
+    with pytest.raises(RecoveryInterrupted):
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"], ())
+    assert recovery._staging_barriers == [1, 0]
+    load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
         recovery._stage_ring_restore(load_balancer, failed, ["placement"], ())
@@ -2279,7 +2291,8 @@ def test_every_survivor_replans_off_the_plans_proposed_earlier_whether_it_staged
     staged_first_plan,
 ):
     """Rank 3 fails during the recovery without rank 2. A survivor that staged the first plan and one
-    interrupted before it got the plan both keep the next plan off the first plan's copies."""
+    interrupted before it got the plan both keep the next plan off the first plan's copies of the chunks the
+    authority says may be in flight, and report the staging barriers they entered and passed."""
     import numpy as np
 
     lost = (FAILED_RANK, 3)
@@ -2288,8 +2301,9 @@ def test_every_survivor_replans_off_the_plans_proposed_earlier_whether_it_staged
         replies = [first, _FURTHER_LOSS]
     else:
         replies = [_FURTHER_LOSS, first]
+    in_flight = ((1, 2),)
     client = _FakeClient(
-        [*replies, Propose(1, lost, (0, 1), ((FAILED_RANK,),)), Install(1), Commit(1)]
+        [*replies, Propose(1, lost, (0, 1), ((FAILED_RANK,),), in_flight), Install(1), Commit(1)]
     )
     recovery = _recovery(client, failed=frozenset(lost))
     shrinks = iter([frozenset({FAILED_RANK}), frozenset(lost)])
@@ -2299,20 +2313,35 @@ def test_every_survivor_replans_off_the_plans_proposed_earlier_whether_it_staged
     load_balancer.recovery_placements.side_effect = lambda dead, base=None: [sorted(dead)]
     plans = []
 
-    def restore_copy_plan(dead, placements, size, ranges, staged):
-        plans.append((sorted(dead), placements, [plan.tolist() for plan in staged]))
+    def restore_copy_plan(dead, placements, size, ranges, staged, staged_in_flight):
+        plans.append(
+            (sorted(dead), placements, [plan.tolist() for plan in staged], staged_in_flight)
+        )
         return np.full((1, 10), len(dead), dtype=np.int64)
 
     load_balancer.restore_copy_plan.side_effect = restore_copy_plan
+
+    def stage_restored_slots(copy_plan, workspace, barrier):
+        # The first plan (dead ranks: 1) stages two chunks.
+        for _ in range(3 - int(copy_plan[0, 0])):
+            barrier()
+
+    load_balancer.stage_restored_slots.side_effect = stage_restored_slots
 
     recovery._recover(_interrupted())
 
     first_plan = [[1] * 10]
     assert plans[-2:] == [
-        ([FAILED_RANK], [[FAILED_RANK]], []),
-        (list(lost), [list(lost)], [first_plan]),
+        ([FAILED_RANK], [[FAILED_RANK]], [], in_flight),
+        (list(lost), [list(lost)], [first_plan], in_flight),
     ]
     assert len(plans) == (3 if staged_first_plan else 2)
+    stopped = [message for message in client.sent if isinstance(message, Stopped)]
+    entered = passed = 2 if staged_first_plan else 0
+    assert stopped == [
+        Stopped(rank=1, failed_ranks=(FAILED_RANK,)),
+        Stopped(rank=1, failed_ranks=lost, barriers_entered=entered, barriers_passed=passed),
+    ]
 
 
 def test_create_checks_the_staging_workspace_fits_with_ring_host_copies(monkeypatch):

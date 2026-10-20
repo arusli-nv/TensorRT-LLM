@@ -386,7 +386,8 @@ def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
     assert authority.handle(_route(0), Ready(0, 1, "digest"), 1.0) == []
 
     lost = (FAILED, 3)
-    assert authority.handle(_route(0), Stopped(0, lost), 2.0) == []
+    # Rank 0 staged two chunks of the first plan and entered the barrier of the third.
+    assert authority.handle(_route(0), Stopped(0, lost, 3, 2), 2.0) == []
     assert authority.phase is Phase.STOPPING and authority.failed_ranks == frozenset(lost)
     # Every round shares the first round's deadline.
     assert authority.deadline == pytest.approx(11.0)
@@ -394,13 +395,15 @@ def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
     assert authority.handle(_route(3), Ready(3, 1, "digest"), 2.0) == []
     # Rank 1 sent these before it saw rank 3 fail; its Stopped for the new plan follows.
     assert authority.handle(_route(1), Ready(1, 1, "digest"), 2.0) == []
-    assert authority.handle(_route(1), Stopped(1, (FAILED,)), 2.0) == []
+    assert authority.handle(_route(1), Stopped(1, (FAILED,), 2, 1), 2.0) == []
     out = authority.handle(_route(1), Stopped(1, lost), 2.0)
     # Rank 2 was fenced in the first round; only rank 3 is asked for.
     assert out == [(_route(0), Fence(3, 0))]
     out = _fence_departed(authority, out, 2.0)
-    # Some survivors may have staged the first plan: every survivor recomputes it.
-    assert out == [(_route(rank), Propose(1, lost, (0, 1), ((FAILED,),))) for rank in (0, 1)]
+    # Some survivors may have staged the first plan: every survivor recomputes it. Rank 0 passed the barriers
+    # of chunks 0 and 1 and rank 1 entered none after chunk 1's: rank 3 may still copy chunk 2 only.
+    proposal = Propose(1, lost, (0, 1), ((FAILED,),), ((2, 2),))
+    assert out == [(_route(rank), proposal) for rank in (0, 1)]
     _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
     out = _report(authority, Installed, (0, 1), generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]

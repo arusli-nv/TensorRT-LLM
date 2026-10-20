@@ -315,6 +315,8 @@ class PeerLossRecovery(RecoveryHook):
         self._shrink_timeout_s = fault_tolerance_config().shrink_timeout_s()
         # KV cache bytes given to the ghost slots of the plan being prepared (returned if it is abandoned).
         self._kv_lent = 0
+        # Ring-restore staging barriers this rank entered and passed since its last Stopped.
+        self._staging_barriers = [0, 0]
         # The last committed membership generation, and whether rank 0 still logs a recovery's first step.
         self._generation = 0
         self._first_step_pending = False
@@ -934,6 +936,7 @@ class PeerLossRecovery(RecoveryHook):
         # Until Install, a further loss restarts the plan with every rank lost so far, off the bytes the plans
         # proposed so far had the lost ranks copy.
         replans = 0
+        self._staging_barriers = [0, 0]
         # What the authority sent while this rank served (a refusal) belongs to no recovery.
         client.discard_pending()
         while True:
@@ -951,7 +954,16 @@ class PeerLossRecovery(RecoveryHook):
             skip = stale if replans else None
 
             try:
-                client.send(Stopped(rank=rank, failed_ranks=failed_ranks))
+                entered, passed = self._staging_barriers
+                self._staging_barriers = [0, 0]
+                client.send(
+                    Stopped(
+                        rank=rank,
+                        failed_ranks=failed_ranks,
+                        barriers_entered=entered,
+                        barriers_passed=passed,
+                    )
+                )
                 self._log_phase("stopped", self._generation + 1)
                 # The authority's deadline starts no later than this Stopped arrives and is shorter, so a recovery
                 # it cannot complete reaches every survivor as Abort rather than as a timeout here.
@@ -977,7 +989,11 @@ class PeerLossRecovery(RecoveryHook):
                     None
                     if online
                     else self._stage_ring_restore(
-                        load_balancer, failed, placements, proposal.earlier_failed_ranks
+                        load_balancer,
+                        failed,
+                        placements,
+                        proposal.earlier_failed_ranks,
+                        proposal.earlier_in_flight,
                     )
                 )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
@@ -1292,13 +1308,15 @@ class PeerLossRecovery(RecoveryHook):
         failed: frozenset,
         placements: List[np.ndarray],
         earlier_failed: Sequence[Sequence[int]],
+        earlier_in_flight: Sequence[Tuple[int, int]] = (),
     ) -> np.ndarray:
         """Copy the experts ``placements`` restores from the ring host copies into their slots; return the copy plan.
 
         After Propose the failed ranks are fenced and no all-to-all runs until the install rearms the workspaces;
-        the plan keeps off the bytes their all-to-alls may still write, and their copies of the plans proposed
-        earlier in this recovery (without ``earlier_failed``). A survivor need not have run those plans, so each
-        recomputes them from the same inputs.
+        the plan keeps off the bytes their all-to-alls may still write, and their copies of the chunks
+        ``earlier_in_flight`` of the plans proposed earlier in this recovery (without ``earlier_failed``). A
+        survivor need not have run those plans, so each recomputes them from the same inputs. The staging
+        barriers this rank enters and passes count in ``_staging_barriers``.
         """
         start = time.monotonic()
         state = self._executor.model_engine.moe_execution_state
@@ -1312,16 +1330,26 @@ class PeerLossRecovery(RecoveryHook):
                     workspace.size(1),
                     state.staging_write_ranges,
                     staged,
+                    earlier_in_flight,
                 )
             )
         copy_plan = load_balancer.restore_copy_plan(
-            failed, placements, workspace.size(1), state.staging_write_ranges, staged
+            failed,
+            placements,
+            workspace.size(1),
+            state.staging_write_ranges,
+            staged,
+            earlier_in_flight,
         )
+
+        def barrier() -> None:
+            self._staging_barriers[0] += 1
+            self._executor.dist.barrier_among_survivors()
+            self._staging_barriers[1] += 1
+
         self._among_survivors(
             "restored experts were copied",
-            lambda: load_balancer.stage_restored_slots(
-                copy_plan, workspace, self._executor.dist.barrier_among_survivors
-            ),
+            lambda: load_balancer.stage_restored_slots(copy_plan, workspace, barrier),
         )
         logger.info(
             f"Staged {len(copy_plan)} expert weight pieces in {(time.monotonic() - start) * 1e3:.1f} ms"
