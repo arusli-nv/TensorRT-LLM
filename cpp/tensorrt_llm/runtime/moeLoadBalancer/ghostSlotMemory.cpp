@@ -30,6 +30,7 @@
 #include <exception>
 #include <iterator>
 #include <utility>
+#include <vector>
 
 namespace tensorrt_llm::runtime
 {
@@ -308,19 +309,23 @@ GhostSlotMemory& GhostSlotMemory::getInstance()
 bool GhostSlotMemory::hostAccessibleSupported()
 {
     // Tried once per process (one device): one chunk is mapped for the host as allocate() would map each of its
-    // allocations, on the GPU's NUMA node or else through GDRCopy. A failure leaves ghost slot memory in device memory.
+    // allocations, on the GPU's NUMA node or else through GDRCopy, and the host writes a pattern into it that the GPU
+    // reads back. A failure leaves ghost slot memory in device memory.
     static bool const supported = []
     {
-        if (!HostAccessibleDeviceAllocator::isSupportedWithoutManagedFallback())
-        {
-            return false;
-        }
-        int const numaId = HostAccessibleDeviceAllocator::gpuMemoryNumaId();
         auto& allocator = HostAccessibleDeviceAllocator::getInstance();
-        allocator.IncRefCount();
-        bool mapped = true;
+        int numaId = -1;
+        bool referenced = false;
+        bool mapped = false;
         try
         {
+            if (!HostAccessibleDeviceAllocator::isSupportedWithoutManagedFallback())
+            {
+                return false;
+            }
+            numaId = HostAccessibleDeviceAllocator::gpuMemoryNumaId();
+            allocator.IncRefCount();
+            referenced = true;
             int device = -1;
             TLLM_CUDA_CHECK(cudaGetDevice(&device));
             if (numaId < 0)
@@ -345,14 +350,27 @@ bool GhostSlotMemory::hostAccessibleSupported()
             configurators.push_back(std::make_unique<HostAccessConfigurator>(address, size));
             CUDAVirtualMemoryChunk chunk(std::make_unique<LocalCreator<false>>(prop, size), std::move(configurators));
             chunk.materialize(); // released by its destructor
+            std::vector<uint8_t> written(std::min<size_t>(size, 4096));
+            for (size_t i = 0; i < written.size(); ++i)
+            {
+                written[i] = static_cast<uint8_t>(i * 131 + 7);
+            }
+            std::vector<uint8_t> read(written.size());
+            allocator.memcpyToDeviceAddress(reinterpret_cast<void*>(address), written.data(), written.size());
+            TLLM_CUDA_CHECK(
+                cudaMemcpy(read.data(), reinterpret_cast<void*>(address), read.size(), cudaMemcpyDeviceToHost));
+            TLLM_CHECK_WITH_INFO(read == written, "the GPU does not read back what the host wrote");
+            mapped = true;
         }
         catch (std::exception const& error)
         {
             TLLM_LOG_WARNING("Ghost slot memory stays in device memory: it cannot be mapped for the host (%s): %s",
                 numaId >= 0 ? "on the GPU's NUMA node" : "through GDRCopy", error.what());
-            mapped = false;
         }
-        allocator.DecRefCount();
+        if (referenced)
+        {
+            allocator.DecRefCount();
+        }
         return mapped;
     }();
     return supported;
