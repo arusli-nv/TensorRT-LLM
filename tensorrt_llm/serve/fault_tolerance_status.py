@@ -49,7 +49,11 @@ def health_state(status: Optional[Status]) -> str:
 
 
 def status_body(status: Optional[Status]) -> dict:
-    """JSON body of ``/health``: the state, and the authority's details when it answered."""
+    """JSON body of ``/health``: the state, and the authority's details when it answered.
+
+    The endpoint is unauthenticated, so an abort reason, which names ranks, pids and hosts, stays in the
+    authority's log.
+    """
     body = {"state": health_state(status)}
     if status is not None:
         body.update(
@@ -62,8 +66,6 @@ def status_body(status: Optional[Status]) -> dict:
             },
             failed_requests=status.failed_requests,
         )
-        if status.abort_reason:
-            body["abort_reason"] = status.abort_reason
     return body
 
 

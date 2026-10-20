@@ -172,7 +172,7 @@ whose heartbeat arrives waits on it (its device waits on that rank, or it waits 
 does not or sends no heartbeat) and the rank finished no step; any finished step restarts the window. A rank
 whose own device waits on another rank is not blamed. When no rank finished a step and every rank's device
 waited on a peer for `hang_confirm_s`, with no single rank waited on by all, no fence can help: the
-authority reports the deployment terminal (`/health` 503 `terminal`, with the reason) and
+authority reports the deployment terminal (`/health` 503 `terminal`; the reason is in its log) and
 every worker exits with code 75 so that the orchestrator restarts it. An idle deployment, or one whose ranks
 all stall on the host between steps, reports no device waits and matches neither rule. Nothing is decided
 while fewer than half the ranks' heartbeats arrive.
@@ -261,8 +261,8 @@ answer, so a loss would end the job: alert, but keep serving). It returns 503 wi
 state this server does not know, for example from a different version). The JSON body always has `state`. While
 the authority answers it also has `generation` (the membership generation), `live_ranks` and `failed_ranks`
 (sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `agree` and `install` durations),
-`failed_requests` (requests the losses failed) and, once terminal, `abort_reason`. An `unprotected` body has only
-`state`. If the engine itself failed, `/health` returns 503 as without fault tolerance.
+`failed_requests` (requests the losses failed). The reason a recovery aborted is only in the authority's log:
+`/health` is not authenticated. An `unprotected` body has only `state`. If the engine itself failed, `/health` returns 503 as without fault tolerance.
 
 What an orchestrator should do with these signals:
 - `degraded`: the deployment serves with fewer GPUs and survives a further loss only while its remaining slots

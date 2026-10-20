@@ -1071,6 +1071,10 @@ def test_status_body_reports_live_ranks_stages_and_failed_requests():
         "failed_requests": 256,
     }
     assert status_body(None) == {"state": "unprotected"}
+    aborted = Status("ABORTED", 1, (0, 1), NODE, 1, (), 0, "rank 2 (pid 7 on node-a) is hung")
+    assert status_body(aborted)["state"] == "terminal" and "abort_reason" not in status_body(
+        aborted
+    )
 
 
 @pytest.mark.parametrize("mode,body", [("1", b'{"state":"unprotected"}'), (None, b"")])
