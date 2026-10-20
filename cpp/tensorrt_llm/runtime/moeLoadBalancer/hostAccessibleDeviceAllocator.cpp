@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <iterator>
 #include <numaif.h>
 #include <sys/mman.h>
 
@@ -357,10 +358,15 @@ void HostAccessibleDeviceAllocator::memcpyToDeviceAddress(void* devPtr, void con
     auto const* from = static_cast<char const*>(src);
     while (size > 0)
     {
-        auto const info = getAllocationInfoFromDevPtr(dst);
+        // Held across the copy, so that unregisterHostAccessible() cannot unpin the record while it is written.
+        std::shared_lock<std::shared_mutex> lock(mAllocationsMutex);
+        auto const it = mDeviceAllocations.upper_bound(dst);
+        TLLM_CHECK_WITH_INFO(
+            it != mDeviceAllocations.begin(), "%p is not host accessible device memory", static_cast<void*>(dst));
+        auto const& info = std::prev(it)->second;
         auto const* recordStart = static_cast<char const*>(info.devPtr);
-        TLLM_CHECK_WITH_INFO(info.devPtr != nullptr && dst < recordStart + info.size,
-            "%p is not host accessible device memory", static_cast<void*>(dst));
+        TLLM_CHECK_WITH_INFO(
+            dst < recordStart + info.size, "%p is not host accessible device memory", static_cast<void*>(dst));
         size_t const offset = dst - recordStart;
         size_t const bytes = std::min(size, info.size - offset);
         void* hostDst = static_cast<char*>(info.hostPtr) + offset;
