@@ -5,6 +5,7 @@
 import os
 import signal
 import socket
+import threading
 import time
 
 import pytest
@@ -147,11 +148,33 @@ def test_a_restart_ends_the_process_with_the_stalled_exit_code(monkeypatch):
 def test_the_first_heartbeat_is_sent_before_the_rank_serves():
     """A rank stopped right after it starts serving must already be known to the authority."""
     r = _Reporter([], heartbeat_s=60.0)
+    senders = []
+    r.reporter._send = lambda message: (
+        senders.append(threading.current_thread()),
+        r.sent.append(message),
+    )
     r.reporter.start()
     try:
         assert r.sent == [Heartbeat(0, 42, False, r.reporter._host, os.getpid())]
+        # The connection is used from the reporter thread only.
+        assert senders == [r.reporter._thread]
     finally:
-        r.reporter.stop()
+        assert r.reporter.stop()
+
+
+def test_stop_gives_up_on_a_blocked_reporter_thread(monkeypatch):
+    monkeypatch.setattr(hang_evidence, "_STOP_TIMEOUT_S", 0.05)
+    release = threading.Event()
+    r = _Reporter([], heartbeat_s=0.01)
+    r.reporter._read_row = lambda: release.wait(30) and None
+    r.reporter.start()
+    time.sleep(0.05)
+    try:
+        assert not r.reporter.stop()
+    finally:
+        release.set()
+    r.reporter._thread.join(5)
+    assert not r.reporter._thread.is_alive()
 
 
 def test_the_native_heartbeat_keeps_arriving_while_python_is_starved():

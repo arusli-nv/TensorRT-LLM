@@ -55,6 +55,8 @@ __all__ = [
 ]
 
 _FLAG_MASK = 0xFFFFFFFF
+# How long stop() waits for the reporter thread, which may be blocked in a device or socket call.
+_STOP_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -214,15 +216,27 @@ class HangEvidenceReporter:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """Send the first heartbeat, so that the authority watches this rank before it serves, then report."""
-        self._heartbeat()
-        self._thread = threading.Thread(target=self._run, name="hang_evidence", daemon=True)
+        """Start reporting; returns once the first heartbeat is sent, so that the authority watches this rank
+        before it serves. Every message goes out from the reporter thread."""
+        sent = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, args=(sent,), name="hang_evidence", daemon=True
+        )
         self._thread.start()
+        sent.wait()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Stop reporting; returns whether the reporter thread ended within ``_STOP_TIMEOUT_S``."""
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join()
+        if self._thread is None:
+            return True
+        self._thread.join(_STOP_TIMEOUT_S)
+        if self._thread.is_alive():
+            logger.warning(
+                f"Rank {self._rank}: the hang evidence reporter did not stop within {_STOP_TIMEOUT_S}s"
+            )
+            return False
+        return True
 
     def _obey(self, now: float) -> None:
         while (message := self._receive()) is not None:
@@ -274,7 +288,13 @@ class HangEvidenceReporter:
             # The rank may have ended itself already; else the authority's fence command remains.
             logger.warning(f"Rank {self._rank}: runtime fence of rank {rank} failed: {error}")
 
-    def _run(self) -> None:
+    def _run(self, sent: threading.Event) -> None:
+        try:
+            self._heartbeat()
+        except Exception as error:  # noqa: BLE001 - evidence is best effort; never kill the worker
+            logger.warning(f"Rank {self._rank}: hang evidence reporting failed: {error}")
+        finally:
+            sent.set()
         while not self._stop.wait(self._heartbeat_s):
             try:
                 self.poll(time.monotonic())

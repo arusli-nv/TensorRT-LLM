@@ -554,8 +554,8 @@ class PeerLossRecovery(RecoveryHook):
                         self._recover(error)
                         self.survives_own_loss = self._own_loss_covered()
         finally:
-            if reporter is not None:
-                reporter.stop()
+            # A reporter thread that did not stop may still use its connection.
+            if reporter is not None and reporter.stop():
                 self._hang_client.close()
             if self._heartbeat is not None:
                 self._heartbeat.stop()
