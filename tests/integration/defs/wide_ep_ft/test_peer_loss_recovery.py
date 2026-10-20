@@ -408,13 +408,14 @@ def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
 def test_restore_into_appended_empty_slots(tmp_path: Path):
-    """Online EPLB's default extra slots are empty ones, held from startup and filled by a restore.
+    """Online EPLB's empty extra slots (the default where GDRCopy cannot map ghost slot memory) are held from
+    startup and filled by a restore.
 
     Each rank gets 4 after its 20 EPLB slots, holding memory from startup, and the restore after rank 2 dies in
     decode loads them without mapping any.
     """
     result, output, authority_text = _run_driver(
-        tmp_path, "inflight", [VICTIM], "--online-slots", "80"
+        tmp_path, "inflight", [VICTIM], "--online-slots", "80", ft_config=dict(extra_slots="empty")
     )
     before_kill = output.partition(KILL_MARKER)[0]
     assert (
