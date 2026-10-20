@@ -184,8 +184,8 @@ def _stop_authority(authority: subprocess.Popen) -> None:
         authority.kill()
 
 
-def _wait_for_teardown(mpirun: subprocess.Popen, result_path: Path) -> None:
-    """Wait until mpirun exits; any exit status counts, since a degraded world ends in Abort."""
+def _wait_for_teardown(mpirun: subprocess.Popen, result_path: Path) -> int:
+    """Wait until mpirun exits and return its exit status."""
     deadline = time.monotonic() + SERVE_TIMEOUT_S
     while mpirun.poll() is None and not result_path.exists() and time.monotonic() < deadline:
         time.sleep(5)
@@ -198,6 +198,7 @@ def _wait_for_teardown(mpirun: subprocess.Popen, result_path: Path) -> None:
             "mpirun did not exit within the bound"
             + (" after the driver finished" if result_path.exists() else "")
         )
+    return mpirun.returncode
 
 
 def _run_driver(
@@ -240,7 +241,7 @@ def _run_driver(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            _wait_for_teardown(mpirun, result_path)
+            returncode = _wait_for_teardown(mpirun, result_path)
         finally:
             _stop_authority(authority)
 
@@ -248,6 +249,8 @@ def _run_driver(
     assert result_path.exists(), f"The driver wrote no result:\n{output[-20000:]}"
     result = json.loads(result_path.read_text())
     assert "after_loss" in result, f"The driver did not finish serving:\n{output[-20000:]}"
+    # The survivors of a recovered world finalize MPI on shutdown and exit 0.
+    assert returncode == 0, f"mpirun exited with {returncode}:\n{output[-20000:]}"
     return result, output, authority_log.read_text()
 
 
@@ -265,11 +268,21 @@ def _assert_recovered(
     Returns the mpirun log from the first fault on.
     """
     _assert_answered(result["healthy"])
+    healthy_ids = {row["rank"]: row["token_ids"] for row in result["healthy"]}
     if mode == "inflight":
         # The lost ranks' requests streamed nothing, so the survivors ran them again from their prompts.
         _assert_answered(result["during_loss"])
+        # A survivor's request decoded its first tokens before the loss, alone on its rank as in
+        # the healthy round: the same greedy tokens.
+        for row in result["during_loss"]:
+            if row["rank"] not in lost:
+                assert row["token_ids"][:SHORT_MAX_TOKENS] == healthy_ids[row["rank"]], row
         assert f"Running {len(lost)} requests of the lost ranks again" in output, output[-20000:]
     _assert_answered(result["after_loss"])
+    # Replicas and restored slots hold the lost experts' exact weights, and every survivor again decodes
+    # its prompt alone: the same greedy tokens as in the healthy round.
+    for row in result["after_loss"]:
+        assert row["token_ids"] == healthy_ids[row["rank"]], (row, healthy_ids[row["rank"]])
 
     before_kill, kill_marker, after_kill = output.partition(KILL_MARKER)
     assert kill_marker, "The driver did not fault a victim"
@@ -391,10 +404,11 @@ def _complete(base_url: str, model: Path, prompt: str) -> str:
         return json.loads(response.read())["choices"][0]["text"]
 
 
-def _assert_completions(base_url: str, model: Path) -> None:
-    for prompt, expected in PROMPTS.values():
-        text = _complete(base_url, model, prompt)
+def _assert_completions(base_url: str, model: Path) -> list[str]:
+    texts = [_complete(base_url, model, prompt) for prompt, _ in PROMPTS.values()]
+    for (prompt, expected), text in zip(PROMPTS.values(), texts):
         assert expected in text, (prompt, text)
+    return texts
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
@@ -452,7 +466,7 @@ def test_authority_lost_while_serving(tmp_path: Path):
                 time.sleep(5)
             # The authority's details ride on /health while it answers.
             assert health[1]["recoveries"] == 0 and health[1]["failed_ranks"] == [], health
-            _assert_completions(base_url, model)
+            healthy_texts = _assert_completions(base_url, model)
 
             authority.kill()
             authority.wait()
@@ -462,7 +476,8 @@ def test_authority_lost_while_serving(tmp_path: Path):
                 time.sleep(1)
             # No details without an answer: nothing stale is reported.
             assert health == (200, {"state": "unprotected"}), health
-            _assert_completions(base_url, model)
+            # No rank was lost: the same greedy completions as before.
+            assert _assert_completions(base_url, model) == healthy_texts
         finally:
             if mpirun is not None and mpirun.poll() is None:
                 os.killpg(mpirun.pid, signal.SIGTERM)

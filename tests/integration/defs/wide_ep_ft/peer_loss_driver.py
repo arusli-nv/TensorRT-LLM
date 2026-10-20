@@ -141,7 +141,8 @@ def collect(pending: list) -> list[dict]:
         prompt, expected = PROMPTS[rank]
         row = dict(rank=rank, prompt=prompt, expected=expected)
         try:
-            row["text"] = request.result(timeout=RESULT_TIMEOUT_S).outputs[0].text
+            output = request.result(timeout=RESULT_TIMEOUT_S).outputs[0]
+            row["text"], row["token_ids"] = output.text, list(output.token_ids)
         except RequestError as error:
             row["error"] = str(error)
         rows.append(row)
