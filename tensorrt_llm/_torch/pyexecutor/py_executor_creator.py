@@ -56,6 +56,7 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .peer_loss_recovery import watch_startup_peer_failures
 from .py_executor import PyExecutor
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -669,6 +670,7 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
+    watch_startup_peer_failures(dist)
 
     vm_pools = {}
     sleep_config = llm_args.sleep_config

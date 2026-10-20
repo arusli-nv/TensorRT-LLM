@@ -30,7 +30,12 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.logger import logger
 
-from ..distributed.communicator import HostCollectiveInterrupted, MPIDist, PeerFailureWatch
+from ..distributed.communicator import (
+    Distributed,
+    HostCollectiveInterrupted,
+    MPIDist,
+    PeerFailureWatch,
+)
 from .error_classification import classify_error
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .llm_request import (
@@ -124,6 +129,42 @@ def _register(
         f"waiting up to {_REGISTRATION_TIMEOUT_S:.0f} s for every rank"
     )
     return client, client.register(recoverable_domains, time.monotonic() + _REGISTRATION_TIMEOUT_S)
+
+
+# Ends the job on a peer failure until a serving loop watches peers.
+_startup_watch: Optional[PeerFailureWatch] = None
+
+
+def watch_startup_peer_failures(dist: Distributed) -> None:
+    """End the job on a peer failure from now until a serving loop watches peers.
+
+    Under ULFM the MPI runtime no longer ends the job when a process dies, and no loss before
+    serving (model loading, warmup, CUDA graph capture, KV cache estimation) is recovered: without
+    this, the survivors would wait out their timeouts. Collective over the world; does nothing
+    when peer-loss recovery is off.
+
+    Raises:
+        ValueError, RuntimeError: See :meth:`MPIDist.enable_peer_loss_recovery`.
+    """
+    global _startup_watch
+    if _startup_watch is None and peer_loss_recovery_enabled() and isinstance(dist, MPIDist):
+        # Checks ULFM and MPI_THREAD_MULTIPLE, which the watch thread needs.
+        dist.enable_peer_loss_recovery()
+        _startup_watch = dist.watch_peer_failures(_end_job_before_serving)
+
+
+def _end_job_before_serving() -> None:
+    from .hang_detector import propagate_hard_kill
+
+    logger.error("A peer failed before serving started: ending the job")
+    propagate_hard_kill()
+
+
+def _stop_startup_watch() -> None:
+    global _startup_watch
+    if _startup_watch is not None:
+        _startup_watch.stop()
+        _startup_watch = None
 
 
 class ResponseContribution(list):
@@ -451,13 +492,15 @@ class PeerLossRecovery(RecoveryHook):
     def run(self, event_loop: Callable[[], None]) -> None:
         """Run ``event_loop``, recovering from each peer loss it raises.
 
-        Peers are watched only while a serving loop runs; a loss during KV
-        cache estimation, which gathers responses on every rank, is terminal.
+        Peers are watched for recovery only while a serving loop runs; a loss
+        before (for example during KV cache estimation, which gathers responses
+        on every rank) ends the job (see :func:`watch_startup_peer_failures`).
         """
         if self._executor.gather_all_responses:
             event_loop()
             return
         self._watch_peer_failures()
+        _stop_startup_watch()
         self.survives_own_loss = self._admitted
         reporter = None
         try:

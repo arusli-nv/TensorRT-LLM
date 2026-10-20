@@ -1083,6 +1083,37 @@ def test_a_failure_seen_only_by_the_watch_counts():
     assert recovery.peer_failed
 
 
+def test_a_peer_failure_before_serving_ends_the_job(monkeypatch):
+    """Nothing recovers a loss during startup, and under ULFM the runtime no longer ends the job."""
+    from tensorrt_llm._torch.pyexecutor import hang_detector
+
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(peer_loss_recovery, "_startup_watch", None)
+    kills = []
+    monkeypatch.setattr(hang_detector, "propagate_hard_kill", lambda: kills.append("kill"))
+    dist = Mock(spec=MPIDist)
+    peer_loss_recovery.watch_startup_peer_failures(dist)
+    # Once per process: the final executor's creation does not watch again.
+    peer_loss_recovery.watch_startup_peer_failures(dist)
+    dist.enable_peer_loss_recovery.assert_called_once_with()
+    ((on_failure,), _) = dist.watch_peer_failures.call_args
+    assert dist.watch_peer_failures.call_count == 1 and kills == []
+    on_failure()
+    assert kills == ["kill"]
+
+
+def test_serving_takes_over_from_the_startup_watch(monkeypatch):
+    startup = Mock()
+    monkeypatch.setattr(peer_loss_recovery, "_startup_watch", startup)
+    recovery = _recovery(_FakeClient([]))
+    recovery._executor.dist.watch_peer_failures.side_effect = (
+        lambda callback, abort_word: startup.stop.assert_not_called() or Mock(failed=False)
+    )
+    recovery.run(Mock())
+    startup.stop.assert_called_once_with()
+    assert peer_loss_recovery._startup_watch is None
+
+
 def test_discard_returns_step_resources_and_padding_request():
     executor = _executor()
     executor.kv_cache_manager = Mock()
