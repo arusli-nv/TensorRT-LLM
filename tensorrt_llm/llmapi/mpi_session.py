@@ -118,7 +118,8 @@ _FINALIZE_GRACE_S = 30.0
 
 def _mpi_finalize() -> int:
     """MPI_Finalize through ctypes, which releases the GIL while it runs (mpi4py's call holds it), so that
-    the timer thread of ``_finalize_and_exit`` can run. Returns the MPI error code."""
+    the timer thread of ``_finalize_and_exit`` can run. Returns the MPI error code.
+    """
     return ctypes.CDLL(mpi4py.MPI.__file__).MPI_Finalize()
 
 
@@ -156,7 +157,9 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
     faulthandler.dump_traceback_later(2 * _FINALIZE_GRACE_S, exit=True)
     error = _mpi_finalize()
     if error:
-        print(f"MPI_Finalize failed: MPI error {error}", file=sys.stderr, flush=True)
+        print(f"MPI_Finalize failed: MPI error {error}",
+              file=sys.stderr,
+              flush=True)
         status = status or 1
     faulthandler.cancel_dump_traceback_later()
     watchdog.cancel()
