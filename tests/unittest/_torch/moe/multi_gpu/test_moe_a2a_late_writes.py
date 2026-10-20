@@ -6,7 +6,8 @@ Two processes share a real MNNVL MoE All-to-All workspace under bound (fixed sou
 slot) execution. The victim, rank 1, keeps pushing capacity-sized
 dispatches into the survivor's workspace and is SIGKILLed while they are in flight.
 The survivor, rank 0, then checks that every byte rank 1 does not own still holds
-its sentinel, and that, with rank 1 masked and the workspace rearmed, its captured
+its sentinel. A dispatch it then issues waits on the dead rank 1 until its MoeExecutionState
+aborts it; after the state rearms and installs a membership without rank 1, its captured
 dispatch/combine graph returns exact results and nothing from rank 1.
 """
 
@@ -25,7 +26,9 @@ from torch.distributed import TCPStore
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
@@ -114,6 +117,27 @@ def _dispatch(workspace, meta, rank, experts, payload, mask, abort, valid_counts
     )
 
 
+def _bound_state(
+    memory: MnnvlMemory, workspace: torch.Tensor, meta: torch.Tensor
+) -> MoeExecutionState:
+    """The survivor's MoeExecutionState, bound by an NVLinkOneSided layer on ``workspace`` as a model binds it.
+
+    The layer carries only the fields binding and the workspace reset read; no MoE layer is built.
+    """
+    health = EPGroupHealth(_EP_SIZE)
+    state = MoeExecutionState(health, workspace.device)
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm.can_use_cft_counted_writes = False
+    comm.ep_group_health = health
+    comm._rank_mask_enabled = True
+    comm._execution_state = None
+    comm._dispatch_state = {"phase": "idle"}
+    comm.mnnvl_mem, comm.workspace, comm.moe_a2a_metainfo = memory, workspace, meta
+    comm.ep_rank, comm.ep_size = _SURVIVOR, _EP_SIZE
+    comm.bind_execution_state(state)
+    return state
+
+
 def _victim(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> None:
     # A pending abort request lets every dispatch push all its rows and then return instead of
     # waiting for the silent survivor, so new NVLink writes are always in flight.
@@ -130,9 +154,12 @@ def _victim(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> Non
             store.set("running", "1")
 
 
-def _survivor(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> None:
+def _survivor(
+    store: TCPStore, memory: MnnvlMemory, workspace: torch.Tensor, meta: torch.Tensor
+) -> None:
     row = workspace[_SURVIVOR]
-    mask, abort = _records(requested=0)
+    state = _bound_state(memory, workspace, meta)
+    mask, abort = state.active_rank_mask, state.abort
     experts = torch.zeros((_CAPACITY, 1), dtype=torch.int32, device="cuda")
     payload = torch.empty((_CAPACITY, _HIDDEN), dtype=torch.bfloat16, device="cuda")
 
@@ -170,10 +197,27 @@ def _survivor(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> N
         staged[start:end] = False
     assert not bool((~live & staged).any()), "source_write_ranges misses storage the victim owns"
 
-    # Exclude the victim and rearm as MoeExecutionState.rearm does for NVLinkOneSided.
-    mask[0] = 1 << _SURVIVOR
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, _SURVIVOR, _EP_SIZE, barrier=False)
-    abort.zero_()
+    # The next dispatch waits for the dead victim's flags (they ran past its round) until recovery aborts it.
+    done = torch.cuda.Event()
+    _dispatch(
+        workspace, meta, _SURVIVOR, experts, payload, mask, abort, torch.zeros_like(valid_counts)
+    )
+    done.record()
+    time.sleep(0.2)
+    assert not done.query(), "dispatch completed without the dead victim"
+    state.request_abort()
+    deadline = time.monotonic() + 10
+    while not done.query():
+        assert time.monotonic() < deadline, "dispatch kept waiting after the abort request"
+        time.sleep(0.01)
+    assert abort.tolist() == [1, 1]
+
+    state.health.mark_failed(_VICTIM)
+    with pytest.raises(RuntimeError, match="abort record"):
+        state.install_mask()
+    state.rearm()
+    state.install_mask()
+    assert mask.cpu().tolist() == [1 << _SURVIVOR, 0, 0, 0]
     values = torch.arange(_CAPACITY * _HIDDEN, device="cuda").view(_CAPACITY, _HIDDEN) % 128
     for step in range(4):
         payload.copy_(values + step)
@@ -188,6 +232,7 @@ def _survivor(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> N
     for name, (start, end) in owned.items():
         if not name.startswith("recv_counter"):
             assert torch.count_nonzero(row[start:end]) == 0, f"late write into {name}"
+    state.close()
 
 
 def _worker(rank: int, port: int) -> None:
@@ -206,7 +251,10 @@ def _worker(rank: int, port: int) -> None:
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, _EP_SIZE, barrier=False)
     # No peer may write into a row before its owner has initialized it.
     comm.barrier()
-    (_survivor if rank == _SURVIVOR else _victim)(store, workspace, meta)
+    if rank == _SURVIVOR:
+        _survivor(store, memory, workspace, meta)
+    else:
+        _victim(store, workspace, meta)
 
 
 def _mnnvl_skip_reason() -> str | None:
