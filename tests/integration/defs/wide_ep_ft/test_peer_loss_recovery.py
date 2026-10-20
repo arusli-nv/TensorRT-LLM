@@ -410,8 +410,8 @@ def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
 def test_restore_into_appended_empty_slots(tmp_path: Path):
     """Online EPLB's empty extra slots are held from startup and filled by a restore.
 
-    They are the default where GDRCopy cannot map ghost slot memory. Each rank gets 4 after its 20 EPLB slots, holding memory from startup, and the restore after rank 2 dies in
-    decode loads them without mapping any.
+    They are the default where GDRCopy cannot map ghost slot memory. Each rank gets 4 after its 20 EPLB slots,
+    holding memory from startup, and the restore after rank 2 dies in decode loads them without mapping any.
     """
     result, output, authority_text = _run_driver(
         tmp_path, "inflight", [VICTIM], "--online-slots", "80", ft_config=dict(extra_slots="empty")
