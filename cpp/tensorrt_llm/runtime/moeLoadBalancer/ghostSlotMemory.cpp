@@ -120,8 +120,8 @@ AccessDescs slotMemoryAccess(int device, int numaId)
     }
     if (numaId >= 0)
     {
-        access.back().location.type = CU_MEM_LOCATION_TYPE_HOST;
-        access.back().location.id = 0;
+        access.back().location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA; // the host's access to HOST_NUMA memory
+        access.back().location.id = numaId;
     }
     return access;
 }
