@@ -1370,7 +1370,7 @@ class MoeLoadBalancer:
             for _, i, target, slot, _, weight, _, offset, size in rows:
                 if target == self.ep_rank:
                     dst = layers[i].weight_slots[(slot, names[i][weight])]
-                    dst.reshape(-1).view(torch.uint8).copy_(
+                    dst.view(-1).view(torch.uint8).copy_(
                         workspace[target, offset:offset + size])
         stream.synchronize()
 
