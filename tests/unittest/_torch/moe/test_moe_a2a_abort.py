@@ -7,6 +7,7 @@ peer in one allocation and only rank 0 issues ops, so they check the native layo
 masking and polling, not peer transport.
 """
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -539,6 +540,13 @@ def test_schema_and_fake_signatures() -> None:
             assert output.shape == (_CAPACITY, _HIDDEN) and output.dtype == torch.bfloat16
 
 
+def _exit_trapped(message: str) -> None:
+    """Print ``message`` and exit at once, flushing the device printf C stdio holds on a pipe."""
+    print(message, flush=True)
+    ctypes.CDLL(None).fflush(None)
+    os._exit(0)
+
+
 def _fence_timeout() -> None:
     """Does a fence wait on a silent peer still fail stop at the timeout?"""
     torch.ops.trtllm.moe_a2a_set_timeout(1)
@@ -548,8 +556,7 @@ def _fence_timeout() -> None:
     try:
         torch.cuda.synchronize()
     except RuntimeError:
-        print("fence timeout trapped", flush=True)
-        os._exit(0)
+        _exit_trapped("fence timeout trapped")
     raise AssertionError("dispatch completed without its peer")
 
 
@@ -562,8 +569,7 @@ def _corrupt_count(count: int) -> None:
     try:
         torch.cuda.synchronize()
     except RuntimeError:
-        print("corrupt count trapped", flush=True)
-        os._exit(0)
+        _exit_trapped("corrupt count trapped")
     raise AssertionError("dispatch accepted a corrupt count")
 
 
