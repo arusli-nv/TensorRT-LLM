@@ -444,6 +444,8 @@ class SingleLayerMoeLoadBalancer:
         # Local slots whose storage maps no memory until a restore (ghost extra slots), or None.
         self.ghost_slots: Optional[List[int]] = None
         self.initial_weight_assignments: Optional[List[int]] = None
+        # The device expert -> slot table once one_slot_table returned it.
+        self._one_slot_table: Optional[torch.Tensor] = None
 
         if self.updates_enabled:
             self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
@@ -892,11 +894,20 @@ class SingleLayerMoeLoadBalancer:
 
         ``route`` then reduces to this lookup. Its address is fixed and placement updates rewrite it in place, so
         captured CUDA graphs read the current placement. Like ``route``, a call that returns a table commits the
-        layer to one slot per expert for every later placement.
+        layer to one slot per expert for every later placement, so the table is kept. Online EPLB never has one.
         """
-        table = torch.ops.trtllm.moe_load_balance_one_slot_table(
-            self.single_layer_load_balancer_ptr)
-        return table if table.numel() > 0 else None
+        if self.updates_enabled:
+            return None
+        if self._one_slot_table is None or torch.compiler.is_compiling():
+            # Traced code gets the op's empty fake, so it keeps the routing kernel.
+            table = torch.ops.trtllm.moe_load_balance_one_slot_table(
+                self.single_layer_load_balancer_ptr)
+            if table.numel() == 0:
+                return None
+            if torch.compiler.is_compiling():
+                return table
+            self._one_slot_table = table
+        return self._one_slot_table
 
     def py_pre_shutdown_cleanup(self):
         """
