@@ -524,11 +524,13 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
 #endif
             count = *round_recv_count;
             // A count beyond the runtime capacity is corrupt. Dropping a live source's tokens would silently change
-            // the output, so trap as on a timeout, unless an abort is pending: ranks that stop waiting drift apart in
-            // rounds, so a lost source's stale flag can match; the aborted step is discarded, so release the source.
+            // the output, so trap as on a timeout. Two cases are an abort instead: a source that stopped waiting under
+            // an abort can run a round ahead and write its count before this rank resets that slot for the round
+            // (the count reads -1), and ranks that stop waiting can match a lost source's stale flag. Release the
+            // source as an aborted one.
             if (count < 0 || count > source_tokens)
             {
-                if (ptrs.abort != nullptr && observe_abort(ptrs.abort))
+                if (count == -1 || (ptrs.abort != nullptr && observe_abort(ptrs.abort)))
                 {
                     count = -1;
                 }
