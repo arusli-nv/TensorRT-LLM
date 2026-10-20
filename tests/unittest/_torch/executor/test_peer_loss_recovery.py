@@ -697,7 +697,9 @@ def test_gather_numbers_follow_rank0_after_a_recovery():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     for number in range(3):
         recovery.gathering_responses([(number, Mock())])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: (2, set())
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (2, set()) if isinstance(value, tuple) else value
+    )
     _sent_responses(recovery)
 
     recovery._recover(_interrupted())
@@ -1569,7 +1571,9 @@ def test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once()
 def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
     recovery = _recovery(_FakeClient([]), rank=1)
     executor = recovery._executor
-    executor.dist.broadcast.side_effect = lambda value, root: (0, {11})
+    executor.dist.broadcast.side_effect = (
+        lambda value, root: (0, {11}) if isinstance(value, tuple) else value
+    )
     parent = Mock(is_child=False, py_request_id=11)
     child = Mock(is_child=True, parent_request_id=11, py_request_id=21)
     other = Mock(is_child=False, py_request_id=12)
@@ -1634,7 +1638,9 @@ def test_a_resent_part_notes_the_requests_it_answered_again():
     """Rank 0 never read the notes of a gather a loss interrupted, so the resent part carries them again."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     recovery.gathering_responses([(11, _response(11))])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: (0, set())
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (0, set()) if isinstance(value, tuple) else value
+    )
     resent = []
     recovery._executor._enqueue_responses = lambda responses: resent.append(
         recovery.gathering_responses(responses)
@@ -1729,7 +1735,9 @@ def test_recovery_resends_gathers_rank0_did_not_process(processed):
     first, second = [(5, Mock(name="first"))], [(6, Mock(name="second"))]
     recovery.gathering_responses(first)
     recovery.gathering_responses(second)
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: (processed, set())
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (processed, set()) if isinstance(value, tuple) else value
+    )
     finished = Mock(name="finished")
     recovery.defer_terminations([finished])
     order = []
@@ -1748,7 +1756,9 @@ def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     for number in range(peer_loss_recovery._GATHER_HISTORY + 1):
         recovery.gathering_responses([(number, Mock())])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: (0, set())
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (0, set()) if isinstance(value, tuple) else value
+    )
     with pytest.raises(RuntimeError, match="no longer held"):
         recovery._recover(_interrupted())
 
@@ -1757,7 +1767,9 @@ def test_recovery_fails_closed_if_gather_numbers_diverged():
     """Rank 0 cannot have processed a gather this rank never made."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     recovery.gathering_responses([(5, Mock())])
-    recovery._executor.dist.broadcast.side_effect = lambda value, root: (2, set())
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (2, set()) if isinstance(value, tuple) else value
+    )
     with pytest.raises(RuntimeError, match="made only 1"):
         recovery._recover(_interrupted())
 
