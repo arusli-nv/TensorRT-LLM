@@ -399,7 +399,8 @@ def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
     # Rank 2 was fenced in the first round; only rank 3 is asked for.
     assert out == [(_route(0), Fence(3, 0))]
     out = _fence_departed(authority, out, 2.0)
-    assert out == [(_route(rank), Propose(1, lost, (0, 1))) for rank in (0, 1)]
+    # Some survivors may have staged the first plan: every survivor recomputes it.
+    assert out == [(_route(rank), Propose(1, lost, (0, 1), ((FAILED,),))) for rank in (0, 1)]
     _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
     out = _report(authority, Installed, (0, 1), generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
@@ -479,6 +480,7 @@ def test_a_further_loss_after_a_recovery_recovers_again():
     # Rank 2 was fenced in the first recovery; only rank 1 is asked for.
     assert out == [(_route(0), Fence(1, 0))]
     out = _fence_departed(authority, out, 50.5)
+    # The first recovery's plan was installed: it is no earlier plan of this one.
     assert out == [(_route(rank), Propose(2, lost, (0, 3))) for rank in (0, 3)]
     out = _report(authority, Ready, (0, 3), now=51.0, generation=2, placement_digest="digest2")
     assert out == [(_route(rank), Install(2)) for rank in (0, 3)]

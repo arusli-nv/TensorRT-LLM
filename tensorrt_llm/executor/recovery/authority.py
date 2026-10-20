@@ -157,6 +157,8 @@ class RecoveryAuthority:
         # Times the current recovery started over because more ranks failed during it, and those ranks.
         self._replans = 0
         self._failed_during_recovery: frozenset[int] = frozenset()
+        # The failed ranks of each plan proposed in the current recovery, in order.
+        self._proposed: list[tuple[int, ...]] = []
         self._ready: dict[int, str] = {}
         self._installed: set[int] = set()
         # Rank -> (route of its evidence connection, host, pid), from its heartbeats.
@@ -458,6 +460,7 @@ class RecoveryAuthority:
             self.deadline = now + self.recovery_timeout
             self._stage_starts = [now]
             self._replans = 0
+            self._proposed.clear()
             self._stopped.clear()
             self._ready.clear()
             self._installed.clear()
@@ -508,7 +511,9 @@ class RecoveryAuthority:
     def _propose(self, now: float) -> Outbound:
         self._stage_starts.append(now)
         self._enter(Phase.PREPARING)
-        proposal = Propose(self.generation + 1, tuple(sorted(self.failed_ranks)), self.survivors)
+        failed = tuple(sorted(self.failed_ranks))
+        proposal = Propose(self.generation + 1, failed, self.survivors, tuple(self._proposed))
+        self._proposed.append(failed)
         return self._to_survivors(proposal)
 
     def _admissible(self, failed: frozenset[int]) -> None:

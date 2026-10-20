@@ -918,9 +918,8 @@ class PeerLossRecovery(RecoveryHook):
         if online and not load_balancer.quiesce(max(0.0, deadline - time.monotonic())):
             raise RuntimeError("EPLB weight updates did not finish within the recovery timeout")
         # Until Install, a further loss restarts the plan with every rank lost so far, off the bytes the plans
-        # staged so far had the lost ranks copy.
+        # proposed so far had the lost ranks copy.
         replans = 0
-        staged: List[np.ndarray] = []
         # What the authority sent while this rank served (a refusal) belongs to no recovery.
         client.discard_pending()
         while True:
@@ -963,7 +962,9 @@ class PeerLossRecovery(RecoveryHook):
                 copy_plan = (
                     None
                     if online
-                    else self._stage_ring_restore(load_balancer, failed, placements, staged)
+                    else self._stage_ring_restore(
+                        load_balancer, failed, placements, proposal.earlier_failed_ranks
+                    )
                 )
                 placement_digest = load_balancer.placement_digest(failed, placements, copy_plan)
                 ready = Ready(rank=rank, generation=generation, placement_digest=placement_digest)
@@ -1268,21 +1269,32 @@ class PeerLossRecovery(RecoveryHook):
         load_balancer: "MoeLoadBalancer",
         failed: frozenset,
         placements: List[np.ndarray],
-        staged: List[np.ndarray],
+        earlier_failed: Sequence[Sequence[int]],
     ) -> np.ndarray:
-        """Copy the experts ``placements`` restores from the ring host copies into their slots; the copy plan,
-        appended to ``staged`` (this recovery's plans) before any copy starts.
+        """Copy the experts ``placements`` restores from the ring host copies into their slots; return the copy plan.
 
         After Propose the failed ranks are fenced and no all-to-all runs until the install rearms the workspaces;
-        the plan keeps off the bytes their all-to-alls or their copies of ``staged`` may still write.
+        the plan keeps off the bytes their all-to-alls may still write, and their copies of the plans proposed
+        earlier in this recovery (without ``earlier_failed``). A survivor need not have run those plans, so each
+        recomputes them from the same inputs.
         """
         start = time.monotonic()
         state = self._executor.model_engine.moe_execution_state
         workspace = state.staging_workspace()
+        staged: List[np.ndarray] = []
+        for earlier in earlier_failed:
+            staged.append(
+                load_balancer.restore_copy_plan(
+                    earlier,
+                    load_balancer.recovery_placements(earlier),
+                    workspace.size(1),
+                    state.staging_write_ranges,
+                    staged,
+                )
+            )
         copy_plan = load_balancer.restore_copy_plan(
             failed, placements, workspace.size(1), state.staging_write_ranges, staged
         )
-        staged.append(copy_plan)
         self._among_survivors(
             "restored experts were copied",
             lambda: load_balancer.stage_restored_slots(

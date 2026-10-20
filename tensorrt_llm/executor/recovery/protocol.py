@@ -99,11 +99,16 @@ class Installed:
 
 @dataclass(frozen=True)
 class Propose:
-    """Authority -> survivors: prepare to continue without ``failed_ranks`` (sorted)."""
+    """Authority -> survivors: prepare to continue without ``failed_ranks`` (sorted).
+
+    ``earlier_failed_ranks`` are the failed ranks of the plans proposed earlier in this recovery, in order:
+    survivors may still be copying for them, and every survivor recomputes their plans to keep off those copies.
+    """
 
     generation: int
     failed_ranks: tuple[int, ...]
     survivors: tuple[int, ...]
+    earlier_failed_ranks: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True)

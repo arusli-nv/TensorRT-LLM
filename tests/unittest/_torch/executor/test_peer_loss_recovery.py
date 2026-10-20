@@ -2175,7 +2175,7 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
         ["placement"],
         workspace.size.return_value,
         engine.moe_execution_state.staging_write_ranges,
-        [plan],
+        [],
     )
     workspace.size.assert_called_with(1)
     load_balancer.stage_restored_slots.assert_called_once_with(
@@ -2186,27 +2186,59 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
 
 
 def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(monkeypatch):
-    import numpy as np
     from mpi4py import MPI
 
     recovery = _recovery(_FakeClient([]))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
-    plans = [np.zeros((1, 10), dtype=np.int64), np.ones((1, 10), dtype=np.int64)]
-    load_balancer.restore_copy_plan.side_effect = plans
     failed = frozenset({FAILED_RANK})
-    staged = []
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
     with pytest.raises(RecoveryInterrupted):
-        recovery._stage_ring_restore(load_balancer, failed, ["placement"], staged)
-    # The interrupted plan's copies may still be in flight: the next plan keeps off them.
-    assert staged == [plans[0]]
-    write_ranges = recovery._executor.model_engine.moe_execution_state.staging_write_ranges
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"], ())
     monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
-        recovery._stage_ring_restore(load_balancer, failed, ["placement"], staged)
-    _, _, _, ranges, passed = load_balancer.restore_copy_plan.call_args.args
-    assert ranges is write_ranges and passed is staged and staged == plans
+        recovery._stage_ring_restore(load_balancer, failed, ["placement"], ())
+
+
+@pytest.mark.parametrize("staged_first_plan", [True, False])
+def test_every_survivor_replans_off_the_plans_proposed_earlier_whether_it_staged_them_or_not(
+    staged_first_plan,
+):
+    """Rank 3 fails during the recovery without rank 2. A survivor that staged the first plan and one
+    interrupted before it got the plan both keep the next plan off the first plan's copies."""
+    import numpy as np
+
+    lost = (FAILED_RANK, 3)
+    first = Propose(1, (FAILED_RANK,), SURVIVORS)
+    if staged_first_plan:
+        replies = [first, _FURTHER_LOSS]
+    else:
+        replies = [_FURTHER_LOSS, first]
+    client = _FakeClient(
+        [*replies, Propose(1, lost, (0, 1), ((FAILED_RANK,),)), Install(1), Commit(1)]
+    )
+    recovery = _recovery(client, failed=frozenset(lost))
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset(lost)])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.covers_loss_of.return_value = True
+    load_balancer.recovery_placements.side_effect = lambda dead, base=None: [sorted(dead)]
+    plans = []
+
+    def restore_copy_plan(dead, placements, size, ranges, staged):
+        plans.append((sorted(dead), placements, [plan.tolist() for plan in staged]))
+        return np.full((1, 10), len(dead), dtype=np.int64)
+
+    load_balancer.restore_copy_plan.side_effect = restore_copy_plan
+
+    recovery._recover(_interrupted())
+
+    first_plan = [[1] * 10]
+    assert plans[-2:] == [
+        ([FAILED_RANK], [[FAILED_RANK]], []),
+        (list(lost), [list(lost)], [first_plan]),
+    ]
+    assert len(plans) == (3 if staged_first_plan else 2)
 
 
 def test_create_checks_the_staging_workspace_fits_with_ring_host_copies(monkeypatch):
