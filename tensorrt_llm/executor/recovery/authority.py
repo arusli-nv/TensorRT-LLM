@@ -277,8 +277,8 @@ class RecoveryAuthority:
                 logger.error(
                     f"Recovery authority: rank {hung.rank} survived its fence; running the fence command"
                 )
+                # The command may fail unseen: rank 0 still fences the rank before a recovery proposes.
                 self._fence(hung)
-                self._fenced.add(hung.rank)
         if self.hang_monitor is not None and self.phase in (Phase.SERVING, Phase.RECOVERED):
             hung = self.hang_monitor.check(now)
             if hung is not None:

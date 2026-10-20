@@ -18,6 +18,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     DeviceWait,
     Fence,
+    Fenced,
     Heartbeat,
     NativeHeartbeat,
     Propose,
@@ -326,13 +327,16 @@ def test_authority_fences_a_hung_rank_through_itself_and_another_rank_then_the_c
     assert authority.phase is Phase.SERVING
 
 
-def test_a_rank_the_fence_command_ended_is_not_fenced_again_before_the_proposal():
+def test_a_rank_the_fence_command_ran_for_is_fenced_by_rank_0_before_the_proposal():
+    """The command's outcome is not observed, so it may have failed: rank 0 ends the rank before any plan."""
     fenced = []
     authority = _serving_authority(fenced)
     _hang_rank_2(authority, 60)
     assert [rank for rank, *_ in fenced] == [2]
     for rank in PEERS:
         out = authority.handle(f"rank-{rank}".encode(), Stopped(rank, (2,)), 60.0)
+    assert out == [(b"rank-0", Fence(2, 102))]
+    out = authority.handle(b"rank-0", Fenced(0, 2, ""), 60.5)
     assert out == [(f"rank-{rank}".encode(), Propose(1, (2,), PEERS)) for rank in PEERS]
 
 
