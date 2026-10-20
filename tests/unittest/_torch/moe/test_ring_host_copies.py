@@ -468,3 +468,87 @@ def test_a_replan_keeps_off_the_copies_a_rank_lost_while_staging_was_given(monke
     unaware = load_balancer.restore_copy_plan([2, 3], placements, row_bytes, write_ranges)
     with pytest.raises(AssertionError):
         _assert_staged_apart(unaware, row_bytes, late_copies)
+
+
+# DeepSeek-R1 at EP32 on eight nodes of four GPUs: 256 experts on 8 + 2 static EPLB slots per rank.
+_R1_EP, _R1_GPUS_PER_NODE, _R1_EXPERTS, _R1_SLOTS = 32, 4, 256, 10
+_R1_HOSTS = [f"node{rank // _R1_GPUS_PER_NODE}" for rank in range(_R1_EP)]
+
+
+def _r1_node(node):
+    return list(range(node * _R1_GPUS_PER_NODE, (node + 1) * _R1_GPUS_PER_NODE))
+
+
+def _r1_static_load_balancer(monkeypatch):
+    """A static R1 MoeLoadBalancer with ring host copies, showing the placement after FT emptied the replicas."""
+    assignments = [
+        (rank * _R1_EXPERTS // _R1_EP + slot) % _R1_EXPERTS
+        for rank in range(_R1_EP)
+        for slot in range(_R1_SLOTS)
+    ]
+    placement = np.array(assignments, dtype=np.int32).reshape(_R1_EP, _R1_SLOTS)
+    placement[:, 8:] = -1
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(
+        MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_R1_HOSTS)
+    )
+    with (
+        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
+        patch(f"{_MLB}.HostMoeTensorSharer"),
+    ):
+        load_balancer = MoeLoadBalancer(0, _R1_EP, 0)
+        native = Mock(
+            get_layer_id=Mock(return_value=0),
+            get_old_rank_expert_ids=Mock(return_value=placement.tolist()),
+        )
+        load_balancer.load_balancer_impl.add_layer.return_value = native
+        load_balancer.add_layer(_R1_EXPERTS, 8, _R1_SLOTS).set_initial_weight_assignments(
+            assignments
+        )
+    return load_balancer, native
+
+
+def _assert_serves_every_expert_once(placement, dead):
+    assert (placement[dead] == -1).all()
+    assert (np.bincount(placement[placement >= 0], minlength=_R1_EXPERTS) == 1).all()
+    assert (placement >= 0).sum(axis=1).max() <= _R1_SLOTS
+
+
+@pytest.mark.parametrize("node", range(1, 8))
+def test_r1_static_restores_a_lost_node_and_then_a_rank(monkeypatch, node):
+    load_balancer, native = _r1_static_load_balancer(monkeypatch)
+    dead = _r1_node(node)
+    (placement,) = load_balancer.recovery_placements(dead)
+    # 32 lost experts, one copy each, into the 56 empty slots of the 28 survivors.
+    _assert_serves_every_expert_once(placement, dead)
+    survivors = np.delete(np.arange(_R1_EP), dead)
+    assert (placement[survivors] != load_balancer.current_placements()[0][survivors]).sum() == 32
+    native.get_old_rank_expert_ids.return_value = placement.tolist()
+    # Then any rank but one of the next node, whose home experts' copies were on the lost node.
+    unprotected = _r1_node((node + 1) % 8)
+    for rank in range(1, _R1_EP):
+        if rank in dead:
+            continue
+        lost = dead + [rank]
+        assert load_balancer.covers_loss_of(lost) == (rank not in unprotected)
+        if rank not in unprotected:
+            _assert_serves_every_expert_once(load_balancer.recovery_placements(lost)[0], lost)
+
+
+def test_r1_static_two_nodes_leave_too_few_slots(monkeypatch):
+    load_balancer, _ = _r1_static_load_balancer(monkeypatch)
+    # 24 survivors hold 240 slots for 256 experts.
+    with pytest.raises(ValueError, match="No surviving replica"):
+        load_balancer.recovery_placements(_r1_node(2) + _r1_node(5))
+
+
+def test_r1_ring_a_node_loss_leaves_the_next_node_without_host_copies(monkeypatch):
+    load_balancer, native = _r1_static_load_balancer(monkeypatch)
+    lost_node = _r1_node(1)
+    native.get_old_rank_expert_ids.return_value = load_balancer.recovery_placements(lost_node)[
+        0
+    ].tolist()
+    # Rank 8 (node 2) kept its home experts 64..71 resident; their only host copies were on node 1.
+    assert not load_balancer.covers_loss_of(lost_node + [8])
+    with pytest.raises(ValueError, match=r"\{0: \[64, 65, 66, 67, 68, 69, 70, 71\]\}"):
+        load_balancer.recovery_placements(lost_node + [8])

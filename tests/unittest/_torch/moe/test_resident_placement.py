@@ -353,3 +353,48 @@ def test_install_masks_only_when_no_expert_moves():
     load_balancer.in_iter = True
     with pytest.raises(RuntimeError, match="iteration is active"):
         load_balancer.install_recovery_placement([1], load_balancer.recovery_placements([1]))
+
+
+# DeepSeek-R1 at EP32 on eight nodes of four GPUs: 256 experts on 9 online EPLB slots per rank (288).
+_R1_EP, _R1_EXPERTS, _R1_EPLB_SLOTS = 32, 256, 9
+
+
+@pytest.mark.parametrize("clumped", [False, True])
+def test_r1_online_restores_every_node_or_rank_loss(monkeypatch, clumped):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig())
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: 4)
+    with (
+        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
+        patch(f"{_MLB}.HostMoeTensorSharer"),
+        patch("torch.cuda.Event"),
+    ):
+        load_balancer = MoeLoadBalancer(0, _R1_EP, 1)
+        native = Mock(get_layer_id=Mock(return_value=0))
+        load_balancer.load_balancer_impl.add_layer.return_value = native
+        layer = load_balancer.add_layer(_R1_EXPERTS, 8, _R1_EPLB_SLOTS, aux_stream=Mock())
+    # 28 survivors of a node need ceil(256 / 28) = 10 slots each: one ghost slot per rank.
+    assert layer.ghost_slot_count == 1
+    rng = np.random.default_rng(0)
+    for _ in range(100):
+        # Online EPLB's 32 replicas go to the most loaded experts, spread at random or clumped on few ranks.
+        load = rng.pareto(1.5, _R1_EXPERTS) + 0.01
+        copies = np.ones(_R1_EXPERTS, dtype=np.int64)
+        for _ in range(_R1_EP * _R1_EPLB_SLOTS - _R1_EXPERTS):
+            copies[np.argmax(load / copies)] += 1
+        slots = np.repeat(np.arange(_R1_EXPERTS), copies)
+        if not clumped:
+            rng.shuffle(slots)
+        placement = np.full((_R1_EP, _R1_EPLB_SLOTS + 1), -1, dtype=np.int32)
+        placement[:, :_R1_EPLB_SLOTS] = slots.reshape(_R1_EP, _R1_EPLB_SLOTS)
+        native.get_old_rank_expert_ids.return_value = placement.tolist()
+        node = int(rng.integers(1, 8))
+        for dead in (list(range(4 * node, 4 * node + 4)), [int(rng.integers(1, _R1_EP))]):
+            (restored,) = load_balancer.recovery_placements(dead)
+            assert (restored[dead] == -1).all()
+            # Every expert keeps at least one copy; only lost experts and evicted replicas moved.
+            assert (np.bincount(restored[restored >= 0], minlength=_R1_EXPERTS) >= 1).all()
+            survivors = np.delete(np.arange(_R1_EP), dead)
+            kept = restored[survivors] == placement[survivors]
+            evicted = placement[survivors][~kept]
+            assert ((evicted < 0) | (copies[np.maximum(evicted, 0)] >= 2)).all()

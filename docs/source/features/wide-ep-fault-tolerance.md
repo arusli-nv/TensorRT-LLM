@@ -205,6 +205,8 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
   with a new key, never under a running job.
 - Stopping the job (`scancel`, deleting its pods) signals every rank; a rank signaled a moment after another may
   log a recovery attempt before it exits. The job ends anyway, with the status of the signal.
+- With ring host copies (online EPLB off), losing a node (or only its copy node) leaves the next node's
+  experts without host copies, so a later loss there is unrecoverable and ends the job.
 
 ## Not supported together with fault tolerance
 
