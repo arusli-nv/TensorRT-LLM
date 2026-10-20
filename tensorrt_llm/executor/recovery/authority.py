@@ -30,7 +30,7 @@ import zmq
 
 from ...logger import logger
 from ..ipc import ZeroMqQueue
-from .client import load_key, unauthenticated
+from .client import CONNECTION_OPTIONS, load_key, unauthenticated
 from .config import COMMAND_FENCE_GRACE_S, CONFIG_ENV, FaultToleranceConfig, fault_tolerance_config
 from .hang_monitor import HangMonitor, HungRank
 from .protocol import (
@@ -628,7 +628,7 @@ def serve(
         datagrams: UDP socket from :func:`datagram_socket` receiving the workers' native
             heartbeats; datagrams that do not authenticate are dropped.
     """
-    last_rejection = -_REJECTION_LOG_INTERVAL_S
+    last_rejection = last_unsent = -_REJECTION_LOG_INTERVAL_S
     poller = zmq.Poller()
     poller.register(router.socket, zmq.POLLIN)
     if datagrams is not None:
@@ -662,12 +662,28 @@ def serve(
             if rejection and time.monotonic() - last_rejection >= _REJECTION_LOG_INTERVAL_S:
                 last_rejection = time.monotonic()
                 logger.warning(f"Recovery authority: {rejection}")
-        for route, message in outbound:
-            router.put(message, routing_id=route)
+        last_unsent = _send(router, outbound, last_unsent)
     # A recovery in progress must not leave the survivors waiting out their deadline.
     if authority.phase in (Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING):
-        for route, message in authority.abort("the recovery authority stopped"):
-            router.put(message, routing_id=route)
+        _send(router, authority.abort("the recovery authority stopped"), last_unsent)
+
+
+def _send(router: ZeroMqQueue, outbound: Outbound, last_log: float) -> float:
+    """Send ``outbound`` without blocking; log (rate-limited from ``last_log``) what cannot be sent.
+
+    A message cannot be sent to a route with no connection, or to a peer that does not read it.
+    Returns the monotonic time of the last log.
+    """
+    for route, message in outbound:
+        try:
+            router.put_nowait(message, routing_id=route)
+        except zmq.ZMQError as error:
+            if time.monotonic() - last_log >= _REJECTION_LOG_INTERVAL_S:
+                last_log = time.monotonic()
+                logger.warning(
+                    f"Recovery authority: could not send {message} to {route!r}: {error}"
+                )
+    return last_log
 
 
 def _receive_datagrams(
@@ -708,7 +724,12 @@ def datagram_socket(endpoint: str) -> socket.socket | None:
 
 
 def router_queue(endpoint: str, key: bytes) -> ZeroMqQueue:
-    """Return a ROUTER queue bound at ``endpoint``; a second connection with a routing id in use is refused."""
+    """Return a ROUTER queue bound at ``endpoint``.
+
+    A connection with a routing id in use takes the route over (a worker reconnecting after its
+    connection died); the session and sequence checks of :meth:`RecoveryAuthority.receive` still
+    drop a replay on it. A message to a route with no connection fails rather than vanishing.
+    """
     router = ZeroMqQueue(
         (endpoint, key),
         socket_type=zmq.ROUTER,
@@ -719,6 +740,9 @@ def router_queue(endpoint: str, key: bytes) -> ZeroMqQueue:
             zmq.LINGER: _CLOSE_LINGER_MS,
             zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES,
             zmq.RCVHWM: _ROUTER_RCVHWM,
+            zmq.ROUTER_HANDOVER: 1,
+            zmq.ROUTER_MANDATORY: 1,
+            **CONNECTION_OPTIONS,
         },
     )
     if "://*:" in endpoint or "0.0.0.0" in endpoint:

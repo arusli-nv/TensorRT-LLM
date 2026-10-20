@@ -21,6 +21,7 @@ from .protocol import MAX_MESSAGE_BYTES, Abort, Message, Register, Registered, S
 
 __all__ = [
     "AUTHORITY_ENV",
+    "CONNECTION_OPTIONS",
     "AUTHORITY_KEY_ENV",
     "RecoveryAborted",
     "RecoveryClient",
@@ -40,6 +41,14 @@ _SESSION = secrets.token_hex(16)
 _SEQUENCE = itertools.count(1)
 # How often a wait with an interrupt checks it.
 _INTERRUPT_POLL_S = 0.005
+# ZMTP heartbeats on both ends of a connection: a connection that dies silently (a half-open TCP connection, an
+# expired NAT or conntrack entry) is closed within the timeout and the worker reconnects, rather than the next
+# recovery's messages vanishing. The pings also keep an idle connection's conntrack entries alive.
+CONNECTION_OPTIONS = {
+    zmq.HEARTBEAT_IVL: 2000,
+    zmq.HEARTBEAT_TIMEOUT: 10000,
+    zmq.HEARTBEAT_TTL: 10000,
+}
 
 _M = TypeVar("_M")
 
@@ -93,8 +102,8 @@ class RecoveryClient:
     """DEALER connection of one worker rank to the recovery authority.
 
     The routing id is derived from the rank and kept across reconnects, so the authority
-    recognizes the worker after one. Not thread-safe: use each client from one thread at a
-    time.
+    recognizes the worker after one: the reconnect takes the route over from the connection
+    that died. Not thread-safe: use each client from one thread at a time.
 
     Args:
         endpoint: Authority address, e.g. ``tcp://host:5555``.
@@ -114,6 +123,7 @@ class RecoveryClient:
                 zmq.LINGER: 0,
                 zmq.MAXMSGSIZE: MAX_MESSAGE_BYTES,
                 zmq.ROUTING_ID: f"rank-{rank}-{secrets.token_hex(8)}".encode(),
+                **CONNECTION_OPTIONS,
             },
         )
 

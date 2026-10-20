@@ -714,6 +714,29 @@ def test_end_to_end_over_zmq(served, clients):
     assert authority.phase is Phase.RECOVERED
 
 
+def test_a_connection_with_a_routing_id_in_use_takes_the_route_over(served, clients):
+    """A worker whose connection died unnoticed reconnects with its routing id; the authority answers it."""
+    _register_clients(clients)
+    routing_id = clients[1]._queue.socket.getsockopt(zmq.ROUTING_ID)
+    successor = _dealer(served[1], options={zmq.ROUTING_ID: routing_id})
+    try:
+        successor.put(StatusQuery())
+        assert successor.get(timeout=5.0).phase == "SERVING"
+    finally:
+        successor.close()
+
+
+def test_a_message_that_cannot_be_sent_is_logged(tmp_path, monkeypatch):
+    router = authority_module.router_queue(f"ipc://{tmp_path}/authority", KEY)
+    warnings = []
+    monkeypatch.setattr(authority_module.logger, "warning", warnings.append)
+    try:
+        authority_module._send(router, [(b"gone", Abort("lost"))], -1e9)
+    finally:
+        router.close()
+    assert len(warnings) == 1 and "could not send" in warnings[0]
+
+
 def test_abort_reaches_every_worker(clients):
     _register_clients(clients)
     clients[1].send(Stopped(1, (3,)))  # rank 3 is not admitted
@@ -781,23 +804,19 @@ def _wait_for(authority, phase):
 def _replay(endpoint, captured, routing_id=None) -> Status:
     """Send ``captured`` again from a new connection; return the status the authority answers next."""
     options = {} if routing_id is None else {zmq.ROUTING_ID: routing_id}
-    # A routing id frees once the authority sees its old connection close: retry until it is accepted.
-    for _ in range(50):
-        replayer = _dealer(endpoint, options=options)
-        try:
-            replayer.put(StatusQuery())
-            if not replayer.poll(1):
-                continue
-            replayer.get()
-            for obj in captured:
-                replayer.socket.send(_signed(obj))
-            replayer.put(StatusQuery())
-            status = replayer.get(timeout=5.0)
-            assert isinstance(status, Status), status
-            return status
-        finally:
-            replayer.close()
-    raise AssertionError("the authority never accepted the replaying connection")
+    replayer = _dealer(endpoint, options=options)
+    try:
+        # A DEALER blocks a send until it connects: connect first.
+        replayer.put(StatusQuery())
+        replayer.get(timeout=5.0)
+        for obj in captured:
+            replayer.socket.send(_signed(obj))
+        replayer.put(StatusQuery())
+        status = replayer.get(timeout=5.0)
+        assert isinstance(status, Status), status
+        return status
+    finally:
+        replayer.close()
 
 
 def _finish_recovery(clients) -> dict:
