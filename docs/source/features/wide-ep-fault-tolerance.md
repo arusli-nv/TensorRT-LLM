@@ -23,7 +23,9 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
   last node keeping the first's; a single node keeps its own), about `1/N` of the copies with `N` nodes. A restore
   copies each expert from a GPU of that node into the restoring rank's NVLinkOneSided workspace and from there
   into its slot, in chunks of half the workspace; losing a node together with the node that keeps its copies is
-  not recoverable.
+  not recoverable. Size `/dev/shm` (host memory) for these copies: with online EPLB, every node needs the expert
+  weights of all MoE layers; with a static placement, about `1/N` of them. Startup fails with the sizes if a
+  rank's copies do not fit.
 - Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4.1 or later.
 
 ## Running
@@ -58,7 +60,7 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
 
 | Variable | Meaning |
 |---|---|
-| `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance |
+| `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance; alone it turns on the rank mask (and its cost) but only detects a loss: rank 0 warns at startup and `/health` reports `unprotected` |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY` | The authority's address; required to recover |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key (64 hex characters) for authority messages |
 | `TLLM_FAULT_TOLERANCE_CONFIG` | Optional YAML file with the settings below; set the same file on the workers and the authority, which refuses a worker's registration with different settings (it logs its settings' digest at startup) |
@@ -145,9 +147,9 @@ status 0 (a survivor that does not finalize within 120 s ends the job with a non
 After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
 (and may take more of the KV cache for restored experts). A request re-run after its rank's loss (see below) runs
 on any survivor, even if it was pinned to the lost rank with `attention_dp_relax=False`; a new request pinned to a
-lost rank fails with "Attention DP rank N is not serving". If a re-run or retried request that crashes
-every rank it runs on lands on rank 0, or on a rank whose loss the remaining slots cannot cover, its crash ends the
-deployment; the server does not recognize a client's retry of a failed request.
+lost rank fails with "Attention DP rank N is not serving" (HTTP 503, see below). If a re-run or retried request
+that crashes every rank it runs on lands on rank 0, or on a rank whose loss the remaining slots cannot cover, its
+crash ends the deployment; the server does not recognize a client's retry of a failed request.
 
 Failure model: a failing rank stops (it dies, or it hangs and is fenced). A rank that keeps running but
 computes wrong results (for example silent memory corruption) is not detected: the survivors keep its
@@ -199,7 +201,10 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
 - A fenced process stuck in the GPU driver may not exit when killed, which can stall the job's shutdown.
 - Whether and how fast the death of a host or its Open MPI (PRRTE) daemon ends the job depends on PRRTE.
 - Nothing restarts the authority, and the workers register only at startup: an authority started again
-  reports `starting` (503) until the deployment restarts.
+  reports `starting` (503) until the deployment restarts. Restart the authority only together with the job,
+  with a new key, never under a running job.
+- Stopping the job (`scancel`, deleting its pods) signals every rank; a rank signaled a moment after another may
+  log a recovery attempt before it exits. The job ends anyway, with the status of the signal.
 
 ## Not supported together with fault tolerance
 
@@ -210,14 +215,15 @@ tested; other methods log a warning at startup, because per-slot draft state kep
 after a recovery, and relaxed acceptance, lossy by design, can accept different tokens.
 
 Refused at startup, with the requirement that is missing:
-attention-DP balancing or a non-default attention-DP router, expert tensor parallelism, beam search, guided
-decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving) and
-connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder
+a non-default attention-DP router (attention-DP balancing is supported), expert tensor parallelism, beam
+search, guided decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving)
+and connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder
 models, sleep/wake-up, a non-MPI executor (Ray, RPC), and a hang-detection timeout that is not above three times
 `recovery_timeout_s`, plus the hang's resolution time when hang detection is on (see the timeouts above).
 
 Rejected per request: repetition, presence and frequency penalties (their token counts cannot be rolled back
-when a step is discarded), and multimodal requests under the overlap scheduler.
+when a step is discarded), logits post-processors (they may keep state and would run again on a re-run step),
+and multimodal requests under the overlap scheduler.
 
 ## What happens during a recovery
 
@@ -229,13 +235,17 @@ when a step is discarded), and multimodal requests under the overlap scheduler.
   once at most: one that an earlier loss interrupted (it ran again, or a survivor was running it) may be what
   crashes the ranks, so it is quarantined, not continued. Quarantined requests, and streaming requests of the
   lost ranks that had already delivered tokens (they are not continued on a survivor), end with a retryable
-  error. Non-streaming requests get an error
-  response. Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE
-  `error` event followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those requests.
+  error. Non-streaming requests get HTTP 503 with `Retry-After: 1` and the error code `peer_loss_retryable`.
+  Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE `error`
+  event with that code followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those
+  requests.
 - A request of the lost ranks whose cancellation they had not answered yet ends cancelled.
 - All other requests continue with their full output. Greedy outputs after a recovery match a server that
   never used the lost rank's experts.
 - No CUDA graphs are recaptured, so serving resumes at once without the lost GPUs.
+- Each rank logs one line when it resumes: "resumed serving without ranks [...] at membership generation N",
+  the time since the interruption, the discarded steps, the remaining ranks and the KV cache bytes given to
+  restored experts; on rank 0 also how many requests ran again and how many failed.
 - Expected in the logs: on rank 0, an `mpi4py.futures` manager thread exits with `MPI_ERR_PROC_FAILED`,
   followed by "a rank departed; only shutdown is accepted from now on". This is the MPI session noticing the
   loss; serving is not affected.
@@ -261,6 +271,19 @@ What an orchestrator should do with these signals:
   recovery), or every rank stalled (the workers then exit with code 75). Move traffic to another replica,
   have clients retry their failed requests there, and restart the deployment.
 - `unprotected`: keep serving, alert, and check the authority.
+
+Health probes: a recovery returns 503 (`recovering`) for about a second, at most `authority_timeout_s`. Let a
+readiness probe take the replica out of rotation after two failures 5 s apart, and give a liveness probe a
+tolerance above `recovery_timeout_s` (for example 6 failures 10 s apart), so that a recovery never restarts the
+deployment while `terminal` still does. Cover model loading (`starting`) with a startup probe.
+
+Exit status of `mpirun` (and of the workers):
+
+| Status | Meaning |
+|---|---|
+| 0 | Stopped cleanly, also after recoveries |
+| 75 | Every rank stalled, or rank 0 hung: restart the deployment |
+| Any other | The loss or error was not recoverable: restart the deployment |
 
 `/health` only reports. There is no control action: no drain, no retry of a lost rank on the same
 GPUs and no scale-down request; drain a deployment by stopping traffic to it at the load balancer.
