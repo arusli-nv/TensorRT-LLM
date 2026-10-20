@@ -126,7 +126,11 @@ def test_abort_rearm_and_exclusion_resume_after_peer_lost_mid_collective() -> No
     resets = []
 
     row_owner = SimpleNamespace(
-        workspace=workspace, moe_a2a_metainfo=meta, ep_rank=0, ep_size=_EP_SIZE
+        workspace=workspace,
+        moe_a2a_metainfo=meta,
+        ep_rank=0,
+        ep_size=_EP_SIZE,
+        _alltoall_watchdog=None,
     )
 
     def reset_workspace() -> None:

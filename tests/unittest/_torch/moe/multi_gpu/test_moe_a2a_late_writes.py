@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -132,7 +133,9 @@ def _bound_state(
     comm._rank_mask_enabled = True
     comm._execution_state = None
     comm._dispatch_state = {"phase": "idle"}
-    comm.mnnvl_mem, comm.workspace, comm.moe_a2a_metainfo = memory, workspace, meta
+    comm.mnnvl_mem, comm.workspace = memory, workspace
+    # The workspace lifecycle supplies the metainfo; this layer runs no watchdog.
+    comm._workspace_lifecycle = SimpleNamespace(metainfo=meta, watchdog_for=lambda layer: None)
     comm.ep_rank, comm.ep_size = _SURVIVOR, _EP_SIZE
     comm.bind_execution_state(state)
     return state
