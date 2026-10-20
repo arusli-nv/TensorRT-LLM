@@ -152,6 +152,10 @@ def _recovery(
     admitted=ADMITTED,
 ):
     executor = _executor(rank, failed, world_size)
+    # A static recovery stages its ring copies: by default the plan copies nothing.
+    executor.model_engine.moe_load_balancer.restore_copy_plan.return_value = np.zeros(
+        (0, 9), dtype=np.int64
+    )
     recovery = PeerLossRecovery(executor, client, admitted)
     recovery._join_device_work = Mock()
     recovery._watch = Mock(failed=False)
