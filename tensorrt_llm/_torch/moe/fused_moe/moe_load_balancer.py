@@ -112,10 +112,27 @@ def _without_replicas(placement: np.ndarray) -> np.ndarray:
     return placement
 
 
+# Whether ghost slot memory is host accessible on every rank; set by the first _ghost_slot_memory_host_accessible().
+_ghost_host_accessible: Optional[bool] = None
+
+
 def _ghost_slot_memory_host_accessible() -> bool:
-    """Whether ghost slot memory can be host accessible here (GPU memory on a NUMA node, or GDRCopy), so that CPU
-    copies load it as they load online EPLB's other slots."""
-    return _tbr.is_ghost_slot_memory_host_accessible()
+    """Whether ghost slot memory can be host accessible on every rank (GPU memory on a NUMA node, or GDRCopy), so
+    that CPU copies load it as they load online EPLB's other slots.
+
+    The first call is collective: MoeLoadBalancer.register_weight_slots_after_to_cuda makes it on every rank.
+    """
+    global _ghost_host_accessible
+    if _ghost_host_accessible is None:
+        ranks = tensorrt_llm.mpi_comm().allgather(
+            _tbr.is_ghost_slot_memory_host_accessible())
+        if any(ranks) and not all(ranks):
+            logger.warning(
+                "Ghost slot memory stays in device memory on every rank: it cannot be host accessible on ranks "
+                f"{[rank for rank, accessible in enumerate(ranks) if not accessible]}"
+            )
+        _ghost_host_accessible = all(ranks)
+    return _ghost_host_accessible
 
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
@@ -1223,6 +1240,9 @@ class MoeLoadBalancer:
         """
         Register weights after model has been moved to cuda, should be invoked after model.to("cuda") and before finalize_model.
         """
+        if self._largest_loss is not None:
+            # Collective: every rank decides the same.
+            _ghost_slot_memory_host_accessible()
         mode = self.extra_slots_mode()
         if mode in ("ghost", "replicas+ghost"):
             if mode == "ghost" or not _ghost_slot_memory_host_accessible():
