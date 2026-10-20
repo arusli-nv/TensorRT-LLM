@@ -164,11 +164,16 @@ def test_the_first_heartbeat_is_sent_before_the_rank_serves():
 
 def test_stop_gives_up_on_a_blocked_reporter_thread(monkeypatch):
     monkeypatch.setattr(hang_evidence, "_STOP_TIMEOUT_S", 0.05)
-    release = threading.Event()
+    blocked, release = threading.Event(), threading.Event()
     r = _Reporter([], heartbeat_s=0.01)
-    r.reporter._read_row = lambda: release.wait(30) and None
+
+    def blocked_read_row():
+        blocked.set()
+        release.wait(30)
+
+    r.reporter._read_row = blocked_read_row
     r.reporter.start()
-    time.sleep(0.05)
+    assert blocked.wait(5)
     try:
         assert not r.reporter.stop()
     finally:

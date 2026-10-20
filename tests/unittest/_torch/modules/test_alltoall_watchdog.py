@@ -154,7 +154,7 @@ def test_watchdog_handles_signed_uint32_generation_boundaries() -> None:
 def test_watchdog_clear_drops_phases_that_never_complete() -> None:
     """After an abort and rearm, queued phases of the aborted collectives are dropped, not reported."""
     reader = FakeCompletionFlagReader(ep_size=2)
-    events: list[AlltoAllWatchdogTimeout] = []
+    timed_out = threading.Event()
 
     with AlltoAllWatchdog(
         ep_size=2,
@@ -162,15 +162,14 @@ def test_watchdog_clear_drops_phases_that_never_complete() -> None:
         completion_reader=reader,
         timeout_s=0.2,
         poll_interval_s=0.005,
-        on_timeout=events.append,
+        on_timeout=lambda _: timed_out.set(),
     ) as watchdog:
         watchdog.watch(phase="dispatch", expected_flag=1)
         watchdog.watch(phase="combine", expected_flag=1)
         watchdog.clear()
         assert watchdog.wait_until_idle(timeout_s=0.01)
-        time.sleep(0.3)
-
-    assert events == []
+        # Past the timeout, no dropped phase is reported.
+        assert not timed_out.wait(0.3)
 
 
 def test_watchdog_defaults_match_design_doc() -> None:
