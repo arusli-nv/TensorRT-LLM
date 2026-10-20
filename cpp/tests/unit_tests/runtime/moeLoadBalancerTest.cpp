@@ -1292,10 +1292,10 @@ TEST(MoeLoadBalancerRestoreTest, CpuCopiesLoadARestoredGhostSlotThroughEachMappi
 
     // EPLB's updates then load both slots of rank 0 with CPU copies.
     setup.mLoadBalancer.resetUpdateSchedule();
-    for (int64_t iterId = 1; iterId <= 3; ++iterId)
+    for (int64_t iterId = 0; iterId < 3; ++iterId)
     {
         std::vector<float> load{1.0F, 2.0F, 3.0F, 4.0F};
-        std::rotate(load.begin(), load.begin() + iterId, load.end());
+        std::rotate(load.begin(), load.begin() + iterId + 1, load.end());
         setup.runUpdate(iterId, load);
         expectSlotHolds(0, static_cast<float>(info->oldRankExpertIds[0][0] + 1));
         expectSlotHolds(1, static_cast<float>(info->oldRankExpertIds[0][1] + 1));
