@@ -112,6 +112,12 @@ def _without_replicas(placement: np.ndarray) -> np.ndarray:
     return placement
 
 
+def _ghost_slot_memory_host_accessible() -> bool:
+    """Whether ghost slot memory can be host accessible here (GPU memory on a NUMA node, or GDRCopy), so that CPU
+    copies load it as they load online EPLB's other slots."""
+    return _tbr.is_ghost_slot_memory_host_accessible()
+
+
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     """
     Convert a tensor to a MoeWeight object.
@@ -658,8 +664,12 @@ class SingleLayerMoeLoadBalancer:
         if self.ghost_slots is None:
             torch.ops.trtllm.migrate_to_host_accessible(wt)
         else:
-            # Restores load these slots with GPU copies, so they need not be host accessible.
-            torch.ops.trtllm.moe_ghost_slot_storage(wt, self.ghost_slots)
+            # Host accessible only for online EPLB, whose updates load them every step; restores of static
+            # placements load them with GPU copies.
+            host_accessible = (self.updates_enabled
+                               and _ghost_slot_memory_host_accessible())
+            torch.ops.trtllm.moe_ghost_slot_storage(wt, self.ghost_slots,
+                                                    host_accessible)
         torch.cuda.empty_cache()
 
     def register_weight_slots_after_to_cuda(self):
@@ -1215,8 +1225,9 @@ class MoeLoadBalancer:
         """
         mode = self.extra_slots_mode()
         if mode in ("ghost", "replicas+ghost"):
-            # Ghost slots are not host accessible: restores and online EPLB's updates copy on the GPU.
-            self.set_use_gpu_memcpy(True)
+            if mode == "ghost" or not _ghost_slot_memory_host_accessible():
+                # Only GPU copies load ghost slots in device memory.
+                self.set_use_gpu_memcpy(True)
             for layer in self.single_layer_load_balancers:
                 placement = np.asarray(layer.initial_weight_assignments,
                                        dtype=np.int32).reshape(
@@ -1237,8 +1248,10 @@ class MoeLoadBalancer:
         maps it). Online
         EPLB keeps ``replicas`` in them (a loss reroutes to them or restores
         into them); where its slots cannot hold every expert after a failure,
-        ``replicas+empty`` (the default) or ``replicas+ghost``: the ghost slots
-        appended to each rank are ``extra_slots`` slots too.
+        ``replicas+ghost`` or ``replicas+empty``: the ghost slots appended to
+        each rank are ``extra_slots`` slots too, by default ``ghost`` where
+        ghost slot memory can be host accessible (CPU copies load it as they
+        load EPLB's other slots) and ``empty`` elsewhere.
         """
         if not peer_loss_recovery_enabled():
             return None
@@ -1247,7 +1260,10 @@ class MoeLoadBalancer:
             return extra_slots or "ghost"
         if any(layer.ghost_slot_count
                for layer in self.single_layer_load_balancers):
-            return f"replicas+{extra_slots or 'empty'}"
+            if extra_slots is None:
+                host_accessible = _ghost_slot_memory_host_accessible()
+                extra_slots = "ghost" if host_accessible else "empty"
+            return f"replicas+{extra_slots}"
         return "replicas"
 
     def finalize_model(self):
@@ -1283,6 +1299,11 @@ class MoeLoadBalancer:
                 f"WideEP peer-loss recovery appends {layer.ghost_slot_count} {mode.split('+')[1]} slots per "
                 f"rank to online EPLB's {layer.slot_count_per_rank - layer.ghost_slot_count}"
             )
+            mappings, mapped_bytes = _tbr.ghost_slot_memory_host_mappings()
+            if mappings:
+                logger.info(
+                    f"Ghost slot memory: {mappings} host mappings of {mapped_bytes / (1 << 30):.2f} GiB on rank 0 "
+                    "(GDRCopy pins where GPU memory is not a NUMA node)")
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):

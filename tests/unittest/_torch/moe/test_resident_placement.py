@@ -159,7 +159,7 @@ def test_ghost_mode_unbacks_the_slots_that_empty_mode_empties(monkeypatch, ep_ra
     ):
         load_balancer.register_weight_slots_after_to_cuda()
     assert layer.ghost_slots == ghost
-    # Ghost slots are not host accessible: restores copy on the GPU.
+    # Static placements keep ghost slots in device memory: restores copy on the GPU.
     load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_called_once_with(True)
 
 
@@ -179,13 +179,21 @@ _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 
 
 def _online_load_balancer(
-    monkeypatch, placement=None, *, largest_loss, experts, eplb_slots, extra_slots="ghost"
+    monkeypatch,
+    placement=None,
+    *,
+    largest_loss,
+    experts,
+    eplb_slots,
+    extra_slots="ghost",
+    host_accessible=True,
 ):
     """An online-EPLB MoeLoadBalancer with WideEP peer-loss recovery over one native layer showing ``placement``.
 
-    ``largest_loss``: the most ranks one failure domain holds.
+    ``largest_loss``: the most ranks one failure domain holds; ``host_accessible``: whether ghost slot memory can be.
     """
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(f"{_MLB}._ghost_slot_memory_host_accessible", lambda: host_accessible)
     monkeypatch.setattr(
         f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig(extra_slots=extra_slots)
     )
@@ -205,19 +213,22 @@ def _online_load_balancer(
 
 
 @pytest.mark.parametrize(
-    "largest_loss, eplb_slots, ghost_slots, extra_slots, mode",
+    "largest_loss, eplb_slots, ghost_slots, extra_slots, host_accessible, mode",
     [
         # A node of two: two survivors need two slots each for four experts.
-        (2, 1, 1, "ghost", "replicas+ghost"),
-        (2, 1, 1, "empty", "replicas+empty"),
+        (2, 1, 1, "ghost", True, "replicas+ghost"),
+        (2, 1, 1, "empty", True, "replicas+empty"),
+        # By default ghost where ghost slot memory can be host accessible, else empty.
+        (2, 1, 1, None, True, "replicas+ghost"),
+        (2, 1, 1, None, False, "replicas+empty"),
         # One rank: three survivors still need two slots each.
-        (1, 1, 1, "ghost", "replicas+ghost"),
+        (1, 1, 1, "ghost", True, "replicas+ghost"),
         # EPLB's slots already hold every expert without a node: nothing is appended.
-        (2, 2, 0, "ghost", "replicas"),
+        (2, 2, 0, "ghost", True, "replicas"),
     ],
 )
 def test_online_eplb_gets_ghost_slots_only_where_its_slots_fall_short(
-    monkeypatch, largest_loss, eplb_slots, ghost_slots, extra_slots, mode
+    monkeypatch, largest_loss, eplb_slots, ghost_slots, extra_slots, host_accessible, mode
 ):
     load_balancer = _online_load_balancer(
         monkeypatch,
@@ -225,6 +236,7 @@ def test_online_eplb_gets_ghost_slots_only_where_its_slots_fall_short(
         experts=EXPERTS,
         eplb_slots=eplb_slots,
         extra_slots=extra_slots,
+        host_accessible=host_accessible,
     )
     (layer,) = load_balancer.single_layer_load_balancers
     load_balancer.load_balancer_impl.add_layer.assert_called_once_with(
@@ -260,9 +272,10 @@ def test_online_eplb_without_peer_loss_recovery_gets_no_ghost_slots(monkeypatch)
     assert load_balancer.extra_slots_mode() is None
 
 
-def test_ghost_slots_start_empty_and_unbacked(monkeypatch):
+@pytest.mark.parametrize("host_accessible", [True, False])
+def test_ghost_slots_start_empty_and_unbacked(monkeypatch, host_accessible):
     load_balancer = _online_load_balancer(
-        monkeypatch, largest_loss=2, experts=EXPERTS, eplb_slots=1
+        monkeypatch, largest_loss=2, experts=EXPERTS, eplb_slots=1, host_accessible=host_accessible
     )
     (layer,) = load_balancer.single_layer_load_balancers
     impl = layer.single_layer_load_balancer_impl
@@ -276,8 +289,16 @@ def test_ghost_slots_start_empty_and_unbacked(monkeypatch):
         impl.set_initial_weight_assignments.assert_called_with([0, -1, 1, -1, 2, -1, 3, -1])
     load_balancer.register_weight_slots_after_to_cuda()
     assert layer.ghost_slots == [1]
-    # Ghost slots are not host accessible: online EPLB's updates copy on the GPU.
-    load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_called_once_with(True)
+    # Online EPLB's updates load host-accessible ghost slots with CPU copies, others with GPU copies.
+    set_use_gpu_memcpy = load_balancer.load_balancer_impl.set_use_gpu_memcpy
+    if host_accessible:
+        set_use_gpu_memcpy.assert_not_called()
+    else:
+        set_use_gpu_memcpy.assert_called_once_with(True)
+    weights = Mock()
+    with patch(f"{_MLB}.torch") as torch:
+        layer.make_tensor_host_accessible(weights)
+    torch.ops.trtllm.moe_ghost_slot_storage.assert_called_once_with(weights, [1], host_accessible)
 
 
 # Six experts on two EPLB slots per rank (experts 0 and 2 twice) and one ghost slot per rank.
