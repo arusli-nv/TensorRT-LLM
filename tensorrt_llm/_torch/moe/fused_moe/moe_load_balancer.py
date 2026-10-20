@@ -253,22 +253,24 @@ class HostMoeTensorSharer:
                 aligned_size = self.align_size(data_size)
                 total_size += aligned_size
 
-        shm_name = self.get_shared_memory_name()
-        try:
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
-        except FileExistsError:
-            tensorrt_llm.logger.warning(
-                f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
-            )
-            existing_shm = shared_memory.SharedMemory(name=shm_name)
-            existing_shm.close()
-            existing_shm.unlink()
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
-        self.own_shm = shm
+        # A rank of a node that holds fewer experts than it has ranks may share none.
+        if total_size:
+            shm_name = self.get_shared_memory_name()
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name,
+                                                 create=True,
+                                                 size=total_size)
+            except FileExistsError:
+                tensorrt_llm.logger.warning(
+                    f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
+                )
+                existing_shm = shared_memory.SharedMemory(name=shm_name)
+                existing_shm.close()
+                existing_shm.unlink()
+                shm = shared_memory.SharedMemory(name=shm_name,
+                                                 create=True,
+                                                 size=total_size)
+            self.own_shm = shm
 
         offset = 0
         for name in self.names:
@@ -304,14 +306,13 @@ class HostMoeTensorSharer:
         Finalize the host tensor sharing.
         """
         for rank in range(self.local_size):
-            if rank == self.local_rank:
+            rank_expert_ids = self.rank_expert_ids(rank)
+            if rank == self.local_rank or not rank_expert_ids:
                 continue
 
             shm_name = self.get_shared_memory_name(rank)
             shm = shared_memory.SharedMemory(name=shm_name)
             self.imported_shms.append(shm)
-
-            rank_expert_ids = self.rank_expert_ids(rank)
 
             offset = 0
             for name in self.names:

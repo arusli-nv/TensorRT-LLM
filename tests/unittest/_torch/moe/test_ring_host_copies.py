@@ -49,6 +49,34 @@ def test_sharer_splits_the_experts_it_holds_over_the_node_s_ranks():
         sharer.share_host_tensor_with_shape(0, "w", torch.zeros(4))
 
 
+def test_a_rank_that_shares_no_expert_creates_no_shared_memory():
+    # Three experts over four ranks: local rank 0 loads none.
+    sharers = [_sharer(rank, 4, expert_count=3) for rank in range(4)]
+    assert sharers[0].own_expert_ids == []
+    for sharer in sharers:
+        sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharers)}")
+        for expert in range(3):
+            if expert in sharer.own_expert_ids:
+                sharer.share_host_tensor_with_shape(expert, "w", torch.full((4,), float(expert)))
+            else:
+                sharer.pre_register_host_tensor_with_shape(expert, "w", torch.float32, (4,))
+    try:
+        for sharer in sharers:
+            sharer.finalize_layer_weights()
+        assert sharers[0].own_shm is None
+        for sharer in sharers:
+            weights = {}
+            sharer.finalize_host_tensor_sharing(
+                lambda expert, name, t: weights.__setitem__(expert, t.tolist())
+            )
+            assert weights == {expert: [float(expert)] * 4 for expert in range(3)}
+    finally:
+        for sharer in sharers:
+            sharer.pre_shutdown_cleanup()
+        for sharer in sharers:
+            sharer.post_shutdown_cleanup()
+
+
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 # A launcher that maps ranks round-robin: node "a" runs ranks 0 and 2, node "b" ranks 1 and 3.
 _HOSTS = ["a", "b", "a", "b"]
