@@ -295,6 +295,8 @@ class NVLinkOneSided(Communication):
     COMBINE_INPUT_SIZE_INDEX = None
     COMBINE_RECV_OFFSET_INDEX = None
     COMBINE_RECV_SIZE_INDEX = None
+    EP_SIZE_INDEX = None
+    EPLB_STATS_NUM_EXPERTS_INDEX = None
     WORKSPACE_SIZE_INDEX = None
 
     @staticmethod
@@ -392,6 +394,8 @@ class NVLinkOneSided(Communication):
             cls.COMBINE_INPUT_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_SIZE_INDEX)
             cls.COMBINE_RECV_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_RECV_OFFSET_INDEX)
             cls.COMBINE_RECV_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_RECV_SIZE_INDEX)
+            cls.EP_SIZE_INDEX = int(thop.MOE_A2A_EP_SIZE_INDEX)
+            cls.EPLB_STATS_NUM_EXPERTS_INDEX = int(thop.MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX)
             cls.WORKSPACE_SIZE_INDEX = int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)
 
     def __init__(
@@ -740,7 +744,11 @@ class NVLinkOneSided(Communication):
             raise ValueError("Bound execution requires rank-mask mode (ep_group_health)")
         if self.can_use_cft_counted_writes:
             raise ValueError("Bound execution requires the fence path; CFT is enabled")
-        state.retain(self.mnnvl_mem, self._reset_local_workspace)
+        state.retain(
+            self.mnnvl_mem,
+            self._reset_local_workspace,
+            lambda source: self.source_write_ranges(self.moe_a2a_metainfo, source),
+        )
         state.track_layer(self.ep_rank, self.reset_state)
         self._execution_state = state
 
@@ -763,6 +771,34 @@ class NVLinkOneSided(Communication):
             int(meta[self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]),
             int(meta[self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]),
         )
+
+    @classmethod
+    def source_write_ranges(cls, metainfo: torch.Tensor, source: int) -> List[Tuple[int, int]]:
+        """Byte ranges ``[start, end)`` of every peer's workspace row (layout ``metainfo``) that bound dispatches
+        and combines of EP rank ``source`` may write: the fence path with fixed slots (moeAlltoAllKernels.cu).
+
+        Its receive count of either parity, its dispatch and combine completion flags, its EPLB statistics row
+        (a call's rows are at most the layout's expert count wide) and the whole dispatch payload region: each
+        call places its payloads in that region by their widths, so ``source``'s rows may lie anywhere in it. A
+        fence combine only reads a peer's combine input, and bound execution never uses CFT's regions.
+        """
+        cls._init_constants()
+        meta = [int(value) for value in metainfo.tolist()]
+        ep_size, experts = meta[cls.EP_SIZE_INDEX], meta[cls.EPLB_STATS_NUM_EXPERTS_INDEX]
+        recv = meta[cls.RECV_COUNTERS_OFFSET_INDEX]
+        stats = meta[cls.EPLB_GATHERED_STATS_OFFSET_INDEX]
+        payload = meta[cls.DISPATCH_PAYLOAD_OFFSET_INDEX]
+        words = [recv + 4 * source, recv + 4 * (ep_size + source)] + [
+            meta[index] + 4 * source
+            for index in (
+                cls.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
+                cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
+            )
+        ]
+        return [(word, word + 4) for word in words] + [
+            (stats, stats + 4 * (source + 1) * experts),
+            (payload, payload + meta[cls.DISPATCH_PAYLOAD_SIZE_INDEX]),
+        ]
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:

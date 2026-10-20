@@ -2,17 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """EPLB host copies of a subset of the experts, as WideEP fault tolerance keeps them in a ring of nodes."""
 
+import functools
 import threading
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     HostMoeTensorSharer,
     MoeLoadBalancer,
     ring_copy_nodes,
 )
+from tensorrt_llm.bindings import internal
 
 pytestmark = pytest.mark.cpu_only
 
@@ -89,6 +92,11 @@ _ASSIGNMENTS = [0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 0]
 _WEIGHTS = {"w1": (300, torch.uint8), "w2": (100, torch.float16)}
 
 
+def _no_writes(rank: int) -> list:
+    """Write ranges of a workspace no all-to-all writes."""
+    return []
+
+
 def test_ring_keeps_each_node_s_copies_on_the_node_before_it():
     hosts = ["b", "a", "b", "a", "c", "c"]
     # Nodes by first rank: b (0, 2), a (1, 3), c (4, 5); b's copies live on c, a's on b, c's on a.
@@ -100,9 +108,17 @@ def test_a_single_node_keeps_its_own_copies():
     assert ring_copy_nodes(["a"] * 4) == [(0, 1, 2, 3)] * 4
 
 
-def _ring_load_balancer(monkeypatch, ep_rank=0, layers=1, layer_updates_per_iter=0):
-    """A MoeLoadBalancer with WideEP peer-loss recovery over native layers showing _PLACEMENT; with a static
-    placement (no ``layer_updates_per_iter``) it keeps ring host copies."""
+def _ring_load_balancer(
+    monkeypatch,
+    ep_rank=0,
+    layers=1,
+    layer_updates_per_iter=0,
+    placement=_PLACEMENT,
+    assignments=_ASSIGNMENTS,
+):
+    """A MoeLoadBalancer with WideEP peer-loss recovery over native layers showing ``placement`` (initial weight
+    ``assignments``); with a static placement (no ``layer_updates_per_iter``) it keeps ring host copies."""
+    slots = len(placement[0])
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_HOSTS))
     monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: 2)
@@ -114,14 +130,14 @@ def _ring_load_balancer(monkeypatch, ep_rank=0, layers=1, layer_updates_per_iter
         load_balancer.load_balancer_impl.add_layer.side_effect = [
             Mock(
                 get_layer_id=Mock(return_value=i),
-                get_old_rank_expert_ids=Mock(return_value=_PLACEMENT),
+                get_old_rank_expert_ids=Mock(return_value=placement),
             )
             for i in range(layers)
         ]
         for _ in range(layers):
-            layer = load_balancer.add_layer(_EXPERTS, 2, 3)
-            layer.set_initial_weight_assignments(_ASSIGNMENTS)
-            for slot in range(3):
+            layer = load_balancer.add_layer(_EXPERTS, 2, slots)
+            layer.set_initial_weight_assignments(assignments)
+            for slot in range(slots):
                 for name, (count, dtype) in _WEIGHTS.items():
                     layer.weight_slots[(slot, name)] = torch.zeros(count, dtype=dtype)
     return load_balancer, sharer
@@ -163,7 +179,7 @@ def test_the_copy_plan_is_the_same_on_every_rank_and_spreads_sources(monkeypatch
     for ep_rank in range(len(_HOSTS)):
         load_balancer, _ = _ring_load_balancer(monkeypatch, ep_rank)
         placements = load_balancer.recovery_placements([3])
-        plan = load_balancer.restore_copy_plan([3], placements, 2048)
+        plan = load_balancer.restore_copy_plan([3], placements, 2048, _no_writes)
         plans.append((plan, load_balancer.placement_digest([3], placements, plan)))
     assert all((plan == plans[0][0]).all() and digest == plans[0][1] for plan, digest in plans)
     # Rank 3's experts 6 and 7 go to the ghost slots of ranks 0 and 1, copied by node a's ranks 0 and 2 in turn.
@@ -182,7 +198,7 @@ def test_the_copy_plan_alternates_workspace_halves_between_chunks(monkeypatch):
     load_balancer, _ = _ring_load_balancer(monkeypatch, layers=2)
     placements = load_balancer.recovery_placements([3])
     # A 1024-byte workspace: chunks of 512 bytes, the second at offset 512, the third back at 0.
-    plan = load_balancer.restore_copy_plan([3], placements, 1024)
+    plan = load_balancer.restore_copy_plan([3], placements, 1024, _no_writes)
     target_0 = plan[plan[:, 2] == 0]
     assert target_0[:, [0, 1, 5, 7]].tolist() == [
         [0, 0, 0, 0],
@@ -192,7 +208,7 @@ def test_the_copy_plan_alternates_workspace_halves_between_chunks(monkeypatch):
     ]
     assert (plan[1:, 0] >= plan[:-1, 0]).all()
     with pytest.raises(ValueError, match="300-byte expert weight of MoE layer 0 does not fit"):
-        load_balancer.restore_copy_plan([3], placements, 512)
+        load_balancer.restore_copy_plan([3], placements, 512, _no_writes)
 
 
 def test_the_copy_plan_refuses_to_load_a_routed_slot(monkeypatch):
@@ -201,7 +217,7 @@ def test_the_copy_plan_refuses_to_load_a_routed_slot(monkeypatch):
     # Rank 0's slot 1 still routes expert 1.
     placement[0, 1] = 6
     with pytest.raises(ValueError, match="would overwrite a routed one"):
-        load_balancer.restore_copy_plan([3], [placement], 2048)
+        load_balancer.restore_copy_plan([3], [placement], 2048, _no_writes)
 
 
 def _expected(layer_idx, expert, name):
@@ -227,7 +243,7 @@ def test_staged_restores_load_every_slot_bit_exactly(monkeypatch):
                         ).view(_WEIGHTS[name][1])
         placements = load_balancer.recovery_placements(dead)
         ranks[ep_rank] = (load_balancer, placements)
-    plan = ranks[0][0].restore_copy_plan(dead, ranks[0][1], workspace.size(1))
+    plan = ranks[0][0].restore_copy_plan(dead, ranks[0][1], workspace.size(1), _no_writes)
     assert plan[-1, 0] >= 2
     barrier = threading.Barrier(len(survivors))
     errors = []
@@ -262,3 +278,108 @@ def test_ring_installs_the_staged_slots_without_loading_them(monkeypatch):
     load_balancer.install_recovery_placement([3], load_balancer.recovery_placements([3]))
     _, kwargs = load_balancer.load_balancer_impl.restore_placement.call_args
     assert kwargs == {"slots_loaded": True}
+
+
+# Bound NVLinkOneSided layouts small enough that ring restores take several chunks of _WEIGHTS.
+_TOKENS, _HIDDEN = 2, 128
+
+
+def _layout(ep_size, top_k, eplb_stats_num_experts, low_precision_combine=False):
+    return NVLinkOneSided._make_workspace_layout(
+        ep_size,
+        top_k,
+        _TOKENS,
+        _HIDDEN,
+        torch.bfloat16,
+        eplb_stats_num_experts,
+        0,
+        False,
+        low_precision_combine,
+    )
+
+
+def _field(meta, name):
+    return int(meta[int(getattr(internal.thop, f"MOE_A2A_{name}_INDEX"))])
+
+
+def _kernel_writes(meta, source):
+    """The byte ranges of a peer's row that the fence kernels with fixed slots write for ``source``.
+
+    Per payload list a bound dispatch may send (bf16, fp8 or NVFP4 activations with block scales, then expert
+    ids and router weights), moeA2ADispatchOp places each payload's ``[ep_size, capacity]`` rows in turn,
+    cacheline aligned; the kernels write the source's rows, its receive count of either parity, its dispatch and
+    combine completion flags and its EPLB statistics row. A fence combine only reads peers' combine input.
+    """
+    ep_size, capacity, top_k, experts = (
+        _field(meta, name) for name in ("EP_SIZE", "MAX_NUM_TOKENS", "TOP_K", "EPLB_STATS_NUM_EXPERTS")
+    )
+    payload_end = _field(meta, "DISPATCH_PAYLOAD_OFFSET") + _field(meta, "DISPATCH_PAYLOAD_SIZE")
+    writes = []
+    for activations in ([_HIDDEN * 2], [_HIDDEN], [_HIDDEN // 2, _HIDDEN // 16]):
+        offset = _field(meta, "DISPATCH_PAYLOAD_OFFSET")
+        for width in activations + [4 * top_k, 4 * top_k]:
+            writes.append((offset + source * capacity * width, offset + (source + 1) * capacity * width))
+            offset = (offset + ep_size * capacity * width + 127) // 128 * 128
+        assert offset <= payload_end, "the layout cannot hold these payloads"
+    recv = _field(meta, "RECV_COUNTERS_OFFSET")
+    words = [recv + 4 * source, recv + 4 * (ep_size + source)] + [
+        _field(meta, f"{name}_OFFSET") + 4 * source
+        for name in ("DISPATCH_COMPLETION_FLAGS", "COMBINE_COMPLETION_FLAGS")
+    ]
+    stats = _field(meta, "EPLB_GATHERED_STATS_OFFSET") + 4 * source * experts
+    return writes + [(word, word + 4) for word in words] + [(stats, stats + 4 * experts)]
+
+
+@pytest.mark.parametrize(
+    "ep_size, top_k, eplb_stats_num_experts", [(1, 1, None), (4, 2, 8), (8, 8, None), (72, 8, 256)]
+)
+def test_source_write_ranges_cover_every_write_of_the_source(ep_size, top_k, eplb_stats_num_experts):
+    meta = _layout(ep_size, top_k, eplb_stats_num_experts)
+    for source in range(ep_size):
+        ranges = NVLinkOneSided.source_write_ranges(meta, source)
+        for begin, end in _kernel_writes(meta, source):
+            assert begin == end or any(b <= begin and end <= e for b, e in ranges), (source, begin, end)
+
+
+# Two ghost slots per rank, so the survivors of a two-rank loss can hold every expert.
+_GHOSTS_PLACEMENT = [[0, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1]]
+_GHOSTS_ASSIGNMENTS = [(2 * rank + slot) % _EXPERTS for rank in range(4) for slot in range(4)]
+
+
+@pytest.mark.parametrize("dead", [[0], [3], [0, 3], [1, 3], [0, 2]])
+@pytest.mark.parametrize(
+    "top_k, eplb_stats_num_experts, low_precision_combine",
+    [(1, None, False), (2, _EXPERTS, False), (8, _EXPERTS, True)],
+)
+def test_the_copy_plan_never_stages_where_a_dead_rank_writes(
+    monkeypatch, dead, top_k, eplb_stats_num_experts, low_precision_combine
+):
+    meta = _layout(len(_HOSTS), top_k, eplb_stats_num_experts, low_precision_combine)
+    row_bytes = _field(meta, "WORKSPACE_SIZE")
+    write_ranges = functools.partial(NVLinkOneSided.source_write_ranges, meta)
+    plans = []
+    for ep_rank in range(len(_HOSTS)):
+        load_balancer, _ = _ring_load_balancer(
+            monkeypatch,
+            ep_rank,
+            layers=2,
+            placement=_GHOSTS_PLACEMENT,
+            assignments=_GHOSTS_ASSIGNMENTS,
+        )
+        placements = load_balancer.recovery_placements(dead)
+        plans.append(load_balancer.restore_copy_plan(dead, placements, row_bytes, write_ranges))
+    plan = plans[0]
+    assert all((other == plan).all() for other in plans)
+    # Every lost expert's weights, in more than one chunk per target, so the halves alternate.
+    assert len(plan) == 2 * 2 * 2 * len(dead) and plan[:, 0].max() >= 1
+    dead_writes = [
+        (begin, end) for rank in dead for begin, end in _kernel_writes(meta, rank) if begin < end
+    ]
+    rows = plan.tolist()
+    for i, (chunk, _, target, _, _, _, _, offset, size) in enumerate(rows):
+        assert 0 <= offset and offset + size <= row_bytes
+        assert not any(offset < end and begin < offset + size for begin, end in dead_writes)
+        # Rows of a target's chunk and of the chunk before (still being read) never share a byte.
+        for j, other in enumerate(rows):
+            if j != i and other[2] == target and other[0] in (chunk - 1, chunk):
+                assert other[7] + other[8] <= offset or offset + size <= other[7]

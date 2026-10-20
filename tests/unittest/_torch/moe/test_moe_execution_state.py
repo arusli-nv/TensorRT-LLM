@@ -133,7 +133,7 @@ def test_abort_rearm_and_exclusion_resume_after_peer_lost_mid_collective() -> No
         resets.append(1)
         NVLinkOneSided._reset_local_workspace(row_owner)
 
-    state.retain(_FakeMemory(), reset_workspace)
+    state.retain(_FakeMemory(), reset_workspace, lambda source: [])
 
     counts, output = _collective_round(state, workspace, meta, experts, payload)
     done = torch.cuda.Event()

@@ -6,9 +6,11 @@ Four processes, one GPU each, map a real MoE All-to-All workspace. The ring
 treats ranks 0 and 2 as one node and ranks 1 and 3 as the other; ranks 1 and 3
 are lost. The survivors copy the lost experts from host memory into the
 target's workspace (their own or the peer's, over NVLink) and from there into
-the target's slots, in chunks of half the workspace, as a WideEP restore does.
+the target's slots, in chunks of half of what the all-to-alls leave unwritten of the workspace, as a WideEP
+restore does: the bytes the lost ranks' all-to-alls may write still hold what they held before.
 """
 
+import functools
 import os
 import pickle
 import subprocess
@@ -25,12 +27,14 @@ from torch.distributed import TCPStore
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     SingleLayerMoeLoadBalancer,
     restore_lost_experts,
     ring_copy_nodes,
 )
+from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
 _EP_SIZE = 4
@@ -42,8 +46,9 @@ _EXPERTS = 8
 _PLACEMENT = [[0, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1]]
 # Per slot: w1 3 MiB of bytes, w2 1.5 MiB of bfloat16 (sizes of real expert weights' order of magnitude).
 _WEIGHTS = {"w1": (3 << 20, torch.uint8), "w2": (768 << 10, torch.bfloat16)}
-# Chunks of 4 MiB: w1 and w2 of one expert never share a chunk, so each target reads from both halves.
-_WORKSPACE_BYTES = 8 << 20
+# The workspace of a bound layer with 128 tokens per rank: about 3.5 MiB per half, so w1 and w2 of one expert
+# never share a chunk and each target reads from both halves.
+_TOKENS, _HIDDEN = 128, 7168
 _TIMEOUT = timedelta(seconds=300)
 
 
@@ -108,12 +113,13 @@ def _load_balancer(rank: int) -> MoeLoadBalancer:
     return load_balancer
 
 
-def _survivor(comm: _StoreComm, workspace: torch.Tensor) -> None:
+def _survivor(comm: _StoreComm, workspace: torch.Tensor, meta: torch.Tensor) -> None:
     load_balancer = _load_balancer(comm.rank)
     placement = np.array(_PLACEMENT, dtype=np.int32)
     placement[_DEAD] = -1
     assert restore_lost_experts(placement, [2, 3, 6, 7], _DEAD) == []
-    plan = load_balancer.restore_copy_plan(_DEAD, [placement], workspace.size(1))
+    write_ranges = functools.partial(NVLinkOneSided.source_write_ranges, meta)
+    plan = load_balancer.restore_copy_plan(_DEAD, [placement], workspace.size(1), write_ranges)
     # Both survivors copy into the other's workspace as well as their own.
     assert {(source, target) for source, target in plan[:, [6, 2]].tolist()} == {
         (0, 0),
@@ -134,6 +140,9 @@ def _survivor(comm: _StoreComm, workspace: torch.Tensor) -> None:
             loaded = layer.weight_slots[(slot, name)].cpu().view(torch.uint8)
             expected = _host_copy(0, expert, name).view(torch.uint8)
             assert torch.equal(loaded, expected), f"rank {comm.rank} slot {slot} {name}"
+    row = workspace[comm.rank]
+    for begin, end in (write for rank in _DEAD for write in write_ranges(rank)):
+        assert bool((row[begin:end] == 0xA5).all()), f"rank {comm.rank} staged into [{begin}, {end})"
 
 
 def _worker(rank: int, port: int) -> None:
@@ -144,10 +153,13 @@ def _worker(rank: int, port: int) -> None:
     comm = _StoreComm(store, rank)
     MnnvlMemory.comm = comm
     MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
-    memory = MnnvlMemory(mapping, _WORKSPACE_BYTES)
+    meta = NVLinkOneSided._make_workspace_layout(
+        _EP_SIZE, 1, _TOKENS, _HIDDEN, torch.bfloat16, None, 0, False, False
+    )
+    memory = MnnvlMemory(mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)]))
     workspace = memory.as_torch_strided_tensor(torch.uint8)
     if rank in _SURVIVORS:
-        _survivor(comm, workspace)
+        _survivor(comm, workspace, meta)
     # The lost ranks keep their workspaces mapped until the survivors are done.
     comm.barrier()
 

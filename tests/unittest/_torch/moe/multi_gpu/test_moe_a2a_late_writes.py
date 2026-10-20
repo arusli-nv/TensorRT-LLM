@@ -164,6 +164,11 @@ def _survivor(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> N
         live[start:end] = False
     contaminated = ((row != sentinel) & live).nonzero().flatten()
     assert contaminated.numel() == 0, f"bytes outside the victim's storage: {contaminated[:16]}"
+    # Ring restores stage around what source_write_ranges reports for a lost rank: it covers those bytes.
+    staged = torch.ones_like(row, dtype=torch.bool)
+    for start, end in NVLinkOneSided.source_write_ranges(meta, _VICTIM):
+        staged[start:end] = False
+    assert not bool((~live & staged).any()), "source_write_ranges misses storage the victim owns"
 
     # Exclude the victim and rearm as MoeExecutionState.rearm does for NVLinkOneSided.
     mask[0] = 1 << _SURVIVOR

@@ -16,6 +16,8 @@ from .nvlink_one_sided import NVLinkOneSided
 
 # Index of the ``requested`` word in the abort record.
 _ABORT_REQUESTED = 0
+# EP rank -> byte ranges [start, end) of a workspace row that its collectives may write.
+WriteRanges = Callable[[int], list[tuple[int, int]]]
 
 
 def _mask_tensor(health: EPGroupHealth) -> torch.Tensor:
@@ -42,8 +44,8 @@ class MoeExecutionState:
         # needs no CUDA work to make progress.
         self.abort = device_visible_host_zeros(2, torch.int32)
         self.active_rank_mask = _mask_tensor(ep_group_health).to(device)
-        # Retained workspaces and their reset callbacks, keyed by allocation.
-        self._workspaces: dict[int, tuple[MnnvlMemory, Callable[[], None]]] = {}
+        # Retained workspaces with their reset and source write ranges callbacks, keyed by allocation.
+        self._workspaces: dict[int, tuple[MnnvlMemory, Callable[[], None], WriteRanges]] = {}
         # Bound layers: (EP rank, reset of the layer's dispatch/combine state machine).
         self._layers: list[tuple[int, Callable[[], None]]] = []
         self.progress_comm: NVLinkOneSided | None = None
@@ -90,23 +92,33 @@ class MoeExecutionState:
             comm.bind_execution_state(state)
         return state
 
-    def retain(self, memory: MnnvlMemory, reset_workspace: Callable[[], None]) -> None:
+    def retain(
+        self,
+        memory: MnnvlMemory,
+        reset_workspace: Callable[[], None],
+        write_ranges: WriteRanges,
+    ) -> None:
         """Keep a bound layer's workspace mapped until :meth:`close`.
 
         ``reset_workspace`` returns this rank's part of the workspace to its
-        initial state; layers sharing one workspace register it once.
+        initial state; ``write_ranges(source)`` are the byte ranges of a row that
+        EP rank ``source``'s collectives on it may write. Layers sharing one
+        workspace register them once.
         """
         if id(memory) not in self._workspaces:
             memory.pin()
-            self._workspaces[id(memory)] = (memory, reset_workspace)
+            self._workspaces[id(memory)] = (memory, reset_workspace, write_ranges)
 
     def staging_workspace(self) -> torch.Tensor:
         """The largest workspace, ``[ep_size, bytes]`` uint8; idle from a fenced abort to :meth:`rearm`."""
-        memory = max(
-            (memory for memory, _ in self._workspaces.values()),
-            key=lambda memory: memory.segment_size,
-        )
-        return memory.as_torch_strided_tensor(torch.uint8)
+        return self._staging()[0].as_torch_strided_tensor(torch.uint8)
+
+    def staging_write_ranges(self, source: int) -> list[tuple[int, int]]:
+        """Byte ranges ``[start, end)`` of a :meth:`staging_workspace` row that EP rank ``source`` may write."""
+        return self._staging()[2](source)
+
+    def _staging(self) -> tuple[MnnvlMemory, Callable[[], None], WriteRanges]:
+        return max(self._workspaces.values(), key=lambda entry: entry[0].segment_size)
 
     def track_layer(self, ep_rank: int, reset_state: Callable[[], None]) -> None:
         """Record a bound layer's EP rank and the reset of its dispatch/combine state machine."""
@@ -123,7 +135,7 @@ class MoeExecutionState:
         """
         torch.cuda.synchronize(self.active_rank_mask.device)
         self.abort.zero_()
-        for _, reset in self._workspaces.values():
+        for _, reset, _ in self._workspaces.values():
             reset()
         for _, reset_state in self._layers:
             reset_state()
@@ -157,6 +169,6 @@ class MoeExecutionState:
 
     def close(self) -> None:
         """Release the workspace pins. Only call after the last forward has completed."""
-        for memory, _ in self._workspaces.values():
+        for memory, _, _ in self._workspaces.values():
             memory.unpin()
         self._workspaces.clear()

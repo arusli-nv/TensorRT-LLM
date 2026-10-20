@@ -369,11 +369,14 @@ class PeerLossRecovery(RecoveryHook):
                 "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
             )
         if load_balancer.is_static_routing():
-            # Ring host copies: restores stage each weight through half the workspace; restore_copy_plan checks it.
+            # Ring host copies: restores stage each weight through half of what all-to-alls leave unwritten of
+            # the workspace; restore_copy_plan checks it.
+            state = engine.moe_execution_state
             load_balancer.restore_copy_plan(
                 [],
                 load_balancer.current_placements(),
-                engine.moe_execution_state.staging_workspace().size(1),
+                state.staging_workspace().size(1),
+                state.staging_write_ranges,
             )
         recoverable = tuple(domains)
         dist.enable_peer_loss_recovery()
@@ -1105,11 +1108,15 @@ class PeerLossRecovery(RecoveryHook):
     ) -> np.ndarray:
         """Copy the experts ``placements`` restores from the ring host copies into their slots; the copy plan.
 
-        After Propose the failed ranks are fenced and no all-to-all runs until the install rearms the workspaces.
+        After Propose the failed ranks are fenced and no all-to-all runs until the install rearms the workspaces;
+        the plan keeps off the bytes their all-to-alls still in flight may write.
         """
         start = time.monotonic()
-        workspace = self._executor.model_engine.moe_execution_state.staging_workspace()
-        copy_plan = load_balancer.restore_copy_plan(failed, placements, workspace.size(1))
+        state = self._executor.model_engine.moe_execution_state
+        workspace = state.staging_workspace()
+        copy_plan = load_balancer.restore_copy_plan(
+            failed, placements, workspace.size(1), state.staging_write_ranges
+        )
         self._among_survivors(
             "restored experts were copied",
             lambda: load_balancer.stage_restored_slots(

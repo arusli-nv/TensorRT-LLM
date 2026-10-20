@@ -1904,7 +1904,10 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
 
     failed = frozenset({FAILED_RANK})
     load_balancer.restore_copy_plan.assert_called_once_with(
-        failed, ["placement"], workspace.size.return_value
+        failed,
+        ["placement"],
+        workspace.size.return_value,
+        engine.moe_execution_state.staging_write_ranges,
     )
     workspace.size.assert_called_with(1)
     load_balancer.stage_restored_slots.assert_called_once_with(
@@ -1943,8 +1946,11 @@ def test_create_checks_the_staging_workspace_fits_with_ring_host_copies(monkeypa
         PeerLossRecovery.create(executor)
     load_balancer.restore_copy_plan.side_effect = None
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
-    workspace_bytes = executor.model_engine.moe_execution_state.staging_workspace().size(1)
+    state = executor.model_engine.moe_execution_state
     load_balancer.restore_copy_plan.assert_called_with(
-        [], load_balancer.current_placements(), workspace_bytes
+        [],
+        load_balancer.current_placements(),
+        state.staging_workspace().size(1),
+        state.staging_write_ranges,
     )
     assert load_balancer.restore_copy_plan.call_count == 2

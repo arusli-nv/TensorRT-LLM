@@ -934,6 +934,47 @@ def restore_lost_experts(placement: np.ndarray, lost: List[int],
     return unplaced
 
 
+def staging_halves(
+    row_bytes: int, write_ranges: Callable[[int], List[Tuple[int, int]]],
+    ep_size: int, dead_ranks: Iterable[int]
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """The byte ranges ``[start, end)`` of a ``row_bytes`` workspace row that no rank of ``dead_ranks`` may
+    write (``write_ranges(rank)``), as the two halves ring restores alternate between.
+
+    The halves split where half of the bytes no rank at all writes lie before: each half only grows as fewer
+    ranks are dead, so what fits with every rank dead fits for any.
+    """
+
+    def unwritten(ranks: Iterable[int]) -> List[Tuple[int, int]]:
+        ranges, start = [], 0
+        for begin, end in sorted(r for rank in ranks for r in write_ranges(rank)):
+            if begin > start:
+                ranges.append((start, begin))
+            start = max(start, end)
+        return ranges + [(start, row_bytes)] if start < row_bytes else ranges
+
+    shared = unwritten(range(ep_size))
+    split, left = row_bytes, sum(end - begin for begin, end in shared) // 2
+    for begin, end in shared:
+        if end - begin >= left:
+            split = begin + left
+            break
+        left -= end - begin
+    ranges = unwritten(dead_ranks)
+    return ([(begin, min(end, split)) for begin, end in ranges if begin < split],
+            [(max(begin, split), end) for begin, end in ranges if end > split])
+
+
+def _first_fit(ranges: List[Tuple[int, int]], cursor: int,
+               size: int) -> Optional[int]:
+    """The first aligned offset from ``cursor`` where ``size`` bytes fit in one of ``ranges``, or None."""
+    for begin, end in ranges:
+        start = HostMoeTensorSharer.align_size(max(begin, cursor))
+        if start + size <= end:
+            return start
+    return None
+
+
 def ring_copy_nodes(hosts: List[str]) -> List[Tuple[int, ...]]:
     """Per rank (``hosts``: its host), the ranks of the node keeping its home experts' copies: the node before
     its own in first-rank order, the last node for the first (a single node keeps its own)."""
@@ -1293,20 +1334,30 @@ class MoeLoadBalancer:
             digest.update(copy_plan.tobytes())
         return digest.hexdigest()
 
-    def restore_copy_plan(self, dead_ranks: Iterable[int],
-                          placements: List[np.ndarray],
-                          workspace_bytes: int) -> np.ndarray:
+    def restore_copy_plan(
+            self, dead_ranks: Iterable[int], placements: List[np.ndarray],
+            workspace_bytes: int,
+            write_ranges: Callable[[int], List[Tuple[int, int]]]) -> np.ndarray:
         """Ring host copies: rows (chunk, layer, target, slot, expert, weight by sorted name, source, workspace
         offset, bytes) that load the slots ``placements`` changes, in chunk order; the same on every rank.
 
-        Sources take turns over the live ranks of the expert's copy node. Per target, a chunk fills at most half
-        the workspace (``workspace_bytes`` per rank), alternating halves.
+        Sources take turns over the live ranks of the expert's copy node. Per target, a chunk fills one of the
+        ``staging_halves`` of its ``workspace_bytes`` row, alternating halves, so no weight is staged where a
+        rank of ``dead_ranks`` may still write (``write_ranges``).
         ValueError if a weight does not fit or ``placements`` loads a slot that still routes an expert.
         """
         dead = sorted(set(dead_ranks))
-        half = workspace_bytes // 2
+        halves = staging_halves(workspace_bytes, write_ranges, self.ep_size,
+                                dead)
+        # What fits with every rank dead fits in any plan (see staging_halves).
+        room = min(
+            max((end - HostMoeTensorSharer.align_size(begin)
+                 for begin, end in half),
+                default=0) for half in staging_halves(
+                     workspace_bytes, write_ranges, self.ep_size,
+                     range(self.ep_size)))
         chunk = np.zeros(self.ep_size, dtype=np.int64)
-        used = np.zeros(self.ep_size, dtype=np.int64)
+        cursor = np.zeros(self.ep_size, dtype=np.int64)
         turns: Dict[Tuple[int, ...], int] = {}
         rows = []
         for layer_idx, (layer, placement) in enumerate(
@@ -1315,11 +1366,11 @@ class MoeLoadBalancer:
                 t.nbytes for (slot, _), t in sorted(layer.weight_slots.items())
                 if slot == 0
             ]
-            if max(sizes) > half:
+            if max(sizes) > room:
                 raise ValueError(
                     f"A {max(sizes)}-byte expert weight of MoE layer {layer.get_layer_idx()} does not fit in "
-                    f"half the {workspace_bytes}-byte NVLinkOneSided workspace that ring host copies stage through"
-                )
+                    f"half of what all-to-alls leave unwritten of the {workspace_bytes}-byte NVLinkOneSided "
+                    "workspace rows that ring host copies stage through")
             masked = self._masked_placement(layer, dead)
             loaded = (placement != masked) & (placement >= 0)
             if (masked[loaded] >= 0).any():
@@ -1333,13 +1384,16 @@ class MoeLoadBalancer:
                 node = self.copy_nodes[layer.home_ranks[expert]]
                 turns[node] = turns.get(node, -1) + 1
                 for weight, size in enumerate(sizes):
-                    if used[target] + size > half:
+                    offset = _first_fit(halves[chunk[target] % 2],
+                                        cursor[target], size)
+                    if offset is None:
                         chunk[target] += 1
-                        used[target] = 0
+                        offset = _first_fit(halves[chunk[target] % 2], 0,
+                                            size)
                     rows.append((chunk[target], layer_idx, target, slot, expert,
-                                 weight, live[turns[node] % len(live)],
-                                 chunk[target] % 2 * half + used[target], size))
-                    used[target] += HostMoeTensorSharer.align_size(size)
+                                 weight, live[turns[node] % len(live)], offset,
+                                 size))
+                    cursor[target] = offset + size
         plan = np.array(rows, dtype=np.int64).reshape(-1, 9)
         return plan[np.argsort(plan[:, 0], kind="stable")]
 
