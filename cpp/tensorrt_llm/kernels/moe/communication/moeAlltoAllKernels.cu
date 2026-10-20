@@ -524,12 +524,20 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
 #endif
             count = *round_recv_count;
             // A count beyond the runtime capacity is corrupt. Dropping a live source's tokens would silently change
-            // the output, so trap as on a timeout.
+            // the output, so trap as on a timeout, unless an abort is pending: ranks that stop waiting drift apart in
+            // rounds, so a lost source's stale flag can match; the aborted step is discarded, so release the source.
             if (count < 0 || count > source_tokens)
             {
-                printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id, count,
-                    source, source_tokens);
-                asm volatile("trap;" ::: "memory");
+                if (ptrs.abort != nullptr && observe_abort(ptrs.abort))
+                {
+                    count = -1;
+                }
+                else
+                {
+                    printf("dispatch: rank %d received corrupt token count %d from rank %d (capacity %d)\n", rank_id,
+                        count, source, source_tokens);
+                    asm volatile("trap;" ::: "memory");
+                }
             }
         }
         ptrs.source_valid_counts[source] = count < 0 ? 0 : count;
