@@ -1085,7 +1085,7 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
 
     def finalize():
         calls.finalized += 1
-        calls.finalize()
+        return calls.finalize()
 
     def exit_(status):
         raise _Exit(status)
@@ -1101,6 +1101,7 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mpi_session, "logging",
                         SimpleNamespace(shutdown=lambda: None))
     monkeypatch.setattr(mpi_session, "global_mpi_rank", lambda: 5)
+    monkeypatch.setattr(mpi_session, "_mpi_finalize", lambda: finalize() or 0)
     monkeypatch.setattr(mpi_session.os, "_exit", exit_)
     calls.faulthandler = Mock()
     monkeypatch.setattr(mpi_session, "faulthandler", calls.faulthandler)
@@ -1134,10 +1135,7 @@ def test_leave_degraded_world_aborts_after_a_failed_task(_fake_world):
 def test_leave_degraded_world_exits_non_zero_when_finalize_fails(_fake_world):
     from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
 
-    def fail():
-        raise _FakeMPIException(75)
-
-    _fake_world.finalize = fail
+    _fake_world.finalize = lambda: 75  # an MPI error code
     with pytest.raises(_Exit) as exited:
         _leave_degraded_world(True)
     assert exited.value.args == (1, )

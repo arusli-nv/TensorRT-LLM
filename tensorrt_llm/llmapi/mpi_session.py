@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
+import ctypes
 import faulthandler
 import functools
 import itertools
@@ -115,6 +116,12 @@ def _is_departed_peer_failure(exc: BaseException) -> bool:
 _FINALIZE_GRACE_S = 30.0
 
 
+def _mpi_finalize() -> int:
+    """MPI_Finalize through ctypes, which releases the GIL while it runs (mpi4py's call holds it), so that
+    the timer thread of ``_finalize_and_exit`` can run. Returns the MPI error code."""
+    return ctypes.CDLL(mpi4py.MPI.__file__).MPI_Finalize()
+
+
 def _finalize_and_exit(status: int, where: str) -> NoReturn:
     """Finalize MPI (*where* names the exit path in the logs), then end this process with *status*.
 
@@ -145,12 +152,11 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
     watchdog = threading.Timer(_FINALIZE_GRACE_S, give_up)
     watchdog.daemon = True
     watchdog.start()
-    # The Timer needs the GIL, which MPI_Finalize may hold.
+    # A backstop that needs no GIL, should the Timer still not run.
     faulthandler.dump_traceback_later(2 * _FINALIZE_GRACE_S, exit=True)
-    try:
-        mpi4py.MPI.Finalize()
-    except mpi4py.MPI.Exception as e:
-        print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
+    error = _mpi_finalize()
+    if error:
+        print(f"MPI_Finalize failed: MPI error {error}", file=sys.stderr, flush=True)
         status = status or 1
     faulthandler.cancel_dump_traceback_later()
     watchdog.cancel()
