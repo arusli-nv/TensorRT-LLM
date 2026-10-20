@@ -1789,6 +1789,23 @@ def test_create_requires_the_hang_detector_to_outlast_a_shrink_waiting_for_a_fen
         PeerLossRecovery.create(executor)
 
 
+@pytest.mark.parametrize("mode,rank,warns", [("1", 0, True), ("1", 1, False), (None, 0, False)])
+def test_create_warns_on_rank0_when_only_detection_is_on(monkeypatch, mode, rank, warns):
+    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: False)
+    if mode is None:
+        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", mode)
+    warning = Mock()
+    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warning)
+    executor = _supported_executor()
+    executor.dist.rank = rank
+    assert type(PeerLossRecovery.create(executor)) is RecoveryHook
+    assert warning.called == warns
+    if warns:
+        assert "TLLM_FAULT_TOLERANCE_AUTHORITY" in warning.call_args.args[0]
+
+
 def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: False)
     executor = _supported_executor()

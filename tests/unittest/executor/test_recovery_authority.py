@@ -1071,3 +1071,22 @@ def test_status_body_reports_live_ranks_stages_and_failed_requests():
         "failed_requests": 256,
     }
     assert status_body(None) == {"state": "unprotected"}
+
+
+@pytest.mark.parametrize("mode,body", [("1", b'{"state":"unprotected"}'), (None, b"")])
+def test_health_reports_unprotected_when_only_detection_is_on(monkeypatch, mode, body):
+    import asyncio
+
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    if mode is None:
+        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", mode)
+    server = object.__new__(OpenAIServer)
+    server._check_health = lambda: True
+    server._recovery_status = None
+
+    response = asyncio.run(server.health())
+
+    assert response.status_code == 200 and response.body == body

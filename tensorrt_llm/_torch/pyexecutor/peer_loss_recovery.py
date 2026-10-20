@@ -5,6 +5,7 @@
 import collections
 import dataclasses
 import functools
+import os
 import socket
 import threading
 import time
@@ -25,7 +26,12 @@ from typing import (
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
+from tensorrt_llm._utils import (
+    FAULT_TOLERANCE_AUTHORITY_ENV,
+    FAULT_TOLERANCE_MODE_ENV,
+    is_mpi_peer_failure,
+    peer_loss_recovery_enabled,
+)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.executor.utils import peer_loss_retryable_message
@@ -355,6 +361,12 @@ class PeerLossRecovery(RecoveryHook):
                 the registration.
         """
         if not peer_loss_recovery_enabled():
+            if os.environ.get(FAULT_TOLERANCE_MODE_ENV) == "1" and executor.dist.rank == 0:
+                logger.warning(
+                    f"{FAULT_TOLERANCE_MODE_ENV}=1 without {FAULT_TOLERANCE_AUTHORITY_ENV}: the "
+                    "WideEP rank mask and its cost are on, but a peer loss is not recovered; set "
+                    f"{FAULT_TOLERANCE_AUTHORITY_ENV} to the recovery authority's address to recover"
+                )
             return RecoveryHook()
         from ..attention.backends.sparse.dsa import DSACacheManagerV2
 
