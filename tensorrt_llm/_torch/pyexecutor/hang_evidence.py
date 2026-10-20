@@ -17,8 +17,8 @@ authority's ``Fence``: of its own rank (its main thread is stuck, this thread
 still runs) by killing its process; of another rank (whose whole process may be
 stopped) after a grace period, by asking the MPI runtime to kill that rank's
 process (``pmix_fence``) on a separate thread, so that heartbeats keep flowing
-while the runtime answers. On the authority's ``Restart`` (every rank stalled) it
-ends its process with ``STALLED_EXIT_CODE``.
+while the runtime answers. On the authority's ``Restart`` (a hang no fence can
+recover) it ends its process with ``STALLED_EXIT_CODE``.
 """
 
 from __future__ import annotations

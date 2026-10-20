@@ -32,8 +32,8 @@ RUNTIME_FENCE_CALL_S = 2.0
 # How long the workers' own fencing gets before the authority's fence command runs: a heartbeat interval until
 # the workers receive the Fence, then the runtime fence's grace and call.
 COMMAND_FENCE_GRACE_S = 5.0
-# The exit code of a worker the authority told that every rank stalled with no rank to blame (EX_TEMPFAIL): the
-# deployment must restart.
+# The exit code of a worker the authority told that the deployment hangs and no fence can recover it (EX_TEMPFAIL):
+# the deployment must restart.
 STALLED_EXIT_CODE = 75
 
 

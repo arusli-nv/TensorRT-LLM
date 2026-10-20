@@ -385,10 +385,12 @@ def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
     assert launched == [["ssh", "node-7", "kill", "-KILL", "4242"]]
 
 
-def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery():
+def test_authority_ends_the_deployment_when_rank_zero_hangs():
+    """Rank 0's loss is never recovered: its confirmed hang is terminal and every worker exits for a restart."""
     fenced = []
     authority = _serving_authority(fenced)
     authority.handle(b"heartbeat-0", Heartbeat(0, 0, False, "node", 100), 0.0)
+    sent = {}
     for now in range(1, 40):
         for rank in (1, 2, 3):
             authority.handle(
@@ -396,9 +398,20 @@ def test_authority_does_not_fence_rank_zero_and_ignores_evidence_during_recovery
                 Heartbeat(rank, 0, True, "node", 100 + rank),
                 float(now),
             )
-        authority.expire(float(now))
-    assert fenced == []  # rank 0's loss is never recovered: reported only
+        outbound = authority.expire(float(now))
+        if outbound:
+            sent[now] = outbound
+    ((_, outbound),) = sent.items()
+    assert authority.phase is Phase.ABORTED and "rank 0" in authority.abort_reason
+    assert authority.status().phase == "ABORTED"
+    aborts = [route for route, message in outbound if isinstance(message, Abort)]
+    restarts = [route for route, message in outbound if isinstance(message, Restart)]
+    assert sorted(aborts) == [f"rank-{rank}".encode() for rank in RANKS]
+    assert sorted(restarts) == [f"heartbeat-{rank}".encode() for rank in RANKS]
+    assert fenced == []
 
+
+def test_authority_ignores_evidence_during_recovery():
     fenced = []
     authority = _serving_authority(fenced)
     authority.handle(b"rank-0", Stopped(0, (2,)), 1.0)

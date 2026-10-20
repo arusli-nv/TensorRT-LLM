@@ -113,7 +113,8 @@ class RecoveryAuthority:
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
         hang_monitor: Judges the workers' heartbeats and device waits; None ignores them. A stall of every
-            rank it reports aborts (terminal) and has every worker end with ``STALLED_EXIT_CODE``.
+            rank it reports, or a hung rank whose loss is not admitted (rank 0), aborts (terminal) and has
+            every worker end with ``STALLED_EXIT_CODE``.
         fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason,
             host and pid): called if the rank's loss has not started a recovery
             ``COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
@@ -285,7 +286,7 @@ class RecoveryAuthority:
                 return self._on_hung(hung, now)
             stalled = self.hang_monitor.all_stalled(now)
             if stalled is not None:
-                return self._on_stalled(stalled)
+                return self._restart(f"every rank stalled ({stalled})")
         return []
 
     def _accept(self, message: NativeHeartbeat) -> bool:
@@ -319,19 +320,17 @@ class RecoveryAuthority:
             )
 
     def _on_hung(self, hung: HungRank, now: float) -> Outbound:
-        """Fence a recoverable hung rank.
+        """Fence a recoverable hung rank; end the deployment for one whose loss is not admitted.
 
         Its own evidence thread ends its process; another rank has the MPI runtime end it
         if that thread cannot (the process is stopped); the fence command if neither
         starts a recovery.
         """
         where = f"rank {hung.rank} (pid {hung.pid} on {hung.host or 'unknown host'})"
-        recoverable = (
-            self.phase in (Phase.SERVING, Phase.RECOVERED)
-            and hung.rank not in self.failed_ranks
-            and frozenset({hung.rank}) in self.admitted_domains
-        )
-        if not recoverable or not hung.pid:
+        # The monitor watches no departed rank, and rank 0's loss is never admitted.
+        if frozenset({hung.rank}) not in self.admitted_domains:
+            return self._restart(f"{where} is hung ({hung.reason}) and its loss is not recoverable")
+        if not hung.pid:
             logger.error(f"Recovery authority: {where} is hung ({hung.reason}); not fencing it")
             return []
         logger.error(f"Recovery authority: {where} is hung ({hung.reason}); fencing it")
@@ -343,9 +342,9 @@ class RecoveryAuthority:
             self._command_fence = (now + COMMAND_FENCE_GRACE_S, hung)
         return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
 
-    def _on_stalled(self, stalled: str) -> Outbound:
-        """End a deployment whose every rank stalled: terminal, and every worker exits for a restart."""
-        reason = f"every rank stalled ({stalled}); the deployment must restart"
+    def _restart(self, why: str) -> Outbound:
+        """End the deployment: terminal, and every worker exits for a restart."""
+        reason = f"{why}; the deployment must restart"
         outbound = self.abort(reason)
         return outbound + [(route, Restart(reason)) for route, _, _ in self._evidence.values()]
 

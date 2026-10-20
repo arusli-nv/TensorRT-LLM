@@ -192,7 +192,7 @@ class Fenced:
 
 @dataclass(frozen=True)
 class Restart:
-    """Authority -> each worker's evidence connection: every rank stalled with no rank to blame.
+    """Authority -> each worker's evidence connection: the deployment hangs and no fence can recover it.
 
     The worker ends its process with ``STALLED_EXIT_CODE`` so that the deployment is restarted.
     """
