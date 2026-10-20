@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
+import faulthandler
 import functools
 import itertools
 import logging
@@ -118,7 +119,8 @@ def _leave_degraded_world(clean: bool) -> NoReturn:
     process leaves on its own. After a clean task end it finalizes MPI with
     the other survivors (ULFM's MPI_Finalize first agrees on the lost ranks)
     and exits with status 0. After an error, or if finalizing takes longer
-    than ``_DEGRADED_FINALIZE_GRACE_S``, it ends the world with MPI_Abort.
+    than ``_DEGRADED_FINALIZE_GRACE_S``, it ends the world with MPI_Abort. A
+    native timer, which needs no GIL, ends the process if that cannot run.
     """
     world = mpi4py.MPI.COMM_WORLD
     if clean:
@@ -135,12 +137,16 @@ def _leave_degraded_world(clean: bool) -> NoReturn:
                                    lambda: world.Abort(1))
         watchdog.daemon = True
         watchdog.start()
+        # The Timer needs the GIL, which MPI_Finalize may hold.
+        faulthandler.dump_traceback_later(2 * _DEGRADED_FINALIZE_GRACE_S,
+                                          exit=True)
         status = 0
         try:
             mpi4py.MPI.Finalize()
         except mpi4py.MPI.Exception as e:
             print(f"MPI_Finalize failed: {e}", file=sys.stderr, flush=True)
             status = 1
+        faulthandler.cancel_dump_traceback_later()
         watchdog.cancel()
         watchdog.join()
         os._exit(status)

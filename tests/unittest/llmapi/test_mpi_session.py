@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -1087,6 +1087,8 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
                         SimpleNamespace(shutdown=lambda: None))
     monkeypatch.setattr(mpi_session, "global_mpi_rank", lambda: 5)
     monkeypatch.setattr(mpi_session.os, "_exit", exit_)
+    calls.faulthandler = Mock()
+    monkeypatch.setattr(mpi_session, "faulthandler", calls.faulthandler)
     return calls
 
 
@@ -1098,6 +1100,11 @@ def test_leave_degraded_world_finalizes_after_a_clean_task(_fake_world):
         _leave_degraded_world(True)
     assert exited.value.args == (0, )
     assert _fake_world.finalized == 1 and _fake_world.aborted == []
+    # A native timer bounds a Finalize that holds the GIL, and is cancelled after it.
+    assert _fake_world.faulthandler.mock_calls == [
+        call.dump_traceback_later(240.0, exit=True),
+        call.cancel_dump_traceback_later(),
+    ]
 
 
 @pytest.mark.cpu_only
