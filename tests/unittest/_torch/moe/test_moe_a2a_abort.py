@@ -11,6 +11,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 import torch
@@ -247,21 +248,34 @@ def test_valid_counts_take_a_peer_s_received_count() -> None:
 
 
 def test_valid_counts_wait_for_a_source_that_arrives_late() -> None:
-    """Does a source count as received when its count and flag arrive after the dispatch started?"""
+    """Does a source count as received when its count and flag arrive while the dispatch waits for it?"""
     workspace, meta, experts, payload = _setup(2)
-    controls, _ = _rank_mask_controls(3)
+    controls, abort = _rank_mask_controls(3)
     expected_flag = _word(workspace, _offset(meta, "FLAG_VAL")).item() + 1
     parity = ((expected_flag - 1) >> 1) & 1
+    count = _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1))
+    flag = _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4)
     torch.cuda.synchronize()
-    # Stand in for peer 1 on another stream: publish its count, then its flag, well after the dispatch
-    # started waiting for it.
+    _, _, _, counts = _dispatch(workspace, meta, experts, [payload, experts], controls)
+    done = torch.cuda.Event()
+    done.record()
+    time.sleep(0.2)
+    assert not done.query(), "the dispatch completed before peer 1 published its count"
+    # Stand in for peer 1 on another stream while the dispatch waits: its count, then its flag.
+    # The stream must run beside the waiting kernel (not with CUDA_DEVICE_MAX_CONNECTIONS=1).
     late = torch.cuda.Stream()
     with torch.cuda.stream(late):
-        torch.cuda._sleep(50_000_000)
-        _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * 2 + 1)).fill_(3)
-        _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(expected_flag)
-    _, _, _, counts = _dispatch(workspace, meta, experts, [payload, experts], controls)
-    torch.cuda.synchronize()
+        count.fill_(3)
+        flag.fill_(expected_flag)
+    deadline = time.monotonic() + 10
+    while not done.query():
+        if time.monotonic() > deadline:
+            # Release the dispatch so that the failure does not hang the process.
+            abort[0] = 1
+            torch.cuda.synchronize()
+            pytest.fail("the dispatch did not take peer 1's late count and flag")
+        time.sleep(0.01)
+    assert abort.tolist() == [0, 0]
     assert counts.tolist() == [_CAPACITY, 3]
 
 
