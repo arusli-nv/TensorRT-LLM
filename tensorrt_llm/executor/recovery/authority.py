@@ -66,8 +66,9 @@ Outbound = list[tuple[bytes, Message]]
 
 _CLOSE_LINGER_MS = 1000
 _REJECTION_LOG_INTERVAL_S = 10.0
-# Bounds on what unauthenticated peers can queue, so a flood cannot starve the loop's deadlines and messages:
-# datagrams handled per pass, and messages queued per connection.
+# Bounds on what unauthenticated peers can queue: datagrams handled per pass, and messages queued per connection.
+# Connections are not bounded and the loop takes one ROUTER message per pass, so N flooding connections still cut
+# the workers' share of the loop to about 1/(N+1).
 _MAX_DATAGRAMS_PER_PASS = 256
 _ROUTER_RCVHWM = 1024
 _HOSTNAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
