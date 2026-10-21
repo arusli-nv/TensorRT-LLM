@@ -246,6 +246,12 @@ def test_recovery_refuses_an_mpi_library_without_ulfm(world, monkeypatch):
         MPIDist(_mapping()).enable_peer_loss_recovery()
 
 
+def test_failed_ranks_need_mpi4py_4():
+    """mpi4py<4 cannot report failures: the callers' no-ULFM handling applies, not an AttributeError."""
+    with pytest.raises(NotImplementedError, match="mpi4py>=4"):
+        _utils.mpi_failed_ranks(SimpleNamespace())
+
+
 def test_recovery_communicators_return_errors(dist, world, native_watch, monkeypatch):
     """A peer failure must raise in each communicator recovery uses, not abort the job."""
 

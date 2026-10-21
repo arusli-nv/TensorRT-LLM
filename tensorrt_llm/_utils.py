@@ -636,8 +636,12 @@ def mpi_failed_ranks(comm: "MPI.Comm") -> frozenset[int]:
     """Ranks in ``mpi_comm()`` that ULFM reports failed in *comm*.
 
     Raises:
-        NotImplementedError: The MPI library cannot report failures (no ULFM).
+        NotImplementedError: The MPI library cannot report failures (no ULFM),
+            or mpi4py is older than 4.
     """
+    if not hasattr(comm, "Get_failed"):
+        raise NotImplementedError(
+            "Reporting failed MPI ranks requires mpi4py>=4")
     try:
         failed_group = comm.Get_failed()
     except MPI.Exception:
