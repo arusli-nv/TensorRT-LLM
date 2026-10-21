@@ -57,7 +57,8 @@ def get_wide_ep_ft_options(
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
     committed membership directly. The kernels read the mask at execution
-    time, so rank-mask mode works with CUDA graphs.
+    time, so rank-mask mode works with CUDA graphs once each communicator is
+    bound to an execution state; an unbound one refuses capture.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})

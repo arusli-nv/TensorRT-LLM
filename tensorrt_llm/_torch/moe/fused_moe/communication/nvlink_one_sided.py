@@ -1148,6 +1148,12 @@ class NVLinkOneSided(Communication):
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
         state = self._execution_state
+        if self._rank_mask_enabled and state is None and torch.cuda.is_current_stream_capturing():
+            # A replay would bypass the mask publication and the watchdog, and nothing could abort it.
+            raise RuntimeError(
+                "Rank-mask mode supports CUDA graphs only once bound to an execution state "
+                "(fault-tolerance recovery); disable CUDA graphs for detection-only fault tolerance"
+            )
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)

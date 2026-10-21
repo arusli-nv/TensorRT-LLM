@@ -252,6 +252,15 @@ def test_detection_only_publish_rewrites_the_mask_only_on_a_new_generation() -> 
     assert publish([1, 0, 0, 0], 1) == [1, 0, 0, 0]
 
 
+def test_an_unbound_rank_mask_dispatch_refuses_cuda_graph_capture(monkeypatch) -> None:
+    """Detection-only fault tolerance binds no execution state: nothing could abort a replayed collective."""
+    comm = _frontend(EPGroupHealth(2))
+    comm.mnnvl_mem.mapped = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="only once bound to an execution state"):
+        comm.dispatch(torch.empty(0), None, torch.empty(0), None, [1, 1])
+
+
 def test_for_model_refuses_models_it_cannot_bind() -> None:
     with pytest.raises(RuntimeError, match="NVLinkOneSided"):
         MoeExecutionState.for_model(torch.nn.Linear(1, 1))
