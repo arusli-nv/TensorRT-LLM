@@ -1551,6 +1551,37 @@ def test_a_request_run_again_fails_when_it_loses_its_rank_again():
     assert [m.generation for m in client.sent if isinstance(m, Installed)] == [1, 2]
 
 
+def test_a_request_run_again_that_reported_progress_runs_again_when_it_loses_its_rank_again():
+    """As above, but rank 3 reported a committed step of the request in a response gather before it was lost: the
+    request delivered nothing and is not what crashed the ranks, so it runs again."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, item)}
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+    recovery._executor.request_accumulated.clear()
+    recovery.requests_routed({3: [item]})
+    # Rank 3's part of a later gather: no response, a committed step of request 11.
+    recovery.responses_gathered(object(), [(), (), None, ([], [], [], [11])])
+    assert recovery._interrupted == set()
+
+    recovery._recover(_interrupted(lost))
+
+    assert recovery._executor.request_accumulated == [item]
+    assert not any(request_id == 11 for part in sent for request_id, _ in part)
+
+
 def _interrupting(recovery, failed, interrupted, progressed=frozenset()):
     """Report ``interrupted`` as the requests the loss interrupted on rank 1, which serves requests 11 and 12,
     and ``progressed`` as those of them that committed a step since an earlier loss interrupted them."""
@@ -1651,6 +1682,9 @@ def test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once()
         recovery.commit_step(batch, Mock())
 
     assert recovery._unprogressed == {11} and recovery._progressed == {12}
+    # The next response gather tells rank 0, once.
+    assert recovery.gathering_responses([]) == ([], [], [], [12])
+    assert recovery.gathering_responses([]) == ()
 
 
 def test_only_the_rank_a_rerun_request_is_routed_to_watches_its_progress():
@@ -1737,8 +1771,8 @@ def test_rank0_keeps_its_books_from_the_notes_of_each_gathered_part():
     ]
     parts = [owner.gathering_responses(step) for step in steps]
     assert [part[1:] for part in parts] == [
-        ([], [11, 12, 13]),
-        ([12, 23], []),
+        ([], [11, 12, 13], []),
+        ([12, 23], [], []),
     ]
     assert owner.gathering_responses([]) == ()
     fast, scan = _recovery(_FakeClient([]), rank=0), _recovery(_FakeClient([]), rank=0)

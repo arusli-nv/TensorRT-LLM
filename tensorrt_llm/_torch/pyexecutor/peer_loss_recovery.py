@@ -77,11 +77,12 @@ if TYPE_CHECKING:
 _REGISTRATION_TIMEOUT_S = 600.0
 
 Responses = List[Tuple[int, LlmResponse]]
-# One rank's part of a response gather: ``(responses, finished, streaming)``, or ``()`` when it has no
-# responses. ``finished``: ids of the responses that are an error or a final result. ``streaming``: ids of
-# the other responses whose request this rank had not answered yet. Rank 0 reads these instead of every
-# response it gathers. A plain tuple keeps rank 0's unpickling of every part cheap.
-ResponseContribution = Union[Tuple[()], Tuple[Responses, List[int], List[int]]]
+# One rank's part of a response gather: ``(responses, finished, streaming, progressed)``, or ``()`` when it has
+# no responses and no progress to report. ``finished``: ids of the responses that are an error or a final result.
+# ``streaming``: ids of the other responses whose request this rank had not answered yet. ``progressed``: ids of
+# the interrupted requests that committed a step since this rank's last gather. Rank 0 reads these instead of
+# every response it gathers. A plain tuple keeps rank 0's unpickling of every part cheap.
+ResponseContribution = Union[Tuple[()], Tuple[Responses, List[int], List[int], List[int]]]
 # A set of ranks lost together, as a sorted tuple: one rank or a whole node.
 FailureDomain = Tuple[int, ...]
 # A request and the context position, state and draft tokens it had before a step changed them.
@@ -328,9 +329,10 @@ class PeerLossRecovery(RecoveryHook):
         # On rank 0: the owned requests a loss interrupted (in a discarded step, or on the lost rank) and that have
         # not committed a step since; another interruption fails them.
         self._interrupted: Set[int] = set()
-        # This rank's requests a loss interrupted, until one of their steps commits; then the ones that did, until
-        # the next recovery tells rank 0.
+        # This rank's requests a loss interrupted, until one of their steps commits; then the ones that did: until
+        # the next response gather tells rank 0, and until the next recovery, in case that gather was interrupted.
         self._unprogressed: Set[int] = set()
+        self._progress_report: List[int] = []
         self._progressed: Set[int] = set()
         # The interrupted requests rank 0 re-admitted to run again, until routed or cancelled: the rank they are
         # routed to adds them to its ``_unprogressed``.
@@ -711,6 +713,7 @@ class PeerLossRecovery(RecoveryHook):
             request_id = request.parent_request_id if request.is_child else request.py_request_id
             if request_id in self._unprogressed:
                 self._unprogressed.discard(request_id)
+                self._progress_report.append(request_id)
                 self._progressed.add(request_id)
 
     # Request and response hooks
@@ -778,6 +781,7 @@ class PeerLossRecovery(RecoveryHook):
     ) -> ResponseContribution:
         """Keep this rank's part of a response gather for redelivery; returns it with rank 0's notes."""
         responses = list(responses)
+        progressed, self._progress_report = self._progress_report, []
         finished, streaming = [], []
         answering = self._answering
         for _, response in responses:
@@ -795,7 +799,7 @@ class PeerLossRecovery(RecoveryHook):
                 streaming.append(request_id)
         self._gather_count += 1
         self._gathers.append((self._gather_count, responses))
-        return (responses, finished, streaming) if responses else ()
+        return (responses, finished, streaming, progressed) if responses or progressed else ()
 
     def responses_gathered(
         self,
@@ -821,12 +825,16 @@ class PeerLossRecovery(RecoveryHook):
         for contribution in contributions:
             if isinstance(contribution, tuple):
                 if contribution:
-                    self._note_responses(contribution[1], contribution[2])
+                    self._note_responses(*contribution[1:])
             elif contribution is not None:
                 self._forget_finished(contribution)
 
-    def _note_responses(self, finished: Iterable[int], streaming: Iterable[int]) -> None:
-        """Retire the requests ``finished`` ends; note the owned ones ``streaming`` answered (rank 0)."""
+    def _note_responses(
+        self, finished: Iterable[int], streaming: Iterable[int], progressed: Iterable[int]
+    ) -> None:
+        """Retire the requests ``finished`` ends; note the owned ones ``streaming`` answered and those that
+        ``progressed`` since a loss interrupted them (rank 0)."""
+        self._interrupted.difference_update(progressed)
         for request_id in finished:
             self._retire(self._parent_ids.get(request_id, request_id))
         for request_id in streaming:
@@ -1040,6 +1048,7 @@ class PeerLossRecovery(RecoveryHook):
             departed=None,
         )
         self._progressed = set()
+        self._progress_report = []
         if self._request_owners is not None:
             self._interrupted.difference_update(*(entry[3] for entry in gathered if entry))
         held = [entry and entry[0] for entry in gathered]
@@ -1452,7 +1461,8 @@ class PeerLossRecovery(RecoveryHook):
         interrupted once at most without progress: the survivors' ``interrupted`` requests (in the
         discarded steps) that a loss interrupted before and that committed no step since fail, as
         they may be what crashes the ranks; so do the departed ranks' requests that a loss
-        interrupted before, whose steps since are not known.
+        interrupted before and that reported no committed step since (in a response gather rank 0
+        processed).
 
         Returns:
             The ids of the requests that run again and how many fail (on rank 0; none elsewhere).

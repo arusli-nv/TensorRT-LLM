@@ -5,7 +5,8 @@ one GPU's process ends the whole job. With fault tolerance on, the surviving ran
 the step in flight, agree on who survived, route the lost rank's experts to their copies on other GPUs and
 keep serving on the same CUDA graphs. Requests the lost rank was serving run again on a survivor if they
 had delivered nothing yet, else end with a retryable error; every other request continues. A request that a
-second loss interrupts ends with a retryable error, whichever ranks were lost.
+second loss interrupts before it completed a step since the first ends with a retryable error, whichever ranks
+were lost.
 
 ## Requirements
 
@@ -264,7 +265,9 @@ and multimodal requests under the overlap scheduler.
 - The requests the lost ranks were serving that had delivered nothing yet (every non-streaming request, and a
   streaming one before its first token) run again from their prompt on a survivor. A request is interrupted
   once at most without progress: one that an earlier loss interrupted (it ran again, or a survivor was running
-  it) and that completed no step since may be what crashes the ranks, so it is quarantined, not continued. Quarantined requests, and streaming requests of the
+  it) and that completed no step since may be what crashes the ranks, so it is quarantined, not continued. A
+  lost rank's steps count once it reported them with its responses, so a step it completed just before the loss
+  may not count. Quarantined requests, and streaming requests of the
   lost ranks that had already delivered tokens (they are not continued on a survivor), end with a retryable
   error. Non-streaming requests get HTTP 503 with `Retry-After: 1` and the error code `peer_loss_retryable`.
   Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE `error`

@@ -9326,10 +9326,11 @@ class PyExecutor:
                     for resp in responses_list:
                         if resp is None:
                             continue
-                        if (isinstance(resp, tuple) and len(resp) == 3
+                        if (isinstance(resp, tuple) and len(resp) == 4
                                 and isinstance(resp[0], list)):
                             # A peer-loss-recovery ResponseContribution:
-                            # (responses, finished, streaming), or ().
+                            # (responses, finished, streaming, progressed),
+                            # or ().
                             resp = resp[0]
                         if not isinstance(resp, (list, tuple)):
                             # A non-list contribution means the TP collective
