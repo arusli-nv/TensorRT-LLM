@@ -275,6 +275,6 @@ def test_fail_unservable_requests_responds_from_rank0_only():
             ((req_id, response),) = responses
             assert req_id == 7 and response.client_id == 11
             assert f"rank {FAILED_RANK} is not serving" in response.error_msg
-            assert is_peer_loss_retryable_message(response.error_msg)
+            assert not is_peer_loss_retryable_message(response.error_msg)
         else:
             assert responses == []

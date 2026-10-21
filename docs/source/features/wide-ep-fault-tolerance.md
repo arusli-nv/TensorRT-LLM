@@ -157,7 +157,8 @@ from a loss still stops: stopping `trtllm-serve` finalizes MPI on each process, 
 After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
 (and may take more of the KV cache for restored experts). A request re-run after its rank's loss (see below) runs
 on any survivor, even if it was pinned to the lost rank with `attention_dp_relax=False`; a new request pinned to a
-lost rank fails with "Attention DP rank N is not serving" (HTTP 503, see below). If a re-run or retried request
+lost rank fails with "Attention DP rank N is not serving" (HTTP 400, not retryable: the rank does not come back
+until the deployment restarts; send the request without `attention_dp_rank` or with `attention_dp_relax`). If a re-run or retried request
 that crashes every rank it runs on lands on rank 0, or on a rank whose loss the remaining slots cannot cover, its
 crash ends the deployment; the server does not recognize a client's retry of a failed request.
 
