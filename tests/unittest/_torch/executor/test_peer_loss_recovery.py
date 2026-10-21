@@ -1814,10 +1814,31 @@ def test_recovery_resends_gathers_rank0_did_not_process(processed):
     assert recovery._undelivered_terminations == []
 
 
-def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held():
+def test_gathers_are_held_until_the_next_rank_state_exchange_however_many():
+    """Every gather since the last exchange is resent; the exchange releases the earlier ones."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
-    for number in range(peer_loss_recovery._GATHER_HISTORY + 1):
+    released = [(0, Mock(name="released"))]
+    recovery.gathering_responses(released)
+    recovery.fetching_requests()
+    held = [[(number, Mock())] for number in range(1, 21)]
+    for responses in held:
+        recovery.gathering_responses(responses)
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (1, set()) if isinstance(value, tuple) else value
+    )
+    sent = []
+    recovery._executor._enqueue_responses = lambda responses: sent.append(list(responses))
+    recovery._recover(_interrupted())
+    assert sent == [[response for responses in held for response in responses]]
+
+
+def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held():
+    """Rank 0 claims it did not process a gather made before the last exchange."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    for number in range(2):
         recovery.gathering_responses([(number, Mock())])
+    recovery.fetching_requests()
+    recovery.gathering_responses([(2, Mock())])
     recovery._executor.dist.broadcast.side_effect = (
         lambda value, root: (0, set()) if isinstance(value, tuple) else value
     )

@@ -87,7 +87,6 @@ FailureDomain = Tuple[int, ...]
 # A request and the context position, state and draft tokens it had before a step changed them.
 StepChange = Tuple[LlmRequest, int, LlmRequestState, List[int]]
 _T = TypeVar("_T")
-_GATHER_HISTORY = 8
 # Free device memory left after ghost slots are mapped: the KV cache rounds its quota to its chunk size per pool.
 _GHOST_MARGIN_BYTES = 256 << 20
 
@@ -322,11 +321,11 @@ class PeerLossRecovery(RecoveryHook):
         # The native heartbeat (HeartbeatSender) while hang detection reports.
         self._heartbeat = None
         # Response gathers are numbered identically on every rank. A rank can
-        # complete the rooted gathers of an iteration before rank 0 does, but
-        # not pass the iteration's allgather, so each rank keeps its last
-        # contributions, more than one iteration makes.
+        # complete the rooted gathers of an iteration before rank 0 processes
+        # them, but not pass the next rank-state exchange: each rank keeps its
+        # contributions since that exchange (see fetching_requests).
         self._gather_count = 0
-        self._gathers: Deque[Tuple[int, Responses]] = collections.deque(maxlen=_GATHER_HISTORY)
+        self._gathers: Deque[Tuple[int, Responses]] = collections.deque()
         self._last_processed_gather = 0
         # Finished requests whose termination waits for their responses.
         self._undelivered_terminations: List[LlmRequest] = []
@@ -719,8 +718,12 @@ class PeerLossRecovery(RecoveryHook):
     # Request and response hooks
 
     def fetching_requests(self) -> None:
-        """The rank-state exchange before a fetch showed every rank received the last broadcast."""
+        """The rank-state exchange before a fetch showed every rank received the last broadcast.
+
+        Rank 0 joined it after processing every earlier response gather, so none is owed any more.
+        """
         self._broadcast_control_items = []
+        self._gathers.clear()
 
     def broadcast_requests(
         self, broadcast: Callable[[List["RequestQueueItem"]], _T], items: List["RequestQueueItem"]
