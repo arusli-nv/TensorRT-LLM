@@ -317,8 +317,8 @@ __host__ __device__ constexpr uint32_t make_warp_lane_mask()
     return (NUM_LANES == 32) ? ~0U : ((1U << NUM_LANES) - 1U);
 }
 
-// Returns the id this lane routes by: the expert id, or with expert_to_slot its slot id.
-template <int TOP_K, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
+// Returns the id this lane routes by: the expert id, or with USE_EXPERT_TO_SLOT its slot id from expert_to_slot.
+template <int TOP_K, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING, bool USE_EXPERT_TO_SLOT>
 __device__ __forceinline__ int route_dispatch_token(int32_t const* token_selected_experts,
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
     int* topk_target_indices, uint32_t lane_mask)
@@ -337,7 +337,7 @@ __device__ __forceinline__ int route_dispatch_token(int32_t const* token_selecte
     int const ep_base = num_experts / ep_size;
     int const ep_remainder = num_experts - ep_base * ep_size;
     int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-    if (ptrs.expert_to_slot != nullptr)
+    if constexpr (USE_EXPERT_TO_SLOT)
     {
         expert_id
             = expert_id >= 0 && expert_id < ptrs.num_routed_experts ? ptrs.expert_to_slot[expert_id] : num_experts;
@@ -614,7 +614,7 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
     }
 }
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING, bool USE_EXPERT_TO_SLOT>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
@@ -668,9 +668,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         __shared__ __align__(16) int32_t routed_ids[TOP_K];
         if (thread_idx < TOP_K)
         {
-            routed_ids[thread_idx] = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(
-                token_selected_experts, ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks,
-                smem_topk_target_indices, kRoutingLaneMask);
+            int const routed_id
+                = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>(
+                    token_selected_experts, ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks,
+                    smem_topk_target_indices, kRoutingLaneMask);
+            if constexpr (USE_EXPERT_TO_SLOT)
+            {
+                routed_ids[thread_idx] = routed_id;
+            }
             // Compact routing slots may be written by a different lane.
             __syncwarp(kRoutingLaneMask);
 
@@ -700,7 +705,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         {
             uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
             int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-            uint8_t const* src_ptr = ptrs.expert_to_slot != nullptr && payload_idx == ptrs.expert_id_payload_index
+            uint8_t const* src_ptr = USE_EXPERT_TO_SLOT && payload_idx == ptrs.expert_id_payload_index
                 ? reinterpret_cast<uint8_t const*>(routed_ids)
                 : src_data + local_token_idx * bytes_per_token;
             vectorized_dispatch<TOP_K, USE_RANK_COMPACT_ROUTING>(
@@ -988,7 +993,7 @@ __device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers con
     }
 }
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING, bool USE_EXPERT_TO_SLOT>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
@@ -1063,9 +1068,9 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         int routed_id = 0;
         if (threadIdx.x < TOP_K)
         {
-            routed_id = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts,
-                ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
-                kRoutingLaneMask);
+            routed_id = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>(
+                token_selected_experts, ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks,
+                smem_topk_target_indices, kRoutingLaneMask);
         }
         __syncthreads();
 
@@ -1098,7 +1103,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             cft_barrier_wait_parity(tma_bar, 0);
         }
         __syncthreads();
-        if (ptrs.expert_to_slot != nullptr)
+        if constexpr (USE_EXPERT_TO_SLOT)
         {
             // Send the routed slot ids in place of the staged expert ids. The generic-proxy stores must be visible
             // to the async proxy (s2g and fabric puts) that reads the staging buffer.
@@ -1314,7 +1319,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 #endif // !DISABLE_SYNC_FOR_PROFILING
 }
 #else  // TLLM_MOE_A2A_COMPILE_SM100
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING, bool USE_EXPERT_TO_SLOT>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
@@ -1483,17 +1488,19 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
                     SWITCH_BOOL(params.ep_size < TOP_K, ENABLE_RANK_COMPACT_ROUTING, {
-                        auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
-                            ENABLE_RANK_COMPACT_ROUTING>;
-                        if (shared_bytes > kDefaultDynamicSmemBytes)
-                        {
-                            TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-                        }
-                        launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
-                            shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
-                            params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                            params.ep_size, params.num_experts, params.eplb_stats_num_experts);
+                        SWITCH_BOOL(params.expert_to_slot != nullptr, USE_EXPERT_TO_SLOT, {
+                            auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
+                                ENABLE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>;
+                            if (shared_bytes > kDefaultDynamicSmemBytes)
+                            {
+                                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                                    kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                            }
+                            launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
+                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
+                        });
                     });
                 });
             });
@@ -1505,12 +1512,14 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
                     SWITCH_BOOL(params.ep_size < TOP_K, ENABLE_RANK_COMPACT_ROUTING, {
-                        auto kernel_fn
-                            = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, ENABLE_RANK_COMPACT_ROUTING>;
-                        launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                            params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                            params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
-                            params.num_experts, params.eplb_stats_num_experts);
+                        SWITCH_BOOL(params.expert_to_slot != nullptr, USE_EXPERT_TO_SLOT, {
+                            auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
+                                ENABLE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>;
+                            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
+                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
+                        });
                     });
                 });
             });
