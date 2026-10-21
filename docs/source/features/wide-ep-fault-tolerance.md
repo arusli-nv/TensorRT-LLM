@@ -204,9 +204,9 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
 - Two ranks hung at once are not confirmed (no single rank is waited on by every peer); they end the job
   through the executor's hang detection or the MoE communication timeout.
 - A fenced process stuck in the GPU driver may not exit when killed, which can stall the job's shutdown.
-- Nothing restarts the authority, and the workers register only at startup: an authority started again
-  reports `starting` (503) until the deployment restarts. Restart the authority only together with the job,
-  with a new key, never under a running job.
+- Nothing restarts the authority, and the workers register only at startup: under an authority started again,
+  `/health` reports `unprotected` and a loss ends the job until the deployment restarts. Restart the authority
+  only together with the job, with a new key, never under a running job.
 - Under ULFM, `MPI_Finalize` can hang, so a stop can take up to about 30 s longer than without fault
   tolerance. Give the orchestrator's grace period room for it (Kubernetes' default is 30 s).
 - Stopping the job (`scancel`, deleting its pods) signals every rank; a rank signaled a moment after another may
@@ -268,8 +268,8 @@ and multimodal requests under the overlap scheduler.
 
 `trtllm-serve` asks the recovery authority for its state. `GET /health` returns 200 with the state while the
 server serves: `healthy` (no loss), `degraded` (serving after a recovery) or `unprotected` (the authority did not
-answer, so a loss would end the job: alert, but keep serving). It returns 503 with the state while `starting`,
-`recovering`, `terminal` (a recovery aborted: restart the deployment) or `unknown` (the authority reported a
+answer, or restarted and lost the deployment's state, so a loss would end the job: alert, but keep serving; restart
+the deployment to protect it again). It returns 503 with the state while `recovering`, `terminal` (a recovery aborted: restart the deployment) or `unknown` (the authority reported a
 state this server does not know, for example from a different version). The JSON body always has `state`. While
 the authority answers it also has `generation` (the membership generation), `live_ranks` and `failed_ranks`
 (sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `agree` and `install` durations),

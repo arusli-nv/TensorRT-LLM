@@ -1061,7 +1061,8 @@ def test_server_probe_reads_the_status_and_reports_unprotected_without_an_answer
     try:
         status = probe.status()
         assert status is not None and status.phase == "REGISTERING"
-        assert health_state(status) == "starting"
+        # The server asks once its workers registered: an authority still registering restarted.
+        assert health_state(status) == "unprotected"
         # A probe with the wrong key gets no answer, so it reports nothing rather than a stale state.
         stranger = RecoveryStatusProbe(endpoint, b"x" * 32, timeout_s=0.2, max_age_s=0.0)
         try:
@@ -1094,7 +1095,7 @@ def test_server_probe_answers_within_its_timeout_while_the_authority_is_down(tmp
 @pytest.mark.parametrize(
     "phase,state",
     [
-        ("REGISTERING", "starting"),
+        ("REGISTERING", "unprotected"),
         ("SERVING", "healthy"),
         ("STOPPING", "recovering"),
         ("PREPARING", "recovering"),
@@ -1108,7 +1109,7 @@ def test_health_states_follow_the_authority_phase(phase, state):
     from tensorrt_llm.serve.fault_tolerance_status import SERVING_STATES, health_state
 
     assert health_state(Status(phase, 0, (0, 1), (), 0, (), 0, "")) == state
-    assert (state in SERVING_STATES) == (state in ("healthy", "degraded"))
+    assert (state in SERVING_STATES) == (state in ("healthy", "degraded", "unprotected"))
 
 
 def test_status_body_reports_live_ranks_stages_and_failed_requests():
@@ -1125,6 +1126,10 @@ def test_status_body_reports_live_ranks_stages_and_failed_requests():
         "failed_requests": 256,
     }
     assert status_body(None) == {"state": "unprotected"}
+    # A restarted authority lost the committed membership: report none of its fields.
+    assert status_body(Status("REGISTERING", 0, (0, 1), (), 0, (), 0, "")) == {
+        "state": "unprotected"
+    }
     aborted = Status("ABORTED", 1, (0, 1), NODE, 1, (), 0, "rank 2 (pid 7 on node-a) is hung")
     assert status_body(aborted)["state"] == "terminal" and "abort_reason" not in status_body(
         aborted

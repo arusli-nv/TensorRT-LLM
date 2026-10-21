@@ -22,9 +22,11 @@ from tensorrt_llm.executor.recovery.protocol import MAX_MESSAGE_BYTES, Status, S
 
 __all__ = ["SERVING_STATES", "RecoveryStatusProbe", "health_state", "status_body"]
 
-# Authority phase -> state reported by the server.
+# Authority phase -> state reported by the server. The server asks only after every worker registered, so an
+# authority still ``REGISTERING`` restarted and lost the committed state: workers register once per process, so
+# a loss would end the job. That is ``unprotected``, as when the authority does not answer.
 _STATES = {
-    "REGISTERING": "starting",
+    "REGISTERING": "unprotected",
     "SERVING": "healthy",
     "STOPPING": "recovering",
     "PREPARING": "recovering",
@@ -33,7 +35,7 @@ _STATES = {
     "ABORTED": "terminal",
 }
 # States in which the server answers requests; /health returns 200 only in these. ``unprotected``: the
-# authority does not answer, so a loss would end the job, but the server itself serves.
+# authority does not answer or restarted, so a loss would end the job, but the server itself serves.
 SERVING_STATES = frozenset({"healthy", "degraded", "unprotected"})
 _STAGES = ("stop", "agree", "install")
 
@@ -55,7 +57,7 @@ def status_body(status: Optional[Status]) -> dict:
     authority's log.
     """
     body = {"state": health_state(status)}
-    if status is not None:
+    if body["state"] != "unprotected":
         body.update(
             generation=status.generation,
             live_ranks=list(status.live_ranks),

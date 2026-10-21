@@ -1700,7 +1700,7 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._check_health():
             probe = getattr(self, "_recovery_status", None)
             if probe is not None:
-                # Starting, recovering or terminal: not serving, so load
+                # Recovering or terminal: not serving, so load
                 # balancers move on. Serving states (healthy, degraded,
                 # unprotected) return 200. The body is for alerting.
                 body = status_body(await asyncio.to_thread(probe.status))
