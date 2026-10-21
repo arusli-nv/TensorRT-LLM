@@ -220,6 +220,13 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
 - With hang detection on, a network partition between the authority and a node's ranks (while the MPI network
   between the ranks stays healthy) looks like a stopped process: their heartbeats stop, so they can be fenced
   as hung, and if rank 0 is among them, the deployment restarts.
+- A loss after the authority's commit, before every survivor resumed, ends the job instead of starting
+  another recovery. So does a commit message lost on the way to a survivor (the authority sends it once): the
+  survivors wait up to the recovery timeout, then exit.
+- A further loss just as the authority installs the new membership can leave survivors on different
+  memberships; the executor's hang detection ends the job.
+- With speculative decoding under the overlap scheduler, a loss in the step after a committed one can skip
+  the committed step's KV cache update for its rejected draft tokens (KV cache manager V2).
 - Open MPI's failure detector declares failed a peer it has not heard from for `mpi_ft_detector_timeout`
   (5 s above), so a network hiccup longer than that costs a rank. Set it above the time the network takes to
   recover from a link flap or route change.
@@ -261,8 +268,9 @@ and multimodal requests under the overlap scheduler.
   event with that code followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those
   requests.
 - A request of the lost ranks whose cancellation they had not answered yet ends cancelled.
-- All other requests continue with their full output. Greedy outputs after a recovery match a server that
-  never used the lost rank's experts.
+- All other requests continue with their full output. In GSM8K runs with one rank killed before the
+  evaluation, accuracy stayed within two standard errors of a server that never lost a rank; outputs are not
+  compared token by token.
 - No CUDA graphs are recaptured, so serving resumes at once without the lost GPUs.
 - Each rank logs one line when it resumes: "resumed serving without ranks [...] at membership generation N",
   the time since the interruption, the discarded steps, the remaining ranks and the KV cache bytes given to
