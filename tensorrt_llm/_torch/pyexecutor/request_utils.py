@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 import torch
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, peer_loss_recovery_enabled
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -118,9 +118,10 @@ def can_process_attention_dp_request(
         max_num_active_requests: Maximum number of active requests per rank.
 
     Returns:
-        True if the request can be processed, False otherwise. A request pinned
-        to a rank that is not serving is returned as processable so the ADP
-        router can fail it instead of leaving it queued forever.
+        True if the request can be processed, False otherwise. With peer-loss
+        recovery, a request pinned to a rank that is not serving is returned as
+        processable so the ADP router can fail it instead of leaving it queued
+        forever. Without it, such a pin raises.
     """
     scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None:
@@ -130,7 +131,7 @@ def can_process_attention_dp_request(
     if target_dp_rank is None or scheduling_params.attention_dp_relax:
         return True
 
-    if target_dp_rank not in all_ranks_num_active_requests:
+    if target_dp_rank not in all_ranks_num_active_requests and peer_loss_recovery_enabled():
         return True
 
     if all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests:

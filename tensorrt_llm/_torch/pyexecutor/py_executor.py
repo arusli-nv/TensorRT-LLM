@@ -6905,8 +6905,10 @@ class PyExecutor:
             if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
-            new_requests, unservable = self.adp_router.split_unservable_requests(
-                new_requests, all_rank_states)
+            unservable = []
+            if self._peer_loss_recovery.enabled:
+                new_requests, unservable = self.adp_router.split_unservable_requests(
+                    new_requests, all_rank_states)
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,

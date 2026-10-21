@@ -39,6 +39,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Set, Tuple
 
+from tensorrt_llm._utils import peer_loss_recovery_enabled
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequestState
@@ -231,8 +232,9 @@ class ADPRouter(ABC):
         """Place requests carrying an explicit ``attention_dp_rank`` on that rank
         (while it is under ``max_num_active_requests``) and return the rest for
         load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
-        place. A relaxed request targeting a rank that is not serving is load
-        balanced; :meth:`split_unservable_requests` removes strict ones first.
+        place. With peer-loss recovery, a relaxed request targeting a rank that
+        is not serving is load balanced; :meth:`split_unservable_requests`
+        removes strict ones first. Without it, such a target raises.
         """
         remaining: List["RequestQueueItem"] = []
         for req_item in requests:
@@ -240,7 +242,11 @@ class ADPRouter(ABC):
             target_dp_rank = (
                 scheduling_params.attention_dp_rank if scheduling_params is not None else None
             )
-            if target_dp_rank is not None and target_dp_rank not in all_ranks_num_active_requests:
+            if (
+                target_dp_rank is not None
+                and target_dp_rank not in all_ranks_num_active_requests
+                and peer_loss_recovery_enabled()
+            ):
                 remaining.append(req_item)
                 continue
             if (

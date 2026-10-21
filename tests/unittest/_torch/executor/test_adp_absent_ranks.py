@@ -24,6 +24,11 @@ from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
 pytestmark = pytest.mark.cpu_only
 
 _INPUTS = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs"
+_GATED_MODULES = (
+    _INPUTS,
+    "tensorrt_llm._torch.pyexecutor.request_utils",
+    "tensorrt_llm._torch.pyexecutor.scheduler.adp_router",
+)
 
 WORLD_SIZE = 4
 FAILED_RANK = 2
@@ -53,6 +58,20 @@ def _survivor_states(active=None):
         RankState(rank=rank, num_active_requests=active.get(rank, 0), num_active_tokens=0)
         for rank in SURVIVORS
     ]
+
+
+@pytest.fixture
+def recovery(monkeypatch):
+    """Peer-loss recovery is enabled."""
+    for module in _GATED_MODULES:
+        monkeypatch.setattr(f"{module}.peer_loss_recovery_enabled", lambda: True)
+
+
+@pytest.fixture
+def no_recovery(monkeypatch):
+    """Fault tolerance is off, so behaviour must match main."""
+    for module in _GATED_MODULES:
+        monkeypatch.setattr(f"{module}.peer_loss_recovery_enabled", lambda: False)
 
 
 def test_gather_all_rank_states_omits_failed_ranks():
@@ -96,7 +115,7 @@ def test_strict_pin_outside_the_group_is_unservable_without_a_loss():
     assert DefaultADPRouter.split_unservable_requests([pinned], states) == ([], [pinned])
 
 
-def test_relaxed_pin_to_failed_rank_is_rebalanced():
+def test_relaxed_pin_to_failed_rank_is_rebalanced(recovery):
     router = _router()
     relaxed = _item(0, target=FAILED_RANK, relax=True)
     routed, _ = router.route_requests(_survivor_states(), [relaxed], 8)
@@ -133,9 +152,8 @@ class _DepartedRankDist:
         return rows
 
 
-def test_every_per_step_vote_survives_a_departed_rank(monkeypatch):
+def test_every_per_step_vote_survives_a_departed_rank(recovery):
     """Each per-step int64 vote treats the departed rank as neutral instead of failing or vetoing."""
-    monkeypatch.setattr(f"{_INPUTS}.peer_loss_recovery_enabled", lambda: True)
     # Admission: survivors have work, so the group can queue.
     executor = PyExecutor.__new__(PyExecutor)
     executor.enable_attention_dp = True
@@ -179,9 +197,8 @@ def test_every_per_step_vote_survives_a_departed_rank(monkeypatch):
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])
-def test_without_peer_loss_recovery_token_and_spec_counts_gather_as_on_main(monkeypatch, tp_size):
+def test_without_peer_loss_recovery_token_and_spec_counts_gather_as_on_main(no_recovery, tp_size):
     """Without recovery the counts go through tp_cp_allgather_int64 as on main: no collective at tp_size 1."""
-    monkeypatch.setattr(f"{_INPUTS}.peer_loss_recovery_enabled", lambda: False)
     dist = Mock(spec=["tp_cp_allgather_int64", "tp_allgather_int64"])
     dist.tp_cp_allgather_int64.side_effect = lambda values: np.tile(
         np.asarray(values, dtype=np.int64), (tp_size, 1)
@@ -202,7 +219,7 @@ def test_without_peer_loss_recovery_token_and_spec_counts_gather_as_on_main(monk
     dist.tp_allgather_int64.assert_not_called()
 
 
-def test_waiting_queue_releases_strict_pin_to_failed_rank():
+def test_waiting_queue_releases_strict_pin_to_failed_rank(recovery):
     waiting_queue = FCFSWaitingQueue()
     pinned = _item(0, target=FAILED_RANK, relax=False)
     full = _item(1, target=1, relax=False)
@@ -220,6 +237,26 @@ def test_waiting_queue_releases_strict_pin_to_failed_rank():
     assert popped == [pinned]
     assert [item.id for item in waiting_queue] == [1]
     assert counts[1] == 8
+
+
+@pytest.mark.parametrize("target", [WORLD_SIZE, -1])
+def test_without_peer_loss_recovery_a_pin_outside_the_group_raises_as_on_main(no_recovery, target):
+    """Main raises on a pin outside [0, tp_size) (IndexError or KeyError); so does FT off."""
+    counts = {rank: 0 for rank in range(WORLD_SIZE)}
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests([_item(0, target=target, relax=False)])
+    with pytest.raises(LookupError):
+        get_from_waiting_queue(
+            waiting_queue,
+            max_req_count=4,
+            enable_attention_dp=True,
+            max_num_active_requests=8,
+            all_ranks_num_active_requests=counts,
+        )
+    states = [RankState(rank=rank) for rank in range(WORLD_SIZE)]
+    for relax in (False, True):
+        with pytest.raises(LookupError):
+            _router().route_requests(states, [_item(0, target=target, relax=relax)], 8)
 
 
 def test_fail_unservable_requests_responds_from_rank0_only():
