@@ -72,12 +72,8 @@ def _reserve_shm(shm: shared_memory.SharedMemory, layer_id: int) -> None:
 
 
 def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
-    """Map the pages of host copies that other local ranks wrote, off the startup path.
-
-    Without it, the first copy from a segment page-faults on every page: a
-    restore's GPU copies of 1.4 GB took ~400 ms instead of ~35 ms. Best effort:
-    older kernels reject the advice and the faults come back.
-    """
+    """Prefault the pages of host copies that other local ranks wrote, off the startup path, so that the first
+    restore copy does not page-fault. Best effort: older kernels reject the advice."""
     libc = ctypes.CDLL(None, use_errno=True)
     spans = [(np.frombuffer(segment.buf,
                             dtype=np.uint8).ctypes.data, segment.size)
