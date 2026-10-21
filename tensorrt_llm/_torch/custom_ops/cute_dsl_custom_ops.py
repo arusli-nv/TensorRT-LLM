@@ -4422,6 +4422,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert a_sf.size(1) == scale_k
 
             num_tiles = m // self.tile_size
+            # Unused unless the kernel reads source slots; 1 keeps its divisor valid.
+            source_tokens = self.source_tokens or 1
+            slot_tokens = self.slot_tokens or 1
             if self.source_tokens and orig_m % self.slot_tokens:
                 raise ValueError("a must hold whole source slots")
             if self.use_expert_counts:
@@ -4512,7 +4515,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          self.activation_type, self.swiglu_limit_scalar,
                          self.use_expert_counts, self.num_local_experts,
                          self.situ_beta, self.situ_linear_beta,
-                         self.source_tokens, self.slot_tokens)
+                         self.source_tokens > 0)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -4528,8 +4531,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_local_experts=self.num_local_experts,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
-                    source_tokens=self.source_tokens,
-                    slot_tokens=self.slot_tokens,
+                    read_source_slots=self.source_tokens > 0,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -4554,6 +4556,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     k,
                     l,
                     expert_capacity,
+                    source_tokens,
+                    slot_tokens,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -4588,6 +4592,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 k,
                 l,
                 expert_capacity,
+                source_tokens,
+                slot_tokens,
             ]
 
             compiled_gemm(*exec_args, stream=stream)
