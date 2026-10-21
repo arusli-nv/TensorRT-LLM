@@ -388,8 +388,9 @@ def _compact_round(workspace, meta, experts, payloads, controls, capacity=_CAPAC
     return received, counts, ids, weights
 
 
-# Capacity 7 with top_k 3 or 6 puts source 1's rows off a 16-byte boundary; (520, 8) gives each source
-# thousands of routing words to copy.
+# With capacity * top_k not a multiple of 4, each source's rows end in a word-by-word tail, and source 1's rows
+# start off a 16-byte boundary, so they are copied word by word.
+# (520, 8): rows past the first 1024 words per CTA, so the copy's later load steps carry data.
 @pytest.mark.parametrize("capacity,top_k", [(_CAPACITY, 1), (7, 3), (7, 6), (520, 8)])
 @pytest.mark.parametrize("peer_active", [True, False])
 def test_compact_routing_copies_the_rows_each_source_sent(
