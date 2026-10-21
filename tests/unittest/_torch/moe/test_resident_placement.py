@@ -7,11 +7,8 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer,
-    restore_lost_experts,
-    ring_copy_nodes,
-)
+from tensorrt_llm._torch.moe.fused_moe.eplb_recovery import restore_lost_experts, ring_copy_nodes
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 
 pytestmark = pytest.mark.cpu_only
