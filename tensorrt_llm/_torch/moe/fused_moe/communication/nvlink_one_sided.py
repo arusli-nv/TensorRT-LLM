@@ -668,9 +668,11 @@ class NVLinkOneSided(Communication):
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
         # Rank-mask mode: the kernels read the active-rank mask from this device record at execution time, so CUDA
-        # graphs captured once observe a mask rewritten in place. Holds the words last published.
+        # graphs captured once observe a mask rewritten in place. Holds the words last published, and their
+        # committed generation (None for a caller's mask).
         self._rank_mask_record: Optional[torch.Tensor] = None
         self._rank_mask_words: Optional[Tuple[int, ...]] = None
+        self._rank_mask_generation: Optional[int] = None
         self._execution_state: "MoeExecutionState | None" = None
         # Bound dispatches' gathered EPLB statistics, [ep_size, eplb_stats_num_experts]; see _eplb_stats_out.
         self._eplb_stats_out_buffer: Optional[torch.Tensor] = None
@@ -922,27 +924,32 @@ class NVLinkOneSided(Communication):
         self._workspace_registered = False
         self._workspace_lifecycle = None
 
-    def _publish_rank_mask(self, mask: torch.Tensor) -> None:
-        """Write ``mask`` (CPU uint64 words) into the device record of the active-rank mask.
+    def _publish_rank_mask(self, snapshot: ActiveRankMaskSnapshot) -> None:
+        """Write the snapshot's mask (CPU uint64 words) into the device record of the active-rank mask.
 
+        A committed mask is compared by its generation, so an unchanged membership costs no host read of the mask.
         The write is a copy on the current stream, so collectives launched before it still read the previous mask.
         Under CUDA graph capture the record is only read: membership changes between captures, never during one.
         """
-        words = tuple(int(word) for word in mask.tolist())
-        if words == self._rank_mask_words:
+        generation = snapshot.committed_generation
+        if generation is not None and generation == self._rank_mask_generation:
             return
-        if not (words[self.ep_rank >> 6] >> (self.ep_rank & 63)) & 1:
-            raise ValueError(
-                f"active_rank_mask must mark the local ep_rank ({self.ep_rank}) as active"
-            )
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("the active-rank mask changed during CUDA graph capture")
-        if self._rank_mask_record is None:
-            self._rank_mask_record = torch.empty(
-                len(words), dtype=torch.uint64, device=self.workspace.device
-            )
-        self._rank_mask_record.copy_(mask)
-        self._rank_mask_words = words
+        mask = snapshot.active_rank_mask
+        words = tuple(int(word) for word in mask.tolist())
+        if words != self._rank_mask_words:
+            if not (words[self.ep_rank >> 6] >> (self.ep_rank & 63)) & 1:
+                raise ValueError(
+                    f"active_rank_mask must mark the local ep_rank ({self.ep_rank}) as active"
+                )
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the active-rank mask changed during CUDA graph capture")
+            if self._rank_mask_record is None:
+                self._rank_mask_record = torch.empty(
+                    len(words), dtype=torch.uint64, device=self.workspace.device
+                )
+            self._rank_mask_record.copy_(mask)
+            self._rank_mask_words = words
+        self._rank_mask_generation = generation
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
@@ -1184,7 +1191,7 @@ class NVLinkOneSided(Communication):
         # Bound execution: the dispatch also copies each source's routed expert ids and router weights to
         # compact lists once that source's rows have arrived, for the routing sort.
         if state is None and active_rank_mask is not None:
-            self._publish_rank_mask(active_rank_mask)
+            self._publish_rank_mask(active_rank_mask_snapshot)
         compact_routing = {}
         source_slots = None
         if state is not None:

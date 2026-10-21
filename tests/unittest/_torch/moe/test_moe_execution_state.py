@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.alltoall_watchdog import ActiveRankMaskSnapshot
 from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
@@ -230,6 +231,25 @@ def test_rearm_resets_bound_layers_and_install_refuses_a_membership_without_this
     with pytest.raises(RuntimeError, match="excludes this rank"):
         state.install_mask()
     assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
+
+
+def test_detection_only_publish_rewrites_the_mask_only_on_a_new_generation() -> None:
+    comm = _frontend(EPGroupHealth(2))
+    comm.workspace = torch.empty(0)
+    comm._rank_mask_record = comm._rank_mask_words = comm._rank_mask_generation = None
+
+    def publish(words: list[int], generation: int | None) -> list[int]:
+        mask = torch.tensor(words, dtype=torch.uint64)
+        comm._publish_rank_mask(ActiveRankMaskSnapshot(mask, generation))
+        return comm._rank_mask_record.tolist()
+
+    assert publish([3, 0, 0, 0], 0) == [3, 0, 0, 0]
+    # The generation alone decides: an unchanged generation never reads the mask.
+    assert publish([1, 0, 0, 0], 0) == [3, 0, 0, 0]
+    assert publish([1, 0, 0, 0], 1) == [1, 0, 0, 0]
+    # A caller's mask carries no generation and is compared by its words.
+    assert publish([3, 0, 0, 0], None) == [3, 0, 0, 0]
+    assert publish([1, 0, 0, 0], 1) == [1, 0, 0, 0]
 
 
 def test_for_model_refuses_models_it_cannot_bind() -> None:
