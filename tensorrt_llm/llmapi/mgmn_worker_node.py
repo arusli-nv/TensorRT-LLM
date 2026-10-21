@@ -25,7 +25,7 @@ with MPICommExecutor(COMM_WORLD) as executor:
 
 logging.warning(f"worker rank{COMM_WORLD.rank} quited")
 
-from tensorrt_llm.executor.recovery.mpi_exit import \
+from tensorrt_llm.llmapi.mpi_session import \
     exit_fault_tolerant_process  # noqa: E402
 
 exit_fault_tolerant_process()
