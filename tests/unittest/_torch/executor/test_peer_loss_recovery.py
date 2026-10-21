@@ -1605,6 +1605,19 @@ def test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once()
     assert recovery._unprogressed == {11} and recovery._progressed == {12}
 
 
+def test_only_the_rank_a_rerun_request_is_routed_to_watches_its_progress():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: [11, 12] if isinstance(value, list) else value
+    )
+    recovery._recover(_interrupted())
+    assert recovery._unprogressed == set()
+
+    recovery.requests_routed({1: [_queued(11)], 2: [_queued(12)]})
+
+    assert recovery._unprogressed == {11} and recovery._rerouting == set()
+
+
 def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
     recovery = _recovery(_FakeClient([]), rank=1)
     executor = recovery._executor

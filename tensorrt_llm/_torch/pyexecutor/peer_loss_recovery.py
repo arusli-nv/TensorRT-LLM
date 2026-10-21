@@ -343,6 +343,9 @@ class PeerLossRecovery(RecoveryHook):
         # the next recovery tells rank 0.
         self._unprogressed: Set[int] = set()
         self._progressed: Set[int] = set()
+        # The interrupted requests rank 0 re-admitted to run again, until routed: the rank they are routed to adds
+        # them to its ``_unprogressed``.
+        self._rerouting: Set[int] = set()
         # On rank 0: the owned requests whose cancellation was broadcast, until their final response.
         self._cancelled: Set[int] = set()
         # Ids of the requests this rank answered, until their error or final result.
@@ -754,7 +757,15 @@ class PeerLossRecovery(RecoveryHook):
         return result
 
     def requests_routed(self, routed: Dict[int, List["RequestQueueItem"]]) -> None:
-        """Record the attention-DP rank serving each new request (rank 0)."""
+        """Watch the re-run requests routed to this rank; on rank 0, record the rank serving each new request."""
+        if self._rerouting:
+            own_rank = self._executor.dist.rank
+            for rank, items in routed.items():
+                for item in items:
+                    if item.id in self._rerouting:
+                        self._rerouting.discard(item.id)
+                        if rank == own_rank:
+                            self._unprogressed.add(item.id)
         if self._request_owners is None:
             return
         for rank, items in routed.items():
@@ -1049,10 +1060,8 @@ class PeerLossRecovery(RecoveryHook):
         rerun, failing = self._deliver_responses(
             failed, buffered, set().union(*(entry[2] for entry in gathered if entry))
         )
-        reran = set(dist.broadcast(rerun, root=0))
-        self._unprogressed = (
-            (self._unprogressed | interrupted) & executor.served_request_ids()
-        ) | reran
+        self._rerouting |= set(dist.broadcast(rerun, root=0))
+        self._unprogressed = (self._unprogressed | interrupted) & executor.served_request_ids()
         self._readmit_undelivered_requests(failed, held)
         self._log_phase("resumed", generation)
         self._first_step_pending = rank == 0
