@@ -1485,7 +1485,9 @@ class PeerLossRecovery(RecoveryHook):
                 f"Rank 0 processed response gather {processed}, but this rank "
                 f"made only {self._gather_count}"
             )
-        if self._gathers and self._gathers[0][0] > processed + 1:
+        if self._gather_count > processed and (
+            not self._gathers or self._gathers[0][0] > processed + 1
+        ):
             raise RuntimeError(
                 f"Response gather {processed + 1} is owed but no longer held for redelivery"
             )

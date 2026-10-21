@@ -1832,13 +1832,15 @@ def test_gathers_are_held_until_the_next_rank_state_exchange_however_many():
     assert sent == [[response for responses in held for response in responses]]
 
 
-def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held():
-    """Rank 0 claims it did not process a gather made before the last exchange."""
+@pytest.mark.parametrize("gathers_since_exchange", [0, 1])
+def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held(gathers_since_exchange):
+    """Rank 0 claims it did not process a gather made before the last exchange, also when none is held."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     for number in range(2):
         recovery.gathering_responses([(number, Mock())])
     recovery.fetching_requests()
-    recovery.gathering_responses([(2, Mock())])
+    for number in range(gathers_since_exchange):
+        recovery.gathering_responses([(2 + number, Mock())])
     recovery._executor.dist.broadcast.side_effect = (
         lambda value, root: (0, set()) if isinstance(value, tuple) else value
     )
