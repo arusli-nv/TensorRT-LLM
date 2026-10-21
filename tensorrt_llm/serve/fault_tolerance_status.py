@@ -9,8 +9,8 @@ deriving the state itself. Asking changes nothing on the authority. If it does n
 
 import os
 import queue
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import zmq
@@ -74,8 +74,9 @@ def status_body(status: Optional[Status]) -> dict:
 class RecoveryStatusProbe:
     """Asks the recovery authority for its status, at most once per ``max_age_s``.
 
-    Thread-safe; a query blocks for at most ``timeout_s``. A status older than ``max_age_s``
-    is never returned: if the authority does not answer in time, the result is None.
+    Thread-safe: one thread of its own uses the socket, which ZeroMQ requires. A query blocks for at most
+    ``timeout_s``. A status older than ``max_age_s`` is never returned: if the authority does not answer in
+    time, the result is None.
 
     Args:
         endpoint: Authority address, e.g. ``tcp://host:5555``.
@@ -89,7 +90,7 @@ class RecoveryStatusProbe:
     ) -> None:
         self._timeout_s = timeout_s
         self._max_age_s = max_age_s
-        self._lock = threading.Lock()
+        self._thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="recovery-status-probe")
         self._status: Optional[Status] = None
         self._status_time = float("-inf")
         self._queue = ZeroMqQueue(
@@ -110,13 +111,14 @@ class RecoveryStatusProbe:
 
     def status(self) -> Optional[Status]:
         """The authority's status, at most ``max_age_s`` old; None if it did not answer."""
-        with self._lock:
-            now = time.monotonic()
-            if now - self._status_time < self._max_age_s:
-                return self._status
+        return self._thread.submit(self._cached_status).result()
+
+    def _cached_status(self) -> Optional[Status]:
+        now = time.monotonic()
+        if now - self._status_time >= self._max_age_s:
             self._status = self._query()
             self._status_time = now
-            return self._status
+        return self._status
 
     def _query(self) -> Optional[Status]:
         # Answers to earlier queries that timed out may still be queued: drop them, and any message that
@@ -147,4 +149,5 @@ class RecoveryStatusProbe:
         return None
 
     def close(self) -> None:
+        self._thread.shutdown()
         self._queue.close()

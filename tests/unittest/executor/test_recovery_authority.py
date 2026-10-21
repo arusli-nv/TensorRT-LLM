@@ -1075,6 +1075,25 @@ def test_server_probe_reads_the_status_and_reports_unprotected_without_an_answer
     assert authority.phase is Phase.REGISTERING
 
 
+def test_server_probe_answers_callers_on_any_thread_under_zmq_debug(served, monkeypatch):
+    """/health asks from a new worker thread each time; ZeroMQ debugging refuses a socket shared across threads."""
+    from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe
+
+    monkeypatch.setenv("TLLM_LLMAPI_ZMQ_DEBUG", "1")
+    _, endpoint = served
+    probe = RecoveryStatusProbe(endpoint, KEY, timeout_s=2.0, max_age_s=0.0)
+    try:
+        statuses = []
+        for _ in range(2):
+            caller = threading.Thread(target=lambda: statuses.append(probe.status()))
+            caller.start()
+            caller.join(timeout=10)
+            assert not caller.is_alive()
+        assert [status.phase for status in statuses] == ["REGISTERING"] * 2
+    finally:
+        probe.close()
+
+
 def test_server_probe_answers_within_its_timeout_while_the_authority_is_down(tmp_path):
     from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe
 
