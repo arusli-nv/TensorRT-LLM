@@ -202,6 +202,7 @@ class Distributed(ABC):
         self.mapping = mapping
         # Whether this rank is inside a host collective (set with peer-loss recovery).
         self.in_host_collective = False
+        self._tp_ranks = tuple(range(mapping.tp_size))
 
     @staticmethod
     @lru_cache(maxsize=None)
@@ -291,7 +292,7 @@ class Distributed(ABC):
     @property
     def live_ranks(self) -> tuple[int, ...]:
         """Logical TP ranks whose processes take part in host collectives."""
-        return tuple(range(self.tp_size))
+        return self._tp_ranks
 
     def enable_peer_loss_recovery(self) -> None:
         """Run host collectives on communicators that recovery may revoke."""

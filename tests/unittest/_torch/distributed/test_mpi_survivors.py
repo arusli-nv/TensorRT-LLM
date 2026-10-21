@@ -381,6 +381,7 @@ def _install(dist):
 
 
 def test_install_survivors_keeps_logical_ranks(dist, world):
+    assert dist.live_ranks == tuple(range(WORLD)) and dist.live_ranks is dist.live_ranks
     dist.revoke()
     assert _install(dist) == frozenset({FAILED})
 
