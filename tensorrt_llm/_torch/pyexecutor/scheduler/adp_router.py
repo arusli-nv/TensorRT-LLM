@@ -234,7 +234,8 @@ class ADPRouter(ABC):
         load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
         place. With peer-loss recovery, a relaxed request targeting a rank that
         is not serving is load balanced; :meth:`split_unservable_requests`
-        removes strict ones first. Without it, such a target raises.
+        removes strict ones first. Without it, every rank serves and the
+        target's count is looked up by position, as in a per-rank list.
         """
         remaining: List["RequestQueueItem"] = []
         for req_item in requests:
@@ -242,18 +243,17 @@ class ADPRouter(ABC):
             target_dp_rank = (
                 scheduling_params.attention_dp_rank if scheduling_params is not None else None
             )
+            count_rank = target_dp_rank
+            if target_dp_rank is not None and target_dp_rank not in all_ranks_num_active_requests:
+                if peer_loss_recovery_enabled():
+                    remaining.append(req_item)
+                    continue
+                count_rank = list(all_ranks_num_active_requests)[target_dp_rank]
             if (
                 target_dp_rank is not None
-                and target_dp_rank not in all_ranks_num_active_requests
-                and peer_loss_recovery_enabled()
+                and all_ranks_num_active_requests[count_rank] < max_num_active_requests
             ):
-                remaining.append(req_item)
-                continue
-            if (
-                target_dp_rank is not None
-                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
-            ):
-                all_ranks_num_active_requests[target_dp_rank] += 1
+                all_ranks_num_active_requests[count_rank] += 1
                 all_ranks_new_requests[target_dp_rank].append(req_item)
             else:
                 remaining.append(req_item)

@@ -239,24 +239,38 @@ def test_waiting_queue_releases_strict_pin_to_failed_rank(recovery):
     assert counts[1] == 8
 
 
-@pytest.mark.parametrize("target", [WORLD_SIZE, -1])
-def test_without_peer_loss_recovery_a_pin_outside_the_group_raises_as_on_main(no_recovery, target):
-    """Main raises on a pin outside [0, tp_size) (IndexError or KeyError); so does FT off."""
+def _pop_pinned(target):
     counts = {rank: 0 for rank in range(WORLD_SIZE)}
     waiting_queue = FCFSWaitingQueue()
     waiting_queue.add_requests([_item(0, target=target, relax=False)])
-    with pytest.raises(LookupError):
-        get_from_waiting_queue(
-            waiting_queue,
-            max_req_count=4,
-            enable_attention_dp=True,
-            max_num_active_requests=8,
-            all_ranks_num_active_requests=counts,
-        )
+    popped = get_from_waiting_queue(
+        waiting_queue,
+        max_req_count=4,
+        enable_attention_dp=True,
+        max_num_active_requests=8,
+        all_ranks_num_active_requests=counts,
+    )
+    return popped, counts
+
+
+def test_without_peer_loss_recovery_a_pin_past_the_last_rank_raises_as_on_main(no_recovery):
+    """Main indexes per-rank lists: IndexError at admission and in the router."""
+    with pytest.raises(IndexError):
+        _pop_pinned(WORLD_SIZE)
     states = [RankState(rank=rank) for rank in range(WORLD_SIZE)]
     for relax in (False, True):
-        with pytest.raises(LookupError):
-            _router().route_requests(states, [_item(0, target=target, relax=relax)], 8)
+        with pytest.raises(IndexError):
+            _router().route_requests(states, [_item(0, target=WORLD_SIZE, relax=relax)], 8)
+
+
+def test_without_peer_loss_recovery_a_negative_pin_behaves_as_on_main(no_recovery):
+    """Main admits it against the last rank's count, then the router raises placing it (KeyError)."""
+    popped, counts = _pop_pinned(-1)
+    assert len(popped) == 1 and counts == {0: 0, 1: 0, 2: 0, WORLD_SIZE - 1: 1}
+    states = [RankState(rank=rank) for rank in range(WORLD_SIZE)]
+    for relax in (False, True):
+        with pytest.raises(KeyError):
+            _router().route_requests(states, [_item(0, target=-1, relax=relax)], 8)
 
 
 def test_fail_unservable_requests_responds_from_rank0_only():
