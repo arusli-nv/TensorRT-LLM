@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock, call
 
 import pytest
 import torch
@@ -456,7 +456,8 @@ def test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan():
     recovery = _recovery(client, rank=0)
     recovery._end_ranks = Mock(return_value={FAILED_RANK: ""})
     recovery._recover(_interrupted())
-    recovery._end_ranks.assert_called_once_with([FAILED_RANK])
+    # The fence's call comes first; the shrink ends the departed ranks again.
+    assert recovery._end_ranks.call_args_list[0] == call([FAILED_RANK])
     assert client.sent[:3] == [
         Stopped(rank=0, failed_ranks=(FAILED_RANK,)),
         Fenced(rank=0, target=FAILED_RANK, error=""),
@@ -1056,6 +1057,7 @@ def test_crashed_loop_exits_only_this_rank_when_peers_can_recover(monkeypatch, m
     monkeypatch.setattr(py_executor, "hard_kill_on_rank_crash", Mock())
     monkeypatch.setattr(py_executor, "start_rank_crash_kill_watchdog", Mock(return_value=None))
     executor._executor_loop_cleanup = Mock()
+    executor.event_loop = Mock()
     with pytest.raises(RuntimeError):
         executor._event_loop_wrapper()
     assert kills == ([signal.SIGKILL] if killed else [])
