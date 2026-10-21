@@ -922,17 +922,15 @@ class NVLinkOneSided(Communication):
         self._workspace_registered = False
         self._workspace_lifecycle = None
 
-    def _publish_rank_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Return the device record of the active-rank mask, after writing ``mask`` (CPU uint64 words) into it.
+    def _publish_rank_mask(self, mask: torch.Tensor) -> None:
+        """Write ``mask`` (CPU uint64 words) into the device record of the active-rank mask.
 
         The write is a copy on the current stream, so collectives launched before it still read the previous mask.
         Under CUDA graph capture the record is only read: membership changes between captures, never during one.
         """
-        if mask is None:
-            return None
         words = tuple(int(word) for word in mask.tolist())
         if words == self._rank_mask_words:
-            return self._rank_mask_record
+            return
         if not (words[self.ep_rank >> 6] >> (self.ep_rank & 63)) & 1:
             raise ValueError(
                 f"active_rank_mask must mark the local ep_rank ({self.ep_rank}) as active"
@@ -945,7 +943,6 @@ class NVLinkOneSided(Communication):
             )
         self._rank_mask_record.copy_(mask)
         self._rank_mask_words = words
-        return self._rank_mask_record
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
@@ -1186,6 +1183,8 @@ class NVLinkOneSided(Communication):
 
         # Bound execution: the dispatch also copies each source's routed expert ids and router weights to
         # compact lists once that source's rows have arrived, for the routing sort.
+        if state is None and active_rank_mask is not None:
+            self._publish_rank_mask(active_rank_mask)
         compact_routing = {}
         source_slots = None
         if state is not None:
@@ -1218,9 +1217,7 @@ class NVLinkOneSided(Communication):
                 else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
-                self._publish_rank_mask(active_rank_mask)
-                if state is None
-                else state.active_rank_mask,
+                self._rank_mask_record if state is None else state.active_rank_mask,
                 abort_state=None if state is None else state.abort,
                 source_valid_counts=None if source_slots is None else source_slots.valid_counts,
                 expert_to_slot=expert_to_slot,
@@ -1382,7 +1379,8 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             use_cft_for_combine,
             self._rank_mask_enabled,
-            self._publish_rank_mask(active_rank_mask) if state is None else state.active_rank_mask,
+            # Dispatch published this collective's mask: combine's mask must match it.
+            self._rank_mask_record if state is None else state.active_rank_mask,
             abort_state=None if state is None else state.abort,
         )
         if state is None:

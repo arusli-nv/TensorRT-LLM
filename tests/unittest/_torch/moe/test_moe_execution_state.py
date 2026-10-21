@@ -264,6 +264,7 @@ def test_backends_get_the_slots_or_a_compact_copy(reads_slots: bool) -> None:
     comm._dispatch_state = {"source_slots": slots}
     comm.supports_post_quant_dispatch = lambda: True
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler._peer_loss_recovery = True
     backend = SimpleNamespace(supports_dispatch_receive_slots=lambda: reads_slots)
     scheduler.moe = SimpleNamespace(comm=comm, enable_alltoall=True, backend=backend)
     plan = scheduler._build_comm_plan(
@@ -286,16 +287,28 @@ def test_backends_get_the_slots_or_a_compact_copy(reads_slots: bool) -> None:
 def test_dispatch_looks_up_the_slots_only_with_peer_loss_recovery(
     monkeypatch, recovery: bool
 ) -> None:
-    """Without peer-loss recovery the scheduler keeps route(): dispatch gets no slot table."""
+    """Without peer-loss recovery the scheduler keeps route() and reads no receive slots."""
     monkeypatch.setattr(moe_scheduler, "peer_loss_recovery_enabled", lambda: recovery)
     table = torch.zeros(2, dtype=torch.int32)
-    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
-    scheduler.moe = SimpleNamespace(
-        layer_load_balancer=Mock(one_slot_table=Mock(return_value=table))
+    comm = _frontend(EPGroupHealth(2))
+    comm._dispatch_state = {"source_slots": Mock()}
+    comm.supports_post_quant_dispatch = lambda: True
+    backend = SimpleNamespace(supports_dispatch_receive_slots=Mock(return_value=True))
+    scheduler = ExternalCommMoEScheduler(
+        SimpleNamespace(
+            comm=comm,
+            enable_alltoall=True,
+            backend=backend,
+            layer_load_balancer=Mock(one_slot_table=Mock(return_value=table)),
+        )
     )
-    scheduler._is_using_nvlink_one_sided = lambda: True
-    assert scheduler._dispatch_slot_table() is (table if recovery else None)
-    assert scheduler.moe.layer_load_balancer.one_slot_table.call_count == int(recovery)
+    assert scheduler._peer_loss_recovery is recovery
+    assert scheduler._dispatch_slot_table() is table
+    plan = scheduler._build_comm_plan(
+        all_rank_num_tokens=[2, 2], output_dtype=None, do_finalize=False
+    )
+    assert (plan.source_slots is not None) is recovery
+    assert backend.supports_dispatch_receive_slots.call_count == int(recovery)
 
 
 def test_compact_copy_is_contiguous_with_one_token_per_source() -> None:

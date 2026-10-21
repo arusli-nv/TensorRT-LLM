@@ -136,6 +136,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
     artifacts when analyzing traces.
     """
 
+    # Only peer-loss recovery binds NVLinkOneSided to fixed receive slots and a slot table.
+    _peer_loss_recovery = False
+
+    def __init__(self, moe: "ConfigurableMoE") -> None:
+        super().__init__(moe)
+        self._peer_loss_recovery = peer_loss_recovery_enabled()
+
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -265,8 +272,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         ids route() returns, so they keep it.
         """
         if not (
-            peer_loss_recovery_enabled()
-            and self._is_using_nvlink_one_sided()
+            self._is_using_nvlink_one_sided()
             and ExpertStatistic.expert_statistic_obj is None
             and get_calibrator().mode == CalibratorMode.NONE
         ):
@@ -558,7 +564,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 ignore_allreduce=ignore_allreduce,
             )
 
-            expert_to_slot = self._dispatch_slot_table()
+            if self._peer_loss_recovery:
+                expert_to_slot = self._dispatch_slot_table()
             if expert_to_slot is None:
                 token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             else:
@@ -642,7 +649,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                x, x_sf = self._compact_receive_slots(x, x_sf)
+                if self._peer_loss_recovery:
+                    x, x_sf = self._compact_receive_slots(x, x_sf)
                 if should_update_eplb_after_dispatch:
                     gathered_stats = moe.comm.get_eplb_gathered_statistics()
                     moe._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
@@ -657,7 +665,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                x, x_sf = self._compact_receive_slots(x, x_sf)
+                if self._peer_loss_recovery:
+                    x, x_sf = self._compact_receive_slots(x, x_sf)
                 if not uses_internal_dispatch_quantization:
                     x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
@@ -1130,7 +1139,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
         recv_expert_count = None
         deep_ep_expert_capacity = None
         source_slots = None
-        if isinstance(moe.comm, NVLinkOneSided) and moe.backend.supports_dispatch_receive_slots():
+        if (
+            self._peer_loss_recovery
+            and isinstance(moe.comm, NVLinkOneSided)
+            and moe.backend.supports_dispatch_receive_slots()
+        ):
             source_slots = moe.comm.dispatch_source_slots()
         if use_deep_ep_direct_metadata:
             assert isinstance(moe.comm, DeepEPLowLatency)

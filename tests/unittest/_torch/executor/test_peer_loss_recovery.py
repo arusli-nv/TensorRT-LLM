@@ -1738,6 +1738,25 @@ def test_rank0_enqueues_the_responses_of_each_gathered_part():
         PyExecutor._enqueue_responses(executor, [])
 
 
+def test_rank0_gathers_responses_without_hook_calls_when_recovery_is_off():
+    """With recovery off, the response gather makes no recovery-hook call."""
+    executor = PyExecutor.__new__(PyExecutor)
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    executor.enable_attention_dp, executor.gather_all_responses = True, False
+    executor.dist = Mock(rank=0, world_size=2)
+    executor.dist.mapping.tp_group = [0, 1]
+    response = _response(11)
+    executor.dist.tp_gather.return_value = [[(11, response)], []]
+    executor._peer_loss_recovery = Mock(enabled=False)
+    executor.response_cv = threading.Condition()
+    executor.responses, executor.result_wait_queues = {}, {}
+
+    PyExecutor._enqueue_responses(executor, [])
+
+    assert executor.responses == {11: [response]}
+    assert executor._peer_loss_recovery.mock_calls == []
+
+
 def test_a_resent_part_notes_the_requests_it_answered_again():
     """Rank 0 never read the notes of a gather a loss interrupted, so the resent part carries them again."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
