@@ -295,7 +295,8 @@ example from a different version: alert, but keep serving). It returns 503 with 
 `terminal` (a recovery aborted: restart the deployment). The JSON body always has `state`. While
 the authority answers it also has `generation` (the membership generation), `live_ranks` and `failed_ranks`
 (sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `agree` and `install` durations),
-`failed_requests` (requests the losses failed). The reason a recovery aborted is only in the authority's log:
+`failed_requests` (requests of the lost ranks that failed; requests a second loss interrupted on a survivor are
+counted only in rank 0's log line). The reason a recovery aborted is only in the authority's log:
 `/health` is not authenticated. An `unprotected` body has only `state`. If the engine itself failed, `/health`
 returns 503 as without fault tolerance.
 
