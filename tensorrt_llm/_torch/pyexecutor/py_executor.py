@@ -5593,11 +5593,8 @@ class PyExecutor:
 
         A negative ``delta`` returns memory to the driver; pages that no longer
         fit move to the host tier. Only while the model is idle: no forward in
-        flight and every step committed or discarded.
-
-        Raises:
-            RuntimeError: Remote-tail attention DP's reserved execution row
-                could not resume.
+        flight and every step committed or discarded. Peer-loss recovery uses
+        it, which refuses a KV cache transceiver and so remote-tail attention DP.
         """
         mgr = self.kv_cache_manager
         paused = [
@@ -5607,31 +5604,17 @@ class PyExecutor:
         for req in paused:
             mgr.suspend_request(req)
         paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
-        remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         try:
             quota = mgr.impl.get_quota(GPU_LEVEL)
             resized = quota + delta > 0 and mgr.impl.resize(
                 GPU_LEVEL, quota + delta)
         finally:
-            # As in _rebalance_kv_pools_now, the reserved execution row resumes
-            # first. A request that cannot resume stays suspended until the
-            # scheduler resumes it.
-            if remote_tail_adp:
-                self._resume_padding_dummies_after_rebalance(
-                    mgr, paused_dummies)
+            # A request that cannot resume stays suspended until the scheduler
+            # resumes it.
             for req in paused:
                 mgr.resume_request(req)
-            if not remote_tail_adp:
-                self._resume_padding_dummies_after_rebalance(
-                    mgr, paused_dummies)
+            self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
             self._kv_cache_capacity = self._read_kv_cache_capacity()
-        if remote_tail_adp:
-            dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
-                0)
-            if dummy is None or not mgr.is_request_active(dummy.py_request_id):
-                raise RuntimeError(
-                    "Resizing the KV cache lost the reserved conditional "
-                    "attention-DP execution row")
         return resized
 
     def _start_pp_rebalance_drain(self) -> None:
