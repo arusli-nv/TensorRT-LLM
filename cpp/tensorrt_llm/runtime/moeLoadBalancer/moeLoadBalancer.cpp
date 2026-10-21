@@ -1310,8 +1310,12 @@ void MoeLoadBalancer::restorePlacement(std::vector<int> const& deadRanks,
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot restore placement.");
+    TLLM_CHECK_WITH_INFO(
+        mFaultToleranceMode, "restorePlacement needs WideEP fault tolerance (TLLM_FAULT_TOLERANCE_MODE=1)");
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot restore placement while an iteration is active.");
     TLLM_CHECK_WITH_INFO(mIterInfoQueue.empty(), "Cannot restore placement while iterations are queued.");
+    // The worker walks the layers of a popped iteration without the lock: only quiesce makes it idle.
+    TLLM_CHECK_WITH_INFO(mWorkerDoneIterId == mIterId, "Placement can only be restored while quiesced.");
     TLLM_CHECK_WITH_INFO(layerRankExpertIds.size() == mLayers.size(), "Got placements for %ld layers, expected %ld",
         static_cast<long>(layerRankExpertIds.size()), static_cast<long>(mLayers.size()));
 

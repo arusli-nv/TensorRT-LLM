@@ -972,6 +972,46 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementPublishesSlotsTheCallerLoaded)
     EXPECT_EQ(setup.slotValue(1), 2.0f);
 }
 
+TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsQuiesce)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    RestorePlacementLayer setup(/*withHostWeights=*/true);
+    std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
+
+    // The iteration ended, but the worker still walks its layers: it waits for this layer's CPU stage.
+    setup.mLoadBalancer.startIter(0, /*enableStatistic=*/true, /*enableUpdateWeights=*/false);
+    int statisticEnabled = 0;
+    moeWaitSignalForGpuStageForTest(setup.mLayer->getSignal(), &statisticEnabled);
+    setup.mLoadBalancer.endIter(0);
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
+        tensorrt_llm::common::TllmException);
+    EXPECT_EQ(setup.mLayer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{0, 1}));
+
+    // Once quiesced, the same placement installs.
+    moeSetSignalForCpuStageForTest(setup.mLayer->getSignal());
+    ASSERT_TRUE(setup.mLoadBalancer.quiesce(/*timeoutMs=*/10000));
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    EXPECT_EQ(setup.mLayer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{2, 1}));
+    EXPECT_EQ(setup.slotValue(0), 3.0f);
+}
+
+TEST(MoeLoadBalancerFaultToleranceOffTest, RestorePlacementIsRejected)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/false);
+    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/0);
+    auto layer = loadBalancer.AddLayer(/*expertCount=*/4, /*topK=*/2, /*slotCountPerRank=*/2);
+    layer->setInitialWeightAssignments({0, 1, 0, 1, 2, 3, 0, 1});
+    loadBalancer.finalizeModel();
+
+    // Without fault tolerance the updater cannot install the dead rank's empty (-1) slots: nothing may change.
+    EXPECT_THROW(
+        loadBalancer.restorePlacement({2}, {{{2, 1}, {0, 3}, {-1, -1}, {0, 1}}}), tensorrt_llm::common::TllmException);
+    EXPECT_EQ(layer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{0, 1}));
+}
+
 TEST(GhostSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
