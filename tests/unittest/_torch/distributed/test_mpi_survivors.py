@@ -393,12 +393,6 @@ def test_install_survivors_keeps_logical_ranks(dist, world):
         "rank3",
     ]
     assert dist.allgather("me", departed=0) == ["rank0", "me", 0, "rank3"]
-    assert dist.tp_cp_allgather("me", small_payload=True, departed=None) == [
-        "rank0",
-        "me",
-        None,
-        "rank3",
-    ]
 
     # A caller that does not say what a departed rank contributes fails stop.
     for gather in (

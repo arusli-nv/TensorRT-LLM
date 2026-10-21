@@ -84,8 +84,6 @@ _PEER_FAILURE_EVIDENCE_S = 1.0
 # loss the gather raises instead of returning a placeholder for the departed
 # rank, so no caller treats a missing rank as an answer by accident.
 DEPARTED_UNSPECIFIED = object()
-# Marks a departed TP rank's group inside tp_cp_allgather.
-_DEPARTED_GROUP = object()
 
 
 def _is_transport_error(error: BaseException) -> bool:
@@ -362,16 +360,11 @@ class Distributed(ABC):
     def cp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
-    def tp_cp_allgather(self,
-                        obj,
-                        *,
-                        small_payload: bool = False,
-                        departed=DEPARTED_UNSPECIFIED):
+    def tp_cp_allgather(self, obj, *, small_payload: bool = False):
         """Allgather across both TP and CP dimensions.
 
         First gathers within CP group, then across TP groups, returning
-        a flattened list with tp_size * cp_size entries. A departed TP rank
-        contributes *departed* for each CP rank (see :meth:`tp_allgather`).
+        a flattened list with tp_size * cp_size entries.
         """
         # Gather across CP dimension.
         if self.cp_size > 1:
@@ -381,23 +374,12 @@ class Distributed(ABC):
 
         # Gather across TP dimension.
         if self.tp_size > 1:
-            obj = self.tp_allgather(obj,
-                                    small_payload=small_payload,
-                                    departed=_DEPARTED_GROUP)
+            obj = self.tp_allgather(obj, small_payload=small_payload)
         else:
             obj = [obj]  # Wrap to match tp_allgather output format.
 
         # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
-        if any(tp_group is _DEPARTED_GROUP for tp_group in obj):
-            if departed is DEPARTED_UNSPECIFIED:
-                raise RuntimeError(
-                    "tp_cp_allgather after a peer loss needs departed=: the "
-                    "value that stands in for a rank that left the group")
-        return [
-            entry for tp_group in obj for entry in (
-                tp_group if tp_group is not _DEPARTED_GROUP else [departed] *
-                self.cp_size)
-        ]
+        return [entry for tp_group in obj for entry in tp_group]
 
     # Fixed-size int64 exchanges. MPIDist does each as one buffer collective
     # (no pickle); the defaults below reuse the object paths, sending plain
