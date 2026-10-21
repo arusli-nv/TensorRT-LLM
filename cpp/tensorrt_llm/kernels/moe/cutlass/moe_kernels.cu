@@ -1388,17 +1388,21 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
 
 constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
+// With the optional trailing MoeInputSourceSlots argument the kernel reads each routing token's input row through it;
+// without it the input rows are the routing tokens.
 template <class InputActivationsType, class ExpandedActivationsType,
-    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, bool PRE_QUANT_AWQ>
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, bool PRE_QUANT_AWQ,
+    class... InputSourceSlots>
 __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
     int const* permuted_row_to_unpermuted_row, int64_t const num_tokens, int64_t const hidden_size, int64_t const k,
     float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
-    int64_t const num_experts_per_node, InputActivationsType const* prequant_scales,
-    MoeInputSourceSlots const input_source_slots)
+    int64_t const num_experts_per_node, InputActivationsType const* prequant_scales = nullptr,
+    InputSourceSlots const... input_source_slots)
 {
+    static_assert(sizeof...(InputSourceSlots) <= 1, "At most one MoeInputSourceSlots argument");
     static_assert(BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE || !PRE_QUANT_AWQ,
         "AWQ and Block Scaling are mutually exclusive");
 #ifdef ENABLE_FP4
@@ -1457,8 +1461,14 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
         int64_t const source_k_rank = unpermuted_row / num_tokens;
         int64_t const source_row = unpermuted_row % num_tokens;
 
-        auto const* source_row_ptr = reinterpret_cast<DataElem const*>(
-            unpermuted_input + input_source_slots.inputRow(source_row) * hidden_size / ELEM_PER_BYTE);
+        int64_t input_row = source_row;
+        if constexpr (sizeof...(InputSourceSlots) == 1)
+        {
+            input_row = (input_source_slots.inputRow(source_row), ...);
+        }
+
+        auto const* source_row_ptr
+            = reinterpret_cast<DataElem const*>(unpermuted_input + input_row * hidden_size / ELEM_PER_BYTE);
         // Cast first to handle when this is FP4
         auto* dest_row_ptr
             = reinterpret_cast<OutputElem*>(permuted_output) + permuted_row * hidden_size / ELEM_PER_THREAD;
@@ -1607,9 +1617,6 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
     void const* prequant_scales, cudaStream_t stream, MoeInputSourceSlots input_source_slots)
 {
-    // Input scales are laid out for input rows that are the routing tokens.
-    TLLM_CHECK_WITH_INFO(input_source_slots.sourceTokens == 0 || input_sf == nullptr,
-        "Input rows in source slots cannot carry input scaling factors");
 #ifdef ENABLE_FP4
     TLLM_CHECK_WITH_INFO(
         (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) || !use_per_expert_act_scale,
@@ -1622,7 +1629,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     int64_t num_padding_tokens = 0;
 #endif
 
-    auto func = [&]()
+    auto selectKernel = [&](auto... slots)
     {
 #ifdef ENABLE_FP8
         // Always MXFP8 and W4A8_AWQ
@@ -1631,10 +1638,11 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
         {
             TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale || prequant_scales,
                 "MXFP8xMXFP4 block scaling or prequant_scales or prequant_scales parameters not provided");
-            return prequant_scales ? &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
-                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, true>
-                                   : &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
-                                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>;
+            return prequant_scales
+                ? &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, true, decltype(slots)...>
+                : &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false, decltype(slots)...>;
         }
         // Could be either regular FP8 or MXFP8
         else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3>
@@ -1645,9 +1653,9 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
             // activation block-scaling, so we accept either slot.
             return quant_params.mxfpxActFc1WeightScale()
                 ? &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
-                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false, decltype(slots)...>
                 : &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
-                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false>;
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false, decltype(slots)...>;
         }
         else
 #endif
@@ -1658,37 +1666,51 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
                 quant_params.fp4.fc1.weight_block_scale, "NVFP4 block scaling is expected for FP4xFP4");
             TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
             return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
-                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, false>;
+                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, false, decltype(slots)...>;
         }
         else
 #endif
         {
             TLLM_CHECK_WITH_INFO(!prequant_scales, "w4afp8 Prequant scales provided for non-FP8 data type");
             return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
-                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false>;
+                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false, decltype(slots)...>;
         }
-    }();
+    };
 
-    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, EXPAND_THREADS_PER_BLOCK, 0);
-    int32_t const blocks
-        = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(std::max(num_rows * k, num_padding_tokens)));
-    int32_t const threads = EXPAND_THREADS_PER_BLOCK;
+    auto launch = [&](auto func, auto... slots)
+    {
+        static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, EXPAND_THREADS_PER_BLOCK, 0);
+        int32_t const blocks
+            = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(std::max(num_rows * k, num_padding_tokens)));
+        int32_t const threads = EXPAND_THREADS_PER_BLOCK;
 
-    cudaLaunchConfig_t config;
-    config.gridDim = blocks;
-    config.blockDim = threads;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
-        permuted_row_to_unpermuted_row, num_rows, hidden_size, k, quant_params.fp4.fc1.act_global_scale,
-        use_per_expert_act_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
-        num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales), input_source_slots);
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks;
+        config.blockDim = threads;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
+            permuted_row_to_unpermuted_row, num_rows, hidden_size, k, quant_params.fp4.fc1.act_global_scale,
+            use_per_expert_act_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
+            num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales), slots...);
+    };
+
+    if (input_source_slots.sourceTokens > 0)
+    {
+        // Input scales are laid out for input rows that are the routing tokens.
+        TLLM_CHECK_WITH_INFO(input_sf == nullptr, "Input rows in source slots cannot carry input scaling factors");
+        launch(selectKernel(input_source_slots), input_source_slots);
+    }
+    else
+    {
+        launch(selectKernel());
+    }
 }
 
 struct Fp8BlockScaleActOutput
