@@ -268,8 +268,9 @@ def _stream_error_events(error: Exception) -> List[str]:
     ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
     """
     message = str(error)
-    code = PEER_LOSS_RETRYABLE_CODE if is_peer_loss_retryable_message(
-        message) else None
+    code = PEER_LOSS_RETRYABLE_CODE if (
+        fault_tolerance_mode()
+        and is_peer_loss_retryable_message(message)) else None
     error_data = json.dumps({
         "error": {
             "message": message,
@@ -1201,7 +1202,7 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
-        elif is_peer_loss_retryable_message(message):
+        elif fault_tolerance_mode() and is_peer_loss_retryable_message(message):
             # Recovery from a peer loss takes about a second.
             err_type = "ServiceUnavailableError"
             status_code = HTTPStatus.SERVICE_UNAVAILABLE

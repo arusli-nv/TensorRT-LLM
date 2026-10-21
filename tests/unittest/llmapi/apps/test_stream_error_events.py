@@ -63,7 +63,8 @@ def test_a_stream_that_completes_passes_through_unchanged():
     assert _drain(completing()) == ["data: first\n\n", "data: [DONE]\n\n"]
 
 
-def test_a_peer_loss_failure_streams_a_retryable_code():
+def test_a_peer_loss_failure_streams_a_retryable_code(monkeypatch):
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     message = peer_loss_retryable_message("Attention DP rank 2 failed; retry it")
 
     (event, _) = _stream_error_events(RequestError(message))
@@ -72,7 +73,8 @@ def test_a_peer_loss_failure_streams_a_retryable_code():
     assert error["code"] == PEER_LOSS_RETRYABLE_CODE and error["message"] == message
 
 
-def test_a_peer_loss_failure_is_a_503_with_retry_after():
+def test_a_peer_loss_failure_is_a_503_with_retry_after(monkeypatch):
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     message = peer_loss_retryable_message("Attention DP rank 2 is not serving")
 
     response = OpenAIServer.create_error_response(f"Request failed: {message}")
@@ -82,6 +84,20 @@ def test_a_peer_loss_failure_is_a_503_with_retry_after():
     body = json.loads(response.body)
     assert body["code"] == PEER_LOSS_RETRYABLE_CODE
     assert body["type"] == "ServiceUnavailableError"
+
+
+def test_without_fault_tolerance_a_tagged_message_is_an_ordinary_error(monkeypatch):
+    """Only fault tolerance emits the tag; without it, a message that carries one is answered as on main."""
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    message = peer_loss_retryable_message("user text")
+
+    response = OpenAIServer.create_error_response(message)
+    (event, _) = _stream_error_events(RequestError(message))
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert "Retry-After" not in response.headers
+    assert json.loads(response.body)["code"] == 400
+    assert json.loads(event[len("data: ") :])["error"]["code"] is None
 
 
 def test_other_errors_stay_400_without_retry_after():
