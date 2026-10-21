@@ -36,11 +36,7 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.recovery.config import CONFIG_ENV as FAULT_TOLERANCE_CONFIG_ENV
-from tensorrt_llm.executor.recovery.config import (
-    FailureDomain,
-    failure_domains,
-    fault_tolerance_config,
-)
+from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.executor.utils import peer_loss_retryable_message
 from tensorrt_llm.logger import logger
 
@@ -86,6 +82,8 @@ Responses = List[Tuple[int, LlmResponse]]
 # the other responses whose request this rank had not answered yet. Rank 0 reads these instead of every
 # response it gathers. A plain tuple keeps rank 0's unpickling of every part cheap.
 ResponseContribution = Union[Tuple[()], Tuple[Responses, List[int], List[int]]]
+# A set of ranks lost together, as a sorted tuple: one rank or a whole node.
+FailureDomain = Tuple[int, ...]
 # A request and the context position, state and draft tokens it had before a step changed them.
 StepChange = Tuple[LlmRequest, int, LlmRequestState, List[int]]
 _T = TypeVar("_T")
@@ -109,6 +107,22 @@ def _tested_spec_dec(spec_config) -> bool:
         and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
         and getattr(spec_config, "sa_config", None) is None
     )
+
+
+def failure_domains(hosts: Sequence[str], failure_domain: str) -> List[FailureDomain]:
+    """The rank sets to recover from: every rank but 0, then for ``node`` every node but rank 0's.
+
+    Args:
+        hosts: Per rank, the host it runs on.
+        failure_domain: ``rank`` or ``node`` (FaultToleranceConfig.failure_domain).
+    """
+    domains = [(rank,) for rank in range(1, len(hosts))]
+    if failure_domain == "node":
+        nodes: Dict[str, List[int]] = {}
+        for rank, host in enumerate(hosts):
+            nodes.setdefault(host, []).append(rank)
+        domains += [tuple(ranks) for host, ranks in nodes.items() if host != hosts[0]]
+    return list(dict.fromkeys(domains))
 
 
 @functools.cache
