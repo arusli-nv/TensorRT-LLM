@@ -614,6 +614,7 @@ def test_source_slots_reject_runtime_over_capacity() -> None:
         ({"use_cft_counted_writes": True}, "fence path"),
         ({"expert_id_payload_index": 1, "invalid_token_expert_id": -1}, "source_valid_counts"),
         ({"enable_rank_mask": False, "active_rank_mask": None, "abort_state": None}, "fence path"),
+        ({"abort_state": None}, "source_valid_counts needs abort_state"),
     ],
 )
 def test_source_slots_reject_unsupported_dispatch_options(extra: dict, match: str) -> None:

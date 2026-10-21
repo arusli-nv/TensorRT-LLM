@@ -611,6 +611,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     bool const fixedSlots = sourceValidCounts.has_value();
     TORCH_CHECK(
         !fixedSlots || (enableRankMask && !useCftCountedWrites), "source_valid_counts needs the rank-mask fence path");
+    TORCH_CHECK(!fixedSlots || abortState.has_value(),
+        "source_valid_counts needs abort_state, which records the status of a released dispatch");
     TORCH_CHECK(!fixedSlots || !sanitizeExpertIds,
         "source_valid_counts marks received rows itself; it excludes expert-id sanitization");
     TORCH_CHECK(!compactRouting || fixedSlots, "compact routing lists need source_valid_counts");
