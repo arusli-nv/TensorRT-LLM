@@ -412,7 +412,8 @@ class HostMoeTensorSharer:
                 add_host_weight_fn(key[0], key[1], t)
 
         self.host_weights.clear()
-        _populate_in_background(self.imported_shms)
+        if peer_loss_recovery_enabled():
+            _populate_in_background(self.imported_shms)
 
     def pre_shutdown_cleanup(self):
         """

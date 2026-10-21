@@ -92,6 +92,38 @@ def test_a_rank_that_shares_no_expert_creates_no_shared_memory():
             sharer.post_shutdown_cleanup()
 
 
+def _shared_layer(local_size: int, expert_count: int) -> list:
+    """A node's sharers of one layer, each holding its own experts' weights and every other's shape."""
+    sharers = [_sharer(rank, local_size, expert_count) for rank in range(local_size)]
+    for sharer in sharers:
+        sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharers)}")
+        for expert in range(expert_count):
+            if expert in sharer.own_expert_ids:
+                sharer.share_host_tensor_with_shape(expert, "w", torch.full((4,), float(expert)))
+            else:
+                sharer.pre_register_host_tensor_with_shape(expert, "w", torch.float32, (4,))
+    return sharers
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_host_copies_are_prefaulted_only_with_peer_loss_recovery(monkeypatch, recovery):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: recovery)
+    populate = Mock()
+    monkeypatch.setattr(f"{_MLB}._populate_in_background", populate)
+    sharers = _shared_layer(2, 2)
+    try:
+        for sharer in sharers:
+            sharer.finalize_layer_weights()
+        for sharer in sharers:
+            sharer.finalize_host_tensor_sharing()
+        assert populate.call_count == (len(sharers) if recovery else 0)
+    finally:
+        for sharer in sharers:
+            sharer.pre_shutdown_cleanup()
+        for sharer in sharers:
+            sharer.post_shutdown_cleanup()
+
+
 def test_a_layer_that_does_not_fit_in_shared_memory_fails_before_creating_it(monkeypatch):
     # Two local ranks share four experts of 300 bytes aligned to 512: this rank's part needs 1024 bytes.
     sharer = _sharer(0, 2, expert_count=4)
