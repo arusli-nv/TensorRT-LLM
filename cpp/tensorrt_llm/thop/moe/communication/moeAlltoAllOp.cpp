@@ -587,6 +587,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         CHECK_INPUT(expertToSlot.value(), torch::kInt32);
         TORCH_CHECK(expertToSlot->dim() == 1 && expertToSlot->size(0) > 0 && expertToSlot->size(0) <= numExperts,
             "expert_to_slot must be [num_routed_experts] with num_routed_experts <= num_experts (slots)");
+        TORCH_CHECK(!useCftCountedWrites, "expert_to_slot needs the fence path; CFT is enabled");
     }
     TORCH_CHECK(!(sanitizeExpertIds && compactRouting), "compact routing lists exclude expert-id sanitization");
     bool enableEplb = eplbLocalStats.has_value();

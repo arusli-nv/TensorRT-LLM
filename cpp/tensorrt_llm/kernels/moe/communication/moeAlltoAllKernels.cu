@@ -1095,7 +1095,7 @@ __device__ __forceinline__ void cft_elect_and_publish(DispatchKernelPointers con
     }
 }
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING, bool USE_EXPERT_TO_SLOT>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
@@ -1167,12 +1167,11 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 
         // ---- Routing: map tokens to target ranks ----
         constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
-        int routed_id = 0;
         if (threadIdx.x < TOP_K)
         {
-            routed_id = route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>(
-                token_selected_experts, ptrs, local_token_idx, ep_size, num_experts, smem_topk_target_ranks,
-                smem_topk_target_indices, kRoutingLaneMask);
+            route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING, false>(token_selected_experts, ptrs,
+                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
+                kRoutingLaneMask);
         }
         __syncthreads();
 
@@ -1205,22 +1204,6 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             cft_barrier_wait_parity(tma_bar, 0);
         }
         __syncthreads();
-        if constexpr (USE_EXPERT_TO_SLOT)
-        {
-            // Send the routed slot ids in place of the staged expert ids. The generic-proxy stores must be visible
-            // to the async proxy (s2g and fabric puts) that reads the staging buffer.
-            if (threadIdx.x < TOP_K)
-            {
-                int staged_offset = 0;
-                for (int p = 0; p < ptrs.expert_id_payload_index; p++)
-                {
-                    staged_offset += ptrs.payload_bytes_per_token[p];
-                }
-                reinterpret_cast<int32_t*>(smem_staging + staged_offset)[threadIdx.x] = routed_id;
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            }
-            __syncthreads();
-        }
 
         // Use a different warp to issue s2g if there are at least 2 warps, so the s2g and the
         // fabric puts overlap instead of serializing on one thread.
@@ -1421,7 +1404,7 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
 #endif // !DISABLE_SYNC_FOR_PROFILING
 }
 #else  // TLLM_MOE_A2A_COMPILE_SM100
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING, bool USE_EXPERT_TO_SLOT>
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, DispatchKernelPointers const ptrs,
     int num_payloads, int max_tokens_per_rank, int local_num_tokens, int rank_id, int ep_size, int num_experts,
     int eplb_stats_num_experts)
@@ -1519,6 +1502,9 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.invalid_expert_id = params.invalid_expert_id;
     }
     kernel_ptrs.expert_id_payload_index = params.expert_id_payload_index;
+    // Only the fence path looks the slots up in expert_to_slot.
+    TLLM_CHECK_WITH_INFO(
+        params.expert_to_slot == nullptr || !params.use_cft_counted_writes, "expert_to_slot needs the fence path");
     kernel_ptrs.expert_to_slot = params.expert_to_slot;
     kernel_ptrs.num_routed_experts = params.num_routed_experts;
 
@@ -1590,19 +1576,17 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
                     SWITCH_BOOL(params.ep_size < TOP_K, ENABLE_RANK_COMPACT_ROUTING, {
-                        SWITCH_BOOL(params.expert_to_slot != nullptr, USE_EXPERT_TO_SLOT, {
-                            auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
-                                ENABLE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>;
-                            if (shared_bytes > kDefaultDynamicSmemBytes)
-                            {
-                                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-                                    kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-                            }
-                            launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
-                                shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
-                                params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
-                                params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
-                        });
+                        auto kernel_fn = moeA2ADispatchKernel_Cft<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
+                            ENABLE_RANK_COMPACT_ROUTING>;
+                        if (shared_bytes > kDefaultDynamicSmemBytes)
+                        {
+                            TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                                kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                        }
+                        launchWithPdlWhenEnabled("moeA2ADispatchKernel_Cft", kernel_fn, grid_size, kBlockSize,
+                            shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+                            params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                            params.ep_size, params.num_experts, params.eplb_stats_num_experts);
                     });
                 });
             });
