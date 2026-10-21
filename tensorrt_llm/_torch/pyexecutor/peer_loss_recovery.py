@@ -1135,18 +1135,21 @@ class PeerLossRecovery(RecoveryHook):
         return outcome
 
     def _shrink(self) -> frozenset:
-        """Agree with the other survivors on the failed ranks, once the ranks this rank sees failed are dead.
+        """Agree with the other survivors on the failed ranks.
 
-        A rank Open MPI's failure detector declared failed may still be alive (a stopped process), and the
-        agreement does not complete until it ends; the detector's verdict counts as its failure, so it is ended
-        first. Every survivor does so for what it sees: the kills are idempotent, and one that fails leaves the
-        authority's fence before Propose to fail closed.
+        With hang detection, the ranks this rank sees failed are ended first: a rank Open MPI's failure detector
+        declared failed may still be alive (a stopped process), and the agreement does not complete until it
+        ends, so the detector's verdict counts as its failure. Every survivor does so for what it sees: the kills
+        are idempotent, and one that fails leaves the authority's fence before Propose to fail closed. Without
+        hang detection, recovery does not use the MPI runtime's job control, and a stopped rank holds the
+        agreement until it ends.
         """
         dist = self._executor.dist
-        reported = dist.reported_failed_ranks()
-        for rank, error in self._end_ranks(sorted(reported)).items():
-            if error:
-                logger.warning(f"Rank {dist.rank}: could not end failed rank {rank}: {error}")
+        if fault_tolerance_config().hang_detection:
+            reported = dist.reported_failed_ranks()
+            for rank, error in self._end_ranks(sorted(reported)).items():
+                if error:
+                    logger.warning(f"Rank {dist.rank}: could not end failed rank {rank}: {error}")
         return dist.shrink()
 
     def _watch_survivors(self, further_loss: threading.Event) -> Optional[PeerFailureWatch]:

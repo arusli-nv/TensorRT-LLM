@@ -102,9 +102,9 @@ class RecoveryAuthority:
     node. A loss recovers only if every survivor reports the same failed set (every rank
     lost so far) and that set is a union of admitted domains; the survivors check that
     their slots still serve every expert without it. The survivors' agreement on the failed
-    set may rest on a failure detector's suspicion (a stopped process is alive), so before
-    proposing, the authority has rank 0 end through the MPI runtime every failed rank it has
-    not fenced itself, and aborts if one cannot be ended.
+    set may rest on a failure detector's suspicion (a stopped process is alive), so with
+    ``fence_departed`` the authority has rank 0 end through the MPI runtime, before proposing, every
+    failed rank it has not fenced itself, and aborts if one cannot be ended.
 
     The authority performs no I/O: ``handle`` and ``expire`` return the messages to
     send as ``(routing_id, message)`` pairs. A protocol violation during registration or
@@ -132,6 +132,8 @@ class RecoveryAuthority:
             the workers alone.
         config_digest: The ``FaultToleranceConfig.digest()`` every worker must register with
             (default: that of the default settings).
+        fence_departed: Have rank 0 end every failed rank before each proposal (hang detection); False
+            recovers without the MPI runtime's job control.
     """
 
     def __init__(
@@ -141,12 +143,15 @@ class RecoveryAuthority:
         hang_monitor: HangMonitor | None = None,
         fence: Callable[[HungRank], None] | None = None,
         config_digest: str | None = None,
+        *,
+        fence_departed: bool = False,
     ) -> None:
         self.world_size = world_size
         self.config_digest = config_digest or FaultToleranceConfig().digest()
         self.recovery_timeout = recovery_timeout
         self.hang_monitor = hang_monitor
         self._fence = fence
+        self._fence_departed = fence_departed
         self.admitted_domains: frozenset[frozenset[int]] = frozenset()
         self.generation = 0
         self.phase = Phase.REGISTERING
@@ -488,7 +493,7 @@ class RecoveryAuthority:
         self._record_barriers(message)
         if len(self._stopped) < len(self.survivors):
             return []
-        self._fencing = set(self.failed_ranks - self._fenced)
+        self._fencing = set(self.failed_ranks - self._fenced) if self._fence_departed else set()
         if self._fencing:
             # Rank 0 is never lost. A pid only names the process in the log; the runtime ends the rank.
             return [
@@ -861,7 +866,12 @@ def main(argv: list[str] | None = None) -> None:
     fence = command_fence(args.fence_command) if args.fence_command else None
     logger.info(f"Recovery authority: fault-tolerance settings {config.digest()}: {config}")
     authority = RecoveryAuthority(
-        args.world_size, config.authority_timeout_s, hang_monitor, fence, config.digest()
+        args.world_size,
+        config.authority_timeout_s,
+        hang_monitor,
+        fence,
+        config.digest(),
+        fence_departed=config.hang_detection,
     )
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):

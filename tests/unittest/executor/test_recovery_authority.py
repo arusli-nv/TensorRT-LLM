@@ -68,8 +68,8 @@ def _register_all(authority, recoverable=lambda rank: RECOVERABLE):
     return out
 
 
-def _registered(timeout: float = 10.0) -> RecoveryAuthority:
-    authority = RecoveryAuthority(WORLD, recovery_timeout=timeout)
+def _registered(timeout: float = 10.0, fence_departed: bool = True) -> RecoveryAuthority:
+    authority = RecoveryAuthority(WORLD, recovery_timeout=timeout, fence_departed=fence_departed)
     out = _register_all(authority, lambda rank: ((1,), NODE, (FAILED,)))
     assert authority.phase is Phase.SERVING
     admitted = Registered(((1,), (FAILED,), NODE))
@@ -421,6 +421,14 @@ def test_a_departed_rank_not_known_dead_is_fenced_before_the_proposal():
     assert out == [(_route(0), Fence(FAILED, 4242))]
     assert authority.phase is Phase.STOPPING
     out = authority.handle(_route(0), Fenced(0, FAILED, ""), 1.25)
+    assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
+    assert authority.phase is Phase.PREPARING
+
+
+def test_without_hang_detection_the_proposal_follows_the_survivors_reports_without_a_fence():
+    authority = _registered(fence_departed=False)
+    for rank in SURVIVORS:
+        out = authority.handle(_route(rank), Stopped(rank, (FAILED,)), 1.0)
     assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
     assert authority.phase is Phase.PREPARING
 
@@ -933,7 +941,7 @@ def test_only_fresh_messages_of_a_ranks_session_are_applied():
 
 
 def test_a_fence_answer_is_applied_only_fresh_from_rank_0_s_protocol_stream():
-    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
+    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0, fence_departed=True)
     domains = ((1,), NODE, (FAILED,))
     for rank in range(WORLD):
         authority.receive(

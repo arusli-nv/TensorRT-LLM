@@ -294,6 +294,7 @@ def _serving_authority(fenced):
         len(RANKS),
         hang_monitor=_monitor(),
         fence=lambda hung: fenced.append((hung.rank, hung.reason, hung.host, hung.pid)),
+        fence_departed=True,
     )
     for rank in RANKS:
         authority.handle(f"rank-{rank}".encode(), Register(rank, ((1,), (2,), (3,)), DIGEST), 0.0)
@@ -597,6 +598,7 @@ def test_a_replayed_device_wait_is_not_evidence(replayed):
         len(RANKS),
         hang_monitor=_monitor(),
         fence=lambda hung: fenced.append(hung.rank),
+        fence_departed=True,
     )
     seq = dict.fromkeys(RANKS, 1)
     for rank in RANKS:

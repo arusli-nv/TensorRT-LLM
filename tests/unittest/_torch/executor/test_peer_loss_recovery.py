@@ -515,7 +515,7 @@ def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch,
     )
 
 
-def _runtime(monkeypatch, kill_rank):
+def _runtime(monkeypatch, kill_rank, hang_detection=True):
     """The MPI runtime: session rank r is runtime rank 10 + r; ``kill_rank`` ends a runtime rank."""
     from tensorrt_llm import _utils
     from tensorrt_llm._torch.distributed import pmix_fence
@@ -523,6 +523,11 @@ def _runtime(monkeypatch, kill_rank):
     monkeypatch.setattr(_utils, "mpi_comm", lambda: None)
     monkeypatch.setattr(pmix_fence, "pmix_ranks", lambda comm: (10, 11, 12, 13))
     monkeypatch.setattr(pmix_fence, "kill_rank", kill_rank)
+    monkeypatch.setattr(
+        peer_loss_recovery,
+        "fault_tolerance_config",
+        lambda: FaultToleranceConfig(hang_detection=hang_detection),
+    )
 
 
 def test_a_shrink_waiting_on_a_detector_reported_live_rank_completes_once_it_is_killed(monkeypatch):
@@ -570,6 +575,16 @@ def test_nothing_is_killed_before_a_shrink_when_no_failure_is_reported(monkeypat
     killed = []
     _runtime(monkeypatch, killed.append)
     recovery = _recovery(_FakeClient(_happy_replies()))
+    recovery._recover(_interrupted())
+    assert killed == []
+    assert recovery._executor.dist.shrink.call_count == 1
+
+
+def test_without_hang_detection_no_reported_rank_is_killed_before_a_shrink(monkeypatch):
+    killed = []
+    _runtime(monkeypatch, killed.append, hang_detection=False)
+    recovery = _recovery(_FakeClient(_happy_replies()))
+    recovery._executor.dist.reported_failed_ranks.return_value = frozenset({FAILED_RANK})
     recovery._recover(_interrupted())
     assert killed == []
     assert recovery._executor.dist.shrink.call_count == 1
