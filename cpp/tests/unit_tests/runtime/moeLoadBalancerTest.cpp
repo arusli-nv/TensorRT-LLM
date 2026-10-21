@@ -674,33 +674,43 @@ TEST(MoeLoadBalancerFaultToleranceOffTest, InitialAssignmentRejectsAnEmptySlot)
     EXPECT_THROW(layer->setInitialWeightAssignments({0, 1, 2, 3, 0, -1, 1, 2}), tensorrt_llm::common::TllmException);
 }
 
-TEST(MoeLoadBalancerFaultToleranceOffTest, FinalizeRejectsWeightSlotsWithoutHostWeights)
+// Adds weight slots but no host weights to one layer, then finalizes the model. GPU copies keep the slot pointers as
+// given, so finalization reaches the host-weight check.
+void finalizeLayerWithoutHostWeights()
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
     TLLM_CUDA_CHECK(cudaSetDevice(0));
-    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/false);
     constexpr int kSlotCountPerRank = 2;
     constexpr size_t kBytes = 256;
-    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/1);
+    void* slotMemory = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&slotMemory, kSlotCountPerRank * kBytes));
+    std::unique_ptr<void, decltype(&cudaFree)> const slotMemoryOwner(slotMemory, &cudaFree);
+    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/0);
+    loadBalancer.setUseGpuMemcpy(true);
     auto layer = loadBalancer.AddLayer(/*expertCount=*/4, /*topK=*/2, kSlotCountPerRank);
-    std::vector<void*> slots(kSlotCountPerRank, nullptr);
     for (int slotId = 0; slotId < kSlotCountPerRank; ++slotId)
     {
-        TLLM_CUDA_CHECK(cudaMalloc(&slots[slotId], kBytes));
         MoeWeight slot;
-        slot.mWeightPtr = slots[slotId];
+        slot.mWeightPtr = static_cast<char*>(slotMemory) + slotId * kBytes;
         slot.mHeight = 1;
         slot.mWidth = kBytes;
         slot.mPitch = kBytes;
         layer->addSingleWeightSlot(slotId, "w", slot);
     }
     layer->setInitialWeightAssignments({0, 1, 0, 1, 2, 3, 0, 1});
+    loadBalancer.finalizeModel();
+}
 
-    EXPECT_THROW(loadBalancer.finalizeModel(), tensorrt_llm::common::TllmException);
-    for (auto* slot : slots)
-    {
-        TLLM_CUDA_CHECK(cudaFree(slot));
-    }
+TEST(MoeLoadBalancerFaultToleranceOffTest, FinalizeRejectsWeightSlotsWithoutHostWeights)
+{
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/false);
+    EXPECT_THROW(finalizeLayerWithoutHostWeights(), tensorrt_llm::common::TllmException);
+}
+
+TEST(MoeLoadBalancerFaultToleranceOnTest, FinalizeAcceptsWeightSlotsWithoutHostWeights)
+{
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/true);
+    EXPECT_NO_THROW(finalizeLayerWithoutHostWeights());
 }
 
 // One layer on EP rank 0 of 4 with 2 slots per rank; by default experts 2 and 3 live only on rank 2. With host weights,
