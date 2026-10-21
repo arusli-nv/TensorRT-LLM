@@ -309,7 +309,9 @@ class TestMoeLoadBalancer(unittest.TestCase):
         layer = balancer.add_layer(4, 2, 1)
         balancer.set_iter_info(True, True)
 
-        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'):
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'), patch(
+                'tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.peer_loss_recovery_enabled',
+                return_value=True):
             with self.assertRaises(ValueError):
                 with MoeLoadBalancerIterContext(balancer):
                     layer.start_wait_gpu_stage()
@@ -323,6 +325,27 @@ class TestMoeLoadBalancer(unittest.TestCase):
                 layer.start_wait_gpu_stage()
         mock_load_balancer_impl.return_value.end_iter.assert_called_with(
             1, interrupted=False)
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_without_peer_loss_recovery_a_raising_forward_ends_its_iteration_as_on_main(
+            self, mock_load_balancer_impl):
+        """Without peer-loss recovery a forward that raises ends its iteration uninterrupted and keeps
+        the layer's stage counts, as on main."""
+
+        torch.cuda.set_device(0)
+
+        balancer = MoeLoadBalancer(0, 4, 2)
+        layer = balancer.add_layer(4, 2, 1)
+        balancer.set_iter_info(True, True)
+
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'):
+            with self.assertRaises(ValueError):
+                with MoeLoadBalancerIterContext(balancer):
+                    layer.start_wait_gpu_stage()
+                    raise ValueError("forward interrupted")
+        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(
+            0, interrupted=False)
+        self.assertEqual(layer.func_called_count["start_wait_gpu_stage"], 1)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_reconfigure_mask_only_rejects_active_iteration(

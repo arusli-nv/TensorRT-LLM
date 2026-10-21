@@ -1890,7 +1890,9 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.end_iter(interrupted=exc_type is not None)
+            # Only peer-loss recovery resumes serving after a forward that raised.
+            self.moe_load_balancer.end_iter(interrupted=exc_type is not None
+                                            and peer_loss_recovery_enabled())
         return False
 
 
