@@ -110,7 +110,7 @@ def _shared_layer(local_size: int, expert_count: int) -> list:
 def test_host_copies_are_prefaulted_only_with_peer_loss_recovery(monkeypatch, recovery):
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: recovery)
     populate = Mock()
-    monkeypatch.setattr(f"{_MLB}._populate_in_background", populate)
+    monkeypatch.setattr(f"{_MLB}._start_populate", populate)
     sharers = _shared_layer(2, 2)
     try:
         for sharer in sharers:
@@ -118,6 +118,11 @@ def test_host_copies_are_prefaulted_only_with_peer_loss_recovery(monkeypatch, re
         for sharer in sharers:
             sharer.finalize_host_tensor_sharing()
         assert populate.call_count == (len(sharers) if recovery else 0)
+        # finalize_model joins these before serving.
+        assert all(
+            sharer.populate_thread is (populate.return_value if recovery else None)
+            for sharer in sharers
+        )
     finally:
         for sharer in sharers:
             sharer.pre_shutdown_cleanup()

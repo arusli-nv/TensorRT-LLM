@@ -71,9 +71,10 @@ def _reserve_shm(shm: shared_memory.SharedMemory, layer_id: int) -> None:
         os.close(fd)
 
 
-def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
-    """Prefault the pages of host copies that other local ranks wrote, off the startup path, so that the first
-    restore copy does not page-fault. Best effort: older kernels reject the advice."""
+def _start_populate(
+        segments: List[shared_memory.SharedMemory]) -> threading.Thread:
+    """Start prefaulting the pages of host copies that other local ranks wrote, so that restore copies do not
+    page-fault; MoeLoadBalancer.finalize_model joins it. Best effort: older kernels reject the advice."""
     libc = ctypes.CDLL(None, use_errno=True)
     spans = [(np.frombuffer(segment.buf,
                             dtype=np.uint8).ctypes.data, segment.size)
@@ -87,9 +88,11 @@ def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
                              f"{os.strerror(ctypes.get_errno())}")
                 return
 
-    threading.Thread(target=populate,
-                     name="eplb_host_copy_populate",
-                     daemon=True).start()
+    thread = threading.Thread(target=populate,
+                              name="eplb_host_copy_populate",
+                              daemon=True)
+    thread.start()
+    return thread
 
 
 # Whether ghost slot memory is host accessible on every rank; set by the first _ghost_slot_memory_host_accessible().
@@ -178,6 +181,7 @@ class HostMoeTensorSharer:
         self.own_shm = None
         self.own_shm_linked = False
         self.imported_shms = []
+        self.populate_thread: Optional[threading.Thread] = None
 
         self.shared_tensors = {}
         self.names = []
@@ -408,7 +412,7 @@ class HostMoeTensorSharer:
 
         self.host_weights.clear()
         if peer_loss_recovery_enabled():
-            _populate_in_background(self.imported_shms)
+            self.populate_thread = _start_populate(self.imported_shms)
 
     def pre_shutdown_cleanup(self):
         """
@@ -1326,6 +1330,11 @@ class MoeLoadBalancer:
         # All shared memory mapping after this barrier.
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
+        # Prefaulting the host copies finishes before serving: during the first requests it stalls their steps.
+        for single_layer_load_balancer in self.single_layer_load_balancers:
+            sharer = single_layer_load_balancer.host_tensor_sharer
+            if sharer is not None and sharer.populate_thread is not None:
+                sharer.populate_thread.join()
         if peer_loss_recovery_enabled():
             # Every rank mapped its peers' shared memory, which nothing opens by name again: ranks that
             # are killed leave nothing in /dev/shm.
