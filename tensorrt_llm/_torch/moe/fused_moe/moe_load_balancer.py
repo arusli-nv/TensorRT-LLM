@@ -27,7 +27,8 @@ from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
-from tensorrt_llm.executor.recovery.config import fault_tolerance_config
+from tensorrt_llm.executor.recovery.config import (failure_domains,
+                                                   fault_tolerance_config)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1203,8 +1204,6 @@ class MoeLoadBalancer:
 
     def _largest_failure_domain(self, hosts: List[str]) -> int:
         """The most ranks one failure domain (FaultToleranceConfig.failure_domain) holds, ``hosts`` per rank."""
-        from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import \
-            failure_domains
         return max(map(
             len, failure_domains(hosts,
                                  fault_tolerance_config().failure_domain)),

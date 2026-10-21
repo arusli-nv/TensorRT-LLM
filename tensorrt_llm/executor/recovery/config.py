@@ -14,14 +14,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import yaml
 from pydantic import ConfigDict, Field, PositiveFloat, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
-__all__ = ["CONFIG_ENV", "STALLED_EXIT_CODE", "FaultToleranceConfig", "fault_tolerance_config"]
+__all__ = [
+    "CONFIG_ENV",
+    "STALLED_EXIT_CODE",
+    "FailureDomain",
+    "FaultToleranceConfig",
+    "failure_domains",
+    "fault_tolerance_config",
+]
 
 CONFIG_ENV = "TLLM_FAULT_TOLERANCE_CONFIG"
 # A worker asks the MPI runtime to kill a hung rank this long after it received the authority's Fence, unless the
@@ -35,6 +42,8 @@ COMMAND_FENCE_GRACE_S = 5.0
 # The exit code of a worker the authority told that the deployment hangs and no fence can recover it (EX_TEMPFAIL):
 # the deployment must restart.
 STALLED_EXIT_CODE = 75
+# A set of ranks lost together, as a sorted tuple: one rank or a whole node.
+FailureDomain = Tuple[int, ...]
 
 
 class FaultToleranceConfig(StrictBaseModel):
@@ -142,3 +151,19 @@ def fault_tolerance_config() -> FaultToleranceConfig:
     if not isinstance(fields, dict):
         raise ValueError(f"{CONFIG_ENV}={path} must hold a mapping of settings")
     return FaultToleranceConfig(**fields)
+
+
+def failure_domains(hosts: Sequence[str], failure_domain: str) -> List[FailureDomain]:
+    """The rank sets to recover from: every rank but 0, then for ``node`` every node but rank 0's.
+
+    Args:
+        hosts: Per rank, the host it runs on.
+        failure_domain: ``rank`` or ``node`` (FaultToleranceConfig.failure_domain).
+    """
+    domains = [(rank,) for rank in range(1, len(hosts))]
+    if failure_domain == "node":
+        nodes: Dict[str, List[int]] = {}
+        for rank, host in enumerate(hosts):
+            nodes.setdefault(host, []).append(rank)
+        domains += [tuple(ranks) for host, ranks in nodes.items() if host != hosts[0]]
+    return list(dict.fromkeys(domains))

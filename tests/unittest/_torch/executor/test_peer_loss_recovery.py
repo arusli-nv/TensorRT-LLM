@@ -37,7 +37,7 @@ from tensorrt_llm.executor.recovery.client import (
     RecoveryInterrupted,
     RecoveryTimeout,
 )
-from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
+from tensorrt_llm.executor.recovery.config import FaultToleranceConfig, failure_domains
 from tensorrt_llm.executor.recovery.protocol import (
     Abort,
     Commit,
@@ -2107,14 +2107,14 @@ def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
 
 def test_failure_domains_are_every_rank_then_every_host_but_rank_0_s():
     hosts = ["a"] * 4 + ["b"] * 4
-    assert peer_loss_recovery.failure_domains(hosts, "rank") == [(r,) for r in range(1, 8)]
-    assert peer_loss_recovery.failure_domains(hosts, "node") == [
+    assert failure_domains(hosts, "rank") == [(r,) for r in range(1, 8)]
+    assert failure_domains(hosts, "node") == [
         *((r,) for r in range(1, 8)),
         (4, 5, 6, 7),
     ]
     # Ranks mapped round-robin over the hosts: a node is the ranks on one host, not a block of ranks.
-    assert peer_loss_recovery.failure_domains(["a", "b", "a", "b"], "node")[-1] == (1, 3)
-    assert peer_loss_recovery.failure_domains(["a", "b", "c", "d"], "node") == [
+    assert failure_domains(["a", "b", "a", "b"], "node")[-1] == (1, 3)
+    assert failure_domains(["a", "b", "c", "d"], "node") == [
         (1,),
         (2,),
         (3,),
