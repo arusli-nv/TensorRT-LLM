@@ -41,11 +41,12 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
    export TLLM_FAULT_TOLERANCE_AUTHORITY_KEY=$(python3 -c "import os; print(os.urandom(32).hex())")
    python3 -m tensorrt_llm.executor.recovery.authority --endpoint "tcp://<private-ip>:5555" --world-size 32
    ```
-   The authority's messages are authenticated but not encrypted, and any host that can reach its port can
-   disrupt recovery: never bind it to a public interface or reuse a key across jobs. Without `--endpoint` it
-   binds to localhost (single-node jobs). With hang detection on, it also receives the workers' native
-   heartbeats as UDP datagrams on the same port number, and exits if it cannot bind that UDP port: let UDP
-   reach it.
+   The authority's messages are authenticated but not encrypted, and any host that can reach its port can disrupt
+   recovery, even without the key (by connecting with a worker's routing id, it takes over the authority's
+   messages to that worker): never bind it to a public interface or reuse a key across jobs. Without `--endpoint`
+   it binds to localhost (single-node jobs). With hang detection on, it also receives the workers' native
+   heartbeats as UDP datagrams on the same port number, and exits if it cannot bind that UDP port: let UDP reach
+   it.
 2. Launch the server under `mpirun --with-ft ulfm` with the ob1 transport and the same key:
    ```bash
    export TLLM_FAULT_TOLERANCE_MODE=1

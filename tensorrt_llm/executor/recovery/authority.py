@@ -8,7 +8,8 @@ workers. Run it outside the workers' launch and termination groups: it must outl
 any one worker.
 
 Experimental: traffic is authenticated but not encrypted, and a host that can reach
-the port can still disrupt recovery, so the authority binds to localhost by default.
+the port can still disrupt recovery (for example, by taking over a worker's route; see
+:func:`router_queue`), so the authority binds to localhost by default.
 A multi-node job binds it to the job's private network interface with
 ``--endpoint`` and a key generated for that job.
 """
@@ -764,7 +765,10 @@ def router_queue(endpoint: str, key: bytes) -> ZeroMqQueue:
 
     A connection with a routing id in use takes the route over (a worker reconnecting after its
     connection died); the session and sequence checks of :meth:`RecoveryAuthority.receive` still
-    drop a replay on it. A message to a route with no connection fails rather than vanishing.
+    drop a replay on it. Those checks cover only inbound messages: routing ids travel in cleartext,
+    so a peer without the key that connects with a worker's id receives the authority's messages to
+    that worker, and the recovery times out. A message to a route with no connection fails rather
+    than vanishing.
     """
     router = ZeroMqQueue(
         (endpoint, key),
