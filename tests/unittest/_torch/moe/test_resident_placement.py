@@ -53,8 +53,8 @@ def test_static_routing_keeps_host_copies_only_with_peer_loss_recovery(recovery)
             return_value=recovery,
         ),
         patch("tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.HostMoeTensorSharer"),
-        patch.object(MoeLoadBalancer, "_gather_largest_loss", return_value=2),
-        patch.object(MoeLoadBalancer, "_gather_copy_nodes", return_value=[(1, 3), (0, 2)] * 2),
+        patch.object(MoeLoadBalancer, "_largest_failure_domain", return_value=2),
+        patch.object(MoeLoadBalancer, "_gather_hosts", return_value=["a", "b"] * 2),
     ):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
         # One slot per expert.
@@ -64,6 +64,17 @@ def test_static_routing_keeps_host_copies_only_with_peer_loss_recovery(recovery)
     assert layer.is_static_routing()
     assert layer.need_load_shared_weights() == recovery
     assert (layer.host_tensor_sharer is not None) == recovery
+
+
+def test_peer_loss_recovery_needs_the_ep_group_to_be_every_rank(monkeypatch):
+    load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    load_balancer.ep_rank, load_balancer.ep_size = 0, WORLD_SIZE
+    # Pipeline parallelism: the world holds two EP groups.
+    world = Mock(Get_size=Mock(return_value=2 * WORLD_SIZE), Get_rank=Mock(return_value=0))
+    monkeypatch.setattr("tensorrt_llm.mpi_comm", lambda: world)
+    with pytest.raises(ValueError, match="EP group to be every rank"):
+        load_balancer._gather_hosts()
+    world.allgather.assert_not_called()
 
 
 def _digest(load_balancer, dead):
@@ -155,7 +166,8 @@ def test_recovery_placements_reject_a_base_with_another_layer_count():
 
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 # Two nodes of two ranks.
-_COPY_NODES = ring_copy_nodes(["a", "a", "b", "b"])
+_HOSTS = ["a", "a", "b", "b"]
+_COPY_NODES = ring_copy_nodes(_HOSTS)
 
 
 def _eplb_load_balancer(
@@ -179,8 +191,10 @@ def _eplb_load_balancer(
     monkeypatch.setattr(
         f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig(extra_slots=extra_slots)
     )
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: largest_loss)
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_copy_nodes", lambda self: _COPY_NODES)
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_hosts", lambda self: _HOSTS)
+    monkeypatch.setattr(
+        MoeLoadBalancer, "_largest_failure_domain", lambda self, hosts: largest_loss
+    )
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),
@@ -236,7 +250,7 @@ def test_online_eplb_without_peer_loss_recovery_gets_no_ghost_slots(monkeypatch)
     def gather(self):
         raise AssertionError("gathered hosts without peer-loss recovery")
 
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", gather)
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_hosts", gather)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),
@@ -534,6 +548,7 @@ def test_install_masks_only_when_no_expert_moves():
 
 # DeepSeek-R1 at EP32 on eight nodes of four GPUs: 256 experts on 9 online EPLB slots per rank (288).
 _R1_EP, _R1_EXPERTS, _R1_EPLB_SLOTS = 32, 256, 9
+_R1_HOSTS = [f"node{rank // 4}" for rank in range(_R1_EP)]
 
 
 @pytest.mark.parametrize("layer_updates_per_iter", [1, 0], ids=["online", "static"])
@@ -542,7 +557,8 @@ def test_r1_restores_every_node_or_rank_loss(monkeypatch, clumped, layer_updates
     """Online EPLB, or a static placement with replicas (offline EPLB) over the same 288 slots."""
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig())
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: 4)
+    # A node of four ranks is the largest loss.
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_hosts", lambda self: _R1_HOSTS)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),

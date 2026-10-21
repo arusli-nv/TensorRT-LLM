@@ -310,8 +310,10 @@ def _ring_load_balancer(
     host copies. ``largest_loss``: the most ranks one failure domain holds."""
     slots = len(placement[0])
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_HOSTS))
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: largest_loss)
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_hosts", lambda self: _HOSTS)
+    monkeypatch.setattr(
+        MoeLoadBalancer, "_largest_failure_domain", lambda self, hosts: largest_loss
+    )
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer") as sharer,
@@ -698,10 +700,8 @@ def _r1_static_load_balancer(monkeypatch):
     placement[:, :8] = np.arange(_R1_EXPERTS).reshape(_R1_EP, 8)
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig())
-    monkeypatch.setattr(
-        MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_R1_HOSTS)
-    )
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: _R1_GPUS_PER_NODE)
+    # A node is the largest loss.
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_hosts", lambda self: _R1_HOSTS)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),

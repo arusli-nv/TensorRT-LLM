@@ -1149,8 +1149,13 @@ class MoeLoadBalancer:
         self.next_layer_repeated_count = None
         # With WideEP peer-loss recovery, the most ranks one admitted failure takes: the survivors' slots,
         # appended slots included, must hold every expert.
-        self._largest_loss = self._gather_largest_loss(
-        ) if peer_loss_recovery_enabled() else None
+        self._largest_loss: Optional[int] = None
+        self._ring_copy_nodes: Optional[List[Tuple[int, ...]]] = None
+        if peer_loss_recovery_enabled():
+            # The only collective over the hosts, made here: a rank may add no layer with restore slots.
+            hosts = self._gather_hosts()
+            self._largest_loss = self._largest_failure_domain(hosts)
+            self._ring_copy_nodes = ring_copy_nodes(hosts)
         # Ring host copies, with restore slots (see add_layer): per EP rank, ring_copy_nodes. Otherwise every
         # node keeps every expert's host copy.
         self.copy_nodes: Optional[List[Tuple[int, ...]]] = None
@@ -1183,19 +1188,24 @@ class MoeLoadBalancer:
             f"Interesting, shared size {shared_size} is not same as local size {local_size}"
         self.shared_mpi_comm = shared_mpi_comm
 
-    def _gather_largest_loss(self) -> int:
-        """The most ranks one failure domain (FaultToleranceConfig.failure_domain) holds; collective."""
+    def _gather_hosts(self) -> List[str]:
+        """Per EP rank, its host; collective over the EP group, which WideEP peer-loss recovery needs to be
+        every rank."""
+        comm = tensorrt_llm.mpi_comm()
+        if (comm.Get_size(), comm.Get_rank()) != (self.ep_size, self.ep_rank):
+            raise ValueError(
+                f"WideEP peer-loss recovery needs the EP group to be every rank: EP rank {self.ep_rank} of "
+                f"{self.ep_size}, rank {comm.Get_rank()} of {comm.Get_size()}")
+        return comm.allgather(socket.gethostname())
+
+    def _largest_failure_domain(self, hosts: List[str]) -> int:
+        """The most ranks one failure domain (FaultToleranceConfig.failure_domain) holds, ``hosts`` per rank."""
         from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import \
             failure_domains
-        hosts = tensorrt_llm.mpi_comm().allgather(socket.gethostname())
         return max(map(
             len, failure_domains(hosts,
                                  fault_tolerance_config().failure_domain)),
                    default=0)
-
-    def _gather_copy_nodes(self) -> List[Tuple[int, ...]]:
-        return ring_copy_nodes(tensorrt_llm.mpi_comm().allgather(
-            socket.gethostname()))
 
     def set_use_gpu_memcpy(self, use_gpu_memcpy: bool):
         self.load_balancer_impl.set_use_gpu_memcpy(use_gpu_memcpy)
@@ -1235,9 +1245,8 @@ class MoeLoadBalancer:
             survivors = self.ep_size - self._largest_loss
             ghost_slot_count = max(
                 0, -(-expert_count // survivors) - slot_count_per_rank)
-            if self.copy_nodes is None and self._has_restore_slots(
-                    expert_count, slot_count_per_rank):
-                self.copy_nodes = self._gather_copy_nodes()
+            if self._has_restore_slots(expert_count, slot_count_per_rank):
+                self.copy_nodes = self._ring_copy_nodes
         single_layer_load_balancer_impl = self.load_balancer_impl.add_layer(
             expert_count, top_k, slot_count_per_rank + ghost_slot_count)
         updates_enabled = not self.is_static_routing()
