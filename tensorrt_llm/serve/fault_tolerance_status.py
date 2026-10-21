@@ -36,14 +36,15 @@ _STATES = {
 }
 # States in which the server answers requests; /health returns 200 only in these. ``unprotected``: the
 # authority does not answer or restarted, so a loss would end the job, but the server itself serves.
-SERVING_STATES = frozenset({"healthy", "degraded", "unprotected"})
+# ``unknown``: the authority runs another version; the server still serves.
+SERVING_STATES = frozenset({"healthy", "degraded", "unprotected", "unknown"})
 _STAGES = ("stop", "agree", "install")
 
 
 def health_state(status: Optional[Status]) -> str:
     """The server state for an authority status.
 
-    ``unprotected`` without one; ``unknown`` (not serving) for a phase this server does not know.
+    ``unprotected`` without one; ``unknown`` (still serving) for a phase this server does not know.
     """
     if status is None:
         return "unprotected"

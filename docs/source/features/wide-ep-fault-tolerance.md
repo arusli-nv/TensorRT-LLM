@@ -284,10 +284,11 @@ and multimodal requests under the overlap scheduler.
 ## Monitoring
 
 `trtllm-serve` asks the recovery authority for its state. `GET /health` returns 200 with the state while the
-server serves: `healthy` (no loss), `degraded` (serving after a recovery) or `unprotected` (the authority did not
+server serves: `healthy` (no loss), `degraded` (serving after a recovery), `unprotected` (the authority did not
 answer, or restarted and lost the deployment's state, so a loss would end the job: alert, but keep serving; restart
-the deployment to protect it again). It returns 503 with the state while `recovering`, `terminal` (a recovery aborted: restart the deployment) or `unknown` (the authority reported a
-state this server does not know, for example from a different version). The JSON body always has `state`. While
+the deployment to protect it again) or `unknown` (the authority reported a state this server does not know, for
+example from a different version: alert, but keep serving). It returns 503 with the state while `recovering` or
+`terminal` (a recovery aborted: restart the deployment). The JSON body always has `state`. While
 the authority answers it also has `generation` (the membership generation), `live_ranks` and `failed_ranks`
 (sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `agree` and `install` durations),
 `failed_requests` (requests the losses failed). The reason a recovery aborted is only in the authority's log:

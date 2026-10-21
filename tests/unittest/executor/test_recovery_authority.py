@@ -1136,7 +1136,7 @@ def test_health_states_follow_the_authority_phase(phase, state):
     from tensorrt_llm.serve.fault_tolerance_status import SERVING_STATES, health_state
 
     assert health_state(Status(phase, 0, (0, 1), (), 0, (), 0, "")) == state
-    assert (state in SERVING_STATES) == (state in ("healthy", "degraded", "unprotected"))
+    assert (state in SERVING_STATES) == (state in ("healthy", "degraded", "unprotected", "unknown"))
 
 
 def test_status_body_reports_live_ranks_stages_and_failed_requests():
