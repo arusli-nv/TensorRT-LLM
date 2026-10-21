@@ -1063,15 +1063,17 @@ void HostMemoryMoeWeightUpdater::updateWeights(
 {
     // PrintUpdateInfo(mMetaInfo, placementCpuInfo);
     bool useGpu = mLayerLoadBalancer->mMoeLoadBalancer->mUseGpuMemcpy;
+    int const minExpertId = mLayerLoadBalancer->mMoeLoadBalancer->mFaultToleranceMode ? -1 : 0;
     for (int slotId = 0; slotId < mMetaInfo.slotCountPerRank; ++slotId)
     {
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
         int newExpertId = placementCpuInfo->rankExpertIds[mMetaInfo.epRank][slotId];
-        // -1: an empty slot (no routing to it). Emptying a slot loads nothing; filling one loads its expert.
-        TLLM_CHECK_WITH_INFO(oldExpertId >= -1 && oldExpertId < mMetaInfo.expertCount,
-            "oldExpertId=%d, should be -1 or in range [0, %d)", oldExpertId, mMetaInfo.expertCount);
-        TLLM_CHECK_WITH_INFO(newExpertId >= -1 && newExpertId < mMetaInfo.expertCount,
-            "newExpertId=%d, should be -1 or in range [0, %d)", newExpertId, mMetaInfo.expertCount);
+        // -1 (fault tolerance only): an empty slot (no routing to it). Emptying a slot loads nothing; filling one
+        // loads its expert.
+        TLLM_CHECK_WITH_INFO(oldExpertId >= minExpertId && oldExpertId < mMetaInfo.expertCount,
+            "oldExpertId=%d, should be in range [%d, %d)", oldExpertId, minExpertId, mMetaInfo.expertCount);
+        TLLM_CHECK_WITH_INFO(newExpertId >= minExpertId && newExpertId < mMetaInfo.expertCount,
+            "newExpertId=%d, should be in range [%d, %d)", newExpertId, minExpertId, mMetaInfo.expertCount);
         if (oldExpertId == newExpertId || newExpertId == -1)
         {
             continue;
