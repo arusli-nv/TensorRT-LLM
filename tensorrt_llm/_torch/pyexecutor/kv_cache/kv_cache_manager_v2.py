@@ -4328,20 +4328,13 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         """Undo the scheduler's KV cache allocations for a step whose forward is discarded.
 
-        Steps are reverted newest first; ``context_capacities`` is the step's
-        :meth:`context_capacities`. A discarded step committed no blocks for
-        reuse, and its KV writes are overwritten when the step runs again. A
-        request whose first context chunk was discarded starts over without a
-        cache. Later chunks shrink back to their capacity before the step and,
-        unlike a step skipped after scheduling (revert_allocate_context, which
-        suspends them), stay resident: the KV cache is left exactly as before
-        the step. Generation requests give back the step's newest allocation.
-        A cache a later step freed or suspended (cancellation, recompute) is
-        left alone: it is rebuilt when its request is scheduled again. A draft
-        pool is reverted by its own call: generation growth the paired
-        scheduler recorded is given back, and with empty ``context_capacities``
-        later context chunks keep their size. Connectors and SWA scratch reuse
-        are not reverted: peer-loss recovery, the only caller, refuses them.
+        Steps are reverted newest first; ``context_capacities`` is the step's :meth:`context_capacities`.
+        A request's first context chunk frees its cache; a later chunk shrinks back to its capacity before
+        the step and stays resident; a generation request gives back the step's newest allocation. A cache
+        that is no longer active is left alone. Connectors and SWA scratch reuse are not reverted.
+
+        Raises:
+            RuntimeError: A cache could not be resized back.
         """
         for req in scheduled_batch.context_requests:
             if req.is_first_context_chunk:

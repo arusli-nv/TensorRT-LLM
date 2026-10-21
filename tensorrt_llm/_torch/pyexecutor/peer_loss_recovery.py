@@ -264,28 +264,14 @@ class RecoveryHook:
 class PeerLossRecovery(RecoveryHook):
     """Recovers a PyExecutor from the loss of failure domains (a peer process or a whole node), one after another.
 
-    Survivors discard the steps the loss interrupted (two under the overlap
-    scheduler), agree on the new
-    membership through the recovery authority (``Stopped`` -> ``Propose`` ->
-    ``Ready`` -> ``Install`` -> ``Installed`` -> ``Commit``) and resume the
-    same requests on their original CUDA graphs: the departed ranks are masked
-    out of host collectives, EPLB routing and the MoE dispatch/combine
-    descriptor. A further loss after a recovery recovers the same way while the
-    survivors' slots still serve every expert. Requests the departed attention-DP
-    ranks were serving run again or fail, and a request a second loss interrupts
-    fails (see ``_deliver_responses``).
-    A failure raises into the executor's terminal path.
+    Survivors discard the steps the loss interrupted, agree on the new membership with the recovery
+    authority and resume the same requests on their original CUDA graphs without the departed ranks.
+    Requests of the departed attention-DP ranks run again or fail (see ``_deliver_responses``).
 
-    The executor calls :meth:`step_prepared` after reserving a step's
-    resources and :meth:`commit_step` before applying its results; a step in
-    between is discarded when a peer fails. Response gathers report through
-    :meth:`gathering_responses` and :meth:`responses_gathered` so that the
-    responses of an interrupted gather are delivered after recovery. The rest of
-    that iteration is skipped.
-
-    The interruption is not a request error: ``HostCollectiveInterrupted``
-    bypasses the executor's error handling, so it fails no request and is not
-    charged to the error budget. Errors of a recovery itself are terminal.
+    The executor calls :meth:`step_prepared` after reserving a step's resources and :meth:`commit_step`
+    before applying its results; :meth:`gathering_responses` and :meth:`responses_gathered` let an
+    interrupted gather be delivered after recovery. ``HostCollectiveInterrupted`` bypasses the executor's
+    error handling; errors of a recovery itself are terminal.
     """
 
     enabled = True
@@ -889,21 +875,10 @@ class PeerLossRecovery(RecoveryHook):
     def _recover(self, error: HostCollectiveInterrupted) -> None:
         """Continue serving without the departed peers, or raise.
 
-        The failed set is the one ULFM's shrink agrees on (see ``_check_recoverable``): every rank
-        lost so far, so a loss after an earlier recovery is checked and planned without them all. A peer
-        that fails after the shrink and before ``Install`` joins it: the survivors shrink again
-        and plan anew. A peer that fails after ``Install`` is not recovered: the survivors'
-        collectives or the authority's deadline end the job.
-
-        The first shrink completes only once every survivor detected the loss: a survivor blocked on a
-        hung peer joins when the authority fences that peer. So the first shrink gets
-        ``shrink_timeout_s`` and the deadline starts when it returns; every round shares that deadline.
-
-        The MPI calls (revoke, shrink, the survivor watch, rank 0's placement broadcast) cannot be
-        interrupted, so none of a further round starts after the deadline, and a first shrink that
-        returns after its timeout ends the recovery. One that never returns is ended by the executor's
-        hang detector, armed for the whole recovery (see ``run``); the authority aborts the other
-        survivors at its own deadline.
+        The failed set is the one ULFM's shrink agrees on: every rank lost so far. A peer that fails before
+        ``Install`` joins it and the survivors plan again; one that fails after ``Install`` ends the job.
+        The first shrink gets ``shrink_timeout_s``; every later round shares one ``recovery_timeout_s``
+        deadline. An MPI call that never returns is ended by the executor's hang detector (see ``run``).
         """
         from tensorrt_llm.executor.recovery.client import RecoveryInterrupted
         from tensorrt_llm.executor.recovery.protocol import (
