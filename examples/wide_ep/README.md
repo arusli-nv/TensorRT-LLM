@@ -130,11 +130,15 @@ numactl -m 0,1 <command>
 
 To achieve online load balancing, all expert weights are stored in shared host memory. Four ranks on the same GB200/GB300 NVL72 node share the same expert weights to save memory.
 
-The environment variable `TRTLLM_EPLB_SHM_NAME` sets the base name of the shared memory (default `moe_shared`). Each job appends a random token to it, so instances on one node never share segments: the segments are named `moe_shared_<token>_l0_lr0_all`, `moe_shared_<token>_l1_lr0_all`, and so on. Here `l0` means the first layer with EPLB, and `lr0` means that it is the part loaded by local rank 0, and `all` means it contains all expert weights of each expert. If a segment of that name already exists, EPLB fails rather than replace a segment it did not create.
+There is one environment variable `TRTLLM_EPLB_SHM_NAME` to specify the base name of the shared memory. This environment variable may need to be specified if there are multiple instances on one node. If not, you can ignore it.
 
-Once every rank of a node has mapped the segments, at the end of model loading, their names are removed from `/dev/shm`: the memory stays mapped and is freed when the last rank exits, however it exits. Only a job that exits abnormally while loading the model can leave segments behind.
+The default value of `TRTLLM_EPLB_SHM_NAME` is `moe_shared`. When `TRTLLM_EPLB_SHM_NAME` is set to `moe_shared`, the shared memory segments will be named as `moe_shared_l0_lr0_all`, `moe_shared_l1_lr0_all`, and so on. Here `l0` means the first layer with EPLB, and `lr0` means that it is the part loaded by local rank 0, and `all` means it contains all expert weights of each expert.
 
-If that happens and you are concerned about the shared memory usage before the next run, check the `/dev/shm` directory and delete any `/dev/shm/moe_shared_*` files no running job uses.
+Normally, these shared memory segments will be cleaned up automatically at process exit. However, they may not get the chance to be cleaned up if an abnormal exit occurs. Therefore, EPLB will automatically clean up leftover shared memory with the same name that already exists before creating new segments.
+
+If you experience an abnormal exit and are concerned about the shared memory usage before the next run, you need to manually check the `/dev/shm` directory and delete any `/dev/shm/moe_shared_*` files if present.
+
+With [WideEP peer-loss recovery](../../docs/source/features/wide-ep-fault-tolerance.md) enabled, each job appends a random token to the base name (`moe_shared_<token>_l0_lr0_all`), so instances on one node never share segments, and fails rather than replace a segment of that name it did not create. Once every rank of a node has mapped the segments, at the end of model loading, their names are removed from `/dev/shm`: the memory is freed when the last rank exits, however it exits.
 
 #### Manual Cleanup Commands
 
@@ -148,7 +152,7 @@ ls -la /dev/shm/moe_shared_*
 rm -f /dev/shm/moe_shared_*
 
 # Or remove specific shared memory segments
-rm -f /dev/shm/moe_shared_<token>_l0_lr0_all
+rm -f /dev/shm/moe_shared_l0_lr0_all
 ```
 
 **Warning:** Be careful when removing shared memory manually, as this may affect running processes that depend on these shared memory segments.

@@ -125,6 +125,7 @@ def test_host_copies_are_prefaulted_only_with_peer_loss_recovery(monkeypatch, re
 
 
 def test_a_layer_that_does_not_fit_in_shared_memory_fails_before_creating_it(monkeypatch):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     # Two local ranks share four experts of 300 bytes aligned to 512: this rank's part needs 1024 bytes.
     sharer = _sharer(0, 2, expert_count=4)
     sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
@@ -151,6 +152,7 @@ def test_a_layer_the_node_s_ranks_together_overfill_shared_memory_with_fails_at_
     monkeypatch,
 ):
     """Each rank found room, but the tmpfs fills before this rank's pages are allocated."""
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     sharer = _sharer(0, 1, expert_count=1)
     sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
     sharer.share_host_tensor_with_shape(0, "w", torch.ones(4))
@@ -169,7 +171,8 @@ def test_a_layer_the_node_s_ranks_together_overfill_shared_memory_with_fails_at_
         sharer.post_shutdown_cleanup()
 
 
-def test_a_sharer_leaves_a_segment_it_did_not_create_in_place():
+def test_a_sharer_leaves_a_segment_it_did_not_create_in_place(monkeypatch):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     sharer = _sharer(0, 1, expert_count=1)
     sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
     sharer.share_host_tensor_with_shape(0, "w", torch.ones(4))
@@ -185,6 +188,7 @@ def test_a_sharer_leaves_a_segment_it_did_not_create_in_place():
 
 
 def test_load_balancers_name_their_shared_memory_apart(monkeypatch):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(
         MoeLoadBalancer,
         "_setup_mpi_comm",
@@ -195,6 +199,71 @@ def test_load_balancers_name_their_shared_memory_apart(monkeypatch):
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         names = {MoeLoadBalancer(0, 1, 0, "base").shared_memory_base_name for _ in range(2)}
     assert len(names) == 2 and all(name.startswith("base_") for name in names)
+
+
+def test_without_peer_loss_recovery_a_sharer_neither_checks_nor_reserves_shared_memory(monkeypatch):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: False)
+    statvfs = Mock()
+    fallocate = Mock()
+    monkeypatch.setattr("os.statvfs", statvfs)
+    monkeypatch.setattr("os.posix_fallocate", fallocate)
+    sharer = _sharer(0, 1, expert_count=1)
+    sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
+    sharer.share_host_tensor_with_shape(0, "w", torch.ones(4))
+    try:
+        sharer.finalize_layer_weights()
+        statvfs.assert_not_called()
+        fallocate.assert_not_called()
+    finally:
+        sharer.pre_shutdown_cleanup()
+        sharer.post_shutdown_cleanup()
+
+
+def test_without_peer_loss_recovery_a_sharer_replaces_a_leftover_segment(monkeypatch):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: False)
+    sharer = _sharer(0, 1, expert_count=1)
+    sharer.set_shared_memory_base_name(f"test_ring_host_copies_{id(sharer)}")
+    sharer.share_host_tensor_with_shape(0, "w", torch.ones(4))
+    leftover = shared_memory.SharedMemory(name=sharer.get_shared_memory_name(), create=True, size=8)
+    leftover.close()
+    try:
+        sharer.finalize_layer_weights()
+        assert bytes(sharer.own_shm.buf[:16]) == torch.ones(4).numpy().tobytes()
+    finally:
+        sharer.pre_shutdown_cleanup()
+        sharer.post_shutdown_cleanup()
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=sharer.get_shared_memory_name())
+
+
+def test_without_peer_loss_recovery_shared_memory_keeps_its_configured_name(monkeypatch):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: False)
+    comm = Mock(Get_rank=Mock(return_value=0))
+    monkeypatch.setattr(
+        MoeLoadBalancer, "_setup_mpi_comm", lambda self: setattr(self, "shared_mpi_comm", comm)
+    )
+    monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", "env_base")
+    with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
+        assert MoeLoadBalancer(0, 1, 0, "base").shared_memory_base_name == "base"
+        assert MoeLoadBalancer(0, 1, 0).shared_memory_base_name == "env_base"
+    comm.bcast.assert_not_called()
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_shared_memory_names_are_removed_at_load_only_with_peer_loss_recovery(
+    monkeypatch, recovery
+):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: recovery)
+    monkeypatch.setattr(MoeLoadBalancer, "extra_slots_mode", lambda self: None)
+    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer.is_shutdown = True
+    balancer.shared_mpi_comm = Mock()
+    balancer.load_balancer_impl = Mock()
+    layer = Mock(host_copies=True)
+    balancer.single_layer_load_balancers = [layer]
+    balancer.finalize_model()
+    assert balancer.shared_mpi_comm.barrier.call_count == (2 if recovery else 1)
+    assert layer.host_tensor_sharer.unlink_shared_memory.call_count == int(recovery)
 
 
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"

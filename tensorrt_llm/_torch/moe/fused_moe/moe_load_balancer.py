@@ -325,25 +325,40 @@ class HostMoeTensorSharer:
 
         # A rank of a node that holds fewer experts than it has ranks may share none.
         if total_size:
-            _check_shm_space(total_size, self.layer_id)
+            # With peer-loss recovery, names carry a per-job token, so a segment of that name is another
+            # job's, and pages are allocated up front.
+            recovery = peer_loss_recovery_enabled()
             shm_name = self.get_shared_memory_name()
-            # A weight reload shares the layer again under the same name.
-            self.unlink_shared_memory()
+            if recovery:
+                _check_shm_space(total_size, self.layer_id)
+                # A weight reload shares the layer again under the same name.
+                self.unlink_shared_memory()
             try:
                 shm = shared_memory.SharedMemory(name=shm_name,
                                                  create=True,
                                                  size=total_size)
             except FileExistsError as error:
-                raise RuntimeError(
-                    f"EPLB shared memory {shm_name} already exists and this job did not create it"
-                ) from error
+                if recovery:
+                    raise RuntimeError(
+                        f"EPLB shared memory {shm_name} already exists and this job did not create it"
+                    ) from error
+                tensorrt_llm.logger.warning(
+                    f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
+                )
+                existing_shm = shared_memory.SharedMemory(name=shm_name)
+                existing_shm.close()
+                existing_shm.unlink()
+                shm = shared_memory.SharedMemory(name=shm_name,
+                                                 create=True,
+                                                 size=total_size)
             self.own_shm = shm
             self.own_shm_linked = True
-            try:
-                _reserve_shm(shm, self.layer_id)
-            except RuntimeError:
-                self.unlink_shared_memory()
-                raise
+            if recovery:
+                try:
+                    _reserve_shm(shm, self.layer_id)
+                except RuntimeError:
+                    self.unlink_shared_memory()
+                    raise
 
         offset = 0
         for name in self.names:
@@ -385,8 +400,9 @@ class HostMoeTensorSharer:
 
             shm_name = self.get_shared_memory_name(rank)
             shm = shared_memory.SharedMemory(name=shm_name)
-            # Only the creator unlinks the name.
-            resource_tracker.unregister(shm._name, "shared_memory")
+            if peer_loss_recovery_enabled():
+                # Only the creator unlinks the name, which it does at once.
+                resource_tracker.unregister(shm._name, "shared_memory")
             self.imported_shms.append(shm)
 
             offset = 0
@@ -421,6 +437,8 @@ class HostMoeTensorSharer:
         """
         for shm in self.imported_shms:
             shm.close()
+            if not peer_loss_recovery_enabled():
+                resource_tracker.unregister(shm._name, "shared_memory")
         self.imported_shms = None
         if self.own_shm:
             self.own_shm.close()
@@ -1110,8 +1128,8 @@ class MoeLoadBalancer:
             ep_rank: The rank of the current process in expert parallelism
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
-            shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None; a per-job token
-                is appended
+            shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None; with peer-loss
+                recovery, a per-job token is appended
         """
         self.is_shutdown = True
         self.ep_rank = ep_rank
@@ -1122,13 +1140,14 @@ class MoeLoadBalancer:
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self._setup_mpi_comm()
-        # A random token local rank 0 draws keeps the names of the node's jobs apart and unguessable.
-        token = self.shared_mpi_comm.bcast(
-            secrets.token_hex(8) if self.shared_mpi_comm.Get_rank() ==
-            0 else None)
-        base_name = shared_memory_base_name or os.getenv(
+        self.shared_memory_base_name = shared_memory_base_name or os.getenv(
             'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
-        self.shared_memory_base_name = f"{base_name}_{token}"
+        if peer_loss_recovery_enabled():
+            # A random token local rank 0 draws keeps the names of the node's jobs apart and unguessable.
+            token = self.shared_mpi_comm.bcast(
+                secrets.token_hex(8) if self.shared_mpi_comm.Get_rank() ==
+                0 else None)
+            self.shared_memory_base_name += f"_{token}"
         self.is_shutdown = False
 
         self.iter_id = 0
@@ -1308,12 +1327,14 @@ class MoeLoadBalancer:
         # All shared memory mapping after this barrier.
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
-        # Every rank mapped its peers' shared memory, which nothing opens by name again.
-        self.shared_mpi_comm.barrier()
-        for single_layer_load_balancer in self.single_layer_load_balancers:
-            if single_layer_load_balancer.host_copies:
-                single_layer_load_balancer.host_tensor_sharer.unlink_shared_memory(
-                )
+        if peer_loss_recovery_enabled():
+            # Every rank mapped its peers' shared memory, which nothing opens by name again: ranks that
+            # are killed leave nothing in /dev/shm.
+            self.shared_mpi_comm.barrier()
+            for single_layer_load_balancer in self.single_layer_load_balancers:
+                if single_layer_load_balancer.host_copies:
+                    single_layer_load_balancer.host_tensor_sharer.unlink_shared_memory(
+                    )
         self.load_balancer_impl.finalize_model()
         mode = self.extra_slots_mode()
         if mode in ("empty", "ghost"):
