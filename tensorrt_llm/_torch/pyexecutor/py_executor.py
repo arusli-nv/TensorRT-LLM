@@ -8685,9 +8685,6 @@ class PyExecutor:
         from host state.
         """
         self._finalize_adp_dummy_allocation(False)
-        if self._recompute_unpaused is not None:
-            self._pause_recompute_paused_requests(self._recompute_unpaused)
-            self._recompute_unpaused = None
         for step in steps:
             for request, position, state, draft_tokens in reversed(
                     step.changes):
@@ -8703,6 +8700,11 @@ class PyExecutor:
                 # for the same capacity.
                 self.draft_kv_cache_manager.revert_prepare_resources(
                     step.batch, {})
+        # After the restore: a recompute victim's KV cache is already freed, so
+        # it restarts its prefill even if an undone step had advanced it.
+        if self._recompute_unpaused is not None:
+            self._pause_recompute_paused_requests(self._recompute_unpaused)
+            self._recompute_unpaused = None
         self._terminate_attention_dp_dummy_requests()
         self._step_changes = None
         self.previous_batch = None

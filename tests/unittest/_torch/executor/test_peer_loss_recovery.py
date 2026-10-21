@@ -1244,6 +1244,28 @@ def test_discard_undoes_each_step_s_request_changes_newest_first():
     assert executor._step_changes is None
 
 
+def test_discard_pauses_a_recompute_victim_after_restoring_its_step():
+    """A request of the uncommitted step can be the next step's recompute victim, whose KV cache is freed."""
+    executor = _executor()
+    executor.inflight_req_ids = Mock()
+    executor._pending_adp_dummy_request = None
+    request = Mock(is_attention_dp_dummy=False, context_current_position=64, state="CONTEXT_INIT")
+    step = PreparedStep(Mock(), {})
+    executor._step_changes = step.changes
+    executor._note_step_change(request)
+    request.context_current_position = 96
+    executor._recompute_unpaused = Mock(name="next_batch")
+    paused_at = []
+    executor._pause_recompute_paused_requests = lambda batch: paused_at.append(
+        request.context_current_position
+    )
+
+    executor.discard_interrupted_steps([step])
+
+    assert paused_at == [64]
+    assert executor._recompute_unpaused is None
+
+
 def test_discard_restores_the_draft_tokens_sampling_set():
     """Sampling sets a finishing context request's draft tokens before its step is accepted."""
     recovery = _recovery(_FakeClient([]))
