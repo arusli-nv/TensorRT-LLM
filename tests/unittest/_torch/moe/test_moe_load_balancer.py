@@ -716,6 +716,21 @@ def test_eplb_slots_are_rows_only_with_peer_loss_recovery(recovery):
                 module.register_to_fix_weight_fn("scales")
 
 
+@pytest.mark.cpu_only
+def test_one_slot_table_keeps_a_none_result() -> None:
+    """A placement with replicas queries the op once, not on every forward."""
+    layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
+    layer.updates_enabled = False
+    layer._one_slot_table = None
+    layer._one_slot_table_queried = False
+    with patch.object(SingleLayerMoeLoadBalancer,
+                      "_query_one_slot_table",
+                      return_value=None) as query:
+        assert layer.one_slot_table() is None
+        assert layer.one_slot_table() is None
+    query.assert_called_once_with()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_ghost_slot_storage_copies_after_the_producer_on_its_stream():
     """The weights may still be written by a kernel on a non-default stream when their slots become ghost slots."""
