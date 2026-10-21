@@ -518,6 +518,7 @@ void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> co
             mCpuPlacementInfo.expertReplicaCount[expertId]++;
         }
     }
+    updateOneReplicaPerExpert();
     prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
     // we don't need to call mWeightUpdater since should be already assigned.
     copyPlacementInfoToGpu();
@@ -645,14 +646,18 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeReplicaCounts(
 
 bool SingleLayerMoeLoadBalancer::routesEachExpertToOneSlot()
 {
-    if (mMoeLoadBalancer->mLayerUpdatesPerIter != 0)
+    if (!mOneReplicaPerExpert || mMoeLoadBalancer->mLayerUpdatesPerIter != 0)
     {
         return false;
     }
+    mOneSlotRoutingUsed = true;
+    return true;
+}
+
+void SingleLayerMoeLoadBalancer::updateOneReplicaPerExpert()
+{
     auto const& counts = mCpuPlacementInfo.expertReplicaCount;
-    bool const oneSlotPerExpert = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 1; });
-    mOneSlotRoutingUsed = mOneSlotRoutingUsed || oneSlotPerExpert;
-    return oneSlotPerExpert;
+    mOneReplicaPerExpert = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 1; });
 }
 
 void SingleLayerMoeLoadBalancer::checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const
@@ -670,6 +675,7 @@ void SingleLayerMoeLoadBalancer::validateMaskOnly(std::vector<uint8_t> const& de
 void SingleLayerMoeLoadBalancer::reconfigureMaskOnly(std::vector<uint8_t> const& deadRankMask)
 {
     mCpuPlacementInfo.expertReplicaCount = computeMaskOnlyReplicaCounts(deadRankMask);
+    updateOneReplicaPerExpert();
 
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
@@ -699,6 +705,7 @@ void SingleLayerMoeLoadBalancer::installPlacement(
     std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds, bool slotsLoaded)
 {
     mCpuPlacementInfo.expertReplicaCount = computeReplicaCounts(deadRankMask, rankExpertIds);
+    updateOneReplicaPerExpert();
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
         bool const rankDead = deadRankMask[rank] != 0;

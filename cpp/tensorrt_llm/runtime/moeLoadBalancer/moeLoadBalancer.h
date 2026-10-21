@@ -223,8 +223,12 @@ private:
         std::vector<std::vector<int>> const& rankExpertIds, std::vector<GhostSlotMemory::Range>& ranges) const;
     // Rejects replica counts the captured routing kernel cannot serve (see routesEachExpertToOneSlot).
     void checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const;
+    // Caches whether the replica counts of a placement set outside EPLB's updates are one per expert.
+    void updateOneReplicaPerExpert();
 
     MoeLoadBalancer* mMoeLoadBalancer = nullptr;
+    // Every expert has exactly one replica (see updateOneReplicaPerExpert).
+    bool mOneReplicaPerExpert = false;
     bool mOneSlotRoutingUsed = false;
 
     std::unique_ptr<MoeWeightUpdaterBase> mWeightUpdater;
