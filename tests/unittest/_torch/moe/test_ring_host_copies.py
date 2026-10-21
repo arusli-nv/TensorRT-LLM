@@ -662,17 +662,19 @@ def test_a_replan_keeps_off_only_the_chunks_a_lost_rank_may_still_copy(monkeypat
     )
     row_bytes = 1024
     first = load_balancer.restore_copy_plan(
-        [3], load_balancer.recovery_placements([3]), row_bytes, _no_writes
+        [2], load_balancer.recovery_placements([2]), row_bytes, _no_writes
     )
-    # Rank 2 copies into both halves of rank 1's row over chunks 0 to 2, then is lost.
-    assert sorted(set(first[first[:, 6] == 2][:, 0].tolist())) == [0, 1, 2]
-    placements = load_balancer.recovery_placements([2, 3])
+    # Rank 1 copies both layers' restores into both halves of rank 0's row over chunks 0 to 2, then is lost.
+    by_rank_1 = first[first[:, 6] == 1]
+    assert by_rank_1[:, 2].tolist() == [0] * len(by_rank_1)
+    assert sorted(set(by_rank_1[:, 0].tolist())) == [0, 1, 2]
+    placements = load_balancer.recovery_placements([1, 2])
     with pytest.raises(ValueError, match=r"\[0, 0\] bytes per half"):
-        load_balancer.restore_copy_plan([2, 3], placements, row_bytes, _no_writes, [first])
+        load_balancer.restore_copy_plan([1, 2], placements, row_bytes, _no_writes, [first])
     # Only chunk 1's copies may still be in flight: the rest of the row stages the restore.
-    late = first[(first[:, 6] == 2) & (first[:, 0] == 1)].tolist()
+    late = by_rank_1[by_rank_1[:, 0] == 1].tolist()
     plan = load_balancer.restore_copy_plan(
-        [2, 3], placements, row_bytes, _no_writes, [first], [(1, 1)]
+        [1, 2], placements, row_bytes, _no_writes, [first], [(1, 1)]
     )
     _assert_pieces_load_every_weight(plan, 2 * 2 * 2)
     _assert_staged_apart(
