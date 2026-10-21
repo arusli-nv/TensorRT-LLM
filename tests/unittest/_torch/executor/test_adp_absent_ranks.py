@@ -239,8 +239,9 @@ def test_waiting_queue_releases_strict_pin_to_failed_rank(recovery):
     assert counts[1] == 8
 
 
-def _pop_pinned(target):
-    counts = {rank: 0 for rank in range(WORLD_SIZE)}
+def _pop_pinned(target, full_rank=None):
+    """Pop a request strictly pinned to ``target``; ``full_rank`` is at capacity. Returns the popped requests."""
+    counts = {rank: 8 if rank == full_rank else 0 for rank in range(WORLD_SIZE)}
     waiting_queue = FCFSWaitingQueue()
     waiting_queue.add_requests([_item(0, target=target, relax=False)])
     popped = get_from_waiting_queue(
@@ -250,7 +251,7 @@ def _pop_pinned(target):
         max_num_active_requests=8,
         all_ranks_num_active_requests=counts,
     )
-    return popped, counts
+    return popped
 
 
 def test_without_peer_loss_recovery_a_pin_past_the_last_rank_raises_as_on_main(no_recovery):
@@ -265,8 +266,9 @@ def test_without_peer_loss_recovery_a_pin_past_the_last_rank_raises_as_on_main(n
 
 def test_without_peer_loss_recovery_a_negative_pin_behaves_as_on_main(no_recovery):
     """Main admits it against the last rank's count, then the router raises placing it (KeyError)."""
-    popped, counts = _pop_pinned(-1)
-    assert len(popped) == 1 and counts == {0: 0, 1: 0, 2: 0, WORLD_SIZE - 1: 1}
+    assert len(_pop_pinned(-1)) == 1
+    assert len(_pop_pinned(-1, full_rank=0)) == 1
+    assert _pop_pinned(-1, full_rank=WORLD_SIZE - 1) == []
     states = [RankState(rank=rank) for rank in range(WORLD_SIZE)]
     for relax in (False, True):
         with pytest.raises(KeyError):
