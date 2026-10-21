@@ -100,6 +100,23 @@ def test_restore_evicts_the_most_replicated_expert_spread_over_ranks():
     assert placement.tolist() == [[2, 1], [-1, -1], [0, 3], [0, 1]]
 
 
+def test_restored_experts_spread_over_the_survivors_across_layers():
+    # Each rank holds one expert and an empty slot; rank 2's expert is restored in each of 5 layers.
+    one_per_rank = [[rank, -1] for rank in range(WORLD_SIZE)]
+    load_balancer = _load_balancer(*[one_per_rank] * 5, host_weights=True)
+    placements = load_balancer.recovery_placements([FAILED_RANK])
+    restored = np.zeros(WORLD_SIZE, dtype=np.int64)
+    for placement in placements:
+        assert (placement[FAILED_RANK] == -1).all()
+        assert sorted(placement[placement >= 0].tolist()) == list(range(EXPERTS))
+        # Only the empty slots changed: every survivor keeps its own expert.
+        assert placement[:, 0].tolist() == [0, 1, -1, 3]
+        restored += placement[:, 1] >= 0
+    survivors = [rank for rank in range(WORLD_SIZE) if rank != FAILED_RANK]
+    assert restored[FAILED_RANK] == 0 and restored.sum() == 5
+    assert restored[survivors].max() - restored[survivors].min() <= 1
+
+
 def test_restore_never_evicts_a_last_replica():
     placement = np.array([[0], [1], [-1], [3]], dtype=np.int32)
     assert restore_lost_experts(placement, [2], [2]) == [2]

@@ -996,8 +996,11 @@ class SingleLayerMoeLoadBalancer:
 _current_moe_load_balancer = threading.local()
 
 
-def restore_lost_experts(placement: np.ndarray, lost: List[int],
-                         dead_ranks: Iterable[int]) -> List[int]:
+def restore_lost_experts(
+        placement: np.ndarray,
+        lost: List[int],
+        dead_ranks: Iterable[int],
+        restored_per_rank: Optional[np.ndarray] = None) -> List[int]:
     """Place each ``lost`` expert into a slot of a live rank in ``placement`` (``[ep_size, slots_per_rank]``
     expert ids, -1 = no expert), in place.
 
@@ -1007,6 +1010,10 @@ def restore_lost_experts(placement: np.ndarray, lost: List[int],
     experts so far, then the lowest rank and slot: a minimal change that
     spreads the loading across ranks and is the same on every rank.
 
+    Args:
+        restored_per_rank: ``[ep_size]`` restored experts per rank so far, updated in place. Pass the same
+            array for every layer of a plan to spread the restored experts over the ranks across layers.
+
     Returns:
         The lost experts that found no slot.
     """
@@ -1014,7 +1021,8 @@ def restore_lost_experts(placement: np.ndarray, lost: List[int],
     usable[list(dead_ranks)] = False
     counts = np.bincount(placement[placement >= 0],
                          minlength=max(lost) + 1 if lost else 0)
-    restored_per_rank = np.zeros(placement.shape[0], dtype=np.int64)
+    if restored_per_rank is None:
+        restored_per_rank = np.zeros(placement.shape[0], dtype=np.int64)
     unplaced = []
     for expert in lost:
         ranks, slots = np.nonzero(usable)
@@ -1414,7 +1422,9 @@ class MoeLoadBalancer:
         The current placement (or ``base``, per layer, the placement the
         survivors agreed on) with the slots of ``dead_ranks`` cleared. In a
         layer with host weights, each expert left without a replica takes over
-        a slot of a replicated expert (``restore_lost_experts``). Every rank
+        a slot of a replicated expert (``restore_lost_experts``), on the ranks
+        that restored the fewest experts in the earlier layers, so the restored
+        experts and their loading spread over the survivors. Every rank
         computes the same placements from the same base.
 
         Raises:
@@ -1430,6 +1440,7 @@ class MoeLoadBalancer:
             raise ValueError(f"Base placement has {len(base)} layers, expected "
                              f"{len(self.single_layer_load_balancers)}")
         placements, missing = [], {}
+        restored_per_rank = np.zeros(self.ep_size, dtype=np.int64)
         for i, layer in enumerate(self.single_layer_load_balancers):
             if base is None:
                 placement = self._masked_placement(layer, dead)
@@ -1446,7 +1457,8 @@ class MoeLoadBalancer:
                     and not self._copy_ranks(layer, expert, dead)
                 ]
                 lost = uncopied + restore_lost_experts(
-                    placement, [e for e in lost if e not in uncopied], dead)
+                    placement, [e for e in lost if e not in uncopied], dead,
+                    restored_per_rank)
             if lost:
                 missing[layer.get_layer_idx()] = lost
             placements.append(placement)
