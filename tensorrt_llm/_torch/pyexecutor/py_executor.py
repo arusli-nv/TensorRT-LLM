@@ -5074,6 +5074,9 @@ class PyExecutor:
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
 
+                    self._peer_loss_recovery.commit_step(
+                        scheduled_batch, sample_state)
+
                     # Handle SaveHiddenStates mode - save hidden states after forward
                     if not self.is_warmup:
                         spec_resource_mgr = self.resource_manager.resource_managers.get(
@@ -5084,9 +5087,6 @@ class PyExecutor:
                                                     'spec_metadata', None)
                             spec_resource_mgr.process_and_save(
                                 scheduled_batch, spec_metadata)
-
-                    self._peer_loss_recovery.commit_step(
-                        scheduled_batch, sample_state)
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
                     if self.speculation_gate is not None:
