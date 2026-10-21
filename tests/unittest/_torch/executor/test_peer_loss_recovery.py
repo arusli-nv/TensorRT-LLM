@@ -1978,6 +1978,7 @@ def _supported_executor():
         enable_kv_pool_rebalance=False,
         hang_detector=SimpleNamespace(timeout=300),
         llm_args=SimpleNamespace(sleep_config=None),
+        sampler=Mock(is_generation_model=Mock(return_value=True)),
     )
 
 
@@ -2013,6 +2014,10 @@ def _supported_executor():
         (lambda ex: setattr(ex.model_engine, "moe_load_balancer", None), "an EPLB load balancer"),
         (lambda ex: setattr(ex.hang_detector, "timeout", 60), r"hang_detection_timeout \(60 s\)"),
         (lambda ex: setattr(ex, "dist", Mock(mapping=ex.dist.mapping)), "MPI executor"),
+        (
+            lambda ex: ex.sampler.is_generation_model.configure_mock(return_value=False),
+            "a generation sampler",
+        ),
     ],
 )
 def test_create_rejects_configurations_a_discarded_step_cannot_rerun(

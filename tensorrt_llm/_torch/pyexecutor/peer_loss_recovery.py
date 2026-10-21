@@ -427,6 +427,8 @@ class PeerLossRecovery(RecoveryHook):
             "shrink timeout plus twice recovery_timeout_s (lower the timeouts in "
             f"{FAULT_TOLERANCE_CONFIG_ENV})": executor.hang_detector.timeout > min_hang_timeout_s,
             "no sleep/wakeup": executor.llm_args.sleep_config is None,
+            # commit_step waits for a step's sampler event; only generation samplers record one.
+            "a generation sampler": executor.sampler.is_generation_model(),
             # Rebalancing applies a step's results outside the step loop and
             # votes with collectives that do not expect a departed rank.
             "no KV pool rebalance": not executor.enable_kv_pool_rebalance,
