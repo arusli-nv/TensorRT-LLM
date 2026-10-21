@@ -86,6 +86,11 @@ std::vector<int> getUsableSlotCounts(tensorrt_llm::kernels::MoeLoadBalanceMetaIn
     std::vector<int> usableSlotCounts(metaInfo.epSize, 0);
     for (int rank = 0; rank < metaInfo.epSize; ++rank)
     {
+        if (unusableSlotMask == nullptr)
+        {
+            usableSlotCounts[rank] = isRankMasked(deadRankMask, rank) ? 0 : metaInfo.slotCountPerRank;
+            continue;
+        }
         for (int localSlotId = 0; localSlotId < metaInfo.slotCountPerRank; ++localSlotId)
         {
             usableSlotCounts[rank]
