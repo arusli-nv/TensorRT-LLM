@@ -455,7 +455,7 @@ class PeerLossRecovery(RecoveryHook):
                 f"serve every expert without each domain; the survivors cannot after losing {uncovered[0]} "
                 "(with s slots per rank, N ranks and K ranks lost, s * (N - K) must reach the expert count)"
             )
-        if load_balancer.is_static_routing():
+        if load_balancer.copy_nodes is not None:
             # Ring host copies: restores stage weights through what all-to-alls leave unwritten of the
             # workspace; restore_copy_plan checks that some is left.
             state = engine.moe_execution_state
@@ -979,7 +979,7 @@ class PeerLossRecovery(RecoveryHook):
                 self._log_phase("proposed", generation)
                 copy_plan = (
                     None
-                    if online
+                    if load_balancer.copy_nodes is None
                     else self._stage_ring_restore(
                         load_balancer,
                         failed,

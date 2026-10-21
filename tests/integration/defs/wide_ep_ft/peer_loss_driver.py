@@ -44,12 +44,13 @@ PROMPTS = {
 def placement(replica_offset: int = 1) -> list[int]:
     """Two replicas of every expert: rank r holds its own experts and those of rank r + offset.
 
-    Offset 1 survives the loss of any one rank; offset 2 also that of ranks 2 and 3 together.
+    Offset 1 survives the loss of any one rank; offset 2 also that of ranks 2 and 3 together. Offset 0: one slot
+    per expert, rank r holding its own.
     """
     per_rank = NUM_EXPERTS // WORLD_SIZE
     slots = []
     for rank in range(WORLD_SIZE):
-        for owner in (rank, (rank + replica_offset) % WORLD_SIZE):
+        for owner in dict.fromkeys((rank, (rank + replica_offset) % WORLD_SIZE)):
             slots += range(owner * per_rank, (owner + 1) * per_rank)
     return slots
 

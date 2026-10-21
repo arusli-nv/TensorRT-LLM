@@ -15,17 +15,22 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
 - NVLinkOneSided all-to-all. The CuteDSL NVFP4 MoE backend on Blackwell (`moe_config.backend: CUTEDSL`)
   and the Cutlass backend for unquantized layers without LoRA (for example a BF16 MTP layer) read the receive
   slots in place; layers on other backends get a compact copy of their hidden states.
-- An EPLB load balancer (`moe_config.load_balancer` with `num_slots` above the number of experts), static
-  (`layer_updates_per_iter: 0`) or online. Host copies of the experts in `/dev/shm` restore the experts of a
-  lost rank into extra slots; rank 0 is never recoverable. Online EPLB keeps every expert's copy on every node; the
-  survivors adopt rank 0's placement during the recovery and restart the update rotation together. A static
-  placement keeps on each node only the home experts of the next node (nodes in order of their first rank, the
-  last node keeping the first's; a single node keeps its own), about `1/N` of the copies with `N` nodes. A restore
-  copies each expert from a GPU of that node into the restoring rank's NVLinkOneSided workspace and from there
-  into its slot, in chunks of half the workspace; losing a node together with the node that keeps its copies is
-  not recoverable. Size `/dev/shm` (host memory) for these copies: with online EPLB, every node needs the expert
-  weights of all MoE layers; with a static placement, about `1/N` of them. Startup fails with the sizes if a
-  rank's copies do not fit.
+- An EPLB load balancer (`moe_config.load_balancer` with `num_slots` at least the number of experts), static
+  (`layer_updates_per_iter: 0`) or online. Fault tolerance appends slots to each rank where the survivors of a
+  failure domain's loss cannot hold every expert (`extra_slots` below), and host copies of the experts in
+  `/dev/shm` restore the experts of a lost rank into them; rank 0 is never recoverable. A placement with replicas
+  (online EPLB, or a static placement with more slots than experts, for example offline EPLB's
+  `initial_global_assignments` from `examples/wide_ep/ep_load_balancer/generate_eplb_config.py`) keeps them
+  routed: a loss reroutes to the surviving replicas or restores into appended slots or a replica's slot, and every
+  node keeps every expert's copy; with online EPLB the survivors adopt rank 0's placement during the recovery and
+  restart the update rotation together. A static placement without replicas (`num_slots` equal to the number of
+  experts) restores only into the appended slots, and each node keeps only the home experts of the next node
+  (nodes in order of their first rank, the last node keeping the first's; a single node keeps its own), about
+  `1/N` of the copies with `N` nodes. A restore there copies each expert from a GPU of that node into the
+  restoring rank's NVLinkOneSided workspace and from there into its slot, in chunks of half the workspace; losing
+  a node together with the node that keeps its copies is not recoverable. Size `/dev/shm` (host memory) for these
+  copies: with replicas, every node needs the expert weights of all MoE layers; without, about `1/N` of them.
+  Startup fails with the sizes if a rank's copies do not fit.
 - Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4.1 or later.
 
 ## Running
@@ -68,7 +73,7 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
 | Setting | Meaning |
 |---|---|
 | `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
-| `extra_slots` | The slots beyond one per expert. Default: `ghost`, except with online EPLB where GDRCopy cannot map ghost slot memory for the host (that takes a GPU with GPUDirect RDMA for virtual memory): `empty` there, as its weight updates would load ghost slots with GPU copies every iteration. GPUs whose memory is a NUMA node use `empty` with online EPLB: host access to ghost slot memory there is untested and deferred. `ghost` slots are empty slots that hold no device memory while healthy (the KV cache keeps it) and get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume); that is about one slot per rank per MoE layer, an estimated 1.4 GiB per GPU for DeepSeek-R1 NVFP4. With online EPLB, its slots keep serving replicas; where they cannot hold every expert after the loss of a failure domain, each rank gets the missing slots of this kind after EPLB's own, and EPLB's updates use one once a restore filled it. Do not set `ghost` with online EPLB where GDRCopy cannot map ghost slot memory: its updates would copy on the GPU every step |
+| `extra_slots` | The kind of slots fault tolerance appends to each rank where the survivors of a failure domain's loss cannot hold every expert (none if they can). Default: `ghost`, except with online EPLB where GDRCopy cannot map ghost slot memory for the host (that takes a GPU with GPUDirect RDMA for virtual memory): `empty` there, as its weight updates would load ghost slots with GPU copies every iteration. GPUs whose memory is a NUMA node use `empty` with online EPLB: host access to ghost slot memory there is untested and deferred. `ghost` slots are empty slots that hold no device memory while healthy (the KV cache keeps it) and get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume); that is about one slot per rank per MoE layer, an estimated 1.4 GiB per GPU for DeepSeek-R1 NVFP4. With online EPLB, its updates use an appended slot once a restore filled it. Do not set `ghost` with online EPLB where GDRCopy cannot map ghost slot memory: its updates would copy on the GPU every step |
 | `recovery_timeout_s` | How long a worker's recovery may take, including finishing a long step first, before the job stops (default 30 s) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20 s; must be below `recovery_timeout_s`) |
 | `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a hung rank 0 or a stall of every rank as terminal (default `false`) |
@@ -114,12 +119,12 @@ The loss, with the NVLink fabric healthy, of either:
   that corrupts its CUDA context, such as an illegal memory access, after which it ends itself), or
 - with `failure_domain: node` (the default), every rank on one host other than rank 0's (the ranks that report the same
   host name). The survivors must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and
-  `K` ranks per host, `s * (N - K)` must be at least the number of experts, which startup checks. For
-  DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, that is 320 slots (320 = 256 active + 64 ghost,
-  10 per rank): the survivors of one node's loss hold 280 slots. The 64 ghost slots cover one node, and up to
-  6 lost GPUs in total over repeated losses (26 survivors hold 260 slots).
-  With online EPLB (`num_slots: 288`), fault tolerance adds one ghost slot per rank after EPLB's own by default (an
-  empty one where ghost slot memory cannot be host accessible): 320 in all.
+  `K` ranks per host, `s * (N - K)` must be at least the number of experts, with `s` including the slots fault
+  tolerance appends. For DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, the 28 survivors of one node's
+  loss need 10 slots each. A static placement of 256 slots gets two ghost slots per rank: 320 in all, which cover
+  one node and up to 6 lost GPUs in total over repeated losses (26 survivors hold 260 slots). Online EPLB or
+  offline EPLB with `num_slots: 288` gets one ghost slot per rank after EPLB's own (with online EPLB, an empty one
+  where ghost slot memory cannot be host accessible): 320 in all.
 
 Several such ranks lost together, or one more during a recovery (before the survivors install the new
 communicator), are recovered as one loss if the survivors' slots still hold every expert. A further loss after a

@@ -19,6 +19,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     ring_copy_nodes,
 )
 from tensorrt_llm.bindings import internal
+from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -270,10 +271,10 @@ _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 # A launcher that maps ranks round-robin: node "a" runs ranks 0 and 2, node "b" ranks 1 and 3.
 _HOSTS = ["a", "b", "a", "b"]
 _EXPERTS = 8
-# Two EPLB slots per rank and a ghost slot; the placement after FT emptied every replica.
+# Two EPLB slots per rank, one per expert, and the ghost slot fault tolerance appends to each rank.
 _PLACEMENT = [[0, 1, -1], [2, 3, -1], [4, 5, -1], [6, 7, -1]]
-# As MoE modules set it: (ep_rank * E // ep_size + local_slot) % E, ghost slots holding replicas until emptied.
-_ASSIGNMENTS = [0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 0]
+# As MoE modules set it: each ghost slot loads its rank's first expert.
+_ASSIGNMENTS = [0, 1, 0, 2, 3, 2, 4, 5, 4, 6, 7, 6]
 # Slot weights by name: w1 300 bytes, w2 200 bytes.
 _WEIGHTS = {"w1": (300, torch.uint8), "w2": (100, torch.float16)}
 
@@ -301,13 +302,16 @@ def _ring_load_balancer(
     layer_updates_per_iter=0,
     placement=_PLACEMENT,
     assignments=_ASSIGNMENTS,
+    eplb_slots=2,
+    largest_loss=1,
 ):
-    """A MoeLoadBalancer with WideEP peer-loss recovery over native layers showing ``placement`` (initial weight
-    ``assignments``); with a static placement (no ``layer_updates_per_iter``) it keeps ring host copies."""
+    """A MoeLoadBalancer with WideEP peer-loss recovery over native layers of ``eplb_slots`` per rank showing
+    ``placement`` (initial weight ``assignments``); with a static placement of one slot per expert it keeps ring
+    host copies. ``largest_loss``: the most ranks one failure domain holds."""
     slots = len(placement[0])
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_HOSTS))
-    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: 2)
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: largest_loss)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer") as sharer,
@@ -321,7 +325,8 @@ def _ring_load_balancer(
             for i in range(layers)
         ]
         for _ in range(layers):
-            layer = load_balancer.add_layer(_EXPERTS, 2, slots)
+            layer = load_balancer.add_layer(_EXPERTS, 2, eplb_slots)
+            assert layer.slot_count_per_rank == slots
             layer.set_initial_weight_assignments(assignments)
             for slot in range(slots):
                 for name, (count, dtype) in _WEIGHTS.items():
@@ -329,8 +334,16 @@ def _ring_load_balancer(
     return load_balancer, sharer
 
 
-def test_online_eplb_keeps_every_expert_s_host_copy(monkeypatch):
-    load_balancer, sharer = _ring_load_balancer(monkeypatch, layer_updates_per_iter=1)
+@pytest.mark.parametrize(
+    "layer_updates_per_iter, eplb_slots", [(1, 2), (0, 3)], ids=["online", "static-replicas"]
+)
+def test_routed_replicas_keep_every_expert_s_host_copy(
+    monkeypatch, layer_updates_per_iter, eplb_slots
+):
+    """Online EPLB, or a static placement with replicas: a restore may evict any replica."""
+    load_balancer, sharer = _ring_load_balancer(
+        monkeypatch, layer_updates_per_iter=layer_updates_per_iter, eplb_slots=eplb_slots
+    )
     (layer,) = load_balancer.single_layer_load_balancers
     assert load_balancer.copy_nodes is None and layer.host_copy_ranks is None
     sharer.return_value.keep_experts.assert_not_called()
@@ -340,7 +353,7 @@ def test_online_eplb_keeps_every_expert_s_host_copy(monkeypatch):
 def test_a_node_shares_the_home_experts_of_the_next_node(monkeypatch, ep_rank, held):
     load_balancer, sharer = _ring_load_balancer(monkeypatch, ep_rank)
     (layer,) = load_balancer.single_layer_load_balancers
-    # Home ranks: each expert's slot after the replicas are emptied.
+    # Home ranks: each expert's only slot.
     assert layer.home_ranks.tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
     # Node a (ranks 0, 2) keeps node b's (ranks 1, 3) experts and the other way round.
     assert layer.host_copy_ranks == ([1, 3] if ep_rank == 0 else [0, 2])
@@ -545,7 +558,9 @@ def test_source_write_ranges_cover_every_write_of_the_source(
 
 # Two ghost slots per rank, so the survivors of a two-rank loss can hold every expert.
 _GHOSTS_PLACEMENT = [[0, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1]]
-_GHOSTS_ASSIGNMENTS = [(2 * rank + slot) % _EXPERTS for rank in range(4) for slot in range(4)]
+_GHOSTS_ASSIGNMENTS = [
+    2 * rank + (slot if slot < 2 else 0) for rank in range(4) for slot in range(4)
+]
 
 
 @pytest.mark.parametrize("dead", [[0], [3], [0, 3], [1, 3], [0, 2]])
@@ -567,6 +582,7 @@ def test_the_copy_plan_never_stages_where_a_dead_rank_writes(
             layers=2,
             placement=_GHOSTS_PLACEMENT,
             assignments=_GHOSTS_ASSIGNMENTS,
+            largest_loss=2,
         )
         placements = load_balancer.recovery_placements(dead)
         plans.append(load_balancer.restore_copy_plan(dead, placements, row_bytes, write_ranges))
@@ -610,7 +626,11 @@ def test_a_replan_keeps_off_the_copies_a_rank_lost_while_staging_was_given(monke
     row_bytes = _field(meta, "WORKSPACE_SIZE")
     write_ranges = functools.partial(NVLinkOneSided.source_write_ranges, meta)
     load_balancer, _ = _ring_load_balancer(
-        monkeypatch, layers=2, placement=_GHOSTS_PLACEMENT, assignments=_GHOSTS_ASSIGNMENTS
+        monkeypatch,
+        layers=2,
+        placement=_GHOSTS_PLACEMENT,
+        assignments=_GHOSTS_ASSIGNMENTS,
+        largest_loss=2,
     )
     first = load_balancer.restore_copy_plan(
         [3], load_balancer.recovery_placements([3]), row_bytes, write_ranges
@@ -634,7 +654,11 @@ def test_a_replan_keeps_off_the_copies_a_rank_lost_while_staging_was_given(monke
 
 def test_a_replan_keeps_off_only_the_chunks_a_lost_rank_may_still_copy(monkeypatch):
     load_balancer, _ = _ring_load_balancer(
-        monkeypatch, layers=2, placement=_GHOSTS_PLACEMENT, assignments=_GHOSTS_ASSIGNMENTS
+        monkeypatch,
+        layers=2,
+        placement=_GHOSTS_PLACEMENT,
+        assignments=_GHOSTS_ASSIGNMENTS,
+        largest_loss=2,
     )
     row_bytes = 1024
     first = load_balancer.restore_copy_plan(
@@ -656,7 +680,8 @@ def test_a_replan_keeps_off_only_the_chunks_a_lost_rank_may_still_copy(monkeypat
     )
 
 
-# DeepSeek-R1 at EP32 on eight nodes of four GPUs: 256 experts on 8 + 2 static EPLB slots per rank.
+# DeepSeek-R1 at EP32 on eight nodes of four GPUs: a static placement of 256 experts on 8 slots per rank, and the
+# 2 ghost slots per rank fault tolerance appends.
 _R1_EP, _R1_GPUS_PER_NODE, _R1_EXPERTS, _R1_SLOTS = 32, 4, 256, 10
 _R1_HOSTS = [f"node{rank // _R1_GPUS_PER_NODE}" for rank in range(_R1_EP)]
 
@@ -666,18 +691,15 @@ def _r1_node(node):
 
 
 def _r1_static_load_balancer(monkeypatch):
-    """A static R1 MoeLoadBalancer with ring host copies, showing the placement after FT emptied the replicas."""
-    assignments = [
-        (rank * _R1_EXPERTS // _R1_EP + slot) % _R1_EXPERTS
-        for rank in range(_R1_EP)
-        for slot in range(_R1_SLOTS)
-    ]
-    placement = np.array(assignments, dtype=np.int32).reshape(_R1_EP, _R1_SLOTS)
-    placement[:, 8:] = -1
+    """A static R1 MoeLoadBalancer of 256 slots with WideEP peer-loss recovery, showing its healthy placement."""
+    placement = np.full((_R1_EP, _R1_SLOTS), -1, dtype=np.int32)
+    placement[:, :8] = np.arange(_R1_EXPERTS).reshape(_R1_EP, 8)
     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(f"{_MLB}.fault_tolerance_config", lambda: FaultToleranceConfig())
     monkeypatch.setattr(
         MoeLoadBalancer, "_gather_copy_nodes", lambda self: ring_copy_nodes(_R1_HOSTS)
     )
+    monkeypatch.setattr(MoeLoadBalancer, "_gather_largest_loss", lambda self: _R1_GPUS_PER_NODE)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),
@@ -688,10 +710,24 @@ def _r1_static_load_balancer(monkeypatch):
             get_old_rank_expert_ids=Mock(return_value=placement.tolist()),
         )
         load_balancer.load_balancer_impl.add_layer.return_value = native
-        load_balancer.add_layer(_R1_EXPERTS, 8, _R1_SLOTS).set_initial_weight_assignments(
-            assignments
-        )
+        layer = load_balancer.add_layer(_R1_EXPERTS, 8, 8)
+        layer.set_initial_weight_assignments(layer.with_ghost_slots(list(range(_R1_EXPERTS))))
     return load_balancer, native
+
+
+def test_r1_static_256_slots_get_two_restore_slots_per_rank(monkeypatch):
+    load_balancer, native = _r1_static_load_balancer(monkeypatch)
+    (layer,) = load_balancer.single_layer_load_balancers
+    # 28 survivors of a node need ceil(256 / 28) = 10 slots each: 320 in all.
+    load_balancer.load_balancer_impl.add_layer.assert_called_once_with(_R1_EXPERTS, 8, _R1_SLOTS)
+    assert (layer.slot_count_per_rank, layer.ghost_slot_count) == (_R1_SLOTS, 2)
+    assert load_balancer.extra_slots_mode() == "ghost"
+    # Routing starts with one slot per expert; ring host copies.
+    native.set_initial_weight_assignments.assert_called_once_with(
+        [expert for rank in native.get_old_rank_expert_ids() for expert in rank]
+    )
+    assert load_balancer.copy_nodes == ring_copy_nodes(_R1_HOSTS)
+    assert layer.home_ranks.tolist() == [expert // 8 for expert in range(_R1_EXPERTS)]
 
 
 def _assert_serves_every_expert_once(placement, dead):

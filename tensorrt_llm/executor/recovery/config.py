@@ -44,15 +44,11 @@ class FaultToleranceConfig(StrictBaseModel):
 
     extra_slots: Optional[Literal["empty", "ghost"]] = Field(
         default=None,
-        description="EPLB slots beyond one per expert: ``ghost`` (no device memory until a restore maps it, so the "
-        "KV cache keeps that memory while healthy) or ``empty`` (memory held, routing never uses them; a restore "
-        "fills them). Default: ``ghost``, except with online EPLB where GDRCopy cannot map ghost slot memory for "
-        "the host (it needs GPUDirect RDMA for virtual memory): ``empty`` there, as its weight updates would load "
-        "ghost slots with GPU copies. GPUs whose memory is a NUMA node use ``empty`` with online EPLB: host access "
-        "to ghost slot memory there is untested and deferred. Online EPLB keeps replicas in its slots; where they "
-        "cannot hold every expert after the loss of a failure domain, each rank gets as many slots of this kind "
-        "after them as that takes. A restore fills them only where replicas cannot, and EPLB's updates use a slot "
-        "once a restore filled it.",
+        description="The kind of EPLB slots fault tolerance appends to each rank where the survivors of a failure "
+        "domain's loss cannot hold every expert: ``ghost`` (no device memory until a restore maps it, so the KV cache "
+        "keeps that memory while healthy) or ``empty`` (memory held). Routing never uses them until a restore fills "
+        "them. Default: ``ghost``, except with online EPLB where GDRCopy cannot map ghost slot memory for the host "
+        "(it needs GPUDirect RDMA for virtual memory) or GPU memory is a NUMA node: ``empty`` there.",
     )
     failure_domain: Literal["rank", "node"] = Field(
         default="node",

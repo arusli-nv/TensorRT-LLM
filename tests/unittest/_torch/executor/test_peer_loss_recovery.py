@@ -205,6 +205,24 @@ def test_recovery_runs_protocol_and_installs_in_order():
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
+def test_static_placement_with_replicas_restores_from_full_host_copies():
+    """Its replicas stay routed and every node keeps every host copy: the install loads, nothing is staged."""
+    recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
+    load_balancer = recovery._executor.model_engine.moe_load_balancer
+    load_balancer.copy_nodes = None
+    recovery._peer_failed.set()
+
+    recovery._recover(_interrupted())
+
+    failed = frozenset({FAILED_RANK})
+    # The placement never changes: no update to wait for and no rank 0 base.
+    load_balancer.quiesce.assert_not_called()
+    load_balancer.recovery_placements.assert_called_once_with(failed, None)
+    load_balancer.restore_copy_plan.assert_not_called()
+    load_balancer.placement_digest.assert_called_once_with(failed, ["placement"], None)
+    load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
+
+
 def test_ghost_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypatch):
     """Ghost slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
     recovery = _recovery(_FakeClient([]))
@@ -584,6 +602,7 @@ def test_a_round_after_a_late_shrink_does_not_start_survivor_collectives():
     load_balancer.covers_loss_of.return_value = True
     # Online EPLB: every round broadcasts rank 0's placement among the survivors.
     load_balancer.is_static_routing.return_value = False
+    load_balancer.copy_nodes = None
     load_balancer.quiesce.return_value = True
     load_balancer.current_placements.return_value = [np.zeros((WORLD_SIZE, 2))]
     dist.broadcast_among_survivors = Mock(return_value=[np.zeros((WORLD_SIZE, 2))])
@@ -2014,13 +2033,16 @@ def test_create_refuses_a_failure_domain_the_slots_cannot_cover(
         assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
 
 
-def test_create_accepts_online_eplb(monkeypatch):
+@pytest.mark.parametrize("static", [False, True], ids=["online", "static-replicas"])
+def test_create_checks_staging_room_only_for_ring_host_copies(monkeypatch, static):
     monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
     monkeypatch.setattr(
         peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )
     executor = _supported_executor()
-    executor.model_engine.moe_load_balancer.is_static_routing.return_value = False
+    # Online EPLB, or a static placement whose replicas stay routed: every node keeps every host copy.
+    executor.model_engine.moe_load_balancer.is_static_routing.return_value = static
+    executor.model_engine.moe_load_balancer.copy_nodes = None
     assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
     executor.model_engine.moe_load_balancer.restore_copy_plan.assert_not_called()
 
@@ -2188,6 +2210,7 @@ def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():
     recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.is_static_routing.return_value = False
+    load_balancer.copy_nodes = None
     load_balancer.quiesce.return_value = True
     own, rank0 = [np.zeros((WORLD_SIZE, 2))], [np.ones((WORLD_SIZE, 2))]
     load_balancer.current_placements.return_value = own
@@ -2215,6 +2238,7 @@ def test_online_eplb_decides_recoverability_from_rank_0s_placement(covered):
     recovery = _recovery(client, failed=lost)
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.is_static_routing.return_value = False
+    load_balancer.copy_nodes = None
     load_balancer.quiesce.return_value = True
     load_balancer.covers_loss_of.return_value = not covered
     rank0 = [np.ones((WORLD_SIZE, 2))]

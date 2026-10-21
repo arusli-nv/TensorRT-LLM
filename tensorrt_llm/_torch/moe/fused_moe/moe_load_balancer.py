@@ -52,7 +52,7 @@ def _no_shm_space(required: int, layer_id: int) -> RuntimeError:
     return RuntimeError(
         f"{_SHM_MOUNT} has {free / gib:.2f} GiB free of {stat.f_blocks * stat.f_frsize / gib:.2f} GiB, "
         f"but this rank's part of the EPLB host copies of MoE layer {layer_id} needs {required / gib:.2f} GiB. "
-        f"Each node keeps in {_SHM_MOUNT} host copies of the experts it may load (with online EPLB, "
+        f"Each node keeps in {_SHM_MOUNT} host copies of the experts it may load (where replicas stay routed, "
         "every expert of every MoE layer); enlarge it, e.g. with docker run --shm-size or a "
         "memory-backed emptyDir in Kubernetes")
 
@@ -94,23 +94,6 @@ def _populate_in_background(segments: List[shared_memory.SharedMemory]) -> None:
     threading.Thread(target=populate,
                      name="eplb_host_copy_populate",
                      daemon=True).start()
-
-
-def _without_replicas(placement: np.ndarray) -> np.ndarray:
-    """``placement`` ([ep_size, slots_per_rank] expert ids) with -1 for every replica beyond an expert's first.
-
-    The kept replica is the one with the lowest local slot (an expert's home
-    slot), ties to the lowest rank.
-    """
-    placement = placement.copy()
-    seen = set()
-    for slot, rank in np.ndindex(placement.shape[::-1]):
-        expert = int(placement[rank, slot])
-        if expert in seen:
-            placement[rank, slot] = -1
-        elif expert >= 0:
-            seen.add(expert)
-    return placement
 
 
 # Whether ghost slot memory is host accessible on every rank; set by the first _ghost_slot_memory_host_accessible().
@@ -492,8 +475,8 @@ class SingleLayerMoeLoadBalancer:
                 with weight updates); with static routing, for loading slots outside iterations (WideEP peer-loss
                 recovery restores a lost rank's experts this way).
             slot_count_per_rank: the number of slots per rank, ``ghost_slot_count`` of them last.
-            ghost_slot_count: slots per rank appended after online EPLB's own for WideEP peer-loss recovery; they
-                start empty and EPLB's updates fill one only once a restore loaded an expert into it.
+            ghost_slot_count: slots per rank appended after EPLB's own for WideEP peer-loss recovery; they start
+                empty and online EPLB's updates fill one only once a restore loaded an expert into it.
             host_copy_ranks: with ring host copies, the EP ranks whose home experts' host copies this node keeps.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
@@ -679,10 +662,9 @@ class SingleLayerMoeLoadBalancer:
         self.initial_weight_assignments = list(initial_weight_assignments)
         if self.host_copy_ranks is not None and self.home_ranks is None:
             # Ring host copies: keep the experts whose home rank is in host_copy_ranks.
-            placement = _without_replicas(
-                np.asarray(initial_weight_assignments,
-                           dtype=np.int32).reshape(-1,
-                                                   self.slot_count_per_rank))
+            placement = np.asarray(initial_weight_assignments,
+                                   dtype=np.int32).reshape(
+                                       -1, self.slot_count_per_rank)
             ranks, _ = np.nonzero(placement >= 0)
             self.home_ranks = np.empty(self.expert_count, dtype=np.int64)
             self.home_ranks[placement[placement >= 0]] = ranks
@@ -1157,15 +1139,13 @@ class MoeLoadBalancer:
         self.enable_update_weights = False
 
         self.next_layer_repeated_count = None
-        # With online EPLB and WideEP peer-loss recovery, the most ranks one admitted failure takes: the
-        # survivors' slots, ghost slots included, must hold every expert.
-        self._largest_loss = self._gather_largest_loss() if (
-            self.is_dynamic_routing()
-            and peer_loss_recovery_enabled()) else None
-        # Ring host copies, with a static placement: per EP rank, ring_copy_nodes. Online EPLB keeps every
-        # expert's host copy on every node.
-        self.copy_nodes = self._gather_copy_nodes() if (
-            self.is_static_routing() and peer_loss_recovery_enabled()) else None
+        # With WideEP peer-loss recovery, the most ranks one admitted failure takes: the survivors' slots,
+        # appended slots included, must hold every expert.
+        self._largest_loss = self._gather_largest_loss(
+        ) if peer_loss_recovery_enabled() else None
+        # Ring host copies, with restore slots (see add_layer): per EP rank, ring_copy_nodes. Otherwise every
+        # node keeps every expert's host copy.
+        self.copy_nodes: Optional[List[Tuple[int, ...]]] = None
 
     def __del__(self):
         if not self.is_shutdown:
@@ -1177,6 +1157,13 @@ class MoeLoadBalancer:
 
     def is_dynamic_routing(self):
         return not self.is_static_routing()
+
+    def _has_restore_slots(self, expert_count: int,
+                           slot_count_per_rank: int) -> bool:
+        """Whether WideEP peer-loss recovery keeps the slots it appends for restores, with ring host copies: with a
+        static placement of one slot per expert. More slots hold replicas, which stay routed."""
+        return self.is_static_routing(
+        ) and slot_count_per_rank * self.ep_size == expert_count
 
     def _setup_mpi_comm(self):
         global_mpi_comm = tensorrt_llm.mpi_comm()
@@ -1228,8 +1215,8 @@ class MoeLoadBalancer:
         Args:
             expert_count: The number of experts in the layer
             top_k: The number of experts each token selects
-            slot_count_per_rank: The number of EPLB slots per rank. With online EPLB, WideEP peer-loss recovery
-                appends the ghost slots the survivors of a failure need to hold every expert.
+            slot_count_per_rank: The number of EPLB slots per rank. WideEP peer-loss recovery appends the
+                slots the survivors of a failure need to hold every expert.
             aux_stream: The auxiliary stream for overlapping
 
         Returns:
@@ -1240,6 +1227,9 @@ class MoeLoadBalancer:
             survivors = self.ep_size - self._largest_loss
             ghost_slot_count = max(
                 0, -(-expert_count // survivors) - slot_count_per_rank)
+            if self.copy_nodes is None and self._has_restore_slots(
+                    expert_count, slot_count_per_rank):
+                self.copy_nodes = self._gather_copy_nodes()
         single_layer_load_balancer_impl = self.load_balancer_impl.add_layer(
             expert_count, top_k, slot_count_per_rank + ghost_slot_count)
         updates_enabled = not self.is_static_routing()
@@ -1270,20 +1260,19 @@ class MoeLoadBalancer:
         """
         Register weights after model has been moved to cuda, should be invoked after model.to("cuda") and before finalize_model.
         """
-        if self._largest_loss is not None:
+        if self._largest_loss is not None and self.is_dynamic_routing():
             # Collective: every rank decides the same.
             _ghost_slot_memory_host_accessible()
         mode = self.extra_slots_mode()
         if mode in ("ghost", "replicas+ghost"):
-            if mode == "ghost" or not _ghost_slot_memory_host_accessible():
+            if self.is_static_routing(
+            ) or not _ghost_slot_memory_host_accessible():
                 # Only GPU copies load ghost slots in device memory.
                 self.set_use_gpu_memcpy(True)
             for layer in self.single_layer_load_balancers:
                 placement = np.asarray(layer.initial_weight_assignments,
                                        dtype=np.int32).reshape(
                                            self.ep_size, -1)
-                if mode == "ghost":
-                    placement = _without_replicas(placement)
                 layer.ghost_slots = np.flatnonzero(
                     placement[self.ep_rank] < 0).tolist()
         for layer in self.single_layer_load_balancers:
@@ -1292,29 +1281,23 @@ class MoeLoadBalancer:
     def extra_slots_mode(self) -> Optional[str]:
         """What WideEP peer-loss recovery keeps in the EPLB slots beyond one per expert; None without it.
 
-        With a static placement, the fault-tolerance config's ``extra_slots``
-        (default ``ghost``): ``empty`` (not routed to while healthy; a restore
-        fills them) or ``ghost`` (also without device memory until a restore
-        maps it). Online
-        EPLB keeps ``replicas`` in them (a loss reroutes to them or restores
-        into them); where its slots cannot hold every expert after a failure,
-        ``replicas+ghost`` or ``replicas+empty``: the ghost slots appended to
-        each rank are ``extra_slots`` slots too, by default ``ghost`` where
-        ghost slot memory can be host accessible (CPU copies load it as they
-        load EPLB's other slots) and ``empty`` elsewhere.
+        ``ghost`` or ``empty``: the slots it appends to a static placement
+        without replicas, kept for restores. Otherwise ``replicas``, with
+        ``+ghost`` or ``+empty`` where it appends slots. The kind is the
+        fault-tolerance config's ``extra_slots``, by default ``ghost`` except
+        with online EPLB where ghost slot memory cannot be host accessible.
         """
         if not peer_loss_recovery_enabled():
             return None
+        if not any(layer.ghost_slot_count
+                   for layer in self.single_layer_load_balancers):
+            return "replicas"
         extra_slots = fault_tolerance_config().extra_slots
-        if self.is_static_routing():
-            return extra_slots or "ghost"
-        if any(layer.ghost_slot_count
-               for layer in self.single_layer_load_balancers):
-            if extra_slots is None:
-                host_accessible = _ghost_slot_memory_host_accessible()
-                extra_slots = "ghost" if host_accessible else "empty"
-            return f"replicas+{extra_slots}"
-        return "replicas"
+        if extra_slots is None:
+            ghost = self.is_static_routing(
+            ) or _ghost_slot_memory_host_accessible()
+            extra_slots = "ghost" if ghost else "empty"
+        return extra_slots if self.copy_nodes is not None else f"replicas+{extra_slots}"
 
     def finalize_model(self):
         """
@@ -1337,19 +1320,11 @@ class MoeLoadBalancer:
                     )
         self.load_balancer_impl.finalize_model()
         mode = self.extra_slots_mode()
-        if mode in ("empty", "ghost"):
-            # Before warmup, so autotuning and CUDA graph capture see the
-            # healthy routing.
-            emptied = self.empty_replica_slots()
-            if self.ep_rank == 0:
-                logger.info(
-                    f"WideEP peer-loss recovery keeps {emptied} EPLB slots empty for restores"
-                )
-        elif mode not in (None, "replicas") and self.ep_rank == 0:
+        if mode not in (None, "replicas") and self.ep_rank == 0:
             layer = self.single_layer_load_balancers[0]
             logger.info(
-                f"WideEP peer-loss recovery appends {layer.ghost_slot_count} {mode.split('+')[1]} slots per "
-                f"rank to online EPLB's {layer.slot_count_per_rank - layer.ghost_slot_count}"
+                f"WideEP peer-loss recovery appends {layer.ghost_slot_count} {mode.split('+')[-1]} slots per "
+                f"rank to EPLB's {layer.slot_count_per_rank - layer.ghost_slot_count}"
             )
             mappings, mapped_bytes = _tbr.ghost_slot_memory_host_mappings()
             if mappings:
@@ -1660,28 +1635,6 @@ class MoeLoadBalancer:
             slots_loaded=self.copy_nodes is not None)
         logger.info(f"Restored {restored} expert slots without ranks {dead} in "
                     f"{(time.monotonic() - start) * 1e3:.1f} ms")
-
-    def empty_replica_slots(self) -> int:
-        """Stop routing to every replica beyond an expert's first, leaving those slots empty for restores.
-
-        Routing then uses one slot per expert, as a placement without spare
-        slots does; the slot buffers keep their addresses (CUDA graphs
-        captured them; ghost slots map no memory). Which replica stays:
-        ``_without_replicas``. Needs host copies, to fill the slots later.
-        Returns the number of slots emptied.
-        """
-        placements = [
-            _without_replicas(
-                np.asarray(layer.get_old_rank_expert_ids(), dtype=np.int32))
-            for layer in self.single_layer_load_balancers
-        ]
-        emptied = sum(int((p < 0).sum()) for p in placements)
-        if emptied:
-            # Emptying slots loads none.
-            self.load_balancer_impl.restore_placement(
-                [], [placement.tolist() for placement in placements],
-                slots_loaded=True)
-        return emptied
 
     @staticmethod
     def _masked_placement(layer: "SingleLayerMoeLoadBalancer",

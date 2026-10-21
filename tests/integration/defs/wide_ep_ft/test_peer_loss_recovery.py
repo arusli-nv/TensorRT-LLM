@@ -390,15 +390,21 @@ def test_rank_lost_during_recovery(tmp_path: Path):
 @pytest.mark.skip_device_not_contain(["GB200"])
 @pytest.mark.parametrize("eplb", ["static", "online"])
 def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
-    """The extra slots hold no memory until rank 2 dies in decode; the restore maps memory behind them.
+    """The appended slots hold no memory until rank 2 dies in decode; the restore maps memory behind them.
 
-    Online EPLB over 80 slots (20 per rank) cannot hold the 72 experts on three ranks: each rank gets 4 ghost
-    slots after its EPLB slots, which the restore fills once the replicas are used up, and EPLB's updates serve on.
+    Three ranks cannot hold the 72 experts in 18 slots each (a static placement of one slot per expert) or in 20
+    (online EPLB over 80 slots): each rank gets 6 or 4 ghost slots after its EPLB slots, which the restore fills
+    once any replicas are used up. Online EPLB's updates then serve on.
     """
-    online_args = ["--online-slots", "80"] if eplb == "online" else []
+    if eplb == "online":
+        args, appended = ["--online-slots", "80"], "4 ghost slots per rank to EPLB's 20"
+    else:
+        args, appended = ["--replica-offset", "0"], "6 ghost slots per rank to EPLB's 18"
     result, output, authority_text = _run_driver(
-        tmp_path, "inflight", [VICTIM], *online_args, ft_config=dict(extra_slots="ghost")
+        tmp_path, "inflight", [VICTIM], *args, ft_config=dict(extra_slots="ghost")
     )
+    before_kill = output.partition(KILL_MARKER)[0]
+    assert f"WideEP peer-loss recovery appends {appended}" in before_kill, output[-20000:]
     after_kill = _assert_recovered(
         result, output, authority_text, "inflight", [VICTIM], online_eplb=eplb == "online"
     )
@@ -417,10 +423,9 @@ def test_restore_into_appended_empty_slots(tmp_path: Path):
         tmp_path, "inflight", [VICTIM], "--online-slots", "80", ft_config=dict(extra_slots="empty")
     )
     before_kill = output.partition(KILL_MARKER)[0]
-    assert (
-        "WideEP peer-loss recovery appends 4 empty slots per rank to online EPLB's 20"
-        in before_kill
-    ), output[-20000:]
+    assert "WideEP peer-loss recovery appends 4 empty slots per rank to EPLB's 20" in before_kill, (
+        output[-20000:]
+    )
     after_kill = _assert_recovered(
         result, output, authority_text, "inflight", [VICTIM], online_eplb=True
     )
