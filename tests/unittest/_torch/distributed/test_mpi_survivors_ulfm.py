@@ -136,13 +136,19 @@ def _run_rank() -> None:
     departed = {VICTIM}
     second = int(os.environ.get("ULFM_SECOND_VICTIM", "-1"))
     if second >= 0:
-        # Another rank fails during the recovery: the survivors shrink again.
+        # Another rank fails during the recovery: the survivors shrink again. The callback drops the
+        # last reference to its watch, which the native watch thread then destroys.
         replan = threading.Event()
-        watch = dist.watch_survivor_failures(replan.set)
+        watches = []
+
+        def on_second_failure() -> None:
+            watches.clear()
+            replan.set()
+
+        watches.append(dist.watch_survivor_failures(on_second_failure))
         if rank == second:
             os._exit(0)
         assert replan.wait(60), "the survivor watch did not observe the second departed rank"
-        watch.stop()
         dist.revoke()
         failed = dist.shrink()
         departed.add(second)

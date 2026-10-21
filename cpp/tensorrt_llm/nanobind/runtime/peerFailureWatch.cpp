@@ -76,11 +76,11 @@ public:
         if (PyGILState_Check())
         {
             nb::gil_scoped_release release;
-            stop();
+            stopForDestruction();
         }
         else
         {
-            stop();
+            stopForDestruction();
         }
     }
 
@@ -92,7 +92,8 @@ public:
     //! Stop watching and release the receive; returns whether it did, after which the caller may free the
     //! communicator. Idempotent; never calls `onFailure` after it returns true. Called from `onFailure` itself, it
     //! only stops the watch and returns false: the thread cannot join itself, so a later call from another
-    //! thread (at the latest the destructor's) joins and releases.
+    //! thread (at the latest the destructor's) joins and releases. Destroyed from `onFailure`, the watch detaches
+    //! the thread instead.
     bool stop()
     {
         {
@@ -108,16 +109,38 @@ public:
             [this]
             {
                 mThread.join();
-                // A failed peer may fail these too; the communicator is freed next either way.
-                if (mRequest != MPI_REQUEST_NULL && MPI_Cancel(&mRequest) == MPI_SUCCESS)
-                {
-                    MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
-                }
+                releaseRequest();
             });
         return true;
     }
 
 private:
+    void stopForDestruction()
+    {
+        if (std::this_thread::get_id() != mThread.get_id())
+        {
+            stop();
+            return;
+        }
+        // The last reference went in onFailure, on the watch thread, which cannot join itself. The thread touches
+        // nothing of this object once onFailure returns, so it may outlive it.
+        std::call_once(mReleased,
+            [this]
+            {
+                mThread.detach();
+                releaseRequest();
+            });
+    }
+
+    void releaseRequest()
+    {
+        // A failed peer may fail these too; the communicator is freed next either way.
+        if (mRequest != MPI_REQUEST_NULL && MPI_Cancel(&mRequest) == MPI_SUCCESS)
+        {
+            MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
+        }
+    }
+
     void watch()
     {
 #if defined(__linux__)
