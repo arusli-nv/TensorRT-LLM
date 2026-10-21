@@ -256,9 +256,14 @@ def _run_driver(
 
 
 def _assert_answered(rows: list[dict]) -> None:
+    """Each request answered with its expected word and exactly ``max_tokens`` tokens.
+
+    The requests ignore EOS, so a token that a discarded or re-run step duplicated or dropped changes the count.
+    """
     for row in rows:
         assert "error" not in row, row
         assert row["expected"] in row["text"], row
+        assert len(row["token_ids"]) == row["max_tokens"], row
 
 
 def _assert_coherent(rows: list[dict]) -> None:

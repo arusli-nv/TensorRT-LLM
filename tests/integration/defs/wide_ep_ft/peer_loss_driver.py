@@ -122,6 +122,7 @@ def submit(llm, ranks, max_tokens: int, stream_index: int | None = None) -> list
     return [
         (
             rank,
+            max_tokens,
             llm.generate_async(
                 PROMPTS[rank][0],
                 params,
@@ -139,9 +140,9 @@ def collect(pending: list) -> list[dict]:
     from tensorrt_llm.llmapi import RequestError
 
     rows = []
-    for rank, request in pending:
+    for rank, max_tokens, request in pending:
         prompt, expected = PROMPTS[rank]
-        row = dict(rank=rank, prompt=prompt, expected=expected)
+        row = dict(rank=rank, prompt=prompt, expected=expected, max_tokens=max_tokens)
         try:
             output = request.result(timeout=RESULT_TIMEOUT_S).outputs[0]
             row["text"], row["token_ids"] = output.text, list(output.token_ids)
@@ -199,7 +200,7 @@ def main() -> None:
             ranks = [rank for rank in all_ranks for _ in range(args.per_rank)]
             probe_index = ranks.index(survivors[0])
             pending = submit(llm, ranks, LONG_MAX_TOKENS, stream_index=probe_index)
-            probe = pending[probe_index][1]
+            probe = pending[probe_index][2]
             while len(next(probe).outputs[0].token_ids) < TOKENS_BEFORE_KILL:
                 pass
             fault(args.victims, signum)
