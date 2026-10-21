@@ -9,8 +9,7 @@ import socket
 
 import pytest
 
-from tensorrt_llm.executor.recovery import authority as authority_module
-from tensorrt_llm.executor.recovery import protocol
+from tensorrt_llm.executor.recovery import authority_server, protocol
 from tensorrt_llm.executor.recovery.authority import Phase, RecoveryAuthority
 from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 from tensorrt_llm.executor.recovery.hang_monitor import HangMonitor, HungRank
@@ -390,13 +389,13 @@ def test_authority_reports_a_stall_of_every_rank_as_terminal_and_restarts_every_
 
 def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
     launched = []
-    original = authority_module.subprocess.Popen
-    authority_module.subprocess.Popen = lambda command, **kwargs: launched.append(command)
+    original = authority_server.subprocess.Popen
+    authority_server.subprocess.Popen = lambda command, **kwargs: launched.append(command)
     try:
-        fence = authority_module.command_fence("ssh {host} kill -KILL {pid}")
+        fence = authority_server.command_fence("ssh {host} kill -KILL {pid}")
         fence(HungRank(2, "every peer waits on it", "node-7", 4242))
     finally:
-        authority_module.subprocess.Popen = original
+        authority_server.subprocess.Popen = original
     assert launched == [["ssh", "node-7", "kill", "-KILL", "4242"]]
 
 
@@ -407,11 +406,11 @@ def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
 def test_command_fence_refuses_a_host_or_pid_that_is_not_plain(host, pid, monkeypatch):
     launched = []
     monkeypatch.setattr(
-        authority_module.subprocess, "Popen", lambda command, **kwargs: launched.append(command)
+        authority_server.subprocess, "Popen", lambda command, **kwargs: launched.append(command)
     )
-    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", host, pid))
+    authority_server.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", host, pid))
     assert launched == []
-    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", "fd00::7", 9))
+    authority_server.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", "fd00::7", 9))
     assert launched == [["ssh", "fd00::7", "kill", "-KILL", "9"]]
 
 
@@ -475,7 +474,7 @@ def test_the_fence_command_is_skipped_once_the_hung_rank_departed():
 
 
 def _datagrams():
-    receiver = authority_module.datagram_socket("tcp://127.0.0.1:0")
+    receiver = authority_server.datagram_socket("tcp://127.0.0.1:0")
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sender.connect(receiver.getsockname())
     return receiver, sender
@@ -483,7 +482,7 @@ def _datagrams():
 
 def _drain(authority, receiver, now):
     # Datagrams on the loopback are queued at once.
-    return authority_module._receive_datagrams(authority, receiver, KEY, now)
+    return authority_server._receive_datagrams(authority, receiver, KEY, now)
 
 
 def _send_forgeries(sender, now):
@@ -534,13 +533,13 @@ def test_an_authority_that_cannot_bind_its_datagram_port_fails():
     try:
         taken.bind(("127.0.0.1", 0))
         with pytest.raises(RuntimeError, match="native heartbeats"):
-            authority_module.datagram_socket(f"tcp://127.0.0.1:{taken.getsockname()[1]}")
+            authority_server.datagram_socket(f"tcp://127.0.0.1:{taken.getsockname()[1]}")
     finally:
         taken.close()
 
 
 def test_a_datagram_flood_yields_to_the_loop(monkeypatch):
-    monkeypatch.setattr(authority_module, "_MAX_DATAGRAMS_PER_PASS", 2)
+    monkeypatch.setattr(authority_server, "_MAX_DATAGRAMS_PER_PASS", 2)
     authority = _serving_authority([])
     receiver, sender = _datagrams()
     try:

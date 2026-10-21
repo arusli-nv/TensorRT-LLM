@@ -13,8 +13,8 @@ import zmq
 from tensorrt_llm._utils import peer_loss_recovery_enabled
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.executor.recovery import authority as authority_module
+from tensorrt_llm.executor.recovery import authority_server, protocol
 from tensorrt_llm.executor.recovery import client as recovery_client
-from tensorrt_llm.executor.recovery import protocol
 from tensorrt_llm.executor.recovery.client import (
     RecoveryAborted,
     RecoveryClient,
@@ -520,11 +520,11 @@ def _signed(obj, key: bytes = KEY) -> bytes:
 
 def test_wire_roundtrip_and_authentication(tmp_path):
     endpoint = f"ipc://{tmp_path}/authority"
-    router = authority_module.router_queue(endpoint, KEY)
+    router = authority_server.router_queue(endpoint, KEY)
     dealer = _dealer(endpoint)
     try:
         # Unlike ZeroMqQueue's default, a connection cannot queue without bound.
-        assert router.socket.getsockopt(zmq.RCVHWM) == authority_module._ROUTER_RCVHWM
+        assert router.socket.getsockopt(zmq.RCVHWM) == authority_server._ROUTER_RCVHWM
         for message in (
             Register(1, ((1,), NODE), DIGEST),
             Registered(((1,), NODE)),
@@ -635,10 +635,10 @@ def test_client_from_env(monkeypatch):
 def served(tmp_path):
     authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
     endpoint = f"ipc://{tmp_path}/authority"
-    router = authority_module.router_queue(endpoint, KEY)
+    router = authority_server.router_queue(endpoint, KEY)
     stop = threading.Event()
     thread = threading.Thread(
-        target=authority_module.serve, args=(authority, router, KEY, stop, 0.01), daemon=True
+        target=authority_server.serve, args=(authority, router, KEY, stop, 0.01), daemon=True
     )
     thread.start()
     yield authority, endpoint
@@ -760,11 +760,11 @@ def test_a_connection_with_a_routing_id_in_use_takes_the_route_over(served, clie
 
 
 def test_a_message_that_cannot_be_sent_is_logged(tmp_path, monkeypatch):
-    router = authority_module.router_queue(f"ipc://{tmp_path}/authority", KEY)
+    router = authority_server.router_queue(f"ipc://{tmp_path}/authority", KEY)
     warnings = []
-    monkeypatch.setattr(authority_module.logger, "warning", warnings.append)
+    monkeypatch.setattr(authority_server.logger, "warning", warnings.append)
     try:
-        authority_module._send(router, [(b"gone", Abort("lost"))], -1e9)
+        authority_server._send(router, [(b"gone", Abort("lost"))], -1e9)
     finally:
         router.close()
     assert len(warnings) == 1 and "could not send" in warnings[0]
@@ -796,10 +796,10 @@ def test_an_interrupted_wait_takes_a_message_that_already_arrived(clients):
 def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):
     authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
     endpoint = f"ipc://{tmp_path}/authority"
-    router = authority_module.router_queue(endpoint, KEY)
+    router = authority_server.router_queue(endpoint, KEY)
     stop = threading.Event()
     thread = threading.Thread(
-        target=authority_module.serve, args=(authority, router, KEY, stop, 0.01)
+        target=authority_server.serve, args=(authority, router, KEY, stop, 0.01)
     )
     thread.start()
     try:
@@ -973,7 +973,7 @@ def test_a_second_session_registering_a_rank_aborts():
 )
 def test_serve_raises_errors_other_than_authentication_failures(tmp_path, monkeypatch, error):
     endpoint = f"ipc://{tmp_path}/authority"
-    router = authority_module.router_queue(endpoint, KEY)
+    router = authority_server.router_queue(endpoint, KEY)
     dealer = _dealer(endpoint)
     try:
         dealer.put(StatusQuery())
@@ -986,7 +986,7 @@ def test_serve_raises_errors_other_than_authentication_failures(tmp_path, monkey
 
         def run():
             try:
-                authority_module.serve(RecoveryAuthority(WORLD), router, KEY, stop, 0.01)
+                authority_server.serve(RecoveryAuthority(WORLD), router, KEY, stop, 0.01)
             except (RuntimeError, ValueError) as caught:
                 raised.append(caught)
 
