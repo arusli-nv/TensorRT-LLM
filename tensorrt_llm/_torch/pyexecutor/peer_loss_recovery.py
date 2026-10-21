@@ -1294,10 +1294,12 @@ class PeerLossRecovery(RecoveryHook):
                 )
             self._kv_lent += short
             logger.warning(f"Gave {short} bytes of the KV cache to the restored expert slots")
+        mapping = time.monotonic()
         load_balancer.back_restored_slots(placements)
+        end = time.monotonic()
         logger.info(
-            f"Mapped {need} bytes behind ghost expert slots in "
-            f"{(time.monotonic() - start) * 1e3:.1f} ms"
+            f"Mapped {need} bytes behind ghost expert slots in {(end - start) * 1e3:.1f} ms "
+            f"({(mapping - start) * 1e3:.1f} ms making room, {(end - mapping) * 1e3:.1f} ms mapping)"
         )
 
     def _stage_ring_restore(
