@@ -1113,7 +1113,7 @@ public:
             unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream, /*input_source_slots=*/{});
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,

@@ -1001,8 +1001,7 @@ public:
                 mFinalOutput + mFinalOutputSize * (mBufferIndex % mNumInputBuffers),
                 mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
                 /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
-                /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream,
-                /*input_source_slots=*/{});
+                /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
 #else
             mMoERunner.runMoe(mInputTensor + mInputTensorSize * (mBufferIndex % mNumInputBuffers), nullptr, true,
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
