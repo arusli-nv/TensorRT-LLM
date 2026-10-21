@@ -174,8 +174,11 @@ private:
         }
         try
         {
-            // The nanobind function wrapper acquires the GIL for the call.
-            mOnFailure(errorClass);
+            // A copy keeps the callback alive through the call: the callback may drop the watch's last reference,
+            // which destroys mOnFailure. Copying and destroying it touches Python references, hence the GIL.
+            nb::gil_scoped_acquire acquire;
+            Callback const onFailure = mOnFailure;
+            onFailure(errorClass);
         }
         catch (nb::python_error& error)
         {
