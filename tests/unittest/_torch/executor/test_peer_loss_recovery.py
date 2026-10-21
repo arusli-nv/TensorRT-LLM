@@ -106,6 +106,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
     events = []
     dist = Mock(
         rank=rank,
+        tp_rank=rank,
         world_size=world_size,
         live_ranks=tuple(r for r in range(world_size) if r not in failed),
     )
@@ -1616,6 +1617,27 @@ def test_only_the_rank_a_rerun_request_is_routed_to_watches_its_progress():
     recovery.requests_routed({1: [_queued(11)], 2: [_queued(12)]})
 
     assert recovery._unprogressed == {11} and recovery._rerouting == set()
+
+
+def test_each_recovery_takes_the_rerun_requests_rank0_has_not_routed():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery._rerouting = {7}
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: [11, 12] if isinstance(value, list) else value
+    )
+    recovery._recover(_interrupted())
+    assert recovery._rerouting == {11, 12}
+
+    recovery.requests_cancelled({12})
+
+    assert recovery._rerouting == {11}
+
+
+def test_rank0_keeps_an_earlier_unrouted_rerun_request_across_a_recovery():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    recovery._rerouting = {7}
+    recovery._recover(_interrupted())
+    assert recovery._rerouting == {7}
 
 
 def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():

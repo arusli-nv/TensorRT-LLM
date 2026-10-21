@@ -9238,6 +9238,7 @@ class PyExecutor:
 
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
+        self._peer_loss_recovery.requests_cancelled(canceled_req_ids_set)
 
         # Remove canceled requests from the waiting queue
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)

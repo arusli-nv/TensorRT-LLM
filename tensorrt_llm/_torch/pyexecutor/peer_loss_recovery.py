@@ -244,6 +244,9 @@ class RecoveryHook:
     def requests_routed(self, routed: Dict[int, List["RequestQueueItem"]]) -> None:
         pass
 
+    def requests_cancelled(self, request_ids: Set[int]) -> None:
+        pass
+
     def gathering_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         return responses
 
@@ -343,8 +346,8 @@ class PeerLossRecovery(RecoveryHook):
         # the next recovery tells rank 0.
         self._unprogressed: Set[int] = set()
         self._progressed: Set[int] = set()
-        # The interrupted requests rank 0 re-admitted to run again, until routed: the rank they are routed to adds
-        # them to its ``_unprogressed``.
+        # The interrupted requests rank 0 re-admitted to run again, until routed or cancelled: the rank they are
+        # routed to adds them to its ``_unprogressed``.
         self._rerouting: Set[int] = set()
         # On rank 0: the owned requests whose cancellation was broadcast, until their final response.
         self._cancelled: Set[int] = set()
@@ -759,7 +762,7 @@ class PeerLossRecovery(RecoveryHook):
     def requests_routed(self, routed: Dict[int, List["RequestQueueItem"]]) -> None:
         """Watch the re-run requests routed to this rank; on rank 0, record the rank serving each new request."""
         if self._rerouting:
-            own_rank = self._executor.dist.rank
+            own_rank = self._executor.dist.tp_rank
             for rank, items in routed.items():
                 for item in items:
                     if item.id in self._rerouting:
@@ -773,6 +776,10 @@ class PeerLossRecovery(RecoveryHook):
                 self._request_owners[item.id] = (rank, item)
                 for child_id in item.child_req_ids or ():
                     self._parent_ids[child_id] = item.id
+
+    def requests_cancelled(self, request_ids: Set[int]) -> None:
+        """Stop watching for the routing of cancelled re-run requests: a waiting one is never routed."""
+        self._rerouting -= request_ids
 
     def gathering_responses(
         self, responses: Iterable[Tuple[int, LlmResponse]]
@@ -1060,7 +1067,8 @@ class PeerLossRecovery(RecoveryHook):
         rerun, failing = self._deliver_responses(
             failed, buffered, set().union(*(entry[2] for entry in gathered if entry))
         )
-        self._rerouting |= set(dist.broadcast(rerun, root=0))
+        # Rank 0's re-run requests not routed yet, including those an earlier recovery re-admitted.
+        self._rerouting = set(dist.broadcast([*self._rerouting, *rerun], root=0))
         self._unprogressed = (self._unprogressed | interrupted) & executor.served_request_ids()
         self._readmit_undelivered_requests(failed, held)
         self._log_phase("resumed", generation)
