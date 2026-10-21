@@ -15,6 +15,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.recovery import mpi_exit
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
@@ -861,12 +862,14 @@ def _fake_ulfm_mpi(request, monkeypatch: pytest.MonkeyPatch) -> bool:
         raising=False)
     monkeypatch.setattr(mpi_session, "mpi_rank", lambda: 0)
     monkeypatch.setattr(
-        mpi_session, "is_mpi_peer_failure", lambda error: isinstance(
+        mpi_exit, "is_mpi_peer_failure", lambda error: isinstance(
             error, _FakeMPIException) and error.error_class in (75, 76, 77))
     monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled",
                         lambda: request.param)
+    monkeypatch.setattr(mpi_exit, "peer_loss_recovery_enabled",
+                        lambda: request.param)
     # A departed peer has been reported once a peer-failure error surfaced.
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    monkeypatch.setattr(mpi_exit, "num_failed_ranks", lambda: 1)
     return request.param
 
 
@@ -887,8 +890,6 @@ def test_server_async_callback_departed_peer(monkeypatch: pytest.MonkeyPatch,
     broken executor before ULFM reports a failed rank.
     """
     from concurrent.futures import BrokenExecutor
-
-    from tensorrt_llm.llmapi import mpi_session
 
     recovery = _fake_ulfm_mpi
     server = object.__new__(RemoteMpiCommSessionServer)
@@ -912,8 +913,8 @@ def test_server_async_callback_departed_peer(monkeypatch: pytest.MonkeyPatch,
     sent.clear()
     server.mpi_async_error_callback(_async_failure(_FakeMPIException(16)))
     server.mpi_async_error_callback(_async_failure(RuntimeError("segfault")))
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 0)
-    monkeypatch.setattr(mpi_session, "_FAILED_RANK_EVIDENCE_S", 0.0)
+    monkeypatch.setattr(mpi_exit, "num_failed_ranks", lambda: 0)
+    monkeypatch.setattr(mpi_exit, "_FAILED_RANK_EVIDENCE_S", 0.0)
     server.mpi_async_error_callback(_async_failure(BrokenExecutor()))
     assert len(sent) == 3
 
@@ -956,10 +957,10 @@ def test_server_stops_waiting_for_tasks_after_a_rank_departed(
     done.set_result(None)
     never = Future()
     monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 1)
+    monkeypatch.setattr(mpi_exit, "num_failed_ranks", lambda: 1)
     assert RemoteMpiCommSessionServer._live_worker_futures([done, never]) == []
 
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: 0)
+    monkeypatch.setattr(mpi_exit, "num_failed_ranks", lambda: 0)
     assert RemoteMpiCommSessionServer._live_worker_futures([done]) == [done]
 
     monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled",
@@ -984,16 +985,15 @@ class _Queue:
 @pytest.mark.cpu_only
 def test_no_failed_ranks_are_counted_when_mpi_cannot_report_them(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    from tensorrt_llm.llmapi import mpi_session
 
     def no_ulfm(comm):
         raise NotImplementedError("no ULFM")
 
-    monkeypatch.setattr(mpi_session, "ENABLE_MULTI_DEVICE", True)
-    monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(mpi_session, "mpi4py", Mock(), raising=False)
-    monkeypatch.setattr(mpi_session, "mpi_failed_ranks", no_ulfm)
-    assert mpi_session._num_failed_ranks() == 0
+    monkeypatch.setattr(mpi_exit, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(mpi_exit, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(mpi_exit, "mpi4py", Mock(), raising=False)
+    monkeypatch.setattr(mpi_exit, "mpi_failed_ranks", no_ulfm)
+    assert mpi_exit.num_failed_ranks() == 0
 
 
 def _degraded_server(monkeypatch: pytest.MonkeyPatch, messages,
@@ -1003,9 +1003,8 @@ def _degraded_server(monkeypatch: pytest.MonkeyPatch, messages,
 
     left = []
     monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks",
-                        lambda: failed_ranks[0])
-    monkeypatch.setattr(mpi_session, "_leave_degraded_world", left.append)
+    monkeypatch.setattr(mpi_exit, "num_failed_ranks", lambda: failed_ranks[0])
+    monkeypatch.setattr(mpi_exit, "leave_degraded_world", left.append)
     monkeypatch.setattr(RemoteMpiCommSessionServer,
                         "_close_global_comm_executor",
                         staticmethod(lambda: None))
@@ -1079,8 +1078,6 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
     """Fake MPI for leaving the world; records Abort, Finalize and the exit status."""
     from types import SimpleNamespace
 
-    from tensorrt_llm.llmapi import mpi_session
-
     calls = SimpleNamespace(aborted=[], finalized=0, finalize=lambda: None)
 
     def finalize():
@@ -1094,26 +1091,24 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
     mpi = SimpleNamespace(COMM_WORLD=world,
                           Finalize=finalize,
                           Exception=_FakeMPIException)
-    monkeypatch.setattr(mpi_session,
+    monkeypatch.setattr(mpi_exit,
                         "mpi4py",
                         SimpleNamespace(MPI=mpi),
                         raising=False)
-    monkeypatch.setattr(mpi_session, "logging",
+    monkeypatch.setattr(mpi_exit, "logging",
                         SimpleNamespace(shutdown=lambda: None))
-    monkeypatch.setattr(mpi_session, "global_mpi_rank", lambda: 5)
-    monkeypatch.setattr(mpi_session, "_mpi_finalize", lambda: finalize() or 0)
-    monkeypatch.setattr(mpi_session.os, "_exit", exit_)
+    monkeypatch.setattr(mpi_exit, "global_mpi_rank", lambda: 5)
+    monkeypatch.setattr(mpi_exit, "_mpi_finalize", lambda: finalize() or 0)
+    monkeypatch.setattr(mpi_exit.os, "_exit", exit_)
     calls.faulthandler = Mock()
-    monkeypatch.setattr(mpi_session, "faulthandler", calls.faulthandler)
+    monkeypatch.setattr(mpi_exit, "faulthandler", calls.faulthandler)
     return calls
 
 
 @pytest.mark.cpu_only
 def test_leave_degraded_world_finalizes_after_a_clean_task(_fake_world):
-    from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
-
     with pytest.raises(_Exit) as exited:
-        _leave_degraded_world(True)
+        mpi_exit.leave_degraded_world(True)
     assert exited.value.args == (0, )
     assert _fake_world.finalized == 1 and _fake_world.aborted == []
     # A native timer bounds a Finalize that holds the GIL, and is cancelled after it.
@@ -1125,30 +1120,24 @@ def test_leave_degraded_world_finalizes_after_a_clean_task(_fake_world):
 
 @pytest.mark.cpu_only
 def test_leave_degraded_world_aborts_after_a_failed_task(_fake_world):
-    from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
-
-    _leave_degraded_world(False)
+    mpi_exit.leave_degraded_world(False)
     assert _fake_world.finalized == 0 and _fake_world.aborted == [1]
 
 
 @pytest.mark.cpu_only
 def test_leave_degraded_world_exits_non_zero_when_finalize_fails(_fake_world):
-    from tensorrt_llm.llmapi.mpi_session import _leave_degraded_world
-
     _fake_world.finalize = lambda: 75  # an MPI error code
     with pytest.raises(_Exit) as exited:
-        _leave_degraded_world(True)
+        mpi_exit.leave_degraded_world(True)
     assert exited.value.args == (1, )
 
 
 @pytest.mark.cpu_only
 def test_leave_degraded_world_exits_cleanly_from_a_finalize_that_does_not_end(
         monkeypatch: pytest.MonkeyPatch, _fake_world):
-    from tensorrt_llm.llmapi import mpi_session
-
     exited = threading.Event()
     statuses = []
-    monkeypatch.setattr(mpi_session, "_FINALIZE_GRACE_S", 0.05)
+    monkeypatch.setattr(mpi_exit, "_FINALIZE_GRACE_S", 0.05)
 
     def exit_(status):
         statuses.append(status)
@@ -1156,7 +1145,7 @@ def test_leave_degraded_world_exits_cleanly_from_a_finalize_that_does_not_end(
         if threading.current_thread() is threading.main_thread():
             raise _Exit(status)
 
-    monkeypatch.setattr(mpi_session.os, "_exit", exit_)
+    monkeypatch.setattr(mpi_exit.os, "_exit", exit_)
     finalizing = threading.Event()
 
     def rank():
@@ -1164,7 +1153,7 @@ def test_leave_degraded_world_exits_cleanly_from_a_finalize_that_does_not_end(
         assert not finalizing.is_set()
         return 5
 
-    monkeypatch.setattr(mpi_session, "global_mpi_rank", rank)
+    monkeypatch.setattr(mpi_exit, "global_mpi_rank", rank)
 
     def finalize():
         finalizing.set()
@@ -1173,7 +1162,7 @@ def test_leave_degraded_world_exits_cleanly_from_a_finalize_that_does_not_end(
 
     _fake_world.finalize = finalize
     with pytest.raises(_Exit):
-        mpi_session._leave_degraded_world(True)
+        mpi_exit.leave_degraded_world(True)
     # The watchdog exited with the clean status, without aborting the world or calling MPI.
     assert statuses == [0, 0] and _fake_world.aborted == []
 
@@ -1183,8 +1172,6 @@ def test_finalize_and_exit_stops_the_startup_watch_first(
         monkeypatch: pytest.MonkeyPatch, _fake_world):
     from types import SimpleNamespace
 
-    from tensorrt_llm.llmapi import mpi_session
-
     order = []
     _fake_world.finalize = lambda: order.append("finalize")
     recovery = SimpleNamespace(
@@ -1193,7 +1180,7 @@ def test_finalize_and_exit_stops_the_startup_watch_first(
                         "tensorrt_llm._torch.pyexecutor.peer_loss_recovery",
                         recovery)
     with pytest.raises(_Exit) as exited:
-        mpi_session._finalize_and_exit(0, "process end")
+        mpi_exit._finalize_and_exit(0, "process end")
     assert exited.value.args == (0, )
     assert order == ["stop_startup_watch", "finalize"]
 
@@ -1202,18 +1189,16 @@ def test_finalize_and_exit_stops_the_startup_watch_first(
 @pytest.mark.parametrize("recovery", [False, True])
 def test_exit_fault_tolerant_process_finalizes_only_with_recovery(
         monkeypatch: pytest.MonkeyPatch, _fake_world, recovery):
-    from tensorrt_llm.llmapi import mpi_session
-
-    monkeypatch.setattr(mpi_session, "ENABLE_MULTI_DEVICE", True)
-    monkeypatch.setattr(mpi_session, "peer_loss_recovery_enabled",
+    monkeypatch.setattr(mpi_exit, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(mpi_exit, "peer_loss_recovery_enabled",
                         lambda: recovery)
     if recovery:
         with pytest.raises(_Exit) as exited:
-            mpi_session.exit_fault_tolerant_process()
+            mpi_exit.exit_fault_tolerant_process()
         assert exited.value.args == (0, )
         assert _fake_world.finalized == 1
     else:
-        mpi_session.exit_fault_tolerant_process()
+        mpi_exit.exit_fault_tolerant_process()
         assert _fake_world.finalized == 0
     assert _fake_world.aborted == []
 
@@ -1236,8 +1221,8 @@ def test_task_end_leaves_a_degraded_world_on_survivors(
     monkeypatch.setattr(mpi_session, "mpi_rank", lambda: rank)
     monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 8, raising=False)
     monkeypatch.setattr(mpi_session, "mpi_barrier", lambda: None)
-    monkeypatch.setattr(mpi_session, "_num_failed_ranks", lambda: failed_ranks)
-    monkeypatch.setattr(mpi_session, "_leave_degraded_world", left.append)
+    monkeypatch.setattr(mpi_exit, "num_failed_ranks", lambda: failed_ranks)
+    monkeypatch.setattr(mpi_exit, "leave_degraded_world", left.append)
 
     def task():
         if fails:
