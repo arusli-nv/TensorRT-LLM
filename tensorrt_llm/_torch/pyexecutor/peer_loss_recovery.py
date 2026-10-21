@@ -1086,14 +1086,10 @@ class PeerLossRecovery(RecoveryHook):
             message = self._client.wait((Propose, Fence), deadline, interrupt=interrupt, skip=skip)
             if isinstance(message, Propose):
                 return message
-            error = self._end_departed_rank(message.rank)
+            error = self._end_ranks([message.rank])[message.rank]
             self._client.send(
                 Fenced(rank=self._executor.dist.rank, target=message.rank, error=error)
             )
-
-    def _end_departed_rank(self, rank: int) -> str:
-        """Have the MPI runtime kill ``rank``'s process (a no-op if it ended); return why it could not, or ''."""
-        return self._end_ranks([rank])[rank]
 
     def _end_ranks(self, ranks: Iterable[int]) -> Dict[int, str]:
         """Have the MPI runtime kill each of ``ranks`` at once, together bounded by ``RUNTIME_FENCE_CALL_S``.

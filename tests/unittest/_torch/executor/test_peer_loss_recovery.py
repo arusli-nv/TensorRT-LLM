@@ -454,9 +454,9 @@ def test_a_shrink_beyond_its_timeout_fails_closed():
 def test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan():
     client = _FakeClient([Fence(FAILED_RANK, 0), *_happy_replies()])
     recovery = _recovery(client, rank=0)
-    recovery._end_departed_rank = Mock(return_value="")
+    recovery._end_ranks = Mock(return_value={FAILED_RANK: ""})
     recovery._recover(_interrupted())
-    recovery._end_departed_rank.assert_called_once_with(FAILED_RANK)
+    recovery._end_ranks.assert_called_once_with([FAILED_RANK])
     assert client.sent[:3] == [
         Stopped(rank=0, failed_ranks=(FAILED_RANK,)),
         Fenced(rank=0, target=FAILED_RANK, error=""),
@@ -467,7 +467,7 @@ def test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan():
 def test_a_departed_rank_the_runtime_cannot_end_is_reported_and_the_recovery_ends():
     client = _FakeClient([Fence(FAILED_RANK, 0), Abort("departed rank 2 could not be fenced")])
     recovery = _recovery(client, rank=0)
-    recovery._end_departed_rank = Mock(return_value="PMIx refused to kill rank 2")
+    recovery._end_ranks = Mock(return_value={FAILED_RANK: "PMIx refused to kill rank 2"})
     with pytest.raises(RecoveryAborted, match="could not be fenced"):
         recovery._recover(_interrupted())
     assert client.sent[-1] == Fenced(
@@ -498,7 +498,7 @@ def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch,
     monkeypatch.setattr(config, "RUNTIME_FENCE_CALL_S", 0.1)
     recovery = _recovery(_FakeClient([]), rank=0)
     try:
-        error = recovery._end_departed_rank(FAILED_RANK)
+        (error,) = recovery._end_ranks([FAILED_RANK]).values()
     finally:
         release.set()
         for thread in threading.enumerate():
