@@ -1062,7 +1062,13 @@ class MPIDist(Distributed):
         example while it waits on the GPU. Collective over the current
         (survivor) world: posts a receive that no peer matches on a private
         duplicate, which ULFM completes with a process-failure error.
+
+        Raises:
+            RuntimeError: Recovery is not enabled.
         """
+        if self._host_world is None:
+            raise RuntimeError(
+                "watch_peer_failures() requires enable_peer_loss_recovery()")
         return PeerFailureWatch(_errors_return(self._world_comm().Dup()),
                                 on_failure, abort_word)
 
@@ -1100,7 +1106,14 @@ class MPIDist(Distributed):
 
     def barrier_among_survivors(self) -> None:
         """Barrier over the survivor communicator that :meth:`shrink` built
-        (``MPI.Exception`` if a survivor failed, see ``is_mpi_peer_failure``)."""
+        (``MPI.Exception`` if a survivor failed, see ``is_mpi_peer_failure``).
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "barrier_among_survivors requires a prior shrink()")
         self._shrunk[0].Barrier()
 
     def _world_comm(self) -> MPI.Comm:

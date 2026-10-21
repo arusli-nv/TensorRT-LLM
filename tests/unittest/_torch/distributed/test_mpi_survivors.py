@@ -535,6 +535,13 @@ def test_a_watch_stopped_from_its_own_callback_is_released_by_the_next_stop(
     assert native_watch[0].stops == 1 and world.free_count == 1
 
 
+def test_survivor_calls_refuse_to_run_before_their_setup(world, dist):
+    with pytest.raises(RuntimeError, match="enable_peer_loss_recovery"):
+        MPIDist(_mapping()).watch_peer_failures(lambda: None)
+    with pytest.raises(RuntimeError, match="prior shrink"):
+        dist.barrier_among_survivors()
+
+
 def test_peer_failures_stay_mpi_errors_without_recovery(world):
     dist = MPIDist(_mapping())
     dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
