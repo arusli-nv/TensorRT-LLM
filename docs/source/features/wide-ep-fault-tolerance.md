@@ -61,7 +61,9 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
    on Open MPI's in-band failure detector on its own thread. It notices a dead or frozen process whose
    connections stay open (a stopped process, a frozen host) within about the timeout: a process silent at the
    OS level for more than 5 s is treated as failed. Without it, only closed connections and hang detection
-   reveal one. Its healthy-path cost is being measured. Open MPI marks it experimental. Its unthreaded form can declare a slow-starting rank dead.
+   reveal one. This includes startup: pinning a KV cache host tier sized automatically (about 70 GiB per rank
+   on GB200) stalled a rank for longer than 5 s and ended the job. Set `kv_cache_config.host_cache_size`
+   (16 GiB per rank in our runs), or raise the timeout. Its healthy-path cost is being measured. Open MPI marks it experimental. Its unthreaded form can declare a slow-starting rank dead.
 
 | Variable | Meaning |
 |---|---|
