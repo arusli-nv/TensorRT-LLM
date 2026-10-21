@@ -645,7 +645,13 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
 
 void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal)
 {
-    moeWaitSignalForCpuStageHost(signal, [] { return false; });
+    bool ready = false;
+    do
+    {
+        auto loaded = __atomic_load_n(&signal->stepAndOwner, __ATOMIC_ACQUIRE);
+        ready = getOwnerDevice(loaded) == MoeLoadBalanceSingleLayerSignal::kCPU;
+    } while (!ready);
+    std::atomic_thread_fence(std::memory_order_acquire);
 }
 
 void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, std::function<bool()> const& abandoned)

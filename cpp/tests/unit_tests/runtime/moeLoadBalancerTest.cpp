@@ -1938,6 +1938,8 @@ TEST_P(MoeLoadBalancerTest, QuiesceWaitsForTheWorkerAndTheGpuStage)
     {
         GTEST_SKIP() << "needs two iterations";
     }
+    // quiesce needs the worker of WideEP fault tolerance, fixed at finalizeModel.
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/true);
     mLoadBalancer->finalizeModel();
     if (param.warmUpIters > 0)
     {
@@ -1979,6 +1981,8 @@ TEST_P(MoeLoadBalancerTest, QuiesceReleasesTheLayersAnInterruptedForwardDidNotRe
     {
         GTEST_SKIP() << "needs two layers and two iterations";
     }
+    // quiesce needs the worker of WideEP fault tolerance, fixed at finalizeModel.
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/true);
     mLoadBalancer->finalizeModel();
     if (param.warmUpIters > 0)
     {

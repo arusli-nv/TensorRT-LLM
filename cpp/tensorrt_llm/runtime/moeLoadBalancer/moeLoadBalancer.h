@@ -345,6 +345,7 @@ public:
     // placement no longer changes. Returns false if that takes longer than timeoutMs (a forward that never reached
     // the GPU stage). Only while no iteration runs. After an interrupted iteration, only once the device work of
     // that iteration is done: the worker then sets the CPU stage of the layers the forward did not reach itself.
+    // Needs WideEP fault tolerance at finalizeModel.
     bool quiesce(int64_t timeoutMs);
 
     // should bind to python
@@ -395,6 +396,9 @@ private:
     int64_t mInterruptedIterId = -1;
     // The iteration whose pending CPU stages the worker sets itself, -1 if none (see quiesce).
     std::atomic<int64_t> mAbandonedIterId{-1};
+    // WideEP fault tolerance (TLLM_FAULT_TOLERANCE_MODE=1) at finalizeModel: only then does the worker publish
+    // mWorkerDoneIterId and release abandoned CPU stages, so quiesce needs it.
+    bool mFaultToleranceMode = false;
     bool mWorkerThreadStopped = true;
     int64_t mWarmUpUntilIter = -1;
 

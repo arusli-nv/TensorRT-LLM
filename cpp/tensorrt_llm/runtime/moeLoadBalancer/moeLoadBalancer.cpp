@@ -584,6 +584,11 @@ void SingleLayerMoeLoadBalancer::setGpuStage()
 
 void SingleLayerMoeLoadBalancer::waitCpuStage()
 {
+    if (!mMoeLoadBalancer->mFaultToleranceMode)
+    {
+        tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal);
+        return;
+    }
     tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal,
         [this] { return mMoeLoadBalancer->mAbandonedIterId.load(std::memory_order_acquire) == mIterId; });
 }
@@ -1186,6 +1191,7 @@ void MoeLoadBalancer::finalizeModel()
     {
         layer->finalizeModel();
     }
+    mFaultToleranceMode = tensorrt_llm::mpi::isFaultToleranceModeEnabled();
     if (mLayerUpdatesPerIter > 0)
     {
         mWorkerThreadStopped = false;
@@ -1365,6 +1371,7 @@ bool MoeLoadBalancer::quiesce(int64_t timeoutMs)
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot quiesce.");
+    TLLM_CHECK_WITH_INFO(mFaultToleranceMode, "quiesce needs WideEP fault tolerance (TLLM_FAULT_TOLERANCE_MODE=1)");
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot quiesce while an iteration is active.");
     // The device will never set the CPU stage of the layers an interrupted forward did not reach. Without
     // releasing them, the worker would wait for them forever, and with it every later iteration.
@@ -1437,15 +1444,23 @@ void MoeLoadBalancer::workerThread()
             layer->waitCpuStage();
             layer->maybeStartUpdateWeights();
         }
-        std::unique_lock<std::mutex> lock(mWorkerThreadMutex);
+        // Under fault tolerance, quiesce and resetUpdateSchedule read the schedule and the finished iteration.
+        std::unique_lock<std::mutex> lock(mWorkerThreadMutex, std::defer_lock);
+        if (mFaultToleranceMode)
+        {
+            lock.lock();
+        }
         if (iterUpdateWeightsEnabled)
         {
             auto currentUpdatedLayers = mUpdateLayerQueue.front();
             mUpdateLayerQueue.pop_front();
             mUpdateLayerQueue.push_back(currentUpdatedLayers);
         }
-        mWorkerDoneIterId = iterId;
-        mWorkerDoneCondition.notify_all();
+        if (mFaultToleranceMode)
+        {
+            mWorkerDoneIterId = iterId;
+            mWorkerDoneCondition.notify_all();
+        }
     }
     for (auto& layer : mLayers)
     {
