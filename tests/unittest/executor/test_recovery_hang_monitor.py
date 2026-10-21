@@ -274,6 +274,21 @@ def test_cleared_device_waits_drop_the_evidence():
         assert monitor.check(float(now)) is None
 
 
+def test_a_rank_that_stops_before_its_first_heartbeat_after_a_reset_is_fenced():
+    """A recovery resets the evidence; a rank that stops right after it is still watched, with its process."""
+    monitor = _monitor()
+    for rank in RANKS:
+        monitor.heartbeat(rank, 0, False, -10.0, "node", 100 + rank)
+    monitor.reset(0.0)
+    # Rank 2 sends nothing more; its peers wait for it in a collective.
+    now, hung = _first_confirmation(
+        monitor,
+        lambda m, t: _beat(m, t, iterations={r: 5 for r in RANKS}, waiting=PEERS, ranks=PEERS),
+    )
+    assert hung == HungRank(2, hung.reason, "node", 102)
+    assert now == CONFIRM + 1
+
+
 def _serving_authority(fenced):
     authority = RecoveryAuthority(
         len(RANKS),

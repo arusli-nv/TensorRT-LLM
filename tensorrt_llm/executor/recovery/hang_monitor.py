@@ -130,9 +130,16 @@ class HangMonitor:
         for evidence in self._evidence.values():
             evidence.device_waits.pop(rank, None)
 
-    def reset(self) -> None:
-        """Forget all evidence, for example after a recovery changed what every rank waits on."""
-        self._evidence.clear()
+    def reset(self, now: float) -> None:
+        """Forget all evidence at time ``now``, for example after a recovery changed what every rank waits on.
+
+        Every watched rank stays watched, as if it had sent a heartbeat and progressed at ``now``, so a rank
+        that stops before its next heartbeat can still be confirmed hung.
+        """
+        self._evidence = {
+            rank: _RankEvidence(heartbeat=now, progressed=now, host=evidence.host, pid=evidence.pid)
+            for rank, evidence in self._evidence.items()
+        }
         self._suspected_since.clear()
 
     def check(self, now: float) -> HungRank | None:

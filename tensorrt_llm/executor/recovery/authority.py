@@ -606,7 +606,7 @@ class RecoveryAuthority:
         self._enter(Phase.RECOVERED)
         if self.hang_monitor is not None:
             # Evidence from before the recovery describes waits that no longer exist.
-            self.hang_monitor.reset()
+            self.hang_monitor.reset(now)
         logger.info(
             f"Recovery authority: committed generation {self.generation} "
             f"without ranks {sorted(self.failed_ranks)}; stage ms "
