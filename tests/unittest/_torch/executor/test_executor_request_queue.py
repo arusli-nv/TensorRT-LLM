@@ -297,8 +297,9 @@ def test_wake_releases_a_blocked_get_without_a_request(executor_queue):
     assert time.time() - start_time < 0.15
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     executor_queue.wake()
+    executor_queue.request_queue.put(RequestQueueItem(2, Mock()))
     assert [item.id
-            for item in executor_queue.get_from_request_queue(None)] == [1]
+            for item in executor_queue.get_from_request_queue(None)] == [1, 2]
     assert executor_queue.request_queue.empty()
 
 

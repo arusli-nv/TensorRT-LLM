@@ -345,9 +345,9 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
-        woken = any(item.is_wake_request for item in items)
-        items = [item for item in items if not item.is_wake_request]
-        if woken or self.batch_wait_timeout_ms == 0:
+        if any(item.is_wake_request for item in items):
+            return [item for item in items if not item.is_wake_request]
+        if self.batch_wait_timeout_ms == 0:
             return items
 
         if len(items) >= self.max_batch_size:
