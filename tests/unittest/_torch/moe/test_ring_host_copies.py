@@ -13,8 +13,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.eplb_recovery import ring_copy_nodes
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    HostMoeTensorSharer,
+    MoeLoadBalancer,
+    ring_copy_nodes,
+)
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 

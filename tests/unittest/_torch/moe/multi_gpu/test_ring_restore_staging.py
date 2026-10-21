@@ -29,10 +29,11 @@ from torch.distributed import TCPStore
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.eplb_recovery import restore_lost_experts, ring_copy_nodes
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     SingleLayerMoeLoadBalancer,
+    restore_lost_experts,
+    ring_copy_nodes,
 )
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
