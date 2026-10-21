@@ -293,7 +293,7 @@ What an orchestrator should do with these signals:
 Health probes: a recovery returns 503 (`recovering`) for about a second, at most `authority_timeout_s`. Let a
 readiness probe take the replica out of rotation after two failures 5 s apart, and give a liveness probe a
 tolerance above `recovery_timeout_s` (for example 6 failures 10 s apart), so that a recovery never restarts the
-deployment while `terminal` still does. Cover model loading (`starting`) with a startup probe.
+deployment while `terminal` still does. Cover model loading with a startup probe.
 
 Exit status of `mpirun` (and of the workers):
 
