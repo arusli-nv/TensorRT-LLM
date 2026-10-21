@@ -1480,7 +1480,7 @@ class PyExecutor:
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-                self._run_event_loop()
+                self._peer_loss_recovery.run(self.event_loop)
         except Exception as e:
             # A raise AFTER the loop reached its own normal-exit `break` (from
             # the profiler's or hang detector's __exit__, or from the enclosing
@@ -1565,15 +1565,6 @@ class PyExecutor:
                         self.dist.world_size,
                         deadline=deadline,
                         error_delivered=self._event_loop_error_delivered)
-
-    def _run_event_loop(self) -> None:
-        """Run the event loop, resuming it after each recovered peer loss.
-
-        Recovery runs between loop entries under the hang detector. A failed
-        recovery raises out of here into the terminal path of
-        ``_event_loop_wrapper``.
-        """
-        self._peer_loss_recovery.run(self.event_loop)
 
     @property
     def is_warmup(self) -> bool:

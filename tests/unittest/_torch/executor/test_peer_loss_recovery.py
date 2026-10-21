@@ -1028,7 +1028,7 @@ def test_crashed_loop_exits_only_this_rank_when_peers_can_recover(monkeypatch, m
     recovery.survives_own_loss = True
     executor = _executor()
     executor._peer_loss_recovery = recovery
-    executor._run_event_loop = Mock(side_effect=RuntimeError(message))
+    recovery.run = Mock(side_effect=RuntimeError(message))
     executor._is_warmup = True
     executor._event_loop_error_delivered = Mock()
     executor.garbage_collection_gen0_threshold = None
