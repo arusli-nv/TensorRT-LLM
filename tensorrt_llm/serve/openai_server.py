@@ -38,8 +38,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._utils import (EnergyMonitor, fault_tolerance_mode,
-                                 peer_loss_recovery_enabled)
+from tensorrt_llm._utils import EnergyMonitor, fault_tolerance_mode
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -270,7 +269,7 @@ def _stream_error_events(error: Exception) -> List[str]:
     """
     message = str(error)
     code = PEER_LOSS_RETRYABLE_CODE if (
-        peer_loss_recovery_enabled()
+        fault_tolerance_mode()
         and is_peer_loss_retryable_message(message)) else None
     error_data = json.dumps({
         "error": {
@@ -1203,8 +1202,7 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
-        elif peer_loss_recovery_enabled() and is_peer_loss_retryable_message(
-                message):
+        elif fault_tolerance_mode() and is_peer_loss_retryable_message(message):
             # Recovery from a peer loss takes about a second.
             err_type = "ServiceUnavailableError"
             status_code = HTTPStatus.SERVICE_UNAVAILABLE

@@ -8,7 +8,6 @@ from http import HTTPStatus
 
 import pytest
 
-from tensorrt_llm._utils import peer_loss_recovery_enabled
 from tensorrt_llm.executor.utils import (
     PEER_LOSS_RETRYABLE_CODE,
     RequestError,
@@ -25,12 +24,9 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture
 def recovery(monkeypatch):
-    """Peer-loss recovery on: fault-tolerance mode plus an authority address."""
+    """Fault-tolerance mode on; the server needs no authority address to answer a peer-loss failure."""
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
-    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", "tcp://127.0.0.1:5555")
-    peer_loss_recovery_enabled.cache_clear()
-    yield
-    peer_loss_recovery_enabled.cache_clear()
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
 
 
 def test_failed_stream_ends_with_an_error_event_then_done():
@@ -97,15 +93,17 @@ def test_a_peer_loss_failure_is_a_503_with_retry_after():
     assert body["type"] == "ServiceUnavailableError"
 
 
-@pytest.mark.parametrize("mode", [None, "1"])
-def test_without_recovery_a_tagged_message_is_an_ordinary_error(monkeypatch, mode):
-    """Only recovery emits the tag; without it (detection only too), a message carrying one is answered as on main."""
-    if mode is None:
-        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+@pytest.mark.parametrize("authority", [None, "tcp://127.0.0.1:5555"])
+def test_without_fault_tolerance_a_tagged_message_is_an_ordinary_error(monkeypatch, authority):
+    """Only recovery emits the tag; without fault-tolerance mode, a message carrying one is answered as on main.
+
+    An authority address without the mode is a worker misconfiguration that the error handler must not raise on.
+    """
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    if authority is None:
+        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
     else:
-        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", mode)
-    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
-    peer_loss_recovery_enabled.cache_clear()
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", authority)
     message = peer_loss_retryable_message("user text")
 
     response = OpenAIServer.create_error_response(message)
