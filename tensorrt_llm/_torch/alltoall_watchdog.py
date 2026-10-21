@@ -53,6 +53,10 @@ _WORKSPACE_WATCHDOG_STATE_KEY = "alltoall_watchdog_shared_state"
 _WORKSPACE_WATCHDOG_STATE_INIT_LOCK = threading.Lock()
 
 
+def _capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 def _normalize_completion_flag(value: int) -> int:
     return int(value) & _COMPLETION_FLAG_MASK
 
@@ -461,15 +465,15 @@ class AlltoAllWatchdogCoordinator:
         phase: str,
         active_rank_mask: torch.Tensor | None,
     ) -> None:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            # A captured collective runs no kernel, so no completion flag advances for it.
-            return
+        # A captured collective runs no kernel, so no completion flag advances for it.
         if watchdog is None:
             state = self._find_shared_state()
             if state is not None:
                 with state.lock:
-                    if state.watchdog is not None:
+                    if state.watchdog is not None and not _capturing():
                         state.generation = (state.generation + 1) & _COMPLETION_FLAG_MASK
+            return
+        if _capturing():
             return
         active_mask = self.active_mask_int(active_rank_mask)
         state = self._get_shared_state()

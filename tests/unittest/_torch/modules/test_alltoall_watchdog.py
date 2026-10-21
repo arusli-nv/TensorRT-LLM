@@ -676,6 +676,31 @@ def test_coordinator_watches_no_collective_under_cuda_graph_capture(
         coordinators[0].release_watchdog(watchdog)
 
 
+def test_coordinator_without_a_watchdog_makes_no_cuda_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without fault tolerance no watchdog is registered: a collective costs no CUDA query."""
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state={},
+        workspace=torch.zeros((1, 32), dtype=torch.uint8),
+        metainfo=torch.tensor([0, 4, 8], dtype=torch.int64),
+        metainfo_index={
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+        },
+        ep_rank=0,
+    )
+
+    def no_query() -> bool:
+        raise AssertionError("queried CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", no_query)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", no_query)
+    coordinator.watch_collective(None, "dispatch", None)
+    coordinator.watch_collective(None, "combine", None)
+
+
 def test_unmonitored_coordinator_advances_shared_generation() -> None:
     workspace_state: dict[str, object] = {}
     workspace = torch.zeros((2, 32), dtype=torch.uint8)
