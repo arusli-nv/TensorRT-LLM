@@ -26,7 +26,7 @@ git apply <<EOF
 diff --git a/src/mpi4py/futures/_core.py b/src/mpi4py/futures/_core.py
 --- a/src/mpi4py/futures/_core.py
 +++ b/src/mpi4py/futures/_core.py
-@@ -534,5 +534,42 @@ def _comm_executor_helper(executor, comm, root):
+@@ -538,5 +538,42 @@ def _comm_executor_helper(executor, comm, root):
              set_comm_server(MPI.COMM_SELF)
              _manager_thread(pool, options)
              return

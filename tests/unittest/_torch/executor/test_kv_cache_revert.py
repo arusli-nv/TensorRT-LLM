@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Rolling back a discarded step on real KV cache managers (WideEP peer-loss recovery)."""
+"""Rolling back a discarded step on real KV cache managers."""
 
 import pytest
 import torch
