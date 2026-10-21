@@ -28,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
     RecoveryHook,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, adp_router
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
 from tensorrt_llm.bindings import executor as trtllm
@@ -1435,6 +1435,7 @@ def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor(monkeypatc
     states = [RankState(rank=rank) for rank in SURVIVORS]
     routable, unservable = DefaultADPRouter.split_unservable_requests([lost, new], states)
     assert routable == [lost] and unservable == [new]
+    monkeypatch.setattr(adp_router, "peer_loss_recovery_enabled", lambda: True)
     router = DefaultADPRouter(dist=Mock(tp_rank=0, tp_size=WORLD_SIZE, has_cp_helix=False))
     routed, _ = router.route_requests(states, routable, 8)
     assert set(routed) == set(SURVIVORS)
