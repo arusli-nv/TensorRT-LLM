@@ -147,8 +147,9 @@ Not covered (these fail closed: the job ends as without fault tolerance):
   re-plans the recovery, see above), and a further loss the remaining slots cannot cover;
 - a rank that hangs without dying, unless hang detection is on and the hang is in the MoE all-to-alls, and a
   stall that every rank shares (a deadlock or desync with no single culprit: with hang detection on it is
-  reported, see below). These end the job only through the executor's hang detection (`hang_detection_timeout`,
-  300 s by default) or the MoE communication timeout;
+  reported, see below). These end the job only through the executor's hang detector (a fixed 300 s without a
+  step; startup refuses fault-tolerance timeouts it would cut short: the agreement's wait plus twice
+  `recovery_timeout_s` must stay below it) or the MoE communication timeout;
 - other errors in the serving loop.
 
 The authority is not a single point of failure for serving: if it stops, the deployment keeps serving but
