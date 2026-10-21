@@ -679,8 +679,11 @@ class PeerLossRecovery(RecoveryHook):
 
         Survivors may decide differently on the same step: one that finished it
         before the loss was reported commits it, another discards it. Both are
-        correct because a step that finished without an abort received every
-        active peer's completion flag, so its data came from every peer.
+        correct because the step is committed only if this rank's abort record
+        is clear: every collective of the step then read every active source's
+        complete data, and a peer whose dispatch was released publishes no
+        further round flag, so none of its outputs reached this rank (see
+        ``MoeA2AAbortState``).
 
         Raises:
             HostCollectiveInterrupted: The step's MoE collectives may have been
@@ -694,7 +697,7 @@ class PeerLossRecovery(RecoveryHook):
             sample_state.sampler_event.synchronize()
         else:
             torch.cuda.current_stream().synchronize()
-        if self.peer_failed:
+        if self.peer_failed or self._executor.model_engine.moe_execution_state.aborted():
             raise HostCollectiveInterrupted("MoE all-to-all", frozenset())
         self._uncommitted_steps.popleft()
         if self._unprogressed:

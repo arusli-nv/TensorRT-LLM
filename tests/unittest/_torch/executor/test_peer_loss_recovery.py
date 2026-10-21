@@ -129,6 +129,7 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
         lambda failed, placements: events.append(("placement", frozenset(failed)))
     )
     engine.moe_execution_state.health = EPGroupHealth(world_size)
+    engine.moe_execution_state.aborted.return_value = False
     executor.dist = dist
     executor.model_engine = engine
     executor.executor_request_queue = Mock()
@@ -1067,6 +1068,22 @@ def test_commit_step_discards_a_step_whose_peer_failed_while_it_ran():
     sample_state.sampler_event.synchronize.side_effect = recovery._peer_failed.set
     with pytest.raises(HostCollectiveInterrupted):
         recovery.commit_step(batch, sample_state)
+
+
+def test_commit_step_discards_a_step_whose_collective_was_released_before_the_failure_is_seen():
+    """A released collective is recorded on the device, so the step is discarded before the watch fires."""
+    recovery = _recovery(_FakeClient([]))
+    batch = Mock(name="batch", context_requests=[])
+    recovery.step_prepared(batch)
+    state = recovery._executor.model_engine.moe_execution_state
+    sample_state = Mock()
+    sample_state.sampler_event.synchronize.side_effect = lambda: setattr(
+        state.aborted, "return_value", True
+    )
+    with pytest.raises(HostCollectiveInterrupted):
+        recovery.commit_step(batch, sample_state)
+    assert not recovery.peer_failed
+    assert [step.batch for step in recovery._uncommitted_steps] == [batch]
 
 
 def test_recovery_aborts_collectives_and_delivers_only_after_commit():

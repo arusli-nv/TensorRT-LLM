@@ -234,7 +234,8 @@ MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTok
     int64_t const rankCountsBytes = epSize * sizeof(int32_t);
     int64_t const combineSlots = epSize * maxNumTokens;
 
-    reserve(FLAG_VAL_OFFSET_INDEX, sizeof(uint32_t));
+    // The round counter and the released-round marker (see MoeA2AAbortState).
+    reserve(FLAG_VAL_OFFSET_INDEX, 2 * sizeof(uint32_t));
 
     // Dispatch writes these counters and routes; combine reuses the completed routes.
     reserve(LOCAL_TOKEN_COUNTER_OFFSET_INDEX, sizeof(int32_t));

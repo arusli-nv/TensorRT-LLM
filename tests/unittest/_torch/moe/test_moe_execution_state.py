@@ -103,6 +103,14 @@ def _collective_round(
     return valid_counts, output
 
 
+def _workspace_word(
+    workspace: torch.Tensor, meta: torch.Tensor, row: int, region: str, word: int
+) -> int:
+    """The ``word``-th int32 of a workspace region of ``row``."""
+    offset = int(meta[int(getattr(internal.thop, f"MOE_A2A_{region}_OFFSET_INDEX"))]) + 4 * word
+    return int(workspace[row, offset : offset + 4].view(torch.int32).item())
+
+
 def test_records_and_install_mask() -> None:
     health = EPGroupHealth(2)
     state = MoeExecutionState(health, torch.device("cuda"))
@@ -154,9 +162,14 @@ def test_abort_rearm_and_exclusion_resume_after_peer_lost_mid_collective() -> No
         assert time.monotonic() < deadline, "collective kept waiting after the abort request"
         time.sleep(0.01)
     assert state.abort.cpu().tolist() == [1, 1]
+    assert state.aborted()
     # Only the lost peer's rows are dropped; this rank's own rows arrived.
     assert counts.tolist() == [_TOKENS, 0]
     assert torch.count_nonzero(output) == 0
+    # The released dispatch marks the round, so the combine published no readiness: a peer that
+    # did not abort cannot combine outputs computed without the lost peer's rows.
+    assert _workspace_word(workspace, meta, 0, "FLAG_VAL", 1) == 1
+    assert _workspace_word(workspace, meta, 1, "COMBINE_COMPLETION_FLAGS", 0) == 0
 
     health.mark_failed(1)
     with pytest.raises(RuntimeError, match="abort record"):
@@ -164,6 +177,7 @@ def test_abort_rearm_and_exclusion_resume_after_peer_lost_mid_collective() -> No
     assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
     state.rearm()
     assert resets == [1] and state.abort.cpu().tolist() == [0, 0]
+    assert _workspace_word(workspace, meta, 0, "FLAG_VAL", 1) == 0
     state.install_mask()
     for _ in range(2):
         _, output = _collective_round(state, workspace, meta, experts, payload)

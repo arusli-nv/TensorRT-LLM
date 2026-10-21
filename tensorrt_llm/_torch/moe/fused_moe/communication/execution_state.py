@@ -150,6 +150,14 @@ class MoeExecutionState:
         """
         self.abort[_ABORT_REQUESTED] = 1
 
+    def aborted(self) -> bool:
+        """Whether, since :meth:`rearm`, an abort was requested or a collective returned without some peer's data.
+
+        A step whose collectives all completed while this is False read every
+        active source's complete data (see ``MoeA2AAbortState``).
+        """
+        return bool(self.abort.any())
+
     def install_mask(self) -> None:
         """Publish the committed EP membership to the kernels. Only call while the model is idle.
 

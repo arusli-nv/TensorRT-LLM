@@ -262,6 +262,11 @@ __device__ __forceinline__ void publish_round_flag(uint32_t* address, uint32_t v
     asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
 }
 
+__device__ __forceinline__ void record_cancelled(MoeA2AAbortState* abort)
+{
+    asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(&abort->status), "r"(MoeA2AAbortState::kCancelled));
+}
+
 // Returns whether the host requested an abort and, if so, records that this kernel cancelled.
 __device__ __forceinline__ bool observe_abort(MoeA2AAbortState* abort)
 {
@@ -269,9 +274,16 @@ __device__ __forceinline__ bool observe_abort(MoeA2AAbortState* abort)
     asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(requested) : "l"(&abort->requested));
     if (requested != 0)
     {
-        asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(&abort->status), "r"(MoeA2AAbortState::kCancelled));
+        record_cancelled(abort);
     }
     return requested != 0;
+}
+
+// Whether a dispatch on this rank returned without some active source's data since the workspace reset; the rank
+// then publishes no round flag (see MoeA2AAbortState). Written and read in kernels ordered by the stream.
+__device__ __forceinline__ bool released_round(uint32_t const* flag_val)
+{
+    return flag_val[kReleasedRoundIndex] != 0;
 }
 
 // Wait until a peer's round flag reaches `expected`. Returns false if the host requested an abort through `abort`
@@ -554,6 +566,10 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
             {
                 if (count == -1 || (ptrs.abort != nullptr && observe_abort(ptrs.abort)))
                 {
+                    if (ptrs.abort != nullptr)
+                    {
+                        record_cancelled(ptrs.abort);
+                    }
                     count = -1;
                 }
                 else
@@ -563,6 +579,10 @@ __device__ void receive_source(DispatchKernelPointers const& ptrs, int source, i
                     asm volatile("trap;" ::: "memory");
                 }
             }
+        }
+        if (count < 0)
+        {
+            ptrs.flag_val[kReleasedRoundIndex] = 1;
         }
         ptrs.source_valid_counts[source] = count < 0 ? 0 : count;
         received = count;
@@ -788,8 +808,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
             // Signal completion to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
+            bool const released = ENABLE_RANK_MASK && released_round(ptrs.flag_val);
 #pragma unroll 1 // No unroll as one iter is typically enough
-            for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
+            for (int target_rank = lane_id; target_rank < ep_size && !released; target_rank += warpSize)
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
@@ -827,6 +848,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
                         ENABLE_RANK_MASK ? ptrs.abort : nullptr, rank_id, peer_rank, "dispatch"))
                 {
+                    ptrs.flag_val[kReleasedRoundIndex] = 1;
                     return;
                 }
             }
@@ -1913,8 +1935,9 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         {
             // Signal readiness to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
+            bool const released = ENABLE_RANK_MASK && released_round(ptrs.flag_val);
 #pragma unroll 1 // No unroll
-            for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+            for (int peer_rank = lane_id; peer_rank < ep_size && !released; peer_rank += warpSize)
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
