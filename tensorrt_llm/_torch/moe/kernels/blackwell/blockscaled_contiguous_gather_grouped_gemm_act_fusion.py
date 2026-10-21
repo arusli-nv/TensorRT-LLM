@@ -291,7 +291,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_local_experts: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
-        read_source_slots: bool = False,
+        source_tokens: int = 0,
+        slot_tokens: int = 0,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -342,10 +343,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param situ_linear_beta: Linear-side (up) SiTU constant. Required for --
             and only valid with -- ``ActivationType.SiTu``.
         :type situ_linear_beta: Optional[float]
-        :param read_source_slots: A holds a fixed slot of ``slot_tokens`` rows per
-            source rank, of which the token ids count ``source_tokens``: token
-            ``t`` is row ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
-        :type read_source_slots: bool
+        :param source_tokens: If positive, A holds a fixed slot of ``slot_tokens``
+            rows per source rank, of which the token ids count ``source_tokens``:
+            token ``t`` is row ``t + (t // source_tokens) * (slot_tokens - source_tokens)``.
+        :type source_tokens: int
+        :param slot_tokens: Rows of A per source rank; see ``source_tokens``.
+        :type slot_tokens: int
         """
 
         self.sf_vec_size = sf_vec_size
@@ -436,8 +439,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.has_swiglu_limit = swiglu_limit != float("inf")
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
-        self.read_source_slots = read_source_slots
-        assert not (read_source_slots and use_expert_counts)
+        self.read_source_slots = source_tokens > 0
+        self.source_tokens = source_tokens
+        self.slot_tokens = slot_tokens
+        assert not (self.read_source_slots and use_expert_counts)
+        assert not self.read_source_slots or 0 < source_tokens <= slot_tokens
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
         if self.use_expert_counts:
             assert self.topk == 1
@@ -708,14 +714,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         return num_valid_tiles, expert_idx, mn_limit, expanded_row_start
 
     @cute.jit
-    def _source_slot_row(
-        self,
-        token: cutlass.Int32,
-        source_tokens: cutlass.Int32,
-        slot_tokens: cutlass.Int32,
-    ) -> cutlass.Int32:
+    def _source_slot_row(self, token: cutlass.Int32) -> cutlass.Int32:
         """Row of ``token`` in A under ``read_source_slots``."""
-        return token + (token // source_tokens) * (slot_tokens - source_tokens)
+        return token + (token // self.source_tokens) * (self.slot_tokens - self.source_tokens)
 
     @cute.jit
     def __call__(
@@ -733,8 +734,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         expert_capacity: cutlass.Int32,
-        source_tokens: cutlass.Int32,
-        slot_tokens: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -1060,8 +1059,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha_tuple,
             expert_capacity,
-            source_tokens,
-            slot_tokens,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1147,8 +1144,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
         expert_capacity: cutlass.Int32,
-        source_tokens: cutlass.Int32,
-        slot_tokens: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1706,7 +1701,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         )
                         if cutlass.const_expr(self.read_source_slots):
                             a_token_offset_tensor[i] = self._source_slot_row(
-                                a_token_offset_tensor[i], source_tokens, slot_tokens
+                                a_token_offset_tensor[i]
                             )
 
                 token_ml_tile_offset = (
@@ -1720,7 +1715,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset] // self.topk
                     if cutlass.const_expr(self.read_source_slots):
                         sfa_token_offset_tensor[0] = self._source_slot_row(
-                            sfa_token_offset_tensor[0], source_tokens, slot_tokens
+                            sfa_token_offset_tensor[0]
                         )
                 sfa_predicate_tensor[0] = (
                     cutlass.Boolean(1)
@@ -3627,8 +3622,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         k: cutlass.Int64,
         l: cutlass.Int64,  # noqa: E741
         expert_capacity: cutlass.Int32,
-        source_tokens: cutlass.Int32,
-        slot_tokens: cutlass.Int32,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -3698,8 +3691,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             expert_capacity,
-            source_tokens,
-            slot_tokens,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
