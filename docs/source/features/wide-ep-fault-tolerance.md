@@ -31,7 +31,7 @@ second loss interrupts ends with a retryable error, whichever ranks were lost.
   a node together with the node that keeps its copies is not recoverable. Size `/dev/shm` (host memory) for these
   copies: with replicas, every node needs the expert weights of all MoE layers; without, about `1/N` of them.
   Startup fails with the sizes if a rank's copies do not fit.
-- Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4.1 or later.
+- Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4 or later (startup checks for `MPI.Comm.Shrink`; the container installs 4.1.2).
 
 ## Running
 
