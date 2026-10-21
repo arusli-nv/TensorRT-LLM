@@ -165,6 +165,8 @@ Timeouts are nominal: NVLinkOneSided, DeepGEMM and DeepEP convert seconds at an 
 
 With committed EP membership (`ep_group_health`), NVLinkOneSided launches its rank-mask kernels, which skip masked peers. The kernels read the active-rank mask through a pointer to a device record that each communicator owns, at execution time. The record is rewritten, by a copy on the current stream, only when the committed or requested mask changes, and never during CUDA graph capture. Graphs captured once therefore follow membership changes made between captures. Without rank-mask mode the mask-free kernel variants run.
 
+Under WideEP peer-loss recovery every NVLinkOneSided layer is bound to one shared `MoeExecutionState` (`communication/execution_state.py`), and its kernels read that state's records instead of the per-communicator one: the device mask, which `install_mask` rewrites from the committed membership only while the model is idle, and the abort record in pinned host memory, which `request_abort` sets from any thread to release kernels waiting on a lost peer.
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components
