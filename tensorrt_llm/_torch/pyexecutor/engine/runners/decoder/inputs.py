@@ -34,7 +34,12 @@ from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_T
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
-from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
+from tensorrt_llm._utils import (
+    maybe_pin_memory,
+    nvtx_range,
+    peer_loss_recovery_enabled,
+    prefer_pinned,
+)
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -468,6 +473,7 @@ class DecoderInputPreparer:
         counts = attn_metadata.get_adp_token_counts()
         if self.mapping.has_cp_helix():
             counts = [math.ceil(count / self.mapping.cp_size) for count in counts]
+        if self.mapping.has_cp_helix() or not peer_loss_recovery_enabled():
             gathered = self.dist.tp_cp_allgather_int64([*counts, *spec_counts])
         else:
             # A departed rank contributes no tokens and no requests.

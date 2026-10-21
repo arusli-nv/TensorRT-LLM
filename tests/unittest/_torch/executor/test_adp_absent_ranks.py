@@ -23,6 +23,8 @@ from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
 
 pytestmark = pytest.mark.cpu_only
 
+_INPUTS = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs"
+
 WORLD_SIZE = 4
 FAILED_RANK = 2
 SURVIVORS = (0, 1, 3)
@@ -131,8 +133,9 @@ class _DepartedRankDist:
         return rows
 
 
-def test_every_per_step_vote_survives_a_departed_rank():
+def test_every_per_step_vote_survives_a_departed_rank(monkeypatch):
     """Each per-step int64 vote treats the departed rank as neutral instead of failing or vetoing."""
+    monkeypatch.setattr(f"{_INPUTS}.peer_loss_recovery_enabled", lambda: True)
     # Admission: survivors have work, so the group can queue.
     executor = PyExecutor.__new__(PyExecutor)
     executor.enable_attention_dp = True
@@ -173,6 +176,30 @@ def test_every_per_step_vote_survives_a_departed_rank():
         runner, SimpleNamespace(batch_size=2), True, SampleType.FULL
     )
     assert votes == [(True, 2, 0)] * len(SURVIVORS)
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_without_peer_loss_recovery_token_and_spec_counts_gather_as_on_main(monkeypatch, tp_size):
+    """Without recovery the counts go through tp_cp_allgather_int64 as on main: no collective at tp_size 1."""
+    monkeypatch.setattr(f"{_INPUTS}.peer_loss_recovery_enabled", lambda: False)
+    dist = Mock(spec=["tp_cp_allgather_int64", "tp_allgather_int64"])
+    dist.tp_cp_allgather_int64.side_effect = lambda values: np.tile(
+        np.asarray(values, dtype=np.int64), (tp_size, 1)
+    )
+    runner = SimpleNamespace(
+        _config=SimpleNamespace(enable_attention_dp=True),
+        mapping=SimpleNamespace(cp_size=1, has_cp_helix=lambda: False),
+        dist=dist,
+    )
+    metadata = SimpleNamespace(
+        get_adp_token_counts=lambda: [7], set_adp_token_counts=lambda counts: counts[0]
+    )
+    spec = SimpleNamespace(dp_num_tokens=lambda: 8, seq_lens=[4, 4], num_generations=2)
+    assert DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(
+        runner, metadata, spec
+    ) == ([7] * tp_size, [[8] * tp_size, [2] * tp_size, [2] * tp_size])
+    dist.tp_cp_allgather_int64.assert_called_once_with([7, 8, 2, 2])
+    dist.tp_allgather_int64.assert_not_called()
 
 
 def test_waiting_queue_releases_strict_pin_to_failed_rank():
