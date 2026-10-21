@@ -457,8 +457,11 @@ def test_hung_rank_fenced(tmp_path: Path):
         f"rank {VICTIM} (pid" in line and line.rstrip().endswith("; fencing it")
         for line in authority_text.splitlines()
     ), authority_text[-20000:]
-    # The workers fenced it (through the MPI runtime): no fence command is configured.
-    assert "survived its fence" not in authority_text, authority_text[-20000:]
+    # No fence command is configured: a live worker had the MPI runtime end the stopped rank.
+    assert (
+        f"asking the MPI runtime to end hung rank {VICTIM}" in output
+        or f"the MPI runtime ended failed rank {VICTIM}" in output
+    ), output[-20000:]
 
 
 def _get(url: str) -> tuple[int, dict]:
