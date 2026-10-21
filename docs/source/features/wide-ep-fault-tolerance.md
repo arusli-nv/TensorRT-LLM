@@ -223,16 +223,19 @@ to tolerate longer whole-process freezes, at the cost of detecting a dead host a
   (5 s above), so a network hiccup longer than that costs a rank. Set it above the time the network takes to
   recover from a link flap or route change.
 
-## Not supported together with fault tolerance
+## Speculative decoding
 
-Speculative decoding: every method is accepted. A recovery discards the interrupted steps' draft tokens
+Every speculative decoding method is accepted. A recovery discards the interrupted steps' draft tokens
 and draft KV, and target verification keeps the output exact. Only one-model MTP with a linear draft is
 tested; other methods log a warning at startup, because per-slot draft state kept inside the CUDA graphs
 (the relaxed-acceptance delta, the suffix automaton, dynamic-tree state) is not reset: acceptance can drop
 after a recovery, and relaxed acceptance, lossy by design, can accept different tokens.
 
+## Not supported together with fault tolerance
+
 Refused at startup, with the requirement that is missing:
-a non-default attention-DP router (attention-DP balancing is supported), expert tensor parallelism, beam
+any layout but pure attention DP (`tp_size == moe_ep_size == world_size`; pipeline and context parallelism are
+refused), a non-default attention-DP router (attention-DP balancing is supported), expert tensor parallelism, beam
 search, guided decoding, LM-head tensor parallelism in attention DP, KV cache transceivers (disaggregated serving)
 and connectors, the conversation manager, SWA scratch reuse, KV pool rebalancing, PEFT/LoRA, encoder-decoder
 models, sleep/wake-up, a non-MPI executor (Ray, RPC), and a hang-detection timeout that is not above three times
