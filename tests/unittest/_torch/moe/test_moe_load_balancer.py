@@ -12,7 +12,9 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.moe.fused_moe.impl_blocks import slot_rows
+from tensorrt_llm._torch.moe.fused_moe import impl_blocks
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import (
+    MoEEplbWeightLayoutMixin, slot_rows)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
@@ -684,6 +686,34 @@ def test_slot_rows_copies_a_repacked_slot_as_its_dense_block():
     # Slots innermost: a slot's elements are strided across the storage.
     with pytest.raises(ValueError, match="dense blocks"):
         slot_rows(torch.zeros(3, 4).t())
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_eplb_slots_are_rows_only_with_peer_loss_recovery(recovery):
+    """Without peer-loss recovery EPLB registers each slot as main does: the slot itself, contiguous only."""
+
+    class _Module(MoEEplbWeightLayoutMixin):
+        pass
+
+    module = _Module()
+    module.layer_load_balancer = MagicMock()
+    module.layer_load_balancer.need_load_shared_weights.return_value = True
+    module.weight = torch.nn.Parameter(torch.arange(12.0).view(2, 2, 3),
+                                       requires_grad=False)
+    module.scales = torch.nn.Parameter(torch.zeros(2, 3, 4).transpose(1, 2),
+                                       requires_grad=False)
+    with patch.object(impl_blocks,
+                      "peer_loss_recovery_enabled",
+                      return_value=recovery):
+        module.register_parameter_weight_slot_fn("weight", 1)
+        slot = module.layer_load_balancer.register_weight_slot.call_args.args[2]
+        assert slot.shape == ((6, ) if recovery else (2, 3))
+        assert torch.equal(slot.flatten(), module.weight.data[1].flatten())
+        if recovery:
+            module.register_to_fix_weight_fn("scales")
+        else:
+            with pytest.raises(AssertionError, match="should be contiguous"):
+                module.register_to_fix_weight_fn("scales")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

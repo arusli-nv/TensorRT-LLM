@@ -41,6 +41,8 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import peer_loss_recovery_enabled
+
 from ...utils import Fp4QuantizedTensor
 from .impl_contract import MoEInputRequirement, MoEStaticCapability
 
@@ -347,6 +349,12 @@ def slot_rows(tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _eplb_slots(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` ([slots, ...]) indexed by slot for EPLB slot copies: ``slot_rows(tensor)`` with peer-loss
+    recovery, which also takes repacked layouts, else ``tensor`` itself."""
+    return slot_rows(tensor) if peer_loss_recovery_enabled() else tensor
+
+
 class MoEEplbWeightLayoutMixin:
     """The EPLB half that follows the weights, not the forward pass.
 
@@ -404,7 +412,7 @@ class MoEEplbWeightLayoutMixin:
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
-        weight_tensor = slot_rows(getattr(self, weight_name).data)[local_slot_id]
+        weight_tensor = _eplb_slots(getattr(self, weight_name).data)[local_slot_id]
         self.layer_load_balancer.register_weight_slot(local_slot_id, weight_name, weight_tensor)
 
     def register_to_fix_weight_fn(self, weight_name: str):
@@ -416,7 +424,13 @@ class MoEEplbWeightLayoutMixin:
         param = getattr(self, weight_name)
         weight_tensor = param.detach()
         assert isinstance(weight_tensor, torch.Tensor), f"weight {weight_name} should be a tensor"
-        slot_rows(weight_tensor)  # Each slot must be one dense block of the storage.
+        if peer_loss_recovery_enabled():
+            slot_rows(weight_tensor)  # Each slot must be one dense block of the storage.
+        else:
+            assert weight_tensor.is_contiguous(), (
+                f"weight {weight_name} should be contiguous, "
+                f"shape={weight_tensor.shape}, strides={weight_tensor.stride()}"
+            )
         assert (
             weight_tensor.numel() * weight_tensor.element_size()
             == weight_tensor.untyped_storage().size()
@@ -451,7 +465,7 @@ class MoEEplbWeightLayoutMixin:
 
         # Setup host tensor sharing
         local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids()
-        host_rows = {name: slot_rows(tensor) for name, tensor in weight_and_tensor_dict.items()}
+        host_rows = {name: _eplb_slots(tensor) for name, tensor in weight_and_tensor_dict.items()}
         for expert_id in range(self.num_experts):
             for weight_name, rows in host_rows.items():
                 if expert_id in local_shared_load_expert_ids:
