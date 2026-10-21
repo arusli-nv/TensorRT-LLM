@@ -184,15 +184,12 @@ def test_stop_gives_up_on_a_blocked_reporter_thread(monkeypatch):
 
 def test_the_native_heartbeat_keeps_arriving_while_python_is_starved():
     """``HeartbeatSender`` sends from a native thread while this thread holds the interpreter lock."""
-    runtime = pytest.importorskip("tensorrt_llm.bindings.internal.runtime")
-    if not hasattr(runtime, "HeartbeatSender"):
-        pytest.skip("the bindings were built without HeartbeatSender")
+    from tensorrt_llm.bindings.internal.runtime import HeartbeatSender
+
     key = b"k" * 32
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.bind(("127.0.0.1", 0))
-    sender = runtime.HeartbeatSender(
-        "127.0.0.1", receiver.getsockname()[1], key, 3, os.getpid(), 0.05
-    )
+    sender = HeartbeatSender("127.0.0.1", receiver.getsockname()[1], key, 3, os.getpid(), 0.05)
     try:
         sender.publish(17)
         # Busy-wait without releasing the lock: no other Python thread runs meanwhile.
