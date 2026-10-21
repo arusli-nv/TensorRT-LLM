@@ -957,6 +957,7 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
         64,
         128,
     )
+    recovery._executor.model_engine.cuda_graph_runner._capture_allowed = False
 
     recovery.run(Mock(return_value=None))
     assert started == []
@@ -972,6 +973,11 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
     (heartbeat,) = heartbeats
     heartbeat.publish.assert_called_once()
     heartbeat.stop.assert_called_once()
+
+    # The reporter's device reads must not run beside a capture on the serving thread.
+    recovery._executor.model_engine.cuda_graph_runner._capture_allowed = True
+    with pytest.raises(AssertionError, match="captured only before serving"):
+        recovery.run(Mock(return_value=None))
 
 
 def test_only_an_admitted_serving_rank_outside_recovery_exits_alone():

@@ -587,6 +587,10 @@ class PeerLossRecovery(RecoveryHook):
         if not config.hang_detection:
             return None
         executor = self._executor
+        graphs = executor.model_engine.cuda_graph_runner
+        assert graphs is None or not graphs._capture_allowed, (
+            "CUDA graphs are captured only before serving"
+        )
         comm = executor.model_engine.moe_execution_state.progress_comm
         reader = ProgressRowReader(comm.workspace, comm.ep_rank, *comm.progress_row_offsets())
         # Its own connection: the recovery client is used only by the serving thread.
