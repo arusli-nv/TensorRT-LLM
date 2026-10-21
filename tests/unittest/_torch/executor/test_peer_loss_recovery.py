@@ -566,9 +566,13 @@ def test_ranks_that_cannot_be_ended_before_the_shrink_are_left_to_the_authority_
 
 
 def test_nothing_is_killed_before_a_shrink_when_no_failure_is_reported(monkeypatch):
-    _runtime(monkeypatch, Mock(side_effect=AssertionError("nothing to kill")))
+    # Kills run on fence threads, where a raised assertion would not fail the test: record them instead.
+    killed = []
+    _runtime(monkeypatch, killed.append)
     recovery = _recovery(_FakeClient(_happy_replies()))
     recovery._recover(_interrupted())
+    assert killed == []
+    assert recovery._executor.dist.shrink.call_count == 1
 
 
 def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
