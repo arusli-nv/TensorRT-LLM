@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "topologyDetector.h"
 #include <algorithm>
 #include <atomic>
@@ -501,13 +502,15 @@ void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> co
 {
     std::fill_n(mCpuPlacementInfo.expertReplicaCount.begin(), mMetaInfo.expertCount, 0);
     mUnusableSlots.clear();
+    // Empty (-1) slots are ghost slots of WideEP fault tolerance.
+    int const minExpertId = tensorrt_llm::mpi::isFaultToleranceModeEnabled() ? -1 : 0;
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
             int const globalSlotId = rank * mMetaInfo.slotCountPerRank + localSlotId;
             int expertId = initialWeightAssignments[globalSlotId];
-            TLLM_CHECK_WITH_INFO(expertId >= -1 && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
+            TLLM_CHECK_WITH_INFO(expertId >= minExpertId && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
             mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = expertId;
             if (expertId == -1)
             {
@@ -963,8 +966,9 @@ void HostMemoryMoeWeightUpdater::finalizeHostWeight()
 void HostMemoryMoeWeightUpdater::finalizeWeights()
 {
     finalizeWeightSlot();
-    // Without host weights, only restorePlacement with slotsLoaded changes the slots.
-    if (!mHostWeights.empty())
+    // Under WideEP fault tolerance a layer may have no host weights: then only restorePlacement with slotsLoaded
+    // changes the slots.
+    if (!mHostWeights.empty() || !tensorrt_llm::mpi::isFaultToleranceModeEnabled())
     {
         finalizeHostWeight();
     }

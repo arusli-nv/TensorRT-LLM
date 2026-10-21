@@ -141,8 +141,8 @@ public:
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight);
 
     // set initial weight assignments for each slot
-    // index is the global slot id, value is the expert id; -1 leaves the slot empty and out of EPLB's updates until
-    // a restore loads an expert into it
+    // index is the global slot id, value is the expert id; under WideEP fault tolerance (TLLM_FAULT_TOLERANCE_MODE=1)
+    // -1 leaves the slot empty and out of EPLB's updates until a restore loads an expert into it
     // should bind to python
     void setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments);
 

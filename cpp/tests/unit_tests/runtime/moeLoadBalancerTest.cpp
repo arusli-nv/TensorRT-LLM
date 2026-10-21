@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <string>
 
 using namespace tensorrt_llm::runtime;
 
@@ -622,6 +624,85 @@ TEST(MoeLoadBalancerMaskOnlyTest, ReconfigureMaskOnlyFailsClosedForLastReplica)
 namespace
 {
 
+// Sets TLLM_FAULT_TOLERANCE_MODE for its lifetime and restores the previous value.
+class ScopedFaultToleranceMode
+{
+public:
+    explicit ScopedFaultToleranceMode(bool enabled)
+    {
+        if (char const* previous = std::getenv("TLLM_FAULT_TOLERANCE_MODE"))
+        {
+            mPrevious = previous;
+        }
+        if (enabled)
+        {
+            setenv("TLLM_FAULT_TOLERANCE_MODE", "1", 1);
+        }
+        else
+        {
+            unsetenv("TLLM_FAULT_TOLERANCE_MODE");
+        }
+    }
+
+    ~ScopedFaultToleranceMode()
+    {
+        if (mPrevious)
+        {
+            setenv("TLLM_FAULT_TOLERANCE_MODE", mPrevious->c_str(), 1);
+        }
+        else
+        {
+            unsetenv("TLLM_FAULT_TOLERANCE_MODE");
+        }
+    }
+
+    ScopedFaultToleranceMode(ScopedFaultToleranceMode const&) = delete;
+    ScopedFaultToleranceMode& operator=(ScopedFaultToleranceMode const&) = delete;
+
+private:
+    std::optional<std::string> mPrevious;
+};
+
+TEST(MoeLoadBalancerFaultToleranceOffTest, InitialAssignmentRejectsAnEmptySlot)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/false);
+    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/0);
+    auto layer = loadBalancer.AddLayer(/*expertCount=*/4, /*topK=*/2, /*slotCountPerRank=*/2);
+
+    EXPECT_THROW(layer->setInitialWeightAssignments({0, 1, 2, 3, 0, -1, 1, 2}), tensorrt_llm::common::TllmException);
+}
+
+TEST(MoeLoadBalancerFaultToleranceOffTest, FinalizeRejectsWeightSlotsWithoutHostWeights)
+{
+    setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    ScopedFaultToleranceMode const faultToleranceMode(/*enabled=*/false);
+    constexpr int kSlotCountPerRank = 2;
+    constexpr size_t kBytes = 256;
+    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/1);
+    auto layer = loadBalancer.AddLayer(/*expertCount=*/4, /*topK=*/2, kSlotCountPerRank);
+    std::vector<void*> slots(kSlotCountPerRank, nullptr);
+    for (int slotId = 0; slotId < kSlotCountPerRank; ++slotId)
+    {
+        TLLM_CUDA_CHECK(cudaMalloc(&slots[slotId], kBytes));
+        MoeWeight slot;
+        slot.mWeightPtr = slots[slotId];
+        slot.mHeight = 1;
+        slot.mWidth = kBytes;
+        slot.mPitch = kBytes;
+        layer->addSingleWeightSlot(slotId, "w", slot);
+    }
+    layer->setInitialWeightAssignments({0, 1, 0, 1, 2, 3, 0, 1});
+
+    EXPECT_THROW(loadBalancer.finalizeModel(), tensorrt_llm::common::TllmException);
+    for (auto* slot : slots)
+    {
+        TLLM_CUDA_CHECK(cudaFree(slot));
+    }
+}
+
 // One layer on EP rank 0 of 4 with 2 slots per rank; by default experts 2 and 3 live only on rank 2. With host weights,
 // every expert's is filled with expertId + 1; every local slot starts with its expert's values (0 in a -1 slot).
 // With ghostSlot1, the slots are one ghost range (GhostSlotMemory) whose slot 1 maps no memory, loaded by CPU copies
@@ -716,6 +797,8 @@ public:
         return value;
     }
 
+    // Empty (-1) slots and slots without host weights need fault tolerance.
+    ScopedFaultToleranceMode mFaultToleranceMode{/*enabled=*/true};
     MoeLoadBalancer mLoadBalancer;
     std::shared_ptr<SingleLayerMoeLoadBalancer> mLayer;
 
