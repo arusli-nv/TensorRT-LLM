@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import atexit
+import collections
 import dataclasses
 import datetime
 import math
@@ -414,6 +415,10 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # Attention-DP context balance: decisions without arrivals after which a burst
+    # of arrivals counts as ended. A burst reaches every rank within 1-3 decisions.
+    ADP_BURST_QUIET_ITERS = 4
 
     def __init__(
         self,
@@ -952,6 +957,12 @@ class PyExecutor:
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
+        # Requests routed since the last balance decision, the routed counts of the
+        # last attention_dp timeout_iters decisions, and decisions since the last
+        # arrival. Every rank routes the same requests, so these agree across ranks.
+        self.adp_routed_since_balance = 0
+        self.adp_recent_arrivals: collections.deque = collections.deque()
+        self.adp_quiet_iters = 0
         self.batch_wait_iters_count = 0
         self.encoder_batch_wait_iters_count = 0
 
@@ -6691,6 +6702,7 @@ class PyExecutor:
 
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
+            self.adp_routed_since_balance += len(all_new_flat)
 
             new_requests = new_requests_cur_rank
 
@@ -6855,6 +6867,12 @@ class PyExecutor:
         ])
 
         if self.attention_dp_enable_balance:
+            arrivals, self.adp_routed_since_balance = self.adp_routed_since_balance, 0
+            recent = self.adp_recent_arrivals
+            recent.append(arrivals)
+            while len(recent) > self.attention_dp_time_out_iters:
+                recent.popleft()
+            self.adp_quiet_iters = 0 if arrivals else self.adp_quiet_iters + 1
             # wait for all ranks have context requests
             if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
                 self.adp_ctx_waiting_iters_count = 0
@@ -6876,7 +6894,17 @@ class PyExecutor:
                         < self.attention_dp_min_generation_requests):
                     timeout_iters = self.attention_dp_low_occupancy_timeout_iters
                 timeout_reached = self.adp_ctx_waiting_iters_count >= timeout_iters
-                if timeout_reached or not all_ranks_have_gen_requests:
+                # After a burst of arrivals (at least one per serving rank within the
+                # timeout window) has gone quiet, no more context is coming to align
+                # with: a rank still holding context would wait out the timeout for
+                # nothing, and in a closed loop its users would stay out of phase with
+                # the next burst. A burst takes a few iterations to reach every rank.
+                burst_ended = (
+                    all_ranks_have_free_ctx_slots
+                    and len(self.waiting_queue) == 0
+                    and sum(self.adp_recent_arrivals) >= len(live_ranks)
+                    and self.adp_quiet_iters >= self.ADP_BURST_QUIET_ITERS)
+                if timeout_reached or not all_ranks_have_gen_requests or burst_ended:
                     self.adp_ctx_waiting_iters_count = 0
                     balanced_context_requests = context_requests
         return balanced_context_requests
