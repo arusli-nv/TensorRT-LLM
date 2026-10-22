@@ -41,7 +41,9 @@ class _LockstepDist:
         dist = self
 
         class _Proxy:
-            def tp_allgather_int64(self, values):
+            live_ranks = (0, 1)
+
+            def tp_allgather_int64(self, values, *, departed=None):
                 vec = list(values)
                 with dist.lock:
                     dist.calls[rank].append(vec)
@@ -213,7 +215,7 @@ def test_can_queue_gathers_only_the_batch_size():
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
 
-    executor.dist.tp_allgather_int64.assert_called_once_with([2])
+    executor.dist.tp_allgather_int64.assert_called_once_with([2], departed=1)
     assert can_queue is False and this_rank is True
 
 
@@ -268,3 +270,13 @@ def test_default_int64_helpers_route_through_object_paths():
     assert dist.tp_cp_allgather_int64([5, 6]).tolist() == [[5, 6], [7, 8]]
     assert dist.broadcast_int64([3]).tolist() == [3]
     assert dist.tp_cp_broadcast_int64([4, 5]).tolist() == [4, 5]
+
+
+def test_tp_cp_int64_gather_fills_departed_tp_rows():
+    """The TP x CP gather hands ``departed`` to the TP gather, which fills the rows of ranks that left."""
+    mapping = Mapping(world_size=2, rank=0, tp_size=2)
+    dist = _ObjectPathDist(mapping, peers=[[5, 6], [7, 8]])
+    dist.tp_allgather_int64 = Mock(return_value=np.array([[5, 6], [0, 0]], dtype=np.int64))
+
+    assert dist.tp_cp_allgather_int64([5, 6], departed=0).tolist() == [[5, 6], [0, 0]]
+    assert dist.tp_allgather_int64.call_args.kwargs == {"departed": 0}

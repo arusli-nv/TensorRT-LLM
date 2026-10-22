@@ -23,6 +23,8 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+# Wakes a blocked get_from_request_queue() and is dropped there; never broadcast.
+WAKE_REQUEST_ID = -6
 
 
 class RequestAdmissionState(enum.Enum):
@@ -64,7 +66,8 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_wake_request)
 
     @property
     def is_prefix_load_completion_request(self):
@@ -81,6 +84,10 @@ class RequestQueueItem:
     @property
     def is_profile_stop_request(self):
         return self.id == PROFILE_STOP_REQUEST_ID
+
+    @property
+    def is_wake_request(self):
+        return self.id == WAKE_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -101,6 +108,8 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        # Whether the serving loop blocks waiting for new requests (read by hang detection).
+        self.waiting_for_requests = False
         self.admission_state = RequestAdmissionState.RUNNING
         self._pending_sleep_tags: frozenset[str] = frozenset()
         self._parked_tags: frozenset[str] = frozenset()
@@ -286,6 +295,10 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
 
+    def wake(self):
+        """Return a blocked get_from_request_queue() without a request; thread-safe."""
+        self.request_queue.put(RequestQueueItem(WAKE_REQUEST_ID))
+
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
@@ -319,7 +332,11 @@ class ExecutorRequestQueue:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
                 # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
+                self.waiting_for_requests = True
+                try:
+                    items.append(self.request_queue.get(timeout=timeout_secs))
+                finally:
+                    self.waiting_for_requests = False
             else:
                 # if not empty or don't want to wait, just return all items in queue
                 while True:
@@ -328,6 +345,8 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
+        if any(item.is_wake_request for item in items):
+            return [item for item in items if not item.is_wake_request]
         if self.batch_wait_timeout_ms == 0:
             return items
 
@@ -343,9 +362,11 @@ class ExecutorRequestQueue:
 
             try:
                 item = self.request_queue.get(timeout=remaining_timeout)
-                items.append(item)
             except queue.Empty:
                 break
+            if item.is_wake_request:
+                break
+            items.append(item)
 
         return items
 

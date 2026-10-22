@@ -205,7 +205,7 @@ def sync_group_all_greedy_sample(
     if not (mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
         return
     local_flag = bool(spec_metadata.is_all_greedy_sample)
-    all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+    all_flags = dist.tp_allgather_int64([local_flag], departed=1)[:, 0]
     spec_metadata.group_all_greedy_sample = bool(all_flags.all())
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph

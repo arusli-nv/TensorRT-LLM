@@ -388,7 +388,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -402,7 +402,7 @@ class TestDefaultADPRouter:
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [_retiring_request(), _retiring_request()]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -419,7 +419,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -507,7 +507,8 @@ class TestDefaultADPRouter:
         assert states[0] == RankState(rank=0, num_active_requests=1, num_active_tokens=10)
         assert states[1] == RankState(rank=1, num_active_requests=2, num_active_tokens=20)
         dist.tp_allgather.assert_called_once_with(
-            RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
+            RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize(),
+            departed=None,
         )
 
     def test_gather_all_rank_states_piggybacks_iter_stats(self):
@@ -538,7 +539,7 @@ class TestDefaultADPRouter:
 
         assert states[0] == expected_local
         assert states[1] == rank1
-        dist.tp_allgather.assert_called_once_with(expected_local.serialize())
+        dist.tp_allgather.assert_called_once_with(expected_local.serialize(), departed=None)
 
     def test_kv_load_payload_only_changes_wire_shape_when_enabled(self):
         payload = RankIterStatsPayload(
@@ -906,10 +907,10 @@ def test_achieve_max_num_active_requests(attention_dp_config):
             )
             req_id += 1
 
-    all_ranks_num_active_requests = [5, 6, 3, 7]
+    all_ranks_num_active_requests = dict(enumerate([5, 6, 3, 7]))
     waiting_queue = FCFSWaitingQueue()
     waiting_queue.extend(req_list)
-    available = max_num_active_requests * 4 - sum(all_ranks_num_active_requests)
+    available = max_num_active_requests * 4 - sum(all_ranks_num_active_requests.values())
 
     result = get_from_waiting_queue(
         waiting_queue,
@@ -951,8 +952,9 @@ def test_attention_dp_scheduling_cases(
     for rank, relax in request_configs:
         append_to_waiting_queue(waiting_queue, rank, relax)
 
+    all_ranks_num_active_requests = dict(enumerate(all_ranks_num_active_requests))
     num_ranks = len(all_ranks_num_active_requests)
-    total_num_active_requests = sum(all_ranks_num_active_requests)
+    total_num_active_requests = sum(all_ranks_num_active_requests.values())
     total_max = max_num_active_requests * num_ranks
 
     new_requests = get_from_waiting_queue(
@@ -983,8 +985,8 @@ def test_balance_requests_across_ranks_empty_requests():
     result = DefaultADPRouter(dist=dist)._balance_requests_across_ranks(
         [],
         all_ranks_new_requests,
-        [2, 1, 3, 0],
-        [20, 10, 30, 5],
+        dict(enumerate([2, 1, 3, 0])),
+        dict(enumerate([20, 10, 30, 5])),
         3,
     )
     for rank in range(4):
@@ -999,8 +1001,8 @@ def test_balance_requests_across_ranks_single_request():
     )
     req.request.input_token_ids = [1, 2, 3, 4, 5]  # 5 tokens
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    all_ranks_num_active_requests = [1, 2, 0, 1]  # Rank 2 has lowest count
-    all_ranks_num_active_tokens = [10, 20, 5, 15]
+    all_ranks_num_active_requests = dict(enumerate([1, 2, 0, 1]))  # Rank 2 has lowest count
+    all_ranks_num_active_tokens = dict(enumerate([10, 20, 5, 15]))
     expected_num_active_requests = 2
 
     dist = _mock_dist()
@@ -1041,8 +1043,8 @@ def test_balance_requests_across_ranks_multiple_requests():
     req3.request.input_token_ids = [1, 2]  # 2 tokens
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    all_ranks_num_active_requests = [0, 1, 2, 1]
-    all_ranks_num_active_tokens = [5, 15, 25, 10]
+    all_ranks_num_active_requests = dict(enumerate([0, 1, 2, 1]))
+    all_ranks_num_active_tokens = dict(enumerate([5, 15, 25, 10]))
     expected_num_active_requests = 2
 
     dist = _mock_dist()
@@ -1080,8 +1082,8 @@ def test_balance_requests_across_ranks_capacity_limits():
         requests.append(req)
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    all_ranks_num_active_requests = [1, 1, 1, 1]  # All ranks start with 1
-    all_ranks_num_active_tokens = [10, 10, 10, 10]
+    all_ranks_num_active_requests = dict(enumerate([1, 1, 1, 1]))  # All ranks start with 1
+    all_ranks_num_active_tokens = dict(enumerate([10, 10, 10, 10]))
     expected_num_active_requests = 2
 
     dist = _mock_dist()
@@ -1123,8 +1125,8 @@ def test_balance_requests_across_ranks_heap_ordering():
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
     # Rank 0 has highest active count, should get requests last
-    all_ranks_num_active_requests = [3, 1, 0, 2]
-    all_ranks_num_active_tokens = [30, 10, 5, 20]
+    all_ranks_num_active_requests = dict(enumerate([3, 1, 0, 2]))
+    all_ranks_num_active_tokens = dict(enumerate([30, 10, 5, 20]))
     expected_num_active_requests = 4
 
     dist = _mock_dist()
@@ -1176,8 +1178,8 @@ def test_balance_requests_across_ranks_token_count_sorting():
     result = DefaultADPRouter(dist=dist)._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
-        [0, 0, 0, 0],
-        [5, 5, 5, 5],
+        dict(enumerate([0, 0, 0, 0])),
+        dict(enumerate([5, 5, 5, 5])),
         2,
     )
 
@@ -1554,7 +1556,7 @@ class TestConversationAwareADPRouter:
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
             _retiring_request(prompt_len=50),
         ]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 

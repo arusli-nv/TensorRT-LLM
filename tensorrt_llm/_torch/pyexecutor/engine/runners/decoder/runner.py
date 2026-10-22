@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -42,7 +43,7 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, peer_loss_recovery_enabled
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
@@ -129,6 +130,8 @@ class DecoderRunner(ScheduledModelRunner):
     _steady_gen_cache_supported = True
     _eager_workspace_reclaim_supported = True
     _deferred_decode_outputs_supported = True
+    # Bound to every NVLinkOneSided layer when recovery is enabled; None otherwise.
+    moe_execution_state: MoeExecutionState | None = None
 
     def __init__(
         self,
@@ -197,6 +200,10 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
         self._initialize_moe_workspace_reclaimer()
+        # Checked at startup: a misconfigured recovery environment fails here, not in the serving loop.
+        self.moe_execution_state = (
+            MoeExecutionState.for_model(model) if peer_loss_recovery_enabled() else None
+        )
         self._warmup = DecoderWarmup(
             config=self._config,
             mapping=mapping,

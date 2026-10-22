@@ -1437,7 +1437,8 @@ class PyExecutor:
             return
         local_dict = self._pending_iter_stats_dict
         self._pending_iter_stats_dict = None
-        gathered = self.dist.tp_allgather(local_dict)
+        # A departed rank reports no stats, like a rank with nothing to send.
+        gathered = self.dist.tp_allgather(local_dict, departed=None)
         if self.dist.tp_rank != 0:
             return
         rank_dicts = [d for d in gathered if d is not None]
@@ -2483,7 +2484,7 @@ class PyExecutor:
             req_stats.append(req_stat)
 
         for req in list(self.executor_request_queue.get_request_queue().queue):
-            if isinstance(req, RequestQueueItem):
+            if isinstance(req, RequestQueueItem) and not req.is_wake_request:
                 req_stat = get_queued_req_stats(req.id)
                 req_stat.stage = RequestStage.QUEUED
                 req_stats.append(req_stat)
@@ -4041,8 +4042,9 @@ class PyExecutor:
                              and (sizes[:, 1] > 0).any())
             can_queue_this_rank = scheduled_batch.batch_size > 0
         elif self.enable_attention_dp:
+            # A rank that left the group must not veto the forward.
             tp_batch_sizes = self.dist.tp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0].tolist()
+                [scheduled_batch.batch_size], departed=1)[:, 0].tolist()
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
@@ -6431,7 +6433,7 @@ class PyExecutor:
     def _get_request_admission_capacity(self) -> int:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
-            return self.dist.tp_size * self.max_num_active_requests
+            return len(self.dist.live_ranks) * self.max_num_active_requests
         return self.max_num_active_requests
 
     def _configure_benchmark_req_queues_size(self) -> None:
@@ -6544,7 +6546,7 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
+        all_ranks_num_active_requests: Optional[Dict[int, int]] = None
     ) -> List[RequestQueueItem]:
         """Pop requests from waiting_queue based on available capacity."""
         admission_capacity = self._get_request_admission_capacity()
@@ -6634,10 +6636,12 @@ class PyExecutor:
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
                         gpu_forward_time_ms=record.gpu_forward_time_ms)
-            all_ranks_num_active_requests = [
-                s.num_active_requests for s in all_rank_states
-            ]
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+            all_ranks_num_active_requests = {
+                s.rank: s.num_active_requests
+                for s in all_rank_states
+            }
+            total_num_active_requests = sum(
+                all_ranks_num_active_requests.values())
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -6818,10 +6822,17 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather_int64([
+        counts = [
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens, num_real_generation_requests
-        ]).tolist()
+        ]
+        gathered = self.dist.tp_allgather_int64(counts, departed=0)
+        # Balance over the serving ranks only: a rank that left the group
+        # after a recovered peer loss schedules nothing.
+        live_ranks = self.dist.live_ranks
+        if len(live_ranks) != len(gathered):
+            gathered = gathered[list(live_ranks)]
+        responses_list = gathered.tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]
