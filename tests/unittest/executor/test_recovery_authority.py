@@ -1090,3 +1090,105 @@ def test_client_rejects_unauthenticated_and_malformed_messages(tmp_path, reply, 
         client.close()
         router.close()
         context.term()
+
+
+def test_server_probe_reads_the_status_and_reports_unprotected_without_an_answer(served):
+    from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe, health_state
+
+    authority, endpoint = served
+    probe = RecoveryStatusProbe(endpoint, KEY, timeout_s=2.0, max_age_s=0.0)
+    try:
+        status = probe.status()
+        assert status is not None and status.phase == "REGISTERING"
+        # The server asks once its workers registered: an authority still registering restarted.
+        assert health_state(status) == "unprotected"
+        # A probe with the wrong key gets no answer, so it reports nothing rather than a stale state.
+        stranger = RecoveryStatusProbe(endpoint, b"x" * 32, timeout_s=0.2, max_age_s=0.0)
+        try:
+            assert stranger.status() is None
+            assert health_state(stranger.status()) == "unprotected"
+        finally:
+            stranger.close()
+    finally:
+        probe.close()
+    assert authority.phase is Phase.REGISTERING
+
+
+def test_server_probe_answers_callers_on_any_thread_under_zmq_debug(served, monkeypatch):
+    """/health asks from a new worker thread each time; ZeroMQ debugging refuses a socket shared across threads."""
+    from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe
+
+    monkeypatch.setenv("TLLM_LLMAPI_ZMQ_DEBUG", "1")
+    _, endpoint = served
+    probe = RecoveryStatusProbe(endpoint, KEY, timeout_s=2.0, max_age_s=0.0)
+    try:
+        statuses = []
+        for _ in range(2):
+            caller = threading.Thread(target=lambda: statuses.append(probe.status()))
+            caller.start()
+            caller.join(timeout=10)
+            assert not caller.is_alive()
+        assert [status.phase for status in statuses] == ["REGISTERING"] * 2
+    finally:
+        probe.close()
+
+
+def test_server_probe_answers_within_its_timeout_while_the_authority_is_down(tmp_path):
+    from tensorrt_llm.serve.fault_tolerance_status import RecoveryStatusProbe
+
+    probe = RecoveryStatusProbe(f"ipc://{tmp_path}/down", KEY, timeout_s=0.5, max_age_s=0.0)
+    try:
+        start = time.monotonic()
+        assert probe.status() is None
+        assert time.monotonic() - start < 2.0
+        # The first query still waits to be sent: later ones fail at once rather than queue behind it.
+        for _ in range(3):
+            start = time.monotonic()
+            assert probe.status() is None
+            assert time.monotonic() - start < 0.25
+    finally:
+        probe.close()
+
+
+@pytest.mark.parametrize(
+    "phase,state",
+    [
+        ("REGISTERING", "unprotected"),
+        ("SERVING", "healthy"),
+        ("STOPPING", "recovering"),
+        ("PREPARING", "recovering"),
+        ("INSTALLING", "recovering"),
+        ("RECOVERED", "degraded"),
+        ("ABORTED", "terminal"),
+        ("A_PHASE_THIS_SERVER_DOES_NOT_KNOW", "unknown"),
+    ],
+)
+def test_health_states_follow_the_authority_phase(phase, state):
+    from tensorrt_llm.serve.fault_tolerance_status import SERVING_STATES, health_state
+
+    assert health_state(Status(phase, 0, (0, 1), (), 0, (), 0, "")) == state
+    assert (state in SERVING_STATES) == (state in ("healthy", "degraded", "unprotected", "unknown"))
+
+
+def test_status_body_reports_live_ranks_stages_and_failed_requests():
+    from tensorrt_llm.serve.fault_tolerance_status import status_body
+
+    status = Status("RECOVERED", 1, (0, 1), NODE, 1, (40_000, 6_000, 18_000), 256, "")
+    assert status_body(status) == {
+        "state": "degraded",
+        "generation": 1,
+        "live_ranks": [0, 1],
+        "failed_ranks": [2, 3],
+        "recoveries": 1,
+        "last_recovery_stage_ms": {"stop": 40.0, "agree": 6.0, "install": 18.0},
+        "failed_requests": 256,
+    }
+    assert status_body(None) == {"state": "unprotected"}
+    # A restarted authority lost the committed membership: report none of its fields.
+    assert status_body(Status("REGISTERING", 0, (0, 1), (), 0, (), 0, "")) == {
+        "state": "unprotected"
+    }
+    aborted = Status("ABORTED", 1, (0, 1), NODE, 1, (), 0, "rank 2 (pid 7 on node-a) is hung")
+    assert status_body(aborted)["state"] == "terminal" and "abort_reason" not in status_body(
+        aborted
+    )

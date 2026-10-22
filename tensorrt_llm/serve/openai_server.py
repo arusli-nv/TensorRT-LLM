@@ -38,13 +38,15 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm._utils import EnergyMonitor, fault_tolerance_mode
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
+                                         PEER_LOSS_RETRYABLE_CODE,
+                                         is_context_length_exceeded_message,
+                                         is_peer_loss_retryable_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -91,6 +93,9 @@ from tensorrt_llm.serve.disagg_auth import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
+from tensorrt_llm.serve.fault_tolerance_status import (SERVING_STATES,
+                                                       RecoveryStatusProbe,
+                                                       status_body)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
@@ -265,11 +270,14 @@ def _stream_error_events(error: Exception) -> List[str]:
     ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
     """
     message = str(error)
+    code = PEER_LOSS_RETRYABLE_CODE if (
+        fault_tolerance_mode()
+        and is_peer_loss_retryable_message(message)) else None
     error_data = json.dumps({
         "error": {
             "message": message,
             "type": "server_error",
-            "code": None,
+            "code": code,
             "param": None,
         }
     })
@@ -839,6 +847,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
+            if getattr(self, "_recovery_status", None) is not None:
+                self._recovery_status.close()
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -879,6 +889,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_embedding_batcher()
             self.register_embedding_routes()
         else:
+            # WideEP peer-loss recovery: the recovery authority's state, for /health.
+            self._recovery_status = RecoveryStatusProbe.from_env()
             self.register_routes()
 
         if self._collect_perf_metrics:
@@ -1196,17 +1208,24 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
+        # Over-length prompts and peer-loss failures are detected from the
+        # message text because they cross the executor IPC boundary as plain
+        # strings (RequestError), so no exception type survives to here.
         code: Union[int, str] = status_code.value
+        headers = None
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
+        elif fault_tolerance_mode() and is_peer_loss_retryable_message(message):
+            # Recovery from a peer loss takes about a second.
+            err_type = "ServiceUnavailableError"
+            status_code = HTTPStatus.SERVICE_UNAVAILABLE
+            code, headers = PEER_LOSS_RETRYABLE_CODE, {"Retry-After": "1"}
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=code)
         return JSONResponse(content=error_response.model_dump(),
-                            status_code=status_code.value)
+                            status_code=status_code.value,
+                            headers=headers)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1696,6 +1715,18 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def health(self) -> Response:
         if self._check_health():
+            probe = getattr(self, "_recovery_status", None)
+            if probe is not None:
+                # Recovering or terminal: not serving, so load
+                # balancers move on. Serving states (healthy, degraded,
+                # unprotected) return 200. The body is for alerting.
+                body = status_body(await asyncio.to_thread(probe.status))
+                return JSONResponse(
+                    status_code=200 if body["state"] in SERVING_STATES else 503,
+                    content=body)
+            if fault_tolerance_mode():
+                # Detection only: a peer loss is not recovered.
+                return JSONResponse(content=status_body(None))
             return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the
