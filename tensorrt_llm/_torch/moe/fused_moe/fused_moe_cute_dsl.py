@@ -26,7 +26,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...custom_ops.cute_dsl_custom_ops import (GroupedGemmInputsHelper,
+                                               loaded_slot_layout)
 from ...cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ...locality_domain.autotune import \
@@ -347,7 +348,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  use_direct_expert_metadata: bool = False,
                  use_locality_domain: bool = False,
                  workload_identity: Optional[Tuple] = None,
-                 prime_inner_tactics: bool = False):
+                 prime_inner_tactics: bool = False,
+                 num_extra_local_experts: int = 0):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -358,6 +360,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
         self.use_locality_domain = use_locality_domain
+        self.num_extra_local_experts = num_extra_local_experts
+        self.tuning_layout = loaded_slot_layout(num_experts, num_local_experts,
+                                                local_expert_offset,
+                                                num_extra_local_experts)
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -372,11 +378,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self):
+        num_experts, num_local_experts, local_expert_offset = (
+            self.tuning_layout)
         identity = (
-            self.num_experts,
+            num_experts,
             self.top_k,
-            self.num_local_experts,
-            self.local_expert_offset,
+            num_local_experts,
+            local_expert_offset,
             self.enable_finalize_fusion,
             self.enable_alltoall,
             self.output_dtype,
@@ -404,16 +412,18 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return [128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
-        key = self.unique_id()
+        key = (self.unique_id(), self.num_extra_local_experts)
         if key not in self.__class__.tuning_config_cache:
+            num_experts, num_local_experts, local_expert_offset = (
+                self.tuning_layout)
             if self.use_direct_expert_metadata:
                 # One tuning profile is shared by the 128- and 256-row
                 # tactics. Use the minimum tile size so its capacity buckets
                 # cover the union needed by both tactics; each kernel still
                 # rounds capacity to its selected tile size.
-                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
-                                                 self.num_local_experts,
-                                                 self.local_expert_offset, 128)
+                helper = GroupedGemmInputsHelper(num_experts, self.top_k,
+                                                 num_local_experts,
+                                                 local_expert_offset, 128)
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, helper.gen_expert_capacity_tuning_buckets,
@@ -429,8 +439,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                                           helper.infer_shape_input0_rows)),
                     use_cold_l2_cache=True)
             else:
+                # The profiled routing runs through forward_impl, so it
+                # selects the loaded slots by their real ids.
                 helper = CuteDslFusedMoENvfp4InputsHelper(
-                    self.num_experts, self.top_k, self.num_local_experts,
+                    num_experts, self.top_k, num_local_experts,
                     self.local_expert_offset)
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -1180,14 +1192,13 @@ class CuteDslFusedMoE(MoEImplBase):
                     "DeepEP direct metadata was requested without dispatch metadata"
                 )
 
+        num_tokens = token_selected_experts.size(0)
         if moe_output is None:
-            moe_output = torch.empty(
-                (token_final_scales.size(0), self.hidden_size),
-                dtype=output_dtype,
-                device=x.device)
+            moe_output = torch.empty((num_tokens, self.hidden_size),
+                                     dtype=output_dtype,
+                                     device=x.device)
         else:
-            assert moe_output.size() == (token_final_scales.size(0),
-                                         self.hidden_size)
+            assert moe_output.size() == (num_tokens, self.hidden_size)
             assert moe_output.dtype == output_dtype
 
         # The async input quantization forked onto the aux stream must be
@@ -1247,6 +1258,9 @@ class CuteDslFusedMoE(MoEImplBase):
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
+            # Direct metadata lays rows out by every local slot.
+            num_extra_local_experts=(0 if use_direct_expert_metadata else
+                                     self._num_extra_local_slots),
         )
 
         if use_direct_expert_metadata:
@@ -1385,9 +1399,15 @@ class CuteDslFusedMoE(MoEImplBase):
         if use_count_native_expert_metadata:
             gather_act_kwargs["expert_counts"] = recv_expert_count
             gather_act_kwargs["expert_capacity"] = deep_ep_expert_capacity
+        # Count-native metadata lays rows out by every local slot.
+        num_extra_local_experts = (0 if use_count_native_expert_metadata else
+                                   self._num_extra_local_slots)
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
+        else:
+            gather_act_kwargs[
+                "num_extra_local_experts"] = num_extra_local_experts
         gather_act_kwargs["activation_type"] = self.activation_type
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
@@ -1476,6 +1496,8 @@ class CuteDslFusedMoE(MoEImplBase):
                 finalize_inplace_kwargs["expert_capacity"] = (
                     deep_ep_expert_capacity
                     if use_count_native_expert_metadata else 0)
+                finalize_inplace_kwargs[
+                    "num_extra_local_experts"] = num_extra_local_experts
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:
