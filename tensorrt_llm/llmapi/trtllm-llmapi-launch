@@ -168,6 +168,11 @@ function configure_flashinfer_workspace {
     done
 }
 
+# WideEP peer-loss recovery: fault-tolerance mode with a recovery authority.
+function peer_loss_recovery_enabled {
+    [ "$TLLM_FAULT_TOLERANCE_MODE" = "1" ] && [ -n "$TLLM_FAULT_TOLERANCE_AUTHORITY" ]
+}
+
 function run_child_command {
     if [ "$flashinfer_workspace_lock_held" -eq 1 ]; then
         "$@" 200>&-
@@ -192,6 +197,12 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 
 tllm_mpi_size=$(mpi_world_size)
 export tllm_mpi_size
+
+# Peer-loss recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too. Each worker's MPI_Init reads
+# these, so a user's own `--mca pml` / `--mca btl` choice (exported the same way) wins.
+if peer_loss_recovery_enabled; then
+    export OMPI_MCA_pml=${OMPI_MCA_pml:-ob1} OMPI_MCA_btl=${OMPI_MCA_btl:-self,tcp}
+fi
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 configure_flashinfer_workspace
 
@@ -287,6 +298,21 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
+    # Under peer-loss recovery the worker replaces this launcher, so that the
+    # MPI runtime sees the worker's own end: peers that reach a rank through
+    # shared memory do not learn of a worker that dies under a launcher shell.
+    # The worker keeps the workspace lock and takes over this launcher's exit
+    # duties (see run_worker_rank in mpi_session.py).
+    if peer_loss_recovery_enabled; then
+        worker_args=()
+        if [ -n "$flashinfer_temporary_workspace" ]; then
+            worker_args+=(--flashinfer-temporary-workspace "$flashinfer_temporary_workspace")
+        fi
+        if [ "$flashinfer_workspace_lock_held" -eq 1 ]; then
+            worker_args+=(--flashinfer-lock-fd 200)
+        fi
+        exec python3 -m tensorrt_llm.llmapi.mgmn_worker_node "${worker_args[@]}"
+    fi
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
