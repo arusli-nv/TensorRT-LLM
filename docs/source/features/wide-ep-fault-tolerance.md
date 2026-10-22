@@ -216,6 +216,9 @@ cost nothing (TODO: re-verify on the current design).
 
 ## Known limits
 
+- A frozen rank (stopped, or alive but stuck) is fenced only after hang confirmation, about 35 s with the
+  defaults, and serving stalls until then; a rank that ends is seen within tens of milliseconds. The MPI
+  runtime's own failure detector, which could flag a silent rank sooner, is not used.
 - Two ranks hung at once are not confirmed (no single rank is waited on by every peer); they end the job
   through the executor's hang detection or the MoE communication timeout.
 - A fenced process stuck in the GPU driver may not exit when killed, which can stall the job's shutdown.
