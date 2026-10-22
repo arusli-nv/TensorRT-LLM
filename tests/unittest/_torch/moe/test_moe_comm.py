@@ -280,6 +280,21 @@ def _read_nvlink_topk_target_indices(
     return raw.view(torch.int32).view(max_num_tokens, top_k).cpu()
 
 
+def _device_rank_mask(comm: NVLinkOneSided, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """The kernels read the active-rank mask from device memory at execution time."""
+    return None if mask is None else mask.to(comm.workspace.device)
+
+
+def _trtllm_op(name: str):
+    """Resolve ``torch.ops.trtllm.<name>`` without naming ``ops`` in this module's bytecode.
+
+    This module is pickled by value, and cloudpickle captures every ``sys.modules``
+    entry under ``torch.`` whose dotted parts all appear in a function's names.
+    ``torch.ops`` can be registered there as an unpicklable ``_Ops`` object.
+    """
+    return getattr(getattr(torch, "ops").trtllm, name)
+
+
 def _run_nvlink_rank_mask_dispatch(
     comm: NVLinkOneSided,
     token_selected_experts: torch.Tensor,
@@ -289,7 +304,7 @@ def _run_nvlink_rank_mask_dispatch(
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
-    recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
+    recv_tensors, combine_payload_offset, _ = _trtllm_op("moe_a2a_dispatch")(
         token_selected_experts,
         [payload],
         comm.workspace,
@@ -300,8 +315,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=_device_rank_mask(comm, active_rank_mask),
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -327,7 +342,7 @@ def _run_nvlink_rank_mask_combine(
     active_rank_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
-    return torch.ops.trtllm.moe_a2a_combine(
+    return _trtllm_op("moe_a2a_combine")(
         combine_payload,
         local_num_tokens,
         comm.workspace,
@@ -339,8 +354,8 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=_device_rank_mask(comm, active_rank_mask),
     )
 
 
@@ -1487,7 +1502,9 @@ def _worker_rank_mask_one_rank_masked(
             dtype=torch.int32,
             device="cuda",
         )
-        _, _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch(
+        # Every dispatch needs its combine: the next round's flag values and
+        # receive-counter bank assume the two alternate.
+        _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             masked_routes,
             _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank),
