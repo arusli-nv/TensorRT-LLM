@@ -8654,6 +8654,35 @@ class PyExecutor:
         """Remember what the step being prepared changes on ``request``, so peer-loss recovery can undo it."""
         self._step_changes.append(PreparedStep.change(request))
 
+    def take_waiting_requests(self) -> List[RequestQueueItem]:
+        """Remove and return the requests waiting to be scheduled."""
+        waiting = list(self.waiting_queue)
+        self.waiting_queue.remove_by_ids({item.id for item in waiting})
+        return waiting
+
+    def readmit_requests(self, items: List[RequestQueueItem]) -> None:
+        """Broadcast ``items`` again, ahead of newly fetched requests (rank 0)."""
+        self.request_accumulated[:0] = items
+
+    def take_buffered_responses(
+            self) -> Tuple[List[Tuple[int, LlmResponse]], List[LlmRequest]]:
+        """Return and clear the responses and terminations buffered for the
+        next synchronized flush."""
+        responses, self._pending_transfer_responses = (
+            self._pending_transfer_responses, [])
+        terminations, self._pending_response_terminations = (
+            self._pending_response_terminations, [])
+        return responses, terminations
+
+    def served_request_ids(self) -> Set[int]:
+        """Ids of the requests this rank serves; one per ``n > 1`` request."""
+        return {
+            request.parent_request_id
+            if request.is_child else request.py_request_id
+            for request in self.active_requests
+            if not request.is_attention_dp_dummy
+        }
+
     def _raise_if_peer_failed(self, operation: str, error: Exception) -> None:
         """Report an error of a step that a peer loss interrupted as such."""
         if isinstance(error, HostCollectiveInterrupted):

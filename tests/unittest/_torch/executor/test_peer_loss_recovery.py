@@ -3,6 +3,7 @@
 """Scheduler-side WideEP peer-loss recovery with fake distributed, model, and authority."""
 
 import functools
+import pickle
 import signal
 import threading
 import time
@@ -15,17 +16,22 @@ import torch
 from tensorrt_llm._torch.distributed.communicator import HostCollectiveInterrupted, MPIDist
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor import llm_request, peer_loss_recovery, py_executor
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    CONTROL_REQUEST_ID,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
 from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
     PeerLossRecovery,
     PreparedStep,
     RecoveryHook,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, adp_router
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
+from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.executor.recovery.client import (
     RecoveryAborted,
     RecoveryInterrupted,
@@ -43,7 +49,9 @@ from tensorrt_llm.executor.recovery.protocol import (
     Ready,
     Stopped,
 )
+from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
 from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -832,6 +840,51 @@ def test_a_round_after_a_late_shrink_does_not_start_survivor_collectives():
     assert dist.broadcast_among_survivors.call_count == 1
 
 
+def _queued(request_id):
+    return RequestQueueItem(request_id, Mock())
+
+
+def _broadcast(recovery, items, interrupted=False):
+    """Broadcast ``items`` through the recovery hook, as the executor does."""
+    if not interrupted:
+        recovery.broadcast_requests(lambda _: None, items)
+        return
+    with pytest.raises(HostCollectiveInterrupted):
+        recovery.broadcast_requests(Mock(side_effect=_interrupted()), items)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_recovery_keeps_unscheduled_requests_on_rank0_only(rank):
+    """Rank 0 re-broadcasts received-but-unscheduled requests after recovery."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=rank)
+    executor = recovery._executor
+    executor.request_accumulated = [_queued(5)]
+    executor.waiting_queue.add_requests([_queued(1), _queued(2)])
+    _broadcast(recovery, [_queued(3)], interrupted=True)
+
+    recovery._recover(_interrupted())
+
+    assert len(executor.waiting_queue) == 0
+    assert recovery._unbroadcast_requests == []
+    expected = [1, 2, 3, 5] if rank == 0 else [5]
+    assert [item.id for item in executor.request_accumulated] == expected
+
+
+def test_recovery_does_not_rebroadcast_a_request_a_survivor_started():
+    """Rank 0's broadcast can complete on a survivor while rank 0 sees it interrupted."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    executor = recovery._executor
+    _broadcast(recovery, [_queued(3), _queued(4)], interrupted=True)
+    served = [(set(), 0, set(), set()), ({3}, 0, set(), set()), None, (set(), 0, set(), set())]
+    executor.dist.allgather.side_effect = lambda value, departed: served
+
+    recovery._recover(_interrupted())
+
+    assert [item.id for item in executor.request_accumulated] == [4]
+    if recovery._request_owners is not None:
+        assert recovery._request_owners[3][0] == 1
+
+
 def test_survivors_resume_from_the_same_iteration():
     """A loss can stop survivors one iteration apart; they resume from the furthest one."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
@@ -847,6 +900,58 @@ def test_survivors_resume_from_the_same_iteration():
     recovery._recover(_interrupted())
 
     assert executor.iter_counter == 8
+
+
+def test_recovery_reports_requests_it_already_answered_as_held():
+    """A request a survivor rejected from an interrupted broadcast must not be admitted again."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    executor = recovery._executor
+    rejected = Mock(spec=LlmResponse, request_id=3, result=None)
+    executor._pending_transfer_responses = [(3, rejected)]
+    reported = []
+    executor.dist.allgather.side_effect = (
+        lambda value, departed: reported.append(value) or [value] * WORLD_SIZE
+    )
+
+    recovery._recover(_interrupted())
+
+    held, *_ = reported[0]
+    assert 3 in held
+
+
+def test_recovery_rebroadcasts_the_cancellations_of_an_interrupted_broadcast():
+    """Rank 0 may finish a broadcast that a survivor never received."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    executor = recovery._executor
+    cancel = RequestQueueItem(7, None, is_canceled_request=True)
+    _broadcast(recovery, [cancel])
+    executor.waiting_queue.add_requests([_queued(1)])
+
+    recovery._recover(_interrupted())
+
+    assert [item.id for item in executor.request_accumulated] == [1, 7]
+
+
+def test_recovery_fails_closed_on_an_interrupted_control_request():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    _broadcast(recovery, [RequestQueueItem(CONTROL_REQUEST_ID)])
+    with pytest.raises(RuntimeError, match="control request"):
+        recovery._recover(_interrupted())
+
+
+def test_gather_numbers_follow_rank0_after_a_recovery():
+    """A rank ahead of rank 0 numbers its next gathers like rank 0."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    for number in range(3):
+        recovery.gathering_responses([(number, Mock())])
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (2, set()) if isinstance(value, tuple) else value
+    )
+    _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    assert recovery._gather_count == recovery._last_processed_gather == 2
 
 
 def test_requests_with_occurrence_penalties_are_rejected():
@@ -1589,6 +1694,673 @@ def _sent_responses(recovery):
     return sent
 
 
+def test_routed_requests_are_tracked_until_their_final_response():
+    recovery = _recovery(_FakeClient([]), rank=0)
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=[21])
+    recovery.requests_routed({FAILED_RANK: [item]})
+    assert recovery._request_owners == {11: (FAILED_RANK, item)}
+    streaming = Mock(spec=LlmResponse, request_id=11, result=Mock(is_final=False))
+    streaming.has_error.return_value = False
+    recovery.responses_gathered([(11, streaming)])
+    assert 11 in recovery._request_owners
+    # The last sequence of an n > 1 request is gathered under its own id.
+    final = Mock(spec=LlmResponse, request_id=11, result=Mock(is_final=True))
+    final.has_error.return_value = False
+    recovery.responses_gathered([(21, final)])
+    assert recovery._request_owners == {} and recovery._parent_ids == {}
+
+
+@pytest.mark.parametrize("sequence_id", [11, 21])
+def test_an_error_of_any_sequence_ends_the_request(sequence_id):
+    recovery = _recovery(_FakeClient([]), rank=0)
+    recovery.requests_routed({1: [Mock(id=11, child_req_ids=[21])]})
+    error = Mock(spec=LlmResponse, request_id=sequence_id, result=None)
+    error.has_error.return_value = True
+    recovery.responses_gathered([(sequence_id, error)])
+    assert recovery._request_owners == {} and recovery._parent_ids == {}
+
+
+def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
+    """Nothing reached the client: a survivor runs it again, once, after the loss of its rank alone too."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    lost, kept = Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, lost), 12: (3, kept)}
+    recovery._executor.active_requests.append(
+        Mock(is_child=False, py_request_id=12, is_attention_dp_dummy=False)
+    )
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    assert sent[-1] == []
+    assert recovery._executor.request_accumulated[:1] == [lost]
+    assert recovery._request_owners == {12: (3, kept)}
+    # Marked as interrupted until it ends.
+    assert recovery._interrupted == {11}
+    recovery.requests_routed({1: [lost]})
+    recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
+    assert recovery._interrupted == set() and recovery._request_owners == {12: (3, kept)}
+
+
+def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor(monkeypatch):
+    """The request was accepted while its rank served: it runs again on a survivor. A new request pinned to the
+    departed rank still fails."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    warnings = []
+    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warnings.append)
+
+    def pinned(request_id):
+        params = SchedulingParams(attention_dp_rank=FAILED_RANK, attention_dp_relax=False)
+        request = Mock(py_scheduling_params=params, num_input_tokens=4)
+        return Mock(id=request_id, request=request, child_req_ids=None)
+
+    lost, new = pinned(11), pinned(12)
+    recovery._request_owners = {11: (FAILED_RANK, lost)}
+    _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    assert recovery._executor.request_accumulated[:1] == [lost]
+    assert "re-ran 1 requests and failed 0; lent 0 bytes of the KV cache" in warnings[-1]
+    assert lost.request.py_scheduling_params == SchedulingParams(
+        attention_dp_rank=FAILED_RANK, attention_dp_relax=True
+    )
+    states = [RankState(rank=rank) for rank in SURVIVORS]
+    routable, unservable = DefaultADPRouter.split_unservable_requests([lost, new], states)
+    assert routable == [lost] and unservable == [new]
+    monkeypatch.setattr(adp_router, "peer_loss_recovery_enabled", lambda: True)
+    router = DefaultADPRouter(dist=Mock(tp_rank=0, tp_size=WORLD_SIZE, has_cp_helix=False))
+    routed, _ = router.route_requests(states, routable, 8)
+    assert set(routed) == set(SURVIVORS)
+    assert [req for reqs in routed.values() for req in reqs] == [lost]
+
+
+@pytest.mark.parametrize("streamed", [True, False])
+def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_again(
+    monkeypatch, streamed
+):
+    """Streamed tokens cannot be taken back; a request that already ran again after its rank failed, and lost its
+    new rank too, may be what crashes them: it is quarantined."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    warnings = []
+    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warnings.append)
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, item)}
+    if streamed:
+        recovery._delivered.add(11)
+    else:
+        recovery._interrupted.add(11)
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    ((request_id, response),) = sent[-1]
+    assert request_id == 11 and response.client_id == "c11"
+    assert f"rank {FAILED_RANK} failed" in response.error_msg
+    assert is_peer_loss_retryable_message(response.error_msg)
+    assert ("streamed" in response.error_msg) == streamed
+    assert ("already interrupted" in response.error_msg) != streamed
+    assert "re-ran 0 requests and failed 1;" in warnings[-1]
+    assert recovery._request_owners == {} and recovery._interrupted == set()
+    assert recovery._executor.request_accumulated == []
+
+
+def test_a_request_run_again_fails_when_it_loses_its_rank_again():
+    """Rank 2's request runs again on rank 3 after the first recovery; rank 3 is lost next: the request fails, and
+    the deployment recovers a second time without both ranks."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, item)}
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+    assert recovery._executor.request_accumulated == [item]
+    recovery._executor.request_accumulated.clear()
+    recovery.requests_routed({3: [item]})
+
+    recovery._recover(_interrupted(lost))
+
+    ((request_id, response),) = sent[-1]
+    assert request_id == 11 and "already interrupted" in response.error_msg
+    assert recovery._executor.request_accumulated == []
+    assert [m.generation for m in client.sent if isinstance(m, Installed)] == [1, 2]
+
+
+def test_a_request_run_again_that_reported_progress_runs_again_when_it_loses_its_rank_again():
+    """As above, but rank 3 reported a committed step of the request in a response gather before it was lost: the
+    request delivered nothing and is not what crashed the ranks, so it runs again."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
+    item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, item)}
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+    recovery._executor.request_accumulated.clear()
+    recovery.requests_routed({3: [item]})
+    # Rank 3's part of a later gather: no response, a committed step of request 11.
+    recovery.responses_gathered(object(), [(), (), None, ([], [], [], [11])])
+    assert recovery._interrupted == set()
+
+    recovery._recover(_interrupted(lost))
+
+    assert recovery._executor.request_accumulated == [item]
+    assert not any(request_id == 11 for part in sent for request_id, _ in part)
+
+
+def _interrupting(recovery, failed, interrupted, progressed=frozenset()):
+    """Report ``interrupted`` as the requests the loss interrupted on rank 1, which serves requests 11 and 12,
+    and ``progressed`` as those of them that committed a step since an earlier loss interrupted them."""
+    recovery._executor.dist.allgather.side_effect = lambda value, departed: [
+        None
+        if r in failed
+        else ({11, 12}, 0, interrupted, set(progressed))
+        if r == 1
+        else (set(), 0, set(), set())
+        for r in range(WORLD_SIZE)
+    ]
+
+
+def test_a_request_two_losses_interrupt_fails_whatever_ranks_were_lost():
+    """A survivor's request runs on after a loss interrupts its step, but a second interruption fails it: it may
+    be what crashes the ranks. A request interrupted once runs on."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    executor = recovery._executor
+    executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    executor.dist.shrink.side_effect = lambda: next(shrinks)
+    recovery.requests_routed(
+        {1: [Mock(id=request_id, child_req_ids=None) for request_id in (11, 12)]}
+    )
+    failures = []
+    executor.fail_requests = lambda request_ids, error_msg: failures.append(set(request_ids))
+    _sent_responses(recovery)
+
+    _interrupting(recovery, {FAILED_RANK}, {11})
+    recovery._recover(_interrupted())
+    assert failures == [set()] and recovery._interrupted == {11}
+
+    _interrupting(recovery, lost, {11, 12})
+    recovery._recover(_interrupted(lost))
+    assert failures[-1] == {11} and recovery._interrupted == {11, 12}
+    assert executor.request_accumulated == []
+
+
+def test_a_request_that_progressed_after_an_interruption_runs_on_after_another():
+    """Under the overlap scheduler most requests sit in a discarded step: one that committed a step since an
+    earlier loss interrupted it is not failed by an unrelated second loss."""
+    lost = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(
+        [
+            *_happy_replies(),
+            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+        ]
+    )
+    recovery = _recovery(client, rank=0, failed=lost)
+    executor = recovery._executor
+    executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    executor.dist.shrink.side_effect = lambda: next(shrinks)
+    recovery.requests_routed(
+        {1: [Mock(id=request_id, child_req_ids=None) for request_id in (11, 12)]}
+    )
+    failures = []
+    executor.fail_requests = lambda request_ids, error_msg: failures.append(set(request_ids))
+    _sent_responses(recovery)
+
+    _interrupting(recovery, {FAILED_RANK}, {11, 12})
+    recovery._recover(_interrupted())
+    _interrupting(recovery, lost, {11, 12}, progressed={12})
+    recovery._recover(_interrupted(lost))
+
+    assert failures[-1] == {11} and recovery._interrupted == {11, 12}
+
+
+def test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    executor = recovery._executor
+    requests = {
+        request_id: Mock(
+            is_child=False, is_dummy=False, is_attention_dp_dummy=False, py_request_id=request_id
+        )
+        for request_id in (11, 12)
+    }
+    executor.active_requests = list(requests.values())
+    interrupted = Mock(context_requests=[], all_requests=lambda: list(requests.values()))
+    recovery.step_prepared(interrupted)
+    reported = []
+    executor.dist.allgather.side_effect = (
+        lambda value, departed: reported.append(value) or [value] * WORLD_SIZE
+    )
+    recovery._recover(_interrupted())
+    assert recovery._unprogressed == {11, 12}
+
+    for _ in range(2):
+        batch = Mock(context_requests=[], all_requests=lambda: [requests[12]])
+        recovery.step_prepared(batch)
+        recovery.commit_step(batch, Mock())
+
+    assert recovery._unprogressed == {11} and recovery._progressed == {12}
+    # The next response gather tells rank 0, once.
+    assert recovery.gathering_responses([]) == ([], [], [], [12])
+    assert recovery.gathering_responses([]) == ()
+
+
+def test_only_the_rank_a_rerun_request_is_routed_to_watches_its_progress():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: [11, 12] if isinstance(value, list) else value
+    )
+    recovery._recover(_interrupted())
+    assert recovery._unprogressed == set()
+
+    recovery.requests_routed({1: [_queued(11)], 2: [_queued(12)]})
+
+    assert recovery._unprogressed == {11} and recovery._rerouting == set()
+
+
+def test_each_recovery_takes_the_rerun_requests_rank0_has_not_routed():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery._rerouting = {7}
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: [11, 12] if isinstance(value, list) else value
+    )
+    recovery._recover(_interrupted())
+    assert recovery._rerouting == {11, 12}
+
+    recovery.requests_cancelled({12})
+
+    assert recovery._rerouting == {11}
+
+
+def test_rank0_keeps_an_earlier_unrouted_rerun_request_across_a_recovery():
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    recovery._rerouting = {7}
+    recovery._recover(_interrupted())
+    assert recovery._rerouting == {7}
+
+
+def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
+    recovery = _recovery(_FakeClient([]), rank=1)
+    executor = recovery._executor
+    executor.dist.broadcast.side_effect = (
+        lambda value, root: (0, {11}) if isinstance(value, tuple) else value
+    )
+    parent = Mock(is_child=False, py_request_id=11)
+    child = Mock(is_child=True, parent_request_id=11, py_request_id=21)
+    other = Mock(is_child=False, py_request_id=12)
+    executor.active_requests = [parent, child, other]
+    executor._handle_errors = Mock()
+    _sent_responses(recovery)
+
+    recovery._deliver_responses(frozenset({FAILED_RANK}), ([], []), set())
+
+    (call,) = executor._handle_errors.call_args_list
+    assert call.kwargs["requests"] == [parent, child] and not call.kwargs["charge_budget"]
+    assert "interrupted this request a second time" in call.args[0]
+    assert is_peer_loss_retryable_message(call.args[0])
+
+
+def test_rank0_tracks_requests_that_delivered_a_response():
+    recovery = _recovery(_FakeClient([]), rank=0)
+    recovery.requests_routed({FAILED_RANK: [_queued(11), _queued(12)]})
+    partial = LlmResponse(request_id=11, result=Mock(is_final=False))
+    recovery.responses_gathered([(11, partial), (11, partial)])
+    assert recovery._delivered == {11}
+    recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
+    assert recovery._delivered == set() and set(recovery._request_owners) == {12}
+
+
+def _response(request_id, is_final=False, error_msg=None):
+    result = None if error_msg else SimpleNamespace(is_final=is_final)
+    return LlmResponse(request_id=request_id, error_msg=error_msg, result=result)
+
+
+def test_rank0_keeps_its_books_from_the_notes_of_each_gathered_part():
+    """Each rank notes the requests its part finishes or first answers; rank 0 reads only those notes, with the
+    same outcome as reading every response."""
+    owner = _recovery(_FakeClient([]), rank=1)
+    steps = [
+        [(11, _response(11)), (12, _response(12)), (13, _response(13)), (23, _response(13))],
+        [
+            (11, _response(11)),
+            (12, _response(12, is_final=True)),
+            (23, _response(23, error_msg="boom")),
+        ],
+    ]
+    parts = [owner.gathering_responses(step) for step in steps]
+    assert [part[1:] for part in parts] == [
+        ([], [11, 12, 13], []),
+        ([12, 23], [], []),
+    ]
+    assert owner.gathering_responses([]) == ()
+    fast, scan = _recovery(_FakeClient([]), rank=0), _recovery(_FakeClient([]), rank=0)
+    for rank0 in (fast, scan):
+        rank0.requests_routed({1: [_queued(11), _queued(12), Mock(id=13, child_req_ids=[23])]})
+    for step, part in zip(steps, parts):
+        sent = pickle.loads(pickle.dumps(part))
+        assert type(sent) is tuple and sent == (step, *part[1:])
+        # Not iterable: rank 0 does not read the responses.
+        fast.responses_gathered(object(), [None, (), sent])
+        scan.responses_gathered(step)
+    for rank0 in (fast, scan):
+        assert (set(rank0._request_owners), rank0._delivered, rank0._parent_ids) == ({11}, {11}, {})
+
+
+def test_rank0_reads_no_notes_from_parts_that_only_continue_answered_requests():
+    owner = _recovery(_FakeClient([]), rank=1)
+    first = owner.gathering_responses([(11, _response(11))])
+    continuing = owner.gathering_responses([(11, _response(11))])
+    assert continuing[1:] == ([], [], [])
+    rank0 = _recovery(_FakeClient([]), rank=0)
+    rank0.requests_routed({1: [_queued(11)]})
+    rank0.responses_gathered(object(), [first])
+    rank0._note_responses = Mock()
+
+    rank0.responses_gathered(object(), [continuing, (), None])
+
+    rank0._note_responses.assert_not_called()
+    assert (set(rank0._request_owners), rank0._delivered) == ({11}, {11})
+
+
+@pytest.mark.parametrize("num_new", [0, 1])
+def test_fetch_splits_and_records_routing_only_with_new_requests(monkeypatch, num_new):
+    """The executor splits off unservable requests and records the routing only in an iteration with new
+    requests; every iteration still routes, as without recovery."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        lambda requests, **kwargs: requests,
+    )
+    new_requests = [_queued(11)][:num_new]
+    states = [RankState(rank=rank) for rank in range(4)]
+    routed = {rank: [] for rank in range(4)}
+    routed[0] = list(new_requests)
+    executor = Mock(
+        enable_attention_dp=True,
+        enable_iter_perf_stats=False,
+        _enable_remote_tail_adp=False,
+        num_fetch_requests=0,
+        num_fetch_requests_cur_rank=0,
+        adp_routed_since_balance=0,
+        max_num_active_requests=8,
+    )
+    executor._kv_load_tracker.begin_step.return_value = None
+    executor._kv_load_tracker.enabled = False
+    executor.dist.tp_rank = 0
+    executor.adp_router.needs_prefix_matches = False
+    executor.adp_router.gather_all_rank_states.return_value = states
+    executor.adp_router.split_unservable_requests.side_effect = lambda requests, _: (requests, [])
+    executor.adp_router.route_requests.return_value = (routed, 1)
+    executor._pop_from_waiting_queue.return_value = list(new_requests)
+    executor._peer_loss_recovery.enabled = True
+
+    assert PyExecutor._fetch_new_requests(executor, Mock(), []) == new_requests
+
+    executor.adp_router.route_requests.assert_called_once_with(states, new_requests, 8)
+    if num_new:
+        executor.adp_router.split_unservable_requests.assert_called_once_with(new_requests, states)
+        executor._peer_loss_recovery.requests_routed.assert_called_once_with(routed)
+    else:
+        executor.adp_router.split_unservable_requests.assert_not_called()
+        executor._peer_loss_recovery.requests_routed.assert_not_called()
+    executor._fail_unservable_requests.assert_not_called()
+
+
+def test_rank0_enqueues_the_responses_of_each_gathered_part():
+    """Rank 0 enqueues the responses of every non-empty part and still rejects a payload of another
+    collective."""
+    owner = _recovery(_FakeClient([]), rank=1)
+    first, second = [(11, _response(11))], [(12, _response(12, is_final=True))]
+    parts = [owner.gathering_responses(first), (), None, owner.gathering_responses(second)]
+    executor = PyExecutor.__new__(PyExecutor)
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    executor.enable_attention_dp, executor.gather_all_responses = True, False
+    executor.dist = Mock(rank=0, world_size=4)
+    executor.dist.mapping.tp_group = [0, 1, 2, 3]
+    executor.dist.tp_gather.return_value = parts
+    executor._peer_loss_recovery = Mock()
+    executor._peer_loss_recovery.contribution_responses.side_effect = owner.contribution_responses
+    executor.response_cv = threading.Condition()
+    executor.responses, executor.result_wait_queues = {}, {}
+
+    PyExecutor._enqueue_responses(executor, [])
+
+    assert executor.responses == {11: [first[0][1]], 12: [second[0][1]]}
+    executor._peer_loss_recovery.responses_gathered.assert_called_once_with(first + second, parts)
+    executor.dist.tp_gather.return_value = [(), 3]
+    with pytest.raises(RuntimeError, match="collective desync"):
+        PyExecutor._enqueue_responses(executor, [])
+
+
+def test_rank0_gathers_responses_without_hook_calls_when_recovery_is_off():
+    """With recovery off, the response gather makes no recovery-hook call."""
+    executor = PyExecutor.__new__(PyExecutor)
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    executor.enable_attention_dp, executor.gather_all_responses = True, False
+    executor.dist = Mock(rank=0, world_size=2)
+    executor.dist.mapping.tp_group = [0, 1]
+    response = _response(11)
+    executor.dist.tp_gather.return_value = [[(11, response)], []]
+    executor._peer_loss_recovery = Mock(enabled=False)
+    executor.response_cv = threading.Condition()
+    executor.responses, executor.result_wait_queues = {}, {}
+
+    PyExecutor._enqueue_responses(executor, [])
+
+    assert executor.responses == {11: [response]}
+    assert executor._peer_loss_recovery.mock_calls == []
+
+
+def test_a_resent_part_notes_the_requests_it_answered_again():
+    """Rank 0 never read the notes of a gather a loss interrupted, so the resent part carries them again."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery.gathering_responses([(11, _response(11))])
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (0, set()) if isinstance(value, tuple) else value
+    )
+    resent = []
+    recovery._executor._enqueue_responses = lambda responses: resent.append(
+        recovery.gathering_responses(responses)
+    )
+
+    recovery._recover(_interrupted())
+
+    assert resent[0][2] == [11]
+
+
+@pytest.mark.parametrize("ran_again, failed_requests", [(False, 1), (True, 2)])
+def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(ran_again, failed_requests):
+    """The authority's status counts the requests a loss failed: those that had streamed, and those that had
+    already run again once."""
+    client = _FakeClient(_happy_replies())
+    recovery = _recovery(client, rank=0)
+    if ran_again:
+        recovery._interrupted.add(12)
+    recovery._request_owners = {
+        11: (FAILED_RANK, Mock(id=11, child_req_ids=None)),
+        12: (FAILED_RANK, Mock(id=12, child_req_ids=None)),
+        13: (1, Mock(id=13, child_req_ids=None)),
+    }
+    recovery._delivered.add(11)
+    _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    (installed,) = [message for message in client.sent if isinstance(message, Installed)]
+    assert installed.failed_requests == failed_requests
+
+
+def test_rank0_reports_the_requests_it_quarantines_as_failed():
+    """A survivor's request a second loss interrupts without progress fails, and the authority's status counts it
+    with the departed rank's request that had streamed."""
+    client = _FakeClient(_happy_replies())
+    recovery = _recovery(client, rank=0)
+    executor = recovery._executor
+    recovery.requests_routed({1: [_queued(11), _queued(12)], FAILED_RANK: [_queued(13)]})
+    recovery._interrupted.update({11, 12})
+    recovery._delivered.add(13)
+    failures = []
+    executor.fail_requests = lambda request_ids, error_msg: failures.append(set(request_ids))
+    _sent_responses(recovery)
+    _interrupting(recovery, {FAILED_RANK}, {11, 12}, progressed={12})
+
+    recovery._recover(_interrupted())
+
+    assert failures == [{11}]
+    (installed,) = [message for message in client.sent if isinstance(message, Installed)]
+    assert installed.failed_requests == 2
+
+
+def test_recovery_readmits_requests_that_never_reached_their_rank():
+    """A torn broadcast can leave a routed request unknown to its live owner."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    torn, delivered = Mock(id=21, child_req_ids=None), Mock(id=22, child_req_ids=None)
+    recovery._request_owners = {21: (3, torn), 22: (1, delivered)}
+    held = {1: ({22}, 0, set(), set()), 3: (set(), 0, set(), set())}
+    recovery._executor.dist.allgather.side_effect = lambda value, departed: [
+        held.get(rank, value) for rank in range(WORLD_SIZE)
+    ]
+    _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    assert recovery._executor.request_accumulated[:1] == [torn]
+    assert recovery._request_owners == {22: (1, delivered)}
+
+
+def test_a_cancelled_request_is_tracked_until_its_rank_answers_it():
+    recovery = _recovery(_FakeClient([]), rank=0)
+    recovery.requests_routed({3: [_queued(21)]})
+    _broadcast(recovery, [RequestQueueItem(21, is_canceled_request=True)])
+    assert 21 in recovery._request_owners and recovery._cancelled == {21}
+    recovery.responses_gathered([(21, LlmResponse(request_id=21, result=Mock(is_final=True)))])
+    assert recovery._request_owners == {} and recovery._cancelled == set()
+
+
+def test_a_cancelled_request_of_a_departed_rank_ends_cancelled_not_run_again():
+    """Its rank was lost before it answered the cancellation; a caller waiting after abort() needs a final
+    response."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=4)
+    recovery.requests_routed({FAILED_RANK: [RequestQueueItem(11, request)]})
+    _broadcast(recovery, [RequestQueueItem(11, is_canceled_request=True)])
+    sent = _sent_responses(recovery)
+
+    recovery._recover(_interrupted())
+
+    ((request_id, response),) = sent[-1]
+    assert request_id == 11 and not response.has_error()
+    response.result.deserialize()
+    assert response.result.is_final
+    assert response.result.finish_reasons == [trtllm.FinishReason.CANCELLED]
+    assert recovery._request_owners == {} and recovery._cancelled == set()
+    assert all(item.is_canceled_request for item in recovery._executor.request_accumulated)
+
+
+def test_survivors_join_departed_request_responses():
+    """Ranks without the owner table still take part in the response collective."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    assert recovery._request_owners is None
+    sent = _sent_responses(recovery)
+    recovery._recover(_interrupted())
+    assert sent == [[]]
+
+
+@pytest.mark.parametrize("processed", [0, 1, 2])
+def test_recovery_resends_gathers_rank0_did_not_process(processed):
+    """A rank resends its parts of every gather rank 0 did not process."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    first, second = [(5, Mock(name="first"))], [(6, Mock(name="second"))]
+    recovery.gathering_responses(first)
+    recovery.gathering_responses(second)
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (processed, set()) if isinstance(value, tuple) else value
+    )
+    finished = Mock(name="finished")
+    recovery.defer_terminations([finished])
+    order = []
+    executor = recovery._executor
+    executor._enqueue_responses = lambda responses: order.append(("send", list(responses)))
+    executor._terminate_request = lambda request: order.append(("terminate", request))
+
+    recovery._recover(_interrupted())
+
+    expected = [first + second, second, []][processed]
+    assert order == [("send", expected), ("terminate", finished)]
+    assert recovery._undelivered_terminations == []
+
+
+def test_gathers_are_held_until_the_next_rank_state_exchange_however_many():
+    """Every gather since the last exchange is resent; the exchange releases the earlier ones."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    released = [(0, Mock(name="released"))]
+    recovery.gathering_responses(released)
+    recovery.fetching_requests()
+    held = [[(number, Mock())] for number in range(1, 21)]
+    for responses in held:
+        recovery.gathering_responses(responses)
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (1, set()) if isinstance(value, tuple) else value
+    )
+    sent = []
+    recovery._executor._enqueue_responses = lambda responses: sent.append(list(responses))
+    recovery._recover(_interrupted())
+    assert sent == [[response for responses in held for response in responses]]
+
+
+@pytest.mark.parametrize("gathers_since_exchange", [0, 1])
+def test_recovery_fails_closed_if_an_owed_gather_is_no_longer_held(gathers_since_exchange):
+    """Rank 0 claims it did not process a gather made before the last exchange, also when none is held."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    for number in range(2):
+        recovery.gathering_responses([(number, Mock())])
+    recovery.fetching_requests()
+    for number in range(gathers_since_exchange):
+        recovery.gathering_responses([(2 + number, Mock())])
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (0, set()) if isinstance(value, tuple) else value
+    )
+    with pytest.raises(RuntimeError, match="no longer held"):
+        recovery._recover(_interrupted())
+
+
+def test_recovery_fails_closed_if_gather_numbers_diverged():
+    """Rank 0 cannot have processed a gather this rank never made."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    recovery.gathering_responses([(5, Mock())])
+    recovery._executor.dist.broadcast.side_effect = (
+        lambda value, root: (2, set()) if isinstance(value, tuple) else value
+    )
+    with pytest.raises(RuntimeError, match="made only 1"):
+        recovery._recover(_interrupted())
+
+
 def test_an_unrecoverable_loss_fails_before_waiting_on_the_device():
     recovery = _recovery(_FakeClient(_happy_replies()), failed=frozenset({0}))
     with pytest.raises(RuntimeError, match=r"ranks \[0\] is not recoverable"):
@@ -1621,6 +2393,24 @@ def test_joining_device_work_is_bounded(monkeypatch):
         for thread in threading.enumerate():
             if thread.name == "peer_loss_device_join":
                 thread.join(timeout=5)
+
+
+def test_recovery_delivers_buffered_error_responses_before_readmission():
+    """A request that failed on its rank is retired, not re-admitted as never received."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+    executor = recovery._executor
+    failed_request, error = Mock(name="failed"), Mock(name="error")
+    executor._pending_transfer_responses = [(9, error)]
+    executor._pending_response_terminations = [failed_request]
+    order = []
+    executor._enqueue_responses = lambda responses: order.append(("send", list(responses)))
+    executor._terminate_request = lambda request: order.append(("terminate", request))
+
+    recovery._recover(_interrupted())
+
+    assert order == [("send", [(9, error)]), ("terminate", failed_request)]
+    assert executor._pending_transfer_responses == []
+    assert executor._pending_response_terminations == []
 
 
 def _supported_executor():

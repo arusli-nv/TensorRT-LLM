@@ -35,8 +35,10 @@ from tensorrt_llm._utils import (
     is_mpi_peer_failure,
     peer_loss_recovery_enabled,
 )
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.recovery.config import CONFIG_ENV as FAULT_TOLERANCE_CONFIG_ENV
 from tensorrt_llm.executor.recovery.config import fault_tolerance_config
+from tensorrt_llm.executor.utils import peer_loss_retryable_message
 from tensorrt_llm.logger import logger
 
 from ..distributed.communicator import (
@@ -52,6 +54,7 @@ from .llm_request import (
     LlmRequestState,
     LlmResponse,
     PyResult,
+    executor_request_to_llm_request,
 )
 from .resource_manager import ResourceManagerType
 from .sampler.penalties import has_occurrence_penalty
@@ -739,6 +742,17 @@ class PeerLossRecovery(RecoveryHook):
         if self._heartbeat is not None:
             self._heartbeat.publish(self._executor.iter_counter)
 
+    def _note_progress(self, batch: ScheduledRequests) -> None:
+        """Note the interrupted requests whose step ``batch`` committed: a further loss may interrupt them again."""
+        for request in batch.all_requests():
+            request_id = request.parent_request_id if request.is_child else request.py_request_id
+            if request_id in self._unprogressed:
+                self._unprogressed.discard(request_id)
+                self._progress_report.append(request_id)
+                self._progressed.add(request_id)
+
+    # Request and response hooks
+
     def fetching_requests(self) -> None:
         """The rank-state exchange before a fetch showed every rank received the last broadcast.
 
@@ -746,6 +760,171 @@ class PeerLossRecovery(RecoveryHook):
         """
         self._broadcast_control_items = []
         self._gathers.clear()
+
+    def broadcast_requests(
+        self, broadcast: Callable[[List["RequestQueueItem"]], _T], items: List["RequestQueueItem"]
+    ) -> _T:
+        """Run the request ``broadcast`` of ``items``, keeping what a peer loss would need again.
+
+        The requests of a broadcast a loss interrupts are admitted again after recovery. On rank
+        0, the control items of a broadcast are kept until a later collective shows that every
+        rank received them.
+        """
+        try:
+            result = broadcast(items)
+        except HostCollectiveInterrupted:
+            self._unbroadcast_requests = list(items)
+            raise
+        if self._request_owners is not None:
+            # Its rank answers a cancelled request with a final response; if the rank is lost first, recovery does.
+            for item in items:
+                if item.is_canceled_request and item.id in self._request_owners:
+                    self._cancelled.add(item.id)
+            self._broadcast_control_items = [
+                item
+                for item in items
+                if not item.is_normal_request
+                and not item.is_profile_start_request
+                and not item.is_profile_stop_request
+            ]
+        return result
+
+    def requests_routed(self, routed: Dict[int, List["RequestQueueItem"]]) -> None:
+        """Watch the re-run requests routed to this rank; on rank 0, record the rank serving each new request."""
+        if self._rerouting:
+            own_rank = self._executor.dist.tp_rank
+            for rank, items in routed.items():
+                for item in items:
+                    if item.id in self._rerouting:
+                        self._rerouting.discard(item.id)
+                        if rank == own_rank:
+                            self._unprogressed.add(item.id)
+        if self._request_owners is None:
+            return
+        for rank, items in routed.items():
+            for item in items:
+                self._request_owners[item.id] = (rank, item)
+                for child_id in item.child_req_ids or ():
+                    self._parent_ids[child_id] = item.id
+
+    def requests_cancelled(self, request_ids: Set[int]) -> None:
+        """Stop watching for the routing of cancelled re-run requests: a waiting one is never routed."""
+        self._rerouting -= request_ids
+
+    def gathering_responses(
+        self, responses: Iterable[Tuple[int, LlmResponse]]
+    ) -> ResponseContribution:
+        """Keep this rank's part of a response gather for redelivery; returns it with rank 0's notes."""
+        responses = list(responses)
+        progressed, self._progress_report = self._progress_report, []
+        finished, streaming = [], []
+        answering = self._answering
+        for _, response in responses:
+            if not isinstance(response, LlmResponse):
+                continue
+            request_id = response.request_id
+            # LlmResponse.has_error() without the call: this runs for every response of every step.
+            if response.error_msg is not None or (
+                response.result is not None and response.result.is_final
+            ):
+                finished.append(request_id)
+                answering.discard(request_id)
+            elif request_id not in answering:
+                answering.add(request_id)
+                streaming.append(request_id)
+        self._gather_count += 1
+        self._gathers.append((self._gather_count, responses))
+        return (responses, finished, streaming, progressed) if responses or progressed else ()
+
+    def contribution_responses(self, contributions: Sequence[object]) -> List[object]:
+        """The responses of each part of a gather (rank 0), from what ``gathering_responses`` returned on each
+        rank. A departed rank's None, and a payload of another collective, are kept for the executor to check."""
+        return [
+            contribution[0]
+            if isinstance(contribution, tuple) and len(contribution) == 4
+            else contribution
+            for contribution in contributions
+        ]
+
+    def responses_gathered(
+        self,
+        responses: Iterable[Tuple[int, LlmResponse]],
+        contributions: Optional[Sequence[Optional[Responses]]] = None,
+    ) -> None:
+        """Note that rank 0 processed the last gather; forget finished requests.
+
+        A result is final once every sequence of the request finished, and an
+        error of any sequence ends the whole request.
+
+        Args:
+            responses: The gathered responses.
+            contributions: Per rank, its part of an attention-DP gather (None for a departed rank). Rank 0 reads
+                the notes of each ``ResponseContribution`` tuple instead of its responses.
+        """
+        self._last_processed_gather = self._gather_count
+        if self._request_owners is None:
+            return
+        if contributions is None:
+            self._forget_finished(responses)
+            return
+        for contribution in contributions:
+            if isinstance(contribution, tuple):
+                # Most parts of a streaming step only continue answered requests and note nothing.
+                if contribution and (contribution[1] or contribution[2] or contribution[3]):
+                    self._note_responses(*contribution[1:])
+            elif contribution is not None:
+                self._forget_finished(contribution)
+
+    def _note_responses(
+        self, finished: Iterable[int], streaming: Iterable[int], progressed: Iterable[int]
+    ) -> None:
+        """Retire the requests ``finished`` ends; note the owned ones ``streaming`` answered and those that
+        ``progressed`` since a loss interrupted them (rank 0)."""
+        self._interrupted.difference_update(progressed)
+        for request_id in finished:
+            self._retire(self._parent_ids.get(request_id, request_id))
+        for request_id in streaming:
+            request_id = self._parent_ids.get(request_id, request_id)
+            if request_id in self._request_owners:
+                self._delivered.add(request_id)
+
+    def _forget_finished(self, responses: Iterable[Tuple[int, LlmResponse]]) -> None:
+        """Forget the owners of the requests these responses finish (rank 0)."""
+        if self._request_owners is None:
+            return
+        for _, response in responses:
+            if not isinstance(response, LlmResponse):
+                continue
+            # Results carry the request id; an error can carry a sequence's own id.
+            request_id = self._parent_ids.get(response.request_id, response.request_id)
+            if response.has_error() or (response.result is not None and response.result.is_final):
+                self._retire(request_id)
+            elif request_id in self._request_owners:
+                self._delivered.add(request_id)
+
+    def _answered_request_ids(self, buffered: Responses) -> Set[int]:
+        """Ids of the requests this rank answered in responses not yet delivered."""
+        pending = [response for _, contribution in self._gathers for response in contribution]
+        return {request_id for request_id, _ in pending + buffered}
+
+    def _retire(self, request_id: int) -> None:
+        """Forget a request that ended (finished, failed or cancelled), with its interruption mark."""
+        self._forget(request_id)
+        self._interrupted.discard(request_id)
+
+    def _forget(self, request_id: int) -> None:
+        self._delivered.discard(request_id)
+        self._cancelled.discard(request_id)
+        _, item = self._request_owners.pop(request_id, (None, None))
+        if item is not None:
+            for child_id in item.child_req_ids or ():
+                self._parent_ids.pop(child_id, None)
+
+    def defer_terminations(self, requests: Iterable[LlmRequest]) -> None:
+        """Terminate ``requests`` after recovery delivers their responses."""
+        self._undelivered_terminations.extend(requests)
+
+    # Recovery
 
     def _recover(self, error: HostCollectiveInterrupted) -> None:
         """Continue serving without the departed peers, or raise.
@@ -887,14 +1066,6 @@ class PeerLossRecovery(RecoveryHook):
             # Every survivor updates the same layers from the same statistics from here on.
             load_balancer.reset_update_schedule()
             load_balancer.set_warm_up_iter_count(_EPLB_WARM_UP_ITERS_AFTER_RECOVERY)
-        failed_requests = self._departed_requests(failed)
-        client.send(Installed(rank=rank, generation=generation, failed_requests=failed_requests))
-        self._log_phase("installed", generation)
-        _expect_generation(client.wait(Commit, deadline), generation)
-        self._generation = generation
-        self._log_phase("committed", generation)
-        self._return_remap_room()
-
         # What each survivor holds: the requests it serves and those it already answered (for example
         # rejected ones); none of them may be admitted again. A loss can stop survivors one iteration apart, so
         # they also resume from the same iteration count, which iteration-gated collectives assume. And the
@@ -915,10 +1086,18 @@ class PeerLossRecovery(RecoveryHook):
             self._interrupted.difference_update(*(entry[3] for entry in gathered if entry))
         held = [entry and entry[0] for entry in gathered]
         executor.iter_counter = max(entry[1] for entry in gathered if entry)
+        quarantined = self._quarantine(set().union(*(entry[2] for entry in gathered if entry)))
+        # Rank 0 counts what fails: the quarantined requests and the departed ranks' requests that do not run again.
+        failed_requests = len(quarantined) + self._departed_requests(failed)
+        client.send(Installed(rank=rank, generation=generation, failed_requests=failed_requests))
+        self._log_phase("installed", generation)
+        _expect_generation(client.wait(Commit, deadline), generation)
+        self._generation = generation
+        self._log_phase("committed", generation)
+        self._return_remap_room()
+
         self._requeue_unscheduled_requests(held)
-        rerun, failing = self._deliver_responses(
-            failed, buffered, set().union(*(entry[2] for entry in gathered if entry))
-        )
+        rerun, failing = self._deliver_responses(failed, buffered, quarantined)
         # Rank 0's re-run requests not routed yet, including those an earlier recovery re-admitted.
         self._rerouting = set(dist.broadcast([*self._rerouting, *rerun], root=0))
         self._unprogressed = (self._unprogressed | interrupted) & executor.served_request_ids()
@@ -1345,6 +1524,226 @@ class PeerLossRecovery(RecoveryHook):
             raise RecoveryTimeout("The recovery deadline passed before the device work joined")
         if errors:
             raise errors[0]
+
+    def _departed_requests(self, failed: frozenset) -> int:
+        """How many requests of the departed ranks fail (see ``_deliver_responses``); known on rank 0 only."""
+        if self._request_owners is None:
+            return 0
+        return sum(
+            owner in failed
+            and request_id not in self._cancelled
+            and (request_id in self._delivered or request_id in self._interrupted)
+            for request_id, (owner, _) in self._request_owners.items()
+        )
+
+    def _requeue_unscheduled_requests(self, served: List[Optional[Set[int]]]) -> None:
+        """Admit again the requests that were received but never scheduled.
+
+        A peer loss can interrupt the broadcast of new requests, leaving them on some ranks and
+        not others. Rank 0 holds every such request, so it broadcasts again the ones no survivor
+        started, in arrival order, and records the owner of the ones a survivor did start; the
+        other ranks drop theirs. Cancellations and shutdown of that broadcast are sent again after
+        them; applying them twice has no further effect. Profiler items are not.
+
+        Args:
+            served: Per rank, the ids of the requests it serves (None for a departed rank).
+
+        Raises:
+            RuntimeError: A control request may not have reached every rank.
+        """
+        unscheduled = [*self._executor.take_waiting_requests(), *self._unbroadcast_requests]
+        self._unbroadcast_requests = []
+        control_items, self._broadcast_control_items = self._broadcast_control_items, []
+        if any(item.is_control_request for item in control_items):
+            raise RuntimeError("A peer loss interrupted the broadcast of a control request")
+        if self._request_owners is None:
+            return
+        started = {
+            rank: items
+            for rank, ids in enumerate(served)
+            if ids and (items := [item for item in unscheduled if item.id in ids])
+        }
+        self.requests_routed(started)
+        started_ids = {item.id for items in started.values() for item in items}
+        self._executor.readmit_requests(
+            [*(item for item in unscheduled if item.id not in started_ids), *control_items]
+        )
+
+    def _quarantine(self, interrupted: Set[int]) -> Set[int]:
+        """Of the survivors' ``interrupted`` requests (in the discarded steps), those that fail (on rank 0).
+
+        A request is interrupted once at most without progress: one a loss interrupted before and that committed
+        no step since fails, as it may be what crashes the ranks. The others are noted as interrupted.
+        """
+        quarantined = set()
+        if self._request_owners is None:
+            return quarantined
+        for request_id in interrupted:
+            if request_id not in self._request_owners:
+                continue
+            if request_id in self._interrupted:
+                quarantined.add(request_id)
+            else:
+                self._interrupted.add(request_id)
+        return quarantined
+
+    def _deliver_responses(
+        self,
+        failed: frozenset,
+        buffered: Tuple[Responses, List[LlmRequest]],
+        quarantined: Set[int],
+    ) -> Tuple[List[int], int]:
+        """Deliver what the interrupted gathers owed their clients.
+
+        Collective over the survivors. Every survivor resends its parts of the
+        gathers rank 0 did not process, and the ``buffered`` error responses it
+        held for the next synchronized flush, then terminates the requests they
+        finished. Every survivor fails rank 0's ``quarantined`` requests (see ``_quarantine``).
+        Rank 0 also takes over the requests that were running on a departed
+        attention-DP rank, whose KV cache left with it: those that delivered nothing run again
+        from their prompt; the others fail, and cancelled ones end cancelled. Like a quarantined
+        request, a departed rank's request that a loss interrupted before and that reported no
+        committed step since (in a response gather rank 0 processed) fails.
+
+        Returns:
+            The ids of the requests that run again and how many fail (on rank 0; none elsewhere).
+        """
+        executor = self._executor
+        processed, quarantined = executor.dist.broadcast(
+            (self._last_processed_gather, quarantined), root=0
+        )
+        executor.fail_requests(
+            quarantined,
+            peer_loss_retryable_message(
+                "A peer loss interrupted this request a second time; it may be what crashes the "
+                "ranks, so it is not continued; retry it"
+            ),
+        )
+        # Every rank numbers the gathers alike because each calls them in the
+        # same sequence, and rank 0 processes a gather only once every rank sent.
+        if self._gather_count < processed:
+            raise RuntimeError(
+                f"Rank 0 processed response gather {processed}, but this rank "
+                f"made only {self._gather_count}"
+            )
+        if self._gather_count > processed and (
+            not self._gathers or self._gathers[0][0] > processed + 1
+        ):
+            raise RuntimeError(
+                f"Response gather {processed + 1} is owed but no longer held for redelivery"
+            )
+        responses = [
+            response
+            for number, contribution in self._gathers
+            if number > processed
+            for response in contribution
+        ]
+        self._gathers.clear()
+        # Rank 0 did not read the notes of these parts: note their requests again when they are resent.
+        self._answering.difference_update(
+            response.request_id for _, response in responses if isinstance(response, LlmResponse)
+        )
+        # A rank may have completed gathers rank 0 did not: number them like rank 0 from here on.
+        self._gather_count = self._last_processed_gather = processed
+        buffered_responses, buffered_terminations = buffered
+        responses += buffered_responses
+        self._undelivered_terminations += buffered_terminations
+        rerun = []
+        failed_requests = len(quarantined) if self._request_owners is not None else 0
+        if self._request_owners is not None:
+            # A request that delivered nothing runs again from its prompt on a survivor (only rank 0's own parts
+            # are redelivered, so what it delivered is known now), unless a loss interrupted it before: it may be
+            # what crashed its rank. One that streamed tokens fails.
+            for request_id, (owner, item) in list(self._request_owners.items()):
+                if owner not in failed:
+                    continue
+                streamed = request_id in self._delivered
+                interrupted_before = request_id in self._interrupted
+                cancelled = request_id in self._cancelled
+                self._forget(request_id)
+                if cancelled:
+                    responses += _cancelled_responses(item)
+                    continue
+                if not streamed and not interrupted_before:
+                    self._interrupted.add(request_id)
+                    _relax_attention_dp_pin(item)
+                    rerun.append(item)
+                    continue
+                reason = (
+                    "had streamed tokens"
+                    if streamed
+                    else "an earlier peer loss had already interrupted"
+                )
+                failed_requests += 1
+                responses.append(
+                    (
+                        request_id,
+                        LlmResponse(
+                            request_id=request_id,
+                            error_msg=peer_loss_retryable_message(
+                                f"Attention DP rank {owner} failed while serving this request, "
+                                f"which {reason}; retry it"
+                            ),
+                            client_id=getattr(item.request, "client_id", None),
+                        ),
+                    )
+                )
+        terminations, self._undelivered_terminations = self._undelivered_terminations, []
+        executor.publish_responses(responses, terminations)
+        self._forget_finished(responses)
+        if rerun:
+            executor.readmit_requests(rerun)
+        return [item.id for item in rerun], failed_requests
+
+    def _readmit_undelivered_requests(
+        self, failed: frozenset, held: Sequence[Optional[Set[int]]]
+    ) -> None:
+        """Re-admit requests that rank 0 routed to a survivor which never received them.
+
+        Collective over the survivors. A loss can interrupt the broadcast of new
+        requests after rank 0 completed its part, so rank 0 can route a request
+        that its owner never received. The owner never started it, so rank 0
+        admits it again. Runs after redelivery, which retires finished requests.
+
+        Args:
+            held: Per rank, the ids of the requests it serves or answered (None for a departed rank).
+        """
+        if self._request_owners is None:
+            return
+        missing = [
+            item
+            for request_id, (owner, item) in self._request_owners.items()
+            if owner not in failed and request_id not in held[owner]
+        ]
+        for item in missing:
+            self._forget(item.id)
+        if missing:
+            self._log(
+                logger.warning,
+                f"Re-admitting {len(missing)} requests that never reached their rank",
+            )
+            self._executor.readmit_requests(missing)
+
+
+def _cancelled_responses(item: "RequestQueueItem") -> Responses:
+    """The final responses, one per sequence, of a cancelled request whose rank was lost with its output."""
+    request = executor_request_to_llm_request(item.id, item.request, item.child_req_ids, False)
+    responses = []
+    for sequence in (request, *request.child_requests):
+        sequence.finish_by_reason(FinishReason.CANCELLED)
+        responses.append((sequence.py_request_id, sequence.create_response()))
+    return responses
+
+
+def _relax_attention_dp_pin(item: "RequestQueueItem") -> None:
+    """Let a request strictly pinned to a lost rank run again on any survivor.
+
+    The request was accepted while its rank served; a new request pinned to a lost rank still fails.
+    """
+    params = getattr(item.request, "py_scheduling_params", None)
+    if params is not None and not params.attention_dp_relax:
+        item.request.py_scheduling_params = dataclasses.replace(params, attention_dp_relax=True)
+
 
 def install_recovery_placement(
     state: "MoeExecutionState",
