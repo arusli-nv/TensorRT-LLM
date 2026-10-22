@@ -7,6 +7,7 @@ import dataclasses
 import datetime
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -16,7 +17,7 @@ from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, Optional, Tuple, Union)
+                    Literal, Optional, Set, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -55,7 +56,7 @@ from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL, OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
@@ -70,7 +71,7 @@ from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
-from ..distributed.communicator import ReduceOp
+from ..distributed.communicator import HostCollectiveInterrupted, ReduceOp
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -109,6 +110,8 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
+from .peer_loss_recovery import (PeerLossRecovery, PreparedStep, RecoveryHook,
+                                 StepChange)
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
@@ -419,6 +422,15 @@ class PyExecutor:
     # Attention-DP context balance: decisions without arrivals after which a burst
     # of arrivals counts as ended. A burst reaches every rank within 1-3 decisions.
     ADP_BURST_QUIET_ITERS = 4
+
+    # The recovery hook for a peer process loss; the do-nothing base when recovery is off.
+    _peer_loss_recovery: RecoveryHook = RecoveryHook()
+    # The request changes of the step being prepared, recorded for peer-loss
+    # recovery; None when recovery is off.
+    _step_changes: Optional[List[StepChange]] = None
+    # Under the overlap scheduler with recovery: the batch whose recompute
+    # victims are freed but not yet paused.
+    _recompute_unpaused: Optional[ScheduledRequests] = None
 
     def __init__(
         self,
@@ -1173,6 +1185,7 @@ class PyExecutor:
         self.dwdp_manager = dwdp_manager
 
         self._validate_moe_a2a_checkpoint_support()
+        self._peer_loss_recovery = PeerLossRecovery.create(self)
 
         if start_worker:
             self.start_worker()
@@ -1427,9 +1440,10 @@ class PyExecutor:
             # Even when this rank has no responses we must participate in the
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
-            self._enqueue_responses(responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+            self.publish_responses(responses, requests_to_terminate)
+        else:
+            for request in requests_to_terminate:
+                self._terminate_request(request)
 
     def _flush_iter_stats_synced(self):
         """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
@@ -1476,7 +1490,7 @@ class PyExecutor:
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-                self.event_loop()
+                self._peer_loss_recovery.run(self.event_loop)
         except Exception as e:
             # A raise AFTER the loop reached its own normal-exit `break` (from
             # the profiler's or hang detector's __exit__, or from the enclosing
@@ -1494,6 +1508,15 @@ class PyExecutor:
             crashed = not self._event_loop_completed
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
+            if crashed and self._peer_loss_recovery.exits_alone(e):
+                # The survivors recover from this rank's loss like any other,
+                # so the rank exits at once: cleanup would enter collectives
+                # with them, and an MPI abort would end the whole job.
+                logger.error("Killing this rank after a local fatal error so "
+                             "that its peers can recover from its loss")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.kill(os.getpid(), signal.SIGKILL)
             # Stash the original error so local consumers
             # (_await_single_response and BaseWorker.AwaitResponseHelper)
             # can surface it instead of letting callers hang. We do NOT
@@ -4878,6 +4901,10 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
+                if self._peer_loss_recovery.enabled and self.previous_batch is None:
+                    # No step in flight, so the KV cache can resize.
+                    self._peer_loss_recovery.serving_idle()
+
                 self.disagg.handle_errors_synced()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
@@ -4917,6 +4944,9 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
                     self._pause_recompute_paused_requests(scheduled_batch)
+                    # The V2 scheduler allocates KV cache with the batch.
+                    if self._peer_loss_recovery.enabled:
+                        self._peer_loss_recovery.step_prepared(scheduled_batch)
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
@@ -4957,6 +4987,7 @@ class PyExecutor:
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                    self._peer_loss_recovery.step_released()
                 self._finalize_adp_dummy_allocation(can_queue)
 
                 if not can_queue and scheduled_batch.encoder_requests:
@@ -5048,6 +5079,10 @@ class PyExecutor:
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
 
+                    if self._peer_loss_recovery.enabled:
+                        self._peer_loss_recovery.commit_step(
+                            scheduled_batch, sample_state)
+
                     # Handle SaveHiddenStates mode - save hidden states after forward
                     if not self.is_warmup:
                         spec_resource_mgr = self.resource_manager.resource_managers.get(
@@ -5058,7 +5093,6 @@ class PyExecutor:
                                                     'spec_metadata', None)
                             spec_resource_mgr.process_and_save(
                                 scheduled_batch, spec_metadata)
-
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
                     if self.speculation_gate is not None:
@@ -5561,6 +5595,35 @@ class PyExecutor:
         # Rebalancing can change the number of primary blocks.
         self._kv_cache_capacity = self._read_kv_cache_capacity()
 
+    def resize_kv_cache_quota(self, delta: int) -> bool:
+        """Change the KV cache's device memory by ``delta`` bytes; False if it cannot.
+
+        A negative ``delta`` returns memory to the driver; pages that no longer
+        fit move to the host tier. Only while the model is idle: no forward in
+        flight and every step committed or discarded. Peer-loss recovery uses
+        it, which refuses a KV cache transceiver and so remote-tail attention DP.
+        """
+        mgr = self.kv_cache_manager
+        paused = [
+            req for req in self.active_requests
+            if mgr.is_request_active(req.py_request_id)
+        ]
+        for req in paused:
+            mgr.suspend_request(req)
+        paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
+        try:
+            quota = mgr.impl.get_quota(GPU_LEVEL)
+            resized = quota + delta > 0 and mgr.impl.resize(
+                GPU_LEVEL, quota + delta)
+        finally:
+            # A request that cannot resume stays suspended until the scheduler
+            # resumes it.
+            for req in paused:
+                mgr.resume_request(req)
+            self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+            self._kv_cache_capacity = self._read_kv_cache_capacity()
+        return resized
+
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.
 
@@ -5756,6 +5819,10 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
+                if self._peer_loss_recovery.enabled and self.previous_batch is None:
+                    # No step in flight, so the KV cache can resize.
+                    self._peer_loss_recovery.serving_idle()
+
                 self.disagg.handle_errors_synced()
 
                 # Need to wait for the copy of previous iteration before
@@ -5790,6 +5857,14 @@ class PyExecutor:
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
+                    # The V2 scheduler allocates KV cache with the batch.
+                    if self._peer_loss_recovery.enabled:
+                        self._step_changes = self._peer_loss_recovery.step_prepared(
+                            scheduled_batch)
+                        # Recompute victims are freed now and paused after the
+                        # previous step's responses; a peer loss in between
+                        # pauses them in the discard.
+                        self._recompute_unpaused = scheduled_batch
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
@@ -5833,6 +5908,8 @@ class PyExecutor:
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                    if self._is_kv_manager_v2:
+                        self._peer_loss_recovery.step_released()
                 self._finalize_adp_dummy_allocation(can_queue)
 
                 if not can_queue and scheduled_batch.encoder_requests:
@@ -5889,6 +5966,19 @@ class PyExecutor:
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    # The step before runs a step ahead; its results apply
+                    # only once it is accepted.
+                    if self._peer_loss_recovery.enabled:
+                        self._peer_loss_recovery.commit_step(
+                            self.previous_batch.scheduled_requests,
+                            self.previous_batch.sample_state)
+                        if self.previous_batch.scheduled_requests.context_requests:
+                            # Deferred from its step: it commits the chunks' blocks.
+                            # It can rewrite host page-index rows that the current
+                            # step's input copy may still be reading.
+                            self._wait_for_model_engine_input_copy()
+                            self._update_v2_context_resources(
+                                self.previous_batch.scheduled_requests)
                     self._update_requests(self.previous_batch.sample_state)
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
@@ -5920,6 +6010,7 @@ class PyExecutor:
 
                 if self._is_kv_manager_v2:
                     self._pause_recompute_paused_requests(scheduled_batch)
+                    self._recompute_unpaused = None
                 else:
                     self._pause_requests(scheduled_batch.paused_requests)
 
@@ -5955,8 +6046,11 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
+                    # With peer-loss recovery this waits until the step is
+                    # accepted: it commits the chunk's blocks for reuse.
                     if (self._is_kv_manager_v2
-                            and scheduled_batch.context_requests):
+                            and scheduled_batch.context_requests
+                            and not self._peer_loss_recovery.enabled):
                         self._update_v2_context_resources(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
@@ -6377,6 +6471,8 @@ class PyExecutor:
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
+        if self._peer_loss_recovery.enabled:
+            self._peer_loss_recovery.fetching_requests()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # A draining control request must still receive transfer completions.
@@ -6427,8 +6523,12 @@ class PyExecutor:
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
         # empty iterations.
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests)
+        if self._peer_loss_recovery.enabled:
+            new_requests, py_request_objects = self._peer_loss_recovery.broadcast_requests(
+                self.request_broadcaster.broadcast, new_requests)
+        else:
+            new_requests, py_request_objects = self.request_broadcaster.broadcast(
+                new_requests)
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -6688,10 +6788,21 @@ class PyExecutor:
             if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
+            unservable = []
+            # Without new requests (most iterations) nothing is split off or routed.
+            if self._peer_loss_recovery.enabled and new_requests:
+                new_requests, unservable = self.adp_router.split_unservable_requests(
+                    new_requests, all_rank_states)
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
+            if self._peer_loss_recovery.enabled and new_requests:
+                self._peer_loss_recovery.requests_routed(all_ranks_new_requests)
+            # After the routed requests are recorded: failing these gathers
+            # responses, which a peer loss can interrupt.
+            if unservable:
+                self._fail_unservable_requests(unservable)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
@@ -6715,6 +6826,28 @@ class PyExecutor:
                               cp_size=self.dist.cp_size,
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits())
+
+    def _fail_unservable_requests(self,
+                                  requests: List[RequestQueueItem]) -> None:
+        """Fail requests strictly pinned to an attention-DP rank that is not serving; retrying cannot succeed.
+
+        Every rank routes the same requests, so every rank reaches the response
+        collective together.
+        """
+        responses = []
+        if self.dist.rank == 0 or self.gather_all_responses:
+            for item in requests:
+                target = item.request.py_scheduling_params.attention_dp_rank
+                responses.append((
+                    item.id,
+                    LlmResponse(
+                        request_id=item.id,
+                        error_msg=
+                        (f"Attention DP rank {target} is not serving: send the request "
+                         "without attention_dp_rank or with attention_dp_relax"
+                         ),
+                        client_id=getattr(item.request, "client_id", None))))
+        self._enqueue_responses(responses)
 
     def _handle_special_queue_items(
             self,
@@ -6777,6 +6910,8 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
+                if self._peer_loss_recovery.enabled:
+                    self._peer_loss_recovery.validate_request(request)
                 if self._mm_encoder_item_scheduling_enabled:
                     initialize_multimodal_encoder_request(
                         request,
@@ -8432,6 +8567,7 @@ class PyExecutor:
                 # R3: the forward did not complete -- drop the armed capture so
                 # the next iteration does not inherit this step's layout.
                 route_capture.abort_forward()
+            self._raise_if_peer_failed("forward", e)
             traceback.print_exc()
             error_msg = str(e)
             logger.error(
@@ -8449,6 +8585,7 @@ class PyExecutor:
         for request in generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
             ):
+                self._note_step_change(request)
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
@@ -8470,11 +8607,67 @@ class PyExecutor:
         if mm_data:
             strip_mm_data_for_generation(mm_data)
 
+    # Peer-loss recovery (see PeerLossRecovery) drives the executor through the
+    # methods below and publish_responses.
+
+    def discard_interrupted_steps(self, steps: Iterable[PreparedStep]) -> None:
+        """Undo steps that a peer loss interrupted before their results applied.
+
+        ``steps`` come newest first. Each step's request changes, logits and
+        additional outputs are undone and the KV cache reserved for it, target
+        and draft, is returned, as is the attention-DP padding request, so that
+        the steps' requests are scheduled again unchanged and the loop restarts
+        from host state.
+        """
+        self._finalize_adp_dummy_allocation(False)
+        for step in steps:
+            for (request, position, state, draft_tokens,
+                 exclude_last_generation_logits) in reversed(step.changes):
+                request.context_current_position = position
+                request.state = state
+                request.py_draft_tokens = draft_tokens
+                request.set_exclude_last_generation_logits(
+                    exclude_last_generation_logits)
+            for result, checkpoint in step.results:
+                result.rollback(checkpoint)
+            self.kv_cache_manager.revert_prepare_resources(
+                step.batch, step.context_capacities)
+            if self.draft_kv_cache_manager is not None:
+                # A draft context cache keeps its size: the step's rerun asks
+                # for the same capacity.
+                self.draft_kv_cache_manager.revert_prepare_resources(
+                    step.batch, {})
+        # After the restore: a recompute victim's KV cache is already freed, so
+        # it restarts its prefill even if an undone step had advanced it.
+        if self._recompute_unpaused is not None:
+            self._pause_recompute_paused_requests(self._recompute_unpaused)
+            self._recompute_unpaused = None
+        self._terminate_attention_dp_dummy_requests()
+        self._step_changes = None
+        self.previous_batch = None
+        # No step's output tokens are on the device any more: every request
+        # takes its input from host state, as after a pause.
+        for request in self.active_requests:
+            request.py_batch_idx = None
+
+    def _note_step_change(self, request: LlmRequest) -> None:
+        """Remember what the step being prepared changes on ``request``, so peer-loss recovery can undo it."""
+        self._step_changes.append(PreparedStep.change(request))
+
+    def _raise_if_peer_failed(self, operation: str, error: Exception) -> None:
+        """Report an error of a step that a peer loss interrupted as such."""
+        if isinstance(error, HostCollectiveInterrupted):
+            raise error
+        if self._peer_loss_recovery.peer_failed:
+            raise HostCollectiveInterrupted(operation, frozenset()) from error
+
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy requests
         self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
+            if self._step_changes is not None:
+                self._note_step_change(request)
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.py_last_context_chunk = (
                     request.context_current_position,
@@ -8542,6 +8735,9 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
+                if self._peer_loss_recovery.enabled:
+                    self._peer_loss_recovery.step_outputs_appending(
+                        scheduled_batch)
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
                                batch_outputs["logits"], beam_width,
@@ -8562,6 +8758,7 @@ class PyExecutor:
             self._maybe_record_hang_diagnostic_phase("sampling_skipped",
                                                      scheduled_batch)
         except Exception as e:
+            self._raise_if_peer_failed("sampling", e)
             self._maybe_record_hang_diagnostic_phase("sampling_error",
                                                      scheduled_batch)
             traceback.print_exc()
@@ -8587,6 +8784,9 @@ class PyExecutor:
         try:
             self.sampler.update_requests(sample_state, resource_manager)
             self._accumulate_spec_dec_stats(sample_state)
+        except HostCollectiveInterrupted:
+            # A peer loss is not a sampling error; peer-loss recovery handles it.
+            raise
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -8818,9 +9018,8 @@ class PyExecutor:
             self._pending_transfer_responses = []
             pending_terminations = self._pending_response_terminations
             self._pending_response_terminations = []
-            self._enqueue_responses(pending + list(error_responses.items()))
-            for request in pending_terminations:
-                self._terminate_request(request)
+            self.publish_responses(pending + list(error_responses.items()),
+                                   pending_terminations)
 
         if not defer_termination:
             for request in failed_requests:
@@ -8954,6 +9153,7 @@ class PyExecutor:
 
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
+        self._peer_loss_recovery.requests_cancelled(canceled_req_ids_set)
 
         # Remove canceled requests from the waiting queue
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
@@ -8984,6 +9184,34 @@ class PyExecutor:
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
+    def fail_requests(self, request_ids: Set[int], error_msg: str) -> None:
+        """Fail every sequence of the active requests ``request_ids`` with ``error_msg``."""
+        requests = [
+            request for request in self.active_requests
+            if (request.parent_request_id if request.is_child else request.
+                py_request_id) in request_ids
+        ]
+        if requests:
+            self._handle_errors(error_msg,
+                                requests=requests,
+                                charge_budget=False)
+
+    def publish_responses(self, responses: Iterable[Tuple[int, LlmResponse]],
+                          terminations: Iterable[LlmRequest]) -> None:
+        """Enqueue ``responses``, then terminate the requests they finish.
+
+        If a peer loss interrupts the response gather, peer-loss recovery
+        delivers the responses and terminates the requests afterwards.
+        """
+        terminations = list(terminations)
+        try:
+            self._enqueue_responses(responses)
+        except HostCollectiveInterrupted:
+            self._peer_loss_recovery.defer_terminations(terminations)
+            raise
+        for request in terminations:
+            self._terminate_request(request)
+
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         self._maybe_record_hang_diagnostic_phase("enqueueing_responses")
@@ -8991,15 +9219,25 @@ class PyExecutor:
             self._maybe_record_hang_diagnostic_phase("response_enqueue_skipped")
             return
 
+        responses_list = None
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
-                responses_list = self.dist.tp_gather(responses)
+                if self._peer_loss_recovery.enabled:
+                    responses = self._peer_loss_recovery.gathering_responses(
+                        responses)
+                # A departed rank contributes no responses (skipped below).
+                responses_list = self.dist.tp_gather(responses, departed=None)
             else:
-                responses_list = self.dist.allgather(responses)
+                responses_list = self.dist.allgather(responses, departed=None)
             if self.dist.rank == 0 or self.gather_all_responses:
                 gather_responses = []
                 if responses_list is not None:
-                    for resp in responses_list:
+                    parts = responses_list
+                    if (self._peer_loss_recovery.enabled
+                            and not self.gather_all_responses):
+                        parts = self._peer_loss_recovery.contribution_responses(
+                            responses_list)
+                    for resp in parts:
                         if resp is None:
                             continue
                         if not isinstance(resp, (list, tuple)):
@@ -9024,6 +9262,10 @@ class PyExecutor:
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
+
+        if self._peer_loss_recovery.enabled:
+            self._peer_loss_recovery.responses_gathered(responses,
+                                                        responses_list)
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
@@ -9261,9 +9503,7 @@ class PyExecutor:
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
-        self._enqueue_responses(new_responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+        self.publish_responses(new_responses, requests_to_terminate)
         # Under multi-rank ADP the coordinator defers the error response to
         # its synced drain; an in-place tp_allgather here would desync
         # (reached from per-rank-divergent gates).

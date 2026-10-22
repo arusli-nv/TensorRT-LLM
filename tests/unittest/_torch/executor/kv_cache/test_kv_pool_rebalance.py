@@ -40,6 +40,7 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import RecoveryHook
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager, OutOfPagesError
@@ -89,6 +90,9 @@ def _make_executor(
     gets its own coverage in ``TestRebalanceCheckThrottle``.
     """
     exe = MagicMock(spec=PyExecutor)
+    # WideEP peer-loss recovery off, as PyExecutor sets it up by default.
+    exe._peer_loss_recovery = RecoveryHook()
+    exe._step_changes = None
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
@@ -555,7 +559,7 @@ class TestConsumePreviousBatch:
             exe.perf_manager = MagicMock()
 
             # Script peer contributions, but check each rank's actual submitted responses.
-            def gather_responses(local_responses: list) -> list | None:
+            def gather_responses(local_responses: list, departed=None) -> list | None:
                 phase = len(transcripts[rank])
                 assert phase < 2
                 expected = [[], []] if phase == 0 else batch_responses
@@ -610,6 +614,7 @@ class TestConsumePreviousBatch:
             )
             exe._handle_responses = MethodType(PyExecutor._handle_responses, exe)
             exe._enqueue_responses = MethodType(PyExecutor._enqueue_responses, exe)
+            exe.publish_responses = MethodType(PyExecutor.publish_responses, exe)
             exe._add_kv_cache_events = MethodType(PyExecutor._add_kv_cache_events, exe)
             return exe
 

@@ -217,6 +217,7 @@ def test_executor_releases_consumed_encoder_outputs_per_chunk_only_for_v2(use_v2
     request.context_chunk_size = 2
     executor = SimpleNamespace(
         _is_kv_manager_v2=use_v2,
+        _step_changes=None,
         _terminate_attention_dp_dummy_requests=lambda: None,
         model_engine=SimpleNamespace(mm_encoder_cache=cache),
     )
