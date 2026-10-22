@@ -37,3 +37,15 @@ dtypes, replay environment variables, and accuracy-validation requirements.
 | Logits Post Processor                                       | Yes               | Yes        | Yes                | Yes                  | Yes                | Yes               | Yes                        | No                    | Yes             | No                            | No                                   | No                                                        | Yes           | Yes            | Yes                      | ---                   |                 |          |
 | Guided Decoding                                             | Yes               | Yes        | Yes                | Yes                  | Yes                | Yes               | Yes                        | Yes                   | Yes             | Yes                           | Yes                                  | Yes                                                       | Yes           | Yes            | Yes                      | Yes                   | ---             |          |
 | LoRA                                                        | Yes               | Yes        | Yes                | Yes                  | Untested           | Untested          | Untested                   | Untested              | Yes             | Untested                      | Untested                             | Untested                                                  | Yes           | Yes            | Yes                      | Yes                   | Untested        | ---      |
+
+[WideEP fault tolerance](wide-ep-fault-tolerance.md) (experimental) supports fewer combinations than the
+matrix above; its page lists every refused feature:
+
+| Feature | WideEP fault-tolerance constraint |
+|---|---|
+| TP / EP / attention DP | Pure attention DP only: `tp_size == moe_ep_size == world_size`, NVLinkOneSided MoE communication |
+| PP / CP / expert TP | Refused at startup |
+| Overlap / CUDA graphs | Supported; no graph is recaptured after a recovery |
+| Speculative decoding | Every method accepted; only one-model MTP with a linear draft is tested |
+| Disaggregated serving / guided decoding / beam search / LoRA | Refused at startup |
+| Logits post processor / repetition, presence and frequency penalties | Rejected per request |
