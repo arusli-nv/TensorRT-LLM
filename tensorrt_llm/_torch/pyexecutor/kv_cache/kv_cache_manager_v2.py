@@ -4410,6 +4410,66 @@ class KVCacheManagerV2(BaseResourceManager):
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
 
+    def context_capacities(self, scheduled_batch: ScheduledRequests) -> Dict[int, Optional[int]]:
+        """Each context request's capacity before the step's resize, by request id.
+
+        Taken right after scheduling: the next step overwrites ``py_ctx_pre_resize_cap`` when it schedules
+        the request's next chunk before this step is accepted (overlap scheduler).
+        """
+        return {
+            req.py_request_id: req.py_ctx_pre_resize_cap for req in scheduled_batch.context_requests
+        }
+
+    def revert_prepare_resources(
+        self, scheduled_batch: ScheduledRequests, context_capacities: Dict[int, Optional[int]]
+    ) -> None:
+        """Undo the scheduler's KV cache allocations for a step whose forward is discarded.
+
+        Steps are reverted newest first; ``context_capacities`` is the step's :meth:`context_capacities`.
+        A request's first context chunk frees its cache; a later chunk shrinks back to its capacity before
+        the step and stays resident; a generation request gives back the step's newest allocation. A cache
+        that is no longer active is left alone. Connectors and SWA scratch reuse are not reverted.
+
+        Raises:
+            RuntimeError: A cache could not be resized back.
+        """
+        for req in scheduled_batch.context_requests:
+            if req.is_first_context_chunk:
+                # Preparing it may have matched a reused prefix and moved the context cursor past it.
+                self.free_resources(req)
+                rewind_context_after_cache_drop(req, self.tokens_per_block)
+                continue
+            req.py_ctx_pre_resize_cap = None
+            pre_cap = context_capacities.get(req.py_request_id)
+            kv_cache = self.kv_cache_map.get(req.py_request_id)
+            if pre_cap is None or kv_cache is None or not kv_cache.is_active:
+                continue
+            if not kv_cache.resize(pre_cap):
+                raise RuntimeError(
+                    f"Failed to revert KV cache capacity for context request "
+                    f"{req.py_request_id} to {pre_cap}"
+                )
+            self._after_shrink(req.py_request_id, kv_cache)
+        for req in scheduled_batch.generation_requests:
+            request_id = req.py_request_id
+            inflight = self._inflight_draft_lens.get(request_id)
+            if not inflight:
+                continue
+            draft_slots = inflight.pop()
+            if not inflight:
+                del self._inflight_draft_lens[request_id]
+            self._allocated_draft_lens.pop(request_id, None)
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is None or not kv_cache.is_active:
+                continue
+            reverted_cap = kv_cache.capacity - 1 - draft_slots
+            if reverted_cap >= 0 and not kv_cache.resize(reverted_cap):
+                raise RuntimeError(
+                    f"Failed to revert KV cache capacity for request {request_id} from "
+                    f"{kv_cache.capacity} to {reverted_cap}"
+                )
+            self._after_shrink(request_id, kv_cache)
+
     def _publish_sparse_metadata(self) -> None:
         """Refresh stable GPU rows on the execution stream before model work.
 
