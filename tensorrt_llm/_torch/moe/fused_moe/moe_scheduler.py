@@ -50,7 +50,9 @@ import torch
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm._utils import peer_loss_recovery_enabled
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
@@ -133,6 +135,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
     separate MoE communication timing from rank skew or load-imbalance
     artifacts when analyzing traces.
     """
+
+    def __init__(self, moe: "ConfigurableMoE") -> None:
+        super().__init__(moe)
+        # Only peer-loss recovery looks the slots up in a table inside the NVLinkOneSided dispatch.
+        self._peer_loss_recovery = peer_loss_recovery_enabled()
 
     def forward(
         self,
@@ -255,6 +262,20 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
+
+    def _dispatch_slot_table(self) -> Optional[torch.Tensor]:
+        """The expert -> slot table NVLinkOneSided dispatch looks the slots up in instead of route(), or None.
+
+        Only with peer-loss recovery and one slot per expert. ExpertStatistic and the calibrator read the slot
+        ids route() returns, so they keep it.
+        """
+        if not (
+            self._is_using_nvlink_one_sided()
+            and ExpertStatistic.expert_statistic_obj is None
+            and get_calibrator().mode == CalibratorMode.NONE
+        ):
+            return None
+        return self.moe.layer_load_balancer.one_slot_table()
 
     # ------------------------------------------------------------------
     # DeepGemm workspace allocation
@@ -525,6 +546,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_final_scales = None
 
         # ========== Step 3: EPLB - Update statistics and route ==========
+        expert_to_slot = None
         if moe.layer_load_balancer and token_selected_experts is not None:
             moe._load_balancer_done_wait_gpu_stage(is_first_call)
 
@@ -540,7 +562,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 ignore_allreduce=ignore_allreduce,
             )
 
-            token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            if self._peer_loss_recovery:
+                expert_to_slot = self._dispatch_slot_table()
+            if expert_to_slot is None:
+                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            else:
+                token_selected_slots = token_selected_experts
         else:
             token_selected_slots = token_selected_experts
 
@@ -587,6 +614,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 moe.dummy_allreduce()
 
             dispatch_kwargs = dict(eplb_dispatch_kwargs)
+            if expert_to_slot is not None:
+                dispatch_kwargs["expert_to_slot"] = expert_to_slot
             # Only DeepEP.dispatch reads this; every other strategy absorbs it
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:

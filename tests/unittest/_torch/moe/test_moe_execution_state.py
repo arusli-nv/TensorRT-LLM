@@ -5,16 +5,18 @@
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.alltoall_watchdog import ActiveRankMaskSnapshot
+from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm.bindings import internal
 
 
@@ -312,3 +314,73 @@ def test_for_model_binds_a_layer_with_an_unfinalized_combine(monkeypatch) -> Non
     state = MoeExecutionState.for_model(moe)
     bind.assert_called_once_with(state)
     assert state.progress_comm is moe.comm
+
+
+@pytest.mark.parametrize("recovery", [True, False])
+def test_scheduler_records_peer_loss_recovery_and_finds_the_one_slot_table(
+    monkeypatch, recovery: bool
+) -> None:
+    """The scheduler records whether peer-loss recovery is on; its slot table is the one-slot table either way."""
+    monkeypatch.setattr(moe_scheduler, "peer_loss_recovery_enabled", lambda: recovery)
+    table = torch.zeros(2, dtype=torch.int32)
+    comm = _frontend(EPGroupHealth(2))
+    scheduler = ExternalCommMoEScheduler(
+        SimpleNamespace(
+            comm=comm,
+            enable_alltoall=True,
+            layer_load_balancer=Mock(one_slot_table=Mock(return_value=table)),
+        )
+    )
+    assert scheduler._peer_loss_recovery is recovery
+    assert scheduler._dispatch_slot_table() is table
+
+
+class _Dispatched(Exception):
+    """Stops the scheduler at the dispatch, carrying the dispatch's keyword arguments."""
+
+
+@pytest.mark.parametrize("recovery", [True, False])
+def test_only_peer_loss_recovery_dispatches_by_the_expert_to_slot_table(
+    monkeypatch, recovery: bool
+) -> None:
+    """Without peer-loss recovery the scheduler routes the slots itself and never passes a slot table, so the
+    dispatch never takes the kernel's expert-to-slot (USE_EXPERT_TO_SLOT) path."""
+    monkeypatch.setattr(moe_scheduler, "peer_loss_recovery_enabled", lambda: recovery)
+    table = torch.zeros(4, dtype=torch.int32)
+    experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    comm = Mock(spec=NVLinkOneSided)
+    comm.supports_post_quant_dispatch.return_value = True
+
+    def dispatch(**kwargs):
+        raise _Dispatched(kwargs)
+
+    comm.dispatch.side_effect = dispatch
+    moe = MagicMock(comm=comm, apply_router_weight_on_input=False, enable_dummy_allreduce=False)
+    moe.routing_method.experts_per_token = 2
+    moe.routing_method.apply.return_value = (experts, torch.ones(2, 2))
+    moe.backend.input_requirement.routing_scales_dtype = None
+    moe.backend.input_requirement.requires_sanitized_expert_ids = False
+    moe.backend.quantize_input.side_effect = lambda x: (x, None)
+    moe.layer_load_balancer.one_slot_table.return_value = table
+    scheduler = ExternalCommMoEScheduler(moe)
+
+    with pytest.raises(_Dispatched) as dispatched:
+        scheduler._forward_chunk_impl(
+            torch.zeros(2, 8),
+            torch.zeros(2, 4),
+            torch.bfloat16,
+            [2, 2],
+            use_dp_padding=False,
+            is_first_call=True,
+            is_last_call=False,
+            row_offset=None,
+        )
+
+    (kwargs,) = dispatched.value.args
+    if recovery:
+        assert kwargs["expert_to_slot"] is table
+        assert kwargs["token_selected_slots"] is experts
+    else:
+        assert "expert_to_slot" not in kwargs
+        moe.layer_load_balancer.one_slot_table.assert_not_called()
+        assert kwargs["token_selected_slots"] is moe._load_balancer_route.return_value
