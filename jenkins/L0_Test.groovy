@@ -1620,6 +1620,11 @@ def getPytestBaseCommandLine(
     // container is destroyed. Never point this at a bind-mounted / shared path:
     // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
     extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
+    // The WideEP fault-tolerance tests of l0_gb200_multi_gpus need Open MPI with ULFM and mpi4py>=4:
+    // they fail rather than skip where the image lacks them.
+    if (stageName.startsWith("GB200-4_GPUs-PyTorch")) {
+        extraInternalEnv += " TLLM_REQUIRE_ULFM=1"
+    }
     // CBTS stages put cbts_plugin/sitecustomize (bare-importable guest hooks) plus the cbts
     // package itself on PYTHONPATH (via ${VAR:-} for set -u safety), plus the config env vars
     // sitecustomize.py reads in subprocesses. The context channel's address is created and
