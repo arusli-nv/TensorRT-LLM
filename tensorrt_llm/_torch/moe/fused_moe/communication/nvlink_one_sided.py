@@ -27,7 +27,7 @@ NVLINK One-Sided supports post-quant dispatch.
 import os
 import re
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import pynvml
 import torch
@@ -40,7 +40,6 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     EPGroupHealthLike,
-    reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.distributed.mnnvl_memory import (
     CftMnnvlMemory,
@@ -57,6 +56,9 @@ from tensorrt_llm.math_utils import pad_up
 
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
+
+if TYPE_CHECKING:
+    from .execution_state import MoeExecutionState
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
@@ -434,7 +436,10 @@ class NVLinkOneSided(Communication):
                 Corresponds to model_config.use_low_precision_moe_combine.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
-                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
+                detection never mutates it. The kernels read the mask from a device record at execution time.
+                The watchdog observes eager launches only. A layer bound to a ``MoeExecutionState`` reads the
+                state's mask and abort records instead, so CUDA graphs captured after the bind follow every later
+                membership change.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -657,6 +662,13 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
+        # Rank-mask mode: the kernels read the active-rank mask from this device record at execution time, so CUDA
+        # graphs captured once observe a mask rewritten in place. Holds the words last published, and their
+        # committed generation (None for a caller's mask).
+        self._rank_mask_record: Optional[torch.Tensor] = None
+        self._rank_mask_words: Optional[Tuple[int, ...]] = None
+        self._rank_mask_generation: Optional[int] = None
+        self._execution_state: "MoeExecutionState | None" = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -714,6 +726,48 @@ class NVLinkOneSided(Communication):
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
+
+    def bind_execution_state(self, state: "MoeExecutionState") -> None:
+        """Run every later dispatch/combine with the state's rank-mask and abort records.
+
+        Bound execution uses the fence path, so CUDA graphs captured afterwards
+        stay valid when the state installs a new rank mask, requests an abort,
+        or remaps the workspace's pages at the same addresses during a recovery.
+        """
+        if self._execution_state is not None:
+            raise RuntimeError("NVLinkOneSided is already bound to an execution state")
+        if not self._rank_mask_enabled:
+            raise ValueError("Bound execution requires rank-mask mode (ep_group_health)")
+        if self.can_use_cft_counted_writes:
+            raise ValueError(
+                "Bound execution requires the fence path, but CFT counted writes are "
+                f"enabled. Set {FORCE_CFT_ENV}=0 to select the fence path"
+            )
+        state.retain(
+            self.mnnvl_mem, self._reset_local_workspace, self._require_workspace_lifecycle()
+        )
+        state.track_layer(self.ep_rank, self.reset_state)
+        self._execution_state = state
+
+    def _reset_local_workspace(self) -> None:
+        """Return this rank's workspace row to its initial state.
+
+        Same as initialization, without the barrier: the caller guarantees that
+        no rank runs a collective on this workspace until every rank has reset.
+        """
+        torch.ops.trtllm.moe_a2a_initialize(
+            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
+        )
+
+    def progress_row_offsets(self) -> Tuple[int, int, int]:
+        """Byte offsets of ``flag_val`` and of the dispatch and combine completion flags in a
+        workspace row: this rank's all-to-all progress, which hang detection reads."""
+        meta = self.moe_a2a_metainfo
+        return (
+            int(meta[self.FLAG_VAL_OFFSET_INDEX]),
+            int(meta[self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]),
+            int(meta[self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]),
+        )
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
@@ -830,6 +884,30 @@ class NVLinkOneSided(Communication):
                 NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
         self._workspace_registered = False
         self._workspace_lifecycle = None
+
+    def _publish_rank_mask(self, snapshot: ActiveRankMaskSnapshot) -> None:
+        """Write the snapshot's mask (CPU uint64 words) into the device record of the active-rank mask.
+
+        A committed mask is compared by its generation, so an unchanged membership costs no host read of the mask.
+        The write is a copy on the current stream, so collectives launched before it still read the previous mask.
+        """
+        generation = snapshot.committed_generation
+        if generation is not None and generation == self._rank_mask_generation:
+            return
+        mask = snapshot.active_rank_mask
+        words = tuple(int(word) for word in mask.tolist())
+        if words != self._rank_mask_words:
+            if not (words[self.ep_rank >> 6] >> (self.ep_rank & 63)) & 1:
+                raise ValueError(
+                    f"active_rank_mask must mark the local ep_rank ({self.ep_rank}) as active"
+                )
+            if self._rank_mask_record is None:
+                self._rank_mask_record = torch.empty(
+                    len(words), dtype=torch.uint64, device=self.workspace.device
+                )
+            self._rank_mask_record.copy_(mask)
+            self._rank_mask_words = words
+        self._rank_mask_generation = generation
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
@@ -953,7 +1031,13 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        state = self._execution_state
+        if self._rank_mask_enabled and state is None and torch.cuda.is_current_stream_capturing():
+            # A replay would bypass the mask publication and the watchdog, and nothing could abort it.
+            raise RuntimeError(
+                "Rank-mask mode supports CUDA graphs only once bound to an execution state "
+                "(fault-tolerance recovery); disable CUDA graphs for detection-only fault tolerance"
+            )
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -991,6 +1075,8 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
+        if state is None and active_rank_mask is not None:
+            self._publish_rank_mask(active_rank_mask_snapshot)
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -1007,12 +1093,17 @@ class NVLinkOneSided(Communication):
                 expert_id_payload_index if can_fuse_sanitize else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
-                active_rank_mask,
+                self._rank_mask_record if state is None else state.active_rank_mask,
+                abort_state=None if state is None else state.abort,
             )
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "dispatch", active_rank_mask
-        )
+        # The host watchdog tracks each eager call, but replayed CUDA graphs skip
+        # this code: bound execution relies on the abort record, set by peer-loss
+        # detection, and on the device timeout instead.
+        if state is None:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "dispatch", active_rank_mask
+            )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
@@ -1094,7 +1185,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        state = self._execution_state
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1151,11 +1242,14 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             use_cft_for_combine,
             self._rank_mask_enabled,
-            active_rank_mask,
+            # Dispatch published this collective's mask: combine's mask must match it.
+            self._rank_mask_record if state is None else state.active_rank_mask,
+            abort_state=None if state is None else state.abort,
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "combine", active_rank_mask
-        )
+        if state is None:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "combine", active_rank_mask
+            )
 
         # Reset state for next round
         self.reset_state()
