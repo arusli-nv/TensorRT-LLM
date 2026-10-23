@@ -184,8 +184,11 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
     watchdog.daemon = True
     watchdog.start()
     # Backstops that need no GIL, should the Timer still not run: the stacks, then SIGALRM's default action ends the
-    # process by a signal (not an exit status, which the MPI runtime would count as a job-ending failure).
+    # process by a signal (not an exit status, which the MPI runtime would count as a job-ending failure). A Python
+    # handler would run only once the main thread leaves MPI_Finalize, so SIGALRM gets its default action back.
     faulthandler.dump_traceback_later(2 * _FINALIZE_GRACE_S, exit=False)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
     signal.alarm(int(2 * _FINALIZE_GRACE_S) + 1)
     error = _mpi_finalize()
     if error:

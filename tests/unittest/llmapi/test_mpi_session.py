@@ -4,6 +4,7 @@
 import json
 import os
 import shlex
+import signal
 import subprocess  # nosec B404
 import sys
 import threading
@@ -1291,7 +1292,10 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mpi_session, "faulthandler", calls.faulthandler)
     calls.alarm = Mock()
     monkeypatch.setattr(mpi_session.signal, "alarm", calls.alarm)
-    return calls
+    # _finalize_and_exit restores SIGALRM's default action; the test process keeps its own.
+    previous = signal.getsignal(signal.SIGALRM)
+    yield calls
+    signal.signal(signal.SIGALRM, previous)
 
 
 @pytest.mark.cpu_only
@@ -1383,6 +1387,23 @@ def test_finalize_and_exit_stops_the_startup_watch_first(
         mpi_session._finalize_and_exit(0, "process end")
     assert exited.value.args == (0, )
     assert order == ["stop_startup_watch", "finalize"]
+
+
+@pytest.mark.cpu_only
+def test_finalize_and_exit_arms_the_alarm_with_its_default_action(_fake_world):
+    """A Python SIGALRM handler would run only after MPI_Finalize returned: the backstop must end the process."""
+    from tensorrt_llm.llmapi import mpi_session
+
+    armed = []
+    _fake_world.alarm.side_effect = lambda seconds: armed.append(
+        (seconds, signal.getsignal(signal.SIGALRM)))
+    previous = signal.signal(signal.SIGALRM, lambda signum, frame: None)
+    try:
+        with pytest.raises(_Exit):
+            mpi_session._finalize_and_exit(0, "process end")
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    assert armed[0] == (61, signal.SIG_DFL)
 
 
 @pytest.mark.cpu_only
