@@ -596,7 +596,9 @@ def test_recovery_requires_hcoll_off(variable, value, world, fake_mpi, monkeypat
             MPIDist(_mapping()).enable_peer_loss_recovery()
     monkeypatch.delenv("OMPI_MCA_coll")
     monkeypatch.setenv(variable, value)
-    MPIDist(_mapping()).enable_peer_loss_recovery()
+    dist = MPIDist(_mapping())
+    dist._tp_comm = FakeComm(range(WORLD), ME)
+    dist.enable_peer_loss_recovery()
 
 
 def test_recovery_requires_mpi4py_ulfm_launch_and_thread_multiple(world, fake_mpi, monkeypatch):
