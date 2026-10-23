@@ -8652,7 +8652,8 @@ class PyExecutor:
 
     def _note_step_change(self, request: LlmRequest) -> None:
         """Remember what the step being prepared changes on ``request``, so peer-loss recovery can undo it."""
-        self._step_changes.append(PreparedStep.change(request))
+        if self._step_changes is not None:
+            self._step_changes.append(PreparedStep.change(request))
 
     def take_waiting_requests(self) -> List[RequestQueueItem]:
         """Remove and return the requests waiting to be scheduled."""
@@ -8695,8 +8696,7 @@ class PyExecutor:
         self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
-            if self._step_changes is not None:
-                self._note_step_change(request)
+            self._note_step_change(request)
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.py_last_context_chunk = (
                     request.context_current_position,

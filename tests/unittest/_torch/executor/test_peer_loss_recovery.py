@@ -1590,6 +1590,20 @@ def test_discard_restores_the_exclusion_of_the_last_generation_logits():
     assert request.state == "GENERATION_IN_PROGRESS"
 
 
+def test_fault_tolerance_off_marks_requests_completing_next_iteration_without_recording():
+    """Without fault tolerance no step is recorded; the overlap scheduler's completion update runs as on main."""
+    executor = PyExecutor.__new__(PyExecutor)
+    assert executor._step_changes is None
+    request = Mock(state=py_executor.LlmRequestState.GENERATION_IN_PROGRESS)
+    request.will_complete_next_iteration.return_value = True
+
+    executor._update_generation_requests_that_will_complete_next_iteration([request])
+
+    request.set_exclude_last_generation_logits.assert_called_once_with(False)
+    assert request.state == py_executor.LlmRequestState.GENERATION_TO_COMPLETE
+    assert executor._step_changes is None
+
+
 def test_discard_drops_the_logits_and_additional_outputs_its_steps_appended(monkeypatch):
     """Sampling appends a step's logits and additional outputs before the step is accepted; its rerun appends
     them again."""
