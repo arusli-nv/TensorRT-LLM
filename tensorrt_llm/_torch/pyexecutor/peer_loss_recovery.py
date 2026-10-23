@@ -1086,9 +1086,7 @@ class PeerLossRecovery(RecoveryHook):
             self._interrupted.difference_update(*(entry[3] for entry in gathered if entry))
         held = [entry and entry[0] for entry in gathered]
         executor.iter_counter = max(entry[1] for entry in gathered if entry)
-        # Records the owners of the requests a survivor started before their routing reached rank 0, which
-        # the quarantine needs.
-        self._requeue_unscheduled_requests(held)
+        self._record_started_owners(held)
         quarantined = self._quarantine(set().union(*(entry[2] for entry in gathered if entry)))
         # Rank 0 counts what fails: the quarantined requests and the departed ranks' requests that do not run again.
         failed_requests = len(quarantined) + self._departed_requests(failed)
@@ -1099,6 +1097,7 @@ class PeerLossRecovery(RecoveryHook):
         self._log_phase("committed", generation)
         self._return_remap_room()
 
+        self._requeue_unscheduled_requests(held)
         rerun, failing = self._deliver_responses(failed, buffered, quarantined)
         # Rank 0's re-run requests not routed yet, including those an earlier recovery re-admitted.
         self._rerouting = set(dist.broadcast([*self._rerouting, *rerun], root=0))
@@ -1560,16 +1559,34 @@ class PeerLossRecovery(RecoveryHook):
             raise RuntimeError("A peer loss interrupted the broadcast of a control request")
         if self._request_owners is None:
             return
-        started = {
-            rank: items
-            for rank, ids in enumerate(served)
-            if ids and (items := [item for item in unscheduled if item.id in ids])
-        }
+        started = self._started(unscheduled, served)
         self.requests_routed(started)
         started_ids = {item.id for items in started.values() for item in items}
         self._executor.readmit_requests(
             [*(item for item in unscheduled if item.id not in started_ids), *control_items]
         )
+
+    @staticmethod
+    def _started(
+        unscheduled: List["RequestQueueItem"], served: List[Optional[Set[int]]]
+    ) -> Dict[int, List["RequestQueueItem"]]:
+        """Per survivor, the ``unscheduled`` requests it already serves."""
+        return {
+            rank: items
+            for rank, ids in enumerate(served)
+            if ids and (items := [item for item in unscheduled if item.id in ids])
+        }
+
+    def _record_started_owners(self, served: List[Optional[Set[int]]]) -> None:
+        """On rank 0, record the owner of each request a survivor started before its routing reached rank 0.
+
+        The quarantine needs the owners before the commit; the requests stay where they are until
+        ``_requeue_unscheduled_requests`` admits the others again after it.
+        """
+        if self._request_owners is None:
+            return
+        unscheduled = [*self._executor.waiting_queue, *self._unbroadcast_requests]
+        self.requests_routed(self._started(unscheduled, served))
 
     def _quarantine(self, interrupted: Set[int]) -> Set[int]:
         """Of the survivors' ``interrupted`` requests (in the discarded steps), those that fail (on rank 0).
