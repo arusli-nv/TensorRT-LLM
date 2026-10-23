@@ -513,6 +513,34 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
+FAULT_TOLERANCE_MODE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
+FAULT_TOLERANCE_AUTHORITY_ENV = "TLLM_FAULT_TOLERANCE_AUTHORITY"
+
+
+def fault_tolerance_mode() -> bool:
+    """True if TLLM_FAULT_TOLERANCE_MODE is set to "1", False otherwise."""
+    return os.environ.get(FAULT_TOLERANCE_MODE_ENV) == "1"
+
+
+@lru_cache(maxsize=None)
+def peer_loss_recovery_enabled() -> bool:
+    """Whether WideEP recovery from a peer loss is enabled; read once per process.
+
+    ``TLLM_FAULT_TOLERANCE_MODE=1`` alone enables detection only; adding the
+    recovery authority's address (``TLLM_FAULT_TOLERANCE_AUTHORITY``) enables
+    recovery.
+
+    Raises:
+        ValueError: The authority address is set without fault-tolerance mode.
+    """
+    if not os.environ.get(FAULT_TOLERANCE_AUTHORITY_ENV):
+        return False
+    if not fault_tolerance_mode():
+        raise ValueError(f"{FAULT_TOLERANCE_AUTHORITY_ENV} requires "
+                         f"{FAULT_TOLERANCE_MODE_ENV}=1")
+    return True
+
+
 def mpi_rank():
     if mpi_disabled():
         try:
