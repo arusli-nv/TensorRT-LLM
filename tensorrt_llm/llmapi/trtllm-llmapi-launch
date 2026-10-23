@@ -198,10 +198,11 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 tllm_mpi_size=$(mpi_world_size)
 export tllm_mpi_size
 
-# Peer-loss recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too. Each worker's MPI_Init reads
-# these, so a user's own `--mca pml` / `--mca btl` choice (exported the same way) wins.
+# Peer-loss recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too, without the hcoll and ucc
+# collectives. Each worker's MPI_Init reads these, so a user's own `--mca pml` / `--mca btl` / `--mca coll` choice
+# (exported the same way) wins.
 if peer_loss_recovery_enabled; then
-    export OMPI_MCA_pml=${OMPI_MCA_pml:-ob1} OMPI_MCA_btl=${OMPI_MCA_btl:-self,tcp}
+    export OMPI_MCA_pml=${OMPI_MCA_pml:-ob1} OMPI_MCA_btl=${OMPI_MCA_btl:-self,tcp} OMPI_MCA_coll=${OMPI_MCA_coll:-^hcoll,ucc}
 fi
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 configure_flashinfer_workspace

@@ -30,7 +30,7 @@ _LAUNCHER = Path(__file__).resolve().parents[3] / "tensorrt_llm" / "llmapi" / "t
 _FAKE_PYTHON = """#!/bin/bash
 if [ "$2" = tensorrt_llm.llmapi.mgmn_worker_node ]; then
     if [ -e /proc/$$/fd/200 ]; then lock=open; else lock=closed; fi
-    echo "$$ $PPID $lock ${OMPI_MCA_pml:-unset} ${OMPI_MCA_btl:-unset} ${*:3}"
+    echo "$$ $PPID $lock ${OMPI_MCA_pml:-unset} ${OMPI_MCA_btl:-unset} ${OMPI_MCA_coll:-unset} ${*:3}"
     exit "${FAKE_WORKER_STATUS:-0}"
 fi
 exec %s "$@"
@@ -48,6 +48,7 @@ _CLEARED_ENV = (
     "TLLM_FAULT_TOLERANCE_AUTHORITY",
     "OMPI_MCA_pml",
     "OMPI_MCA_btl",
+    "OMPI_MCA_coll",
 )
 
 
@@ -78,8 +79,8 @@ def _launch_worker(
         command = [str(_LAUNCHER)]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True)
     stdout, _ = process.communicate(timeout=60)
-    pid, ppid, lock, pml, btl, *args = stdout.split()
-    return process.pid, process.returncode, int(pid), int(ppid), lock, args, (pml, btl)
+    pid, ppid, lock, pml, btl, coll, *args = stdout.split()
+    return process.pid, process.returncode, int(pid), int(ppid), lock, args, (pml, btl, coll)
 
 
 @pytest.mark.parametrize("status", [0, 3])
@@ -90,20 +91,20 @@ def test_recovery_execs_the_worker_holding_the_workspace_lock(status, tmp_path):
     assert lock == "open"
     assert args == ["--flashinfer-lock-fd", "200"]
     assert (tmp_path / "home" / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-1").is_dir()
-    # Recovery runs on ob1 over TCP.
-    assert transport == ("ob1", "self,tcp")
+    # Recovery runs on ob1 over TCP, without the hcoll and ucc collectives.
+    assert transport == ("ob1", "self,tcp", "^hcoll,ucc")
 
 
 def test_recovery_keeps_the_users_transport_choice(tmp_path):
-    *_, transport = _launch_worker(tmp_path, True, OMPI_MCA_btl="self,sm,tcp")
-    assert transport == ("ob1", "self,sm,tcp")
+    *_, transport = _launch_worker(tmp_path, True, OMPI_MCA_btl="self,sm,tcp", OMPI_MCA_coll="^hcoll")
+    assert transport == ("ob1", "self,sm,tcp", "^hcoll")
 
 
 @pytest.mark.parametrize("status", [0, 3, 137])
 def test_without_recovery_the_worker_is_a_child_without_the_lock(status, tmp_path):
     launcher, returncode, pid, ppid, lock, args, transport = _launch_worker(tmp_path, False, status)
     assert pid != launcher and ppid == launcher and returncode == status
-    assert lock == "closed" and args == [] and transport == ("unset", "unset")
+    assert lock == "closed" and args == [] and transport == ("unset", "unset", "unset")
 
 
 def test_recovery_passes_the_temporary_workspace_on(tmp_path):

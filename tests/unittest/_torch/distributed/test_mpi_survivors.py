@@ -198,6 +198,7 @@ def fake_mpi(monkeypatch):
     monkeypatch.setattr(communicator, "MPI", fake)
     monkeypatch.setenv("OMPI_MCA_mpi_ft_enable", "1")
     monkeypatch.setenv("OMPI_MCA_pml", "ob1")
+    monkeypatch.setenv("OMPI_MCA_coll", "^hcoll,ucc")
     monkeypatch.setattr(
         communicator,
         "is_mpi_peer_failure",
@@ -579,6 +580,23 @@ def test_peer_failures_stay_mpi_errors_without_recovery(world):
     world.error = FakeMPIException(ERR_PROC_FAILED)
     with pytest.raises(FakeMPIException):
         dist.broadcast_int64([0])
+
+
+@pytest.mark.parametrize(
+    "variable, value",
+    [("OMPI_MCA_coll", "^hcoll,ucc"), ("OMPI_MCA_coll", "tuned,basic"), ("OMPI_MCA_coll_hcoll_enable", "0")],
+)
+def test_recovery_requires_hcoll_off(variable, value, world, fake_mpi, monkeypatch):
+    monkeypatch.delenv("OMPI_MCA_coll", raising=False)
+    monkeypatch.delenv("OMPI_MCA_coll_hcoll_enable", raising=False)
+    for selection in ("", "hcoll,tuned", "^ucc"):
+        if selection:
+            monkeypatch.setenv("OMPI_MCA_coll", selection)
+        with pytest.raises(RuntimeError, match="hcoll"):
+            MPIDist(_mapping()).enable_peer_loss_recovery()
+    monkeypatch.delenv("OMPI_MCA_coll")
+    monkeypatch.setenv(variable, value)
+    MPIDist(_mapping()).enable_peer_loss_recovery()
 
 
 def test_recovery_requires_mpi4py_ulfm_launch_and_thread_multiple(world, fake_mpi, monkeypatch):

@@ -902,6 +902,17 @@ class PeerFailureWatch:
             self._comm.Free()
 
 
+def _coll_component_excluded(name: str) -> bool:
+    """Whether Open MPI's environment keeps collective component ``name`` out: disabled, excluded, or not listed."""
+    if os.environ.get(f"OMPI_MCA_coll_{name}_enable") in ("0", "false"):
+        return True
+    selection = os.environ.get("OMPI_MCA_coll", "")
+    components = {c.strip() for c in selection.lstrip("^").split(",")}
+    if selection.startswith("^"):
+        return name in components
+    return bool(selection) and name not in components
+
+
 class MPIDist(Distributed):
     tp_comm: MPI.Comm
 
@@ -961,6 +972,10 @@ class MPIDist(Distributed):
             raise RuntimeError(
                 "Peer-loss recovery requires Open MPI's ob1 messaging layer; "
                 "launch through trtllm-llmapi-launch or with `--mca pml ob1`")
+        if not _coll_component_excluded("hcoll"):
+            raise RuntimeError(
+                "Peer-loss recovery requires Open MPI's hcoll collectives off; "
+                "launch through trtllm-llmapi-launch or with `--mca coll ^hcoll,ucc`")
         try:
             mpi_failed_ranks(mpi_comm())
             mpi_comm().Is_revoked()
