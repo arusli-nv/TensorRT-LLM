@@ -3,6 +3,7 @@
 """Recovery authority state machine, wire protocol, and client."""
 
 import hmac
+import os
 import pickle  # nosec B403
 import threading
 import time
@@ -609,6 +610,12 @@ def test_malformed_datagrams_are_rejected(payload):
     assert protocol.decode_datagram(payload + tag, KEY) is None
 
 
+@pytest.fixture(autouse=True)
+def _key_not_loaded(monkeypatch):
+    """Each test starts before the process read its HMAC key."""
+    monkeypatch.setattr(recovery_client, "_KEY", None)
+
+
 def test_load_key_validates_the_environment(monkeypatch):
     env = recovery_client.AUTHORITY_KEY_ENV
     monkeypatch.delenv(env, raising=False)
@@ -621,6 +628,14 @@ def test_load_key_validates_the_environment(monkeypatch):
     with pytest.raises(ValueError, match="16 bytes"):
         recovery_client.load_key()
     monkeypatch.setenv(env, KEY.hex())
+    assert recovery_client.load_key() == KEY
+
+
+def test_load_key_removes_the_key_from_the_environment(monkeypatch):
+    """No child process inherits the key; the process still has it."""
+    monkeypatch.setenv(recovery_client.AUTHORITY_KEY_ENV, KEY.hex())
+    assert recovery_client.load_key() == KEY
+    assert recovery_client.AUTHORITY_KEY_ENV not in os.environ
     assert recovery_client.load_key() == KEY
 
 

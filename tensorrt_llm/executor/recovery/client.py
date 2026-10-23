@@ -16,6 +16,7 @@ import zmq
 from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
 
 from ..ipc import ZeroMqQueue
+from ..utils import _scrub_process_env_value
 from .config import fault_tolerance_config
 from .protocol import MAX_MESSAGE_BYTES, Abort, Message, Register, Registered, Sent, is_message
 
@@ -51,14 +52,22 @@ CONNECTION_OPTIONS = {
 }
 
 _M = TypeVar("_M")
+# The HMAC key, once read from the environment (which no longer holds it).
+_KEY: bytes | None = None
 
 
 def load_key() -> bytes:
     """Return the HMAC key held in ``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`` as hex.
 
+    The first call removes the key from the environment, so no child process inherits it; later calls return it
+    again.
+
     Raises:
         ValueError: The key is missing, not hex, or shorter than 16 bytes.
     """
+    global _KEY
+    if _KEY is not None:
+        return _KEY
     text = os.environ.get(AUTHORITY_KEY_ENV)
     if not text:
         raise ValueError(f"{AUTHORITY_KEY_ENV} is not set")
@@ -68,6 +77,9 @@ def load_key() -> bytes:
         raise ValueError(f"{AUTHORITY_KEY_ENV} is not a hex string") from error
     if len(key) < _MIN_KEY_BYTES:
         raise ValueError(f"{AUTHORITY_KEY_ENV} must hold at least {_MIN_KEY_BYTES} bytes")
+    _scrub_process_env_value(AUTHORITY_KEY_ENV, text)
+    os.environ.pop(AUTHORITY_KEY_ENV, None)
+    _KEY = key
     return key
 
 

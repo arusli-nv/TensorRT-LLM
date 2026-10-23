@@ -4,6 +4,7 @@
 
 import hashlib
 import hmac
+import os
 import pickle  # nosec B403
 import socket
 import subprocess
@@ -404,6 +405,21 @@ def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
     finally:
         authority_module.subprocess.Popen = original
     assert launched == [["ssh", "node-7", "kill", "-KILL", "4242"]]
+
+
+def test_command_fence_never_passes_the_hmac_key(monkeypatch):
+    """The fence command does not inherit the authority's key, even while the environment still holds it."""
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY_KEY", "00" * 32)
+    envs = []
+    monkeypatch.setattr(
+        authority_module.subprocess,
+        "Popen",
+        lambda command, **kwargs: envs.append(kwargs.get("env")) or Mock(wait=lambda: 0),
+    )
+    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", "node-7", 4242))
+    (env,) = envs
+    assert env is not None and "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY" not in env
+    assert env["PATH"] == os.environ["PATH"]
 
 
 def test_command_fence_reaps_the_command_and_logs_its_failure(monkeypatch):

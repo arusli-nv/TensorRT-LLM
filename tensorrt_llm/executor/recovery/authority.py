@@ -31,7 +31,7 @@ import zmq
 
 from ...logger import logger
 from ..ipc import ZeroMqQueue
-from .client import CONNECTION_OPTIONS, load_key, unauthenticated
+from .client import AUTHORITY_KEY_ENV, CONNECTION_OPTIONS, load_key, unauthenticated
 from .config import COMMAND_FENCE_GRACE_S, CONFIG_ENV, FaultToleranceConfig, fault_tolerance_config
 from .hang_monitor import HangMonitor, HungRank
 from .protocol import (
@@ -808,7 +808,12 @@ def command_fence(template: str) -> Callable[[HungRank], None]:
             return
         command = [arg.format(host=hung.host, pid=hung.pid) for arg in arguments]
         try:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env={k: v for k, v in os.environ.items() if k != AUTHORITY_KEY_ENV},
+            )
         except OSError as error:
             logger.error(
                 f"Recovery authority: fencing rank {hung.rank} with {command} failed: {error}"
