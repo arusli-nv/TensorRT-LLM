@@ -209,17 +209,23 @@ def _run_driver(
     *driver_args: str,
     overlap: bool = False,
     ft_config: dict | None = None,
+    fault_tolerance: bool = True,
     **extra_env: str,
 ) -> tuple[dict, str, str]:
-    """Serve with the driver under ULFM mpirun; return its result, the mpirun log and the authority log."""
+    """Serve with the driver under ULFM mpirun; return its result, the mpirun log and the authority log.
+
+    Without ``fault_tolerance`` no authority runs and the executor serves as on main.
+    """
     model = _model()
     env = _fault_tolerance_env(tmp_path, ft_config, **extra_env)
+    if not fault_tolerance:
+        del env["TLLM_FAULT_TOLERANCE_MODE"]
     authority_log = tmp_path / "authority.log"
     mpirun_log = tmp_path / "mpirun.log"
     result_path = tmp_path / "result.json"
 
     with open(authority_log, "w") as authority_out, open(mpirun_log, "w") as mpirun_out:
-        authority = _start_authority(env, authority_out)
+        authority = _start_authority(env, authority_out) if fault_tolerance else None
         try:
             mpirun = subprocess.Popen(
                 [
@@ -244,12 +250,14 @@ def _run_driver(
             )
             returncode = _wait_for_teardown(mpirun, result_path)
         finally:
-            _stop_authority(authority)
+            if authority is not None:
+                _stop_authority(authority)
 
     output = mpirun_log.read_text(errors="replace")
     assert result_path.exists(), f"The driver wrote no result:\n{output[-20000:]}"
     result = json.loads(result_path.read_text())
-    assert "after_loss" in result, f"The driver did not finish serving:\n{output[-20000:]}"
+    last_round = "healthy" if mode == "healthy" else "after_loss"
+    assert last_round in result, f"The driver did not finish serving:\n{output[-20000:]}"
     # The survivors of a recovered world finalize MPI on shutdown and exit 0.
     assert returncode == 0, f"mpirun exited with {returncode}:\n{output[-20000:]}"
     return result, output, authority_log.read_text()
@@ -336,6 +344,15 @@ def _assert_recovered(
 def test_peer_loss_recovery(mode: str, overlap: bool, tmp_path: Path):
     result, output, authority_text = _run_driver(tmp_path, mode, [VICTIM], overlap=overlap)
     _assert_recovered(result, output, authority_text, mode, [VICTIM])
+
+
+@pytest.mark.skip_less_device(WORLD_SIZE)
+@pytest.mark.skip_device_not_contain(["GB200"])
+@pytest.mark.parametrize("overlap", [False, True], ids=["sync", "overlap"])
+def test_serving_without_fault_tolerance(overlap: bool, tmp_path: Path):
+    """With fault tolerance off every request completes with all its tokens, as on main."""
+    result, _, _ = _run_driver(tmp_path, "healthy", [], overlap=overlap, fault_tolerance=False)
+    _assert_answered(result["healthy"])
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)

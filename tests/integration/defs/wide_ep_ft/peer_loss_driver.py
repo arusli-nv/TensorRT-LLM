@@ -161,8 +161,13 @@ def fault(ranks: list[int], signum: signal.Signals) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mode", choices=("idle", "inflight"), required=True)
-    parser.add_argument("--victims", type=int, nargs="+", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("idle", "inflight", "healthy"),
+        required=True,
+        help="when to fault the victims; healthy: serve one round and fault none",
+    )
+    parser.add_argument("--victims", type=int, nargs="*", default=[])
     parser.add_argument(
         "--also-lost",
         type=int,
@@ -192,6 +197,8 @@ def main() -> None:
     llm = LLM(model=args.model, **llm_kwargs(args.overlap, args.replica_offset, args.online_slots))
     try:
         result["healthy"] = collect(submit(llm, all_ranks, SHORT_MAX_TOKENS))
+        if args.mode == "healthy":
+            return
         if args.mode == "idle":
             time.sleep(2)
             fault(args.victims, signum)
