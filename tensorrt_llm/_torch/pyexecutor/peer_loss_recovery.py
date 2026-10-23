@@ -1086,6 +1086,9 @@ class PeerLossRecovery(RecoveryHook):
             self._interrupted.difference_update(*(entry[3] for entry in gathered if entry))
         held = [entry and entry[0] for entry in gathered]
         executor.iter_counter = max(entry[1] for entry in gathered if entry)
+        # Records the owners of the requests a survivor started before their routing reached rank 0, which
+        # the quarantine needs.
+        self._requeue_unscheduled_requests(held)
         quarantined = self._quarantine(set().union(*(entry[2] for entry in gathered if entry)))
         # Rank 0 counts what fails: the quarantined requests and the departed ranks' requests that do not run again.
         failed_requests = len(quarantined) + self._departed_requests(failed)
@@ -1096,7 +1099,6 @@ class PeerLossRecovery(RecoveryHook):
         self._log_phase("committed", generation)
         self._return_remap_room()
 
-        self._requeue_unscheduled_requests(held)
         rerun, failing = self._deliver_responses(failed, buffered, quarantined)
         # Rank 0's re-run requests not routed yet, including those an earlier recovery re-admitted.
         self._rerouting = set(dist.broadcast([*self._rerouting, *rerun], root=0))

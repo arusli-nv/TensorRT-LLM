@@ -885,6 +885,22 @@ def test_recovery_does_not_rebroadcast_a_request_a_survivor_started():
         assert recovery._request_owners[3][0] == 1
 
 
+def test_rank0_marks_interrupted_a_started_request_whose_routing_the_loss_cut_off():
+    """Rank 1 started request 3 in the discarded step while rank 0 saw its broadcast interrupted: rank 0 learns
+    its owner before the quarantine, so the request is marked interrupted and a second loss without progress
+    fails it."""
+    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
+    executor = recovery._executor
+    _broadcast(recovery, [_queued(3)], interrupted=True)
+    gathered = [(set(), 0, set(), set()), ({3}, 0, {3}, set()), None, (set(), 0, set(), set())]
+    executor.dist.allgather.side_effect = lambda value, departed: gathered
+
+    recovery._recover(_interrupted())
+
+    assert recovery._request_owners[3][0] == 1
+    assert recovery._interrupted == {3}
+
+
 def test_survivors_resume_from_the_same_iteration():
     """A loss can stop survivors one iteration apart; they resume from the furthest one."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
