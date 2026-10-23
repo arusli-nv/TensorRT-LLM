@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "heartbeatSender.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
 #include "tensorrt_llm/common/bindingUtils.h"
@@ -336,6 +337,7 @@ void initBindings(nb::module_& m)
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);
+    initHeartbeatSenderBindings(m);
     // Initialize HostFunc bindings
     initHostFuncBindings(m);
 }
