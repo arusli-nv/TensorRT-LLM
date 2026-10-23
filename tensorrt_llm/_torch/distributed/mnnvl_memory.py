@@ -268,7 +268,7 @@ class _LiveRowsComm:
     """An allocation's communicator restricted to its live members, for :meth:`MnnvlMemory.remap`.
 
     ``gather(value)`` returns one entry per global rank, None for a departed one; :meth:`allgather`
-    orders them by the allocation's communicator ranks.
+    orders them by the allocation's communicator ranks. ``gather_failed`` records that an exchange raised.
     """
 
     def __init__(
@@ -276,6 +276,7 @@ class _LiveRowsComm:
     ) -> None:
         self._record = record
         self._gather = gather
+        self.gather_failed = False
 
     def Get_rank(self) -> int:
         return self._record.comm_rank
@@ -284,7 +285,11 @@ class _LiveRowsComm:
         return self._record.comm_size
 
     def allgather(self, value: Any) -> list[Any]:
-        by_rank = self._gather(value)
+        try:
+            by_rank = self._gather(value)
+        except BaseException:
+            self.gather_failed = True
+            raise
         return [by_rank[member] for member in self._record.comm_membership]
 
 
@@ -966,7 +971,8 @@ class MnnvlMemory:
 
         The live ranks exchange whether their mapping succeeded: an import or a mapping fails on some ranks
         only (of the handle of a rank that is failing meanwhile, say), so every live rank either maps or
-        raises. A failure, or an exception of ``gather``, leaves the allocation unmapped, so a later attempt
+        raises. An exception of ``gather`` propagates at once, as the outcome exchange could not complete
+        either. A failure, or an exception of ``gather``, leaves the allocation unmapped, so a later attempt
         may remap it; if releasing the fresh pages fails too, that is logged, the original error propagates,
         and the allocation is broken.
 
@@ -977,16 +983,19 @@ class MnnvlMemory:
         record = cls.allocated_map[self.ptr]
         if record.state is not _MnnvlAllocationState.UNMAPPED:
             raise RuntimeError(f"Cannot remap MNNVL allocation in {record.state.value} state")
+        comm = _LiveRowsComm(record, gather)
         handles, error = None, None
         try:
             handles = cls._create_and_map_handles(
-                _LiveRowsComm(record, gather),
+                comm,
                 record.aligned_size,
                 record.start_address,
                 record.rank_stride,
                 record.address_offset,
             )
         except Exception as failure:
+            if comm.gather_failed:
+                raise
             error = f"{type(failure).__name__}: {failure}"
         try:
             failures = [

@@ -242,6 +242,26 @@ def test_a_peer_lost_during_the_outcome_exchange_leaves_the_allocation_unmapped(
     assert memory.mapped
 
 
+def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_exchange(monkeypatch):
+    """The exchange that failed could not report an outcome either: the loss reaches the recovery at once."""
+    memory, driver = _memory(monkeypatch)
+    memory.release_backing()
+    driver.released.clear()
+    calls = []
+
+    def gather(value):
+        calls.append(value)
+        raise _PeerLost()
+
+    with pytest.raises(_PeerLost):
+        memory.remap(gather)
+    assert len(calls) == 1
+    assert driver.mapped == {} and not memory.mapped
+    assert len(driver.released) == 1
+    memory.remap(_gather_without({2}))
+    assert memory.mapped
+
+
 def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(monkeypatch):
     """A peer lost during the outcome exchange stays the error the recovery sees, even if releasing the fresh
     pages fails too; that failure is logged and the allocation is not remapped again."""
