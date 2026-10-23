@@ -12,7 +12,8 @@ were lost.
 
 - Attention data parallelism with expert parallelism over the whole world (DEP), PyTorch backend,
   KV Cache Manager V2 or its DSA sparse-attention variant (KV block reuse is supported: a step's context blocks become reusable only once the step
-  is accepted, so an interrupted step publishes none), the default attention-DP router.
+  is accepted, so an interrupted step publishes none), the default attention-DP router, and a generation sampler
+  (not a non-generation model or a multimodal encoder-only executor).
 - NVLinkOneSided all-to-all on its fence path. Where CFT counted writes are available (a build against CUDA 13.4 or
   later, driver 615 or later, SM100 or newer), NVLinkOneSided selects them by default and fault tolerance refuses to
   start: set `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0`, also in a deployment without fault tolerance it is compared
@@ -67,16 +68,16 @@ were lost.
 
 | Variable | Meaning |
 |---|---|
-| `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance; alone it turns on the rank mask (and its cost) but only detects a loss: rank 0 warns at startup and `/health` reports `unprotected` |
+| `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance; alone it turns on the rank mask (and its cost) but only detects a loss: rank 0 warns at startup, `/health` reports `unprotected`, and CUDA graph capture fails, so disable CUDA graphs in this mode |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY` | The authority's address; required to recover |
-| `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key (64 hex characters) for authority messages |
+| `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key for authority messages: a hex string of at least 16 bytes (32 hex characters) |
 | `TLLM_FAULT_TOLERANCE_CONFIG` | Optional YAML file with the settings below; set the same file on the workers and the authority, which refuses a worker's registration with different settings (it logs its settings' digest at startup) |
 
 | Setting | Meaning |
 |---|---|
 | `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
-| `extra_slots` | The kind of slots fault tolerance appends to each rank where the survivors of a failure domain's loss cannot hold every expert (none if they can). Default: `ghost`, except with online EPLB where GDRCopy cannot map ghost slot memory for the host (that takes a GPU with GPUDirect RDMA for virtual memory): `empty` there, as its weight updates would load ghost slots with GPU copies every iteration. GPUs whose memory is a NUMA node use `empty` with online EPLB: host access to ghost slot memory there is untested and deferred. `ghost` slots are empty slots that hold no device memory while healthy (the KV cache keeps it) and get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume); that is about one slot per rank per MoE layer, an estimated 1.4 GiB per GPU for DeepSeek-R1 NVFP4 (TODO: measure). With online EPLB, its updates use an appended slot once a restore filled it. An explicit `ghost` with online EPLB where ghost slot memory is not host accessible (no GDRCopy mapping, or GPU memory is a NUMA node) is accepted without a warning: every online EPLB weight update then copies on the GPU instead of the host, which is slower |
-| `recovery_timeout_s` | How long a worker's recovery may take, including finishing a long step first, before the job stops (default 30 s) |
+| `extra_slots` | The kind of slots fault tolerance appends to each rank where the survivors of a failure domain's loss cannot hold every expert (none if they can). Default: `ghost`, except with online EPLB where GDRCopy cannot map ghost slot memory for the host (that takes a GPU with GPUDirect RDMA for virtual memory): `empty` there, as its weight updates would load ghost slots with GPU copies every iteration. GPUs whose memory is a NUMA node use `empty` with online EPLB: host access to ghost slot memory there is untested and deferred. `ghost` slots are empty slots whose device memory, in chunks of the VMM granularity that lie wholly inside them, is not backed while healthy (the KV cache keeps it; a chunk shared with a neighbouring slot stays backed, and each process maps unbacked chunks to one scratch allocation each of 1, 2, 4 and 8 chunks); they get memory only when a recovery restores a lost rank's experts into them (taken from the KV cache when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot shrink, the recovery fails and the job ends). `empty` slots hold their memory and are not routed to while healthy (no mapping at recovery: a faster resume); that is about one slot per rank per MoE layer, an estimated 1.4 GiB per GPU for DeepSeek-R1 NVFP4 (TODO: measure). With online EPLB, its updates use an appended slot once a restore filled it. An explicit `ghost` with online EPLB where ghost slot memory is not host accessible (no GDRCopy mapping, or GPU memory is a NUMA node) is accepted, and rank 0 warns at startup: every online EPLB weight update then copies on the GPU instead of the host, which is slower |
+| `recovery_timeout_s` | How long each of a worker's two recovery phases may take before the job stops: from the survivors' agreement on the failed ranks until it reports itself stopped (including finishing a long step first), and from that report until it resumes; up to about twice this in all (default 30 s) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20 s; must be below `recovery_timeout_s`) |
 | `peer_failure_poll_s` | How often a worker tests whether MPI reported a peer failure; detection lags MPI's report by at most this (default 0.02 s, at most 1 s) |
 | `hang_detection` | Workers report heartbeats and long all-to-all waits; the authority confirms a hung rank and fences it, or reports a hung rank 0 or a stall of every rank as terminal (default `false`) |
@@ -138,8 +139,8 @@ The loss, with the NVLink fabric healthy, of either:
   where ghost slot memory cannot be host accessible): 320 in all.
 
 Several such ranks lost together, or one more during a recovery (before the survivors install the new
-communicator), are recovered as one loss if the survivors' slots still hold every expert; a loss while the
-survivors remap the all-to-all workspaces can end the job instead (see Known limits). A further loss after a
+communicator, including while they remap the all-to-all workspaces), are recovered as one loss if the survivors'
+slots still hold every expert. A further loss after a
 recovery is recovered the same way: the survivors recover again as long as their slots still hold every expert
 without every rank lost so far (startup checks only one failure domain, so how many further losses a deployment
 survives depends on its spare slots).
@@ -150,9 +151,8 @@ Not covered (these fail closed: the job ends as without fault tolerance):
   ends the job depends on Open MPI's runtime (PRRTE). `failure_domain: node` covers the loss of every rank
   process of a host that stays up;
 - a fault that takes down a GPU device, the NVLink fabric, several hosts or a rack;
-- a further loss after the survivors installed a recovery and before it committed, or while they remap the
-  all-to-all workspaces (another loss before the install re-plans the recovery, see above), and a further loss
-  the remaining slots cannot cover;
+- a further loss after the survivors installed a recovery and before it committed (another loss before the
+  install re-plans the recovery, see above), and a further loss the remaining slots cannot cover;
 - a rank that hangs without dying, unless hang detection is on and the hang is in the MoE all-to-alls, and a
   stall that every rank shares (a deadlock or desync with no single culprit: with hang detection on it is
   reported, see below). These end the job only through the executor's hang detector (a fixed 300 s without a
@@ -167,7 +167,8 @@ from a loss still stops: stopping `trtllm-serve` finalizes MPI on each process, 
 
 After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
 and may take KV cache: for restored experts until the deployment restarts, and for the remapped all-to-all
-workspaces only until the failed processes have ended and the executor is idle or a later recovery commits. A request re-run after its rank's loss (see below) runs
+workspaces only until the failed processes have ended (returned at the recovery's commit, else at an idle
+iteration or a later recovery's commit). A request re-run after its rank's loss (see below) runs
 on any survivor, even if it was pinned to the lost rank with `attention_dp_relax=False`; a new request pinned to a
 lost rank fails with "Attention DP rank N is not serving" (HTTP 400, not retryable: the rank does not come back
 until the deployment restarts; send the request without `attention_dp_rank` or with `attention_dp_relax`). If a re-run or retried request
@@ -185,7 +186,7 @@ Timeouts (see the settings above):
 | A dead process | detected when its TCP connections close, in milliseconds |
 | A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, or `heartbeat_timeout_s` (5 s) until a stopped rank's heartbeat counts as missing, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured from a SIGSTOP to serving again at DEP32 under an earlier rule: 10.6 / 15.9 / 36.7 s with `hang_confirm_s` 3 / 10 / 30 (TODO: re-measure on the current design and cite the run) |
 | A stall of every rank, or a hung rank 0 | `hang_confirm_s` (30 s) from its start until the deployment is reported terminal and every worker exits with code 75 |
-| A recovery | `recovery_timeout_s` (30 s) at the workers from the survivors' agreement on the failed ranks, `authority_timeout_s` (20 s) at the authority; a recovery takes TODO(measure: detection to resume, including the workspace remap) after detection. The agreement waits for every survivor: up to the hang's resolution time (with hang detection) plus `recovery_timeout_s`, since a survivor can detect a stopped peer before the others, which stay blocked on it until it is fenced |
+| A recovery | `recovery_timeout_s` (30 s) at the workers from the survivors' agreement on the failed ranks until each reports itself stopped, and again from then until it resumes (up to about 60 s in all), `authority_timeout_s` (20 s) at the authority; a recovery takes TODO(measure: detection to resume, including the workspace remap) after detection. The agreement waits for every survivor: up to the hang's resolution time (with hang detection) plus `recovery_timeout_s`, since a survivor can detect a stopped peer before the others, which stay blocked on it until it is fenced |
 
 How a hang is judged. Each worker sends heartbeats twice: from a native thread, which runs without the Python
 interpreter lock and reports the iteration of the last finished step, and from a Python thread, which also
@@ -241,11 +242,12 @@ cost nothing (TODO: re-verify on the current design).
   survivors wait up to the recovery timeout, then exit.
 - A further loss just as the authority installs the new membership can leave survivors on different
   memberships; the executor's hang detection ends the job.
-- A further loss while the survivors remap the all-to-all workspaces can end the job (it fails closed) instead
-  of re-planning the recovery.
-- KV cache lent to a remap is returned only once the failed processes have ended and the executor has an idle
-  iteration (checked at most once a second) or a later recovery commits. Under the overlap scheduler with steady
-  load no iteration is idle, so that KV cache stays lent.
+- A survivor that cannot release or map its all-to-all workspaces during a remap (for example for lack of
+  memory) ends the job (it fails closed); a further loss during the remap re-plans the recovery.
+- KV cache lent to a remap is returned once the failed processes have ended: at the recovery's commit if they
+  have by then, else at an idle iteration (checked at most once a second) or a later recovery's commit. Under the
+  overlap scheduler with steady load no iteration is idle, so if the failed processes end after the commit, that
+  KV cache stays lent until a later recovery commits.
 - With speculative decoding under the overlap scheduler, a loss in the step after a committed one can skip
   the committed step's KV cache update for its rejected draft tokens (KV cache manager V2).
 

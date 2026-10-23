@@ -45,7 +45,7 @@ matrix above; its page lists every refused feature:
 |---|---|
 | TP / EP / attention DP | Pure attention DP only: `tp_size == moe_ep_size == world_size`, NVLinkOneSided MoE communication |
 | PP / CP / expert TP | Refused at startup |
-| Overlap / CUDA graphs | Supported; no graph is recaptured after a recovery |
+| Overlap / CUDA graphs | Supported; no graph is recaptured after a recovery. Detection-only mode (no authority) refuses CUDA graph capture |
 | Speculative decoding | Every method accepted; only one-model MTP with a linear draft is tested |
 | Disaggregated serving / guided decoding / beam search / LoRA | Refused at startup |
 | Logits post processor / repetition, presence and frequency penalties | Rejected per request |
