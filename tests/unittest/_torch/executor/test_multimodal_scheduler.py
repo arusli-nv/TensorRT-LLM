@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -221,6 +221,7 @@ def test_executor_releases_consumed_encoder_outputs_per_chunk_only_for_v2(use_v2
         _terminate_attention_dp_dummy_requests=lambda: None,
         model_engine=SimpleNamespace(mm_encoder_cache=cache),
     )
+    executor._note_step_change = MethodType(PyExecutor._note_step_change, executor)
 
     PyExecutor._update_request_states_tp(executor, SimpleNamespace(context_requests=[request]))
 
