@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import ctypes
 import errno
 import gc
 import hashlib
@@ -28,8 +27,6 @@ from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-# madvise(2) advice that builds this process's page-table entries for resident pages (Linux 5.14+).
-_MADV_POPULATE_READ = 22
 # Where multiprocessing.shared_memory keeps the EPLB host copies on Linux.
 _SHM_MOUNT = "/dev/shm"
 
@@ -66,30 +63,6 @@ def _reserve_shm(shm: shared_memory.SharedMemory, layer_id: int) -> None:
         raise _no_shm_space(shm.size, layer_id) from error
     finally:
         os.close(fd)
-
-
-def _start_populate(
-        segments: List[shared_memory.SharedMemory]) -> threading.Thread:
-    """Start prefaulting the pages of host copies that other local ranks wrote, so that restore copies do not
-    page-fault; MoeLoadBalancer.finalize_model joins it. Best effort: older kernels reject the advice."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    spans = [(np.frombuffer(segment.buf,
-                            dtype=np.uint8).ctypes.data, segment.size)
-             for segment in segments]
-
-    def populate() -> None:
-        for address, size in spans:
-            if libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(size),
-                            _MADV_POPULATE_READ):
-                logger.debug("Prefaulting EPLB host copies failed: "
-                             f"{os.strerror(ctypes.get_errno())}")
-                return
-
-    thread = threading.Thread(target=populate,
-                              name="eplb_host_copy_populate",
-                              daemon=True)
-    thread.start()
-    return thread
 
 
 # Whether ghost slot memory is host accessible on every rank; set by the first _ghost_slot_memory_host_accessible().
@@ -178,7 +151,6 @@ class HostMoeTensorSharer:
         self.own_shm = None
         self.own_shm_linked = False
         self.imported_shms = []
-        self.populate_thread: Optional[threading.Thread] = None
 
         self.shared_tensors = {}
         self.names = []
@@ -408,8 +380,6 @@ class HostMoeTensorSharer:
                 add_host_weight_fn(key[0], key[1], t)
 
         self.host_weights.clear()
-        if peer_loss_recovery_enabled():
-            self.populate_thread = _start_populate(self.imported_shms)
 
     def pre_shutdown_cleanup(self):
         """
@@ -1307,11 +1277,6 @@ class MoeLoadBalancer:
         # All shared memory mapping after this barrier.
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
-        # Prefaulting the host copies finishes before serving: during the first requests it stalls their steps.
-        for single_layer_load_balancer in self.single_layer_load_balancers:
-            sharer = single_layer_load_balancer.host_tensor_sharer
-            if sharer is not None and sharer.populate_thread is not None:
-                sharer.populate_thread.join()
         if peer_loss_recovery_enabled():
             # Every rank mapped its peers' shared memory, which nothing opens by name again: ranks that
             # are killed leave nothing in /dev/shm.
