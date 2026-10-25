@@ -39,3 +39,15 @@ dtypes, replay environment variables, and accuracy-validation requirements.
 | LoRA                                                        | Yes               | Yes        | Yes                | Yes                  | Untested           | Untested          | Untested                   | Untested              | Yes             | Untested                      | Untested                             | Untested                                                  | Yes           | Yes            | Yes                      | Yes                   | Untested        | ---      |
 
 [^dynamic-tree-swa]: EAGLE 3 dynamic tree mode does not support sliding window attention. See [Dynamic Tree Mode](speculative-decoding.md#dynamic-tree-mode) for its attention restrictions. Other dynamic-tree implementations are untested with sliding window attention.
+
+[WideEP fault tolerance](wide-ep-fault-tolerance.md) (experimental) supports fewer combinations than the
+matrix above; its page lists every refused feature:
+
+| Feature | WideEP fault-tolerance constraint |
+|---|---|
+| TP / EP / attention DP | Pure attention DP only: `tp_size == moe_ep_size == world_size`, NVLinkOneSided MoE communication |
+| PP / CP / expert TP | Refused at startup |
+| Overlap / CUDA graphs | Supported; no graph is recaptured after a recovery. Detection-only mode (no authority) refuses CUDA graph capture |
+| Speculative decoding | Every method accepted; only one-model MTP with a linear draft is tested |
+| Disaggregated serving / guided decoding / beam search / LoRA | Refused at startup |
+| Logits post processor / repetition, presence and frequency penalties | Rejected per request |
