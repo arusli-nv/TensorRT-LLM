@@ -1280,6 +1280,8 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 {
+    TLLM_CHECK_WITH_INFO(params.expert_to_slot == nullptr || params.enable_rank_mask,
+        "expert_to_slot needs the rank-mask kernels (enable_rank_mask)");
     constexpr int kBlockSize = 256;
 
     // Validate parameters
@@ -1421,14 +1423,31 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
                 SWITCH_TOP_K(params.top_k, TOP_K, {
                     SWITCH_BOOL(params.ep_size < TOP_K, ENABLE_RANK_COMPACT_ROUTING, {
-                        SWITCH_BOOL(params.expert_to_slot != nullptr, USE_EXPERT_TO_SLOT, {
+                        auto launch = [&](auto use_expert_to_slot)
+                        {
                             auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK,
-                                ENABLE_RANK_COMPACT_ROUTING, USE_EXPERT_TO_SLOT>;
+                                ENABLE_RANK_COMPACT_ROUTING, decltype(use_expert_to_slot)::value>;
                             launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
                                 shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
                                 params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
                                 params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
-                        });
+                        };
+                        // The expert-to-slot lookup is instantiated only with the rank mask (the op checks it).
+                        if constexpr (ENABLE_RANK_MASK)
+                        {
+                            if (params.expert_to_slot != nullptr)
+                            {
+                                launch(std::true_type{});
+                            }
+                            else
+                            {
+                                launch(std::false_type{});
+                            }
+                        }
+                        else
+                        {
+                            launch(std::false_type{});
+                        }
                     });
                 });
             });

@@ -505,6 +505,51 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Clean up
             balancer.shutdown()
 
+    def test_one_slot_table_is_what_routing_reads(self):
+        """Under fault tolerance a static one-slot placement exposes route()'s device table at a fixed address;
+        dynamic routing has none, and without fault tolerance routing uses the routing kernel (no table)."""
+        torch.cuda.set_device(0)
+        ep_size, expert_count, top_k, slots_per_rank = 2, 4, 2, 2
+        num_slots = ep_size * slots_per_rank
+        for fault_tolerance, layer_updates_per_iter in ((True, 0), (True, 1),
+                                                        (False, 0)):
+            with self.subTest(fault_tolerance=fault_tolerance, layer_updates_per_iter=layer_updates_per_iter), \
+                    patch.dict(os.environ, {
+                        "TLLM_FAULT_TOLERANCE_MODE": "1" if fault_tolerance else "0",
+                        "TLLM_FAULT_TOLERANCE_AUTHORITY": "tcp://127.0.0.1:5555" if fault_tolerance else "",
+                    }):
+                balancer = MoeLoadBalancer(0, ep_size, layer_updates_per_iter)
+                balancer.set_use_gpu_memcpy(True)
+                layer = balancer.add_layer(expert_count, top_k, slots_per_rank)
+                # Slot s holds expert [2, 0, 3, 1][s].
+                layer.set_initial_weight_assignments([2, 0, 3, 1])
+                balancer.finalize_model()
+                try:
+                    table = layer.one_slot_table()
+                    if layer_updates_per_iter or not fault_tolerance:
+                        self.assertIsNone(table)
+                        continue
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(table.cpu(),
+                                               torch.tensor([1, 3, 0, 2],
+                                                            dtype=torch.int32),
+                                               rtol=0,
+                                               atol=0)
+                    experts = torch.tensor([[0, 1], [2, 3], [3, -1]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+                    expected = torch.where(experts >= 0,
+                                           table[experts.clamp(min=0)],
+                                           num_slots)
+                    torch.testing.assert_close(layer.route(experts),
+                                               expected,
+                                               rtol=0,
+                                               atol=0)
+                    self.assertEqual(layer.one_slot_table().data_ptr(),
+                                     table.data_ptr())
+                finally:
+                    balancer.shutdown()
+
 
 @pytest.fixture
 def mock_runtime() -> Iterator[MagicMock]:
@@ -675,6 +720,21 @@ def test_eplb_slots_are_rows_only_with_peer_loss_recovery(recovery):
         else:
             with pytest.raises(AssertionError, match="should be contiguous"):
                 module.register_to_fix_weight_fn("scales")
+
+
+@pytest.mark.cpu_only
+def test_one_slot_table_keeps_a_none_result() -> None:
+    """A placement with replicas queries the op once, not on every forward."""
+    layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
+    layer.updates_enabled = False
+    layer._one_slot_table = None
+    layer._one_slot_table_queried = False
+    with patch.object(SingleLayerMoeLoadBalancer,
+                      "_query_one_slot_table",
+                      return_value=None) as query:
+        assert layer.one_slot_table() is None
+        assert layer.one_slot_table() is None
+    query.assert_called_once_with()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

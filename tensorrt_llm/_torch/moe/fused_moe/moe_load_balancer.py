@@ -498,6 +498,9 @@ class SingleLayerMoeLoadBalancer:
         self.to_migrate_weight_fns = []
         # Local slots whose storage maps no memory until a restore (ghost extra slots), or None.
         self.ghost_slots: Optional[List[int]] = None
+        # one_slot_table's first eager result: the device expert -> slot table, or None.
+        self._one_slot_table: Optional[torch.Tensor] = None
+        self._one_slot_table_queried = False
 
         if self.updates_enabled:
             self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
@@ -947,6 +950,29 @@ class SingleLayerMoeLoadBalancer:
         return torch.ops.trtllm.moe_load_balance_routing(
             token_selected_experts, offset_by_ep_rank,
             self.single_layer_load_balancer_ptr)
+
+    def one_slot_table(self) -> Optional[torch.Tensor]:
+        """The device expert -> slot table [num_experts] while every expert has exactly one slot, else None.
+
+        ``route`` then reduces to this lookup. Its address is fixed and placement updates rewrite it in place, so
+        captured CUDA graphs read the current placement. Like ``route``, a call that returns a table commits the
+        layer to one slot per expert for every later placement, so the table is kept. A None result is kept too:
+        the routing kernel serves every placement. Online EPLB never has one.
+        """
+        if self.updates_enabled:
+            return None
+        if torch.compiler.is_compiling():
+            # Traced code gets the op's empty fake, so it keeps the routing kernel.
+            return self._query_one_slot_table()
+        if not self._one_slot_table_queried:
+            self._one_slot_table = self._query_one_slot_table()
+            self._one_slot_table_queried = True
+        return self._one_slot_table
+
+    def _query_one_slot_table(self) -> Optional[torch.Tensor]:
+        table = torch.ops.trtllm.moe_load_balance_one_slot_table(
+            self.single_layer_load_balancer_ptr)
+        return table if table.numel() > 0 else None
 
     def py_pre_shutdown_cleanup(self):
         """
