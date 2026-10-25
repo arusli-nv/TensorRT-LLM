@@ -17,6 +17,7 @@ import math
 import os
 import pickle  # nosec B403
 import threading
+import time
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import lru_cache, wraps
@@ -35,11 +36,15 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
-from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
-                                 mpi_comm, mpi_disabled, mpi_isend,
+# yapf: disable
+from tensorrt_llm._utils import (is_mpi_peer_failure, local_mpi_size,
+                                 mpi_allgather, mpi_barrier, mpi_comm,
+                                 mpi_disabled, mpi_failed_ranks, mpi_isend,
                                  mpi_isend_object, mpi_recv, mpi_recv_object,
-                                 mpi_send, mpi_send_object, mpi_world_size,
-                                 prefer_pinned, torch_pybind11_abi)
+                                 mpi_send, mpi_send_object, mpi_world_ranks,
+                                 mpi_world_size, prefer_pinned,
+                                 torch_pybind11_abi)
+# yapf: enable
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -49,6 +54,99 @@ try:
     import ray
 except ModuleNotFoundError:
     from tensorrt_llm.executor.ray import stub as ray
+
+
+class HostCollectiveInterrupted(Exception):
+    """A host collective failed because a peer process died or the
+    communicator was revoked.
+
+    The original MPI exception is chained as ``__cause__``.
+
+    Attributes:
+        operation: Name of the interrupted ``Distributed`` method.
+        failed_ranks: Logical (world) ranks this process knows to have
+            failed when the error was raised. May be empty when the MPI
+            library cannot report them.
+    """
+
+    def __init__(self, operation: str, failed_ranks: frozenset[int]) -> None:
+        detail = sorted(failed_ranks) if failed_ranks else "unknown"
+        super().__init__(f"Host collective {operation} interrupted by peer "
+                         f"failure (failed ranks: {detail})")
+        self.operation = operation
+        self.failed_ranks = failed_ranks
+
+    def __reduce__(self):
+        return type(self), (self.operation, self.failed_ranks)
+
+
+# How long a host collective error waits for ULFM to report a failed peer
+# before it counts as an error of this rank.
+_PEER_FAILURE_EVIDENCE_S = 1.0
+
+# Default of the ``departed`` argument of the object gathers: after a peer
+# loss the gather raises instead of returning a placeholder for the departed
+# rank, so no caller treats a missing rank as an answer by accident.
+DEPARTED_UNSPECIFIED = object()
+
+
+def _errors_return(comm: "MPI.Comm") -> "MPI.Comm":
+    """Return *comm* set to return errors: a peer failure in it must raise,
+    never abort the job."""
+    comm.Set_errhandler(MPI.ERRORS_RETURN)
+    return comm
+
+
+def _failure_evidence(comm: "MPI.Comm", timeout: float) -> frozenset[int]:
+    """Failed ranks ULFM reports in *comm*, waiting up to *timeout* seconds
+    unless *comm* is revoked first."""
+    deadline = time.monotonic() + timeout
+    failed = mpi_failed_ranks(comm)
+    while not failed and not comm.Is_revoked() and time.monotonic() < deadline:
+        time.sleep(0.001)
+        failed = mpi_failed_ranks(comm)
+    return failed
+
+
+def _interruptible(func: Callable) -> Callable:
+    """With peer-loss recovery enabled, raise :class:`HostCollectiveInterrupted`
+    from an ``MPIDist`` method whenever a peer has failed.
+
+    ULFM can complete a collective that a peer dies in without an error on some
+    ranks, with that peer's part undefined, so a result counts only once no
+    failure is known. An exception counts as an interruption when ULFM reports
+    a failed peer shortly after or the communicator was revoked (a garbled
+    payload can fail to unpickle with any exception type, also inside mpi4py);
+    otherwise it is raised as is. Without recovery the method runs unchanged.
+    """
+
+    @wraps(func)
+    def wrapper(self: "MPIDist", *args, **kwargs):
+        if self._host_world is None:
+            return func(self, *args, **kwargs)
+        # Read by hang detection: a rank in a host collective waits on its peers.
+        self.in_host_collective = True
+        try:
+            result = func(self, *args, **kwargs)
+        except HostCollectiveInterrupted:
+            raise
+        except Exception as error:  # noqa: BLE001 - classified below; others re-raised as is
+            comm = self._world_comm()
+            if is_mpi_peer_failure(error):
+                raise HostCollectiveInterrupted(
+                    func.__name__, mpi_failed_ranks(comm)) from error
+            failed = _failure_evidence(comm, _PEER_FAILURE_EVIDENCE_S)
+            if not failed and not comm.Is_revoked():
+                raise
+            raise HostCollectiveInterrupted(func.__name__, failed) from error
+        finally:
+            self.in_host_collective = False
+        failed = mpi_failed_ranks(self._world_comm())
+        if failed:
+            raise HostCollectiveInterrupted(func.__name__, failed)
+        return result
+
+    return wrapper
 
 
 class ReduceOp(IntEnum):
@@ -106,6 +204,9 @@ class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):
         self.mapping = mapping
+        # Whether this rank is inside a host collective (set with peer-loss recovery).
+        self.in_host_collective = False
+        self._tp_ranks = tuple(range(mapping.tp_size))
 
     @staticmethod
     @lru_cache(maxsize=None)
@@ -192,6 +293,16 @@ class Distributed(ABC):
     def local_world_size(self):
         """Number of ranks co-located on this physical node."""
 
+    @property
+    def live_ranks(self) -> tuple[int, ...]:
+        """Logical TP ranks whose processes take part in host collectives."""
+        return self._tp_ranks
+
+    def enable_peer_loss_recovery(self) -> None:
+        """Run host collectives on communicators that recovery may revoke."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support peer-loss recovery")
+
     @abstractmethod
     def barrier(self):
         pass
@@ -236,7 +347,7 @@ class Distributed(ABC):
         return self.broadcast(obj, root=root)
 
     @abstractmethod
-    def allgather(self, obj, root=0):
+    def allgather(self, obj, root=0, *, departed=DEPARTED_UNSPECIFIED):
         pass
 
     @abstractmethod
@@ -268,8 +379,18 @@ class Distributed(ABC):
         return obj
 
     @abstractmethod
-    def tp_allgather(self, obj, *, small_payload: bool = False):
-        pass
+    def tp_allgather(self,
+                     obj,
+                     *,
+                     small_payload: bool = False,
+                     departed=DEPARTED_UNSPECIFIED):
+        """Gather *obj* from every TP rank, in rank order.
+
+        After a recovered peer loss, a departed rank has no entry: the caller
+        must pass *departed*, the value that stands in for it (for example
+        ``None`` when the caller skips missing entries); without it the gather
+        raises. The same holds for :meth:`allgather` and ``tp_gather``.
+        """
 
     @abstractmethod
     def cp_allgather(self, obj, *, small_payload: bool = False):
@@ -300,11 +421,19 @@ class Distributed(ABC):
     # (no pickle); the defaults below reuse the object paths, sending plain
     # int lists so the pickled payload stays small on every backend.
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(
+            self,
+            values: ArrayLike,
+            *,
+            departed: ArrayLike = DEPARTED_UNSPECIFIED) -> np.ndarray:
         """All-gather a fixed-size int64 vector across the TP group.
 
         Returns an int64 array of shape ``[tp_size, len(values)]`` whose row
-        *i* is rank *i*'s vector. Every rank must pass the same length.
+        *i* is rank *i*'s vector. Every rank must pass the same length. Rows
+        of ranks outside :attr:`live_ranks` (ranks that left the group after a
+        recovered peer loss) are set to *departed* (a scalar or a per-column
+        vector), the value that is neutral for how the caller combines rows.
+        Without one, a departed rank raises: the caller does not handle it.
         """
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
         gathered = self.tp_allgather(vec.tolist(), small_payload=True)
@@ -317,15 +446,20 @@ class Distributed(ABC):
         gathered = self.cp_allgather(vec.tolist(), small_payload=True)
         return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
 
-    def tp_cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_cp_allgather_int64(
+            self,
+            values: ArrayLike,
+            *,
+            departed: ArrayLike = DEPARTED_UNSPECIFIED) -> np.ndarray:
         """Fixed-size int64 all-gather across TP x CP; rows are ordered like
-        :meth:`tp_cp_allgather` (tp-major, cp-minor)."""
+        :meth:`tp_cp_allgather` (tp-major, cp-minor). The rows of a TP rank
+        that left the group are *departed*, as in :meth:`tp_allgather_int64`."""
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
         n = vec.size
         if self.cp_size > 1:
             vec = self.cp_allgather_int64(vec).reshape(-1)
         if self.tp_size > 1:
-            vec = self.tp_allgather_int64(vec).reshape(-1)
+            vec = self.tp_allgather_int64(vec, departed=departed).reshape(-1)
         return vec.reshape(-1, n)
 
     def broadcast_int64(self,
@@ -758,6 +892,78 @@ def safe_allgather(
     return _deserialize_recvbuf(recvbuf, lengths, displs, size)
 
 
+def _native_peer_failure_watch(*args):
+    from tensorrt_llm.bindings.internal.runtime import \
+        PeerFailureWatch as Native
+    return Native(*args)
+
+
+class PeerFailureWatch:
+    """Background detection of a failed peer on a private communicator.
+
+    A native thread polls a receive that no peer matches, without the GIL,
+    every ``peer_failure_poll_s`` of the fault-tolerance config; ULFM fails it
+    once a peer fails. On a failure the thread sets :attr:`failed`, then stores
+    1 to ``abort_word``, then calls ``on_failure`` once.
+
+    Args:
+        comm: Communicator owned by the watch; freed by :meth:`stop`.
+        on_failure: Called from the watch thread when a peer fails, or when
+            detection itself fails.
+        abort_word: Address of a host int32 the MoE all-to-all kernels poll
+            as their abort request, or 0.
+    """
+
+    def __init__(self,
+                 comm: "MPI.Comm",
+                 on_failure: Callable[[], None],
+                 abort_word: int = 0) -> None:
+        self._comm = comm
+        self._stopped = False
+
+        def failure(error_class: int) -> None:
+            # Release the waiters before the log write, which can stall.
+            try:
+                on_failure()
+            finally:
+                logger.warning(
+                    f"Peer failure watch fired with MPI error class {error_class}"
+                )
+
+        from tensorrt_llm.executor.recovery.config import fault_tolerance_config
+        self._native = _native_peer_failure_watch(
+            comm.py2f(), abort_word, failure,
+            fault_tolerance_config().peer_failure_poll_s)
+
+    @property
+    def failed(self) -> bool:
+        """Whether a failure was detected; set before the abort word."""
+        return self._native.failed
+
+    def stop(self) -> None:
+        """Stop watching and release the receive and the communicator.
+
+        Idempotent; ``on_failure`` is not called after it returns. Called from
+        ``on_failure`` itself, it only stops the watch; a later call releases.
+        """
+        if self._stopped:
+            return
+        if self._native.stop():
+            self._stopped = True
+            self._comm.Free()
+
+
+def _coll_component_excluded(name: str) -> bool:
+    """Whether Open MPI's environment keeps collective component ``name`` out: disabled, excluded, or not listed."""
+    if os.environ.get(f"OMPI_MCA_coll_{name}_enable") in ("0", "false"):
+        return True
+    selection = os.environ.get("OMPI_MCA_coll", "")
+    components = {c.strip() for c in selection.lstrip("^").split(",")}
+    if selection.startswith("^"):
+        return name in components
+    return bool(selection) and name not in components
+
+
 class MPIDist(Distributed):
     tp_comm: MPI.Comm
 
@@ -766,6 +972,260 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        # Private world duplicate that recovery may revoke.
+        self._host_world: Optional[MPI.Comm] = None
+        # Survivor communicator and its logical ranks, from shrink().
+        self._shrunk: Optional[tuple[MPI.Comm, tuple[int, ...]]] = None
+        # The installed survivor communicator and its members' logical ranks.
+        self._survivor_comm: Optional[MPI.Comm] = None
+        self._live_ranks: Optional[tuple[int, ...]] = None
+
+    @property
+    def live_ranks(self) -> tuple[int, ...]:
+        if self._live_ranks is None:
+            return super().live_ranks
+        return self._live_ranks
+
+    def enable_peer_loss_recovery(self) -> None:
+        """Move world-level host collectives to a private communicator.
+
+        Collective over the world; call before any host collective that
+        recovery may need to interrupt. Only pure attention-DP layouts
+        (``tp_size == moe_ep_size == world_size``, no PP or CP) are supported;
+        there the TP communicator spans the world.
+
+        Raises:
+            ValueError: The layout is unsupported.
+            RuntimeError: The job was not launched with ULFM fault tolerance,
+                the MPI library lacks the ULFM calls, or MPI was not
+                initialized with ``MPI_THREAD_MULTIPLE``.
+        """
+        mapping = self.mapping
+        if not (mapping.enable_attention_dp and mapping.pp_size == 1
+                and mapping.cp_size == 1 and
+                mapping.tp_size == mapping.moe_ep_size == mapping.world_size):
+            raise ValueError(
+                "Peer-loss recovery requires pure attention DP "
+                "(tp_size == moe_ep_size == world_size, pp_size == cp_size == 1)"
+            )
+        if not hasattr(MPI.Comm, "Shrink"):
+            raise RuntimeError("Peer-loss recovery requires mpi4py>=4")
+        # Without fault tolerance enabled at launch, a lost process ends the
+        # job even though the library exposes the ULFM calls.
+        if os.environ.get("OMPI_MCA_mpi_ft_enable") not in ("1", "true"):
+            raise RuntimeError(
+                "Peer-loss recovery requires Open MPI with ULFM fault "
+                "tolerance; launch with `mpirun --with-ft ulfm`")
+        if MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+            raise RuntimeError(
+                "Peer-loss recovery requires MPI_THREAD_MULTIPLE")
+        if os.environ.get("OMPI_MCA_pml") != "ob1":
+            raise RuntimeError(
+                "Peer-loss recovery requires Open MPI's ob1 messaging layer; "
+                "launch through trtllm-llmapi-launch or with `--mca pml ob1`")
+        if not _coll_component_excluded("hcoll"):
+            raise RuntimeError(
+                "Peer-loss recovery requires Open MPI's hcoll collectives off; "
+                "launch through trtllm-llmapi-launch or with `--mca coll ^hcoll,ucc`"
+            )
+        try:
+            mpi_failed_ranks(mpi_comm())
+            mpi_comm().Is_revoked()
+        except NotImplementedError as error:
+            raise RuntimeError(
+                "Peer-loss recovery requires an MPI library with the ULFM "
+                "calls (MPIX_Comm_get_failed, MPIX_Comm_revoke, "
+                "MPIX_Comm_shrink); this one does not provide them") from error
+        if self._host_world is None:
+            self._host_world = _errors_return(mpi_comm().Dup())
+            # Survivors must shrink the same communicator, so the TP
+            # communicator, otherwise built on first use, exists from now on.
+            _errors_return(self.tp_comm)
+
+    def revoke(self) -> None:
+        """Revoke the communicators host collectives run on so that every
+        rank blocked in one of them raises :class:`HostCollectiveInterrupted`.
+
+        Idempotent. Requires :meth:`enable_peer_loss_recovery` and an MPI
+        library with ULFM support.
+        """
+        if self._host_world is None:
+            raise RuntimeError("revoke() requires enable_peer_loss_recovery()")
+        comms = [self._world_comm()]
+        if self._live_ranks is None and self._tp_comm is not None:
+            comms.append(self._tp_comm)
+        if self._shrunk is not None:
+            comms.append(self._shrunk[0])
+        for comm in comms:
+            if not comm.Is_revoked():
+                comm.Revoke()
+
+    def reported_failed_ranks(self) -> frozenset[int]:
+        """The ranks this process's ULFM view reports failed in its host communicator.
+
+        Local: no agreement with the other survivors (see :meth:`shrink`).
+
+        Raises:
+            RuntimeError: Recovery is not enabled.
+        """
+        if self._host_world is None:
+            raise RuntimeError(
+                "reported_failed_ranks() requires enable_peer_loss_recovery()")
+        return mpi_failed_ranks(self._world_comm())
+
+    def shrink(self) -> frozenset[int]:
+        """Agree with the other survivors on the failed ranks.
+
+        Collective over all surviving ranks; call after :meth:`revoke`. Builds
+        the survivor communicator without using it yet and returns every rank
+        failed so far, the same set on every survivor. Before
+        :meth:`install_survivors` (a further loss during the recovery) it
+        shrinks the communicator it built; after it, the installed one.
+
+        Raises:
+            RuntimeError: Recovery is not enabled.
+        """
+        if self._host_world is None:
+            raise RuntimeError("shrink() requires enable_peer_loss_recovery()")
+        if self._shrunk is not None:
+            comm = self._shrunk[0]
+        elif self._live_ranks is not None:
+            comm = self._survivor_comm
+        else:
+            comm = self._tp_comm
+        survivor_comm = _errors_return(comm.Shrink())
+        live_ranks = mpi_world_ranks(survivor_comm.Get_group())
+        self._shrunk = (survivor_comm, live_ranks)
+        return frozenset(range(self.mapping.world_size)) - frozenset(live_ranks)
+
+    def install_survivors(self) -> None:
+        """Switch host collectives to the communicator built by :meth:`shrink`.
+
+        Logical ranks keep their meaning: ``tp_rank``/``tp_size`` are unchanged,
+        roots name logical ranks, and gathers return one entry per logical rank,
+        with the caller's ``departed`` for failed ranks. The replaced
+        communicator is not freed (freeing one with failed members is not
+        guaranteed to be local).
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+        """
+        if self._shrunk is None:
+            raise RuntimeError("install_survivors requires a prior shrink()")
+        survivor_comm, live_ranks = self._shrunk
+        self._survivor_comm = survivor_comm
+        self._live_ranks = live_ranks
+        self._shrunk = None
+
+    def watch_peer_failures(self,
+                            on_failure: Callable[[], None],
+                            abort_word: int = 0) -> "PeerFailureWatch":
+        """Call *on_failure* once, from a native thread, when a peer fails
+        before the returned watch is stopped; first store 1 to *abort_word*
+        (an int32 address) if it is not 0.
+
+        Covers time outside host collectives (e.g. GPU waits). Collective over
+        the current (survivor) world: posts a receive no peer matches on a
+        private duplicate, which ULFM completes with a process-failure error.
+
+        Raises:
+            RuntimeError: Recovery is not enabled.
+        """
+        if self._host_world is None:
+            raise RuntimeError(
+                "watch_peer_failures() requires enable_peer_loss_recovery()")
+        return PeerFailureWatch(_errors_return(self._world_comm().Dup()),
+                                on_failure, abort_word)
+
+    def watch_survivor_failures(
+            self, on_failure: Callable[[], None]) -> "PeerFailureWatch":
+        """Like :meth:`watch_peer_failures`, on the survivor communicator that
+        :meth:`shrink` built and :meth:`install_survivors` has not installed:
+        a further peer failure during the recovery. Collective over the
+        survivors.
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "watch_survivor_failures requires a prior shrink()")
+        return PeerFailureWatch(_errors_return(self._shrunk[0].Dup()),
+                                on_failure)
+
+    def broadcast_among_survivors(self, obj, root: int = 0):
+        """Broadcast *obj* from logical rank *root* over the survivor
+        communicator that :meth:`shrink` built, before it is installed.
+        Collective over the survivors.
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+            MPI.Exception: Another survivor failed, or the communicator was
+                revoked (see ``is_mpi_peer_failure``).
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "broadcast_among_survivors requires a prior shrink()")
+        survivor_comm, live_ranks = self._shrunk
+        return survivor_comm.bcast(obj, root=live_ranks.index(root))
+
+    def allgather_among_survivors(self, obj) -> list:
+        """Gather *obj* from every survivor over the communicator that
+        :meth:`shrink` built, before it is installed: one entry per logical
+        rank, None for a failed one. Collective over the survivors.
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+            MPI.Exception: Another survivor failed, or the communicator was
+                revoked (see ``is_mpi_peer_failure``).
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "allgather_among_survivors requires a prior shrink()")
+        survivor_comm, live_ranks = self._shrunk
+        gathered = [None] * self.mapping.world_size
+        for rank, value in zip(live_ranks, survivor_comm.allgather(obj)):
+            gathered[rank] = value
+        return gathered
+
+    def barrier_among_survivors(self) -> None:
+        """Barrier over the survivor communicator that :meth:`shrink` built
+        (``MPI.Exception`` if a survivor failed, see ``is_mpi_peer_failure``).
+
+        Raises:
+            RuntimeError: :meth:`shrink` has not run.
+        """
+        if self._shrunk is None:
+            raise RuntimeError(
+                "barrier_among_survivors requires a prior shrink()")
+        self._shrunk[0].Barrier()
+
+    def _world_comm(self) -> MPI.Comm:
+        if self._live_ranks is not None:
+            return self._survivor_comm
+        if self._host_world is not None:
+            return self._host_world
+        return mpi_comm()
+
+    def _comm_root(self, root: int) -> int:
+        """Rank in the current host communicator of logical rank *root*."""
+        if self._live_ranks is None:
+            return root
+        if root not in self._live_ranks:
+            raise ValueError(f"Collective root {root} is not a live rank")
+        return self._live_ranks.index(root)
+
+    def _to_logical(self, gathered: list, departed, operation: str) -> list:
+        """Place the survivors' entries at their logical ranks; departed ranks
+        get *departed*, which the caller must have given."""
+        if departed is DEPARTED_UNSPECIFIED:
+            raise RuntimeError(
+                f"{operation} after a peer loss needs departed=: the value that "
+                "stands in for a rank that left the group")
+        logical = [departed] * self.mapping.tp_size
+        for rank, entry in zip(self._live_ranks, gathered):
+            logical[rank] = entry
+        return logical
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -780,25 +1240,39 @@ class MPIDist(Distributed):
                     f"(tp_size={self.mapping.tp_size} * pp_size={self.mapping.pp_size} * cp_size={self.mapping.cp_size}), "
                     f"but MPI world size is only {actual_world_size}. ")
 
+    @_interruptible
     def broadcast(self,
                   obj,
                   root=0,
                   chunk_size: int = 4 * 1024 * 1024,
                   prefer_cpu=False):
         # prefer_cpu is a no-op here: MPI object collectives are host-side.
-        comm = mpi_comm()
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+        return safe_broadcast(self._world_comm(),
+                              obj,
+                              root=self._comm_root(root),
+                              chunk_size=chunk_size)
 
-    def allgather(self, obj):
-        return mpi_allgather(obj)
+    @_interruptible
+    def allgather(self, obj, *, departed=DEPARTED_UNSPECIFIED):
+        if self._host_world is None:
+            return mpi_allgather(obj)
+        gathered = self._world_comm().allgather(obj)
+        if self._live_ranks is None:
+            return gathered
+        return self._to_logical(gathered, departed, "allgather")
 
     @property
     def local_world_size(self):
         return local_mpi_size()
 
+    @_interruptible
     def barrier(self):
-        mpi_barrier()
+        if self._host_world is None:
+            mpi_barrier()
+        else:
+            self._world_comm().Barrier()
 
+    @_interruptible
     def tp_barrier(self):
         self.tp_comm.Barrier()
 
@@ -825,6 +1299,8 @@ class MPIDist(Distributed):
 
     @property
     def tp_comm(self):
+        if self._live_ranks is not None:
+            return self._survivor_comm
         if self._tp_comm is None:
             self._validate_world_size()
             mapping = self.mapping
@@ -869,27 +1345,48 @@ class MPIDist(Distributed):
         comm = self.cp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
+    @_interruptible
     def tp_allgather(self,
                      obj,
                      chunk_size: int = 4 * 1024 * 1024,
                      *,
-                     small_payload: bool = False):
+                     small_payload: bool = False,
+                     departed=DEPARTED_UNSPECIFIED):
         comm = self.tp_comm
         if small_payload:
-            return comm.allgather(obj)
-        return safe_allgather(comm, obj, chunk_size=chunk_size)
+            gathered = comm.allgather(obj)
+        else:
+            gathered = safe_allgather(comm, obj, chunk_size=chunk_size)
+        if self._live_ranks is None:
+            return gathered
+        return self._to_logical(gathered, departed, "tp_allgather")
 
-    def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    @_interruptible
+    def tp_gather(self,
+                  obj,
+                  root=0,
+                  chunk_size: int = 4 * 1024 * 1024,
+                  *,
+                  departed=DEPARTED_UNSPECIFIED):
         comm = self.tp_comm
-        return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
+        gathered = safe_gather(comm,
+                               obj,
+                               root=self._comm_root(root),
+                               chunk_size=chunk_size)
+        if self._live_ranks is None or gathered is None:
+            return gathered
+        return self._to_logical(gathered, departed, "tp_gather")
 
+    @_interruptible
     def tp_broadcast(self,
                      obj,
                      root=0,
                      chunk_size: int = 4 * 1024 * 1024,
                      **kwargs):
-        comm = self.tp_comm
-        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+        return safe_broadcast(self.tp_comm,
+                              obj,
+                              root=self._comm_root(root),
+                              chunk_size=chunk_size)
 
     def pp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
         comm = self.pp_comm
@@ -902,10 +1399,12 @@ class MPIDist(Distributed):
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
 
+    @_interruptible
     def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         reduce_op = reduce_op_to_mpi(op)
-        return mpi_comm().allreduce(obj, reduce_op)
+        return self._world_comm().allreduce(obj, reduce_op)
 
+    @_interruptible
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         reduce_op = reduce_op_to_mpi(op)
         return self.tp_comm.allreduce(obj, reduce_op)
@@ -926,26 +1425,46 @@ class MPIDist(Distributed):
         comm.Bcast([buf, MPI.INT64_T], root=root)
         return buf
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
-        return self._allgather_int64_comm(self.tp_comm, values)
+    @_interruptible
+    def tp_allgather_int64(
+            self,
+            values: ArrayLike,
+            *,
+            departed: ArrayLike = DEPARTED_UNSPECIFIED) -> np.ndarray:
+        rows = self._allgather_int64_comm(self.tp_comm, values)
+        if self._live_ranks is None:
+            return rows
+        if departed is DEPARTED_UNSPECIFIED:
+            raise RuntimeError(
+                "tp_allgather_int64 needs departed= for the ranks that "
+                "left the group after a peer loss")
+        logical = np.empty((self.mapping.tp_size, rows.shape[1]),
+                           dtype=np.int64)
+        logical[:] = departed
+        logical[list(self._live_ranks)] = rows
+        return logical
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.cp_comm, values)
 
+    @_interruptible
     def broadcast_int64(self,
                         values: ArrayLike,
                         root: int = 0,
                         *,
                         prefer_cpu: bool = False) -> np.ndarray:
         # prefer_cpu is a no-op here: MPI buffer collectives are host-side.
-        return self._broadcast_int64_comm(mpi_comm(), values, root)
+        return self._broadcast_int64_comm(self._world_comm(), values,
+                                          self._comm_root(root))
 
+    @_interruptible
     def tp_cp_broadcast_int64(self,
                               values: ArrayLike,
                               root: int = 0) -> np.ndarray:
         buf = np.asarray(values, dtype=np.int64).reshape(-1)
         if self.tp_size > 1:
-            buf = self._broadcast_int64_comm(self.tp_comm, buf, root)
+            buf = self._broadcast_int64_comm(self.tp_comm, buf,
+                                             self._comm_root(root))
         if self.cp_size > 1:
             buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
         return buf
@@ -1479,7 +1998,8 @@ class TorchDist(Distributed):
         return super().broadcast_or_none(obj, root=root)
 
     @log_op
-    def allgather(self, obj):
+    def allgather(self, obj, *, departed=DEPARTED_UNSPECIFIED):
+        # Peer-loss recovery runs only on MPIDist: no rank departs here.
         vote_pg = self._cuda_obj_pg("world")
         if isinstance(obj, torch.Tensor):
             output_list = [
@@ -1625,7 +2145,11 @@ class TorchDist(Distributed):
         return obj
 
     @log_op
-    def tp_allgather(self, obj, *, small_payload: bool = False):
+    def tp_allgather(self,
+                     obj,
+                     *,
+                     small_payload: bool = False,
+                     departed=DEPARTED_UNSPECIFIED):
         vote_pg = self._cuda_obj_pg("tp")
         if isinstance(obj, torch.Tensor):
             if not obj.is_cuda and vote_pg is not None:
@@ -1645,7 +2169,11 @@ class TorchDist(Distributed):
                                    group=self.mapping.tp_group_pg)
             return output_list
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(
+            self,
+            values: ArrayLike,
+            *,
+            departed: ArrayLike = DEPARTED_UNSPECIFIED) -> np.ndarray:
         """Fixed-size int64 TP all-gather on the CUDA-staged CPU-tensor path.
 
         The base implementation ships the vector as a pickled object, which on
@@ -1655,11 +2183,12 @@ class TorchDist(Distributed):
         instead -- one kernel and one sync, the same transport as the
         attention-DP RankState exchange. Falls back to the base path when the
         object-collective groups are unavailable (kill switch, graph capture),
-        a rank-consistent condition (see ``_cuda_obj_pg``).
+        a rank-consistent condition (see ``_cuda_obj_pg``). Peer-loss recovery
+        runs only on MPIDist, so no rank departs and ``departed`` is unused.
         """
         vote_pg = self._cuda_obj_pg("tp")
         if vote_pg is None:
-            return super().tp_allgather_int64(values)
+            return super().tp_allgather_int64(values, departed=departed)
         vec = torch.from_numpy(
             np.ascontiguousarray(
                 np.asarray(values, dtype=np.int64).reshape(-1)))
@@ -1668,7 +2197,7 @@ class TorchDist(Distributed):
             len(rows), -1)
 
     @log_op
-    def tp_gather(self, obj, dst=0):
+    def tp_gather(self, obj, dst=0, *, departed=DEPARTED_UNSPECIFIED):
         global_rank = torch.distributed.get_rank()
         if isinstance(obj, torch.Tensor):
             if global_rank == dst:
