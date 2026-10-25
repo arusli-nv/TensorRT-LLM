@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,12 @@
 
 #include <string.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <iterator>
 #include <numaif.h>
 #include <sys/mman.h>
 
@@ -29,6 +32,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -170,18 +174,20 @@ bool HostAccessibleDeviceAllocator::mAllowManagedFallback = false;
 
 bool HostAccessibleDeviceAllocator::isSupported()
 {
-    if (!tensorrt_llm::common::getEnvEplbForceGdrcopy()
-        && TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
-    {
-        // we are on systems that GPU memory is also a NUMA node.
-        return true;
-    }
-    if (!tensorrt_llm::runtime::gdrcopy::isInitialized() && !tensorrt_llm::runtime::gdrcopy::initialize())
-    {
-        // system don't support GDRCopy.
-        return mAllowManagedFallback;
-    }
-    return true;
+    return isSupportedWithoutManagedFallback() || mAllowManagedFallback;
+}
+
+bool HostAccessibleDeviceAllocator::isSupportedWithoutManagedFallback()
+{
+    // GPU memory that is a NUMA node, or GDRCopy.
+    return gpuMemoryNumaId() >= 0 || tensorrt_llm::runtime::gdrcopy::isInitialized()
+        || tensorrt_llm::runtime::gdrcopy::initialize();
+}
+
+int HostAccessibleDeviceAllocator::gpuMemoryNumaId()
+{
+    return tensorrt_llm::common::getEnvEplbForceGdrcopy() ? -1
+                                                          : TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
 }
 
 void HostAccessibleDeviceAllocator::init()
@@ -199,13 +205,9 @@ void HostAccessibleDeviceAllocator::init()
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevId));
     if (tensorrt_llm::common::getEnvEplbForceGdrcopy())
     {
-        mGpuMemNumaId = -1;
         TLLM_LOG_INFO("Force using GDRCopy for EPLB, ignore NUMA node for GPU memory.");
     }
-    else
-    {
-        mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
-    }
+    mGpuMemNumaId = gpuMemoryNumaId();
 
     if (mGpuMemNumaId < 0)
     {
@@ -243,6 +245,14 @@ void HostAccessibleDeviceAllocator::shutdown()
 
 HostAccessibleDeviceAllocator& HostAccessibleDeviceAllocator::getInstance()
 {
+    // Never destroyed under WideEP fault tolerance: the process's CudaVirtualMemoryManager, destroyed after it, may
+    // still unregister backed ghost slot memory from its entries' teardown.
+    static HostAccessibleDeviceAllocator* const leakedInstance
+        = tensorrt_llm::mpi::isPeerLossRecoveryEnabled() ? new HostAccessibleDeviceAllocator : nullptr;
+    if (leakedInstance != nullptr)
+    {
+        return *leakedInstance;
+    }
     static HostAccessibleDeviceAllocator instance;
     return instance;
 }
@@ -346,6 +356,91 @@ void HostAccessibleDeviceAllocator::memcpyToDevice(void* dst, void const* src, s
     else
     {
         memcpy(dst, src, size);
+    }
+}
+
+void HostAccessibleDeviceAllocator::memcpyToDeviceAddress(void* devPtr, void const* src, size_t size)
+{
+    auto* dst = static_cast<char*>(devPtr);
+    auto const* from = static_cast<char const*>(src);
+    while (size > 0)
+    {
+        // Held across the copy, so that unregisterHostAccessible() cannot unpin the record while it is written.
+        std::shared_lock<std::shared_mutex> lock(mAllocationsMutex);
+        auto const it = mDeviceAllocations.upper_bound(dst);
+        TLLM_CHECK_WITH_INFO(
+            it != mDeviceAllocations.begin(), "%p is not host accessible device memory", static_cast<void*>(dst));
+        auto const& info = std::prev(it)->second;
+        auto const* recordStart = static_cast<char const*>(info.devPtr);
+        TLLM_CHECK_WITH_INFO(
+            dst < recordStart + info.size, "%p is not host accessible device memory", static_cast<void*>(dst));
+        size_t const offset = dst - recordStart;
+        size_t const bytes = std::min(size, info.size - offset);
+        void* hostDst = static_cast<char*>(info.hostPtr) + offset;
+        if (info.memDesc != nullptr)
+        {
+            tensorrt_llm::runtime::gdrcopy::copy_to_mapping(info.memDesc->gdrMh, hostDst, from, bytes);
+        }
+        else
+        {
+            memcpy(hostDst, from, bytes);
+        }
+        dst += bytes;
+        from += bytes;
+        size -= bytes;
+    }
+}
+
+void HostAccessibleDeviceAllocator::registerHostAccessible(void* devPtr, size_t size)
+{
+    TLLM_CHECK_WITH_INFO(mIsInited, "HostAccessibleDeviceAllocator is not initialized");
+    if (mGpuMemNumaId >= 0)
+    {
+        recordAllocation(devPtr, size, devPtr);
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(mGdrHandle != nullptr, "GDRCopy is not available to map device memory for the host");
+    auto const address = reinterpret_cast<uint64_t>(devPtr);
+    TLLM_CHECK_WITH_INFO(address % GPU_PAGE_SIZE == 0 && size % GPU_PAGE_SIZE == 0 && size > 0,
+        "GDRCopy maps whole GPU pages: %p of %zu bytes", devPtr, size);
+    gdr_mh_t handle{};
+    TLLM_CHECK_WITH_INFO(gdrcopy::pin_buffer(mGdrHandle, address, size, 0, 0, &handle) == 0,
+        "GDR pin_buffer failed for %p of %zu bytes", devPtr, size);
+    // The range starts on a GPU page, so its mapping starts at devPtr.
+    void* hostPtr = nullptr;
+    if (gdrcopy::map(mGdrHandle, handle, &hostPtr, size) != 0)
+    {
+        gdrcopy::unpin_buffer(mGdrHandle, handle);
+        TLLM_THROW("GDR map failed for %p of %zu bytes", devPtr, size);
+    }
+    recordAllocation(devPtr, size, hostPtr, new gdrcopy::GdrMemDesc{nullptr, hostPtr, 0, size, handle});
+}
+
+void HostAccessibleDeviceAllocator::unregisterHostAccessible(void* devPtr) noexcept
+{
+    AllocationInfo info{};
+    {
+        std::unique_lock<std::shared_mutex> lock(mAllocationsMutex);
+        auto it = mDeviceAllocations.find(devPtr);
+        if (it == mDeviceAllocations.end())
+        {
+            TLLM_LOG_ERROR("%p is not registered host accessible memory", devPtr);
+            return;
+        }
+        info = it->second;
+        mHostAllocations.erase(info.hostPtr);
+        mDeviceAllocations.erase(it);
+    }
+    if (info.memDesc != nullptr)
+    {
+        int const unmapped
+            = gdrcopy::unmap(mGdrHandle, info.memDesc->gdrMh, info.memDesc->gdrMap, info.memDesc->gdrMapSize);
+        int const unpinned = gdrcopy::unpin_buffer(mGdrHandle, info.memDesc->gdrMh);
+        if (unmapped != 0 || unpinned != 0)
+        {
+            TLLM_LOG_ERROR("Unmapping or unpinning GDRCopy memory at %p failed", devPtr);
+        }
+        delete info.memDesc;
     }
 }
 

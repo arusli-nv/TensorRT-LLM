@@ -490,6 +490,11 @@ void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE,
 //! a proper `LLMArgs` field will replace it in PR 1d.1.
 bool isFaultToleranceModeEnabled();
 
+//! \brief Returns true iff WideEP recovery from a peer loss is enabled: fault-tolerance mode
+//! (`isFaultToleranceModeEnabled()`) plus the recovery authority's address in `TLLM_FAULT_TOLERANCE_AUTHORITY`.
+//! Fault-tolerance mode alone only detects a peer loss. Matches `peer_loss_recovery_enabled()` in Python.
+bool isPeerLossRecoveryEnabled();
+
 //! \brief Install WideEP fault-tolerance signal handlers on `SIGABRT` and `SIGSEGV`.
 //!
 //! Replaces the default handlers (which call `MPI_Abort(MPI_COMM_WORLD)`

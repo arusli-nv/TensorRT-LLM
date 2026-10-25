@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 namespace tensorrt_llm::runtime
 {
 
+class GhostSlotMemory;
 class MoeLoadBalancer;
 
 namespace unit_tests
@@ -53,6 +54,18 @@ public:
      * @return true if supported else false.
      */
     static bool isSupported();
+
+    /**
+     * @brief Whether the host reaches device memory without the managed memory fallback: GPU memory is a NUMA node
+     * (gpuMemoryNumaId() >= 0), or GDRCopy maps device memory for the host.
+     */
+    static bool isSupportedWithoutManagedFallback();
+
+    /**
+     * @brief The NUMA node of the GPU's memory, at whose device addresses the host reaches it; -1 if there is none or
+     * TRTLLM_EPLB_FORCE_GDRCOPY is set (GDRCopy then maps device memory for the host).
+     */
+    static int gpuMemoryNumaId();
 
     /**
      * @brief Allocate host accessible memory on the device.
@@ -87,6 +100,26 @@ public:
      */
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
+    /**
+     * @brief Copies from the host to device memory at its device address; the range may span several recorded
+     * allocations, each written through its own host mapping.
+     */
+    void memcpyToDeviceAddress(void* devPtr, void const* src, size_t size);
+
+    /**
+     * @brief Records device memory allocated and mapped elsewhere, so that getHostPtr() and the copies serve it. Where
+     * GPU memory is a NUMA node, the host reaches it at its device address; otherwise GDRCopy pins and maps it, which
+     * needs memory allocated GPUDirect RDMA capable, aligned to GPU pages, and one physical allocation per record.
+     * Needs an initialized allocator (a live MoeLoadBalancer or GhostSlotMemory's host-accessible memory).
+     */
+    void registerHostAccessible(void* devPtr, size_t size);
+
+    /**
+     * @brief Forgets memory recorded by registerHostAccessible(), unpinning it if GDRCopy pinned it; before the memory
+     * is unmapped. Errors are logged.
+     */
+    void unregisterHostAccessible(void* devPtr) noexcept;
+
 private:
     struct AllocationInfo
     {
@@ -115,6 +148,7 @@ private:
     void shutdown();
 
     friend class tensorrt_llm::runtime::MoeLoadBalancer;
+    friend class tensorrt_llm::runtime::GhostSlotMemory;
     friend class tensorrt_llm::runtime::unit_tests::HostAccessibleDeviceAllocatorTest;
 
     /**

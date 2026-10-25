@@ -22,8 +22,11 @@
 #include <csignal>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
+#include <optional>
 #include <string>
 #include <sys/wait.h>
+#include <tuple>
 #include <unistd.h>
 
 namespace
@@ -122,6 +125,40 @@ TEST(MpiUtilsFaultToleranceTest, EnvVarNonOneStringIsDisabled)
         FaultToleranceModeEnvGuard guard{val};
         EXPECT_FALSE(tensorrt_llm::mpi::isFaultToleranceModeEnabled())
             << "expected disabled for TLLM_FAULT_TOLERANCE_MODE=\"" << val << "\"";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// isPeerLossRecoveryEnabled()
+// ---------------------------------------------------------------------------
+
+TEST(MpiUtilsFaultToleranceTest, PeerLossRecoveryNeedsModeAndAuthority)
+{
+    char const* const previous = std::getenv("TLLM_FAULT_TOLERANCE_AUTHORITY");
+    std::optional<std::string> const saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+    for (auto const& [mode, authority, enabled] : std::initializer_list<std::tuple<char const*, char const*, bool>>{
+             {"1", "tcp://127.0.0.1:5555", true}, {"1", "", false}, {"1", nullptr, false},
+             {"0", "tcp://127.0.0.1:5555", false}, {nullptr, "tcp://127.0.0.1:5555", false}})
+    {
+        FaultToleranceModeEnvGuard guard{mode};
+        if (authority == nullptr)
+        {
+            ::unsetenv("TLLM_FAULT_TOLERANCE_AUTHORITY");
+        }
+        else
+        {
+            ::setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", authority, /*overwrite=*/1);
+        }
+        EXPECT_EQ(tensorrt_llm::mpi::isPeerLossRecoveryEnabled(), enabled)
+            << "mode=" << (mode ? mode : "unset") << " authority=" << (authority ? authority : "unset");
+    }
+    if (saved)
+    {
+        ::setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", saved->c_str(), /*overwrite=*/1);
+    }
+    else
+    {
+        ::unsetenv("TLLM_FAULT_TOLERANCE_AUTHORITY");
     }
 }
 

@@ -170,6 +170,12 @@ bool isFaultToleranceModeEnabled()
     return val != nullptr && std::string_view(val) == "1";
 }
 
+bool isPeerLossRecoveryEnabled()
+{
+    char const* authority = std::getenv("TLLM_FAULT_TOLERANCE_AUTHORITY");
+    return isFaultToleranceModeEnabled() && authority != nullptr && authority[0] != '\0';
+}
+
 void installFaultToleranceSignalHandlers()
 {
     // Exit code mirrors the SIGKILL convention (128 + 9 = 137) so logs distinguish
