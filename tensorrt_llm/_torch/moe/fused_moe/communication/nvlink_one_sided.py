@@ -657,6 +657,12 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
+        # Rank-mask mode: the kernels read the active-rank mask from this device record at execution time, so CUDA
+        # graphs captured once observe a mask rewritten in place. Holds the words last published, and their
+        # committed generation (None for a caller's mask).
+        self._rank_mask_record: Optional[torch.Tensor] = None
+        self._rank_mask_words: Optional[Tuple[int, ...]] = None
+        self._rank_mask_generation: Optional[int] = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -831,6 +837,30 @@ class NVLinkOneSided(Communication):
         self._workspace_registered = False
         self._workspace_lifecycle = None
 
+    def _publish_rank_mask(self, snapshot: ActiveRankMaskSnapshot) -> None:
+        """Write the snapshot's mask (CPU uint64 words) into the device record of the active-rank mask.
+
+        A committed mask is compared by its generation, so an unchanged membership costs no host read of the mask.
+        The write is a copy on the current stream, so collectives launched before it still read the previous mask.
+        """
+        generation = snapshot.committed_generation
+        if generation is not None and generation == self._rank_mask_generation:
+            return
+        mask = snapshot.active_rank_mask
+        words = tuple(int(word) for word in mask.tolist())
+        if words != self._rank_mask_words:
+            if not (words[self.ep_rank >> 6] >> (self.ep_rank & 63)) & 1:
+                raise ValueError(
+                    f"active_rank_mask must mark the local ep_rank ({self.ep_rank}) as active"
+                )
+            if self._rank_mask_record is None:
+                self._rank_mask_record = torch.empty(
+                    len(words), dtype=torch.uint64, device=self.workspace.device
+                )
+            self._rank_mask_record.copy_(mask)
+            self._rank_mask_words = words
+        self._rank_mask_generation = generation
+
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
         Check if NVLINK one-sided comm is feasible for the given workload at runtime.
@@ -991,6 +1021,8 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
+        if active_rank_mask is not None:
+            self._publish_rank_mask(active_rank_mask_snapshot)
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -1007,7 +1039,7 @@ class NVLinkOneSided(Communication):
                 expert_id_payload_index if can_fuse_sanitize else None,
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
-                active_rank_mask,
+                self._rank_mask_record,
             )
         )
         self._watchdog_coordinator.watch_collective(
@@ -1151,7 +1183,8 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             use_cft_for_combine,
             self._rank_mask_enabled,
-            active_rank_mask,
+            # Dispatch published this collective's mask: combine's mask must match it.
+            self._rank_mask_record,
         )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask
