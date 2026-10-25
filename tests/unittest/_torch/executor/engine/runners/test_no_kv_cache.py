@@ -237,7 +237,7 @@ def test_no_kv_cache_runner_prepare_inputs_gathers_attention_dp_token_counts(
     )
 
     assert attn_metadata.all_rank_num_tokens == [2, 5]
-    dist.tp_allgather_int64.assert_called_once_with([2])
+    dist.tp_allgather_int64.assert_called_once_with([2], departed=0)
     dist.tp_cp_allgather_int64.assert_called_once_with([2])
 
 

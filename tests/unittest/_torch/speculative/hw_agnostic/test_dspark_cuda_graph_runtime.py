@@ -269,7 +269,7 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     runner.enable_in_graph_sampling = True
     exchanges = []
 
-    def allgather(payload):
+    def allgather(payload, departed=None):
         exchanges.append(payload)
         peer = list(payload)
         peer[-1] = SampleType.FULL.value
@@ -278,7 +278,7 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
         mapping=SimpleNamespace(tp_size=2),
-        dist=SimpleNamespace(tp_allgather_int64=allgather),
+        dist=SimpleNamespace(tp_allgather_int64=allgather, live_ranks=(0, 1)),
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
 

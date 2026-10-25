@@ -2154,7 +2154,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(inputs, metadata, spec)
         )
         assert spec_counts == [[6, 9], [1, 2], [1, 2]]
-        gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1])
+        gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1], departed=0)
     else:
         gather = Mock(return_value=torch.tensor([[local_rows, decoder_rows], [513, peer_rows]]))
         metadata.all_rank_num_tokens = get_all_rank_num_tokens(
@@ -2163,7 +2163,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_allgather_int64=gather),
         )
-        gather.assert_called_once_with([local_rows, decoder_rows])
+        gather.assert_called_once_with([local_rows, decoder_rows], departed=0)
     if mode == "late_full_states":
         with pytest.raises(ValueError, match="Full token states must be requested"):
             model._plan_bounded_replay(metadata, True)

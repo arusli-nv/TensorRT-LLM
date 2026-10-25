@@ -41,6 +41,7 @@ from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
+from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
@@ -806,6 +807,13 @@ class ModelEngine:
         return None
 
     @property
+    def moe_execution_state(self) -> MoeExecutionState | None:
+        """MoE execution state of the decoder runner; None without recovery."""
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner.moe_execution_state
+        return None
+
+    @property
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):
@@ -1146,6 +1154,10 @@ class ModelEngine:
         # handle available if graph release fails and cleanup is retried.
         # Destruction timing is not rank-symmetric; only explicit shutdown releases owners.
         self._release_cuda_graphs(release_nccl_window_owners=False)
+        # No captured graph can replay against the MoE workspaces any more.
+        execution_state = self.moe_execution_state
+        if execution_state is not None:
+            execution_state.close()
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
