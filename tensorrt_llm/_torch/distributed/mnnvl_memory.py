@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol, Sequence
 
 import pynvml
 import torch
@@ -261,6 +261,36 @@ class _MnnvlAllocationRecord:
     comm_signature: tuple[int, ...] = ()
     state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
     pending_comm: Any = None
+    pin_count: int = 0
+
+
+class _LiveRowsComm:
+    """An allocation's communicator restricted to its live members, for :meth:`MnnvlMemory.remap`.
+
+    ``gather(value)`` returns one entry per global rank, None for a departed one; :meth:`allgather`
+    orders them by the allocation's communicator ranks. ``gather_failed`` records that an exchange raised.
+    """
+
+    def __init__(
+        self, record: _MnnvlAllocationRecord, gather: Callable[[Any], Sequence[Any]]
+    ) -> None:
+        self._record = record
+        self._gather = gather
+        self.gather_failed = False
+
+    def Get_rank(self) -> int:
+        return self._record.comm_rank
+
+    def Get_size(self) -> int:
+        return self._record.comm_size
+
+    def allgather(self, value: Any) -> list[Any]:
+        try:
+            by_rank = self._gather(value)
+        except BaseException:
+            self.gather_failed = True
+            raise
+        return [by_rank[member] for member in self._record.comm_membership]
 
 
 class MnnvlMemory:
@@ -324,6 +354,25 @@ class MnnvlMemory:
     def mapped(self) -> bool:
         """Whether the allocation is mapped and ready for data-path access."""
         return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
+
+    def pin(self) -> None:
+        """Keep the allocation's addresses until the matching :meth:`unpin`.
+
+        Captured CUDA graphs address them directly, so checkpointing and closing
+        do not unmap a pinned allocation; only :meth:`release_backing` and
+        :meth:`remap` replace its pages, at the same addresses.
+        """
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            raise RuntimeError(f"Cannot pin MNNVL allocation in {record.state.value} state")
+        record.pin_count += 1
+
+    def unpin(self) -> None:
+        """Release one :meth:`pin`."""
+        record = type(self).allocated_map[self.ptr]
+        if record.pin_count == 0:
+            raise RuntimeError("MNNVL allocation is not pinned")
+        record.pin_count -= 1
 
     def as_torch_strided_tensor(self, dtype):
         # Describe the allocation with the layout it was created under, recorded at
@@ -592,24 +641,28 @@ class MnnvlMemory:
                 },
                 operation="handle export",
             )
+            # A rank that sent nothing (see _LiveRowsComm) keeps its row unmapped.
+            live = [rank for rank, payload in enumerate(exported_by_rank) if payload is not None]
             export_errors = [
-                f"rank {rank}: {payload['error']}"
-                for rank, payload in enumerate(exported_by_rank)
-                if payload["error"] is not None
+                f"rank {rank}: {exported_by_rank[rank]['error']}"
+                for rank in live
+                if exported_by_rank[rank]["error"] is not None
             ]
             if export_errors:
                 raise RuntimeError(
                     "MNNVL handle export failed before mapping:\n" + "\n".join(export_errors)
                 )
-            fabric_modes = {payload["is_fabric"] for payload in exported_by_rank}
+            fabric_modes = {exported_by_rank[rank]["is_fabric"] for rank in live}
             if len(fabric_modes) != 1:
                 raise RuntimeError("MNNVL ranks selected inconsistent shareable handle types")
             is_fabric = fabric_modes.pop()
+            all_handles_data = [None] * len(exported_by_rank)
             if is_fabric:
-                all_handles_data = [payload["handle"] for payload in exported_by_rank]
+                for rank in live:
+                    all_handles_data[rank] = exported_by_rank[rank]["handle"]
             else:
-                all_exported_fds = [payload["handle"] for payload in exported_by_rank]
-                all_pids = [payload["pid"] for payload in exported_by_rank]
+                all_exported_fds = [exported_by_rank[rank]["handle"] for rank in live]
+                all_pids = [exported_by_rank[rank]["pid"] for rank in live]
                 syscall = ctypes.CDLL(None, use_errno=True).syscall
                 fd_import_error = None
                 try:
@@ -658,12 +711,14 @@ class MnnvlMemory:
                         "MNNVL POSIX file descriptor import failed on one or more ranks:\n"
                         + "\n".join(failed_ranks)
                     )
-                all_handles_data = remote_fds
+                for rank, remote_fd in zip(live, remote_fds):
+                    all_handles_data[rank] = remote_fd
 
             access_desc = cuda.CUmemAccessDesc()
             access_desc.location = allocation_prop.location
             access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-            for rank, handle_data in enumerate(all_handles_data):
+            for rank in live:
+                handle_data = all_handles_data[rank]
                 rank_ptr = start_address + rank_stride * rank + address_offset
                 handle = (
                     local_handle
@@ -808,6 +863,9 @@ class MnnvlMemory:
                 f"Skipping cleanup of MNNVL allocation in terminal state {record.state.value}"
             )
             return
+        if record.pin_count:
+            logger.warning("Retaining pinned MNNVL allocation")
+            return
         cls.allocated_map.pop(ptr)
         if record.state is _MnnvlAllocationState.MAPPED:
             cls._unmap_and_release_handles(record)
@@ -832,6 +890,9 @@ class MnnvlMemory:
     def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
         first_error = None
         for rank in range(record.comm_size):
+            if record.mem_handles[rank] is None:
+                # Not mapped: a departed rank's row after remap().
+                continue
             rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
             try:
                 _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
@@ -862,6 +923,13 @@ class MnnvlMemory:
             return
         if record.state is not _MnnvlAllocationState.MAPPED:
             raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
+        if any(handle is None for handle in record.mem_handles):
+            raise RuntimeError(
+                "Cannot checkpoint an MNNVL allocation remapped without departed ranks: "
+                "its restore would map their rows again"
+            )
+        if record.pin_count:
+            raise RuntimeError("Cannot checkpoint a pinned MNNVL allocation")
         record.state = _MnnvlAllocationState.PREPARING
         try:
             torch.cuda.synchronize()
@@ -871,6 +939,87 @@ class MnnvlMemory:
             record.state = _MnnvlAllocationState.BROKEN
             raise
         record.state = _MnnvlAllocationState.UNMAPPED
+
+    def release_backing(self) -> int:
+        """Unmap every row and release its handle, keeping the addresses; return the bytes of this rank's row.
+
+        Unlike :meth:`checkpoint_prepare` this applies to a pinned allocation: captured graphs keep the
+        addresses and replay only after :meth:`remap`. Pages stay allocated while any importer still maps
+        them, so a departed importer's late writes land in pages no live rank maps again. No collective;
+        the caller has joined the device work that may use the rows.
+        """
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if record.state is _MnnvlAllocationState.MAPPED:
+            torch.cuda.synchronize()
+            try:
+                cls._unmap_and_release_handles(record)
+            except Exception:
+                record.state = _MnnvlAllocationState.BROKEN
+                raise
+            record.state = _MnnvlAllocationState.UNMAPPED
+        elif record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot release MNNVL allocation in {record.state.value} state")
+        return record.aligned_size
+
+    def remap(self, gather: Callable[[Any], Sequence[Any]]) -> None:
+        """Map fresh pages at the addresses :meth:`release_backing` kept, shared only among the live ranks.
+
+        ``gather(value)`` collects ``value`` from every live rank: one entry per global rank, None for a departed
+        one, whose row stays unmapped. Collective over the live ranks. The fresh pages are uninitialized.
+
+        The live ranks exchange whether their mapping succeeded (it can fail on some ranks only), so every live
+        rank either maps or raises; an exception of ``gather`` propagates at once. Either leaves the allocation
+        unmapped, so a later attempt may remap it, made by every live rank together (the handle exchange has no
+        round tag); if releasing the fresh pages fails too, that is logged, the original error propagates, and the
+        allocation is broken.
+
+        Raises:
+            RuntimeError: Mapping failed on some live rank.
+        """
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot remap MNNVL allocation in {record.state.value} state")
+        comm = _LiveRowsComm(record, gather)
+        handles, error, local_failure = None, None, None
+        try:
+            handles = cls._create_and_map_handles(
+                comm,
+                record.aligned_size,
+                record.start_address,
+                record.rank_stride,
+                record.address_offset,
+            )
+        except Exception as failure:
+            if comm.gather_failed:
+                raise
+            local_failure = failure
+            error = f"{type(failure).__name__}: {failure}"
+        try:
+            failures = [
+                f"rank {rank}: {outcome}"
+                for rank, outcome in enumerate(gather(error))
+                if outcome is not None
+            ]
+            if failures:
+                raise RuntimeError(
+                    "MNNVL remap failed on live ranks:\n" + "\n".join(failures)
+                ) from local_failure
+        except BaseException:
+            if handles is not None:
+                record.mem_handles = handles
+                try:
+                    cls._unmap_and_release_handles(record)
+                except RuntimeError as cleanup_error:
+                    # The original error decides how the recovery goes on; this allocation is not remapped again.
+                    logger.error(
+                        f"Failed to release the pages of a failed MNNVL remap: {cleanup_error}"
+                    )
+                    record.state = _MnnvlAllocationState.BROKEN
+            raise
+        record.mem_handles = handles
+        record.state = _MnnvlAllocationState.MAPPED
 
     def checkpoint_fail_closed(self) -> None:
         """Make a timed-out checkpoint allocation terminal.

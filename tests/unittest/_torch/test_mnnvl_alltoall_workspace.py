@@ -277,6 +277,35 @@ def test_checkpoint_suspends_and_recreates_one_shared_watchdog(
     assert comm.allgather_count == 1
 
 
+def test_remap_restarts_the_watchdog_after_the_row_reset_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog reads its flag baseline when it starts: only once the remapped row was reset on the device."""
+    lifecycle, memory, _ = _make_lifecycle()
+    order = []
+    coordinator = Mock()
+    coordinator.acquire_watchdog.side_effect = lambda **kwargs: order.append("start") or Mock()
+    coordinator.release_watchdog.side_effect = lambda watchdog: order.append("stop")
+    lifecycle._coordinator = coordinator
+    client = _Client()
+    lifecycle.register(
+        client,
+        watchdog_timeout_s=5.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
+    memory.release_backing.side_effect = lambda: order.append("release") or 1
+    memory.remap.side_effect = lambda gather: order.append("remap")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: order.append("synchronize"))
+    order.clear()
+
+    lifecycle.release_backing()
+    lifecycle.remap(Mock(), lambda: order.append("reset"))
+
+    assert order == ["stop", "release", "remap", "reset", "synchronize", "start"]
+    assert client in lifecycle._watchdog_clients
+
+
 def test_unregister_stops_watchdog_after_last_enabled_client() -> None:
     lifecycle, _, _ = _make_lifecycle()
     coordinator = Mock()
