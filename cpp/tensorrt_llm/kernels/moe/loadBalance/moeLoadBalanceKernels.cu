@@ -652,6 +652,20 @@ void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal)
     std::atomic_thread_fence(std::memory_order_acquire);
 }
 
+void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, std::function<bool()> const& abandoned)
+{
+    while (getOwnerDevice(__atomic_load_n(&signal->stepAndOwner, __ATOMIC_ACQUIRE))
+        != MoeLoadBalanceSingleLayerSignal::kCPU)
+    {
+        if (abandoned())
+        {
+            __atomic_fetch_or(&signal->stepAndOwner, MoeLoadBalanceSingleLayerSignal::kCPU, __ATOMIC_ACQ_REL);
+            break;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
 void moeSetSignalForGpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, int64_t iterId, bool enableStatistic)
 {
     std::atomic_thread_fence(std::memory_order_release);

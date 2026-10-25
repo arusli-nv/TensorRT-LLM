@@ -17,9 +17,11 @@
 
 #include "moeBindings.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <vector>
 
@@ -99,8 +101,10 @@ void initMoeBindings(nb::module_& m)
 
     // Bind MoeLoadBalancer class
     nb::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
-        .def(nb::init<int, int, int>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
-            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency",
+        .def(nb::init<int, int, int, bool>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
+            nb::arg("peer_loss_recovery") = false,
+            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, update frequency and "
+            "whether WideEP peer-loss recovery is enabled",
             nb::call_guard<nb::gil_scoped_release>())
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, nb::arg("use_gpu_memcpy"),
             "Set whether to use GPU memcpy for weight updates", nb::call_guard<nb::gil_scoped_release>())
@@ -115,16 +119,38 @@ void initMoeBindings(nb::module_& m)
         .def("start_iter", &tr::MoeLoadBalancer::startIter, nb::arg("iter_id"), nb::arg("enable_statistic"),
             nb::arg("enable_update_weights"), "Start a new iteration with the given ID and settings",
             nb::call_guard<nb::gil_scoped_release>())
-        .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), "End the iteration with the given ID",
+        .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), nb::arg("interrupted") = false,
+            "End the iteration with the given ID; interrupted if its forward raised",
             nb::call_guard<nb::gil_scoped_release>())
         .def("reconfigure_mask_only", &tr::MoeLoadBalancer::reconfigureMaskOnly, nb::arg("dead_ranks"),
             "Reconfigure EPLB routing metadata so slots on dead EP ranks are unreachable",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
+            nb::arg("layer_rank_expert_ids"), nb::arg("slots_loaded") = false,
+            "Mark dead EP ranks and install a new placement per layer, loading changed local slots from host weights",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("quiesce", &tr::MoeLoadBalancer::quiesce, nb::arg("timeout_ms"),
+            "Wait until started iterations and weight updates are done; false on timeout",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("reset_update_schedule", &tr::MoeLoadBalancer::resetUpdateSchedule,
+            "Restart the layer update rotation and clear the load factors (only while quiesced)",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("restore_backing_bytes", &tr::MoeLoadBalancer::restoreBackingBytes, nb::arg("layer_rank_expert_ids"),
+            "Device memory a restore of this placement maps behind ghost slots",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("back_restored_slots", &tr::MoeLoadBalancer::backRestoredSlots, nb::arg("layer_rank_expert_ids"),
+            "Map device memory behind the ghost slots a restore of this placement loads",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("release_uninstalled_backing", &tr::MoeLoadBalancer::releaseUninstalledBacking,
+            "Return the memory mapped for a placement that was never installed; the bytes freed",
             nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
             nb::call_guard<nb::gil_scoped_release>());
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
         "If current system support host accessible device memory");
+    m.def("is_ghost_slot_memory_host_accessible", &tr::GhostSlotMemory::hostAccessibleSupported,
+        "Whether ghost slot memory can be host accessible without the managed memory fallback, for CPU copies");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, nb::arg("meta_info"), nb::arg("expert_load_factor"),

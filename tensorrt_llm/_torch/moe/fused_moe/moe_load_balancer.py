@@ -899,8 +899,11 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.layer_updates_per_iter = layer_updates_per_iter
-        self.load_balancer_impl = _tbr.MoeLoadBalancer(ep_rank, ep_size,
-                                                       layer_updates_per_iter)
+        self.load_balancer_impl = _tbr.MoeLoadBalancer(
+            ep_rank,
+            ep_size,
+            layer_updates_per_iter,
+            peer_loss_recovery=peer_loss_recovery_enabled())
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(

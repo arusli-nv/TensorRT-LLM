@@ -44,8 +44,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer = MoeLoadBalancer(ep_rank, ep_size, layer_updates_per_iter)
 
         # Verify
-        mock_load_balancer_impl.assert_called_once_with(ep_rank, ep_size,
-                                                        layer_updates_per_iter)
+        mock_load_balancer_impl.assert_called_once_with(
+            ep_rank, ep_size, layer_updates_per_iter, peer_loss_recovery=False)
         self.assertEqual(balancer.ep_rank, ep_rank)
         self.assertEqual(balancer.ep_size, ep_size)
         self.assertEqual(balancer.layer_updates_per_iter,
@@ -166,7 +166,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
                              104)
             self.assertEqual(get_moe_load_balancer(), balancer)
 
-        mock_load_balancer_impl.assert_called_once_with(0, 4, 2)
+        mock_load_balancer_impl.assert_called_once_with(
+            0, 4, 2, peer_loss_recovery=False)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_exception_in_context(self, mock_load_balancer_impl):
