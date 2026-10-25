@@ -608,6 +608,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 top_k,
                 slot_count_per_rank,
                 aux_stream=aux_stream)
+            # EPLB's slots, then any ghost slots WideEP peer-loss recovery appends.
+            self.expert_size_per_partition = self.layer_load_balancer.slot_count_per_rank
 
             self.repeat_count = self.layer_load_balancer.get_repeat_count()
 
@@ -629,6 +631,9 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     range(self.num_experts))
                 self.initial_global_assignments = loaded_initial_global_assignments
 
+            self.initial_global_assignments = self.layer_load_balancer.with_ghost_slots(
+                self.initial_global_assignments)
+            self.num_slots = len(self.initial_global_assignments)
             self.layer_load_balancer.set_initial_weight_assignments(
                 self.initial_global_assignments)
 

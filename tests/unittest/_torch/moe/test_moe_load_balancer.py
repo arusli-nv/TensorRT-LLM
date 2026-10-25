@@ -12,6 +12,9 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe import impl_blocks
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import (
+    MoEEplbWeightLayoutMixin, slot_rows)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
@@ -291,11 +294,61 @@ class TestMoeLoadBalancer(unittest.TestCase):
             mock_load_balancer_impl.return_value.start_iter.assert_called_once_with(
                 0, True, True)
 
-        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(0)
+        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(
+            0, interrupted=False)
 
         # shutdown
         balancer.shutdown()
         mock_load_balancer_impl.return_value.shutdown.assert_called_once()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_forward_raising_mid_layer_ends_the_iteration_interrupted(
+            self, mock_load_balancer_impl):
+        """A forward that raises between a layer's stage calls ends its iteration interrupted."""
+
+        torch.cuda.set_device(0)
+
+        balancer = MoeLoadBalancer(0, 4, 2)
+        layer = balancer.add_layer(4, 2, 1)
+        balancer.set_iter_info(True, True)
+
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'), patch(
+                'tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.peer_loss_recovery_enabled',
+                return_value=True):
+            with self.assertRaises(ValueError):
+                with MoeLoadBalancerIterContext(balancer):
+                    layer.start_wait_gpu_stage()
+                    layer.done_wait_gpu_stage()
+                    raise ValueError("forward interrupted")
+            mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(
+                0, interrupted=True)
+
+            # The next forward starts the layer's stages again.
+            with MoeLoadBalancerIterContext(balancer):
+                layer.start_wait_gpu_stage()
+        mock_load_balancer_impl.return_value.end_iter.assert_called_with(
+            1, interrupted=False)
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_without_peer_loss_recovery_a_raising_forward_ends_its_iteration_as_on_main(
+            self, mock_load_balancer_impl):
+        """Without peer-loss recovery a forward that raises ends its iteration uninterrupted and keeps
+        the layer's stage counts."""
+
+        torch.cuda.set_device(0)
+
+        balancer = MoeLoadBalancer(0, 4, 2)
+        layer = balancer.add_layer(4, 2, 1)
+        balancer.set_iter_info(True, True)
+
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'):
+            with self.assertRaises(ValueError):
+                with MoeLoadBalancerIterContext(balancer):
+                    layer.start_wait_gpu_stage()
+                    raise ValueError("forward interrupted")
+        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(
+            0, interrupted=False)
+        self.assertEqual(layer.func_called_count["start_wait_gpu_stage"], 1)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_reconfigure_mask_only_rejects_active_iteration(
@@ -562,6 +615,93 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
         finally:
             balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+@pytest.mark.parametrize("recovering", [True, False])
+def test_shutdown_tolerates_a_lost_node_peer_only_during_recovery(recovering):
+    """A dead node-mate fails the shutdown preflight and barriers: recovery shuts down without it."""
+    from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer
+
+    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer.is_shutdown = False
+    balancer.in_iter = False
+    balancer.single_layer_load_balancers = []
+    balancer.load_balancer_impl = MagicMock()
+    balancer.shared_mpi_comm = MagicMock()
+    balancer.shared_mpi_comm.allgather.side_effect = MPI.Exception(
+        MPI.ERR_OTHER)
+    balancer.shared_mpi_comm.barrier.side_effect = MPI.Exception(MPI.ERR_OTHER)
+    with patch.object(moe_load_balancer, "peer_loss_recovery_enabled", return_value=recovering), \
+            patch.object(moe_load_balancer, "is_mpi_peer_failure", return_value=True):
+        if recovering:
+            assert balancer.shutdown() is True
+            assert balancer.is_shutdown
+            balancer.load_balancer_impl.shutdown.assert_called_once()
+        else:
+            with pytest.raises(MPI.Exception):
+                balancer.shutdown()
+            balancer.load_balancer_impl.shutdown.assert_not_called()
+
+
+def test_slot_rows_copies_a_repacked_slot_as_its_dense_block():
+    """DEEPGEMM's MN-major block scales: no slot is contiguous, but each fills one block of the storage."""
+    storage = torch.arange(2 * 3 * 4, dtype=torch.int32).view(2, 3, 4)
+    scales = storage.transpose(1, 2)
+    rows = slot_rows(scales)
+    assert rows.shape == (2, 12) and rows.is_contiguous()
+    assert rows.data_ptr() == scales.data_ptr()
+    assert torch.equal(rows[1], storage[1].flatten())
+    # Padding inside a slot: copying its block would copy the padding, so it is refused.
+    with pytest.raises(ValueError, match="dense blocks"):
+        slot_rows(torch.zeros(2, 4, 5)[:, :, :3])
+    # Slots innermost: a slot's elements are strided across the storage.
+    with pytest.raises(ValueError, match="dense blocks"):
+        slot_rows(torch.zeros(3, 4).t())
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_eplb_slots_are_rows_only_with_peer_loss_recovery(recovery):
+    """Without peer-loss recovery EPLB registers each slot itself, contiguous only."""
+
+    class _Module(MoEEplbWeightLayoutMixin):
+        pass
+
+    module = _Module()
+    module.layer_load_balancer = MagicMock()
+    module.layer_load_balancer.need_load_shared_weights.return_value = True
+    module.weight = torch.nn.Parameter(torch.arange(12.0).view(2, 2, 3),
+                                       requires_grad=False)
+    module.scales = torch.nn.Parameter(torch.zeros(2, 3, 4).transpose(1, 2),
+                                       requires_grad=False)
+    with patch.object(impl_blocks,
+                      "peer_loss_recovery_enabled",
+                      return_value=recovery):
+        module.register_parameter_weight_slot_fn("weight", 1)
+        slot = module.layer_load_balancer.register_weight_slot.call_args.args[2]
+        assert slot.shape == ((6, ) if recovery else (2, 3))
+        assert torch.equal(slot.flatten(), module.weight.data[1].flatten())
+        if recovery:
+            module.register_to_fix_weight_fn("scales")
+        else:
+            with pytest.raises(AssertionError, match="should be contiguous"):
+                module.register_to_fix_weight_fn("scales")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_ghost_slot_storage_copies_after_the_producer_on_its_stream():
+    """The weights may still be written by a kernel on a non-default stream when their slots become ghost slots."""
+    import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        weights = torch.zeros(4, 1 << 20, device="cuda")
+        torch.cuda._sleep(
+            50_000_000
+        )  # the producer is still busy when the slots become ghost slots
+        weights.fill_(3.0)
+        torch.ops.trtllm.moe_ghost_slot_storage(weights, [1])
+    torch.cuda.synchronize()
+    assert weights[0].eq(3.0).all() and weights[2:].eq(3.0).all()
 
 
 if __name__ == '__main__':
