@@ -19,6 +19,7 @@
 #include "heartbeatSender.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
+#include "peerFailureWatch.h"
 #include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
@@ -337,6 +338,7 @@ void initBindings(nb::module_& m)
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);
+    initPeerFailureWatchBindings(m);
     initHeartbeatSenderBindings(m);
     // Initialize HostFunc bindings
     initHostFuncBindings(m);
