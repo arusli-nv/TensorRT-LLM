@@ -41,6 +41,8 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import peer_loss_recovery_enabled
+
 from ...utils import Fp4QuantizedTensor
 from .impl_contract import MoEInputRequirement, MoEStaticCapability
 
@@ -283,12 +285,46 @@ class MoEWeightOwnerMixin:
         return self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
 
 
+def slot_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` ([slots, ...]) as ``[slots, elements]`` rows over the same storage, for EPLB slot copies.
+
+    A slot of a repacked layout (e.g. DEEPGEMM's MN-major block scales) is not contiguous, but its elements fill
+    one dense block of the storage; EPLB copies that block as is, and the host copies share the layout.
+
+    Raises:
+        ValueError: A slot's elements do not fill one dense block.
+    """
+    if tensor.is_contiguous():
+        return tensor.reshape(tensor.shape[0], -1)
+    block = tensor.stride(0)
+    filled = 1
+    for stride, size in sorted(
+        (stride, size) for stride, size in zip(tensor.stride()[1:], tensor.shape[1:]) if size > 1
+    ):
+        if stride != filled:
+            break
+        filled *= size
+    else:
+        if filled == block:
+            return tensor.as_strided((tensor.shape[0], block), (block, 1))
+    raise ValueError(
+        f"EPLB slots of shape {tuple(tensor.shape)} and strides {tensor.stride()} are not dense blocks"
+    )
+
+
+def _eplb_slots(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` ([slots, ...]) indexed by slot for EPLB slot copies: ``slot_rows(tensor)`` with peer-loss
+    recovery, which also takes repacked layouts, else ``tensor`` itself."""
+    return slot_rows(tensor) if peer_loss_recovery_enabled() else tensor
+
+
 class MoEEplbWeightLayoutMixin:
     """The EPLB half that follows the weights, not the forward pass.
 
     "Weight" here means weight-side, not static-only: four of these members
-    return early unless ``_using_dynamic_load_balancer()``, so the block serves
-    the dynamic balancer at least as much as the static one. Naming it after
+    return early unless ``_using_host_weight_copies()`` (dynamic routing, or
+    static routing that restores slots), so the block serves the dynamic
+    balancer at least as much as the static one. Naming it after
     static layout would send a reader looking for the dynamic path elsewhere.
 
     ``create_weights`` / ``load_weights`` delegate to
@@ -306,7 +342,7 @@ class MoEEplbWeightLayoutMixin:
     """
 
     def _add_raw_shared_weights_for_unmap(self, weight_tensors: List[torch.Tensor]):
-        if self._using_dynamic_load_balancer():
+        if self._using_host_weight_copies():
             self.layer_load_balancer._add_raw_host_weight_for_unmap(weight_tensors)
 
     def _supports_load_balancer(self) -> bool:
@@ -326,28 +362,38 @@ class MoEEplbWeightLayoutMixin:
             return self.layer_load_balancer.is_dynamic_routing()
         return False
 
+    def _using_host_weight_copies(self) -> bool:
+        """Whether the load balancer keeps host copies of the experts and loadable slots (dynamic routing, or
+        static routing with restores)."""
+        return (
+            bool(self.layer_load_balancer) and self.layer_load_balancer.need_load_shared_weights()
+        )
+
     def register_parameter_weight_slot_fn(self, weight_name: str, local_slot_id: int):
         """Register parameter weight slot function for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not self._using_host_weight_copies():
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
-        weight_tensor = getattr(self, weight_name).data[local_slot_id]
+        weight_tensor = _eplb_slots(getattr(self, weight_name).data)[local_slot_id]
         self.layer_load_balancer.register_weight_slot(local_slot_id, weight_name, weight_tensor)
 
     def register_to_fix_weight_fn(self, weight_name: str):
         """Register weight fixing function for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not self._using_host_weight_copies():
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
         param = getattr(self, weight_name)
         weight_tensor = param.detach()
         assert isinstance(weight_tensor, torch.Tensor), f"weight {weight_name} should be a tensor"
-        assert weight_tensor.is_contiguous(), (
-            f"weight {weight_name} should be contiguous, "
-            f"shape={weight_tensor.shape}, strides={weight_tensor.stride()}"
-        )
+        if peer_loss_recovery_enabled():
+            slot_rows(weight_tensor)  # Each slot must be one dense block of the storage.
+        else:
+            assert weight_tensor.is_contiguous(), (
+                f"weight {weight_name} should be contiguous, "
+                f"shape={weight_tensor.shape}, strides={weight_tensor.stride()}"
+            )
         assert (
             weight_tensor.numel() * weight_tensor.element_size()
             == weight_tensor.untyped_storage().size()
@@ -364,7 +410,7 @@ class MoEEplbWeightLayoutMixin:
         self, weight_and_tensor_dict: Dict[str, torch.Tensor]
     ):
         """Register all parameter slot and weight fixing functions for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not self._using_host_weight_copies():
             return
 
         # Register weight functions for each local slot
@@ -382,14 +428,15 @@ class MoEEplbWeightLayoutMixin:
 
         # Setup host tensor sharing
         local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids()
+        host_rows = {name: _eplb_slots(tensor) for name, tensor in weight_and_tensor_dict.items()}
         for expert_id in range(self.num_experts):
-            for weight_name, weight_tensor in weight_and_tensor_dict.items():
+            for weight_name, rows in host_rows.items():
                 if expert_id in local_shared_load_expert_ids:
                     local_slot_id = local_shared_load_expert_ids.index(expert_id)
                     self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor[local_slot_id]
+                        expert_id, weight_name, rows[local_slot_id]
                     )
                 else:
                     self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype, weight_tensor[0].shape
+                        expert_id, weight_name, rows.dtype, rows[0].shape
                     )

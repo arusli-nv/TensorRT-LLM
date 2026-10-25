@@ -5,7 +5,7 @@
 import pytest
 
 from tensorrt_llm.executor.recovery import config as config_module
-from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConfig
+from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConfig, failure_domains
 
 pytestmark = pytest.mark.cpu_only
 
@@ -103,3 +103,19 @@ def test_digest_is_stable_and_changes_with_any_field():
     assert changed.keys() == FaultToleranceConfig.model_fields.keys()
     digests = {FaultToleranceConfig(**{name: value}).digest() for name, value in changed.items()}
     assert digest not in digests and len(digests) == len(changed)
+
+
+def test_failure_domains_are_every_rank_then_every_host_but_rank_0_s():
+    hosts = ["a"] * 4 + ["b"] * 4
+    assert failure_domains(hosts, "rank") == [(r,) for r in range(1, 8)]
+    assert failure_domains(hosts, "node") == [
+        *((r,) for r in range(1, 8)),
+        (4, 5, 6, 7),
+    ]
+    # Ranks mapped round-robin over the hosts: a node is the ranks on one host, not a block of ranks.
+    assert failure_domains(["a", "b", "a", "b"], "node")[-1] == (1, 3)
+    assert failure_domains(["a", "b", "c", "d"], "node") == [
+        (1,),
+        (2,),
+        (3,),
+    ]
