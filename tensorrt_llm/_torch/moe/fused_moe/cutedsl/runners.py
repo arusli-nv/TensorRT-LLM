@@ -33,7 +33,7 @@ from ....autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from ....custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ....custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper, loaded_slot_layout
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ....locality_domain.autotune import (
     LocalityDomainConcurrentTunableRunner as _LocalityDomainConcurrentTunableRunner,
@@ -143,6 +143,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_locality_domain: bool = False,
         workload_identity: tuple | None = None,
         prime_inner_tactics: bool = False,
+        num_extra_local_experts: int = 0,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -154,6 +155,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
         self.use_locality_domain = use_locality_domain
+        self.num_extra_local_experts = num_extra_local_experts
+        self.tuning_layout = loaded_slot_layout(
+            num_experts, num_local_experts, local_expert_offset, num_extra_local_experts
+        )
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -168,11 +173,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self) -> tuple:
+        num_experts, num_local_experts, local_expert_offset = self.tuning_layout
         identity = (
-            self.num_experts,
+            num_experts,
             self.top_k,
-            self.num_local_experts,
-            self.local_expert_offset,
+            num_local_experts,
+            local_expert_offset,
             self.enable_finalize_fusion,
             self.enable_alltoall,
             self.output_dtype,
@@ -200,18 +206,19 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return [128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
-        key = self.unique_id()
+        key = (self.unique_id(), self.num_extra_local_experts)
         if key not in self.__class__.tuning_config_cache:
+            num_experts, num_local_experts, local_expert_offset = self.tuning_layout
             if self.use_direct_expert_metadata:
                 # One tuning profile is shared by the 128- and 256-row
                 # tactics. Use the minimum tile size so its capacity buckets
                 # cover the union needed by both tactics; each kernel still
                 # rounds capacity to its selected tile size.
                 helper = GroupedGemmInputsHelper(
-                    self.num_experts,
+                    num_experts,
                     self.top_k,
-                    self.num_local_experts,
-                    self.local_expert_offset,
+                    num_local_experts,
+                    local_expert_offset,
                     128,
                 )
                 tuning_config = TuningConfig(
@@ -232,8 +239,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     use_cold_l2_cache=True,
                 )
             else:
+                # The profiled routing runs through forward_impl, so it
+                # selects the loaded slots by their real ids.
                 helper = CuteDslFusedMoENvfp4InputsHelper(
-                    self.num_experts, self.top_k, self.num_local_experts, self.local_expert_offset
+                    num_experts, self.top_k, num_local_experts, self.local_expert_offset
                 )
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(
