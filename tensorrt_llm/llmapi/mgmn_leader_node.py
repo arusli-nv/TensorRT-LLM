@@ -16,7 +16,8 @@ from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.executor.utils import (
     get_spawn_proxy_process_ipc_addr_env,
     get_spawn_proxy_process_ipc_hmac_key_env)
-from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+from tensorrt_llm.llmapi.mpi_session import (RemoteMpiCommSessionServer,
+                                             exit_fault_tolerant_process)
 from tensorrt_llm.llmapi.utils import logger_debug
 from tensorrt_llm.logger import logger
 
@@ -105,6 +106,7 @@ def main(action: Literal["start", "stop"] = "start"):
     '''
     if action == "start":
         launch_server_main()
+        exit_fault_tolerant_process()
     elif action == "stop":
         if not stop_server_main():
             sys.exit(1)
