@@ -22,6 +22,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py TIMEOUT (10)
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py TIMEOUT (10)
   - unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py TIMEOUT (10)
+  - unittest/_torch/distributed/test_mpi_survivors_ulfm.py
+  - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[idle-sync] TIMEOUT (45)
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
@@ -101,6 +103,19 @@ l0_gb200_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[idle-overlap] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[inflight-sync] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery[inflight-overlap] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_serving_without_fault_tolerance[sync] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_serving_without_fault_tolerance[overlap] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_peer_loss_recovery_under_load TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_two_ranks_lost_together TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_rank_lost_during_recovery TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_ghost_slots[static] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_ghost_slots[online] TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_restore_into_appended_empty_slots TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_hung_rank_fenced TIMEOUT (45)
+  - wide_ep_ft/test_peer_loss_recovery.py::test_authority_lost_while_serving TIMEOUT (45)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_OFF]
