@@ -20,6 +20,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py TIMEOUT (10)
+  - unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py TIMEOUT (10)
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
