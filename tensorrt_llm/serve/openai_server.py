@@ -291,6 +291,42 @@ def _configure_parser_special_token_decoding(
         sampling_params.spaces_between_special_tokens = False
 
 
+def _stream_error_events(error: Exception) -> List[str]:
+    """The SSE events that end a stream whose request failed after it began.
+
+    The HTTP status is already committed by then, so the error travels as an
+    ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
+    """
+    message = str(error)
+    error_data = json.dumps({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "code": None,
+            "param": None,
+        }
+    })
+    return [f"data: {error_data}\n\n", "data: [DONE]\n\n"]
+
+
+async def _end_stream_on_error(
+        events: AsyncIterator[str]) -> AsyncGenerator[str, None]:
+    """Pass ``events`` through; if they fail, end the stream with ``_stream_error_events``.
+
+    A failure after ``[DONE]``, such as in metrics extraction, is only logged: the stream has ended.
+    """
+    done = False
+    try:
+        async for event in events:
+            yield event
+            done = event == "data: [DONE]\n\n"
+    except Exception as error:
+        logger.error(traceback.format_exc())
+        if not done:
+            for event in _stream_error_events(error):
+                yield event
+
+
 def _record_generator_termination(generator) -> None:
     """Classify a fatal generator error without exposing exception details."""
     component = "llm"
@@ -2074,34 +2110,27 @@ class OpenAIServer(_VideoRoutesMixin):
         async def chat_stream_generator(
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-                )
-                pp_results = first_response.outputs[
+            if not self.postproc_worker_enabled:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            first_response = await anext(promise)
+            raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
+            )
+            pp_results = first_response.outputs[
+                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                    first_response, args)
+            for pp_res in pp_results:
+                yield pp_res
+            # Making sure we can handle the situation where there is only one response
+            res = first_response
+            async for res in promise:
+                pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        first_response, args)
+                        res, args)
                 for pp_res in pp_results:
                     yield pp_res
-                # Making sure we can handle the situation where there is only one response
-                res = first_response
-                async for res in promise:
-                    pp_results = res.outputs[
-                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                            res, args)
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-                nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
+            yield "data: [DONE]\n\n"
+            await self._extract_metrics(res, raw_request)
+            nvtx_mark("generation ends")
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -2505,8 +2534,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if request.stream:
-                response_generator = chat_stream_generator(
-                    promise, postproc_params)
+                response_generator = _end_stream_on_error(
+                    chat_stream_generator(promise, postproc_params))
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
@@ -3013,20 +3042,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(output, raw_request)
             except Exception as e:
                 logger.error(traceback.format_exc())
-                # StreamingResponse commits HTTP 200 before the first
-                # chunk, so we cannot change the status code.  Yield
-                # an SSE error event so the stream terminates cleanly
-                # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
+                # generator_wrapper ends the stream with [DONE].
+                yield _stream_error_events(e)[0]
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3182,31 +3199,25 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = (
-                    self._adjusted_steady_clock.now())
-                pp_results = (first_response.outputs[0]._postprocess_result if
+            if not self.postproc_worker_enabled:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            first_response = await anext(promise)
+            raw_request.state.server_first_token_time = (
+                self._adjusted_steady_clock.now())
+            pp_results = (first_response.outputs[0]._postprocess_result
+                          if self.postproc_worker_enabled else post_processor(
+                              first_response, args))
+            for pp_res in pp_results:
+                yield pp_res
+            res = first_response
+            async for res in promise:
+                pp_results = (res.outputs[0]._postprocess_result if
                               self.postproc_worker_enabled else post_processor(
-                                  first_response, args))
+                                  res, args))
                 for pp_res in pp_results:
                     yield pp_res
-                res = first_response
-                async for res in promise:
-                    pp_results = (res.outputs[0]._postprocess_result
-                                  if self.postproc_worker_enabled else
-                                  post_processor(res, args))
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.error(traceback.format_exc())
-                raise
+            yield "data: [DONE]\n\n"
+            await self._extract_metrics(res, raw_request)
 
         try:
             ensure_request_chat_template_allowed(
@@ -3316,8 +3327,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
+                return StreamingResponse(content=_end_stream_on_error(
+                    create_streaming_generator(promise, postproc_params)),
                                          media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
