@@ -1570,6 +1570,29 @@ def test_stream_reframer_surfaces_malformed_upstream_chunk_as_error():
     assert events[-1][1]["error"]["type"] == "api_error"
 
 
+def test_stream_reframer_ends_a_failed_upstream_stream_with_its_error():
+    """A stream that fails mid-way ends with an error event carrying the upstream message."""
+    error = {"error": {"message": "rank 2 failed; retry it", "type": "server_error"}}
+
+    async def source():
+        yield f"data: {chunk({'content': 'hel'}).model_dump_json()}\n\n"
+        yield f"data: {json.dumps(error)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert [name for name, _ in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "error",
+    ]
+    assert events[-1][1]["error"] == {"type": "api_error", "message": "rank 2 failed; retry it"}
+
+
 # ---------------------------------------------------------------------------
 # A forced tool_choice repeats the tool name on every chunk
 # ---------------------------------------------------------------------------
