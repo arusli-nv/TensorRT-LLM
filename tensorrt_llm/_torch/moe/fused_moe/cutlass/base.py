@@ -363,6 +363,7 @@ class CutlassFusedMoEBase(MoEImplBase):
             swiglu_beta=self.act_beta,
             swiglu_limit=self.act_clamp,
             swiglu_clamp_after_silu=self.act_clamp_after_silu,
+            num_extra_local_experts=self._num_extra_local_slots,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
