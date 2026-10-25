@@ -10,6 +10,7 @@ import pytest
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     restore_lost_experts,
+    ring_copy_nodes,
 )
 from tensorrt_llm.executor.recovery.config import FaultToleranceConfig
 
@@ -58,7 +59,8 @@ def test_static_routing_keeps_host_copies_only_with_peer_loss_recovery(recovery)
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
         # One slot per expert.
         layer = load_balancer.add_layer(EXPERTS, 2, 1)
-    # Routing stays static either way; only the host copies and loadable slots follow recovery.
+    # Routing stays static either way; only the host copies (ring ones) and loadable slots follow recovery.
+    assert (load_balancer.copy_nodes is not None) == recovery
     assert layer.is_static_routing()
     assert layer.need_load_shared_weights() == recovery
     assert (layer.host_tensor_sharer is not None) == recovery
@@ -189,6 +191,7 @@ def test_recovery_placements_reject_a_base_with_another_layer_count():
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
 # Two nodes of two ranks.
 _HOSTS = ["a", "a", "b", "b"]
+_COPY_NODES = ring_copy_nodes(_HOSTS)
 
 
 def _eplb_load_balancer(
@@ -369,6 +372,8 @@ def test_static_placement_with_replicas_keeps_them_routed_and_appends_ghost_slot
     assert (layer.slot_count_per_rank, layer.ghost_slot_count) == (3, 1)
     # Ghost by default: restores load a static placement's ghost slots with GPU copies, host accessible or not.
     assert load_balancer.extra_slots_mode() == "replicas+ghost"
+    # A restore may evict any replica, so every node keeps every expert's host copy.
+    assert load_balancer.copy_nodes is None and layer.host_copy_ranks is None
     load_balancer.register_weight_slots_after_to_cuda()
     assert layer.ghost_slots == [2]
     impl.set_use_gpu_memcpy.assert_called_once_with(True)
@@ -395,7 +400,9 @@ def test_static_placement_with_replicas_restores_as_online_eplb_does(monkeypatch
     placements = load_balancer.recovery_placements([FAILED_RANK])
     assert placements[0].tolist() == [[0, 1, 4], [2, 3, 5], [-1, -1, -1], [0, 2, -1]]
     load_balancer.install_recovery_placement([FAILED_RANK], placements)
-    impl.restore_placement.assert_called_once_with([FAILED_RANK], [placements[0].tolist()])
+    impl.restore_placement.assert_called_once_with(
+        [FAILED_RANK], [placements[0].tolist()], slots_loaded=False
+    )
     assert load_balancer.covers_loss_of(_NODE)
 
 
@@ -415,8 +422,91 @@ def test_static_placement_with_replicas_evicts_one_for_a_lost_expert(monkeypatch
     assert placements[0].tolist() == [[2, 1], [-1, -1], [0, 3], [0, 1]]
     load_balancer.install_recovery_placement([1], placements)
     load_balancer.load_balancer_impl.restore_placement.assert_called_once_with(
-        [1], [placements[0].tolist()]
+        [1], [placements[0].tolist()], slots_loaded=False
     )
+
+
+@pytest.mark.parametrize(
+    "layer_updates_per_iter, experts, eplb_slots, extra_slots, mode",
+    [
+        # A static placement of one slot per expert: the appended slots are kept for restores.
+        (0, EXPERTS, 1, None, "ghost"),
+        (0, EXPERTS, 1, "empty", "empty"),
+        # More slots than experts hold replicas, which stay routed, whatever extra_slots says.
+        (0, 6, 2, None, "replicas+ghost"),
+        (0, 6, 2, "empty", "replicas+empty"),
+        (0, EXPERTS, 2, "ghost", "replicas"),
+        # Online EPLB keeps its slots routed even with one per expert.
+        (1, EXPERTS, 1, None, "replicas+ghost"),
+        (1, EXPERTS, 2, "empty", "replicas"),
+    ],
+)
+def test_the_placement_decides_whether_replicas_stay_routed(
+    monkeypatch, layer_updates_per_iter, experts, eplb_slots, extra_slots, mode
+):
+    load_balancer = _eplb_load_balancer(
+        monkeypatch,
+        largest_loss=2,
+        experts=experts,
+        eplb_slots=eplb_slots,
+        extra_slots=extra_slots,
+        layer_updates_per_iter=layer_updates_per_iter,
+    )
+    assert load_balancer.extra_slots_mode() == mode
+    assert (load_balancer.copy_nodes is not None) == (mode in ("ghost", "empty"))
+
+
+# One slot per expert, and the slot each rank gets appended.
+_ONE_SLOT_PER_EXPERT = [[0, -1], [1, -1], [2, -1], [3, -1]]
+
+
+@pytest.mark.parametrize("extra_slots", ["ghost", "empty"])
+def test_static_placement_without_replicas_gets_restore_slots_with_ring_host_copies(
+    monkeypatch, extra_slots
+):
+    """The survivors of a node's loss need two slots each for the four experts: each rank gets one appended, kept
+    empty for restores from ring host copies."""
+    load_balancer = _eplb_load_balancer(
+        monkeypatch,
+        _ONE_SLOT_PER_EXPERT,
+        largest_loss=2,
+        experts=EXPERTS,
+        eplb_slots=1,
+        extra_slots=extra_slots,
+        host_accessible=False,
+        layer_updates_per_iter=0,
+    )
+    (layer,) = load_balancer.single_layer_load_balancers
+    impl = load_balancer.load_balancer_impl
+    impl.add_layer.assert_called_once_with(EXPERTS, 2, 2)
+    assert (layer.slot_count_per_rank, layer.ghost_slot_count) == (2, 1)
+    # Node a (ranks 0, 1) keeps node b's experts.
+    assert load_balancer.copy_nodes == _COPY_NODES and layer.host_copy_ranks == [2, 3]
+    # The appended slot loads its rank's expert, but nothing routes to it while healthy.
+    assignments = layer.with_ghost_slots([0, 1, 2, 3])
+    assert assignments == [0, 0, 1, 1, 2, 2, 3, 3]
+    layer.set_initial_weight_assignments(assignments)
+    layer.single_layer_load_balancer_impl.set_initial_weight_assignments.assert_called_once_with(
+        [0, -1, 1, -1, 2, -1, 3, -1]
+    )
+    assert layer.home_ranks.tolist() == [0, 1, 2, 3]
+    assert load_balancer.extra_slots_mode() == extra_slots
+    load_balancer.register_weight_slots_after_to_cuda()
+    # Restores load a static placement's slots with GPU copies.
+    impl.set_use_gpu_memcpy.assert_called_once_with(True)
+    assert layer.ghost_slots == ([1] if extra_slots == "ghost" else None)
+    load_balancer.finalize_model()
+    impl.restore_placement.assert_not_called()
+    # Losing rank 2: its expert takes rank 0's appended slot, which ring staging loaded.
+    placements = load_balancer.recovery_placements([FAILED_RANK])
+    assert placements[0].tolist() == [[0, 2], [1, -1], [-1, -1], [3, -1]]
+    load_balancer.install_recovery_placement([FAILED_RANK], placements)
+    impl.restore_placement.assert_called_once_with(
+        [FAILED_RANK], [placements[0].tolist()], slots_loaded=True
+    )
+    # Losing node b: its experts take the appended slots of node a.
+    (placement,) = load_balancer.recovery_placements(_NODE)
+    assert placement.tolist() == [[0, 2], [1, 3], [-1, -1], [-1, -1]]
 
 
 def test_with_host_weights_lost_experts_are_restored():
@@ -458,7 +548,9 @@ def test_install_masks_only_when_no_expert_moves():
     impl.restore_placement.assert_not_called()
 
     load_balancer.install_recovery_placement([1], load_balancer.recovery_placements([1]))
-    impl.restore_placement.assert_called_once_with([1], [[[2, 1], [-1, -1], [0, 3], [0, 1]]])
+    impl.restore_placement.assert_called_once_with(
+        [1], [[[2, 1], [-1, -1], [0, 3], [0, 1]]], slots_loaded=False
+    )
 
     load_balancer.in_iter = True
     with pytest.raises(RuntimeError, match="iteration is active"):
@@ -491,6 +583,8 @@ def test_deepseek_r1_ep32_restores_every_node_or_rank_loss(
         layer = load_balancer.add_layer(_R1_EXPERTS, 8, _R1_EPLB_SLOTS, aux_stream=Mock())
     # 28 survivors of a node need ceil(256 / 28) = 10 slots each: one ghost slot per rank.
     assert layer.ghost_slot_count == 1
+    # The replicas stay routed: every node keeps every expert's host copy.
+    assert load_balancer.copy_nodes is None
     rng = np.random.default_rng(0)
     for _ in range(100):
         # EPLB's 32 replicas go to the most loaded experts, spread at random or clumped on few ranks.
