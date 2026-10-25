@@ -242,6 +242,21 @@ class LogitsStorage:
         if self.use_chunked_generation_logits and self._device_fragments:
             self._transfer_chunk_to_host()
 
+    def checkpoint(self) -> tuple:
+        """The state ``rollback`` returns to: the logits appended so far."""
+        if self.use_chunked_generation_logits:
+            return (len(self._logits_indices), self._current_position,
+                    list(self._device_fragments))
+        return len(self._logits_indices), None, None
+
+    def rollback(self, checkpoint: tuple) -> None:
+        """Drop the logits appended since ``checkpoint``."""
+        count, position, fragments = checkpoint
+        del self._logits_indices[count:]
+        if self.use_chunked_generation_logits:
+            self._current_position = position
+            self._device_fragments = fragments
+
 
 class LogProbStorage:
     beam_width: int = -1
@@ -410,6 +425,10 @@ class PyResult:
                 self._additional_generation_outputs[name].append(
                     additional_generation_outputs)
 
+    @property
+    def exclude_last_generation_logits(self) -> bool:
+        return self._exclude_last_generation_logits
+
     def set_exclude_last_generation_logits(
             self, exclude_last_generation_logits: bool):
         self._exclude_last_generation_logits = exclude_last_generation_logits
@@ -499,6 +518,40 @@ class PyResult:
             additional_generation_outputs.to("cpu", non_blocking=True))
         self.diff.additional_generation_outputs_list.append(
             (name, self._additional_generation_outputs[name][-1]))
+
+    def checkpoint(self) -> tuple:
+        """The state ``rollback`` returns to: the logits and additional outputs appended so far."""
+        return (
+            None if self._context_logits is None else
+            self._context_logits.checkpoint(),
+            None if self._generation_logits is None else
+            self._generation_logits.checkpoint(),
+            {
+                name: len(outputs)
+                for name, outputs in (
+                    self._additional_context_outputs or {}).items()
+            },
+            {
+                name: len(outputs)
+                for name, outputs in (
+                    self._additional_generation_outputs or {}).items()
+            },
+        )
+
+    def rollback(self, checkpoint: tuple) -> None:
+        """Drop the logits and additional outputs appended since ``checkpoint``.
+
+        ``diff``, which only pipeline parallelism sends, keeps them.
+        """
+        context_logits, generation_logits, context_outputs, generation_outputs = checkpoint
+        if context_logits is not None:
+            self._context_logits.rollback(context_logits)
+        if generation_logits is not None:
+            self._generation_logits.rollback(generation_logits)
+        for name, count in context_outputs.items():
+            del self._additional_context_outputs[name][count:]
+        for name, count in generation_outputs.items():
+            del self._additional_generation_outputs[name][count:]
 
     def set_log_probs(self, log_probs: list[TokenLogprobs]
                       | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
