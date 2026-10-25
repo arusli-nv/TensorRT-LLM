@@ -812,6 +812,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
     }
     params.abort = resolveAbortState(abortState);
+    TORCH_CHECK(!expertToSlot.has_value() || enableRankMask, "expert_to_slot requires enable_rank_mask=True");
     params.expert_to_slot = expertToSlot.has_value() ? expertToSlot->data_ptr<int32_t>() : nullptr;
     params.num_routed_experts = expertToSlot.has_value() ? static_cast<int>(expertToSlot->size(0)) : 0;
 

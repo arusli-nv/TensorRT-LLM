@@ -620,13 +620,15 @@ __global__ void moeComputeRouteSortKernel(MoeLoadBalanceMetaInfo metaInfo, MoePl
 }
 
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream)
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream,
+    bool oneSlotPerExpert)
 {
     constexpr int kThreadCount = 256;
     constexpr int kEltPerThread = 4;
     int blockCount = (tokenCount * metaInfo.topK + kThreadCount * kEltPerThread - 1) / (kThreadCount * kEltPerThread);
     int dynamicShmSize = sizeof(int16_t) * metaInfo.epSize * metaInfo.slotCountPerRank;
-    if (metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
+    // With one replica per expert, replica j of expert e is entry e of globalSlotIds.
+    if (oneSlotPerExpert || metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
     {
         auto* kernelFn = moeComputeRouteNoRedundantKernel<1024, kThreadCount, kEltPerThread>;
         // no redundant expert, so we don't need complex routing, but just assign to the correct solt.
