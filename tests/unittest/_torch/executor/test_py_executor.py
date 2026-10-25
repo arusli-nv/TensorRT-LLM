@@ -12,6 +12,7 @@ to PyExecutor, including:
 - Event-loop crash propagation to await_responses callers (nvbug 6038228)
 """
 
+import collections
 import threading
 import time
 import types
@@ -4363,6 +4364,7 @@ class TestAdpBalanceExcludesPadDummies:
         executor.dist.tp_allgather_int64 = Mock(
             return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
         )
+        executor.dist.tp_size = len(per_rank)
         executor.max_batch_size = 64
         executor.attention_dp_enable_balance = True
         executor.attention_dp_time_out_iters = 60
@@ -4371,6 +4373,10 @@ class TestAdpBalanceExcludesPadDummies:
         executor.attention_dp_low_occupancy_timeout_iters = 0
         executor.adp_ctx_waiting_iters_count = 0
         executor.adp_ctx_batching_wait_iters_count = 0
+        executor.adp_routed_since_balance = 0
+        executor.adp_recent_arrivals = collections.deque()
+        executor.adp_quiet_iters = 0
+        executor.waiting_queue = []
         return executor
 
     @staticmethod
@@ -4551,6 +4557,78 @@ def _first_token_executor(*, overlap: bool) -> PyExecutor:
     executor.responses = {}
     executor.result_wait_queues = {}
     return executor
+
+
+class TestAdpBalanceReleasesAfterBurst:
+    """A context request held for alignment is released once a burst of arrivals has ended.
+
+    In a closed loop at low load, a request that arrives just after a refill
+    burst finds no other rank with context; waiting out the timeout cannot
+    align it with anything, and its user stays out of phase with later bursts.
+    """
+
+    _make_executor = staticmethod(TestAdpBalanceExcludesPadDummies._make_executor)
+
+    @staticmethod
+    def _decide(executor, routed=0):
+        """One fetch that routes ``routed`` requests in total, then one balance decision."""
+        executor.adp_routed_since_balance += routed
+        return executor._balance_adp_requests(
+            [TestAdpBalanceExcludesPadDummies._make_context_request()],
+            [TestAdpBalanceExcludesPadDummies._make_generation_request(False)],
+        )
+
+    def _held_decisions(self, executor, first_routed):
+        """Decisions until the context is released, the first one routing ``first_routed`` requests."""
+        if self._decide(executor, first_routed):
+            return 1
+        for decisions in range(2, executor.attention_dp_time_out_iters + 2):
+            if self._decide(executor):
+                return decisions
+        raise AssertionError("never released")
+
+    def test_straggler_after_a_burst_is_released_once_arrivals_stop(self):
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=0)
+        # The burst routed one request per serving rank; quiet decisions follow.
+        decisions = self._held_decisions(executor, first_routed=2)
+        assert decisions == 1 + PyExecutor.ADP_BURST_QUIET_ITERS
+        assert executor.adp_ctx_waiting_iters_count == 0
+
+    def test_sparse_arrivals_wait_out_the_timeout(self):
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=0)
+        # Fewer arrivals than serving ranks is not a burst: the timeout applies as before.
+        assert (
+            self._held_decisions(executor, first_routed=1) == executor.attention_dp_time_out_iters
+        )
+
+    def test_queued_requests_keep_the_hold(self):
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=0)
+        executor.waiting_queue = [object()]
+        assert (
+            self._held_decisions(executor, first_routed=2) == executor.attention_dp_time_out_iters
+        )
+
+    def test_a_full_rank_keeps_the_hold(self):
+        # A rank without a free slot routes nothing because it has no room, not because demand ended.
+        executor = self._make_executor([(1, 4, 4), (0, 64, 64)], threshold=0)
+        assert (
+            self._held_decisions(executor, first_routed=2) == executor.attention_dp_time_out_iters
+        )
+
+    def test_arrivals_of_fetches_before_one_decision_add_up(self):
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=0)
+        executor.adp_routed_since_balance += 1
+        assert (
+            self._held_decisions(executor, first_routed=1) == 1 + PyExecutor.ADP_BURST_QUIET_ITERS
+        )
+
+    def test_arrivals_leave_the_window_after_the_timeout(self):
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=0)
+        executor.attention_dp_time_out_iters = 3
+        self._decide(executor, routed=2)
+        for _ in range(3):
+            self._decide(executor)
+        assert list(executor.adp_recent_arrivals) == [0, 0, 0]
 
 
 class _CpuPlacedTorch:
