@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ctypes
 import errno
 import gc
 import hashlib
@@ -27,6 +28,8 @@ from tensorrt_llm.executor.recovery.config import fault_tolerance_config
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+# madvise(2) advice that removes this process's page-table entries for a range (a shared mapping's data stays).
+_MADV_DONTNEED = 4
 # Where multiprocessing.shared_memory keeps the EPLB host copies on Linux.
 _SHM_MOUNT = "/dev/shm"
 
@@ -63,6 +66,18 @@ def _reserve_shm(shm: shared_memory.SharedMemory, layer_id: int) -> None:
         raise _no_shm_space(shm.size, layer_id) from error
     finally:
         os.close(fd)
+
+
+def _unmap_pages(shm: shared_memory.SharedMemory) -> None:
+    """Drop this process's page-table entries for ``shm``; its data stays in the segment and the next access
+    faults the pages back in. Best effort: a failure only keeps the entries."""
+    address = np.frombuffer(shm.buf, dtype=np.uint8).ctypes.data
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(shm.size),
+                    _MADV_DONTNEED):
+        logger.debug(
+            f"Unmapping the EPLB host copies' pages failed: {os.strerror(ctypes.get_errno())}"
+        )
 
 
 # Whether ghost slot memory is host accessible on every rank; set by the first _ghost_slot_memory_host_accessible().
@@ -380,6 +395,10 @@ class HostMoeTensorSharer:
                 add_host_weight_fn(key[0], key[1], t)
 
         self.host_weights.clear()
+        if peer_loss_recovery_enabled() and self.own_shm is not None:
+            # Between restores only online EPLB's updates read the host copies, faulting in what they read; a
+            # process that maps none of their pages is not interrupted when the kernel migrates them (compaction).
+            _unmap_pages(self.own_shm)
 
     def pre_shutdown_cleanup(self):
         """

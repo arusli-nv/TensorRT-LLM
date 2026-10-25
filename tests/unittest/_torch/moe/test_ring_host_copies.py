@@ -119,7 +119,48 @@ def test_peer_host_copies_are_not_prefaulted(monkeypatch, recovery):
             sharer.finalize_layer_weights()
         for sharer in sharers:
             sharer.finalize_host_tensor_sharing()
-        libc.madvise.assert_not_called()
+        # No advice is MADV_POPULATE_READ (22), which builds page-table entries ahead of use.
+        assert all(advice.args[2] != 22 for advice in libc.madvise.call_args_list)
+    finally:
+        for sharer in sharers:
+            sharer.pre_shutdown_cleanup()
+        for sharer in sharers:
+            sharer.post_shutdown_cleanup()
+
+
+def _resident_bytes(segment_name: str) -> int:
+    """This process's resident bytes (smaps Rss) in mappings of /dev/shm/``segment_name``."""
+    total, current = 0, False
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            fields = line.split()
+            if "-" in fields[0] and ":" not in fields[0]:
+                current = fields[-1] == f"/dev/shm/{segment_name}"
+            elif current and fields[0] == "Rss:":
+                total += int(fields[1]) * 1024
+    return total
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_a_rank_keeps_no_pages_of_its_written_host_copies_mapped_with_recovery(
+    monkeypatch, recovery
+):
+    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: recovery)
+    sharers = _shared_layer(2, 2)
+    try:
+        for sharer in sharers:
+            sharer.finalize_layer_weights()
+        for sharer in sharers:
+            sharer.finalize_host_tensor_sharing()
+        for sharer in sharers:
+            name = sharer.get_shared_memory_name()
+            assert (_resident_bytes(name) == 0) == recovery
+            # The data stays: reading faults the pages back in.
+            expert = sharer.own_expert_ids[0]
+            assert (
+                np.frombuffer(sharer.own_shm.buf, dtype=np.float32, count=4).tolist()
+                == [float(expert)] * 4
+            )
     finally:
         for sharer in sharers:
             sharer.pre_shutdown_cleanup()
