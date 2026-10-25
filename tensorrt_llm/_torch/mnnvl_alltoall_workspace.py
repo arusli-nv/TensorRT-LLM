@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Callable, Mapping, MutableMapping, Protocol, cast
+from typing import Callable, Mapping, MutableMapping, Protocol, Sequence, cast
 from weakref import WeakSet
 
 import torch
@@ -298,6 +298,28 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
             self._memory._checkpoint_restore_failed()
             self._stop_watchdog()
             raise
+
+    def release_backing(self) -> int:
+        """Stop the watchdog, whose flag reads would fault, and release the workspace's backing.
+
+        See :meth:`MnnvlMemory.release_backing`; returns the bytes :meth:`remap` allocates again.
+        """
+        self._stop_watchdog()
+        return self._memory.release_backing()
+
+    def remap(
+        self, gather: Callable[[object], Sequence[object]], reset: Callable[[], None]
+    ) -> None:
+        """Back the workspace with fresh pages shared among the live ranks, reset this rank's row, then restart
+        the watchdog.
+
+        See :meth:`MnnvlMemory.remap`. ``reset`` returns this rank's row to its initial state; the watchdog
+        restarts once the device has done that, so it reads the reset flags rather than uninitialized pages.
+        """
+        self._memory.remap(gather)
+        reset()
+        torch.cuda.synchronize()
+        self._start_watchdog()
 
     def _create_coordinator(self) -> AlltoAllWatchdogCoordinator:
         return AlltoAllWatchdogCoordinator(
