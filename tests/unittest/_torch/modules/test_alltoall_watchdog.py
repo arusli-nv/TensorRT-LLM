@@ -30,10 +30,11 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     CompletionFlagReadTimeout,
-    reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import get_wide_ep_ft_options
+
+pytestmark = pytest.mark.cpu_only
 
 
 class FakeCompletionFlagReader:
@@ -198,29 +199,31 @@ def test_wide_ep_ft_options_create_shared_health_when_enabled(
     assert poll_again_s == poll_interval_s
 
 
-def test_wide_ep_ft_options_reject_cuda_graphs(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("recovery", [False, True])
+def test_wide_ep_ft_options_allow_cuda_graphs_only_with_recovery(
+    monkeypatch: pytest.MonkeyPatch, recovery: bool
 ) -> None:
+    """The kernels read the rank mask at execution time, so rank-mask mode works with CUDA graphs once recovery
+    binds the communicators; without recovery the model is refused before it loads."""
+    import tensorrt_llm._torch.moe.fused_moe.wide_ep_ft as wide_ep_ft
+
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    monkeypatch.setattr(wide_ep_ft, "peer_loss_recovery_enabled", lambda: recovery)
     model_config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(moe_ep_size=4),
         use_cuda_graph=True,
     )
+    if not recovery:
+        with pytest.raises(ValueError, match="does not support CUDA graphs"):
+            get_wide_ep_ft_options(model_config)
+        assert model_config.extra_attrs == {}
+        return
 
-    with pytest.raises(ValueError, match="does not support CUDA graphs"):
-        get_wide_ep_ft_options(model_config)
-    assert model_config.extra_attrs == {}
-
-
-def test_rank_mask_mode_rejects_direct_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    reject_rank_mask_cuda_graph_capture(False)
-    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
-        reject_rank_mask_cuda_graph_capture(True)
+    health, _, _ = get_wide_ep_ft_options(model_config)
+    assert isinstance(health, EPGroupHealth)
+    assert health.moe_world_size == 4
+    assert list(model_config.extra_attrs.values()) == [health]
 
 
 def test_wide_ep_ft_options_ignore_legacy_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -618,6 +621,31 @@ def test_workspace_coordinator_wraps_shared_generation() -> None:
         assert watchdog.wait_until_idle(timeout_s=1.0)
     finally:
         coordinator.release_watchdog(watchdog)
+
+
+def test_coordinator_without_a_watchdog_makes_no_cuda_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without fault tolerance no watchdog is registered: a collective costs no CUDA query."""
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state={},
+        workspace=torch.zeros((1, 32), dtype=torch.uint8),
+        metainfo=torch.tensor([0, 4, 8], dtype=torch.int64),
+        metainfo_index={
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+        },
+        ep_rank=0,
+    )
+
+    def no_query() -> bool:
+        raise AssertionError("queried CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", no_query)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", no_query)
+    coordinator.watch_collective(None, "dispatch", None)
+    coordinator.watch_collective(None, "combine", None)
 
 
 def test_unmonitored_coordinator_advances_shared_generation() -> None:
