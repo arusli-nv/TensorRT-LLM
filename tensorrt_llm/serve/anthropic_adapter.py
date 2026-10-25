@@ -1244,8 +1244,21 @@ async def reframe_openai_stream(
                 done = True
                 continue
             try:
-                chunk = ChatCompletionStreamResponse(**json.loads(data))
-            except (json.JSONDecodeError, ValueError) as e:
+                payload = json.loads(data)
+            except json.JSONDecodeError as e:
+                raise AnthropicResponseError("Malformed upstream stream chunk") from e
+            if isinstance(payload, dict) and "error" in payload:
+                # The upstream request failed after the stream began: the
+                # OpenAI server sends {"error": {"message": ...}} and then
+                # [DONE]. The message is what OpenAI clients already see.
+                error = payload["error"]
+                message = error.get("message") if isinstance(error, dict) else error
+                for frame in reframer.error(str(message or "Internal server error")):
+                    yield frame
+                return
+            try:
+                chunk = ChatCompletionStreamResponse(**payload)
+            except ValueError as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
