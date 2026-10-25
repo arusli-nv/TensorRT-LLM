@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
+from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
 
 pytestmark = pytest.mark.cpu_only
 
@@ -278,3 +279,24 @@ def test_without_peer_loss_recovery_a_negative_pin_behaves_as_on_main(no_recover
     for relax in (False, True):
         with pytest.raises(KeyError):
             _router().route_requests(states, [_item(0, target=-1, relax=relax)], 8)
+
+
+def test_fail_unservable_requests_responds_from_rank0_only():
+    for rank, expect_response in ((0, True), (1, False)):
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.dist = Mock(rank=rank)
+        executor.gather_all_responses = False
+        executor._enqueue_responses = Mock()
+        item = _item(7, target=FAILED_RANK, relax=False)
+        item.request.client_id = 11
+
+        executor._fail_unservable_requests([item])
+
+        (responses,), _ = executor._enqueue_responses.call_args
+        if expect_response:
+            ((req_id, response),) = responses
+            assert req_id == 7 and response.client_id == 11
+            assert f"rank {FAILED_RANK} is not serving" in response.error_msg
+            assert not is_peer_loss_retryable_message(response.error_msg)
+        else:
+            assert responses == []
