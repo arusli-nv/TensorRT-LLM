@@ -20,6 +20,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
+from ..distributed.communicator import live_rows
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
@@ -402,14 +403,20 @@ class CUDAGraphRunner:
     def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
                                      can_run_cuda_graph: bool,
                                      sample_type: SampleType):
-        """Return ``[(can_run_cuda_graph, batch_size, sample_type)]`` per TP rank.
+        """Return ``[(can_run_cuda_graph, batch_size, sample_type)]`` per live TP rank.
 
         One fixed-size exchange, entered by every rank unconditionally. The
         sampling tier rides along because it is part of the graph key: ranks
         that resolved different tiers would otherwise replay different graphs.
+        Ranks that left the group after a recovered peer loss do not vote.
         """
-        gathered = self.config.dist.tp_allgather_int64(
-            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value])
+        dist = self.config.dist
+        # Departed ranks' rows are dropped; the departed value is unused.
+        gathered = live_rows(
+            dist,
+            dist.tp_allgather_int64(
+                [bool(can_run_cuda_graph), batch.batch_size, sample_type.value],
+                departed=0))
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
@@ -1688,13 +1695,19 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         # component before launch; -1 denotes a non-applicable field.
         local_bucket = self._ragged_verify_bucket(
             batch) if can_run_cuda_graph else None
-        peer_shapes = self.config.dist.tp_allgather_int64([
-            can_run_cuda_graph,
-            batch.batch_size,
-            -1 if local_bucket is None else int(local_bucket),
-            self._local_draft_len(batch) if can_run_cuda_graph else -1,
-            local_sample_type.value,
-        ]).tolist()
+        dist = self.config.dist
+        # Ranks that left the group after a recovered peer loss do not vote;
+        # their rows are dropped, so the departed value is unused.
+        peer_shapes = live_rows(
+            dist,
+            dist.tp_allgather_int64([
+                can_run_cuda_graph,
+                batch.batch_size,
+                -1 if local_bucket is None else int(local_bucket),
+                self._local_draft_len(batch) if can_run_cuda_graph else -1,
+                local_sample_type.value,
+            ],
+                                    departed=0)).tolist()
         if (not all(peer[0] for peer in peer_shapes)
                 or not all(peer[1:4] == peer_shapes[0][1:4]
                            for peer in peer_shapes)):

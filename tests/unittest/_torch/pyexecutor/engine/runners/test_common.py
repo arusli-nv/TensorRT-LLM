@@ -138,7 +138,7 @@ def test_get_all_rank_num_tokens_uses_tp_collective() -> None:
     )
 
     assert result == [5, 7]
-    dist.tp_allgather_int64.assert_called_once_with([5])
+    dist.tp_allgather_int64.assert_called_once_with([5], departed=0)
 
 
 def test_get_all_rank_num_tokens_reports_post_reduce_scatter_helix_count() -> None:
@@ -195,7 +195,7 @@ def test_attention_dp_padding_uses_all_rank_context_and_token_counts(
     expected: tuple[int, bool, list[int]],
 ) -> None:
     dist = SimpleNamespace(
-        tp_allgather_int64=lambda values: torch.tensor(context_counts).unsqueeze(1),
+        tp_allgather_int64=lambda values, departed: torch.tensor(context_counts).unsqueeze(1),
     )
 
     assert (

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -359,7 +360,7 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     runner.enable_in_graph_sampling = True
     exchanges = []
 
-    def allgather(payload):
+    def allgather(payload, departed=None):
         exchanges.append(payload)
         peer = list(payload)
         peer[-1] = SampleType.FULL.value
@@ -368,7 +369,7 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
         mapping=SimpleNamespace(tp_size=2),
-        dist=SimpleNamespace(tp_allgather_int64=allgather),
+        dist=SimpleNamespace(tp_allgather_int64=allgather, live_ranks=(0, 1)),
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
 
@@ -418,14 +419,14 @@ def test_stale_replay_vote_rejoins_the_shape_collective():
     runner.enable_in_graph_sampling = False
     exchanges = []
 
-    def exchange(payload):
+    def exchange(payload, *, departed=None):
         exchanges.append(payload)
-        return SimpleNamespace(tolist=lambda: [payload, list(payload)])
+        return np.array([payload, payload], dtype=np.int64)
 
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
         mapping=SimpleNamespace(tp_size=2),
-        dist=SimpleNamespace(tp_allgather_int64=exchange),
+        dist=SimpleNamespace(tp_allgather_int64=exchange, live_ranks=range(2)),
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
     assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FAST)

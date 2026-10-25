@@ -32,6 +32,7 @@ from ..distributed import Distributed
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
+from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
@@ -648,6 +649,13 @@ class ModelEngine:
         return None
 
     @property
+    def moe_execution_state(self) -> MoeExecutionState | None:
+        """MoE execution state of the decoder runner; None without recovery."""
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner.moe_execution_state
+        return None
+
+    @property
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):
@@ -954,6 +962,10 @@ class ModelEngine:
         if self._cleanup_done:
             return
         self._release_cuda_graphs(release_nccl_window_owners=release_nccl_window_owners)
+        # No captured graph can replay against the MoE workspaces any more.
+        execution_state = self.moe_execution_state
+        if execution_state is not None:
+            execution_state.close()
 
     def shutdown_moe_load_balancer(self, *, local_safe: bool) -> bool:
         """Run the manager's rank-aligned teardown preflight and collectives."""

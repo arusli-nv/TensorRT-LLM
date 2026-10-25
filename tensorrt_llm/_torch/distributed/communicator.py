@@ -200,6 +200,16 @@ def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
     return _reduce_op_to_mpi_dict[op]
 
 
+def live_rows(dist: "Distributed", rows: np.ndarray) -> np.ndarray:
+    """The rows of a ``tp_allgather_int64`` that the ranks in ``dist.live_ranks`` sent, in rank order.
+
+    After a recovered peer loss, gathers fill a departed rank's row; callers that combine only the serving
+    ranks' values drop it here. Without a departed rank this returns ``rows``.
+    """
+    live = dist.live_ranks
+    return rows if len(live) == len(rows) else rows[list(live)]
+
+
 class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):

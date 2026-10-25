@@ -593,6 +593,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         rank=0,
         tp_rank=0,
         tp_size=4,
+        live_ranks=(0, 1, 2, 3),
         pp_size=1,
         cp_size=1,
         mapping=object(),

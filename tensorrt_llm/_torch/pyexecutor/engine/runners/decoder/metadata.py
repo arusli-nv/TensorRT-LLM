@@ -413,7 +413,7 @@ def sync_group_all_greedy_sample(
         return
     local_flag = bool(spec_metadata.is_all_greedy_sample)
     if mapping.tp_size > 1:
-        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+        all_flags = dist.tp_allgather_int64([local_flag], departed=1)[:, 0]
         spec_metadata.group_all_greedy_sample = bool(all_flags.all())
     else:
         spec_metadata.group_all_greedy_sample = local_flag
