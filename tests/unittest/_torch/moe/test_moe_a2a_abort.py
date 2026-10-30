@@ -61,6 +61,7 @@ def _setup(
         extra_bytes,
         False,
         False,
+        rank_mask=True,
     )
     size = int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
     workspace = torch.zeros((ep_size, size), dtype=torch.uint8, device="cuda")

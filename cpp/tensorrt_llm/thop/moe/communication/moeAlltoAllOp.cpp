@@ -196,7 +196,7 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torc
 // the following phase's control buffers remain aligned.
 MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTokens, int64_t topK,
     int64_t dispatchBytes, int64_t combineInputBytes, int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
-    bool canUseCft)
+    bool canUseCft, bool rankMask)
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
@@ -234,8 +234,11 @@ MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTok
     int64_t const rankCountsBytes = epSize * sizeof(int32_t);
     int64_t const combineSlots = epSize * maxNumTokens;
 
-    // The round counter and the released-round marker (see MoeA2AAbortState).
-    reserve(FLAG_VAL_OFFSET_INDEX, 2 * sizeof(uint32_t));
+    reserve(FLAG_VAL_OFFSET_INDEX, sizeof(uint32_t));
+    if (rankMask)
+    {
+        reserve(RELEASED_ROUND_OFFSET_INDEX, sizeof(uint32_t));
+    }
 
     // Dispatch writes these counters and routes; combine reuses the completed routes.
     reserve(LOCAL_TOKEN_COUNTER_OFFSET_INDEX, sizeof(int32_t));
@@ -278,10 +281,11 @@ MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTok
 }
 
 torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t topK, int64_t dispatchBytes,
-    int64_t combineInputBytes, int64_t combineRecvBytes, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCft)
+    int64_t combineInputBytes, int64_t combineRecvBytes, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCft,
+    bool rankMask)
 {
     auto const layout = calculateWorkspaceLayout(epSize, maxNumTokens, topK, dispatchBytes, combineInputBytes,
-        combineRecvBytes, eplbStatsNumExperts.value_or(0), canUseCft);
+        combineRecvBytes, eplbStatsNumExperts.value_or(0), canUseCft, rankMask);
     auto metainfo
         = torch::empty({NUM_METAINFO_FIELDS}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
     std::copy(layout.begin(), layout.end(), metainfo.data_ptr<int64_t>());
@@ -303,7 +307,7 @@ void moeA2AInitializeOp(
     TORCH_CHECK(layout[EP_SIZE_INDEX] == epSize, "Workspace layout EP size mismatch");
     auto const expected = calculateWorkspaceLayout(epSize, layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
         layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
-        layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
+        layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX], layout[RELEASED_ROUND_OFFSET_INDEX] != 0);
     TORCH_CHECK(layout == expected, "Workspace layout metadata is inconsistent");
     TORCH_CHECK(layout[DISPATCH_PAYLOAD_SIZE_INDEX] > 0 && layout[COMBINE_INPUT_SIZE_INDEX] > 0,
         "Dispatch and combine input payload capacities must be positive");
@@ -714,6 +718,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), &params.payloads[0]);
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
+    params.released_round = offsets[RELEASED_ROUND_OFFSET_INDEX] == 0
+        ? nullptr
+        : reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[RELEASED_ROUND_OFFSET_INDEX]);
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
@@ -959,6 +966,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         = useLowPrecision && !inputIsWorkspace ? params.wire_bytes_per_token : params.source_stride_per_token;
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
+    params.released_round = offsets[RELEASED_ROUND_OFFSET_INDEX] == 0
+        ? nullptr
+        : reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[RELEASED_ROUND_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
     params.topk_target_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_INDICES_OFFSET_INDEX]);
     params.recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
@@ -1170,7 +1180,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_get_workspace_layout(int ep_size, int max_num_tokens_per_rank, int top_k, "
         "int dispatch_payload_bytes, int combine_input_bytes, int combine_recv_bytes, "
-        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor",
+        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False, bool rank_mask=False) -> Tensor",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetWorkspaceLayoutOp);
 }
 

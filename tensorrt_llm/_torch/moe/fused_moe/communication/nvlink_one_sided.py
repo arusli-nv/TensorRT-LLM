@@ -305,8 +305,10 @@ class NVLinkOneSided(Communication):
         extra_payload_bytes_per_token: int,
         can_use_cft_counted_writes: bool,
         use_low_precision_combine: bool,
+        rank_mask: bool = False,
     ) -> torch.Tensor:
-        """Plan per-rank control buffers and independently sized payload regions."""
+        """Plan per-rank control buffers and independently sized payload regions; rank-mask kernels need
+        ``rank_mask``."""
         if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
             raise ValueError("hidden_size must be positive and extra payload size non-negative")
         tokens = ep_size * max_num_tokens
@@ -340,6 +342,7 @@ class NVLinkOneSided(Communication):
             combine_recv_bytes,
             eplb_stats_num_experts,
             can_use_cft_counted_writes,
+            rank_mask,
         )
 
     @staticmethod
@@ -349,6 +352,7 @@ class NVLinkOneSided(Communication):
         eplb_stats_num_experts: Optional[int] = None,
         can_use_cft_counted_writes: bool = False,
         top_k: Optional[int] = None,
+        rank_mask: bool = False,
     ) -> int:
         """Control-buffer bytes; omitted top_k reserves the native routing limit."""
         layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(
@@ -360,6 +364,7 @@ class NVLinkOneSided(Communication):
             0,
             eplb_stats_num_experts,
             can_use_cft_counted_writes,
+            rank_mask,
         )
         return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
@@ -533,6 +538,7 @@ class NVLinkOneSided(Communication):
                 0,
                 self.can_use_cft_counted_writes,
                 self.use_low_precision_combine,
+                rank_mask=ep_group_health is not None,
             )
             auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
         workspace_mb_env = os.environ.get("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
@@ -566,6 +572,7 @@ class NVLinkOneSided(Communication):
                 self.eplb_stats_num_experts,
                 self.can_use_cft_counted_writes,
                 self.top_k,
+                rank_mask=ep_group_health is not None,
             )
             regions = 3 if self.can_use_cft_counted_writes else 2
             capacity = (
@@ -582,6 +589,7 @@ class NVLinkOneSided(Communication):
                 capacity if self.can_use_cft_counted_writes else 0,
                 self.eplb_stats_num_experts,
                 self.can_use_cft_counted_writes,
+                ep_group_health is not None,
             )
         # Fixed region capacities are shared by allocation, native bounds checks,
         # and workspace-backed views. Runtime shapes only pack tokens inside them.

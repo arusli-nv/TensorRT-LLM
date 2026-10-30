@@ -65,7 +65,7 @@ static constexpr int64_t kAbortPollCycles = 100ll * 1000ll;
 // that wait for peers return. A kernel that returns without some active source's data records `status = kCancelled`
 // first. While the record is nonzero the outputs of every collective that uses it are invalid.
 //
-// A dispatch that returns without some active source's data also sets flag_val[kReleasedRoundIndex], after which
+// A dispatch that returns without some active source's data also sets the released-round word, after which
 // this rank publishes no round flag until the workspace is reset: no peer combines outputs this rank computed from
 // an incomplete dispatch. So a collective that returns while `status` is clear read every active source's complete
 // data, and a step whose collectives all did so is valid on this rank whatever its peers aborted.
@@ -76,9 +76,6 @@ struct MoeA2AAbortState
     int32_t requested; // Set by the host to release kernels waiting on lost peers
     int32_t status;    // kCancelled once a dispatch or combine returned without some active source's data
 };
-
-// flag_val[kReleasedRoundIndex] follows the round counter flag_val[0]; see MoeA2AAbortState.
-static constexpr int kReleasedRoundIndex = 1;
 
 // Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
 // cudaFuncAttributeMaxDynamicSharedMemorySize.
@@ -103,7 +100,8 @@ struct DispatchKernelPointers
     // Completion flags for synchronization (fence-based path)
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
-    uint32_t* flag_val; // [0]: the value of the flag for this round; [kReleasedRoundIndex]: see MoeA2AAbortState
+    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+    uint32_t* released_round;              // Nonzero once this rank published no round flag; see MoeA2AAbortState
 
     // LE dispatch counters: HW-incremented byte counters for dispatch data.
     // le_dispatch_counters[target_rank][source_rank] is incremented by fabric engine
@@ -170,7 +168,8 @@ struct CombineKernelPointers
     // Combine readiness flags shared by the fence and CFT paths.
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
-    uint32_t* flag_val; // [0]: the value of the flag for this round; [kReleasedRoundIndex]: see MoeA2AAbortState
+    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+    uint32_t* released_round;              // Nonzero once this rank published no round flag; see MoeA2AAbortState
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int const* topk_target_ranks;   // target rank per k, -1 for invalid or duplicate routes
@@ -214,6 +213,7 @@ struct MoeA2ADispatchParams
 
     // Local aux data
     uint32_t* flag_val;       // The value of the flag for this round (stored on the local rank)
+    uint32_t* released_round; // See MoeA2AAbortState (stored on the local rank)
     int* local_token_counter; // Atomic counter for completed tokens on this rank
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
@@ -309,7 +309,8 @@ struct MoeA2ACombineParams
         use_low_precision; // If true, prepare kernel quantizes payload→FP8; combine kernel accumulates FP8→output dtype
 
     // Local aux data
-    uint32_t* flag_val;     // The value of the flag for this round (stored on the local rank)
+    uint32_t* flag_val;       // The value of the flag for this round (stored on the local rank)
+    uint32_t* released_round; // See MoeA2AAbortState (stored on the local rank)
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
     int* topk_target_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index

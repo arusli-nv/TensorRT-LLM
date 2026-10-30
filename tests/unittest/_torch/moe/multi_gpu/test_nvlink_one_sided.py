@@ -737,6 +737,32 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
         )
 
 
+@pytest.mark.parametrize("cft", [False, True])
+def test_only_rank_mask_layouts_reserve_the_released_round(cft: bool) -> None:
+    """Only rank-mask layouts reserve the released-round word, a control word next to the flag value."""
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+
+    def field(layout: torch.Tensor, name: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{name}")])
+
+    args = (8, 6, 128, 7168, torch.bfloat16, None, 0, cft, False)
+    plain = NVLinkOneSided._make_workspace_layout(*args)
+    masked = NVLinkOneSided._make_workspace_layout(*args, rank_mask=True)
+    assert field(plain, "RELEASED_ROUND_OFFSET_INDEX") == 0
+    released = field(masked, "RELEASED_ROUND_OFFSET_INDEX")
+    assert released == field(masked, "FLAG_VAL_OFFSET_INDEX") + 4
+    assert released + 4 <= field(masked, "LOCAL_TOKEN_COUNTER_OFFSET_INDEX")
+    assert field(masked, "WORKSPACE_SIZE_INDEX") % 256 == 0
+    for size in (
+        "DISPATCH_PAYLOAD_SIZE_INDEX",
+        "COMBINE_INPUT_SIZE_INDEX",
+        "COMBINE_RECV_SIZE_INDEX",
+    ):
+        assert field(masked, size) == field(plain, size)
+
+
 # ============================================================================
 # CFT path selection and capability checks
 # ============================================================================
