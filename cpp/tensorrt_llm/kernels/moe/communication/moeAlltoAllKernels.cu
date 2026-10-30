@@ -279,11 +279,13 @@ __device__ __forceinline__ bool observe_abort(MoeA2AAbortState* abort)
     return requested != 0;
 }
 
-// Whether a dispatch on this rank returned without some active source's data since the workspace reset; the rank
-// then publishes no round flag (see MoeA2AAbortState). Written and read in kernels ordered by the stream.
-__device__ __forceinline__ bool released_round(uint32_t const* flag_val)
+// The round flag value (.x) and whether a dispatch on this rank returned without some active source's data since the
+// workspace reset (.y != 0; the rank then publishes no round flag, see MoeA2AAbortState), in one load. The marker is
+// written and read in kernels ordered by the stream, and within a kernel only after this read.
+__device__ __forceinline__ uint2 load_round_state(uint32_t const* flag_val)
 {
-    return flag_val[kReleasedRoundIndex] != 0;
+    static_assert(kReleasedRoundIndex == 1, "the round state is two adjacent, 8-byte aligned words");
+    return *reinterpret_cast<uint2 const*>(flag_val);
 }
 
 // Wait until a peer's round flag reaches `expected`. Returns false if the host requested an abort through `abort`
@@ -671,18 +673,37 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 ptrs.recv_counters[target_rank][parity * ep_size + rank_id] = send_count;
             }
 
-            if constexpr (ENABLE_EPLB)
+            if constexpr (ENABLE_EPLB && ENABLE_RANK_MASK)
             {
                 // Write local stats into peer buffers before the release fence below.
-                // Skip masked target ranks for the same reason as above.
+                // Skip masked target ranks for the same reason as above. The lanes test the mask for warpSize peers
+                // at once, so the serial walk over the peers reads a register bit.
+#pragma unroll 1
+                for (int base = 0; base < ep_size; base += warpSize)
+                {
+                    uint32_t const active = __ballot_sync(
+                        ~0U, base + lane_id < ep_size && is_rank_active_in_words(rank_mask, base + lane_id));
+                    int const chunk = min(ep_size - base, static_cast<int>(warpSize));
+#pragma unroll 1
+                    for (int j = 0; j < chunk; ++j)
+                    {
+                        if (!((active >> j) & 1U))
+                            continue;
+                        int* target_stats = ptrs.eplb_gathered_stats[base + j];
+                        for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
+                        {
+                            int stat_val = ptrs.eplb_local_stats[expert_id];
+                            target_stats[rank_id * eplb_stats_num_experts + expert_id] = stat_val;
+                        }
+                    }
+                }
+            }
+            else if constexpr (ENABLE_EPLB)
+            {
+                // Write local stats into peer buffers before the release fence below.
 #pragma unroll 1
                 for (int target_rank = 0; target_rank < ep_size; ++target_rank)
                 {
-                    if constexpr (ENABLE_RANK_MASK)
-                    {
-                        if (!is_rank_active_in_words(rank_mask, target_rank))
-                            continue;
-                    }
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
                     for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
                     {
@@ -693,7 +714,18 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             }
 
 #if !DISABLE_SYNC_FOR_PROFILING
-            uint32_t expected_value = *ptrs.flag_val;
+            uint32_t expected_value;
+            bool released = false;
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                uint2 const round_state = load_round_state(ptrs.flag_val);
+                expected_value = round_state.x;
+                released = round_state.y != 0;
+            }
+            else
+            {
+                expected_value = *ptrs.flag_val;
+            }
 
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
@@ -703,7 +735,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
             // Signal completion to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
-            bool const released = ENABLE_RANK_MASK && released_round(ptrs.flag_val);
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size && !released; target_rank += warpSize)
             {
@@ -1785,13 +1816,23 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
     if (is_first_warp)
     {
         int lane_id = threadIdx.x % warpSize;
-        uint32_t expected_value = *ptrs.flag_val;
+        uint32_t expected_value;
+        bool released = false;
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            uint2 const round_state = load_round_state(ptrs.flag_val);
+            expected_value = round_state.x;
+            released = round_state.y != 0;
+        }
+        else
+        {
+            expected_value = *ptrs.flag_val;
+        }
 
         if (blockIdx.x == 0)
         {
             // Signal readiness to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
-            bool const released = ENABLE_RANK_MASK && released_round(ptrs.flag_val);
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size && !released; peer_rank += warpSize)
             {
