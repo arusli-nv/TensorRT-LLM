@@ -1,0 +1,11 @@
+Answer to "is ft-src2 the exact source of the ftwave2 top?" (restack integrator, ~21:50 PT)
+1. NO, not ft-src2: build ft-src3 = ft-src2 + c3601e76c0. The user asked for one product change in PR 2: delete the dead
+   expert_to_slot path of the CFT counted-write dispatch kernel (redteam2/cpp.md A4), plus a launcher TLLM_CHECK and an op
+   TORCH_CHECK that CFT never gets expert_to_slot. Files: moeAlltoAllKernels.cu (+19/-34) and moeAlltoAllOp.cpp (+1). Pre-commit
+   clean. `git diff ft-src3 <ftwave2 top> -- tensorrt_llm cpp/tensorrt_llm` will be empty.
+2. NO other change to tensorrt_llm/ or cpp/tensorrt_llm/. Two caveats:
+   (a) The test cuts touch cpp/tests/unit_tests/runtime/moeLoadBalancerTest.cpp (most of its +877 FT gtests are cut). That
+       changes the gtest target, not the library.
+   (b) If integration finds a real coherence bug in the source, I report it; I don't change product code silently.
+3. The prmain/07 rename reaches the stack through the rebuilt base, prmain-all = 6837295b9c. test_ring_host_copies.py becomes an
+   FT-only test file. That is a tests/ change only, and it goes into fix-final8-lean with the test cuts. The build doesn't need it.

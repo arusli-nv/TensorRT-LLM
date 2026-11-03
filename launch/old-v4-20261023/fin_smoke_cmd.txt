@@ -1,0 +1,38 @@
+# FIN_SMOKE (16 nodes, two 8-node groups, segment 8, limit 4200 s per group): thin driver over the fin_* files with
+# SMOKE=1 (same arms, loads, knobs, rows and readouts as the finals; only lengths differ: ~120 s windows via
+# COST_LOAD_ITERATIONS 32=11,128=5 / 8=16,512=1, WIDEEP_BURNIN 32:2, KF_ITERATIONS 3, KF_LOAD=32 rows 8 waves,
+# KF_STOP_ITERATIONS 4, KF_REPEATS 1, CR_RUNS rank5, ACC_REPS 1). Each piece runs one fin file's group part
+# (FIN_GROUP / FIN_PART) in this group, in its own run dirs (BUNDLE_FILL_ROUND=<file><group><part>: e.g.
+# STD-<job>-fillh1g0p1). The group's gate runs once, then the pieces, then every readout the fin files list over
+# the pieces' run dirs (SMOKE_FAIL readout ... on a failing one, so a broken figure input shows).
+# Group 0 (healthy, ~56 min): fin_h1 G0 part 1 = no-EPLB tuning pass (std-noeplb + std-noeplb-ft) merged and pinned,
+#   then std-noeplb | std-noeplb-ft at 32+128 (the main-set method). Est: gate 5 + tune 24.4 + off 12.4 + ft 13.4 + 1.
+# Group 8 (recovery, ~61 min): fin_h1 G0 part 2 = no-EPLB rank5 + node1 at 128 (fixed trigger WIDEEP_KILL_AFTER_STEPS),
+#   fin_ad1 G8 part 2 = online rank5 at 32 (KF_LOAD=32, std-online.yaml), fin_ad2 G0 = no-EPLB warm restart
+#   (COLD-RESTART, rank5 + relaunch). Est: gate 5 + 11.6 + 9.4 + 2 + 12.5 + 2 + 17.6 + 1.
+# Skipped at <= ~60 min per group (each needs its own server starts and, for healthy, a 12-18 min tuning pass per
+# arm): online / offline healthy and their tuning (fin_h* G-on / G-off), HX 8+512 (fin_hx*), P main / static-LB
+# floor arms (fin_p*), kill rows twokill / stop / rank5pf / rank0 / deadline / rank5upd and the online 128 rows,
+# D online / offline, GSM8K (A: no subset knob - bench.py never passes accuracy_client.py --limit - and every
+# case is a full server start, ~10 min). Victim rotation and a fixed trigger for twokill / stop do not exist (missing).
+# Not covered by any smoke: the 20-wave cap (job.sh:2819) - smoke windows (<= 11 waves) stay under it.
+# Submit (16 nodes, segment 8) after the refrozen build passed:
+#   bash $R/tools/require_presubmit.sh <token> && bash $R/launch/fin_smoke_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+# The fin files this driver runs (a dry run points it at its copies).
+L=$R/launch
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# TODO hash: the same refrozen wheel the fin files carry (no overlay).
+B=build-FREEZE-HASH; SRC=$R/overlays/build-src-FREEZE-HASH; O=
+OV=${O:-$SRC}; OT=${O:+$O-tests}; OT=${OT:-$SRC}
+T="tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py tests/unittest/_torch/executor/test_multimodal_scheduler.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/executor/test_py_executor.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/finsmoke-gate$1-\$SLURM_JOB_ID $R/$B/dist $OV $OT $SRC $R/$B/point-units-finsmoke-g$1 $T"; }
+# piece FILE GROUP [PART]: one fin file's group (part) with SMOKE=1, in its own run dirs.
+piece() { echo "SMOKE=1 FIN_GROUP=$2 ${3:+FIN_PART=$3} BUNDLE_FILL_ROUND=$1g$2${3:+p$3} bash $L/fin_$1_cmd.txt"; }
+# Readouts on the group's node 0 over the smoke's run dirs (a dry run's runs live under its scratch directory). Each
+# bundle spec must stay on one line (bundle.sh reads it with read).
+RD='RUNS=${WIDEEP_DRY_RUN:+$WIDEEP_DRY_RUN/runs}; RUNS=${RUNS:-'$R'/mvp/runs}; rd() { "$@" || echo "SMOKE_FAIL readout rc=$? $*"; }'
+H0="[[ \$SLURM_NODEID == 0 ]] && { $RD; d=\$RUNS/STD-\$SLURM_JOB_ID-fillh1g0p1; cat \$d/tactic_check.txt \$d/std_layout.txt; rd python3 -I $R/tools/trim_readout.py \$d --off std-noeplb-1; rd python3 -I $R/mvp/analysis/ctx_stall_cost.py \$d; for l in 32 128; do rd python3 -I $R/tools/ctx_classify.py --load healthy-\$l --full-pos 5 --off \$d/std-noeplb-1 --on \$d/std-noeplb-ft-1; done; }"
+K8="[[ \$SLURM_NODEID == 0 ]] && { $RD; rd grep -h 'KILL_FINAL_VERDICT\|KILL_FINAL_SUMMARY' \$RUNS/KILL-FINAL-OFF-\$SLURM_JOB_ID-fillh1g0p2/kill_final.txt \$RUNS/KILL-FINAL-ON-A-\$SLURM_JOB_ID-fillad1g8p2/kill_final.txt; rd grep -h '^COLD_RESTART' \$RUNS/COLD-RESTART-A-\$SLURM_JOB_ID-fillad2g0/cold_restart.txt; }"
+bash $R/bundle.sh "0:8:4200:$(g 0) && { $(piece h1 0 1); $H0; }" \
+  "8:8:4200:$(g 8) && { $(piece h1 0 2); $(piece ad1 8 2); $(piece ad2 0); $K8; }"

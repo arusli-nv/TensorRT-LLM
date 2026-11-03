@@ -1,0 +1,35 @@
+# Stress tests (review/PRODUCT_STRESS_PLAN.md: input 128-4k and output 64-2k tokens): std-online.yaml with max_seq_len
+# 6400 (4096 in + 2048 out + 1 draft = 6145, with std-online.yaml's margin), everything else identical. Same file for
+# FT off (std-online) and FT on (std-online-ft) arms. max_seq_len sizes startup buffers (CLAIMS #82: the 8k recipe,
+# max_seq_len 9472 with max_num_tokens 12288 and KV 0.7, ran out of memory at startup with and without FT); untested here.
+tensor_parallel_size: 32
+moe_expert_parallel_size: 32
+enable_attention_dp: true
+gpus_per_node: 4
+max_batch_size: 512
+max_num_tokens: 8192
+max_seq_len: 6400
+attn_backend: TRTLLM
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 0
+  timeout_iters: 60
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 512
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 1
+stream_interval: 10
+num_postprocess_workers: 4
+print_iter_log: true
+moe_config:
+  backend: CUTEDSL
+  use_low_precision_moe_combine: true
+  load_balancer:
+    num_slots: 288
+    layer_updates_per_iter: 1

@@ -1,0 +1,8 @@
+# KILLS-FIRST bundle (user 21:15): decode-only kills on rc1 wheel + final8 Python overlay (overlays/py-final8-4de25459ce),
+# standard configs, graph sizes +136,148, n=1 per row. G0: w/o EPLB rank5+node1 (OFF-A), offline rank5 (OFF-B);
+# G1: online rank5+node1 (ON-A), offline node1 (ON-B). Rows files launch/kf_rows-<job>-KILL-FINAL-OFF-B="rank5",
+# -ON-B="node1" (written right after submit).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-rc1-78836d1723
+K="MVP_BUILD=$B FINAL_BUILD=$B KF_ALLOW_OVERLAY=1 MVP_OVERLAY=$R/overlays/py-final8-4de25459ce WIDEEP_FAILURE_DOMAIN=node KF_REPEATS=1 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 TLLM_TEST_POPULATE=timed"
+bash $R/bundle.sh "0:8:6900:$K KF_BENCH_CONFIG=std-noeplb-ft.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K KF_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B" \
+  "8:8:6900:$K KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A; $K KF_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B"

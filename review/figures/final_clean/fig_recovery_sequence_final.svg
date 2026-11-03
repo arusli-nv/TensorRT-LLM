@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="350" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="#FFFFFF"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#2D3142"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#8C99A6"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<defs><marker id="mid" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#6B6B6B"/></marker></defs>
+<rect x="20" y="16" width="176" height="288" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="34" y="44" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold">Detect</text>
+<rect x="214" y="16" width="176" height="288" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="228" y="44" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold">Agree</text>
+<rect x="408" y="16" width="176" height="288" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="422" y="44" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold">Plan</text>
+<rect x="602" y="16" width="176" height="288" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="616" y="44" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold">Install</text>
+<rect x="796" y="16" width="176" height="288" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="810" y="44" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold">Resume</text>
+<rect x="33" y="62" width="150" height="52" rx="8" fill="#FBE6E4" stroke="#C8372D" stroke-width="2" stroke-dasharray="7 4"/>
+<text x="108.0" y="84.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Rank 2 dies</text>
+<text x="108.0" y="106.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">process ends</text>
+<rect x="33" y="148" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="108.0" y="170.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Failure watch</text>
+<text x="108.0" y="192.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">polls ULFM</text>
+<rect x="33" y="234" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="108.0" y="256.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Abort flag set</text>
+<text x="108.0" y="278.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">kernels return</text>
+<line x1="108.0" y1="114" x2="108.0" y2="144" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<line x1="108.0" y1="200" x2="108.0" y2="230" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<rect x="227" y="62" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="302.0" y="84.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Shrink</text>
+<text x="302.0" y="106.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">agree on failed</text>
+<rect x="227" y="148" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="302.0" y="170.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Stop</text>
+<text x="302.0" y="192.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">discard steps</text>
+<line x1="302.0" y1="114" x2="302.0" y2="144" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<rect x="421" y="62" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="496.0" y="84.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Placement</text>
+<text x="496.0" y="106.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">map unbacked slots</text>
+<rect x="421" y="148" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="496.0" y="170.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Remap, stage</text>
+<text x="496.0" y="192.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">send plan hash</text>
+<rect x="421" y="234" width="150" height="52" rx="8" fill="white" stroke="#2D3142" stroke-width="2"/>
+<text x="496.0" y="256.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Fence, propose</text>
+<text x="496.0" y="278.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">generation 1</text>
+<line x1="496.0" y1="114" x2="496.0" y2="144" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<line x1="496.0" y1="234" x2="496.0" y2="204" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="506.0" y="223.0" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">Propose</text>
+<rect x="615" y="62" width="150" height="52" rx="8" fill="white" stroke="#2D3142" stroke-width="2"/>
+<text x="690.0" y="84.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Check</text>
+<text x="690.0" y="106.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">plan hashes match</text>
+<rect x="615" y="148" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="690.0" y="170.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Install</text>
+<text x="690.0" y="192.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">load, route, mask</text>
+<rect x="615" y="234" width="150" height="52" rx="8" fill="white" stroke="#2D3142" stroke-width="2"/>
+<text x="690.0" y="256.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Commit</text>
+<text x="690.0" y="278.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">generation 1</text>
+<line x1="690.0" y1="114" x2="690.0" y2="144" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="700.0" y="137.0" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">Install</text>
+<line x1="690.0" y1="200" x2="690.0" y2="230" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="700.0" y="223.0" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">all Installed</text>
+<rect x="809" y="62" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="884.0" y="84.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Replay</text>
+<text x="884.0" y="106.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">discarded steps</text>
+<rect x="809" y="148" width="150" height="52" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="884.0" y="170.0" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">Serve</text>
+<text x="884.0" y="192.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">same CUDA graphs</text>
+<line x1="884.0" y1="114" x2="884.0" y2="144" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<path d="M 183 260.0 L 205.0 260.0 L 205.0 88.0 L 223 88.0" fill="none" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<path d="M 377 164.0 L 393.0 164.0 L 393.0 88.0 L 417 88.0" fill="none" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<path d="M 377 184.0 L 405.0 184.0 L 405.0 260.0 L 417 260.0" fill="none" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="397.0" y="265.0" font-size="15" fill="#2D3142" text-anchor="end" font-weight="normal">all Stopped</text>
+<path d="M 571 174.0 L 593.0 174.0 L 593.0 88.0 L 611 88.0" fill="none" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="585.0" y="137.0" font-size="15" fill="#2D3142" text-anchor="end" font-weight="normal">all Ready</text>
+<path d="M 765 260.0 L 787.0 260.0 L 787.0 88.0 L 805 88.0" fill="none" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="795.0" y="265.0" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">Commit</text>
+<rect x="40" y="320" width="22" height="14" rx="3" fill="#EAF4D6" stroke="#76B900" stroke-width="1.8"/>
+<text x="70" y="332" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">survivors</text>
+<rect x="170" y="320" width="22" height="14" rx="3" fill="white" stroke="#2D3142" stroke-width="1.8"/>
+<text x="200" y="332" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">recovery authority</text>
+<rect x="360" y="320" width="22" height="14" rx="3" fill="#FBE6E4" stroke="#C8372D" stroke-width="1.8" stroke-dasharray="4 2"/>
+<text x="390" y="332" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">failed rank</text>
+<line x1="720" y1="327" x2="760" y2="327" stroke="#2D3142" stroke-width="2.2" marker-end="url(#ink)"/>
+<text x="768" y="332" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">local</text>
+<line x1="830" y1="327" x2="870" y2="327" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="878" y="332" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">ZeroMQ</text>
+</svg>

@@ -1,0 +1,7 @@
+# UNITS-BC3: the v4 b+c unit gate (bdb01feb4f) on the v3 wheel + overlay, 1 node: the five FT unit files that cover b and c.
+# PASS = POINT_UNITS_PASS (every file rc=0). b+c is promoted only on PASS here and PT-BC3's kill PASS.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays/v4bc-bdb01feb4f
+bash $R/tools/point_units.sh $R/$B/dist $O $O-tests $R/overlays/build-src-bcea8da496 $R/$B/point-units-bdb01feb4f-1node \
+    tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/llmapi/test_mpi_session.py \
+    tests/unittest/_torch/moe/test_resident_placement.py tests/unittest/_torch/moe/test_ring_host_copies.py \
+    tests/unittest/_torch/moe/test_moe_load_balancer.py

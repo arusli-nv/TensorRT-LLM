@@ -1,0 +1,18 @@
+# HOSTMEM-RESERVE-UNIT (1 node, 4 GPUs): unit tests of the uncommitted ft-hostmem reservation change (on 70a2a9f869;
+# review/diag/ft_hostmem_reserve.diff) on the freeze wheel with the change's .py files overlaid
+# (scratch-v5pr/hostmem-reserve): test_host_numa_memory.py (CPU fakes + GPU two-process test),
+# test_ring_host_copies.py, test_resident_placement.py. Output: review/diag/hostmem-reserve-unit-<job>.txt.
+# ~15 min; --time 00:30. Can share a job with warm_cache_probe_cmd.txt (run this first, --time 01:10).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+out=$R/review/diag/hostmem-reserve-unit-${SLURM_JOB_ID:-x}.txt
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/fixtest-install.log || { tail -20 /tmp/fixtest-install.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/fixtest-pip.log 2>&1 || tail -5 /tmp/fixtest-pip.log
+    for t in test_host_numa_memory.py test_ring_host_copies.py test_resident_placement.py; do
+        echo "### $t"; bash $R/scratch-v5pr/run.sh $R/scratch-v5pr/hostmem-reserve $t
+    done
+    echo HOSTMEM_RESERVE_UNIT_DONE
+} > "$out" 2>&1

@@ -1,0 +1,10 @@
+# FT-off identity pack: final wheel FT off (noft) vs main's wheel (noft-main), with a noft A/A arm, online EPLB on,
+# 8/32/128 per GPU, one pinned table. main reads it the same way: LADDER-8072497 noft-main-2 shows the same 6 warm-up
+# misses as noft, and all 81 rank-0 keys match. Group 0 tunes noft (LADDER); group 1 is seeded from cost (a) pack 1's
+# table (LADDER-8087786, same build). LADDER_MAIN_TAIL=0: noft-main is a round arm here, so the tail would overwrite
+# its last round. Presubmit: tools/presubmit.py --name f16 --nodes 16 --segment 8 --job LADDER[-B]
+#   --build build-final-aae00e6c65 --branch /tmp/claude-161238/work/wt-review
+# Read: final_cost_table.py --ladder noft,noft-main,noft-aa, <job>  (positive cost = our FT-off build slower than main).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+E="MVP_BUILD=build-final-aae00e6c65 FINAL_BUILD=build-final-aae00e6c65 FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node LADDER_MAIN_TAIL=0 FT_COST_E2E_ARMS='noft noft-main noft-aa' LADDER_TUNE_ARMS=noft LADDER_PAIRS='noft:noft-main noft:noft-aa'"
+bash $R/bundle.sh "0:8:6900:$E FT_COST_E2E_ROUNDS=2 bash $R/mvp/harness/run_job.sh LADDER" "8:8:6900:$E FT_COST_E2E_ROUNDS=3 FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json bash $R/mvp/harness/run_job.sh LADDER-B"

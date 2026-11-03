@@ -1,0 +1,701 @@
+run,on,off,date,build,trust,mode,hang,poll,extra,shm_on,shm_off,cold_gt200ms_on,cold_gt200ms_off,cold_sum_gt200_s_on,cold_sum_gt200_s_off,cold_p90_on,cold_p90_off,stall_32_on,stall_32_off,stall_128_on,stall_128_off,d_stall_32,d_stall_128,d_trim_32,d_trim_128
+ACCURACY-7996453,acc-ft-loss,acc-noft,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,9,2,2.34,0.8,179.5,177.3,,,,,,,,
+B2-MECH-1K-8031777,ft288-1,noft288-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,17.31,18.57,13.5,11.5,0.126,0.44,0.155,0.125,-0.314,0.03,0.179,0.212
+B2-MECH-1K-8031777,ft288-1,noft288-2,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,17.31,17.29,13.5,12.8,0.126,0.264,0.155,0.072,-0.138,0.083,0.184,0.226
+B2-MECH-1K-8031777,ft288-2,noft288-1,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.36,18.57,13.5,11.5,0.174,0.44,0.106,0.125,-0.266,-0.019,0.229,0.394
+B2-MECH-1K-8031777,ft288-2,noft288-2,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.36,17.29,13.5,12.8,0.174,0.264,0.106,0.072,-0.09,0.034,0.234,0.408
+B2X-MECH-1K-8032671,ft288-1,noft288-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.77,16.29,11.4,11.4,0.17,0.165,0.0,0.13,0.005,-0.13,0.221,0.182
+B2X-MECH-1K-8032671,ft288-1,noft288-2,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.77,16.85,11.4,11.3,0.17,0.058,0.0,0.263,0.112,-0.263,0.225,0.334
+B2X-MECH-1K-8032671,ft288-1,noft288-3,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.77,16.42,11.4,11.3,0.17,0.142,0.0,0.184,0.028,-0.184,0.225,0.298
+B2X-MECH-1K-8032671,ft288-1,profile-noft288,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.77,16.37,11.4,11.3,0.17,,0.0,,,,,
+B2X-MECH-1K-8032671,ft288-2,noft288-1,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.43,16.29,11.5,11.4,0.23,0.165,0.02,0.13,0.065,-0.11,0.23,0.213
+B2X-MECH-1K-8032671,ft288-2,noft288-2,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.43,16.85,11.5,11.3,0.23,0.058,0.02,0.263,0.172,-0.243,0.234,0.365
+B2X-MECH-1K-8032671,ft288-2,noft288-3,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.43,16.42,11.5,11.3,0.23,0.142,0.02,0.184,0.088,-0.164,0.234,0.329
+B2X-MECH-1K-8032671,ft288-2,profile-noft288,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.43,16.37,11.5,11.3,0.23,,0.02,,,,,
+B2X-MECH-1K-8032671,ft288-3,noft288-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.86,16.29,11.5,11.4,0.203,0.165,0.11,0.13,0.038,-0.02,0.207,0.222
+B2X-MECH-1K-8032671,ft288-3,noft288-2,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.86,16.85,11.5,11.3,0.203,0.058,0.11,0.263,0.145,-0.153,0.211,0.374
+B2X-MECH-1K-8032671,ft288-3,noft288-3,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.86,16.42,11.5,11.3,0.203,0.142,0.11,0.184,0.061,-0.074,0.211,0.338
+B2X-MECH-1K-8032671,ft288-3,profile-noft288,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.86,16.37,11.5,11.3,0.203,,0.11,,,,,
+C-PROF-8048853,tail-ft-8,prof-empty288-128,2026-10-18,build-dev-7684541f66,lower(unaudited),offline,n/a(settings not logged),,,full(>150G),full(>150G),36,67,43.22,66.44,577.6,1055.9,,,,2.034,,,,
+DEPL-PROF-8035971,ft-empty,noft288,2026-10-17,build-restore2-9911149fa0,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,16.33,16.99,63.0,11.5,,,,,,,,
+DEPL-PROF-8038960,ft-empty,noft288,2026-10-18,build-restore2-9911149fa0,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,18.31,17.79,54.9,11.3,,,,,,,,
+FINAL-HEALTHY-8044639,ft-1,noft-1,2026-10-18,build-all2-a4aa5440e0,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),3,4,17.24,18.79,71.8,114.0,0.375,3.726,,,-3.351,,-0.241,
+FINAL-HEALTHY-8044639,ft-1,noft-2,2026-10-18,build-all2-a4aa5440e0,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),3,3,17.24,16.12,71.8,64.4,0.375,0.258,,,0.117,,0.166,
+FINAL-HEALTHY-8044639,ft-1,noft-3,2026-10-18,build-all2-a4aa5440e0,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),3,3,17.24,17.71,71.8,65.6,0.375,0.391,,,-0.016,,0.175,
+FINAL-HEALTHY-8044639,ft-2,noft-1,2026-10-18,,lower(build unknown),online,n/a(settings not logged),,,full(>150G),full(>150G),3,4,18.51,18.79,78.2,114.0,0.653,3.726,,,-3.073,,-0.244,
+FINAL-HEALTHY-8044639,ft-2,noft-2,2026-10-18,,lower(build unknown),online,n/a(settings not logged),,,full(>150G),full(>150G),3,3,18.51,16.12,78.2,64.4,0.653,0.258,,,0.395,,0.163,
+FINAL-HEALTHY-8044639,ft-2,noft-3,2026-10-18,,lower(build unknown),online,n/a(settings not logged),,,full(>150G),full(>150G),3,3,18.51,17.71,78.2,65.6,0.653,0.391,,,0.262,,0.172,
+FINAL-HEALTHY-8044639,ft-3,noft-1,2026-10-18,build-all2-a4aa5440e0,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),3,4,18.15,18.79,62.4,114.0,0.132,3.726,,,-3.594,,-0.283,
+FINAL-HEALTHY-8044639,ft-3,noft-2,2026-10-18,build-all2-a4aa5440e0,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),3,3,18.15,16.12,62.4,64.4,0.132,0.258,,,-0.126,,0.124,
+FINAL-HEALTHY-8044639,ft-3,noft-3,2026-10-18,build-all2-a4aa5440e0,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),3,3,18.15,17.71,62.4,65.6,0.132,0.391,,,-0.259,,0.133,
+FT-COST-A-8054076,ft-1,noft-ulfm-1,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),30,36,33.24,41.66,304.1,521.8,5.267,1.999,0.246,0.382,3.268,-0.136,0.2,0.338
+FT-COST-A-8054076,ft-1,noft-ulfm-2,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),30,26,33.24,28.23,304.1,280.9,5.267,8.229,0.246,0.0,-2.962,0.246,0.077,0.525
+FT-COST-A-8054076,ft-1,noft-ulfm-3,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),30,16,33.24,26.66,304.1,213.1,5.267,10.556,0.246,0.438,-5.289,-0.192,-0.583,0.478
+FT-COST-A-8054076,ft-1,start8k-noft,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),unknown,30,1,33.24,0.51,304.1,513.3,5.267,,0.246,,,,,
+FT-COST-A-8054076,ft-2,noft-ulfm-1,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),27,36,30.11,41.66,329.8,521.8,3.834,1.999,0.575,0.382,1.835,0.193,0.522,0.069
+FT-COST-A-8054076,ft-2,noft-ulfm-2,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),27,26,30.11,28.23,329.8,280.9,3.834,8.229,0.575,0.0,-4.395,0.575,0.399,0.256
+FT-COST-A-8054076,ft-2,noft-ulfm-3,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),27,16,30.11,26.66,329.8,213.1,3.834,10.556,0.575,0.438,-6.722,0.137,-0.261,0.209
+FT-COST-A-8054076,ft-2,start8k-noft,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),unknown,27,1,30.11,0.51,329.8,513.3,3.834,,0.575,,,,,
+FT-COST-A-8054076,ft-3,noft-ulfm-1,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),17,36,22.74,41.66,222.8,521.8,5.64,1.999,0.274,0.382,3.641,-0.108,0.357,0.084
+FT-COST-A-8054076,ft-3,noft-ulfm-2,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),17,26,22.74,28.23,222.8,280.9,5.64,8.229,0.274,0.0,-2.589,0.274,0.234,0.271
+FT-COST-A-8054076,ft-3,noft-ulfm-3,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),full(>150G),17,16,22.74,26.66,222.8,213.1,5.64,10.556,0.274,0.438,-4.916,-0.164,-0.426,0.224
+FT-COST-A-8054076,ft-3,start8k-noft,2026-10-18,build-dev-cf36fc9386,lower(unaudited),online,n/a(settings not logged),,,full(>150G),unknown,17,1,22.74,0.51,222.8,513.3,5.64,,0.274,,,,,
+FT-COST-A-8055539,ft-1,noft-ulfm-1,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),42,46,42.73,38.85,565.6,519.9,5.264,1.005,0.417,3.529,4.259,-3.112,0.489,0.024
+FT-COST-A-8055539,ft-1,noft-ulfm-2,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),42,57,42.73,42.87,565.6,477.8,5.264,6.164,0.417,0.518,-0.9,-0.101,0.355,-0.04
+FT-COST-A-8055539,ft-1,noft-ulfm-3,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),42,50,42.73,53.04,565.6,769.6,5.264,5.058,0.417,0.473,0.206,-0.056,0.318,-0.099
+FT-COST-A-8055539,ft-2,noft-ulfm-1,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),49,46,40.31,38.85,483.7,519.9,21.595,1.005,0.425,3.529,20.59,-3.104,1.187,0.232
+FT-COST-A-8055539,ft-2,noft-ulfm-2,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),49,57,40.31,42.87,483.7,477.8,21.595,6.164,0.425,0.518,15.431,-0.093,1.053,0.168
+FT-COST-A-8055539,ft-2,noft-ulfm-3,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),49,50,40.31,53.04,483.7,769.6,21.595,5.058,0.425,0.473,16.537,-0.048,1.016,0.109
+FT-COST-A-8055539,ft-3,noft-ulfm-1,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),65,46,53.26,38.85,694.3,519.9,1.517,1.005,0.822,3.529,0.512,-2.707,0.218,0.235
+FT-COST-A-8055539,ft-3,noft-ulfm-2,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),65,57,53.26,42.87,694.3,477.8,1.517,6.164,0.822,0.518,-4.647,0.304,0.084,0.171
+FT-COST-A-8055539,ft-3,noft-ulfm-3,2026-10-18,build-dev-4c27cd5a98,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),65,50,53.26,53.04,694.3,769.6,1.517,5.058,0.822,0.473,-3.541,0.349,0.047,0.112
+FT-COST-BISECT-8066570,ft-1,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,57,49.91,51.07,1021.3,879.5,,,2.42,3.168,,-0.748,,0.139
+FT-COST-BISECT-8066570,ft-1,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,54,49.91,63.0,1021.3,1201.4,,,2.42,2.521,,-0.101,,0.596
+FT-COST-BISECT-8066570,ft-1,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,48,49.91,53.55,1021.3,1039.1,,,2.42,0.347,,2.073,,0.342
+FT-COST-BISECT-8066570,ft-2,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,57,42.63,51.07,868.3,879.5,,,1.184,3.168,,-1.984,,0.252
+FT-COST-BISECT-8066570,ft-2,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,54,42.63,63.0,868.3,1201.4,,,1.184,2.521,,-1.337,,0.709
+FT-COST-BISECT-8066570,ft-2,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,48,42.63,53.55,868.3,1039.1,,,1.184,0.347,,0.837,,0.455
+FT-COST-BISECT-8066570,ft-3,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,57,42.29,51.07,721.1,879.5,,,3.017,3.168,,-0.151,,0.098
+FT-COST-BISECT-8066570,ft-3,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,54,42.29,63.0,721.1,1201.4,,,3.017,2.521,,0.496,,0.555
+FT-COST-BISECT-8066570,ft-3,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),39,48,42.29,53.55,721.1,1039.1,,,3.017,0.347,,2.67,,0.301
+FT-COST-BISECT-8066570,ft-noH-1,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),60,57,64.46,51.07,946.0,879.5,,,0.393,3.168,,-2.775,,-0.065
+FT-COST-BISECT-8066570,ft-noH-1,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),60,54,64.46,63.0,946.0,1201.4,,,0.393,2.521,,-2.128,,0.392
+FT-COST-BISECT-8066570,ft-noH-1,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),60,48,64.46,53.55,946.0,1039.1,,,0.393,0.347,,0.046,,0.138
+FT-COST-BISECT-8066570,ft-noH-2,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),52,57,53.05,51.07,898.7,879.5,,,6.82,3.168,,3.652,,0.396
+FT-COST-BISECT-8066570,ft-noH-2,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),52,54,53.05,63.0,898.7,1201.4,,,6.82,2.521,,4.299,,0.853
+FT-COST-BISECT-8066570,ft-noH-2,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),52,48,53.05,53.55,898.7,1039.1,,,6.82,0.347,,6.473,,0.599
+FT-COST-BISECT-8066570,ft-noH-3,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,57,60.27,51.07,1100.9,879.5,,,0.705,3.168,,-2.463,,-0.058
+FT-COST-BISECT-8066570,ft-noH-3,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,54,60.27,63.0,1100.9,1201.4,,,0.705,2.521,,-1.816,,0.399
+FT-COST-BISECT-8066570,ft-noH-3,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,48,60.27,53.55,1100.9,1039.1,,,0.705,0.347,,0.358,,0.145
+FT-COST-E2E-8059717,ft-1,noft-stack-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,9,28.9,24.49,408.3,163.1,0.107,0.102,0.513,0.203,0.005,0.31,0.111,0.27
+FT-COST-E2E-8059717,ft-1,noft-stack-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,10,28.9,20.76,408.3,169.1,0.107,0.073,0.513,0.169,0.034,0.344,0.129,0.369
+FT-COST-E2E-8059717,ft-1,noft-stack-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,27,28.9,28.43,408.3,291.1,0.107,0.583,0.513,0.089,-0.476,0.424,0.079,0.214
+FT-COST-E2E-8059717,ft-2,noft-stack-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),29,9,26.47,24.49,281.8,163.1,0.603,0.102,0.254,0.203,0.501,0.051,0.156,0.275
+FT-COST-E2E-8059717,ft-2,noft-stack-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),29,10,26.47,20.76,281.8,169.1,0.603,0.073,0.254,0.169,0.53,0.085,0.174,0.374
+FT-COST-E2E-8059717,ft-2,noft-stack-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),29,27,26.47,28.43,281.8,291.1,0.603,0.583,0.254,0.089,0.02,0.165,0.124,0.219
+FT-COST-E2E-8059717,ft-3,noft-stack-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),17,9,21.24,24.49,207.9,163.1,0.158,0.102,0.129,0.203,0.056,-0.074,0.105,0.278
+FT-COST-E2E-8059717,ft-3,noft-stack-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),17,10,21.24,20.76,207.9,169.1,0.158,0.073,0.129,0.169,0.085,-0.04,0.123,0.377
+FT-COST-E2E-8059717,ft-3,noft-stack-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),17,27,21.24,28.43,207.9,291.1,0.158,0.583,0.129,0.089,-0.425,0.04,0.073,0.222
+FT-COST-E2E-8064963,ft-1,noft-stack-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,3,30.02,16.79,326.4,18.7,0.193,1.363,0.791,0.102,-1.17,0.689,-0.061,0.099
+FT-COST-E2E-8064963,ft-1,noft-stack-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,57,30.02,42.99,326.4,542.9,0.193,1.703,0.791,0.166,-1.51,0.625,0.053,0.166
+FT-COST-E2E-8064963,ft-1,noft-stack-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,57,30.02,40.14,326.4,444.9,0.193,0.323,0.791,0.125,-0.13,0.666,0.094,0.171
+FT-COST-E2E-8064963,ft-2,noft-stack-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),43,3,32.18,16.79,361.7,18.7,0.3,1.363,0.0,0.102,-1.063,-0.102,-0.012,0.15
+FT-COST-E2E-8064963,ft-2,noft-stack-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),43,57,32.18,42.99,361.7,542.9,0.3,1.703,0.0,0.166,-1.403,-0.166,0.102,0.217
+FT-COST-E2E-8064963,ft-2,noft-stack-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),43,57,32.18,40.14,361.7,444.9,0.3,0.323,0.0,0.125,-0.023,-0.125,0.143,0.222
+FT-COST-E2E-8064963,ft-3,noft-stack-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),3,3,17.12,16.79,14.1,18.7,2.892,1.363,0.091,0.102,1.529,-0.011,0.035,0.191
+FT-COST-E2E-8064963,ft-3,noft-stack-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),3,57,17.12,42.99,14.1,542.9,2.892,1.703,0.091,0.166,1.189,-0.075,0.149,0.258
+FT-COST-E2E-8064963,ft-3,noft-stack-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),3,57,17.12,40.14,14.1,444.9,2.892,0.323,0.091,0.125,2.569,-0.034,0.19,0.263
+FT-COST-LOW-8057805,ft-1,noft-ulfm-1,2026-10-18,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),38,18,29.0,21.86,361.6,215.5,0.39,0.099,,,0.291,,0.128,
+FT-COST-LOW-8057805,ft-1,noft-ulfm-2,2026-10-18,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),38,3,29.0,17.39,361.6,14.0,0.39,0.838,,,-0.448,,0.112,
+FT-COST-LOW-8057805,ft-1,noft-ulfm-3,2026-10-18,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),38,23,29.0,28.17,361.6,222.6,0.39,0.263,,,0.127,,0.125,
+FT-COST-LOW-8057805,ft-2,noft-ulfm-1,2026-10-18,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),42,18,32.04,21.86,401.3,215.5,2.384,0.099,,,2.285,,0.216,
+FT-COST-LOW-8057805,ft-2,noft-ulfm-2,2026-10-18,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),42,3,32.04,17.39,401.3,14.0,2.384,0.838,,,1.546,,0.2,
+FT-COST-LOW-8057805,ft-2,noft-ulfm-3,2026-10-18,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),42,23,32.04,28.17,401.3,222.6,2.384,0.263,,,2.121,,0.213,
+FT-COST-LOW-8057805,ft-3,noft-ulfm-1,2026-10-19,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),30,18,26.55,21.86,304.8,215.5,0.515,0.099,,,0.416,,0.124,
+FT-COST-LOW-8057805,ft-3,noft-ulfm-2,2026-10-19,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),30,3,26.55,17.39,304.8,14.0,0.515,0.838,,,-0.323,,0.108,
+FT-COST-LOW-8057805,ft-3,noft-ulfm-3,2026-10-19,build-dev-28ea730a19,lower(unaudited),online,False,,borrowed,full(>150G),full(>150G),30,23,26.55,28.17,304.8,222.6,0.515,0.263,,,0.252,,0.121,
+FT-COST-MECH-8063159,ft-1,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),44,39,34.41,40.15,464.8,496.6,,,1.606,0.381,,1.225,,0.402
+FT-COST-MECH-8063159,ft-1,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),44,33,34.41,26.11,464.8,325.7,,,1.606,0.0,,1.606,,0.511
+FT-COST-MECH-8063159,ft-1,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),44,43,34.41,37.84,464.8,462.0,,,1.606,0.828,,0.778,,0.498
+FT-COST-MECH-8063159,ft-1,noft-ulfm-4,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),44,3,34.41,18.88,464.8,14.0,,,1.606,0.057,,1.549,,0.534
+FT-COST-MECH-8063159,ft-2,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),70,39,47.1,40.15,548.0,496.6,,,0.662,0.381,,0.281,,0.352
+FT-COST-MECH-8063159,ft-2,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),70,33,47.1,26.11,548.0,325.7,,,0.662,0.0,,0.662,,0.461
+FT-COST-MECH-8063159,ft-2,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),70,43,47.1,37.84,548.0,462.0,,,0.662,0.828,,-0.166,,0.448
+FT-COST-MECH-8063159,ft-2,noft-ulfm-4,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),70,3,47.1,18.88,548.0,14.0,,,0.662,0.057,,0.605,,0.484
+FT-COST-MECH-8063159,ft-3,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),46,39,33.63,40.15,417.0,496.6,,,0.155,0.381,,-0.226,,0.327
+FT-COST-MECH-8063159,ft-3,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),46,33,33.63,26.11,417.0,325.7,,,0.155,0.0,,0.155,,0.436
+FT-COST-MECH-8063159,ft-3,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),46,43,33.63,37.84,417.0,462.0,,,0.155,0.828,,-0.673,,0.423
+FT-COST-MECH-8063159,ft-3,noft-ulfm-4,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),46,3,33.63,18.88,417.0,14.0,,,0.155,0.057,,0.098,,0.459
+FT-COST-MECH-8063159,ft-4,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,39,38.69,40.15,428.8,496.6,,,0.616,0.381,,0.235,,0.328
+FT-COST-MECH-8063159,ft-4,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,33,38.69,26.11,428.8,325.7,,,0.616,0.0,,0.616,,0.437
+FT-COST-MECH-8063159,ft-4,noft-ulfm-3,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,43,38.69,37.84,428.8,462.0,,,0.616,0.828,,-0.212,,0.424
+FT-COST-MECH-8063159,ft-4,noft-ulfm-4,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),49,3,38.69,18.88,428.8,14.0,,,0.616,0.057,,0.559,,0.46
+FT-COST-PROF-8065299,ft-1,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,47,40.9,48.0,1012.5,818.9,,,4.241,3.684,,0.557,,0.308
+FT-COST-PROF-8065299,ft-1,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,39,40.9,45.56,1012.5,690.5,,,4.241,5.61,,-1.369,,0.13
+FT-COST-PROF-8065299,ft-2,noft-ulfm-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),43,47,42.36,48.0,747.0,818.9,,,5.128,3.684,,1.444,,0.31
+FT-COST-PROF-8065299,ft-2,noft-ulfm-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),43,39,42.36,45.56,747.0,690.5,,,5.128,5.61,,-0.482,,0.132
+FT-COST-PROF-8076084,ft-1,noft-ulfm-1,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),58,50,63.47,54.73,1214.3,1042.6,,,3.942,4.34,,-0.398,,0.419
+FT-COST-PROF-8076084,ft-1,noft-ulfm-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),58,68,63.47,63.8,1214.3,989.4,,,3.942,3.523,,0.419,,0.38
+FT-COST-PROF-8076084,ft-2,noft-ulfm-1,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),67,50,71.97,54.73,1286.8,1042.6,,,3.814,4.34,,-0.526,,0.471
+FT-COST-PROF-8076084,ft-2,noft-ulfm-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),67,68,71.97,63.8,1286.8,989.4,,,3.814,3.523,,0.291,,0.432
+FT-COST-PROF-8092284,ft-1,noft-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,35,38.21,38.99,380.7,475.3,4.907,3.147,,,1.76,,2.266,
+FT-COST-PROF-8092284,ft-1,noft-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,23,38.21,32.63,380.7,269.4,4.907,9.296,,,-4.389,,2.2,
+FT-COST-PROF-8092284,ft-2,noft-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,35,36.91,38.99,471.1,475.3,5.657,3.147,,,2.51,,2.62,
+FT-COST-PROF-8092284,ft-2,noft-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,23,36.91,32.63,471.1,269.4,5.657,9.296,,,-3.639,,2.554,
+FT-COST-PROF-8094116,ft-1,noft-1,2026-10-20,build-final-066b5189a9,lower(unaudited),online,False,,,full(>150G),full(>150G),55,25,50.67,28.19,809.5,308.0,4.579,6.187,,,-1.608,,0.582,
+FT-COST-PROF-8099338,ft-1,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),39,19,42.13,28.73,392.3,289.9,4.265,6.174,,,-1.909,,0.389,
+FT-COST-PROF-B-8076084,ft-1,noft-ulfm-1,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,21,53.39,29.43,980.5,411.6,,,3.43,9.011,,-5.581,,0.056
+FT-COST-PROF-B-8076084,ft-1,noft-ulfm-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,55,53.39,60.09,980.5,899.0,,,3.43,3.173,,0.257,,0.3
+FT-COST-PROF-B-8076084,ft-2,noft-ulfm-1,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),48,21,56.99,29.43,1146.6,411.6,,,3.384,9.011,,-5.627,,0.007
+FT-COST-PROF-B-8076084,ft-2,noft-ulfm-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),48,55,56.99,60.09,1146.6,899.0,,,3.384,3.173,,0.211,,0.251
+FT-COST-PROF-B-8092284,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,7,21.16,19.82,122.9,12.6,1.659,3.237,,,-1.578,,0.109,
+FT-COST-PROF-B-8092284,ft-ghost320-1,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,7,21.16,19.89,122.9,15.4,1.659,1.467,,,0.192,,0.167,
+FT-COST-PROF-B-8092284,ft-ghost320-2,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),13,7,20.85,19.82,164.0,12.6,1.384,3.237,,,-1.853,,0.122,
+FT-COST-PROF-B-8092284,ft-ghost320-2,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),13,7,20.85,19.89,164.0,15.4,1.384,1.467,,,-0.083,,0.18,
+FT-COST-PROF-B-8094116,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-066b5189a9,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),19,7,22.95,18.55,228.2,52.2,1.418,1.498,,,-0.08,,0.097,
+FT-COST-PROF-B-8099338,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,7,19.35,20.14,96.3,21.9,1.514,1.215,,,0.299,,0.139,
+GHOST-COST-8078355,ft-ghost320-1,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),20,4,22.03,17.54,316.9,10.9,0.303,0.118,0.034,0.06,0.185,-0.026,0.08,0.192
+GHOST-COST-8078355,ft-ghost320-1,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),20,4,22.03,16.78,316.9,10.9,0.303,0.055,0.034,0.152,0.248,-0.118,0.073,0.215
+GHOST-COST-8078355,ft-ghost320-1,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),20,4,22.03,17.82,316.9,10.9,0.303,0.21,0.034,0.155,0.093,-0.121,0.089,0.147
+GHOST-COST-8078355,ft-ghost320-1,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),20,4,22.03,17.18,316.9,10.9,0.303,0.104,0.034,0.106,0.199,-0.072,0.122,0.195
+GHOST-COST-8078355,ft-ghost320-2,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),18,4,23.48,17.54,220.9,10.9,0.402,0.118,0.018,0.06,0.284,-0.042,0.072,0.268
+GHOST-COST-8078355,ft-ghost320-2,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),18,4,23.48,16.78,220.9,10.9,0.402,0.055,0.018,0.152,0.347,-0.134,0.065,0.291
+GHOST-COST-8078355,ft-ghost320-2,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),18,4,23.48,17.82,220.9,10.9,0.402,0.21,0.018,0.155,0.192,-0.137,0.081,0.223
+GHOST-COST-8078355,ft-ghost320-2,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),18,4,23.48,17.18,220.9,10.9,0.402,0.104,0.018,0.106,0.298,-0.088,0.114,0.271
+GHOST-COST-8079187,ft-ghost320-1,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,19.32,18.56,13.7,12.4,0.062,0.059,0.145,0.144,0.003,0.001,0.106,0.33
+GHOST-COST-8079187,ft-ghost320-1,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,19.32,17.35,13.7,15.8,0.062,0.334,0.145,0.096,-0.272,0.049,0.135,0.466
+GHOST-COST-8079187,ft-ghost320-1,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,19.32,19.32,13.7,10.9,0.062,0.074,0.145,0.045,-0.012,0.1,0.138,0.299
+GHOST-COST-8079187,ft-ghost320-1,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,19.32,19.47,13.7,12.3,0.062,0.059,0.145,0.202,0.003,-0.057,0.136,0.429
+GHOST-COST-8079187,ft-ghost320-2,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,18.08,18.56,25.1,12.4,0.142,0.059,0.111,0.144,0.083,-0.033,0.111,0.427
+GHOST-COST-8079187,ft-ghost320-2,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,18.08,17.35,25.1,15.8,0.142,0.334,0.111,0.096,-0.192,0.015,0.14,0.563
+GHOST-COST-8079187,ft-ghost320-2,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,18.08,19.32,25.1,10.9,0.142,0.074,0.111,0.045,0.068,0.066,0.143,0.396
+GHOST-COST-8079187,ft-ghost320-2,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),4,4,18.08,19.47,25.1,12.3,0.142,0.059,0.111,0.202,0.083,-0.091,0.141,0.526
+GHOST-COST-8079803,ft-ghost320-1,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),12,4,20.47,16.95,105.1,10.9,0.194,0.208,0.1,0.107,-0.014,-0.007,0.094,0.335
+GHOST-COST-8079803,ft-ghost320-1,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),12,4,20.47,16.72,105.1,11.0,0.194,0.196,0.1,0.036,-0.002,0.064,0.124,0.113
+GHOST-COST-8079803,ft-ghost320-1,lay-eplb0-3,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),12,4,20.47,18.05,105.1,10.9,0.194,0.187,0.1,0.217,0.007,-0.117,0.136,0.244
+GHOST-COST-8079803,ft-ghost320-1,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),12,4,20.47,16.4,105.1,10.9,0.194,0.288,0.1,0.126,-0.094,-0.026,0.15,0.211
+GHOST-COST-8079803,ft-ghost320-1,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),12,4,20.47,17.76,105.1,11.0,0.194,0.277,0.1,0.291,-0.083,-0.191,0.148,0.361
+GHOST-COST-8079803,ft-ghost320-1,lay-eplb0-aa-3,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),12,4,20.47,16.39,105.1,11.0,0.194,0.192,0.1,0.107,0.002,-0.007,0.135,0.264
+GHOST-COST-8079803,ft-ghost320-2,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),5,4,16.43,16.95,120.5,10.9,0.173,0.208,0.186,0.107,-0.035,0.079,0.049,0.306
+GHOST-COST-8079803,ft-ghost320-2,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),5,4,16.43,16.72,120.5,11.0,0.173,0.196,0.186,0.036,-0.023,0.15,0.079,0.084
+GHOST-COST-8079803,ft-ghost320-2,lay-eplb0-3,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),5,4,16.43,18.05,120.5,10.9,0.173,0.187,0.186,0.217,-0.014,-0.031,0.091,0.215
+GHOST-COST-8079803,ft-ghost320-2,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),5,4,16.43,16.4,120.5,10.9,0.173,0.288,0.186,0.126,-0.115,0.06,0.105,0.182
+GHOST-COST-8079803,ft-ghost320-2,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),5,4,16.43,17.76,120.5,11.0,0.173,0.277,0.186,0.291,-0.104,-0.105,0.103,0.332
+GHOST-COST-8079803,ft-ghost320-2,lay-eplb0-aa-3,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),5,4,16.43,16.39,120.5,11.0,0.173,0.192,0.186,0.107,-0.019,0.079,0.09,0.235
+GHOST-COST-8079803,ft-ghost320-3,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),3,4,16.97,16.95,92.7,10.9,0.062,0.208,0.102,0.107,-0.146,-0.005,0.059,0.374
+GHOST-COST-8079803,ft-ghost320-3,lay-eplb0-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),3,4,16.97,16.72,92.7,11.0,0.062,0.196,0.102,0.036,-0.134,0.066,0.089,0.152
+GHOST-COST-8079803,ft-ghost320-3,lay-eplb0-3,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),3,4,16.97,18.05,92.7,10.9,0.062,0.187,0.102,0.217,-0.125,-0.115,0.101,0.283
+GHOST-COST-8079803,ft-ghost320-3,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),3,4,16.97,16.4,92.7,10.9,0.062,0.288,0.102,0.126,-0.226,-0.024,0.115,0.25
+GHOST-COST-8079803,ft-ghost320-3,lay-eplb0-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),3,4,16.97,17.76,92.7,11.0,0.062,0.277,0.102,0.291,-0.215,-0.189,0.113,0.4
+GHOST-COST-8079803,ft-ghost320-3,lay-eplb0-aa-3,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),3,4,16.97,16.39,92.7,11.0,0.062,0.192,0.102,0.107,-0.13,-0.005,0.1,0.303
+GHOST-COST-8087786,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.2,18.6,31.9,10.8,0.259,0.132,0.24,0.073,0.127,0.167,0.124,0.219
+GHOST-COST-8087786,ft-ghost320-1,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.2,18.47,31.9,10.8,0.259,0.112,0.24,0.093,0.147,0.147,0.128,0.233
+GHOST-COST-8087786,ft-ghost320-1,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.2,17.43,31.9,10.8,0.259,0.275,0.24,0.019,-0.016,0.221,0.133,0.228
+GHOST-COST-8087786,ft-ghost320-1,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.2,17.55,31.9,10.9,0.259,0.109,0.24,0.18,0.15,0.06,0.099,0.116
+GHOST-COST-8087786,ft-ghost320-1,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.2,16.71,31.9,10.9,0.259,0.333,0.24,0.118,-0.074,0.122,0.125,0.206
+GHOST-COST-8087786,ft-ghost320-1,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.2,18.03,31.9,10.8,0.259,0.232,0.24,0.265,0.027,-0.025,0.129,0.185
+GHOST-COST-8087786,ft-ghost320-2,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.56,18.6,80.1,10.8,0.301,0.132,0.273,0.073,0.169,0.2,0.098,0.277
+GHOST-COST-8087786,ft-ghost320-2,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.56,18.47,80.1,10.8,0.301,0.112,0.273,0.093,0.189,0.18,0.102,0.291
+GHOST-COST-8087786,ft-ghost320-2,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.56,17.43,80.1,10.8,0.301,0.275,0.273,0.019,0.026,0.254,0.107,0.286
+GHOST-COST-8087786,ft-ghost320-2,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.56,17.55,80.1,10.9,0.301,0.109,0.273,0.18,0.192,0.093,0.073,0.174
+GHOST-COST-8087786,ft-ghost320-2,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.56,16.71,80.1,10.9,0.301,0.333,0.273,0.118,-0.032,0.155,0.099,0.264
+GHOST-COST-8087786,ft-ghost320-2,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.56,18.03,80.1,10.8,0.301,0.232,0.273,0.265,0.069,0.008,0.103,0.243
+GHOST-COST-8087786,ft-ghost320-3,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,4,21.54,18.6,154.6,10.8,0.388,0.132,0.218,0.073,0.256,0.145,0.098,0.271
+GHOST-COST-8087786,ft-ghost320-3,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,4,21.54,18.47,154.6,10.8,0.388,0.112,0.218,0.093,0.276,0.125,0.102,0.285
+GHOST-COST-8087786,ft-ghost320-3,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,4,21.54,17.43,154.6,10.8,0.388,0.275,0.218,0.019,0.113,0.199,0.107,0.28
+GHOST-COST-8087786,ft-ghost320-3,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,4,21.54,17.55,154.6,10.9,0.388,0.109,0.218,0.18,0.279,0.038,0.073,0.168
+GHOST-COST-8087786,ft-ghost320-3,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,4,21.54,16.71,154.6,10.9,0.388,0.333,0.218,0.118,0.055,0.1,0.099,0.258
+GHOST-COST-8087786,ft-ghost320-3,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),11,4,21.54,18.03,154.6,10.8,0.388,0.232,0.218,0.265,0.156,-0.047,0.103,0.237
+GHOST-COST-8087790,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.08,17.82,11.1,10.9,0.253,0.059,0.218,0.347,0.194,-0.129,0.207,0.181
+GHOST-COST-8087790,ft-ghost320-1,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.08,17.37,11.1,33.7,0.253,0.059,0.218,0.133,0.194,0.085,0.227,0.214
+GHOST-COST-8087790,ft-ghost320-1,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.08,18.46,11.1,11.0,0.253,0.104,0.218,0.082,0.149,0.136,0.215,0.176
+GHOST-COST-8087790,ft-ghost320-1,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.08,17.39,11.1,11.0,0.253,0.215,0.218,0.109,0.038,0.109,0.216,0.204
+GHOST-COST-8087790,ft-ghost320-1,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.08,17.5,11.1,11.0,0.253,0.119,0.218,0.275,0.134,-0.057,0.227,0.158
+GHOST-COST-8087790,ft-ghost320-1,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.08,17.47,11.1,10.9,0.253,0.059,0.218,0.16,0.194,0.058,0.216,0.164
+GHOST-COST-8087790,ft-ghost320-2,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,17.11,17.82,23.5,10.9,0.207,0.059,0.249,0.347,0.148,-0.098,0.167,0.108
+GHOST-COST-8087790,ft-ghost320-2,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,17.11,17.37,23.5,33.7,0.207,0.059,0.249,0.133,0.148,0.116,0.187,0.141
+GHOST-COST-8087790,ft-ghost320-2,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,17.11,18.46,23.5,11.0,0.207,0.104,0.249,0.082,0.103,0.167,0.175,0.103
+GHOST-COST-8087790,ft-ghost320-2,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,17.11,17.39,23.5,11.0,0.207,0.215,0.249,0.109,-0.008,0.14,0.176,0.131
+GHOST-COST-8087790,ft-ghost320-2,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,17.11,17.5,23.5,11.0,0.207,0.119,0.249,0.275,0.088,-0.026,0.187,0.085
+GHOST-COST-8087790,ft-ghost320-2,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,17.11,17.47,23.5,10.9,0.207,0.059,0.249,0.16,0.148,0.089,0.176,0.091
+GHOST-COST-8087790,ft-ghost320-3,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,16.59,17.82,13.7,10.9,0.167,0.059,0.11,0.347,0.108,-0.237,0.18,0.23
+GHOST-COST-8087790,ft-ghost320-3,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,16.59,17.37,13.7,33.7,0.167,0.059,0.11,0.133,0.108,-0.023,0.2,0.263
+GHOST-COST-8087790,ft-ghost320-3,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,16.59,18.46,13.7,11.0,0.167,0.104,0.11,0.082,0.063,0.028,0.188,0.225
+GHOST-COST-8087790,ft-ghost320-3,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,16.59,17.39,13.7,11.0,0.167,0.215,0.11,0.109,-0.048,0.001,0.189,0.253
+GHOST-COST-8087790,ft-ghost320-3,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,16.59,17.5,13.7,11.0,0.167,0.119,0.11,0.275,0.048,-0.165,0.2,0.207
+GHOST-COST-8087790,ft-ghost320-3,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),5,4,16.59,17.47,13.7,10.9,0.167,0.059,0.11,0.16,0.108,-0.05,0.189,0.213
+GHOST-COST-8089166,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.27,17.96,16.4,10.9,0.147,0.083,0.137,0.079,0.064,0.058,0.122,0.269
+GHOST-COST-8089166,ft-ghost320-1,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.27,18.61,16.4,10.9,0.147,0.095,0.137,0.07,0.052,0.067,0.123,0.288
+GHOST-COST-8089166,ft-ghost320-1,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.27,17.73,16.4,10.9,0.147,0.059,0.137,0.231,0.088,-0.094,0.109,0.065
+GHOST-COST-8089166,ft-ghost320-1,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.27,18.34,16.4,10.9,0.147,0.24,0.137,0.475,-0.093,-0.338,0.132,0.3
+GHOST-COST-8089166,ft-ghost320-1,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.27,17.97,16.4,10.9,0.147,0.054,0.137,0.326,0.093,-0.189,0.133,0.344
+GHOST-COST-8089166,ft-ghost320-1,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),6,4,17.27,18.57,16.4,11.0,0.147,0.081,0.137,0.281,0.066,-0.144,0.131,0.347
+GHOST-COST-8089166,ft-ghost320-2,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,4,17.75,17.96,100.7,10.9,0.417,0.083,0.131,0.079,0.334,0.052,0.11,0.209
+GHOST-COST-8089166,ft-ghost320-2,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,4,17.75,18.61,100.7,10.9,0.417,0.095,0.131,0.07,0.322,0.061,0.111,0.228
+GHOST-COST-8089166,ft-ghost320-2,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,4,17.75,17.73,100.7,10.9,0.417,0.059,0.131,0.231,0.358,-0.1,0.097,0.005
+GHOST-COST-8089166,ft-ghost320-2,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,4,17.75,18.34,100.7,10.9,0.417,0.24,0.131,0.475,0.177,-0.344,0.12,0.24
+GHOST-COST-8089166,ft-ghost320-2,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,4,17.75,17.97,100.7,10.9,0.417,0.054,0.131,0.326,0.363,-0.195,0.121,0.284
+GHOST-COST-8089166,ft-ghost320-2,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),7,4,17.75,18.57,100.7,11.0,0.417,0.081,0.131,0.281,0.336,-0.15,0.119,0.287
+GHOST-COST-8089166,ft-ghost320-3,lay-eplb0-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.69,17.96,130.7,10.9,0.443,0.083,0.069,0.079,0.36,-0.01,0.105,0.217
+GHOST-COST-8089166,ft-ghost320-3,lay-eplb0-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.69,18.61,130.7,10.9,0.443,0.095,0.069,0.07,0.348,-0.001,0.106,0.236
+GHOST-COST-8089166,ft-ghost320-3,lay-eplb0-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.69,17.73,130.7,10.9,0.443,0.059,0.069,0.231,0.384,-0.162,0.092,0.013
+GHOST-COST-8089166,ft-ghost320-3,lay-eplb0-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.69,18.34,130.7,10.9,0.443,0.24,0.069,0.475,0.203,-0.406,0.115,0.248
+GHOST-COST-8089166,ft-ghost320-3,lay-eplb0-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.69,17.97,130.7,10.9,0.443,0.054,0.069,0.326,0.389,-0.257,0.116,0.292
+GHOST-COST-8089166,ft-ghost320-3,lay-eplb0-aa-3,2026-10-20,build-final-aae00e6c65,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),12,4,21.69,18.57,130.7,11.0,0.443,0.081,0.069,0.281,0.362,-0.212,0.114,0.295
+GHOST-COST-8097555,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),10,4,18.18,17.88,137.9,10.9,0.408,0.195,0.239,0.145,0.213,0.094,0.136,0.027
+GHOST-COST-8099447,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),18,4,22.33,17.65,260.5,10.8,0.211,0.107,0.288,0.027,0.104,0.261,0.115,0.109
+GHOST-COST-8099447,ft-ghost320-1,lay-eplb0-2,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),18,4,22.33,17.83,260.5,11.0,0.211,0.136,0.288,0.239,0.075,0.049,0.11,0.118
+GHOST-COST-8099447,ft-ghost320-1,lay-eplb0-3,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),18,4,22.33,17.31,260.5,11.0,0.211,0.059,0.288,0.135,0.152,0.153,0.1,0.163
+GHOST-COST-8099447,ft-ghost320-2,lay-eplb0-1,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),18,4,21.79,17.65,211.3,10.8,0.127,0.107,0.043,0.027,0.02,0.016,0.116,0.159
+GHOST-COST-8099447,ft-ghost320-2,lay-eplb0-2,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),18,4,21.79,17.83,211.3,11.0,0.127,0.136,0.043,0.239,-0.009,-0.196,0.111,0.168
+GHOST-COST-8099447,ft-ghost320-2,lay-eplb0-3,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),18,4,21.79,17.31,211.3,11.0,0.127,0.059,0.043,0.135,0.068,-0.092,0.101,0.213
+GHOST-COST-8099447,ft-ghost320-3,lay-eplb0-1,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,17.34,17.65,78.8,10.8,0.318,0.107,0.244,0.027,0.211,0.217,0.156,0.223
+GHOST-COST-8099447,ft-ghost320-3,lay-eplb0-2,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,17.34,17.83,78.8,11.0,0.318,0.136,0.244,0.239,0.182,0.005,0.151,0.232
+GHOST-COST-8099447,ft-ghost320-3,lay-eplb0-3,2026-10-20,build-final-183d390691,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,17.34,17.31,78.8,11.0,0.318,0.059,0.244,0.135,0.259,0.109,0.141,0.277
+GHOST-COST-8102532,ft-ghost320-1,lay-eplb0-1,2026-10-20,build-final-547a6aa7ed,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.76,19.7,11.2,10.9,0.062,0.294,0.182,0.0,-0.232,0.182,0.036,0.099
+GHOST-COST-8102532,ft-ghost320-1,lay-eplb0-2,2026-10-20,build-final-547a6aa7ed,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,18.76,19.69,11.2,10.9,0.062,0.113,0.182,0.251,-0.051,-0.069,0.096,0.22
+GHOST-COST-8102532,ft-ghost320-2,lay-eplb0-1,2026-10-20,build-final-547a6aa7ed,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,17.41,19.7,11.1,10.9,0.21,0.294,0.05,0.0,-0.084,0.05,0.05,0.126
+GHOST-COST-8102532,ft-ghost320-2,lay-eplb0-2,2026-10-20,build-final-547a6aa7ed,lower(unaudited),static320,False,,ghost,ring(5-150G),none(<5G),4,4,17.41,19.69,11.1,10.9,0.21,0.113,0.05,0.251,0.097,-0.201,0.11,0.247
+GHOST-COST-B-8081165,ft-ghost320-1,lay-eplb0-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),19,4,22.12,17.37,280.0,10.9,0.044,,0.0,,,,,
+GHOST-COST-B-8081165,ft-ghost320-1,lay-eplb0-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),static320,False,,ghost,ring(5-150G),ring(5-150G),19,4,22.12,17.38,280.0,10.9,0.044,0.217,0.0,0.356,-0.173,-0.356,0.114,0.127
+L1-512-7996104,sweep-ft-1,sweep-noft-1,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,74,76,53.09,53.56,698.2,698.7,,,,,,,,
+L1-512-7996104,sweep-ft-1,sweep-noft-2,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,74,75,53.09,54.08,698.2,696.9,,,,,,,,
+L1-512-7996104,sweep-ft-2,sweep-noft-1,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,75,76,53.86,53.56,698.6,698.7,,,,,,,,
+L1-512-7996104,sweep-ft-2,sweep-noft-2,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,75,75,53.86,54.08,698.6,696.9,,,,,,,,
+L1-512-8002665,sweep-ft-2,sweep-noft-1,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,74,74,49.84,53.09,692.9,700.6,,,,,,,,
+L1-512-8005424,sweep-ft-1,sweep-noft-2,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,75,76,50.2,50.21,690.5,692.4,,,,,,,,
+L1-A-7993389,sweep-ft,sweep-noft,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,74,74,57.3,57.95,699.3,697.5,0.089,0.028,0.0,0.372,0.061,-0.372,1.189,1.256
+L1-B-7993390,sweep-ft,sweep-noft,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,74,75,60.38,56.82,709.2,695.2,0.4,0.021,0.025,0.212,0.379,-0.187,1.083,1.266
+LADDER-8072497,ft-1,noft-1,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),34,54,29.04,40.72,317.3,515.4,0.105,0.75,0.37,0.491,-0.645,-0.121,0.135,0.376
+LADDER-8072497,ft-1,noft-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),34,34,29.04,29.48,317.3,375.2,0.105,0.187,0.37,0.211,-0.082,0.159,0.086,0.365
+LADDER-8072497,ft-1,noft-main-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),34,3,29.04,20.48,317.3,100.4,0.105,0.332,0.37,0.18,-0.227,0.19,0.107,0.389
+LADDER-8072497,ft-2,noft-1,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,54,35.96,40.72,447.7,515.4,0.693,0.75,0.0,0.491,-0.057,-0.491,0.073,0.289
+LADDER-8072497,ft-2,noft-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,34,35.96,29.48,447.7,375.2,0.693,0.187,0.0,0.211,0.506,-0.211,0.024,0.278
+LADDER-8072497,ft-2,noft-main-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,3,35.96,20.48,447.7,100.4,0.693,0.332,0.0,0.18,0.361,-0.18,0.045,0.302
+LADDER-8072497,ft-base-1,noft-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,54,36.98,40.72,473.3,515.4,0.106,0.75,0.28,0.491,-0.644,-0.211,0.131,0.433
+LADDER-8072497,ft-base-1,noft-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,34,36.98,29.48,473.3,375.2,0.106,0.187,0.28,0.211,-0.081,0.069,0.082,0.422
+LADDER-8072497,ft-base-1,noft-main-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),45,3,36.98,20.48,473.3,100.4,0.106,0.332,0.28,0.18,-0.226,0.1,0.103,0.446
+LADDER-8072497,ft-base-2,noft-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),22,54,23.06,40.72,229.3,515.4,2.811,0.75,0.129,0.491,2.061,-0.362,0.6,0.279
+LADDER-8072497,ft-base-2,noft-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),22,34,23.06,29.48,229.3,375.2,2.811,0.187,0.129,0.211,2.624,-0.082,0.551,0.268
+LADDER-8072497,ft-base-2,noft-main-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),22,3,23.06,20.48,229.3,100.4,2.811,0.332,0.129,0.18,2.479,-0.051,0.572,0.292
+LADDER-8078355,ft-1,noft-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,54,26.03,39.36,145.0,492.8,0.387,0.721,0.44,0.649,-0.334,-0.209,0.009,0.19
+LADDER-8078355,ft-1,noft-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,22,26.03,22.85,145.0,259.3,0.387,0.102,0.44,0.086,0.285,0.354,0.074,0.126
+LADDER-8078355,ft-1,noft-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,63,26.03,41.5,145.0,531.9,0.387,0.46,0.44,0.639,-0.073,-0.199,0.028,0.159
+LADDER-8078355,ft-1,noft-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,41,26.03,37.48,145.0,474.9,0.387,0.574,0.44,0.288,-0.187,0.152,0.039,0.053
+LADDER-8078355,ft-2,noft-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),58,54,41.68,39.36,532.8,492.8,1.763,0.721,0.476,0.649,1.042,-0.173,0.033,0.156
+LADDER-8078355,ft-2,noft-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),58,22,41.68,22.85,532.8,259.3,1.763,0.102,0.476,0.086,1.661,0.39,0.098,0.092
+LADDER-8078355,ft-2,noft-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),58,63,41.68,41.5,532.8,531.9,1.763,0.46,0.476,0.639,1.303,-0.163,0.052,0.125
+LADDER-8078355,ft-2,noft-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),58,41,41.68,37.48,532.8,474.9,1.763,0.574,0.476,0.288,1.189,0.188,0.063,0.019
+LADDER-8079187,ft-1,noft-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),57,66,35.72,46.21,375.4,586.2,1.431,2.66,0.784,0.26,-1.229,0.524,1.662,1.284
+LADDER-8079187,ft-1,noft-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),57,53,35.72,36.83,375.4,450.4,1.431,0.592,0.784,0.31,0.839,0.474,1.757,1.322
+LADDER-8079187,ft-1,noft-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),57,44,35.72,30.87,375.4,334.9,1.431,0.292,0.784,0.311,1.139,0.473,1.731,1.28
+LADDER-8079187,ft-1,noft-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),57,36,35.72,27.79,375.4,316.7,1.431,0.102,0.784,0.0,1.329,0.784,1.75,1.311
+LADDER-8079803,ft-1,noft-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),65,31,53.57,29.87,560.6,305.0,1.057,0.276,1.142,0.358,0.781,0.784,1.752,1.197
+LADDER-8079803,ft-1,noft-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),65,26,53.57,24.48,560.6,307.3,1.057,0.772,1.142,0.102,0.285,1.04,1.799,1.084
+LADDER-8079803,ft-1,noft-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),65,36,53.57,32.09,560.6,364.9,1.057,0.275,1.142,0.0,0.782,1.142,1.786,1.201
+LADDER-8079803,ft-1,noft-aa-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),65,42,53.57,36.77,560.6,459.7,1.057,0.898,1.142,0.211,0.159,0.931,1.711,1.07
+LADDER-8079803,ft-1,noft-main-2,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),65,3,53.57,16.72,560.6,70.8,1.057,0.261,1.142,0.478,0.796,0.664,1.713,1.135
+LADDER-8079803,ft-2,noft-1,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,31,39.79,29.87,590.6,305.0,1.384,0.276,1.027,0.358,1.108,0.669,1.979,1.23
+LADDER-8079803,ft-2,noft-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,26,39.79,24.48,590.6,307.3,1.384,0.772,1.027,0.102,0.612,0.925,2.026,1.117
+LADDER-8079803,ft-2,noft-aa-1,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,36,39.79,32.09,590.6,364.9,1.384,0.275,1.027,0.0,1.109,1.027,2.013,1.234
+LADDER-8079803,ft-2,noft-aa-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,42,39.79,36.77,590.6,459.7,1.384,0.898,1.027,0.211,0.486,0.816,1.938,1.103
+LADDER-8079803,ft-2,noft-main-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),54,3,39.79,16.72,590.6,70.8,1.384,0.261,1.027,0.478,1.123,0.549,1.94,1.168
+LADDER-8087786,ft-1,noft-1,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),32,22,30.33,28.11,336.2,264.5,1.194,0.192,0.961,0.18,1.002,0.781,1.871,1.325
+LADDER-8087786,ft-1,noft-2,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),32,18,30.33,21.62,336.2,216.2,1.194,0.343,0.961,0.367,0.851,0.594,1.877,1.303
+LADDER-8087786,ft-1,noft-aa-1,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),32,39,30.33,33.38,336.2,331.9,1.194,0.334,0.961,0.0,0.86,0.961,1.879,1.227
+LADDER-8087786,ft-1,noft-aa-2,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),32,17,30.33,21.58,336.2,214.5,1.194,0.134,0.961,0.328,1.06,0.633,1.857,1.148
+LADDER-8087786,ft-1,noft-main-2,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),32,3,30.33,15.54,336.2,75.8,1.194,0.527,0.961,0.073,0.667,0.888,1.894,1.298
+LADDER-8087786,ft-2,noft-1,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),15,22,20.8,28.11,197.9,264.5,1.407,0.192,0.766,0.18,1.215,0.586,1.991,1.2
+LADDER-8087786,ft-2,noft-2,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),15,18,20.8,21.62,197.9,216.2,1.407,0.343,0.766,0.367,1.064,0.399,1.997,1.178
+LADDER-8087786,ft-2,noft-aa-1,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),15,39,20.8,33.38,197.9,331.9,1.407,0.334,0.766,0.0,1.073,0.766,1.999,1.102
+LADDER-8087786,ft-2,noft-aa-2,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),15,17,20.8,21.58,197.9,214.5,1.407,0.134,0.766,0.328,1.273,0.438,1.977,1.023
+LADDER-8087786,ft-2,noft-main-2,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),15,3,20.8,15.54,197.9,75.8,1.407,0.527,0.766,0.073,0.88,0.693,2.014,1.173
+LADDER-8087790,ft-1,noft-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),15,43,24.66,32.33,193.0,425.3,2.201,0.131,1.074,0.342,2.07,0.732,1.722,1.524
+LADDER-8087790,ft-1,noft-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),15,21,24.66,27.47,193.0,216.5,2.201,1.117,1.074,0.473,1.084,0.601,1.695,1.632
+LADDER-8087790,ft-1,noft-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),15,15,24.66,22.91,193.0,199.7,2.201,0.349,1.074,0.15,1.852,0.924,1.733,1.508
+LADDER-8087790,ft-1,noft-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),15,19,24.66,24.19,193.0,247.7,2.201,0.692,1.074,0.257,1.509,0.817,1.746,1.594
+LADDER-8087790,ft-2,noft-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),30,43,27.82,32.33,317.5,425.3,1.525,0.131,0.997,0.342,1.394,0.655,1.876,1.309
+LADDER-8087790,ft-2,noft-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),30,21,27.82,27.47,317.5,216.5,1.525,1.117,0.997,0.473,0.408,0.524,1.849,1.417
+LADDER-8087790,ft-2,noft-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),30,15,27.82,22.91,317.5,199.7,1.525,0.349,0.997,0.15,1.176,0.847,1.887,1.293
+LADDER-8087790,ft-2,noft-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),30,19,27.82,24.19,317.5,247.7,1.525,0.692,0.997,0.257,0.833,0.74,1.9,1.379
+LADDER-8088395,ft-1,noft-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),48,40,47.61,35.15,467.5,337.5,1.374,0.35,1.093,,1.024,,1.741,
+LADDER-8089166,ft-1,noft-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),16,28,21.95,31.33,204.6,259.5,1.344,0.31,1.236,0.115,1.034,1.121,1.724,1.394
+LADDER-8089166,ft-1,noft-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),16,30,21.95,26.12,204.6,302.1,1.344,0.32,1.236,0.079,1.024,1.157,1.686,1.505
+LADDER-8089166,ft-1,noft-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),16,35,21.95,34.58,204.6,303.0,1.344,0.552,1.236,0.253,0.792,0.983,1.7,1.315
+LADDER-8089166,ft-1,noft-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),16,30,21.95,33.09,204.6,367.5,1.344,0.533,1.236,0.424,0.811,0.812,1.688,1.394
+LADDER-8089166,ft-2,noft-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,28,26.77,31.33,229.3,259.5,1.49,0.31,0.877,0.115,1.18,0.762,1.999,1.041
+LADDER-8089166,ft-2,noft-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,30,26.77,26.12,229.3,302.1,1.49,0.32,0.877,0.079,1.17,0.798,1.961,1.152
+LADDER-8089166,ft-2,noft-aa-1,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,35,26.77,34.58,229.3,303.0,1.49,0.552,0.877,0.253,0.938,0.624,1.975,0.962
+LADDER-8089166,ft-2,noft-aa-2,2026-10-20,build-final-aae00e6c65,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),28,30,26.77,33.09,229.3,367.5,1.49,0.533,0.877,0.424,0.957,0.453,1.963,1.041
+LADDER-8097555,ft-1,noft-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),15,21,25.12,26.9,198.8,356.2,6.613,2.987,1.545,1.217,3.626,0.328,0.149,-0.091
+LADDER-8097555,ft-1,noft-main-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),15,3,25.12,16.94,198.8,99.2,6.613,4.861,1.545,1.17,1.752,0.375,0.026,0.176
+LADDER-8099447,ft-1,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),7,41,24.88,35.06,132.8,365.2,1.119,0.226,0.132,0.697,0.893,-0.565,0.112,0.221
+LADDER-8099447,ft-1,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),7,34,24.88,32.52,132.8,312.9,1.119,0.786,0.132,0.087,0.333,0.045,0.138,0.119
+LADDER-8099447,ft-1,noft-3,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),7,20,24.88,27.64,132.8,233.7,1.119,0.898,0.132,1.194,0.221,-1.062,-0.007,0.126
+LADDER-8099447,ft-2,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),15,41,22.77,35.06,196.4,365.2,2.404,0.226,0.135,0.697,2.178,-0.562,0.12,0.215
+LADDER-8099447,ft-2,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),15,34,22.77,32.52,196.4,312.9,2.404,0.786,0.135,0.087,1.618,0.048,0.146,0.113
+LADDER-8099447,ft-2,noft-3,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),15,20,22.77,27.64,196.4,233.7,2.404,0.898,0.135,1.194,1.506,-1.059,0.001,0.12
+LADDER-8099447,ft-3,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),36,41,33.14,35.06,415.6,365.2,1.509,0.226,1.612,0.697,1.283,0.915,0.113,0.225
+LADDER-8099447,ft-3,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),36,34,33.14,32.52,415.6,312.9,1.509,0.786,1.612,0.087,0.723,1.525,0.139,0.123
+LADDER-8099447,ft-3,noft-3,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),36,20,33.14,27.64,415.6,233.7,1.509,0.898,1.612,1.194,0.611,0.418,-0.006,0.13
+LADDER-8102532,ft-1,noft-1,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),53,3,41.99,16.88,646.2,25.4,0.411,1.979,0.202,0.293,-1.568,-0.091,0.015,0.329
+LADDER-8102532,ft-1,noft-2,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),53,13,41.99,20.48,646.2,190.8,0.411,0.138,0.202,0.091,0.273,0.111,0.054,0.364
+LADDER-8102532,ft-2,noft-1,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),24,3,27.25,16.88,296.6,25.4,0.102,1.979,0.354,0.293,-1.877,0.061,-0.011,0.194
+LADDER-8102532,ft-2,noft-2,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),24,13,27.25,20.48,296.6,190.8,0.102,0.138,0.354,0.091,-0.036,0.263,0.028,0.229
+LADDER-8106373,ft-1,noft-1,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),30,30,32.49,39.43,546.3,748.8,,,0.374,1.864,,-1.49,,0.255
+LADDER-8106373,ft-1,noft-2,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),30,40,32.49,44.86,546.3,979.6,,,0.374,0.0,,0.374,,0.271
+LADDER-8106373,ft-2,noft-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),47,30,47.61,39.43,795.2,748.8,,,0.787,1.864,,-1.077,,0.369
+LADDER-8106373,ft-2,noft-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),47,40,47.61,44.86,795.2,979.6,,,0.787,0.0,,0.787,,0.385
+LADDER-8106373,ft-b183-1,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),48,30,45.07,39.43,863.3,748.8,,,0.095,1.864,,-1.769,,0.108
+LADDER-8106373,ft-b183-1,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),48,40,45.07,44.86,863.3,979.6,,,0.095,0.0,,0.095,,0.124
+LADDER-8106373,ft-b183-2,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),42,30,40.98,39.43,734.9,748.8,,,2.348,1.864,,0.484,,0.011
+LADDER-8106373,ft-b183-2,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),42,40,40.98,44.86,734.9,979.6,,,2.348,0.0,,2.348,,0.027
+LADDER-B-8072497,ft-1,noft-1,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),3,41,17.9,30.35,14.2,337.3,0.816,0.23,9.348,0.234,0.586,9.114,0.116,0.716
+LADDER-B-8072497,ft-1,noft-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),3,4,17.9,17.26,14.2,25.3,0.816,0.607,9.348,0.059,0.209,9.289,0.038,0.56
+LADDER-B-8072497,ft-1,noft-main-2,2026-10-19,build-devs-f4afe429ba,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),3,3,17.9,18.53,14.2,95.9,0.816,0.271,9.348,0.211,0.545,9.137,0.135,0.628
+LADDER-B-8072497,ft-2,noft-1,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),41,41,30.09,30.35,334.2,337.3,0.142,0.23,0.04,0.234,-0.088,-0.194,0.056,0.434
+LADDER-B-8072497,ft-2,noft-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),41,4,30.09,17.26,334.2,25.3,0.142,0.607,0.04,0.059,-0.465,-0.019,-0.022,0.278
+LADDER-B-8072497,ft-2,noft-main-2,2026-10-19,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),41,3,30.09,18.53,334.2,95.9,0.142,0.271,0.04,0.211,-0.129,-0.171,0.075,0.346
+LADDER-B-8072497,ft-base-1,noft-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,41,17.56,30.35,87.2,337.3,0.109,0.23,0.107,0.234,-0.121,-0.127,0.059,0.447
+LADDER-B-8072497,ft-base-1,noft-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,4,17.56,17.26,87.2,25.3,0.109,0.607,0.107,0.059,-0.498,0.048,-0.019,0.291
+LADDER-B-8072497,ft-base-1,noft-main-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),7,3,17.56,18.53,87.2,95.9,0.109,0.271,0.107,0.211,-0.162,-0.104,0.078,0.359
+LADDER-B-8072497,ft-base-2,noft-1,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),37,41,30.61,30.35,398.4,337.3,0.345,0.23,0.0,0.234,0.115,-0.234,0.047,0.456
+LADDER-B-8072497,ft-base-2,noft-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),37,4,30.61,17.26,398.4,25.3,0.345,0.607,0.0,0.059,-0.262,-0.059,-0.031,0.3
+LADDER-B-8072497,ft-base-2,noft-main-2,2026-10-19,build-next-fcc86b10b2,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),37,3,30.61,18.53,398.4,95.9,0.345,0.271,0.0,0.211,0.074,-0.211,0.066,0.368
+LADDER-B-8081165,ft-1,noft-aa-1,2026-10-19,build-final-2945b0f5bb,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),33,31,37.24,30.26,325.0,380.3,1.086,,0.805,,,,,
+LADDER-B-8106373,ft-1,noft-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),51,78,47.62,73.99,838.4,1122.5,,,3.969,4.101,,-0.132,,0.335
+LADDER-B-8106373,ft-1,noft-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),51,50,47.62,61.89,838.4,1221.4,,,3.969,1.484,,2.485,,0.303
+LADDER-B-8106373,ft-2,noft-1,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),45,78,53.76,73.99,816.1,1122.5,,,0.536,4.101,,-3.565,,0.223
+LADDER-B-8106373,ft-2,noft-2,2026-10-20,build-final-547a6aa7ed,lower(unaudited),online,False,,,full(>150G),full(>150G),45,50,53.76,61.89,816.1,1221.4,,,0.536,1.484,,-0.948,,0.191
+LADDER-B-8106373,ft-b183-1,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,none(<5G),full(>150G),1,78,0.32,73.99,323.6,1122.5,,,,4.101,,,,
+LADDER-B-8106373,ft-b183-1,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,none(<5G),full(>150G),1,50,0.32,61.89,323.6,1221.4,,,,1.484,,,,
+LADDER-B-8106373,ft-b183-2,noft-1,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),54,78,58.36,73.99,1122.7,1122.5,,,4.423,4.101,,0.322,,0.116
+LADDER-B-8106373,ft-b183-2,noft-2,2026-10-20,build-final-183d390691,lower(unaudited),online,False,,,full(>150G),full(>150G),54,50,58.36,61.89,1122.7,1221.4,,,4.423,1.484,,2.939,,0.084
+MECH-PROF-8034652,ft288-1,noft288-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,17.4,16.6,11.7,11.5,,,,,,,,
+MECH-PROF-8034652,ft288-1,noft288-2,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,4,4,17.4,18.08,11.7,11.5,,,,,,,,
+MECH-PROF-8034652,ft288-2,noft288-1,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,17.77,16.6,11.7,11.5,,,,,,,,
+MECH-PROF-8034652,ft288-2,noft288-2,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,4,17.77,18.08,11.7,11.5,,,,,,,,
+PREFLIGHT-B2-8031198,ft288,noft288,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,38,26.41,28.18,596.7,594.6,,,,,,,,
+PREFLIGHT-B2-8031198,ft288-8k,noft288,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,65,38,49.12,28.18,727.1,594.6,,,,,,,,
+PREFLIGHT-B2-8031198,ft288-idle,noft288,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,5,38,5.27,28.18,13.0,594.6,,,,,,,,
+PREFLIGHT-FINAL-8042599,final-idle,final-noft,2026-10-18,,lower(build unknown),online,n/a(settings not logged),,,unknown,unknown,4,4,3.68,17.15,154.2,139.7,,,,,,,,
+PROFILE-7993661,ft-256,noft-256,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,39,28.15,28.23,657.4,658.0,,,,,,,,
+PROFILE-7993661,ft-256,noft-8,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,3,28.15,17.09,657.4,33.7,,,,,,,,
+PROFILE-7993661,ft-8,noft-256,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,39,17.19,28.23,18.0,658.0,,,,,,,,
+PROFILE-7993661,ft-8,noft-8,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,3,17.19,17.09,18.0,33.7,,,,,,,,
+RESTORE-E2E2-8034134,acc-restore-r3,acc-noft,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,4,2,1.9,0.74,150.6,21.0,,,,,,,,
+RESTORE-E2E2-8034134,copies-idle-r2,acc-noft,2026-10-17,build-restore2-9911149fa0,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,6,2,17.94,0.74,145.9,21.0,,,,,,,,
+RESTORE-E2E2-8034134,empty-idle-r3,acc-noft,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,5,2,17.79,0.74,123.0,21.0,,,,,,,,
+RESTORE-E2E2-8034134,restore-decode-r3,acc-noft,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,42,2,26.66,0.74,594.3,21.0,,,,,,,,
+RESTORE-E2E2-8034134,restore-idle-r3,acc-noft,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,14,2,23.13,0.74,176.1,21.0,,,,,,,,
+SHUTDOWN-R1-8089163,ft-clean,noft-clean,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),50,38,52.85,46.89,684.2,607.8,,,,,,,,
+SHUTDOWN-R1-8089163,ft-loss,noft-clean,2026-10-20,,lower(build unknown),online,False,,ghost,full(>150G),full(>150G),13,38,22.75,46.89,24.5,607.8,,,,,,,,
+SHUTDOWN-R1-8094116,ft-clean,noft-clean,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),37,30,37.99,31.81,544.9,423.5,,,,,,,,
+SHUTDOWN-R1-8094116,ft-loss,noft-clean,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),25,30,36.9,31.81,310.3,423.5,,,,,,,,
+SHUTDOWN-R1-8097555,ft-clean,noft-clean,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),47,33,45.83,36.05,663.1,362.0,,,,,,,,
+SHUTDOWN-R1-8097555,ft-loss,noft-clean,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),36,33,39.57,36.05,416.7,362.0,,,,,,,,
+SHUTDOWN-R1-8102532,ft-clean,noft-clean,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),57,13,67.83,24.92,960.0,166.9,,,,,,,,
+SHUTDOWN-R1-8102532,ft-loss,noft-clean,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),63,13,52.19,24.92,820.8,166.9,,,,,,,,
+SHUTDOWN-R1-8138133,ft-clean,noft-clean,2026-10-21,build-v3-bcea8da496,clean,online,False,,,full(>150G),full(>150G),22,11,33.53,21.5,267.0,81.8,,,,,,,,
+SHUTDOWN-R1-8138133,ft-loss,noft-clean,2026-10-21,build-v3-bcea8da496,clean,online,False,,,full(>150G),full(>150G),24,11,36.49,21.5,356.5,81.8,,,,,,,,
+SHUTDOWN-R1-8139740,ft-clean,noft-clean,2026-10-21,build-v3-bcea8da496,clean,online,False,,,full(>150G),full(>150G),30,12,31.21,23.39,335.1,101.8,,,,,,,,
+SHUTDOWN-R1-8139740,ft-loss,noft-clean,2026-10-21,build-v3-bcea8da496,clean,online,False,,,full(>150G),full(>150G),30,12,34.61,23.39,432.8,101.8,,,,,,,,
+SHUTDOWN-R1-8169315,ft-clean,noft-clean,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),online,True,0.02,,full(>150G),full(>150G),54,12,62.32,24.24,968.5,118.4,,,,,,,,
+SHUTDOWN-R1-8169315,ft-loss,noft-clean,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),online,True,0.02,,full(>150G),full(>150G),50,12,63.89,24.24,963.6,118.4,,,,,,,,
+SHUTDOWN-R1-8178388,ft-clean,noft-clean,2026-10-22,build-freeze-5330b899f0,clean,online,True,0.02,,full(>150G),full(>150G),38,12,46.13,21.13,612.0,102.7,,,,,,,,
+SHUTDOWN-R1-8178388,ft-loss,noft-clean,2026-10-22,build-freeze-5330b899f0,clean,online,True,0.02,,full(>150G),full(>150G),54,12,70.17,21.13,1183.6,102.7,,,,,,,,
+STD-8110144,std-noeplb-ft-1,std-noeplb-1,2026-10-20,build-rc1-78836d1723,lower(unaudited),noeplb,False,,ghost,ring(5-150G),none(<5G),3,3,18.11,18.44,12.0,12.1,0.544,0.568,0.421,0.355,-0.024,0.066,0.321,0.137
+STD-8110144,std-offline-ft-1,std-offline-1,2026-10-20,build-rc1-78836d1723,lower(unaudited),offline,False,,ghost,full(>150G),none(<5G),16,3,26.66,17.84,204.5,12.4,0.186,0.454,0.464,0.205,-0.268,0.259,0.126,0.044
+STD-8116111,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.902,0.389,0.572,0.399,0.513,0.173,0.354,0.053
+STD-8116111,std-offline-ft-1,std-offline-1,2026-10-21,build-v2-cef4670789,clean,offline,False,,ghost,full(>150G),none(<5G),11,0,3.02,0.0,159.2,10.1,0.476,0.446,0.331,0.131,0.03,0.2,0.116,-0.058
+STD-8118134,std-offline-ft-1,std-offline-1,2026-10-21,build-v2-cef4670789,clean,offline,False,,ghost,full(>150G),none(<5G),0,0,0.0,0.0,10.1,10.1,0.322,0.135,0.209,0.116,0.187,0.093,0.111,-0.115
+STD-8118134,std-online-ft-1,std-online-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),8,0,2.48,0.0,107.3,11.3,0.394,0.329,0.531,0.203,0.065,0.328,0.053,0.115
+STD-8118573,std-offline-ft-1,std-offline-1,2026-10-21,build-v2-cef4670789,clean,offline,False,,ghost,full(>150G),none(<5G),60,0,27.73,0.0,571.7,10.1,0.274,0.449,0.285,0.3,-0.175,-0.015,0.11,-0.084
+STD-8118573,std-online-ft-1,std-online-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),47,0,16.04,0.0,372.5,113.8,0.656,0.614,0.255,0.254,0.042,0.001,-0.048,-0.102
+STD-8121996,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.618,0.386,,,0.232,,0.327,
+STD-8121996,std-noeplb-ft-1,std-noeplb-nopdl-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,10.6,0.618,0.859,,,-0.241,,-0.124,
+STD-8121996,std-noeplb-ft-nopdl-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.8,9.5,0.586,0.386,,,0.2,,0.665,
+STD-8121996,std-noeplb-ft-nopdl-1,std-noeplb-nopdl-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.8,10.6,0.586,0.859,,,-0.273,,0.214,
+STD-8122177,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,11.7,9.6,,,,,,,,
+STD-8123150,std-noeplb-ft-loc-1,std-noeplb-loc-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-8123150,std-noeplb-ft-loc-1,std-noeplb-ulfm-loc-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-8126134,std-noeplb-ft-loc-1,std-noeplb-loc-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-8127379,std-online-ft-loc-1,std-online-loc-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.5,11.2,0.549,0.284,0.28,0.586,0.265,-0.306,0.031,0.026
+STD-8128593,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.637,0.42,0.386,0.539,0.217,-0.153,0.358,0.162
+STD-8133265,std-noeplb-ft-loc-1,std-noeplb-loc-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),5,0,1.12,0.0,129.7,9.5,0.73,0.316,,,0.414,,0.275,
+STD-8133265,std-noeplb-ft-loc-1,std-noeplb-loc-aw10-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),5,0,1.12,0.0,129.7,9.5,0.73,2.058,,,-1.328,,0.259,
+STD-8133265,std-noeplb-ft-loc-aw10-1,std-noeplb-loc-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),1,0,0.25,0.0,45.5,9.5,2.231,0.316,,,1.915,,0.317,
+STD-8133265,std-noeplb-ft-loc-aw10-1,std-noeplb-loc-aw10-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),1,0,0.25,0.0,45.5,9.5,2.231,2.058,,,0.173,,0.301,
+STD-8134758,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.974,0.6,,,0.374,,0.349,
+STD-8134758,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.7,0.974,0.457,,,0.517,,0.243,
+STD-8137627,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.607,0.501,0.284,0.358,0.106,-0.074,0.365,0.156
+STD-8139740,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,10.9,0.741,0.831,,,-0.09,,0.328,
+STD-8139740,std-noeplb-ft-1,std-noeplb-ulfm-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.741,0.749,,,-0.008,,0.339,
+STD-8140516,std-online-ft-1,std-online-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),29,0,9.09,0.0,301.8,11.2,0.466,0.287,1.016,0.287,0.179,0.729,-0.047,-0.119
+STD-8140516,std-online-ft-1,std-online-ulfm-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),29,0,9.09,0.0,301.8,43.1,0.466,0.667,1.016,0.363,-0.201,0.653,-0.098,-0.117
+STD-8141738,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.6,0.32,0.928,,,-0.608,,0.298,
+STD-8145956,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.5,0.992,0.714,,,0.278,,0.3,
+STD-8145956,std-noeplb-ft-sm-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.608,0.714,,,-0.106,,0.296,
+STD-8146122,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.8,9.5,0.767,0.35,,,0.417,,0.376,
+STD-8146122,std-noeplb-ft-1,std-noeplb-2,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.8,9.5,0.767,0.639,,,0.128,,0.351,
+STD-8146122,std-noeplb-ft-2,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.657,0.35,,,0.307,,0.379,
+STD-8146122,std-noeplb-ft-2,std-noeplb-2,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.657,0.639,,,0.018,,0.354,
+STD-8146122,std-noeplb-ft-noH-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,15.4,9.5,0.701,0.35,,,0.351,,0.41,
+STD-8146122,std-noeplb-ft-noH-1,std-noeplb-2,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,15.4,9.5,0.701,0.639,,,0.062,,0.385,
+STD-8146122,std-noeplb-ft-noH-2,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,13.4,9.5,0.643,0.35,,,0.293,,0.398,
+STD-8146122,std-noeplb-ft-noH-2,std-noeplb-2,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,13.4,9.5,0.643,0.639,,,0.004,,0.373,
+STD-8146122,std-noeplb-ft-noT-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,31.1,9.5,0.335,0.35,,,-0.015,,0.365,
+STD-8146122,std-noeplb-ft-noT-1,std-noeplb-2,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,31.1,9.5,0.335,0.639,,,-0.304,,0.34,
+STD-8146122,std-noeplb-ft-noT-2,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.612,0.35,,,0.262,,0.355,
+STD-8146122,std-noeplb-ft-noT-2,std-noeplb-2,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.612,0.639,,,-0.027,,0.33,
+STD-8147471,std-online-ft-1,std-online-1,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.4,11.2,,,0.271,0.394,,-0.123,,-0.079
+STD-8147471,std-online-ft-1,std-online-2,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.4,61.9,,,0.271,0.98,,-0.709,,-0.085
+STD-8147471,std-online-ft-2,std-online-1,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),70,0,32.74,0.0,613.0,11.2,,,0.302,0.394,,-0.092,,-0.129
+STD-8147471,std-online-ft-2,std-online-2,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),70,0,32.74,0.0,613.0,61.9,,,0.302,0.98,,-0.678,,-0.135
+STD-8147471,std-online-ft-sm-1,std-online-1,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),41,0,13.43,0.0,309.4,11.2,,,1.265,0.394,,0.871,,-0.049
+STD-8147471,std-online-ft-sm-1,std-online-2,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),41,0,13.43,0.0,309.4,61.9,,,1.265,0.98,,0.285,,-0.055
+STD-8147471,std-online-ft-sm-2,std-online-1,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),17,0,5.31,0.0,209.7,11.2,,,0.198,0.394,,-0.196,,-0.195
+STD-8147471,std-online-ft-sm-2,std-online-2,2026-10-22,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),17,0,5.31,0.0,209.7,61.9,,,0.198,0.98,,-0.782,,-0.201
+STD-8147927,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.5,0.883,0.411,,,0.472,,0.368,
+STD-8147927,std-noeplb-ft-1,std-noeplb-mnt2048-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.6,0.883,0.0,,,0.883,,0.509,
+STD-8147927,std-noeplb-ft-mnt2048-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.025,0.411,,,-0.386,,0.129,
+STD-8147927,std-noeplb-ft-mnt2048-1,std-noeplb-mnt2048-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.025,0.0,,,0.025,,0.27,
+STD-8150634,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.823,0.647,,,0.176,,0.317,
+STD-8152150,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5r-b643ad8a29,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,27.4,9.5,1.07,0.583,,,0.487,,0.208,
+STD-8152150,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5-2ccc3e8e1c,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.769,0.583,,,0.186,,0.274,
+STD-8154122,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5r-b0ad558bcb,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.578,0.401,,,0.177,,0.25,
+STD-8154122,std-noeplb-ft-noinplace-1,std-noeplb-1,2026-10-22,build-v5r-b0ad558bcb,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.1,9.5,0.713,0.401,,,0.312,,1.423,
+STD-8154122,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5-2ccc3e8e1c,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.511,0.401,,,0.11,,0.317,
+STD-8154122,std-noeplb-ft-unbound-1,std-noeplb-1,2026-10-22,build-v5r-b0ad558bcb,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.803,0.401,,,0.402,,0.208,
+STD-8158617,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5x-eb3950a3f8,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.59,0.891,,,-0.301,,0.1,
+STD-8158617,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5-2ccc3e8e1c,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.426,0.891,,,-0.465,,0.223,
+STD-8164194,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.37,0.38,0.586,0.532,-0.01,0.054,0.112,0.128
+STD-8164194,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.37,0.369,0.586,0.402,0.001,0.184,-0.013,-0.026
+STD-8164194,std-noeplb-ft-noghost-1,std-noeplb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.542,0.38,0.566,0.532,0.162,0.034,0.092,0.115
+STD-8164194,std-noeplb-ft-noghost-1,std-noeplb-lb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.6,0.542,0.369,0.566,0.402,0.173,0.164,-0.033,-0.039
+STD-8164194,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5land-9f2f1892f0,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.302,0.38,0.55,0.532,-0.078,0.018,0.221,0.172
+STD-8164194,std-noeplb-ft-oldk-1,std-noeplb-lb-1,2026-10-22,build-v5land-9f2f1892f0,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.6,0.302,0.369,0.55,0.402,-0.067,0.148,0.096,0.018
+STD-8167505,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.514,0.405,,,0.109,,0.079,
+STD-8167505,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.7,0.514,0.401,,,0.113,,-0.015,
+STD-8167505,std-noeplb-ft-noghost-1,std-noeplb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.389,0.405,,,-0.016,,0.091,
+STD-8167505,std-noeplb-ft-noghost-1,std-noeplb-lb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.7,0.389,0.401,,,-0.012,,-0.003,
+STD-8169329,std-online-ft-1,std-online-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),online,True,0.02,ghost,full(>150G),full(>150G),9,0,3.14,0.0,162.3,11.3,0.407,0.33,,,0.077,,0.007,
+STD-8178389,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.5,9.4,0.643,0.353,,,0.29,,0.134,
+STD-8178389,std-noeplb-ft-1,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.5,9.5,0.643,0.604,,,0.039,,0.14,
+STD-8178389,std-noeplb-ft-2,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.4,0.459,0.353,,,0.106,,0.112,
+STD-8178389,std-noeplb-ft-2,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.459,0.604,,,-0.145,,0.118,
+STD-8178389,std-noeplb-ft-noslottable-1,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.5,9.4,0.403,0.353,,,0.05,,0.16,
+STD-8178389,std-noeplb-ft-noslottable-1,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.5,9.5,0.403,0.604,,,-0.201,,0.166,
+STD-8178389,std-noeplb-ft-noslottable-2,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.4,0.431,0.353,,,0.078,,0.183,
+STD-8178389,std-noeplb-ft-noslottable-2,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.431,0.604,,,-0.173,,0.189,
+STD-8193512,std-noeplb-ft-1,std-noeplb-1,2026-10-23,build-freeze-7e8dfb37df,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.488,0.24,0.305,0.224,0.248,0.081,0.119,0.091
+STD-8194123,std-offline-ft-1,std-offline-1,2026-10-23,build-freeze-7e8dfb37df,clean,offline,True,0.02,ghost,full(>150G),none(<5G),25,0,10.74,0.0,326.8,9.8,0.266,0.068,0.0,0.027,0.198,-0.027,0.031,0.092
+STD-8199989,std-noeplb-ft-1,std-noeplb-1,2026-10-23,build-freeze-1117f7e0e7,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.599,0.508,0.634,0.527,0.091,0.107,0.137,0.098
+STD-8202865,std-online-ft-1,std-online-1,2026-10-23,build-freeze-58caa0fde6,clean,online,True,0.02,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.3,11.1,1.446,0.432,0.396,0.224,1.014,0.172,0.203,0.033
+STD-8206860,std-online-ft-1,std-online-1,2026-10-23,build-freeze-58caa0fde6,clean,online,True,0.02,ghost,full(>150G),full(>150G),19,0,5.33,0.0,208.0,11.2,1.427,0.416,0.51,0.278,1.011,0.232,0.061,0.076
+STD-8206860,std-online-ft-1,std-online-main-1,2026-10-23,build-freeze-58caa0fde6,clean,online,True,0.02,ghost,full(>150G),full(>150G),19,0,5.33,0.0,208.0,64.0,1.427,0.805,0.51,0.866,0.622,-0.356,0.012,0.172
+STD-8206861,std-offline-ft-1,std-offline-1,2026-10-23,build-freeze-58caa0fde6,clean,offline,True,0.02,ghost,full(>150G),none(<5G),2,0,0.41,0.0,11.1,11.1,0.611,0.238,0.833,0.603,0.373,0.23,0.087,0.127
+STD-8206863,std-offline-ft-1,std-offline-1,2026-10-23,build-freeze-58caa0fde6,clean,offline,True,0.02,ghost,full(>150G),none(<5G),28,0,14.01,0.0,461.2,9.8,0.515,0.432,0.954,0.726,0.083,0.228,0.056,0.013
+STD-8208527,std-noeplb-ft-1,std-noeplb-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.441,0.432,0.961,0.931,0.009,0.03,0.111,0.072
+STD-8208527,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.6,0.441,0.407,0.961,0.942,0.034,0.019,0.082,-0.027
+STD-8208527,std-noeplb-ft-1,std-noeplb-main-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.441,1.103,0.961,1.241,-0.662,-0.28,0.097,0.074
+STD-8208527,std-noeplb-ft-1,std-noeplb-ulfm-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.441,1.119,0.961,0.894,-0.678,0.067,0.119,0.09
+STD-8215947,std-noeplb-ft-1,std-noeplb-1,2026-10-24,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.51,0.491,1.062,1.27,0.019,-0.208,0.097,0.11
+STD-A-8026760,ft-1,noft-1,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,39,27.26,27.0,632.1,630.6,0.325,0.342,0.154,0.089,-0.017,0.065,0.124,0.018
+STD-A-8026760,ft-1,noft-2,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,38,27.26,27.23,632.1,632.9,0.325,0.144,0.154,0.115,0.181,0.039,0.153,0.064
+STD-A-8026760,ft-1,profile-noft-32,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,7,27.26,19.81,632.1,14.0,0.325,0.3,0.154,,0.025,,0.076,
+STD-A-8026760,ft-2,noft-1,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,39,27.53,27.0,631.6,630.6,0.178,0.342,0.078,0.089,-0.164,-0.011,0.134,0.333
+STD-A-8026760,ft-2,noft-2,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,38,27.53,27.23,631.6,632.9,0.178,0.144,0.078,0.115,0.034,-0.037,0.163,0.379
+STD-A-8026760,ft-2,profile-noft-32,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,7,27.53,19.81,631.6,14.0,0.178,0.3,0.078,,-0.122,,0.086,
+STD-A-8026760,profile-ft-32,noft-1,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,39,19.85,27.0,14.1,630.6,0.197,0.342,,0.089,-0.145,,0.165,
+STD-A-8026760,profile-ft-32,noft-2,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,38,19.85,27.23,14.1,632.9,0.197,0.144,,0.115,0.053,,0.194,
+STD-A-8026760,profile-ft-32,profile-noft-32,2026-10-17,build-next-6b2a752418,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,19.85,19.81,14.1,14.0,0.197,0.3,,,-0.103,,0.117,
+STD-B-8027195,ft-1,noft-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,38,39,28.26,29.7,637.7,643.0,,,,,,,,
+STD-B-8028211,ft-1,noft-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,39,29.79,28.61,647.6,628.6,0.153,0.253,0.497,1.262,-0.1,-0.765,0.191,0.153
+STD-B-8028211,ft-1,noft-2,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,38,29.79,29.6,647.6,634.8,0.153,0.11,0.497,0.439,0.043,0.058,0.19,0.131
+STD-B-8028211,ft-1,noft-3,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,39,29.79,28.86,647.6,628.5,0.153,0.115,0.497,0.577,0.038,-0.08,0.228,0.198
+STD-B-8028211,ft-2,noft-1,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,39,39,28.65,28.61,631.4,628.6,0.178,0.253,0.44,1.262,-0.075,-0.822,0.16,0.39
+STD-B-8028211,ft-2,noft-2,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,39,38,28.65,29.6,631.4,634.8,0.178,0.11,0.44,0.439,0.068,0.001,0.159,0.368
+STD-B-8028211,ft-2,noft-3,2026-10-17,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,39,39,28.65,28.86,631.4,628.5,0.178,0.115,0.44,0.577,0.063,-0.137,0.197,0.435
+STD-B-8028211,ft-3,noft-1,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,39,28.55,28.61,634.7,628.6,0.374,0.253,0.346,1.262,0.121,-0.916,0.175,0.339
+STD-B-8028211,ft-3,noft-2,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,38,28.55,29.6,634.7,634.8,0.374,0.11,0.346,0.439,0.264,-0.093,0.174,0.317
+STD-B-8028211,ft-3,noft-3,2026-10-17,build-pr8-937403a6cc,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,39,28.55,28.86,634.7,628.5,0.374,0.115,0.346,0.577,0.259,-0.231,0.212,0.384
+STD-G1-8110144,std-noeplb-ft-1,std-noeplb-1,2026-10-20,build-rc1-78836d1723,lower(unaudited),noeplb,False,,ghost,ring(5-150G),none(<5G),3,3,19.13,17.34,15.9,12.2,0.505,0.297,1.059,0.322,0.208,0.737,0.385,0.052
+STD-G1-8110144,std-online-ft-1,std-online-1,2026-10-20,build-rc1-78836d1723,lower(unaudited),online,False,,ghost,full(>150G),full(>150G),13,3,19.57,17.24,177.0,14.0,0.203,0.514,0.468,0.275,-0.311,0.193,-0.06,-0.002
+STD-G1-8116111,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.6,9.5,0.36,0.823,0.568,0.285,-0.463,0.283,0.299,0.1
+STD-G1-8116111,std-online-ft-1,std-online-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.4,29.9,0.532,0.511,0.196,0.282,0.021,-0.086,0.03,-0.014
+STD-G1-8118134,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,31.1,9.5,0.846,0.6,0.524,0.396,0.246,0.128,0.337,0.072
+STD-G1-8118134,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,31.1,9.7,0.846,0.397,0.524,0.758,0.449,-0.234,0.221,-0.03
+STD-G1-8118573,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.342,0.748,0.566,0.569,-0.406,-0.003,0.295,0.152
+STD-G1-8118573,std-online-ft-1,std-online-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),64,0,24.63,0.0,492.6,63.6,1.139,0.507,0.408,0.396,0.632,0.012,0.01,-0.049
+STD-G1-8119878,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),7,7,20.27,21.12,30.2,15.6,1.527,1.026,,,0.501,,0.345,
+STD-G1-8119878,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),7,7,20.27,22.75,30.2,27.1,1.527,1.456,,,0.071,,0.218,
+STD-G1-8121996,std-online-ft-1,std-online-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),28,22,30.97,28.84,492.3,446.6,,,2.774,2.112,,0.662,,0.057
+STD-G1-8122177,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-G1-8123150,std-noeplb-ft-loc-1,std-noeplb-loc-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-G1-8123150,std-noeplb-ft-loc-1,std-noeplb-ulfm-loc-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-G1-8126134,std-noeplb-ft-loc-1,std-noeplb-loc-1,2026-10-21,build-v2-cef4670789,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,,,,,,,,
+STD-G1-8127379,std-online-ft-loc-1,std-online-loc-1,2026-10-21,build-v2-cef4670789,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.5,45.4,0.254,0.495,0.179,0.224,-0.241,-0.045,0.002,0.05
+STD-G1-8128593,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.668,0.541,0.514,0.77,0.127,-0.256,0.367,0.21
+STD-G1-8133265,std-online-ft-loc-aw10-1,std-online-loc-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.8,12.4,1.156,0.445,,,0.711,,0.08,
+STD-G1-8133265,std-online-ft-loc-aw10-1,std-online-loc-aw10-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.8,11.2,1.156,1.307,,,-0.151,,0.039,
+STD-G1-8134758,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.0,9.5,0.697,0.344,,,0.353,,0.352,
+STD-G1-8134758,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.0,9.7,0.697,0.921,,,-0.224,,0.211,
+STD-G1-8140516,std-online-ft-1,std-online-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.7,69.8,0.411,0.855,0.537,0.844,-0.444,-0.307,-0.032,-0.057
+STD-G1-8140516,std-online-ft-1,std-online-ulfm-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.7,90.8,0.411,0.666,0.537,0.405,-0.255,0.132,0.012,-0.054
+STD-G1-8150634,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.8,1.038,0.409,,,0.629,,0.299,
+STD-G1-8150634,std-noeplb-ft-1,std-noeplb-2,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.6,1.038,0.674,,,0.364,,0.325,
+STD-G1-8150634,std-noeplb-ft-1,std-noeplb-3,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.3,1.038,0.345,,,0.693,,0.323,
+STD-G1-8150634,std-noeplb-ft-2,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.8,0.723,0.409,,,0.314,,0.299,
+STD-G1-8150634,std-noeplb-ft-2,std-noeplb-2,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.6,0.723,0.674,,,0.049,,0.325,
+STD-G1-8150634,std-noeplb-ft-2,std-noeplb-3,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.3,0.723,0.345,,,0.378,,0.323,
+STD-G1-8150634,std-noeplb-ft-3,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.8,0.788,0.409,,,0.379,,0.297,
+STD-G1-8150634,std-noeplb-ft-3,std-noeplb-2,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.6,0.788,0.674,,,0.114,,0.323,
+STD-G1-8150634,std-noeplb-ft-3,std-noeplb-3,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.3,0.788,0.345,,,0.443,,0.321,
+STD-G1-8150634,std-noeplb-ft-noT-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,11.1,10.8,1.068,0.409,,,0.659,,0.297,
+STD-G1-8150634,std-noeplb-ft-noT-1,std-noeplb-2,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,11.1,9.6,1.068,0.674,,,0.394,,0.323,
+STD-G1-8150634,std-noeplb-ft-noT-1,std-noeplb-3,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,11.1,10.3,1.068,0.345,,,0.723,,0.321,
+STD-G1-8150634,std-noeplb-ft-noT-2,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,10.8,0.563,0.409,,,0.154,,0.286,
+STD-G1-8150634,std-noeplb-ft-noT-2,std-noeplb-2,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.563,0.674,,,-0.111,,0.312,
+STD-G1-8150634,std-noeplb-ft-noT-2,std-noeplb-3,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,10.3,0.563,0.345,,,0.218,,0.31,
+STD-G1-8150634,std-noeplb-ft-noT-3,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.8,0.615,0.409,,,0.206,,0.29,
+STD-G1-8150634,std-noeplb-ft-noT-3,std-noeplb-2,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.6,0.615,0.674,,,-0.059,,0.316,
+STD-G1-8150634,std-noeplb-ft-noT-3,std-noeplb-3,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,10.3,0.615,0.345,,,0.27,,0.314,
+STD-G1-8152150,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5r-b643ad8a29,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,20.7,9.5,0.965,0.783,,,0.182,,0.305,
+STD-G1-8152150,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5-2ccc3e8e1c,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.648,0.783,,,-0.135,,0.311,
+STD-G1-8154122,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5r-b0ad558bcb,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.816,0.308,,,0.508,,0.245,
+STD-G1-8154122,std-noeplb-ft-noinplace-1,std-noeplb-1,2026-10-22,build-v5r-b0ad558bcb,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.1,9.5,0.819,0.308,,,0.511,,1.409,
+STD-G1-8154122,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5-2ccc3e8e1c,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.397,0.308,,,0.089,,0.277,
+STD-G1-8154122,std-noeplb-ft-unbound-1,std-noeplb-1,2026-10-22,build-v5r-b0ad558bcb,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.727,0.308,,,0.419,,0.146,
+STD-G1-8158617,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5x-eb3950a3f8,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.6,10.7,0.747,0.402,,,0.345,,0.134,
+STD-G1-8158617,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5-2ccc3e8e1c,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,10.7,0.892,0.402,,,0.49,,0.282,
+STD-G1-8164194,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.471,0.475,0.401,0.566,-0.004,-0.165,0.156,0.125
+STD-G1-8164194,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.6,0.471,0.41,0.401,0.363,0.061,0.038,0.046,-0.021
+STD-G1-8164194,std-noeplb-ft-noghost-1,std-noeplb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.47,0.475,0.468,0.566,-0.005,-0.098,0.08,0.062
+STD-G1-8164194,std-noeplb-ft-noghost-1,std-noeplb-lb-1,2026-10-22,build-v5zero-6645ce1848,clean,noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.6,0.47,0.41,0.468,0.363,0.06,0.105,-0.03,-0.084
+STD-G1-8164194,std-noeplb-ft-oldk-1,std-noeplb-1,2026-10-22,build-v5land-9f2f1892f0,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.371,0.475,0.449,0.566,-0.104,-0.117,0.224,0.191
+STD-G1-8164194,std-noeplb-ft-oldk-1,std-noeplb-lb-1,2026-10-22,build-v5land-9f2f1892f0,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.6,0.371,0.41,0.449,0.363,-0.039,0.086,0.114,0.045
+STD-G1-8167505,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.9,9.5,0.339,0.365,,,-0.026,,0.116,
+STD-G1-8167505,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.9,9.7,0.339,0.414,,,-0.075,,0.003,
+STD-G1-8167505,std-noeplb-ft-noghost-1,std-noeplb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.7,9.5,0.461,0.365,,,0.096,,0.124,
+STD-G1-8167505,std-noeplb-ft-noghost-1,std-noeplb-lb-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),noeplb,False,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.7,9.7,0.461,0.414,,,0.047,,0.011,
+STD-G1-8169329,std-online-ft-1,std-online-1,2026-10-22,build-v5zero-f9e6bc0f8b,lower(unaudited),online,True,0.02,ghost,full(>150G),full(>150G),0,2,0.0,0.42,11.4,88.7,,,0.197,0.273,,-0.076,,-0.037
+STD-G1-8178389,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.552,0.451,,,0.101,,0.097,
+STD-G1-8178389,std-noeplb-ft-1,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.4,0.552,0.478,,,0.074,,0.114,
+STD-G1-8178389,std-noeplb-ft-2,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.557,0.451,,,0.106,,0.099,
+STD-G1-8178389,std-noeplb-ft-2,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.4,0.557,0.478,,,0.079,,0.116,
+STD-G1-8178389,std-noeplb-ft-noslottable-1,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.454,0.451,,,0.003,,0.146,
+STD-G1-8178389,std-noeplb-ft-noslottable-1,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.4,0.454,0.478,,,-0.024,,0.163,
+STD-G1-8178389,std-noeplb-ft-noslottable-2,std-noeplb-1,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.5,0.242,0.451,,,-0.209,,0.169,
+STD-G1-8178389,std-noeplb-ft-noslottable-2,std-noeplb-2,2026-10-22,build-freeze-5330b899f0,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.6,9.4,0.242,0.478,,,-0.236,,0.186,
+STD-G1-8193512,std-online-ft-1,std-online-1,2026-10-23,build-freeze-7e8dfb37df,clean,online,True,0.02,ghost,full(>150G),full(>150G),14,0,5.63,0.0,179.6,46.2,0.431,0.255,0.051,0.332,0.176,-0.281,0.097,-0.006
+STD-G1-8199989,std-online-ft-1,std-online-1,2026-10-23,build-freeze-1117f7e0e7,clean,online,True,0.02,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.4,11.1,0.251,0.386,0.272,0.373,-0.135,-0.101,0.179,-0.044
+STD-G1-8202865,std-noeplb-ft-1,std-noeplb-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),9,0,2.17,0.0,59.6,9.5,0.384,0.907,1.313,0.726,-0.523,0.587,0.131,0.01
+STD-G1-8206860,std-online-ft-1,std-online-1,2026-10-23,build-freeze-58caa0fde6,clean,online,True,0.02,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.3,91.7,0.312,0.468,0.525,0.294,-0.156,0.231,0.1,0.077
+STD-G1-8206860,std-online-ft-1,std-online-main-1,2026-10-23,build-freeze-58caa0fde6,clean,online,True,0.02,ghost,full(>150G),full(>150G),0,0,0.0,0.0,11.3,25.4,0.312,0.488,0.525,0.397,-0.176,0.128,0.102,0.175
+STD-G1-8206861,std-offline-ft-1,std-offline-1,2026-10-23,build-freeze-58caa0fde6,clean,offline,True,0.02,ghost,full(>150G),none(<5G),10,0,3.0,0.0,141.7,9.9,0.435,0.274,0.646,0.498,0.161,0.148,0.107,0.142
+STD-G1-8206863,std-offline-ft-1,std-offline-1,2026-10-23,build-freeze-58caa0fde6,clean,offline,True,0.02,ghost,full(>150G),none(<5G),21,0,8.16,0.0,248.0,9.8,0.287,0.314,0.338,0.313,-0.027,0.025,0.071,0.067
+STD-G1-8208527,std-noeplb-ft-1,std-noeplb-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.7,9.5,0.605,0.395,0.763,0.846,0.21,-0.083,0.102,0.178
+STD-G1-8208527,std-noeplb-ft-1,std-noeplb-lb-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.7,9.6,0.605,0.698,0.763,0.908,-0.093,-0.145,0.054,0.077
+STD-G1-8208527,std-noeplb-ft-1,std-noeplb-main-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.7,9.4,0.605,0.546,0.763,1.02,0.059,-0.257,0.105,0.169
+STD-G1-8208527,std-noeplb-ft-1,std-noeplb-ulfm-1,2026-10-23,build-freeze-58caa0fde6,clean,noeplb,True,0.02,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,16.7,9.5,0.605,0.346,0.763,0.942,0.259,-0.179,0.116,0.233
+STD-G1-8215947,std-online-ft-1,std-online-1,2026-10-24,build-freeze-58caa0fde6,clean,online,True,0.02,ghost,full(>150G),full(>150G),2,0,0.48,0.0,18.7,11.1,0.724,0.35,0.602,0.363,0.374,0.239,0.198,0.144
+STD-G2-8145956,std-online-ft-1,std-online-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),49,0,17.01,0.0,378.4,95.1,1.236,0.879,,,0.357,,0.0,
+STD-G2-8145956,std-online-ft-sm-1,std-online-1,2026-10-21,build-v3-bcea8da496,clean,online,False,,ghost,full(>150G),full(>150G),29,0,9.97,0.0,336.7,95.1,0.627,0.879,,,-0.252,,-0.085,
+STD-G2-8150634-fill1,std-noeplb-ft-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,10.7,9.5,0.715,0.488,,,0.227,,0.347,
+STD-G2-8150634-fill1,std-noeplb-ft-noT-1,std-noeplb-1,2026-10-22,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.7,9.5,0.927,0.488,,,0.439,,0.349,
+STD-G3-8145956,std-noeplb-ft-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,ring(5-150G),none(<5G),0,0,0.0,0.0,9.8,9.6,0.727,0.375,,,0.352,,0.335,
+STD-G3-8145956,std-noeplb-ft-sm-1,std-noeplb-1,2026-10-21,build-v3-bcea8da496,clean,noeplb,False,,ghost,none(<5G),none(<5G),0,0,0.0,0.0,36.2,9.6,,0.375,,,,,,
+TAIL-CTRL-8100346,ft-empty-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),8,8,27.04,23.41,131.5,140.6,1.27,1.168,,,0.102,,0.142,
+TAIL-CTRL-8100346,ft-empty-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),8,7,27.04,21.86,131.5,86.2,1.27,0.577,,,0.693,,0.222,
+TAIL-CTRL-8100346,ft-empty-w-1,noft-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),8,32,27.04,31.65,131.5,286.6,1.27,0.865,,,0.405,,0.095,
+TAIL-CTRL-8100346,ft-empty-w-1,noft-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),8,28,27.04,34.64,131.5,363.1,1.27,1.786,,,-0.516,,0.111,
+TAIL-CTRL-8100346,ft-empty-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),42,8,34.17,23.41,380.5,140.6,1.483,1.168,,,0.315,,0.119,
+TAIL-CTRL-8100346,ft-empty-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),42,7,34.17,21.86,380.5,86.2,1.483,0.577,,,0.906,,0.199,
+TAIL-CTRL-8100346,ft-empty-w-2,noft-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),42,32,34.17,31.65,380.5,286.6,1.483,0.865,,,0.618,,0.072,
+TAIL-CTRL-8100346,ft-empty-w-2,noft-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),42,28,34.17,34.64,380.5,363.1,1.483,1.786,,,-0.303,,0.088,
+TAIL-CTRL-8100346,ft-w-1,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),35,8,31.22,23.41,393.8,140.6,0.82,1.168,,,-0.348,,0.013,
+TAIL-CTRL-8100346,ft-w-1,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),35,7,31.22,21.86,393.8,86.2,0.82,0.577,,,0.243,,0.093,
+TAIL-CTRL-8100346,ft-w-1,noft-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),35,32,31.22,31.65,393.8,286.6,0.82,0.865,,,-0.045,,-0.034,
+TAIL-CTRL-8100346,ft-w-1,noft-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),35,28,31.22,34.64,393.8,363.1,0.82,1.786,,,-0.966,,-0.018,
+TAIL-CTRL-8100346,ft-w-2,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),33,8,35.1,23.41,504.1,140.6,1.605,1.168,,,0.437,,0.106,
+TAIL-CTRL-8100346,ft-w-2,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),33,7,35.1,21.86,504.1,86.2,1.605,0.577,,,1.028,,0.186,
+TAIL-CTRL-8100346,ft-w-2,noft-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),33,32,35.1,31.65,504.1,286.6,1.605,0.865,,,0.74,,0.059,
+TAIL-CTRL-8100346,ft-w-2,noft-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),33,28,35.1,34.64,504.1,363.1,1.605,1.786,,,-0.181,,0.075,
+TAIL-CTRL-8103521,ft-empty-loc-w-1,noft-main-loc-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),37,7,36.53,20.64,555.9,95.8,2.782,3.15,,,-0.368,,0.125,
+TAIL-CTRL-8103521,ft-empty-loc-w-1,noft-main-loc-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),37,8,36.53,19.54,555.9,94.8,2.782,0.874,,,1.908,,0.157,
+TAIL-CTRL-8103521,ft-empty-loc-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),37,7,36.53,22.06,555.9,97.9,2.782,0.704,,,2.078,,0.141,
+TAIL-CTRL-8103521,ft-empty-loc-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),37,7,36.53,20.33,555.9,70.0,2.782,0.588,,,2.194,,0.131,
+TAIL-CTRL-8103521,ft-empty-loc-w-2,noft-main-loc-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),21,7,27.98,20.64,224.2,95.8,0.734,3.15,,,-2.416,,0.018,
+TAIL-CTRL-8103521,ft-empty-loc-w-2,noft-main-loc-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),21,8,27.98,19.54,224.2,94.8,0.734,0.874,,,-0.14,,0.05,
+TAIL-CTRL-8103521,ft-empty-loc-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),21,7,27.98,22.06,224.2,97.9,0.734,0.704,,,0.03,,0.034,
+TAIL-CTRL-8103521,ft-empty-loc-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),21,7,27.98,20.33,224.2,70.0,0.734,0.588,,,0.146,,0.024,
+TAIL-CTRL-8103521,ft-loc-w-1,noft-main-loc-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),42,7,35.69,20.64,425.3,95.8,2.318,3.15,,,-0.832,,0.104,
+TAIL-CTRL-8103521,ft-loc-w-1,noft-main-loc-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),42,8,35.69,19.54,425.3,94.8,2.318,0.874,,,1.444,,0.136,
+TAIL-CTRL-8103521,ft-loc-w-1,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),42,7,35.69,22.06,425.3,97.9,2.318,0.704,,,1.614,,0.12,
+TAIL-CTRL-8103521,ft-loc-w-1,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),42,7,35.69,20.33,425.3,70.0,2.318,0.588,,,1.73,,0.11,
+TAIL-CTRL-8103521,ft-loc-w-2,noft-main-loc-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),24,7,32.71,20.64,349.4,95.8,4.707,3.15,,,1.557,,0.188,
+TAIL-CTRL-8103521,ft-loc-w-2,noft-main-loc-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),24,8,32.71,19.54,349.4,94.8,4.707,0.874,,,3.833,,0.22,
+TAIL-CTRL-8103521,ft-loc-w-2,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),24,7,32.71,22.06,349.4,97.9,4.707,0.704,,,4.003,,0.204,
+TAIL-CTRL-8103521,ft-loc-w-2,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),24,7,32.71,20.33,349.4,70.0,4.707,0.588,,,4.119,,0.194,
+TAIL-CTRL-8108645,ft-hpin-w-1,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),17,12,27.74,21.75,215.0,170.0,5.299,6.343,,,-1.044,,0.043,
+TAIL-CTRL-8108645,ft-hpin-w-1,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),17,7,27.74,19.41,215.0,103.4,5.299,3.057,,,2.242,,0.15,
+TAIL-CTRL-8108645,ft-hpin-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),7,12,19.15,21.75,17.0,170.0,0.446,6.343,,,-5.897,,-0.111,
+TAIL-CTRL-8108645,ft-hpin-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),7,7,19.15,19.41,17.0,103.4,0.446,3.057,,,-2.611,,-0.004,
+TAIL-CTRL-8108645,ft-nolog-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),17,12,25.49,21.75,248.9,170.0,2.553,6.343,,,-3.79,,-0.142,
+TAIL-CTRL-8108645,ft-nolog-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),17,7,25.49,19.41,248.9,103.4,2.553,3.057,,,-0.504,,-0.035,
+TAIL-CTRL-8108645,ft-nolog-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),40,12,36.96,21.75,419.6,170.0,7.702,6.343,,,1.359,,-0.01,
+TAIL-CTRL-8108645,ft-nolog-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),40,7,36.96,19.41,419.6,103.4,7.702,3.057,,,4.645,,0.097,
+TAIL-CTRL-8108645,ft-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),16,12,27.25,21.75,214.3,170.0,2.267,6.343,,,-4.076,,-0.045,
+TAIL-CTRL-8108645,ft-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),16,7,27.25,19.41,214.3,103.4,2.267,3.057,,,-0.79,,0.062,
+TAIL-CTRL-8108645,ft-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),26,12,29.35,21.75,332.2,170.0,18.733,6.343,,,12.39,,0.8,
+TAIL-CTRL-8108645,ft-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),26,7,29.35,19.41,332.2,103.4,18.733,3.057,,,15.676,,0.907,
+TAIL-CTRL-B-8100346,ft-empty-w-1,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),53,7,46.09,21.54,533.7,67.5,0.288,0.23,,,0.058,,0.176,
+TAIL-CTRL-B-8100346,ft-empty-w-1,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),53,9,46.09,23.64,533.7,147.3,0.288,3.281,,,-2.993,,-0.057,
+TAIL-CTRL-B-8100346,ft-empty-w-1,noft-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),53,15,46.09,25.93,533.7,191.8,0.288,2.639,,,-2.351,,0.076,
+TAIL-CTRL-B-8100346,ft-empty-w-1,noft-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),53,37,46.09,44.37,533.7,422.6,0.288,1.883,,,-1.595,,0.02,
+TAIL-CTRL-B-8100346,ft-empty-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),19,7,24.83,21.54,203.3,67.5,2.186,0.23,,,1.956,,0.235,
+TAIL-CTRL-B-8100346,ft-empty-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),19,9,24.83,23.64,203.3,147.3,2.186,3.281,,,-1.095,,0.002,
+TAIL-CTRL-B-8100346,ft-empty-w-2,noft-w-1,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),19,15,24.83,25.93,203.3,191.8,2.186,2.639,,,-0.453,,0.135,
+TAIL-CTRL-B-8100346,ft-empty-w-2,noft-w-2,2026-10-20,,lower(build unknown),online,False,,empty,full(>150G),full(>150G),19,37,24.83,44.37,203.3,422.6,2.186,1.883,,,0.303,,0.079,
+TAIL-CTRL-B-8100346,ft-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),56,7,49.85,21.54,672.3,67.5,2.281,0.23,,,2.051,,0.211,
+TAIL-CTRL-B-8100346,ft-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),56,9,49.85,23.64,672.3,147.3,2.281,3.281,,,-1.0,,-0.022,
+TAIL-CTRL-B-8100346,ft-w-1,noft-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),56,15,49.85,25.93,672.3,191.8,2.281,2.639,,,-0.358,,0.111,
+TAIL-CTRL-B-8100346,ft-w-1,noft-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),56,37,49.85,44.37,672.3,422.6,2.281,1.883,,,0.398,,0.055,
+TAIL-CTRL-B-8100346,ft-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),26,7,31.02,21.54,290.2,67.5,7.089,0.23,,,6.859,,0.499,
+TAIL-CTRL-B-8100346,ft-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),26,9,31.02,23.64,290.2,147.3,7.089,3.281,,,3.808,,0.266,
+TAIL-CTRL-B-8100346,ft-w-2,noft-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),26,15,31.02,25.93,290.2,191.8,7.089,2.639,,,4.45,,0.399,
+TAIL-CTRL-B-8100346,ft-w-2,noft-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),26,37,31.02,44.37,290.2,422.6,7.089,1.883,,,5.206,,0.343,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-1,noft-main-loc-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),16,8,27.46,21.8,217.2,115.3,3.103,2.586,,,0.517,,0.168,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-1,noft-main-loc-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),16,7,27.46,21.34,217.2,97.5,3.103,3.285,,,-0.182,,0.191,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-1,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),16,8,27.46,21.84,217.2,104.2,3.103,1.177,,,1.926,,0.173,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-1,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),16,7,27.46,22.05,217.2,74.2,3.103,0.82,,,2.283,,0.2,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-2,noft-main-loc-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),38,8,40.68,21.8,579.1,115.3,5.044,2.586,,,2.458,,0.129,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-2,noft-main-loc-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),38,7,40.68,21.34,579.1,97.5,5.044,3.285,,,1.759,,0.152,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-2,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),38,8,40.68,21.84,579.1,104.2,5.044,1.177,,,3.867,,0.134,
+TAIL-CTRL-B-8103521,ft-empty-loc-w-2,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,empty,full(>150G),full(>150G),38,7,40.68,22.05,579.1,74.2,5.044,0.82,,,4.224,,0.161,
+TAIL-CTRL-B-8103521,ft-loc-w-1,noft-main-loc-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),52,8,50.23,21.8,782.2,115.3,5.118,2.586,,,2.532,,0.611,
+TAIL-CTRL-B-8103521,ft-loc-w-1,noft-main-loc-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),52,7,50.23,21.34,782.2,97.5,5.118,3.285,,,1.833,,0.634,
+TAIL-CTRL-B-8103521,ft-loc-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),52,8,50.23,21.84,782.2,104.2,5.118,1.177,,,3.941,,0.616,
+TAIL-CTRL-B-8103521,ft-loc-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),52,7,50.23,22.05,782.2,74.2,5.118,0.82,,,4.298,,0.643,
+TAIL-CTRL-B-8103521,ft-loc-w-2,noft-main-loc-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),57,8,42.19,21.8,510.9,115.3,0.436,2.586,,,-2.15,,0.039,
+TAIL-CTRL-B-8103521,ft-loc-w-2,noft-main-loc-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),57,7,42.19,21.34,510.9,97.5,0.436,3.285,,,-2.849,,0.062,
+TAIL-CTRL-B-8103521,ft-loc-w-2,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),57,8,42.19,21.84,510.9,104.2,0.436,1.177,,,-0.741,,0.044,
+TAIL-CTRL-B-8103521,ft-loc-w-2,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),57,7,42.19,22.05,510.9,74.2,0.436,0.82,,,-0.384,,0.071,
+TAIL-CTRL-B-8108645,ft-hpin-w-1,noft-main-w-1,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),40,7,40.19,19.36,534.7,19.6,4.372,1.023,,,3.349,,0.303,
+TAIL-CTRL-B-8108645,ft-hpin-w-1,noft-main-w-2,2026-10-20,build-diag-da13f20b76,lower(unaudited),online,False,,,full(>150G),full(>150G),40,9,40.19,20.81,534.7,125.2,4.372,2.983,,,1.389,,0.215,
+TAIL-CTRL-B-8108645,ft-hpin-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),31,7,40.23,19.36,461.7,19.6,5.744,1.023,,,4.721,,0.346,
+TAIL-CTRL-B-8108645,ft-hpin-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),31,9,40.23,20.81,461.7,125.2,5.744,2.983,,,2.761,,0.258,
+TAIL-CTRL-B-8108645,ft-nolog-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),27,7,37.99,19.36,328.3,19.6,8.628,1.023,,,7.605,,0.432,
+TAIL-CTRL-B-8108645,ft-nolog-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),27,9,37.99,20.81,328.3,125.2,8.628,2.983,,,5.645,,0.344,
+TAIL-CTRL-B-8108645,ft-nolog-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),39,7,41.81,19.36,412.5,19.6,2.276,1.023,,,1.253,,0.21,
+TAIL-CTRL-B-8108645,ft-nolog-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),39,9,41.81,20.81,412.5,125.2,2.276,2.983,,,-0.707,,0.122,
+TAIL-CTRL-B-8108645,ft-w-1,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),49,7,51.55,19.36,562.8,19.6,1.533,1.023,,,0.51,,0.219,
+TAIL-CTRL-B-8108645,ft-w-1,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),49,9,51.55,20.81,562.8,125.2,1.533,2.983,,,-1.45,,0.131,
+TAIL-CTRL-B-8108645,ft-w-2,noft-main-w-1,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),64,7,51.49,19.36,722.4,19.6,3.7,1.023,,,2.677,,0.199,
+TAIL-CTRL-B-8108645,ft-w-2,noft-main-w-2,2026-10-20,,lower(build unknown),online,False,,,full(>150G),full(>150G),64,9,51.49,20.81,722.4,125.2,3.7,2.983,,,0.717,,0.111,
+CHANGE-7984574,ft,noft,2026-10-15,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,38,38,28.47,27.88,677.5,661.4,0.022,0.144,,,-0.122,,0.083,
+CHANGE-7984574,ft-copy,noft,2026-10-15,build-final-97e13f42b6,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,38,28.42,27.88,675.9,661.4,0.058,0.144,,,-0.086,,0.062,
+DIAG-7984906,ft,noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,18.96,18.59,23.2,22.8,0.191,0.737,,,-0.546,,0.583,
+DIAG-7984906,ft,noft-ulfm,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,18.96,19.4,23.2,22.4,0.191,0.384,,,-0.193,,0.596,
+DIAG-7984906,ft,sweep-noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,3,18.96,16.23,23.2,16.8,0.191,,,,,,,
+DIAG-7984906,ft-idle-watch,noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,18.95,18.59,23.3,22.8,0.32,0.737,,,-0.417,,0.64,
+DIAG-7984906,ft-idle-watch,noft-ulfm,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,18.95,19.4,23.3,22.4,0.32,0.384,,,-0.064,,0.653,
+DIAG-7984906,ft-idle-watch,sweep-noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,3,18.95,16.23,23.3,16.8,0.32,,,,,,,
+DIAG-7984906,sweep-ft,noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,7,16.7,18.59,19.7,22.8,,0.737,,,,,,
+DIAG-7984906,sweep-ft,noft-ulfm,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,7,16.7,19.4,19.7,22.4,,0.384,,,,,,
+DIAG-7984906,sweep-ft,sweep-noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,3,16.7,16.23,19.7,16.8,,,,,,,,
+L1-A-7990892,sweep-ft,sweep-noft,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,76,75,56.67,56.97,690.9,695.4,,2.889,,0.498,,,,
+L1-A-7990892,sweep-ft,ulfm-noft,2026-10-16,build-final-b1d7fa789d,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,76,21,56.67,29.87,690.9,640.2,,,,0.363,,,,
+OPT-7986195,ft,noft,2026-10-15,,lower(build unknown),offline,n/a(settings not logged),,,unknown,unknown,38,38,27.7,27.79,657.0,658.7,0.0,1.242,,,-1.242,,0.276,
+PROFILE-7987039,ft-256,noft-256,2026-10-15,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,39,28.06,28.17,664.3,661.5,,,,,,,,
+PROFILE-7987039,ft-256,noft-8,2026-10-15,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,39,3,28.06,16.53,664.3,17.4,,,,,,,,
+PROFILE-7987039,ft-8,noft-256,2026-10-15,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,39,17.17,28.17,17.6,661.5,,,,,,,,
+PROFILE-7987039,ft-8,noft-8,2026-10-15,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,3,17.17,16.53,17.6,17.4,,,,,,,,
+SMOKE-7984623,sweep-ft,abort-noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,4,16.57,16.79,17.6,17.5,,,,,,,,
+SMOKE-7984623,sweep-ft,restart-noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,0,16.57,0.0,17.6,15.6,,,,,,,,
+SMOKE-7984623,sweep-ft,sweep-noft,2026-10-15,build-final-66244a1ead,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,3,3,16.57,16.29,17.6,17.2,,,,,,,,
+TRANSPORT-7988072,ft-sm,noft-tcp,2026-10-16,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,20.08,21.36,22.4,22.8,0.209,0.323,,,-0.114,,0.003,
+TRANSPORT-7988072,ft-sm,noft-ucx,2026-10-16,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,20.08,20.01,22.4,21.8,0.209,0.289,,,-0.08,,0.776,
+TRANSPORT-7988072,ft-tcp,noft-tcp,2026-10-16,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,19.2,21.36,22.9,22.8,0.261,0.323,,,-0.062,,0.343,
+TRANSPORT-7988072,ft-tcp,noft-ucx,2026-10-16,build-final-c13cda2721,lower(unaudited),offline,n/a(settings not logged),,,unknown,unknown,7,7,19.2,20.01,22.9,21.8,0.261,0.289,,,-0.028,,1.116,

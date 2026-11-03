@@ -1,0 +1,17 @@
+# MINI BENCHMARK on build-final-183d390691 (fix-slim 183d390691), PRELIMINARY n=1 (CLAIMS label). After build 8096703's
+# gtests pass. One 16-node bundle; groups sized ~95-100 min each (reaper). Seeded single pinned table per deployment,
+# no PIN_TRANSPLANT (the tuning key now normalizes FT layouts to FT off's loaded-slot key).
+# Group 0 (online dep32-final): LADDER noft vs ft at 8/32/128/512 (1 round, ~36 min) -> KILL-FINAL-ON-A rank5+node1 at
+#   128 with KF_GRAPH_SIZES=136,144 (post-recovery throughput without padding, ~25 min) -> KILL-FINAL-ON-B twokill+stop
+#   at 128 (~25 min) -> KILL-FINAL-OFF-B rows "stop" (static hung rank, ~12 min; rows file below).
+# Group 1 (static b2-320): GHOST-COST lay-eplb0 vs ft-ghost320 at 8/32/128/512 (1 round, ~30 min) -> KILL-FINAL-OFF-A
+#   rank5+node1 (~25 min) -> SHUTDOWN-R1 (~35 min; FT cases now bounded at 30 s).
+# Before submit: echo stop > $R/launch/kf_rows-<JOB>-KILL-FINAL-OFF-B ; presubmit each job name.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-final-183d390691
+E="MVP_BUILD=$B FINAL_BUILD=$B FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node COST_CASE_TIMEOUT_S=2400 WIDEEP_DMON=1"
+ON="$E FT_COST_E2E_ROUNDS=1 COST_LOADS=8,32,128,512 FT_COST_E2E_ARMS='noft ft' LADDER_PAIRS='noft:ft' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+OFF="$E FT_COST_E2E_ROUNDS=1 GHOST_COST_LOADS=8,32,128,512 FT_COST_E2E_ARMS='lay-eplb0 ft-ghost320' GHOST_COST_PAIRS='lay-eplb0:ft-ghost320' FT_COST_E2E_SEED=$R/mvp/runs/GHOST-COST-8087786/autotuner/pinned.json"
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_REPEATS=1"
+bash $R/bundle.sh \
+  "0:8:6900:$ON bash $R/mvp/harness/run_job.sh LADDER; $K KF_GRAPH_SIZES=136,144 KF_ITERATIONS=8 bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B" \
+  "8:8:6900:$OFF bash $R/mvp/harness/run_job.sh GHOST-COST; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; MVP_BUILD=$B FINAL_BUILD=$B bash $R/mvp/harness/run_job.sh SHUTDOWN-R1"

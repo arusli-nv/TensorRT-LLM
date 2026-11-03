@@ -1,0 +1,39 @@
+--- launch/task.sh	2026-10-18 12:26:49.000000000 -0700
++++ launch/task.sh	2026-10-19 08:39:17.297459216 -0700
+@@ -60,11 +60,35 @@
+     -x WIDEEP_AGENT_DIR -x WIDEEP_AGENT_KEY_FILE -x PATH -x LD_LIBRARY_PATH "${forward[@]}" \
+     --host "${hosts%,}" -np "$np" --map-by ppr:$ppn:node --bind-to none "$@" > "$run/mpirun.log" 2>&1 &
+ launcher=$!
++frontend_pids() {  # this case's trtllm-serve process on this node (not the shells that launched it, not its forks)
++    local p argv all=() pid
++    for p in /proc/[0-9]*; do
++        grep -qzxF "WIDEEP_CASE_TAG=$WIDEEP_CASE_TAG" "$p/environ" 2>/dev/null || continue
++        mapfile -d '' -t argv < "$p/cmdline" 2>/dev/null || continue
++        [[ ${argv[0]##*/} == trtllm-serve || ( ${argv[0]##*/} == python* && ${argv[1]:-} == */trtllm-serve ) ]] \
++            && all+=("${p#/proc/}")
++    done
++    for pid in "${all[@]}"; do
++        [[ " ${all[*]} " == *" $(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null) "* ]] || echo "$pid"
++    done
++}
+ # Once the frontend has finished, stop mpirun (after a rank loss it can outlive every rank even after
+ # MPI_Abort): SIGTERM, then SIGKILL after 30 s. Profiled runs first get WIDEEP_LAUNCHER_GRACE_S to
+-# finish writing their reports.
++# finish writing their reports. Clean-shutdown cases (WIDEEP_GRACEFUL_STOP=TERM|INT) first stop the deployment
++# as an orchestrator does, by signalling trtllm-serve, and give mpirun WIDEEP_GRACEFUL_STOP_S to exit on its own.
+ (
+     while [[ ! -e "$run/frontend.done" ]] && kill -0 $launcher 2>/dev/null; do sleep 1; done
++    if [[ -n "${WIDEEP_GRACEFUL_STOP:-}" ]] && kill -0 $launcher 2>/dev/null; then
++        pids=$(frontend_pids | paste -sd' ')
++        echo "GRACEFUL_STOP $(date +%s.%N) signal=$WIDEEP_GRACEFUL_STOP pids=[$pids]" >> "$run/timeline"
++        if [[ -n $pids ]]; then
++            kill -s "$WIDEEP_GRACEFUL_STOP" $pids 2>/dev/null || true
++            for _ in $(seq "${WIDEEP_GRACEFUL_STOP_S:-120}"); do kill -0 $launcher 2>/dev/null || exit 0; sleep 1; done
++            echo "GRACEFUL_TIMEOUT $(date +%s.%N)" >> "$run/timeline"
++        else
++            echo "GRACEFUL_NO_FRONTEND $(date +%s.%N)" >> "$run/timeline"
++        fi
++    fi
+     if [[ -n "${TLLM_TEST_NSYS_RANKS:-}" ]]; then
+         for _ in $(seq "${WIDEEP_LAUNCHER_GRACE_S:-60}"); do kill -0 $launcher 2>/dev/null || exit 0; sleep 1; done
+     fi

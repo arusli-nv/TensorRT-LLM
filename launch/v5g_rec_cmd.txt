@@ -1,0 +1,51 @@
+# V5G-REC: the v5-final rerun (V5F-REC below) on the page-lock + GPU-copy build: v5-final 27442bd91d + 5b42dabe65 + 85ea85de95 = overlays/fix-pingpu-85ea85de95 on build-freeze-58caa0fde6 (only if COMPACT-PROBE2 passes).
+# V5F-REC: FIX-REC (below) rerun on v5-final 27442bd91d (fix 1 + fix 2) = overlays/fix-dropmap-9f1fd4cab4 (product files identical to 27442bd91d) on build-freeze-58caa0fde6, so the final data matches the final code (monitor plan 2026-10-24 ~21:50).
+# FIX-REC (16 nodes, two 8-node groups, segment 8; fix = v5-final d71f169e4b as overlays/fix-nopopulate-d71f169e4b on build-freeze-58caa0fde6): recovery rows that run a restore, and GSM8K
+# with a kill, on the fix (set FIX_OVERLAY, or FIX_BUILD for a rebuilt wheel). Same rows/knobs as FIN6 (J4-J8): victims
+# rotate per repeat. Runs in wave 1 so a failure stops wave 2 (rerun data is discarded if any row fails, as J1/J2).
+# G0 online: rank5 x2, node1 x2, then twokill, stop, rank5pf, rank5upd x1 (~27 + 23 + 13.5 + 12.5 + 24 + 4 = ~104 min).
+# G8 no-EPLB: rank5 x2, node1 x2, then twokill, stop, rank5pf x1 (~22 + 22 + 11 + 11 + 11 + 4 = ~81) + GSM8K kill x1 +
+# FT-off ref (~23) = ~104 min. --time 01:55. (n=2 for every row: online ~150 + noeplb ~114 min, needs a third wave.)
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+# The fix's unit test, fail-first and pass, CPU only, on G8's first node before its first case (G8's other nodes wait at
+# the case's node barrier): test_ring_host_copies.py's new test must FAIL on the wheel's Python and the file must PASS with
+# the fix overlaid (scratch-fixtest/run.sh, staged from the fix commit).
+[[ ${SLURM_NODEID:-} == 8 && -z ${WIDEEP_DRY_RUN:-} ]] && bash $R/scratch-fixtest/run.sh > "$R/review/diag/fixtest-${SLURM_JOB_ID}.txt" 2>&1
+B=${FIX_BUILD:-build-freeze-58caa0fde6}; MB=build-main-9cc37929e8  # FIX_BUILD: the fix wheel if it needs a rebuild
+FIX_OVERLAY=${FIX_OVERLAY:-$R/overlays/fix-pingpu-85ea85de95}
+O=${FIX_OVERLAY:+MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1}  # FIX_OVERLAY: a Python-only fix overlaid on B
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=6,128=3 IT_HX=8=24,32=6,128=3,512=1 BURN=32:2 KI=4 KI32=8 KSTOP=4 CRR=rank5
+else
+    IT_MAIN=32=28,128=12 IT_HX=8=39,32=28,128=12,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 CRR='rank5 rank5'
+fi
+SNO=$R/mvp/runs/STD-8193512/autotuner/pinned.json
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+SOFF=$R/mvp/runs/STD-8194123/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="$O MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1 COST_MAX_WAVES=40 COST_CASE_TIMEOUT_S=3000"
+MAIN="COST_LOADS=32,128 COST_LOAD_ITERATIONS=$IT_MAIN"
+HX="COST_LOADS=8,32,128,512 COST_LOAD_ITERATIONS=$IT_HX"
+KS=200
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+D="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 WIDEEP_KILL_AFTER_STEPS=$KS"
+A="$O MVP_BUILD=$B FINAL_BUILD=$B $HD WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$KON KF_ROWS='rank5 node1' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-ON)"
+P0_2="$KON KF_ROWS='twokill stop rank5pf rank5upd' KF_REPEATS=1 $(run KILL-FINAL-ON-A)"
+G0="{ $P0_1; $P0_2; }"
+P8_1="$KNO KF_ROWS='rank5 node1' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-OFF)"
+P8_2="$KNO KF_ROWS='twokill stop rank5pf' KF_REPEATS=1 $(run KILL-FINAL-OFF-A)"
+P8_3="$A ACC_REPS=1 ACC_REFS='ref-final' $(run ACCURACY-KILL-ON)"
+G8="{ $P8_1; $P8_2; $P8_3; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:7000:$G0" "8:8:7000:$G8"

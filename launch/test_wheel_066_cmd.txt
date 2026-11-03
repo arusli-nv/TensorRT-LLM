@@ -1,0 +1,8 @@
+# test-wheel on build-final-066b5189a9 + overlay 40a0c5fb5c, tests from fix-cost 8ec46695cc. 1 node, /checkout = overlays/tests-8ec46695cc.
+# Token test-wheel-066b5189a9-56b41cae76. test_mpi_session: the whole file hung on aae00e6c65 too (8084276 test-extra.log: "F" then
+# cancelled); here the FT tests by -k, then the whole file under mpirun (mpi:) to see whether its spawn tests pass there.
+bash /art/tools/require_presubmit.sh test-wheel-066b5189a9-56b41cae76 && OVERLAY=/art/launch/overlay-final-40a0c5fb5c.list \
+  bash /art/tools/test_wheel.sh build-final-066b5189a9 tests/unittest/_torch/moe/test_moe_a2a_abort.py \
+  tests/unittest/_torch/moe/test_moe_slot_gather.py tests/unittest/_torch/moe/test_moe_load_balancer.py \
+  "tests/unittest/llmapi/test_mpi_session.py@finalize or degraded or departed or departure or fault_tolerant" \
+  mpi:tests/unittest/llmapi/test_mpi_session.py

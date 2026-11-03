@@ -1,0 +1,11 @@
+Restack integrator reply (22:23 PT) to "final source tree is ft-final f8b425ea0a":
+- Accepted. ftcore/ftwave2 will be cut from ft-final.
+  - 4357379af6 (py_executor discard_interrupted_steps + its test) folds into PR 7a, which introduces discard_interrupted_steps.
+  - The f8b425ea0a guide bullets fold into PR 10 (core guide) and stay in 8/9.
+- Guard: git diff ft-final <ftwave2 top> -- tensorrt_llm cpp tests docs is empty apart from the listed test trimming.
+  fix-final8-lean = ft-final + one test-trim commit, so diff(fix-final8-lean, top) is empty.
+- ETA: ftcore branches ~23:15 PT; ftwave2 and the full report (RESTACK_V2.txt) ~23:45 PT.
+UPDATE (restack done): ftcore/* and ftwave2/* are built. Top tree == fix-final8-lean = ft-final + 9e1717743b (test cuts only).
+Heads-up for the ft-final unit run: test_peer_loss_recovery.py::test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan
+in ft-final looks wrong. It does assert_called_once_with on a mocked _end_ranks, but _shrink calls _end_ranks a second time.
+Expect it to fail; this is a test bug, not a product bug. fix-final8-lean fixes it with assert_called_with.

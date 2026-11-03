@@ -1,0 +1,27 @@
+what,mode,source,model_load_s,autotune_s,graph_capture_s,other_s,total_s
+restart,noeplb,COLD-RESTART-A-8193512 run 1 (relaunch restart-after-rank5-1),48.4,62.0,153.4,37.1,300.9
+restart,noeplb,COLD-RESTART-A-8206870 run 1 (relaunch restart-after-rank5-1),61.2,64.0,158.9,34.0,318.1
+restart,noeplb,COLD-RESTART-A-8134113 run 1 (relaunch restart-after-rank5-1),55.4,90.0,138.9,37.0,321.3
+restart,noeplb,COLD-RESTART-A-8353534 run 1 (relaunch rank5-2),164.5,63.0,150.4,38.1,416.0
+restart,noeplb,COLD-RESTART-A-8353534 run 2 (relaunch rank5-3),58.6,122.0,153.4,36.3,370.3
+restart,noeplb,COLD-RESTART-A-8353534 run 3 (relaunch restart-after-rank5-3),59.3,63.0,151.6,35.9,309.8
+restart,offline,COLD-RESTART-B-8194123 run 1 (relaunch restart-after-rank5-1),57.2,65.0,161.0,36.7,319.9
+restart,offline,COLD-RESTART-B-8206870 run 1 (relaunch rank5-2),276.8,66.0,163.4,35.1,541.3
+restart,offline,COLD-RESTART-B-8206870 run 2 (relaunch restart-after-rank5-2),57.7,66.0,171.7,38.1,333.5
+restart,offline,COLD-RESTART-B-8134113 run 1 (relaunch restart-after-rank5-1),70.6,80.0,162.6,38.1,351.3
+restart,offline,COLD-RESTART-B-8353534 run 1 (relaunch rank5-2),68.6,63.0,165.6,36.7,333.9
+restart,offline,COLD-RESTART-B-8353534 run 2 (relaunch rank5-3),57.0,63.0,166.4,38.1,324.5
+restart,offline,COLD-RESTART-B-8353534 run 3 (relaunch restart-after-rank5-3),64.2,130.0,164.3,37.1,395.6
+restart,online,COLD-RESTART-8194123 run 1 (relaunch restart-after-rank5-1),322.5,64.0,173.6,37.4,597.5
+restart,online,COLD-RESTART-8206870 run 1 (relaunch rank5-2),307.0,66.0,173.3,38.1,584.4
+restart,online,COLD-RESTART-8206870 run 2 (relaunch restart-after-rank5-2),341.5,65.0,180.9,37.7,625.1
+restart,online,COLD-RESTART-8353534 run 1 (relaunch rank5-2),344.4,125.0,185.4,38.2,693.0
+restart,online,COLD-RESTART-8353534 run 2 (relaunch rank5-3),304.2,65.0,173.3,37.7,580.2
+restart,online,COLD-RESTART-8353534 run 3 (relaunch rank5-4),377.1,66.0,183.2,37.0,663.3
+restart,online,COLD-RESTART-8353534 run 4 (relaunch restart-after-rank5-4),363.4,66.0,171.1,39.6,640.1
+restart,noeplb,MEAN n=6,74.6,77.3,151.1,36.4,339.4
+FT on recovery,noeplb,MEAN n=4 (fig7_recovery.csv),,,,,1.503
+restart,offline,MEAN n=7,93.1,76.1,165.0,37.1,371.4
+FT on recovery,offline,MEAN n=5 (fig7_recovery.csv),,,,,1.282
+restart,online,MEAN n=7,337.2,73.9,177.3,37.9,626.2
+FT on recovery,online,MEAN n=8 (fig7_recovery.csv),,,,,0.880

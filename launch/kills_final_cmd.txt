@@ -1,0 +1,10 @@
+# FINAL KILLS on the clean wheel build-v2-cef4670789 (no overlay): decode-only, n=3 per cell, rows interleaved, KF_ITERATIONS=4,
+# graph sizes +136,148 (they fit 128/GPU after a loss: 4096/31, 4096/28), node failure domain, seed-free (KILL-FINAL tunes its own
+# ft.json at the first case of each group). Labels: rank5 = one rank killed; node1 = all ranks of one node killed (host stays up).
+# G0: w/o EPLB rank5+node1 x3 (OFF-A), then online rank5 x3 (ON-B, rows file "rank5"). G1: offline rank5+node1 x3 (OFF-B, rows
+# file "rank5 node1"), then online node1 x3 (ON-A, rows file "node1"). ~102 min per group. Write the 3 rows files right after submit:
+# launch/kf_rows-<job>-KILL-FINAL-ON-B = rank5; -KILL-FINAL-OFF-B = "rank5 node1"; -KILL-FINAL-ON-A = node1.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_REPEATS=3 KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1"
+bash $R/bundle.sh "0:8:6900:$K KF_BENCH_CONFIG=std-noeplb-ft.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B" \
+  "8:8:6900:$K KF_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B; $K KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A"

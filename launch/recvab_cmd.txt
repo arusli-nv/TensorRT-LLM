@@ -1,0 +1,16 @@
+# RECVAB (16 nodes): the warp-per-source receive fix (v5-recvfix b643ad8a29; review/hostfix/recv_fix.md, recv_review.md)
+# against H1 (kernels_a.md: FT's per-source receive CTAs oversubscribe 152 SMs from 32/GPU). Arms on each group's own
+# nodes, one launch each sweeping 24/32/40/GPU: off | ft-oldk (wheel build-v5-2ccc3e8e1c) | ft (wheel
+# build-v5r-b643ad8a29); the old wheel gets the same Python through overlay v5f-f96a8c1a53. Group 8 runs the reverse order. Unit gate: BUILD-RECVFIX
+# 8150629 (gtests, gpu_moe incl. the new a2a tests, multi-GPU nvlink_one_sided and late_writes).
+# Pass rule (rank-0 healthy-<load> decode-only trim mean, dist32 metric): at 32 and 40/GPU, (ft - off) <= 1/3 of
+# (ft-oldk - off) in both groups -> the fix removes the SM-budget cost; land it on v5. Otherwise H1 is not the cause.
+# Fill (the group that ends first): kills on the new kernel (rank5, node1; KILL_FINAL_VERDICT PASS).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5r-b643ad8a29; OLD=$R/overlays/v5f-f96a8c1a53
+E="MVP_BUILD=$B FINAL_BUILD=$B OLDK_BUILD=build-v5-2ccc3e8e1c OLDK_OVERLAY=$OLD COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=24,32,40 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+export BUNDLE_FILL_LIMIT_S=2400
+export BUNDLE_FILL_0="$K KF_ROWS='rank5 node1' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A"
+export BUNDLE_FILL_8="$K KF_ROWS='node1 rank5' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B"
+bash $R/bundle.sh "0:8:7000:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft-oldk std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb-ft-oldk std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

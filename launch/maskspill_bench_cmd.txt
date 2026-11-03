@@ -1,0 +1,61 @@
+# MASK-SPILL bench (8 nodes, 4 GB200 each, segment 8 = one NVL72 domain; DIAGNOSTIC, AFTERNOON_PLAN_2026-10-25 item 3,
+# CLAIMS 200/200b; no server, no product change). Question: is FT's EPLB-stats a2a delta that grows with EP (CLAIMS 200:
+# EP32 T=64 stats +3.02 us, no stats +1.00 us per round trip) caused by the rank mask's local-memory copy (STACK 64,
+# one LDL chain per peer in the serial stats loop, review/diag/a2a_ep_scaling_coderead.md)?
+# Runs only after BUILD-MASKSPILL printed BUILD_MASKSPILL_OK (launch/maskspill_build_cmd.txt).
+# Method: A2A-EP2's driver unchanged (tools/a2aep_ep.sh + tools/a2aep_bench.py: one CUDA graph of 200 dispatch+combine
+#   round trips per variant off / ft / off2, 20 recorded cycles + 1 warm-up, rotating order, PDL on, R1 NVFP4 shapes).
+#   Phase NEW: wheel build-maskspill-7162255fce (mask in __shared__), EP 8 and 32 (2 and 8 nodes), T = 32 and 64,
+#     stats and no stats, 3 repeats (repeat 2 reverses EP and stats order): 12 launches.
+#   Phase CTRL (same nodes, same job, right after): freeze wheel build-freeze-58caa0fde6 + overlays/fix-dropmap-9f1fd4cab4
+#     (= v5-final 27442bd91d, the CLAIMS 200 code), EP 32, T = 64, stats and no stats, 3 repeats: 6 launches.
+# Code check, every node, each phase: the 5 .py sha256 of 27442bd91d (CODE_V5F_OK; the mask change is C++ only, so the
+#   .py are identical in both phases) + A2AEP_RES_EXPECT: `cuobjdump -res-usage` of the installed libth_common.so via
+#   tools/maskspill_res.py must print MASKSPILL_RES_OK (NEW: STACK 24 for all MASK=1 instantiations) / MASKSPILL_RES_SPILL
+#   (CTRL: 64), and NEW's lib sha256 must equal build-maskspill-7162255fce/LIB_SHA256. Any mismatch stops the phase.
+# Est: A2A-EP2 8282103: ~25-30 s per launch, install + overlay <= ~6 min. NEW: 6 min install + 12 x ~25 s = ~11 min;
+#   CTRL: ~4 min reinstall + 6 x ~25 s = ~7 min. ~20 min total; --time 00:40.
+# Output: review/diag/maskspill-<job>/{new,ctrl}/ (as a2aep-*: r<rep>-ep<EP>-s<stats>.json, code-*, res-*, summary.txt),
+#   verdict.txt (tools/maskspill_verdict.py new ctrl).
+#
+# PRE-REGISTERED (written 2026-10-25 before any data; the user approves before submission):
+# Statistic: as A2A-EP2 (block = min over ranks of replay time / 200; M_v = median over 20 blocks; D = median over the 3
+#   launches of M_ft - M_off; N = median of M_off2 - M_off; Nmax = max |noise|).
+# Decision cell: EP32, T = 64. S = stats-only part = D(stats) - D(no stats), per phase (CLAIMS 200: 3.02 - 1.00 = 2.02).
+# Validity: build MASKSPILL_RES_OK and the per-node res/code checks above; |N| < 0.3 us and Nmax < 0.5 us in the four
+#   decision cells (NEW and CTRL, stats and no stats); else INCONCLUSIVE (report, no rerun without the user).
+#   If CTRL's D differs from CLAIMS 200 by > 0.4 us, the report says so (MASKSPILL_NOTE); the verdict still uses CTRL.
+# Prediction (plan): stats +3.0 -> ~+1.0 us, no stats +1.0 -> ~+0.4 us.
+#   CONFIRMED: NEW stats D <= 1.5 us AND S_NEW <= 0.3 x S_CTRL (the stats-only part drops by >= 70%): the spilled mask's
+#     per-peer LDL is the EP-scaling term.
+#   REFUTED: NEW stats D >= 2.5 us with STACK 24 verified: the spill is not the EP-scaling term.
+#   PARTIAL: anything else (report D and S per phase; follow-ups only with the user).
+#   Secondary, reported, never changing the verdict: NEW no-stats D <= 0.6 us -> NOSTATS EXPLAINED (the spill is the
+#     constant part); >= 0.85 -> NOT_SPILL; else PARTIAL. Context: EP8 and T=32 cells; off (MASK=0 kernel, unchanged
+#     source) NEW vs CTRL at EP32 T=64.
+# Scope: kernel-only, back to back, as CLAIMS 200; says nothing about serving (CLAIMS 194) by itself.
+#
+# Submit (after BUILD_MASKSPILL_OK and the user's OK): python3 $R/tools/presubmit.py --name MASKSPILL --nodes 8 --segment 8
+#   --build build-maskspill-7162255fce --branch /tmp/claude-161238/wt-fix   (wt-fix HEAD must be 7162255fce)
+#   -> TOKEN; replace TOKEN below. slurm_submit: 8 nodes, segment 8, 4 GPUs/node, one task per node, --time 00:40,
+#   mounts R:R:rw (as A2A-EP2 8282103); command: bash $R/launch/maskspill_bench_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/require_presubmit.sh MASKSPILL-fc7f97fd56 || exit 1
+bash $R/tools/check_excluded_nodes.sh || exit 1
+[[ -s $R/build-maskspill-7162255fce/LIB_SHA256 ]] && grep -q MASKSPILL_RES_OK $R/build-maskspill-7162255fce/res.txt \
+    || { echo "MASKSPILL_NO_BUILD: run launch/maskspill_build_cmd.txt first"; exit 1; }
+out=$R/review/diag/maskspill-${SLURM_JOB_ID:-x}
+mkdir -p "$out/new" "$out/ctrl"
+A2AEP_WHEEL=$R/build-maskspill-7162255fce/dist A2AEP_NODES="2 8" A2AEP_LOADS=32,64 A2AEP_RES_EXPECT=ok \
+    bash $R/tools/a2aep_ep.sh "$out/new" > "$out/new/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+(( SLURM_NODEID == 0 )) && cat "$out/new/node-0.log"
+(( rc == 0 )) || exit $rc
+A2AEP_NODES=8 A2AEP_LOADS=64 A2AEP_RES_EXPECT=spill \
+    bash $R/tools/a2aep_ep.sh "$out/ctrl" > "$out/ctrl/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+if (( SLURM_NODEID == 0 )); then
+    cat "$out/ctrl/node-0.log"
+    python3 $R/tools/maskspill_verdict.py "$out/new" "$out/ctrl" | tee "$out/verdict.txt"
+fi
+exit $rc

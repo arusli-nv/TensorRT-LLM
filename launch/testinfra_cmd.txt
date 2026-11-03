@@ -1,0 +1,34 @@
+# TEST-INFRA (1 node; OPEN_ITEMS_2026-10-25 item 5): (a) test_moe_comm.py WITHOUT pytest --timeout (MASKSPILL-MOECOMM
+# 8288059: its first test AllGatherReduceScatter_ep2_n12 timed out at 900 s under --timeout on both the new and the
+# control wheel; V5PR-RERUN A2 8279691 ran the file without --timeout: 41/41 in 584 s); (b) test_moe_module.py in full
+# (never completed: 83% in 3600 s at b954). Code: v5-final = build-freeze-58caa0fde6 + overlays/fix-dropmap-9f1fd4cab4
+# copied into the installed package; tests from scratch-mpisession/v5final (v5-final tree). Outer `timeout` only.
+# Rule (set before data): (a) passes -> the 8288059 hang was the pytest-timeout signal method in this setup
+# (environmental), and test_moe_comm validates v5-final's a2a code paths (freeze+overlay build only; says nothing
+# about the mask-spill wheel, which stays validated only by gpu_moe 101); (a) hangs/fails -> report the first failing test with
+# its traceback (no conclusion about the kernel). (b) completes with 0 F/E -> test_moe_module validated on v5-final; any
+# F/E -> report it. Output: review/diag/testinfra-<job>.txt + per-file logs. Est (a) ~10 min, (b) ~75 min; --time 01:45.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+job=${SLURM_JOB_ID:-x}
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+# The tests spawn their own MPI pools (MPIPoolExecutor): drop the outer srun's PMIx/Slurm env, as run_commit_tests.sh does
+# (TEST-INFRA 8291240 and MASKSPILL-MOECOMM 8288059 kept it and hung in test_moe_comm's first test).
+for var in $(compgen -e | grep -E '^(PMIX_|PMI_|SLURM_|OMPI_MCA_ess|PRTE_MCA_ras)'); do unset "$var"; done
+ out=$R/review/diag/testinfra-$job.txt; T=$R/scratch-mpisession/v5final
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pkg=$(cd / && python3 -c "import importlib.util as u, os; print(os.path.dirname(u.find_spec('tensorrt_llm').origin))")
+    (cd $R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm && find . -name '*.py' -print0) | while IFS= read -r -d '' f; do
+        cp "$R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm/$f" "$pkg/$f"; done
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    for t in test_moe_comm:1800 test_moe_module:5400; do
+        name=${t%%:*}; lim=${t#*:}; start=$SECONDS
+        (cd /tmp && PYTHONPATH=$T/tests/unittest:$T/tests timeout -k 30 $lim python3 -m pytest -q -p no:cacheprovider \
+            --tb=short -rfE --durations=10 --basetemp=/tmp/bt-$name $T/tests/unittest/_torch/moe/$name.py \
+            > $R/review/diag/testinfra-$job-$name.log 2>&1)
+        echo "### $name rc=$? $((SECONDS - start))s | $(tail -1 $R/review/diag/testinfra-$job-$name.log)"
+    done
+    echo TESTINFRA_DONE
+} > "$out" 2>&1

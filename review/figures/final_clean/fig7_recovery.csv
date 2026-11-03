@@ -1,0 +1,112 @@
+panel,failure,mode,source,row,value_s,n,fence_s
+a,rank,noeplb,KILL-FINAL-OFF-8269102,rank5-1,1.55
+a,rank,noeplb,KILL-FINAL-OFF-8269102,rank5-2,1.48
+a,rank,noeplb,KILL-FINAL-OFF-8285728,rank5-1,1.53
+a,rank,noeplb,KILL-FINAL-OFF-8285728,rank5-2,1.45
+a,rank,noeplb,MEAN (min-max),n=4,1.503 (1.45-1.55)
+a,rank,offline,KILL-FINAL-OFF-B-8283311,rank5-1,1.37
+a,rank,offline,KILL-FINAL-OFF-B-8302191,rank5-1,1.23
+a,rank,offline,KILL-FINAL-OFF-B-8302191,rank5-2,1.24
+a,rank,offline,KILL-FINAL-OFF-B-8363511,rank5-1,1.33
+a,rank,offline,KILL-FINAL-OFF-B-8363511,rank5-2,1.24
+a,rank,offline,MEAN (min-max),n=5,1.282 (1.23-1.37)
+a,rank,online,KILL-FINAL-ON-8269102,rank5-1,0.91
+a,rank,online,KILL-FINAL-ON-8269102,rank5-2,0.76
+a,rank,online,KILL-FINAL-ON-8285728,rank5-1,0.89
+a,rank,online,KILL-FINAL-ON-8285728,rank5-2,0.83
+a,rank,online,KILL-FINAL-ON-A-8271210,rank5upd-1,0.84
+a,rank,online,KILL-FINAL-ON-A-8353506,rank5upd-1,0.96
+a,rank,online,KILL-FINAL-ON-A-8361282,rank5upd-1,1.00
+a,rank,online,KILL-FINAL-ON-A-8361282,rank5upd-2,0.85
+a,rank,online,MEAN (min-max),n=8,0.880 (0.76-1.00)
+a,rank,FT off restart noeplb,COLD-RESTART-A-8193512 run 1,rank5,300.9
+a,rank,FT off restart noeplb,COLD-RESTART-A-8206870 run 1,rank5,318.1
+a,rank,FT off restart noeplb,COLD-RESTART-A-8134113 run 1,rank5,321.3
+a,rank,FT off restart noeplb,COLD-RESTART-A-8353534 run 1,rank5,416.0
+a,rank,FT off restart noeplb,COLD-RESTART-A-8353534 run 2,rank5,370.3
+a,rank,FT off restart noeplb,COLD-RESTART-A-8353534 run 3,rank5,309.8
+a,rank,FT off restart offline,COLD-RESTART-B-8194123 run 1,rank5,319.9
+a,rank,FT off restart offline,COLD-RESTART-B-8206870 run 1,rank5,541.3
+a,rank,FT off restart offline,COLD-RESTART-B-8206870 run 2,rank5,333.5
+a,rank,FT off restart offline,COLD-RESTART-B-8134113 run 1,rank5,351.3
+a,rank,FT off restart offline,COLD-RESTART-B-8353534 run 1,rank5,333.9
+a,rank,FT off restart offline,COLD-RESTART-B-8353534 run 2,rank5,324.5
+a,rank,FT off restart offline,COLD-RESTART-B-8353534 run 3,rank5,395.6
+a,rank,FT off restart online,COLD-RESTART-8194123 run 1,rank5,597.5
+a,rank,FT off restart online,COLD-RESTART-8206870 run 1,rank5,584.4
+a,rank,FT off restart online,COLD-RESTART-8206870 run 2,rank5,625.1
+a,rank,FT off restart online,COLD-RESTART-8353534 run 1,rank5,693.0
+a,rank,FT off restart online,COLD-RESTART-8353534 run 2,rank5,580.2
+a,rank,FT off restart online,COLD-RESTART-8353534 run 3,rank5,663.3
+a,rank,FT off restart online,COLD-RESTART-8353534 run 4,rank5,640.1
+a,rank,FT off restart,MEAN (min-max),n=20,451.0 (300.9-693.0)
+a,node,noeplb,KILL-FINAL-OFF-8269102,node1-1,2.54
+a,node,noeplb,KILL-FINAL-OFF-8269102,node1-2,2.52
+a,node,noeplb,KILL-FINAL-OFF-8285728,node1-1,2.42
+a,node,noeplb,KILL-FINAL-OFF-8285728,node1-2,2.81
+a,node,noeplb,MEAN (min-max),n=4,2.573 (2.42-2.81)
+a,node,offline,KILL-FINAL-OFF-B-8283311,node1-1,1.72
+a,node,offline,KILL-FINAL-OFF-B-8302191,node1-1,1.55
+a,node,offline,KILL-FINAL-OFF-B-8302191,node1-2,1.61
+a,node,offline,KILL-FINAL-OFF-B-8363511,node1-1,1.51
+a,node,offline,KILL-FINAL-OFF-B-8363511,node1-2,1.72
+a,node,offline,MEAN (min-max),n=5,1.622 (1.51-1.72)
+a,node,online,KILL-FINAL-ON-8269102,node1-1,1.42
+a,node,online,KILL-FINAL-ON-8269102,node1-2,1.83
+a,node,online,KILL-FINAL-ON-8285728,node1-1,1.42
+a,node,online,KILL-FINAL-ON-8285728,node1-2,1.53
+a,node,online,MEAN (min-max),n=4,1.550 (1.42-1.83)
+a,frozen,noeplb,KILL-FINAL-OFF-A-8269102,stop-1,37.21,,34.1
+a,frozen,noeplb,KILL-FINAL-OFF-A-8302191,stop-1,37.42,,34.11
+a,frozen,noeplb,KILL-FINAL-OFF-8363511,stop-1,34.11,,30.32
+a,frozen,noeplb,MEAN (min-max),n=3,36.247 (34.11-37.42),,32.843
+a,frozen,offline,KILL-FINAL-OFF-B-8353506,stop-1,34.14,,30.1
+a,frozen,offline,KILL-FINAL-OFF-B-8353506,stop-2,32.91,,29.49
+a,frozen,offline,KILL-FINAL-OFF-A-8363511,stop-1,33.98,,29.99
+a,frozen,offline,MEAN (min-max),n=3,33.677 (32.91-34.14),,29.860
+a,frozen,online,KILL-FINAL-ON-A-8269102,stop-1,33.07,,29.99
+a,frozen,online,KILL-FINAL-ON-A-8302191,stop-1,32.86,,30.53
+a,frozen,online,KILL-FINAL-ON-B-8363511,stop-1,35.79,,33.4
+a,frozen,online,MEAN (min-max),n=3,33.907 (32.86-35.79),,31.307
+b,rank,noeplb,median,detect,0.015,n=4
+b,rank,noeplb,median,agree,0.050,n=4
+b,rank,noeplb,median,map,0.170,n=4
+b,rank,noeplb,median,remap,0.972,n=4
+b,rank,noeplb,median,stage,0.237,n=4
+b,rank,noeplb,median,install,0.010,n=4
+b,rank,noeplb,median,first,0.060,n=4
+b,rank,offline,median,detect,0.010,n=5
+b,rank,offline,median,agree,0.050,n=5
+b,rank,offline,median,map,0.160,n=5
+b,rank,offline,median,remap,0.920,n=5
+b,rank,offline,median,stage,0.000,n=5
+b,rank,offline,median,install,0.040,n=5
+b,rank,offline,median,first,0.070,n=5
+b,rank,online,median,detect,0.020,n=8
+b,rank,online,median,agree,0.050,n=8
+b,rank,online,median,map,0.200,n=8
+b,rank,online,median,remap,0.485,n=8
+b,rank,online,median,stage,0.000,n=8
+b,rank,online,median,install,0.030,n=8
+b,rank,online,median,first,0.070,n=8
+b,node,noeplb,median,detect,0.030,n=4
+b,node,noeplb,median,agree,0.050,n=4
+b,node,noeplb,median,map,0.650,n=4
+b,node,noeplb,median,remap,0.736,n=4
+b,node,noeplb,median,stage,0.953,n=4
+b,node,noeplb,median,install,0.015,n=4
+b,node,noeplb,median,first,0.070,n=4
+b,node,offline,median,detect,0.020,n=5
+b,node,offline,median,agree,0.050,n=5
+b,node,offline,median,map,0.610,n=5
+b,node,offline,median,remap,0.650,n=5
+b,node,offline,median,stage,0.000,n=5
+b,node,offline,median,install,0.150,n=5
+b,node,offline,median,first,0.070,n=5
+b,node,online,median,detect,0.030,n=4
+b,node,online,median,agree,0.060,n=4
+b,node,online,median,map,0.760,n=4
+b,node,online,median,remap,0.545,n=4
+b,node,online,median,stage,0.000,n=4
+b,node,online,median,install,0.055,n=4
+b,node,online,median,first,0.070,n=4

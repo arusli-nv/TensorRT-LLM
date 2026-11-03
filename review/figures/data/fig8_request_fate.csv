@@ -1,0 +1,12 @@
+kind,mode,case,completed,full,rerun,cut,reset,failed,lost_held,recovery_failed
+rank5,noeplb,KILL-FINAL-OFF-8194123/rank5-1,12288,12160.0,0.0,128.0,0.0,0.0,128,128
+rank5,noeplb,KILL-FINAL-OFF-B-8198951/rank5-1,8192,8160.0,0.0,32.0,0.0,0.0,32,32
+rank5,online,KILL-FINAL-ON-8198951/rank5-1,12288,12160.0,0.0,128.0,0.0,0.0,128,128
+rank5pf,noeplb,KILL-FINAL-OFF-A-8198951/rank5pf-1,12288,12288.0,3.0,0.0,0.0,0.0,0,0
+rank5pf,online,KILL-FINAL-ON-A-8198951/rank5pf-1,12288,12288.0,2.0,0.0,0.0,0.0,0,0
+rank5upd,online,KILL-FINAL-ON-A-8198951/rank5upd-1,12288,12160.0,0.0,128.0,0.0,0.0,128,128
+node1,noeplb,KILL-FINAL-OFF-8194123/node1-1,12288,11776.0,0.0,512.0,0.0,0.0,512,512
+node1,online,KILL-FINAL-ON-8198951/node1-1,12288,11776.0,0.0,512.0,0.0,0.0,512,512
+twokill,noeplb,KILL-FINAL-OFF-8194123/twokill-1,12288,12155.0,0.0,133.0,0.0,0.0,133,133
+stop,noeplb,KILL-FINAL-OFF-8194123/stop-1,8192,8128.0,0.0,64.0,0.0,0.0,64,64
+stop,online,KILL-FINAL-ON-A-8198951/stop-1,8192,8128.0,0.0,64.0,0.0,0.0,64,64

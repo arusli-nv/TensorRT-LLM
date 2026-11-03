@@ -1,0 +1,17 @@
+# FULL BENCHMARK job 1 on build-final-183d390691 (fix-slim 68ff00e7da product code). Transplanted (one pinned table per
+# deployment), interleaved rounds on the same nodes, loads 8/32/128/512 (512 at 2 iterations), host_cache 16 GiB both arms,
+# /dev/shm guard + WIDEEP_POLLUTION_CHECKS=1, LADDER_MAIN_TAIL=0. Measured case times (8097555): online 4-load case
+# 16-19 min, static ~15 min, kill case 12-15 min. G0: online noft/ft x3 rounds (~105 min, ROUND_MIN 36).
+# G1: static lay-eplb0/ft-ghost320 x3 rounds (~90 min) + static stop kill (~12 min) = ~102 min.
+# Job 2: same transplanted pair. Job 3: one transplanted noft/ft round + self-tuned arms + FT-off A/A + noft-main identity
+# (transplanted n>=7 over 3 jobs). Pollution checks log only (WIDEEP_POLLUTION_CHECKS=1); =hard after job 1 shows no false positive.
+# Submitted as job 8099447 (16 nodes, segment 8, qos short, 02:00:00, image devel:1.4.0rc0.dev202610090112); rows file
+# launch/kf_rows-8099447-KILL-FINAL-OFF-B = "stop". Presubmit tokens f16-afb1d728d4 (LADDER), f16-107b735bb4 (GHOST-COST),
+# f16-1f1f7344ce (KILL-FINAL-OFF-B).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-final-183d390691
+E="MVP_BUILD=$B FINAL_BUILD=$B FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node COST_CASE_TIMEOUT_S=2400 WIDEEP_DMON=1 WIDEEP_POLLUTION_CHECKS=1 LADDER_MAIN_TAIL=0 FT_COST_E2E_ROUNDS=3 FT_COST_E2E_ROUND_MIN=36"
+ON="$E COST_LOADS=8,32,128,512 FT_COST_E2E_ARMS='noft ft' LADDER_PAIRS='noft:ft' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+OFF="$E GHOST_COST_LOADS=8,32,128,512 FT_COST_E2E_ARMS='lay-eplb0 ft-ghost320' GHOST_COST_PAIRS='lay-eplb0:ft-ghost320' FT_COST_E2E_SEED=$R/mvp/runs/GHOST-COST-8087786/autotuner/pinned.json"
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_REPEATS=1 WIDEEP_POLLUTION_CHECKS=1"
+bash $R/bundle.sh "0:8:6900:$ON bash $R/mvp/harness/run_job.sh LADDER" \
+  "8:8:6900:$OFF bash $R/mvp/harness/run_job.sh GHOST-COST; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B"

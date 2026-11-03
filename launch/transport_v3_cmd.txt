@@ -1,0 +1,20 @@
+# TRANSPORT-V3 (16 nodes): C33 (exec'd FT worker + ob1 self,sm,tcp with CMA) on the v3 wheel + overlay v3c33-0fed8d8141
+# (v3 + fence-always + detector removal + exec + finalize backstop; no C++ change). Unit gate in-job before GPU use.
+# Group 0: kills on sm (KILL-FINAL-OFF-A rows: rank5 with node-mates 4,6,7; node1; ...), detector off.
+#   Pass (a): every kill recovers; detect_s / resume_s within the TCP rows' range (CLAIMS); a same-node rank's detect_s
+#   comparable to a cross-node one (node-mates learn of the failure promptly with exec).
+# Group 8: healthy A/B on the same 8 nodes. noeplb at 8 and 32/GPU off|ft|ft-sm, then online at 32/GPU ft-sm|ft|off.
+#   Pass (b) 8/GPU: ft-sm's late-refill stall count and stall-free mean step within 1% of off; client tok/s pair delta CI
+#   includes >= -1%. (c) online: ft-sm's ctx-phase cost vs off < 1/3 of ft's. (d) noeplb 32: ft-sm ~ ft (control).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays/v3c33-0fed8d8141
+SM="--mca pml ob1 --mca btl self,sm,tcp --mca btl_tcp_if_include eth0 --mca smsc cma --mca coll ^hcoll,ucc"
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=1 WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+g() { echo "PYTEST_ADDOPTS='-k \"not flashinfer_temporary_cleanup\"' bash $R/tools/units_gate.sh $R/logs/bundle/tv3-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $R/overlays/v3c33-db3af1f98c-tests $R/overlays/build-src-bcea8da496 $R/$B/point-units-0fed8d8141-g$1 tests/unittest/llmapi/test_mpi_session.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py tests/unittest/executor/test_recovery_authority.py tests/unittest/executor/test_recovery_config.py tests/unittest/_torch/executor/test_peer_loss_recovery.py"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_COLL_TIMES=1000 TLLM_TEST_COLL_RANKS=all TLLM_TEST_LOG_ADMIT=1 TLLM_TEST_PHASE_TIMES=2000 WIDEEP_TIMED_CLIENT=1"
+# Fill rounds (no idle group): group 0 reruns the noeplb 8/32 A/B mirrored on its nodes (second node set); group 8
+# reruns the online 32 A/B.
+export BUNDLE_FILL_LIMIT_S=3000
+export BUNDLE_FILL_0="$E COST_LOADS=8,32 FT_COST_E2E_ARMS='std-noeplb-ft-sm std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G3"
+export BUNDLE_FILL_8="$E COST_LOADS=32 FT_COST_E2E_ARMS='std-online std-online-ft std-online-ft-sm' bash $R/mvp/harness/run_job.sh STD-G1"
+bash $R/bundle.sh "0:8:6600:$(g 0) && $K WIDEEP_MPI_MCA='$SM' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A" \
+  "8:8:6600:$(g 8) && $E COST_LOADS=8,32 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ft-sm' bash $R/mvp/harness/run_job.sh STD; $E COST_LOADS=32 FT_COST_E2E_ARMS='std-online-ft-sm std-online-ft std-online' bash $R/mvp/harness/run_job.sh STD-G2"

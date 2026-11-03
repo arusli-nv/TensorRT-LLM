@@ -1,0 +1,8 @@
+# PDL A/B (monitor 07:27): is the w/o EPLB 32/GPU FT cost the PDL interplay of FT's dispatch with its early-launched neighbour?
+# G0: std-noeplb and std-noeplb-ft at 32/GPU, PDL on and off (job.sh ARM-nopdl -> TRTLLM_ENABLE_PDL=0), mirrored order
+# off-pdl1, ft-pdl1, ft-pdl0, off-pdl0; the PDL-on pair must reproduce the gap in this group. G1: the online-128 prefill nsys
+# rerun with 50-step windows (STD_NSYS default; the 300-step window hung the profiled ranks after capture, 8119878).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 FT_COST_E2E_ROUNDS=1 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:5100:$E FT_COST_E2E_ROUND_MIN=70 WIDEEP_BURNIN=32:6 COST_LOADS=32 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ft-nopdl std-noeplb-nopdl' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:5100:$E FT_COST_E2E_ROUND_MIN=40 STD_NSYS=1 COST_LOADS=128 COST_LOAD_ITERATIONS=128=4 FT_COST_E2E_ARMS='std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD-G1"

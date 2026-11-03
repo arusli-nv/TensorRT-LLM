@@ -1,0 +1,32 @@
+# MASKSPILL-MOECOMM (1 node): BUILD-MASKSPILL 8287138's extra tests did not finish: test_moe_comm.py's first test
+# errored after the 600 s per-test timeout ('E'), then the step was killed (CANCELLED by 0, 15:11). Is it the mask-spill
+# kernel (hang) or the test setup? Same node, same test file, two wheels, verbose with durations:
+#   (1) build-maskspill-7162255fce (mask in __shared__); (2) build-freeze-58caa0fde6 + fix-dropmap overlay (control,
+#   the code that passed test_moe_comm 41/41 in V5PR-RERUN A2 8279691 in 584 s).
+# Rule (set before data): (1) fails/hangs and (2) passes -> the kernel change breaks the a2a (do not bench; fix first);
+# both pass -> the build-job failure was environmental, bench proceeds; both fail the same way -> environment.
+# Output: review/diag/maskspill-moecomm-<job>.txt (+ per-arm logs). ~30 min; --time 00:55.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+job=${SLURM_JOB_ID:-x}; out=$R/review/diag/maskspill-moecomm-$job.txt; T=$R/overlays/build-src-maskspill-7162255fce
+{
+    for arm in new ctrl; do
+        echo "##### $arm"
+        if [[ $arm == new ]]; then
+            bash $R/install_wheel.sh $R/build-maskspill-7162255fce/dist /tmp/i-$arm.log || { tail -20 /tmp/i-$arm.log; exit 1; }
+        else
+            bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i-$arm.log || { tail -20 /tmp/i-$arm.log; exit 1; }
+            pkg=$(cd / && python3 -c "import importlib.util as u, os; print(os.path.dirname(u.find_spec('tensorrt_llm').origin))")
+            (cd $R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm && find . -name '*.py' -print0) | while IFS= read -r -d '' f; do
+                cp "$R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm/$f" "$pkg/$f"; done
+        fi
+        pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+        start=$SECONDS
+        (cd /tmp && PYTHONPATH=$T/tests/unittest timeout -k 30 1500 python3 -m pytest -v -x -p no:cacheprovider --timeout=900 \
+            --durations=10 --tb=short $T/tests/unittest/_torch/moe/test_moe_comm.py > $R/review/diag/maskspill-moecomm-$job-$arm.log 2>&1)
+        echo "$arm test_moe_comm rc=$? $((SECONDS - start))s | $(tail -1 $R/review/diag/maskspill-moecomm-$job-$arm.log)"
+    done
+    echo MASKSPILL_MOECOMM_DONE
+} > "$out" 2>&1

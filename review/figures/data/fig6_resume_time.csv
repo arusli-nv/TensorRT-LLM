@@ -1,0 +1,13 @@
+kind,mode,case,field,phases,resume_s,pass
+rank5,noeplb,KILL-FINAL-OFF-8194123/rank5-1,phases1,"detect=0.04,stopped=0.07,proposed=0.24,ready=1.33,install=1.33,installed=1.34,committed=1.34,resumed=1.35,first_step=1.41",1.52,True
+rank5,noeplb,KILL-FINAL-OFF-B-8198951/rank5-1,phases1,"detect=0.01,stopped=0.06,proposed=0.22,ready=1.62,install=1.62,installed=1.63,committed=1.63,resumed=1.64,first_step=1.68",1.71,True
+rank5,online,KILL-FINAL-ON-8198951/rank5-1,phases1,"detect=0.02,stopped=0.07,proposed=0.25,ready=0.73,install=0.73,installed=0.76,committed=0.76,resumed=0.77,first_step=0.82",1.2,True
+rank5pf,noeplb,KILL-FINAL-OFF-A-8198951/rank5pf-1,phases1,"detect=0.01,stopped=0.06,proposed=0.22,ready=1.52,install=1.52,installed=1.53,committed=1.53,resumed=1.53,first_step=2.59",1.57,True
+rank5pf,online,KILL-FINAL-ON-A-8198951/rank5pf-1,phases1,"detect=0.02,stopped=0.07,proposed=0.27,ready=0.80,install=0.80,installed=0.82,committed=0.82,resumed=0.82,first_step=1.86",1.11,True
+rank5upd,online,KILL-FINAL-ON-A-8198951/rank5upd-1,phases1,"detect=0.04,stopped=0.09,proposed=0.28,ready=0.76,install=0.76,installed=0.79,committed=0.79,resumed=0.80,first_step=0.85",1.2,True
+node1,noeplb,KILL-FINAL-OFF-8194123/node1-1,phases1,"detect=0.02,stopped=0.07,proposed=0.72,ready=2.84,install=2.85,installed=2.86,committed=2.86,resumed=2.87,first_step=2.98",3.2,True
+node1,online,KILL-FINAL-ON-8198951/node1-1,phases1,"detect=0.02,stopped=0.08,proposed=0.76,ready=1.42,install=1.42,installed=1.48,committed=1.48,resumed=1.49,first_step=1.55",1.53,False
+twokill,noeplb,KILL-FINAL-OFF-8194123/twokill-1,phases1,"detect=0.01,stopped=0.06,proposed=0.24,ready=1.20,install=1.20,installed=1.21,committed=1.21,resumed=1.22,first_step=1.28",1.68,True
+twokill,noeplb,KILL-FINAL-OFF-8194123/twokill-1,phases2,"stopped=0.06,proposed=0.22,ready=1.26,install=1.26,installed=1.27,committed=1.27,resumed=1.27,first_step=2.23",1.74,True
+stop,noeplb,KILL-FINAL-OFF-8194123/stop-1,phases1,"detect=32.24,stopped=32.29,proposed=32.46,ready=33.70,install=33.70,installed=33.71,committed=33.71,resumed=33.71,first_step=33.84",confirm=30.19;resume=3.92,True
+stop,online,KILL-FINAL-ON-A-8198951/stop-1,phases1,"detect=35.24,stopped=35.29,proposed=35.47,ready=35.98,install=35.98,installed=36.01,committed=36.01,resumed=36.02,first_step=36.07",confirm=33.86;resume=2.23,True

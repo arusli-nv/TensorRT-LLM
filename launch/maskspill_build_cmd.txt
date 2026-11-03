@@ -1,0 +1,50 @@
+# BUILD-MASKSPILL (1 node, --time 00:50; DIAGNOSTIC for AFTERNOON_PLAN_2026-10-25 item 3 / CLAIMS 200b; explain, not
+# ship). Kernel-only incremental build of mask-spill 7162255fce = v5-final 27442bd91d + one kernel change
+# (moeAlltoAllKernels.cu: the fence dispatch/combine kernels keep the active-rank mask in a per-CTA __shared__ copy
+# instead of the register copy that spills; side branch only, never v5-pr/v5-pr-fixes/v5-final).
+# C++ diff from build-root-v2's last build (58caa0fde6): that one .cu only (Python 58caa0fde6..27442bd91d =
+# moe_load_balancer.py + tests, so the wheel already carries fix-dropmap; no overlay).
+# Mounts (as BUILD-REFREEZE5): R:/art:rw and R:R:rw, overlays/build-root-v2:/art/build-root (its cpp-build-oot is
+#   overlays/build-root-feat's: no other build may run on build-root-v2/-feat while this runs; check the queue),
+#   overlays/build-src-maskspill-7162255fce:/checkout (cp -a of build-src-8c52d11469 at 58caa0fde6, mtimes kept, then
+#   checkout 7162255fce: only the .cu is newer than the objects; the freeze snapshot is untouched).
+# Steps: (1) incremental wheel (build_and_test.sh: touches the .cu, verify_wheel 0 differ / 0 stale) -> /art/build-
+#   maskspill-7162255fce/dist; (2) MASKSPILL_RES: `cuobjdump -res-usage` of the wheel's libth_common.so through
+#   tools/maskspill_res.py; expected MASKSPILL_RES_OK = STACK 24 for every MASK=1 dispatch (96) and combine (48)
+#   instantiation (freeze wheel: 64x96 / 64x48, MASKSPILL_RES_SPILL; checked on the login host 2026-10-25); LIB_SHA256
+#   staged next to dist for the bench's code check; (3) GPU tests only (no CPU groups after a build): gpu_moe group +
+#   test_moe_comm.py + multi_gpu/test_nvlink_one_sided.py (masked sources, abort, late writes, replay) on this wheel.
+#   test_moe_a2a_recovery.py is left out (it has torn down the container, HANDOFF 14:35 10/22).
+# Est: kernel-only incremental ~22 min (memory: no-idle-gpu-jobs), res check < 1 min, GPU tests ~10 min -> ~35 min.
+# Pass: BUILD_SUCCESS, MASKSPILL_RES_OK, every test file rc=0 -> BUILD_MASKSPILL_OK. A MASKSPILL_RES_SPILL means the
+#   change did not remove the spill: do not run the bench (fix the kernel first).
+#
+# Before submit (login host): the snapshot must show HEAD 7162255fce (only the .cu differs from 58caa0fde6's C++):
+#   git -C $R/overlays/build-src-maskspill-7162255fce log --oneline -1
+#   python3 $R/tools/presubmit.py --name build-maskspill-7162255fce --nodes 1 --build-job --branch /tmp/claude-161238/wt-fix
+#   -> TOKEN; replace TOKEN below. slurm_submit: 1 node, 4 GPUs, --time 00:50, mounts above,
+#   command: bash $R/launch/maskspill_build_cmd.txt
+bash /art/tools/require_presubmit.sh build-maskspill-7162255fce-8485bd17c4 || exit 1
+[[ $(git -c safe.directory='*' -C /checkout rev-parse --short=10 HEAD) == 7162255fce ]] || { echo "BUILD_MASKSPILL_FAILED /checkout is not 7162255fce"; exit 1; }
+[[ $(cat /art/build-root/last_built_commit) == 58caa0fde6* ]] || echo "note: build-root-v2 last built $(cat /art/build-root/last_built_commit), not 58caa0fde6: more than the .cu may recompile"
+label=maskspill-7162255fce
+out=/art/build-$label
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+SKIP_TESTS=1 bash /art/build_and_test.sh "$label" || { echo BUILD_MASKSPILL_FAILED build; exit 1; }
+grep -E "Building C|Linking" "$out/build.log" | tail -8
+lib=$(mktemp -d)/libth_common.so
+python3 -c "import sys, zipfile; open(sys.argv[2], 'wb').write(zipfile.ZipFile(sys.argv[1]).read('tensorrt_llm/libs/libth_common.so'))" "$out"/dist/*.whl "$lib"
+sha256sum < "$lib" | cut -c1-64 > "$out/LIB_SHA256"
+"$(command -v cuobjdump || echo /usr/local/cuda/bin/cuobjdump)" -res-usage "$lib" | python3 /art/tools/maskspill_res.py | tee "$out/res.txt"
+grep -q MASKSPILL_RES_OK "$out/res.txt" || { echo "BUILD_MASKSPILL_FAILED res (wheel kept in $out/dist; do not bench)"; exit 1; }
+SKIP_BUILD=1 GROUPS_ONLY=gpu_moe bash /art/build_and_test.sh "$label" 2>&1 | grep -v "^commit="
+cd /tmp
+for t in tests/unittest/_torch/moe/test_moe_comm.py tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py; do
+    PYTHONPATH=/checkout/tests/unittest timeout -k 30 1200 python3 -m pytest -q -p no:cacheprovider --timeout=600 \
+        "/checkout/$t" >> "$out/test-extra.log" 2>&1
+    echo "extra $t rc=$?"
+done
+grep -E '^(FAILED|ERROR)|passed|failed' "$out/test-extra.log" "$out/test-gpu_moe.log" | tail -20
+grep -qE '^(FAILED|ERROR)| failed' "$out/test-extra.log" "$out/test-gpu_moe.log" && { echo BUILD_MASKSPILL_FAILED tests; exit 1; }
+echo BUILD_MASKSPILL_OK

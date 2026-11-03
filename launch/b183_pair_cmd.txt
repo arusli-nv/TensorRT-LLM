@@ -1,0 +1,9 @@
+# B183 PAIR (user go 18:2x PT): is online EPLB's +350 us FT cost at 128/GPU on the final build (547a6aa7ed, R2 + the
+# compact-copy revert) a regression vs build 183d390691? One job, both groups, arms noft (547), ft (547), ft-b183
+# (FT on, build 183), interleaved and rotated, 128/GPU only, 3 rounds -> n=6 per arm. Same seeded pinned table, node
+# failure domain, backlog 16384, online dep32-final (MTP1 forced). Read: rank-0 full-step (num_active) device median,
+# ft vs ft-b183 paired by round; noft anchors both.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-final-547a6aa7ed
+E="MVP_BUILD=$B FINAL_BUILD=$B FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node COST_CASE_TIMEOUT_S=2400 LADDER_MAIN_TAIL=0 FT_COST_E2E_ROUNDS=3 FT_COST_E2E_ROUND_MIN=40 COST_LOADS=128 LADDER_PAIRS='noft:ft ft-b183:ft noft:ft-b183' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+bash $R/bundle.sh "0:8:6900:$E FT_COST_E2E_ARMS='noft ft ft-b183' bash $R/mvp/harness/run_job.sh LADDER" \
+  "8:8:6900:$E FT_COST_E2E_ARMS='ft-b183 ft noft' bash $R/mvp/harness/run_job.sh LADDER-B"

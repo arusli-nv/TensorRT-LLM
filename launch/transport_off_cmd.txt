@@ -1,0 +1,15 @@
+# TRANSPORT-OFF (16 nodes, two 8-node groups mirrored): is the online prefill/whole-window cost (C21/C22) host transport?
+# FT OFF in every arm, so no v5-zero code is involved: wheel build-v5land-9f2f1892f0 (BUILD-LAND 8159146 gate: all pass
+# except the known late_writes row-check test bug), no overlay. std-online.yaml (online EPLB) at 128/GPU, 1k/1k (refill
+# bursts). Arms: std-online (UCX, as deployed without FT) | std-online-ulfm (FT's launcher, FT off: ob1 self,tcp eth0) |
+# std-online-ulfm-2nic (ob1 tcp eth0,eth1, both 200 Gb/s NICs) | std-online-ulfm-uct (ob1 + btl/uct on mlx5; only if
+# tools/uct_check.sh accepts uct under ULFM). TLLM_TEST_BCAST_LOG=0,31: per refill, RequestBroadcaster bcast ms and bytes
+# and each context step's tokens (FT-agnostic). Readout: tools/trim_readout.py --off std-online-1; ctx_stall_cost.py per
+# arm (CTX_ON_SUFFIX=-ulfm, -ulfm-2nic, -ulfm-uct); mvp/analysis/bcast_readout.py.
+# Decision: ulfm - off on context steps ~ the FT prefill cost -> transport (fix: IB path for ob1, 2nic or uct, whichever
+# closes it); ulfm ~ off -> not transport (the FT arms of TRANSPORT-CTX then decide bound path vs FT logic).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5land-9f2f1892f0
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY= COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=70 WIDEEP_BURNIN=32:6 COST_LOADS=128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_BCAST_LOG=0,31"
+u() { echo "U=; bash $R/tools/uct_check.sh $R/logs/bundle/toff-uct$1-\$SLURM_JOB_ID && U=std-online-ulfm-uct"; }
+bash $R/bundle.sh "0:8:7000:$(u 0); $E FT_COST_E2E_ARMS=\"std-online std-online-ulfm std-online-ulfm-2nic \$U\" bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(u 8); $E FT_COST_E2E_ARMS=\"\$U std-online-ulfm-2nic std-online-ulfm std-online\" bash $R/mvp/harness/run_job.sh STD-G1"

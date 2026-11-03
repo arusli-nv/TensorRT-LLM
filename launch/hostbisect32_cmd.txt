@@ -1,0 +1,14 @@
+# HOSTBISECT32 (16 nodes): FT's no-EPLB 32/GPU cost is a near-constant ~0.35 ms per decode step (dist32.md: stall-free
+# mean step +2.41%, sd 0.22, 11/11 pairs; client -1.4%), not transport (ulfm ~0, CLAIMS 155) and not the a2a GPU segment
+# (NSYS32: dispatch start -> sort end ft 24.5 vs off 35.5 us). Hypothesis: FT's per-step host work on a host-bound step.
+# Arms at 32/GPU, mirrored across two node sets: off | ft | ft-noH (no FT host taps: coll, resp, step) | ft-noT (no
+# peer-failure watch thread). Rank 0 logs per-phase host times in every arm (TLLM_TEST_PHASE_TIMES: schedule, fetch,
+# forward, update, responses, the input-copy wait, the recovery hook's taps, and the step period).
+# Pass rule: ft-noH recovers >= 2/3 of ft's stall-free mean-step cost in both sets -> host taps are the cause; the phase
+# times name which one. Fill rounds (STD-G2/G3): off|ft at 32 for more pairs.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_PHASE_TIMES=2000"
+export BUNDLE_FILL_0="$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD-G2"
+export BUNDLE_FILL_8="$E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G3"
+bash $R/bundle.sh "0:8:4500:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ft-noH std-noeplb-ft-noT' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:4500:$E FT_COST_E2E_ARMS='std-noeplb-ft-noT std-noeplb-ft-noH std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

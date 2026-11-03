@@ -1,0 +1,26 @@
+# LATEWRITE-V5F (1 node, 4 GB200, qos short, --time 01:00): first logged run of the late-write / remap safety tests on
+# v5-final 27442bd91d (last passes were on v5-zero, UNITS-POINT 8167245). User approved clearing open doubts (10-26).
+# Code: build-freeze-58caa0fde6 wheel + overlays/fix-dropmap-9f1fd4cab4 (= v5-final .py); tests and source snapshot
+# scratch-mpisession/v5final (test files byte-identical to 27442bd91d, checked). Runner: tools/point_units.sh (PMIx/SLURM
+# env unset, absolute /tmp/ut test paths, pytest --timeout 600, known_failures plugin - none of these files is listed).
+# Files, each run 3x (fresh pytest process per run, as UNITS-POINT):
+#   tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
+#   tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py   (incl. test_remap_orphans_late_writer,
+#        test_second_loss_orphans_importer_of_remapped_pages)
+#   tests/unittest/_torch/test_mnnvl_memory_remap.py                (release/remap, fake driver)
+# RULE (before data): every file rc 0 with >= 1 passed in all 3 runs -> "late-write tests pass on v5-final"; otherwise
+# report each failing run with its first error. A run that collects nothing or skips everything is reported as such
+# (not a pass). Output: review/diag/latewrite-v5f-<job>/rep{1,2,3}/*.log + summary review/diag/latewrite-v5f-<job>.txt.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+job=${SLURM_JOB_ID:-x}
+bash $R/tools/check_excluded_nodes.sh || exit 1
+S=$R/scratch-mpisession/v5final; O=$R/overlays/fix-dropmap-9f1fd4cab4; D=$R/review/diag/latewrite-v5f-$job
+F="tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/test_mnnvl_memory_remap.py"
+{
+    hostname; nvidia-smi -L | head -4
+    for rep in 1 2 3; do
+        echo "## rep $rep $(date +%T)"
+        bash $R/tools/point_units.sh $R/build-freeze-58caa0fde6/dist $O $S $S $D/rep$rep $F
+    done
+    echo LATEWRITE_V5F_DONE
+} > $R/review/diag/latewrite-v5f-$job.txt 2>&1

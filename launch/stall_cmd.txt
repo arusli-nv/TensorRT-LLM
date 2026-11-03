@@ -1,0 +1,75 @@
+# STALL-ATTR (DIAGNOSTIC, POST_FINAL_ANALYSIS_PLAN item 1; not a cost number, does not replace CLAIMS 193-197).
+# Question: which rank causes rank 0's far-from-prefill stalls at offline EPLB 32/GPU (~0.6% of the ~-1.0% 12-pair
+# mean, review/diag/offline32_analysis.md "Leading explanation" (b) and section 4)?
+# Hypothesis: another attention-DP rank's context (prefill) step holds up the collective step.
+# Job: 16 nodes, two groups of 8 (segment 8). Offline 32/GPU only. FT on = v5-final 27442bd91d (overlays/fix-dropmap-9f1fd4cab4
+# on build-freeze-58caa0fde6) vs FT off on the same build + overlay, as the finals' offline arms (V5F-W1A P0_2 / P8_2):
+# same seed (pinned tactics STD-8194123), placement (STD-8109649), burn-in 32:6, 28 waves at 32/GPU, hang detection.
+# Two differences from the finals, both on every arm: (1) TLLM_PROFILE_LOG_RANKS=all, so all 32 ranks write the
+# print_iter_log line (profiling.py:647-653,738); (2) the -loc arm suffix (job.sh:2925,2932 -> TLLM_TEST_LOCAL_LOGS=1,
+# rank.sh:38-44): rank logs go to node-local /tmp and serve.sh copies them into the case dir at case end
+# (serve.sh:451-456), so 32 line-buffered writers do not hit Lustre (a blocked writer would itself make the stalls this
+# job hunts). The finals' rank 0 wrote to Lustre; this job's rank 0 does not.
+# Order (2 rounds per group; round 2 rotates round 1, job.sh:3176): G0 FT off off FT (ABBA), G8 off FT FT off (BAAB).
+# Time (measured, finals offline cases 8269103/8270779/8271451 with the healthy-128 part (5.0 min) removed:
+# FT-off cases 12.4-14.3 min, FT 14.6-19.0 min, from round-*.go / done mtimes and result.json rows): per group 2 off
+# + 2 FT = ~59 min (worst ~67) + ~1 min start + ~1 min/case reading 32 logs in TACTIC_CHECK (job.sh:3199-3203) +7%
+# = ~67 min (worst ~77). --time 01:30, bundle limit 5100 s. Both groups run the same 4 cases, so they end within
+# ~5-8 min of each other (FT startup spread). Round guard FT_COST_E2E_ROUND_MIN=36 (worst pair ~33 min + checks):
+# round 2 starts at ~31-36 min with ~54 min left, so it is skipped only if round 1 overran by >20 min; a case is
+# bounded by COST_CASE_TIMEOUT_S=1800 (longest measured 32-only case 19.0 min).
+#
+# DECISION RULE (written before data; analysis = tools/stall_analysis.py, how-to = review/drafts/stall_NOTES.md):
+# Far stall (exactly offline32_analysis.md header + section 4; reproduced by the script on STD-G1-8271451 FT:
+#   75 stalls / 8.90 s, 46 far / 6.82 s, and the fix-1/finals per-pair far-stall seconds of its section 4 table):
+#   rank-0 iteration lines inside the healthy-32 row's wall window (result.json start_wall_s .. +elapsed_s);
+#   full step = num_ctx_requests 0 and num_active >= 29; stall = full step with host_step_time > 1.5 x the median full
+#   step; far = more than 5 iterations from every rank-0 context step.
+# Clock alignment: the iteration index. Each step all 32 ranks join the attention-DP allgather and the MoE all-to-all,
+#   so iteration N is the same collective step on every rank. Checked on existing all-rank logs (STD-8123150
+#   std-noeplb-ft-loc-1, 31 ranks vs rank 0 over the healthy-8 window): every window iteration present on every
+#   rank, log step-time correlation >= 0.960 at lag 0 vs <= 0.712 at lag +-1, same-iteration wall stamps within
+#   1.0 s across 8 nodes. Uncertainty +-1 iteration (overlap scheduler: a rank's long forward in loop j is waited
+#   on by the others in loop j+1), so rank r "overlaps" stall N if its line j in [N-2, N+1] has num_ctx_requests > 0
+#   and num_scheduled_requests > 0 (4 steps, ~57 ms at 14.3 ms/step). Wall clocks (1 s stamps, node clocks) are a
+#   cross-check only. Validity per case: each rank has >= 99.9% of rank 0's window iterations, its lag-0 correlation
+#   is the highest of lags -1/0/+1, and same-iteration wall stamps differ <= 2 s; any failure -> INVALID, no verdict.
+# Coverage of rank r = share of far stalls it overlaps; baseline = share of rank 0's far, non-stalled full steps it
+#   overlaps (chance level). Evaluated on FT cases with >= 10 far stalls, pooled by stall count:
+#   - ATTRIBUTED to rank r: coverage >= 80% and coverage - baseline >= 50 points (also reported per case).
+#   - SPREAD-PREFILL: no single rank qualifies, but "any non-0 rank" coverage >= 80% and >= 50 points above its
+#     baseline: other ranks' out-of-phase prefill causes the stalls, on varying ranks (report ranks/nodes, events).
+#   - PARTLY-PREFILL: any-rank coverage 50-80%: prefill explains part; the rest is reported as uncovered.
+#   - NOT-PREFILL: any-rank coverage < 50%: look elsewhere (the uncovered stalls' longest prev_device_step rank,
+#     rank 0's own host, the ADP gate); no rank is named from this job.
+#   - INCONCLUSIVE: no FT case with >= 10 far stalls (7 of the 12 earlier FT arms had >= 10; 5 of them >= 28).
+#   - The FT-off arms get the same readout (descriptive). Excess-weighted coverage, the ctx-minus-stall offset
+#     histogram and the out-of-phase event counts (FT vs off) are descriptive and change no verdict.
+# Disclosure: the existing rank-0 logs already show that 110 of 213 far stalls in the 12 FT arms come 3-5
+#   iterations after another rank fetched new requests (currank_total_requests total rising, rank 0's own count not;
+#   baseline <= 1% of calm steps). That look informed the hypothesis, not the rule's numbers (80% / 50 points / [N-2,N+1]
+#   were set by the request and the measured +-1 lag). No rule changes after this job's data (memory: no criteria change).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-freeze-58caa0fde6; MB=build-main-9cc37929e8
+FIX_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4
+O="MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1"
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then IT=32=6 BURN=32:2 RMIN=10; else IT=32=28 BURN=32:6 RMIN=36; fi
+SOFF=$R/mvp/runs/STD-8194123/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="$O MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD COST_MAX_WAVES=40 COST_CASE_TIMEOUT_S=1800"
+# All-rank iteration logs (mvp/harness/launch/task.sh:44 forwards every TLLM_* variable to every rank with mpirun -x).
+LOGS="TLLM_PROFILE_LOG_RANKS=all"
+CS="COST_LOADS=32 COST_LOAD_ITERATIONS=$IT FT_COST_E2E_ROUNDS=2 FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$RMIN"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0="$E $LOGS $CS FT_COST_E2E_ARMS='std-offline-ft-loc std-offline-loc' $(run STD-G2)"
+P8="$E $LOGS $CS FT_COST_E2E_ARMS='std-offline-loc std-offline-ft-loc' $(run STD-G3)"
+G0="{ $P0; }"
+G8="{ $P8; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:5100:$G0" "8:8:5100:$G8"

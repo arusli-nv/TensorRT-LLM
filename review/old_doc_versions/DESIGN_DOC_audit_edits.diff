@@ -1,0 +1,167 @@
+57,58c57,58
+< - Open MPI built with ULFM (`ompi_info | grep ftmpi`), launched with `mpirun --with-ft ulfm` over the ob1/TCP
+<   transport; mpi4py 4.1.2
+---
+> - Open MPI built with ULFM (`ompi_info | grep ftmpi`), launched with `mpirun --with-ft ulfm`, and mpi4py ≥ 4 (FT
+>   checks both; our container has 4.1.2); our launcher selects the ob1/TCP transport
+61c61,62
+< KV connectors, PEFT, pipeline or context parallelism).
+---
+> KV connectors, PEFT, pipeline or context parallelism), and rejects requests it cannot replay (per-request
+> penalties, logits post-processors, multimodal input with the overlap scheduler).
+67,72c68,77
+< - Further process-level rank failures after a recovery (or during one, before the new placement is applied), while
+<   the remaining expert slots on survivors can hold every expert
+< - A frozen process, e.g. `SIGSTOP` (serving again in ~5 s on an earlier build); a rank that hangs while alive needs
+<   the optional hang detection (off by default, ~35-40 s)
+< - Anything else (rank 0, rank 0's node, host death, NVLink fabric, >1 node) ends the job as it would without FT,
+<   possibly only after the executor's hang timeout; silent wrong results are not detected.
+---
+> - Further process-level rank failures after a recovery (or during one, before the new placement is applied). A loss,
+>   counting every rank lost so far, is recovered if and only if it is a union of admitted failure domains that the
+>   survivors' slots still cover; otherwise every survivor raises before changing anything and the job ends (at the
+>   authority's recovery deadline). For DeepSeek-R1 the ghost slots cover exactly one node (24 x 10 = 240 < 256 slots
+>   after a second node), so losing a second node ends the job.
+> - A frozen process, e.g. `SIGSTOP`, or a rank that hangs while alive, only with the optional hang detection on (off
+>   by default; ~35-40 s for a live hang; a frozen process served again in ~5 s on an earlier build). Without it, a
+>   stopped rank holds the survivors' agreement until it ends.
+> - Anything else (rank 0, rank 0's node, host death, NVLink fabric) ends the job as it would without FT, possibly only
+>   after the executor's hang timeout; silent wrong results are not detected.
+89,90c94,96
+<   tokens are read in place. A failed GPU is fenced (its process ended) before the survivors change membership; see
+<   Late writes for what that does and does not guarantee.
+---
+>   tokens are read in place where the MoE backend supports it. Once the survivors agree on who failed, the failed GPU
+>   is fenced (its process ended) before they change routing or the live-rank mask; see Late writes for what that does
+>   and does not guarantee.
+92c98
+<   survivor applies the same change, or none does.
+---
+>   survivor applies the same change; if one fails to install it, the job ends at the authority's deadline.
+121,122c127,129
+<   node for DeepSeek-R1), so the copy stays on the node. CPU threads write it through GDRCopy, the same path EPLB uses
+<   for its updates. FT off with offline EPLB keeps no host copies, so this memory is new.
+---
+>   node for DeepSeek-R1), so the copy stays on the node. With online EPLB, CPU threads write it through GDRCopy, the
+>   same path EPLB uses for its updates; with offline EPLB, the GPU copies it in. FT off with offline EPLB keeps no host
+>   copies, so this memory is new.
+133,134c140,141
+< runs, and with online EPLB the host-writable ghost memory holds GDRCopy mappings (13 GiB of BAR1 on rank 0). If GPU memory can't be made CPU-writable, online EPLB falls back to
+< spare slots that are backed by memory and left empty.
+---
+> runs, and with online EPLB the host-writable ghost memory holds GDRCopy mappings (13 GiB of BAR1 on rank 0). If GPU memory can't be made CPU-writable, online EPLB defaults to
+> spare slots that are backed by memory and left empty (`extra_slots: empty`, which can also be chosen in config).
+153,155c160,164
+< - Its receive counters and completion flags are its own, so a late signal from a dead sender cannot complete a live
+<   sender's transfer. Its payload rows are not fixed: each step places payloads by that step's widths, so a late
+<   payload write can land anywhere in the dispatch payload region (`NVLinkOneSided.source_write_ranges`).
+---
+> - Everything a sender writes into a peer is indexed by the sender: its completion flag, its receive count, its EPLB
+>   statistics row and its payload rows (fixed slots: row = sender x capacity + i). Each payload layout (e.g. NVFP4
+>   layers vs DeepSeek-R1's BF16 MTP layer) has its own fixed dispatch region, so a late write from a dead sender, however
+>   late it lands, only reaches that sender's rows, which receivers ignore once it is masked. No timing assumption is
+>   needed. The fence-path combine pulls, so a dead rank writes no combine data into survivors.
+158,159c167,169
+< - The expert GEMMs read each token's hidden state straight from its mailbox, so FT adds no extra copy of the hidden
+<   states; only each token's small routing row (top-8 slot ids and scales, ~64 bytes) is compacted.
+---
+> - Where the MoE backend supports it (CuteDSL NVFP4 except SM107, Cutlass unquantized without LoRA), the expert GEMMs
+>   read each token's hidden state straight from its mailbox and only each token's small routing row (top-8 slot ids
+>   and scales, ~64 bytes) is compacted; other paths copy the received tokens into a compact buffer.
+173,179c183,190
+<    process in ~5 s (`mpi_ft_detector_timeout`). An abort flag stops kernels waiting on the dead rank.
+< 2. **Agree:** survivors stop, discard uncommitted steps and agree on who failed. The authority fences the failed
+<    ranks and proposes a new generation.
+< 3. **Plan:** each survivor computes the new placement, maps memory for its ghost slots, and replies with a hash of
+<    the plan.
+< 4. **Install:** once all hashes match, survivors copy in the lost experts, update the routing table and live-rank
+<    mask, and the authority commits.
+---
+>    process in ~5 s (`mpi_ft_detector_timeout`; recovering from it needs hang detection). An abort flag stops kernels waiting on the dead rank.
+> 2. **Agree:** survivors stop, agree on who failed (the ULFM shrink) and discard uncommitted steps. Each survivor
+>    computes the new placement and maps memory for its ghost slots while the authority fences the failed ranks and
+>    proposes a new generation.
+> 3. **Plan:** without EPLB, survivors copy in the lost experts; each survivor replies with a hash of the plan
+>    (placement and copy plan).
+> 4. **Install:** once all hashes match, survivors copy in the lost experts (with EPLB replicas), update the routing
+>    table and live-rank mask, and the authority commits.
+186,188c197,200
+<   output yet; otherwise they end with a retryable error.
+< - `/health` returns 200 with `healthy`, `degraded` (fewer ranks) or `unprotected` (the authority is gone), and 503
+<   with `recovering` (~1 s, at most `authority_timeout_s`), `terminal` or `unknown`. Load balancers stop routing on
+---
+>   output yet; otherwise they end with a retryable error. A request that a later loss interrupts again without
+>   progress ends with a retryable error on any rank; a cancelled request stays cancelled.
+> - `/health` returns 200 with `healthy`, `degraded` (fewer ranks), `unprotected` (the authority is gone) or
+>   `unknown`, and 503 with `recovering` (~1 s, at most `authority_timeout_s`) or `terminal`. Load balancers stop routing on
+198,202c210,215
+< - **Launch:** Open MPI built with ULFM (not in the release container yet), the ob1/TCP transport, and one extra
+<   recovery-authority process.
+< - **Shutdown:** 43-45 s instead of ~17 s; set the orchestrator's grace period above 45 s.
+< - **Not covered:** rank 0 or its node, a dead host, an NVLink fabric failure, and more than one node; these end the job
+<   as without FT. Disaggregated serving, guided decoding and per-request penalties are not supported with FT yet.
+---
+> - **Launch:** Open MPI built with ULFM (not in the release container yet), mpi4py ≥ 4, the ob1/TCP transport
+>   (selected by our launcher), and one extra recovery-authority process.
+> - **Shutdown:** slower than without FT (see Limitations); set the orchestrator's grace period accordingly.
+> - **Not covered:** rank 0 or its node, a dead host, an NVLink fabric failure, and (for DeepSeek-R1) a
+>   second node; these end the job as without FT. Disaggregated serving, guided decoding, per-request penalties,
+>   logits post-processors and multimodal input with the overlap scheduler are not supported with FT yet.
+208c221,223
+< FT is enabled per deployment with `TLLM_FAULT_TOLERANCE_MODE` and a small YAML file (`TLLM_FAULT_TOLERANCE_CONFIG`):
+---
+> FT is enabled per deployment with `TLLM_FAULT_TOLERANCE_MODE`, the authority's address and key
+> (`TLLM_FAULT_TOLERANCE_AUTHORITY`, `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`; the mode alone enables detection only) and a
+> small YAML file (`TLLM_FAULT_TOLERANCE_CONFIG`):
+211c226
+< (`executor/recovery/authority_server.py`). Moving these settings into `LlmArgs` is a follow-up.
+---
+> (`python -m tensorrt_llm.executor.recovery.authority`, `executor/recovery/authority.py`). Moving these settings into `LlmArgs` is a follow-up.
+223c238,241
+< code path on its default launcher; FT on adds the FT config, the ULFM launcher and the recovery authority.
+---
+> code path on its default launcher; FT on adds the FT config, the ULFM launcher and the recovery authority. FT reserves a separate dispatch region
+> per payload layout, so a dead rank's late writes stay in its own rows across layers of different precision
+> (DeepSeek-R1's MTP layer is BF16, the others NVFP4); this takes about 1.07 GB per rank from the KV cache, with FT on
+> only.
+290c308,309
+<   survivors; all others continue from their exact tokens.
+---
+>   survivors; all others continue from their exact tokens (a request a later loss interrupts again without progress
+>   would end with a retryable error).
+306,307c325,326
+< - **Spare slots backed by memory:** faster to restore, but the memory is held out of the KV cache permanently. Kept
+<   only as the fallback where GPU memory can't be made CPU-writable.
+---
+> - **Spare slots backed by memory:** faster to restore, but the memory is held out of the KV cache permanently. The
+>   default only where GPU memory can't be made CPU-writable; otherwise a config choice (`extra_slots: empty`).
+340c359
+<   UCX hangs the server), so FT on always runs a different transport than FT off. Its measured step cost was within noise
+---
+>   UCX hangs the server), so our FT launcher selects ob1/TCP and FT on runs a different transport than FT off. Its measured step cost was within noise
+344,346c363,366
+< - **Backend coverage:** in-place mailbox reads exist for the CuteDSL and Cutlass MoE backends; DeepGEMM and
+<   TRTLLM-Gen still compact the receive buffer.
+< - **Fail-closed paths:** a second loss that is a GPU error, a loss after commit and before resume, a loss during
+---
+> - **Backend coverage:** in-place mailbox reads exist for CuteDSL NVFP4 (except SM107) and Cutlass unquantized
+>   without LoRA; other paths, including DeepGEMM and TRTLLM-Gen, compact the receive buffer.
+> - **Fail-closed paths:** a second loss during a recovery that is a GPU error (after a recovery, a rank with a GPU
+>   error exits alone and is recovered if the slots cover it), a loss after commit and before resume, a loss during
+354,355c374,375
+< - **Shutdown under ULFM:** `MPI_Finalize` can hang; it is bounded at 30 s (shutdown 43-45 s vs 17 s without FT,
+<   above Kubernetes' 30 s default grace period), and the cause is open.
+---
+> - **Shutdown under ULFM:** FT's shutdown is held by `MPI_Finalize` in Open MPI's in-band failure detector; a fix is
+>   in progress (the current 3 s bound in code is a stopgap under review).
+357,360c377
+<   recoverable" (FT off exits silently; both exit with code 1). A graceful `trtllm-serve` shutdown (SIGTERM) is clean
+<   with FT, only slower (45 s vs 17 s).
+<   Similarly, on every recovery rank 0 logs a traceback from mpi4py's futures manager thread
+<   (`MPI_ERR_PROC_FAILED` in `iprobe`); recovery is unaffected, but the thread should handle the error quietly.
+---
+>   recoverable" (FT off exits silently; both exit with code 1).
+377,379d393
+< - **Recovery-path logging:** survivors log just before sending each recovery message, so a slow log destination
+<   delays every survivor's agreement (a 2.8 s outlier in 1 of 16 kills traced to rank logs on Lustre); send first,
+<   log after.

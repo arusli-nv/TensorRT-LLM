@@ -1,0 +1,9 @@
+# PRELIMINARY STD job 1 on build-rc1-78836d1723 (fix-final8-rc1): standard configs (configs/std-*.yaml), three EPLB modes,
+# FT off vs on interleaved, loads 8/32/128/512 with >=150 s per point (COST_LOAD_ITERATIONS default 20/15/7/3 waves),
+# merged tactic seed launch/std/std-seed.json, node failure domain, backlog 16384.
+# G0: STD-STATS (offline placement from FT-off w/o EPLB stats) + noeplb, noeplb-ft, offline, offline-ft (~108 min).
+# G1: online, online-ft, noeplb-ft, noeplb (~102 min). Job 2 swaps modes so every mode reaches n=2.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-rc1-78836d1723
+E="MVP_BUILD=$B FINAL_BUILD=$B TLLM_TEST_POPULATE=timed FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_SEED=$R/launch/std/std-seed.json"
+bash $R/bundle.sh "0:8:6900:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-offline std-offline-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:6900:$E FT_COST_E2E_ARMS='std-online std-online-ft std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

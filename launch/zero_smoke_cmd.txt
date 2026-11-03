@@ -1,0 +1,51 @@
+# UPDATE 14:41: KILL-SMOKE 8162957/8164530 were cancelled by the Occupied Idle Job Reaper (uid 146504): the in-job gate
+# ran ~25+ min on node 0 while 7 nodes per group idled. Now: code = BUILD-ZERO2 wheel build-v5zero-f9e6bc0f8b (full FT suite
+# passed there) + overlay vzero-b6f895cbc5 (same as ZERO-AB2 8167505); short gate on the overlay's changed modules only.
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# UPDATE 12:13: the gate deselects late_writes' no-remap NEGATIVE CONTROL (it checks the test's detection power, not the
+# product): it missed the victim's writes in ZERO-AB 8162956 group 0 (timing) and passed in group 8; a robust control is
+# being fixed on v5-zero and point-tested on 1 node first. The remap cases (the guarantee) stay in the gate.
+# UPDATE 11:25: code is v5-zero 95d6a64a73 = the same Python as 981fd845e2 plus 7 test fixes (ZERO-AB 8161823's gate
+# failures, all test bugs); overlays vzero-95d6a64a73 (Python) and vzero-95d6a64a73-tests (every test changed since 6645ce1848).
+# The gate runs test_moe_a2a_recovery.py 5x per group (monitor: race-prone remap test, repeat before trusting it).
+# KILL-SMOKE (16 nodes, two 8-node groups, < 2 h): kill smoke of v5-zero 981fd845e2 = wheel build-v5zero-6645ce1848 +
+# Python overlay vzero-981fd845e2 (KF_ALLOW_OVERLAY=1; G1a survivor workspace remap at recovery, G1b main's packed
+# fence path + rank mask, G4 host trims, and the remap fixes after 6645ce1848).
+# Launch as VAL-K: design C, fence-always, Open MPI's in-band detector off, no pml/btl flags (WIDEEP_MPI_MCA keeps
+# btl_tcp_if_include and coll), std-noeplb-ft.yaml (R1 NVFP4 + MTP), node failure domain, kill in steady decode,
+# hang detection on (hang_confirm_s 30) in every case, 1 case per row.
+# Each group first runs the in-job unit gate (units_gate.sh, 17 files on the wheel + overlay: VAL-K's 8 and every
+# test file of tests overlay vzero-981fd845e2-tests, incl. the fixed test_moe_a2a_late_writes and test_moe_a2a_recovery
+# (4 GPUs; the survivor remap against a late writer, PeerLossRecovery's real _remap_workspaces); for
+# test_modeling_deepseekv41 only its changed test). A gate FAIL ends the group: no kill runs on top of it. Known
+# failures only via tools/pytest_plugins/known_failures.txt.
+# Rows (job.sh KILL-FINAL):
+#   Group 0: rank5, node1 at 128/GPU: recover (KILL_FINAL_VERDICT PASS); rank0: not recoverable, its job ends on its
+#     own within 180 s.
+#   Group 8: stop: rank 2 SIGSTOPped at 64/GPU, fenced by hang detection while its process lives, then ended by the
+#     runtime before the survivors propose (C7/C38, ~35 s); rank5acc: rank 5 SIGKILLed in a decode step of a warm load
+#     (128/GPU, 4 waves), then GSM8K (1319 questions, real MTP acceptance) on the 31 survivors: strict >= 0.90
+#     (KF_GSM8K_FLOOR; a sanity floor for corrupted all-to-all data after the remap, not a parity claim; CLAIMS 143).
+# No late-write row: under fence-always a lost rank's process is ended before the survivors propose, and its queued
+# GPU writes end with its context, so DRH2-R1's SIGSTOP late writes cannot land after a recovery (DECISIONS: CLAIMS
+# 100 was INVALID for that reason); the remap against a late writer is covered by the gate's test_moe_a2a_recovery
+# and test_moe_a2a_late_writes on 4 GPUs.
+# Pass (every row): KILL_FINAL_VERDICT PASS = served again, lost ranks exactly the victim(s), no survivor request
+# failed beyond what the victim held, no capture/compile/tune after the resume (a survivor fault after the remap shows
+# as a lost survivor or a failed case); rank5acc also gsm8k_sane. Readout: KILL_FINAL_VERDICT / KILL_FINAL_ROW in
+# $R/mvp/runs/KILL-FINAL-OFF-{A,B}-<job>/kill_final.txt.
+# Estimates: gate ~25 min (install 3, test_mpi_session 7, late_writes 2.5, nvlink 2.3, a2a_recovery ~5, rest ~5);
+# group 0 ~25 + 15 + 15 + 10 = ~65 min; group 8 ~25 + 15 + 17 = ~57 min; limit 7000 s (117 min).
+# Submit (16 nodes, segment 8): bash $R/tools/require_presubmit.sh <token> && bash $R/launch/zero_smoke_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+B=build-v5zero-f9e6bc0f8b; SRC=$R/overlays/build-src-f9e6bc0f8b; O=$R/overlays/vzero-b6f895cbc5; OT=$O-tests
+# The unit gate's files: VAL-K's FT set, then the tests overlay's (one changed test of test_modeling_deepseekv41).
+T="tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py"
+# + test_ring_host_copies.py (fixed in 4a30682ead: BUILD-ZERO 8160496 ran it against the old _kernel_writes signature).
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/zsmoke-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $OT $SRC $R/$B/point-units-zsmoke-g$1 $T"; }
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+H="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=${O:+1} WIDEEP_MPI_MCA='$M' $H WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $K KF_ROWS='rank5 node1 rank0' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A" \
+  "8:8:7000:$(g 8) && $K KF_ROWS='stop rank5acc' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B"

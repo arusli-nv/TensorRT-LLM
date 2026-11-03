@@ -1,0 +1,90 @@
+V2 Python fixes: branch v2-py, worktree /tmp/claude-161238/wt-v2py, on ft-final2 (8d0ec8cf1c). 8 commits. Not pushed.
+Each commit has a DCO sign-off and no co-author line. Pre-commit passed on every commit, and every changed .py file passes py_compile.
+No test was run: this host has no torch. No new top-level imports were added between llmapi and executor.
+
+1 (#4) Recovery used PMIx job control even with hang detection off.
+  37551d6035  Kill failed ranks and fence them before a proposal only with hang detection  (+64/-24)
+   - peer_loss_recovery.py: _shrink calls _end_ranks only when fault_tolerance_config().hang_detection is on.
+   - authority.py: new keyword-only parameter RecoveryAuthority(fence_departed=False). Fence-before-Propose runs only when it is set. main() passes fence_departed=config.hang_detection.
+   - Behaviour with hang detection on is unchanged.
+   - The guide's fence paragraph and its list of kill sites now say "with hang_detection".
+   - Tests:
+     - New: test_without_hang_detection_no_reported_rank_is_killed_before_a_shrink (test_peer_loss_recovery.py).
+     - New: test_without_hang_detection_the_proposal_follows_the_survivors_reports_without_a_fence (test_recovery_authority.py).
+     - Existing fence tests now opt in: _registered(fence_departed=True), the hang-monitor authorities, and _runtime(hang_detection=True).
+
+2 (#5) CUDA-graph refusal restored.
+  a0851f0458  Refuse CUDA graph capture of a rank-mask dispatch bound to no execution state  (+18/-2)
+   - The refusal used to be in two places, both removed by 91f8fb2c00:
+     - reject_rank_mask_cuda_graph_capture in NVLinkOneSided dispatch/combine;
+     - a use_cuda_graph ValueError in get_wide_ep_ft_options.
+   - Restored in NVLinkOneSided.dispatch: it raises RuntimeError when rank-mask mode is on, no execution state is bound and the stream is capturing.
+   - FT off is unchanged (the check short-circuits on _rank_mask_enabled).
+   - Bound comms are unchanged: the runner binds them before warmup and capture (runner.py, for_model before DecoderWarmup).
+   - Combine is not checked: it requires a dispatch first.
+   - Updated the wide_ep_ft.py docstring and MOE_DEVELOPER_GUIDE.md ("graphs follow membership changes" now says this needs a bound state).
+   - Test: test_an_unbound_rank_mask_dispatch_refuses_cuda_graph_capture (test_moe_execution_state.py).
+
+3 (#10) Serve.
+ (a) 96ebd05a84  Answer a peer-loss failure by fault-tolerance mode, which cannot raise in the error handler  (+15/-19)
+   - openai_server.py: the gate is now fault_tolerance_mode(), a plain env compare that cannot raise, instead of peer_loss_recovery_enabled(). The message-text detection is kept.
+   - I did not drop the gate entirely. That would let a non-FT server turn an echoed "[peer_loss_retryable]" into a 503, which changes the FT-off path.
+   - Tests (test_stream_error_events.py):
+     - The fixture now sets MODE only.
+     - test_without_fault_tolerance_a_tagged_message_is_an_ordinary_error is parametrized with AUTHORITY set and unset, without MODE, which is the case that used to raise.
+   - Note: detection-only mode now also maps a tagged message to 503. Only recovery emits the tag.
+ (b) 4f24c7d10e  Keep /health at 200 for an authority phase the server does not know  (+34/-7)
+   - "unknown" added to SERVING_STATES (fault_tolerance_status.py). Guide updated.
+   - Test: new test_health_returns_503_only_while_recovering_or_terminal (test_fault_tolerance_health.py) uses a fake probe for SERVING, RECOVERED, STOPPING, ABORTED and an unknown phase. test_health_states_follow_the_authority_phase was updated.
+   - Not done: a Status that fails to unpickle still gives a 500 (the review's related point). It was not in my task list.
+ (c) c4a9495bfd  Document the executor's fixed hang detector instead of an unexposed hang_detection_timeout setting  (+3/-2)
+   - Doc only, no test.
+   - The guide now says the executor's hang detector is a fixed 300 s, and startup refuses FT timeouts it would cut short (shrink timeout + 2x recovery_timeout_s). That is the check in PeerLossRecovery.create.
+   - In this tree the setting was mentioned only once (around line 150).
+
+4 FT-off negative attention_dp_rank.
+  c31ce145fd  Index a pin outside the attention-DP ranks by position as main does when fault tolerance is off  (+43/-26)
+   - The review's premise is only partly right. Checked with git show upstream/main:
+     - Admission (can_process_attention_dp_request): -1 counted against the last rank, and the request was admitted.
+     - DefaultADPRouter._assign_explicit_dp_ranks then raised KeyError at all_ranks_new_requests[-1], a dict keyed by rank.
+     - Out-of-range targets raised IndexError in both places.
+     - So "routes to the last rank" was never true end to end on main.
+   - The fix restores main exactly. With FT off, when the target is not a key, the count is looked up positionally (list(counts)[target]) in both functions. This gives:
+     - admission of -1 against the last rank;
+     - KeyError when the router places it;
+     - IndexError for a target past the last rank.
+   - Tests in test_adp_absent_ranks.py (they replace the old test, which wrongly expected -1 to raise at admission):
+     - test_without_peer_loss_recovery_a_pin_past_the_last_rank_raises_as_on_main
+     - test_without_peer_loss_recovery_a_negative_pin_behaves_as_on_main
+   - The ConversationAware and KV-aware routers still use lists, so they are unchanged.
+
+5 (7b) Progress of a request on a lost rank.
+  44cb071834  Report an interrupted request's progress with its responses so a lost rank's progress reaches rank 0  (+66/-18)
+   - The finding is valid. Each rank's progress used to reach rank 0 only in the next recovery's allgather, which a departed rank never joins.
+   - ResponseContribution is now (responses, finished, streaming, progressed). progressed lists the interrupted requests that committed a step since this rank's last gather. A part is sent when it has responses or progress, else ().
+   - Rank 0's _note_responses removes those ids from _interrupted.
+   - The recovery allgather of _progressed is kept, for gathers a loss interrupted.
+   - py_executor's contribution check changed from len==3 to len==4.
+   - Remaining case: a step a lost rank committed after its last processed gather does not count. The guide's request-handling bullet and overview now say so.
+   - Tests in test_peer_loss_recovery.py:
+     - New: test_a_request_run_again_that_reported_progress_runs_again_when_it_loses_its_rank_again
+     - Extended: test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once (progress is reported once)
+     - Updated: test_rank0_keeps_its_books_from_the_notes_of_each_gathered_part
+  f1b5c697f1  Document that /health's failed_requests counts the lost ranks' failed requests only  (+2/-1)
+   - The review is right that survivors' quarantined requests are not counted. Counting them is not cleanly possible:
+     - Installed (which carries the count) is sent before Commit.
+     - Survivors' interrupted sets are only gathered after Commit.
+     - Moving that gather before Installed would make a loss there fail closed.
+   - So the guide now defines the field. Quarantined requests appear only in rank 0's "failed N" log line, which counts both.
+   - Doc only, no test.
+
+Not addressed:
+ - The narrower "two close losses quarantine a whole batch" rule (review 7b, second bullet).
+ - Status unpickle failure giving a 500.
+ - Closing the probe and reading the env once in /health.
+
+Follow-up (container failure in test_without_peer_loss_recovery_a_negative_pin_behaves_as_on_main):
+- The test was wrong; the product code (c31ce145fd) was right.
+- get_from_waiting_queue counts on all_ranks_num_active_requests.copy(), on main (where it is a list) and here (where it is a dict). The caller's dict never changes, so the test's assertion on the caller's counts was wrong.
+- The fix checks the outcome instead: -1 is popped when rank 0 is full, and stays queued when the last rank is full.
+- Commits: 66d54cadd7 on v2-py, cherry-picked as cef4670789 on v2. Test file only (+7/-5).

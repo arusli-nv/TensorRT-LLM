@@ -1,0 +1,12 @@
+# NCU32: where FT's extra MoE all-to-all time goes at w/o EPLB 32/GPU (+2.7-4%; ~+2.8 us dispatch, +3.4 us combine per
+# layer): polling / flag loads (long-scoreboard stalls on the flag addresses) or more / scattered data bytes?
+# Rank 1 under Nsight Compute (rank.sh), dispatch/prepare/combine kernels only, 200 launches (~1 step) in a window 60 s into
+# the 32/GPU load, single-pass metric sets: -ncuhw = duration, DRAM r/w bytes, L2 hit rate, NVLink rx/tx bytes;
+# -ncupc = PC-sampled warp stall reasons. Arms std-noeplb (256) / std-noeplb-lay320 (FT off, 256 + 64 empty ghosts) /
+# std-noeplb-ft (320): group A the hw set, group B the pc set, each on its own nodes (n=1 per cell). The first case doubles as the tooling dry run (NCU_RANK / NCU_MISSING in the timeline; CASE_TIMEOUT bounds a hang).
+# Each group's node 0 then exports the reports to CSV (ncu --import --page raw).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json WIDEEP_LAUNCHER_GRACE_S=240"
+X='[[ $SLURM_NODEID == 0 ]] && for f in '"$R"'/mvp/runs/$J-$SLURM_JOB_ID/*/ncu-rank1.ncu-rep; do ncu=$(command -v ncu || ls /usr/local/cuda/bin/ncu /opt/nvidia/nsight-compute/*/ncu 2>/dev/null | head -1); $ncu --import "$f" --csv --page raw > "${f%.ncu-rep}.csv" 2>&1; echo "NCU_CSV $f $(wc -l < "${f%.ncu-rep}.csv")"; done'
+bash $R/bundle.sh "0:8:5100:$E FT_COST_E2E_ARMS='std-noeplb-ncuhw std-noeplb-lay320-ncuhw std-noeplb-ft-ncuhw' bash $R/mvp/harness/run_job.sh STD; J=STD; $X" \
+  "8:8:5100:$E FT_COST_E2E_ARMS='std-noeplb-ft-ncupc std-noeplb-lay320-ncupc std-noeplb-ncupc' bash $R/mvp/harness/run_job.sh STD-G1; J=STD-G1; $X"

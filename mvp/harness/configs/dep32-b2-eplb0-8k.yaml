@@ -1,0 +1,43 @@
+# 8k/1k variant of dep32-eplb0.yaml (perf-sanity 8k1k: max_num_tokens 12288; max_seq_len for 8192 + 1024).
+# EPLB A/B (2026-10-17 steering, step 2), FT off: the standard aggregated DEP32 recipe (overlap scheduler, ADP
+# balancing, finalize fusion on as in perf-sanity) without EPLB (256 slots, as perf-sanity's R1 DEP32 eplb0).
+# KV fraction 0.7 as dep32-std-ship.yaml.
+tensor_parallel_size: 32
+moe_expert_parallel_size: 32
+enable_attention_dp: true
+enable_lm_head_tp_in_adp: false
+gpus_per_node: 4
+max_batch_size: 512
+max_num_tokens: 12288
+max_seq_len: 9472
+attn_backend: TRTLLM
+disable_overlap_scheduler: false
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 192
+  - 256
+  - 384
+  - 512
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+moe_config:
+  backend: CUTEDSL
+  use_low_precision_moe_combine: true
+stream_interval: 10
+num_postprocess_workers: 4
+print_iter_log: true
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 0
+  timeout_iters: 60

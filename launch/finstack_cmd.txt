@@ -1,0 +1,7 @@
+# FINSTACK: what MPI_Finalize waits on under Open MPI's in-band failure detector (every rank holds it until the 30 s bound,
+# CLAIMS 145). SHUTDOWN-R1 detector A/B (one round: ft-clean-det-1, ft-clean-nodet-1) on b+c (overlay
+# v4bc-bdb01feb4f, no d), every node py-spy --native dumps its ranks 25 s after the graceful stop (inside Finalize in
+# the det case; the nodet case has exited, a control). Decides d: name the wait (detector heartbeat to an exited peer,
+# PRRTE fence, ...) and prefer a clean fix (e.g. all ranks enter Finalize together) over the 3 s bound.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+bash $R/bundle.sh "0:8:3000:MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$R/overlays/v4bc-bdb01feb4f SHUTDOWN_DETECTOR_AB=1 SHUTDOWN_STACKS_S=25 bash $R/mvp/harness/run_job.sh SHUTDOWN-R1"

@@ -1,0 +1,35 @@
+# VAL-H1 (16 nodes, two 8-node groups mirrored, < 2 h): healthy no-EPLB freeze validation of the freeze build
+# (v5-zero rebased onto current main, no overlay). VAL-H was split: online EPLB (C21/C22) is VAL-H2 (val_h2_cmd.txt).
+# Per group, on its own 8 nodes:
+#   1. short in-job unit gate (units_gate.sh, 7 fast FT files, ~6 min; reaper rule: < 10 min). The full FT suite runs
+#      in the freeze build job's extras (require_build_pass before submit); known failures only via known_failures.txt.
+#   2. STD at 32/GPU: tuning pass at 128/GPU of std-noeplb and std-noeplb-ft on this build (C14: no seed; PIN_CHECK in
+#      tactic_check.txt; ft-noslottable has ft's layout and reads the merged table), then 2 rotated rounds of
+#      off = std-noeplb | ft = std-noeplb-ft | ft-noslottable = std-noeplb-ft-noslottable (bound path, route() writes
+#      the slot ids, no expert-to-slot table; HOOK proof WIDEEP_FT_NO_SLOT_TABLE_ACTIVE/_CALL on every rank, fixed
+#      15:35 in testhooks.py + job.sh). Group 8 runs the reverse order. n=2 per arm per group, n=4 per arm in total.
+#      FT arms: ob1 self,tcp on eth0 (task.sh default = what the doc launch picks; the doc launch itself is covered by
+#      VAL-K and VAL-P C17), hang detection on, hang_confirm_s 30 (H19, as VAL-K). FT off: plain mpirun (UCX).
+# Pass: PIN_CHECK OK and cache_miss equal across arms; off G0 vs off G8 within 0.1 ms; per group trim-mean gap ft - off
+# (CLAIMS 173: ~ the static-LB floor) and ft - ft-noslottable (the table vs route()), stall ms/step, client tok/s
+# (PREFLIGHT 14), both groups agree in sign. C19: KV pool per rank off vs ft by hand from the rank-0 logs.
+# Readout: python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job> --off std-noeplb-1
+#   cat $R/mvp/runs/STD{,-G1}-<job>/tactic_check.txt; noslottable proof (32 ranks each, no _REFUSED):
+#   grep -l "WIDEEP_FT_NO_SLOT_TABLE_ACTIVE.*slot_table=0$" $R/mvp/runs/STD{,-G1}-<job>/std-noeplb-ft-noslottable-1/rank-*.log | wc -l
+# Estimate per group: gate ~6 + tuning 2 x ~10 + 6 cases x ~11.5 (ZERO-AB2 8167505 at 32: 10.2-11.7 min) + ~2
+# = ~97 min of 117 (7000 s). Round 2 needs 38 min left (ROUND_MIN), else it is dropped (n=1: a lead only).
+# H5 (no-iteration-log tail) dropped: no room.
+# Submit (16 nodes, segment 8), after the freeze build passed:
+#   (freeze build: require_build_pass on its log + verify_wheel 0 differ) && bash $R/tools/require_presubmit.sh <token> && bash $R/launch/val_h1_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# Freeze 759787cb17 = the wheel of 5330b899f0 (BUILD-FREEZE 8173212; tensorrt_llm/ and cpp/ identical); snapshot build-src-5330b899f0 holds 759787cb17.
+B=build-freeze-5330b899f0; SRC=$R/overlays/build-src-5330b899f0; O=
+# The unit gate's overlay arguments: the source snapshot itself when the wheel carries all of the Python (no overlay).
+OV=${O:-$SRC}; OT=${O:+$O-tests}; OT=${OT:-$SRC}
+T="tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py tests/unittest/_torch/executor/test_multimodal_scheduler.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/executor/test_py_executor.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/valh1-gate$1-\$SLURM_JOB_ID $R/$B/dist $OV $OT $SRC $R/$B/point-units-valh1-g$1 $T"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=${O:+1} WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=38 STD_TUNE_ARMS='std-noeplb std-noeplb-ft'"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ft-noslottable' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && $E FT_COST_E2E_ARMS='std-noeplb-ft-noslottable std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

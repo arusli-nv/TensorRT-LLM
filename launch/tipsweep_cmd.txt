@@ -1,0 +1,30 @@
+# TIP-SWEEP (1 node): does the PR stack break main's own unit tests outside the files it touches? Found by V5PR-RERUN
+# A2 8279691: main's test_no_kv_cache.py asserts tp_allgather_int64([2]) but c352 passes departed=0 -> fails at b954
+# and so at the tip; V5PR-TESTS ran only touched test files. Arms: (main) build-main-9cc37929e8 wheel + main's tests;
+# (tip) freeze wheel + the tip's .py overlaid (v5-pr b27007aca1 tree = v5-pr-restack2 tree) + the tip's tests.
+# Directories: the test dirs of the product areas the stack changes (pyexecutor/engine, distributed, disaggregation,
+# executor/recovery, MoE comm). Rule (set before data): a test failing at the tip and passing (or absent) at main is a
+# stack regression to fix in the commit that introduced it; failing in both is pre-existing (listed, not ours).
+# Output: review/diag/tipsweep-<job>/{main,tip}-<n>.txt + summary in review/diag/tipsweep-<job>.txt. --time 02:00.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+job=${SLURM_JOB_ID:-x}; out=$R/review/diag/tipsweep-$job.txt; full=$R/review/diag/tipsweep-$job; mkdir -p $full
+DIRS="tests/unittest/_torch/executor tests/unittest/_torch/disaggregation tests/unittest/_torch/distributed tests/unittest/executor tests/unittest/_torch/modeling/test_modeling_deepseekv41.py tests/unittest/_torch/moe/test_moe_comm_timeout_guard.py tests/unittest/_torch/moe/test_communication_factory.py tests/unittest/_torch/moe/test_moe_routing.py"
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    echo "##### tip (freeze wheel + tip .py)"
+    OVERLAY=1 bash $R/scratch-v5pr-tip/run_dirs.sh $R/scratch-v5pr-tip $full/tip $DIRS
+    echo "##### main (main wheel, main tests)"
+    bash $R/install_wheel.sh $R/build-main-9cc37929e8/dist /tmp/i2.log || { tail -20 /tmp/i2.log; exit 1; }
+    OVERLAY=0 bash $R/scratch-v5pr-tip/run_dirs.sh $R/scratch-mpisession/main $full/main $DIRS
+    echo "##### failures: tip-only"
+    comm -23 <(grep -h "^FAILED\|^ERROR" $full/tip-*.txt | sed -E 's#.*tests/unittest/##; s/ - .*//' | sort -u) \
+             <(grep -h "^FAILED\|^ERROR" $full/main-*.txt | sed -E 's#.*tests/unittest/##; s/ - .*//' | sort -u)
+    echo "##### failures: both"
+    comm -12 <(grep -h "^FAILED\|^ERROR" $full/tip-*.txt | sed -E 's#.*tests/unittest/##; s/ - .*//' | sort -u) \
+             <(grep -h "^FAILED\|^ERROR" $full/main-*.txt | sed -E 's#.*tests/unittest/##; s/ - .*//' | sort -u)
+    echo TIPSWEEP_DONE
+} > "$out" 2>&1

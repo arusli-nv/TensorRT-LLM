@@ -1,0 +1,71 @@
+# BUILD-ABLATE (1 node, --time 00:50; DIAGNOSTIC for OPEN_ITEMS_2026-10-25 items 1-2 / CLAIMS 200, 200b, 205; explain,
+# not ship). Kernel-only incremental build of a2a-ablate d47a3bcf88 = v5-final 27442bd91d + one kernel change
+# (moeAlltoAllKernels.cu: int FT_ABL template parameter on the fence dispatch/combine kernels, nonzero only for
+# ENABLE_RANK_MASK=1, TOP_K=8, picked per launch from env TRTLLM_A2A_FT_ABLATE = 0|S|S1|F|F8|L|A|SO|ALL; healthy-run
+# microbench only, the variants are not fault tolerant; side branch only, never v5-pr/v5-pr-fixes/v5-final).
+# C++ diff from build-root-v2's last build (mask-spill 7162255fce, same base 27442bd91d): that one .cu only.
+# Mounts (as BUILD-MASKSPILL 8287138): R:/art:rw and R:R:rw, overlays/build-root-v2:/art/build-root (its cpp-build-oot is
+#   overlays/build-root-feat's: no other build may run on build-root-v2/-feat while this runs; check the queue),
+#   overlays/build-src-ablate-d47a3bcf88:/checkout (cp -a of build-src-maskspill-7162255fce, mtimes kept, then
+#   checkout d47a3bcf88: only the .cu is newer than the objects; the maskspill snapshot is untouched).
+# Steps: (1) incremental wheel (build_and_test.sh: touches the .cu, verify_wheel 0 differ / 0 stale) -> /art/build-
+#   ablate-d47a3bcf88/dist; (2) ABLATE_RES gate: `cuobjdump -res-usage` of the wheel's libth_common.so through
+#   tools/ablate_res.py: every variant instantiated for both kernels exactly where the FT_ABL=0 MASK=1 TOP_K=8 control
+#   is, never elsewhere, and ALL at STACK 24 -> ABLATE_RES_OK (else stop: do not smoke/bench). Informational, not
+#   gating: ABLATE_RES_CTRL_SAME (FT_ABL=0 resource lines vs the v5-final freeze wheel's) and ABLATE_SASS_SAME (sm_100
+#   SASS instruction lines of 5 FT_ABL=0 kernels vs review/diag/ablate_ref_sass/, the freeze lib's SASS from the
+#   a2a_ep_scaling_coderead); per-variant SASS of dispatch<8,EPLB,MASK> and bf16 low-precision combine saved to sass/;
+#   (3) LIB_SHA256 staged next to dist for the bench's code check; (4) GPU tests: the gpu_moe group only (env unset,
+#   so FT_ABL=0; test_moe_comm.py is left out: its first test times out at setup under --timeout, OPEN_ITEMS item 5).
+# Est: incremental build ~12-20 min (BUILD-MASKSPILL: 11 min; FT_ABL adds ~110 kernel instantiations to this .cu),
+#   res + SASS check ~1 min, gpu_moe ~3 min (101 tests, 93 s) -> ~20-30 min; --time 00:50.
+# Pass: BUILD_SUCCESS, ABLATE_RES_OK, gpu_moe rc=0 -> BUILD_ABLATE_OK.
+#
+# Before submit (login host): the snapshot must show HEAD d47a3bcf88 (only the .cu differs from 7162255fce):
+#   git -C $R/overlays/build-src-ablate-d47a3bcf88 log --oneline -1
+#   git -C $R/overlays/build-src-ablate-d47a3bcf88 diff --stat 7162255fce d47a3bcf88   (1 file, moeAlltoAllKernels.cu)
+#   python3 $R/tools/presubmit.py --name build-ablate-d47a3bcf88 --nodes 1 --build-job --branch /tmp/claude-161238/wt-fix
+#   (wt-fix HEAD must be d47a3bcf88 on a2a-ablate) -> TOKEN; replace TOKEN below. slurm_submit: 1 node, 4 GPUs,
+#   --time 00:50, mounts above, command: bash $R/launch/ablate_build_cmd.txt
+bash /art/tools/require_presubmit.sh build-ablate-d47a3bcf88-34e69647c1 || exit 1
+[[ $(git -c safe.directory='*' -C /checkout rev-parse --short=10 HEAD) == d47a3bcf88 ]] || { echo "BUILD_ABLATE_FAILED /checkout is not d47a3bcf88"; exit 1; }
+[[ $(cat /art/build-root/last_built_commit) == 7162255fce* ]] || echo "note: build-root-v2 last built $(cat /art/build-root/last_built_commit), not 7162255fce: more than the .cu may recompile"
+label=ablate-d47a3bcf88
+out=/art/build-$label
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+SKIP_TESTS=1 bash /art/build_and_test.sh "$label" || { echo BUILD_ABLATE_FAILED build; exit 1; }
+grep -E "Building C|Linking" "$out/build.log" | tail -8
+cuobjdump=$(command -v cuobjdump || echo /usr/local/cuda/bin/cuobjdump)
+scratch=$(mktemp -d)
+extract() { python3 -c "import sys, zipfile; open(sys.argv[2], 'wb').write(zipfile.ZipFile(sys.argv[1]).read('tensorrt_llm/libs/libth_common.so'))" "$1" "$2"; }
+lib=$scratch/libth_common.so ref_lib=$scratch/ref_libth_common.so
+extract "$(ls "$out"/dist/*.whl)" "$lib"
+extract "$(ls /art/build-freeze-58caa0fde6/dist/*.whl)" "$ref_lib"
+sha256sum < "$lib" | cut -c1-64 > "$out/LIB_SHA256"
+"$cuobjdump" -res-usage "$ref_lib" > "$scratch/ref_res.txt"
+"$cuobjdump" -res-usage "$lib" | python3 /art/tools/ablate_res.py "$scratch/ref_res.txt" | tee "$out/res.txt"
+# Control codegen (informational): instruction lines of FT_ABL=0 kernels vs the freeze lib's (same template arguments).
+mkdir -p "$out/sass"
+ns=_ZN12tensorrt_llm3_v17kernels8moe_comm
+disp() { echo "${ns}20moeA2ADispatchKernelILi8ELb$1ELb$2ELb0ELb0ELi$3EEEvPKiNS2_22DispatchKernelPointersEiiiiiii"; }
+comb() { echo "${ns}19moeA2ACombineKernelI13__nv_bfloat16Li8ELb1ELb$1ELi$2EEEvNS2_21CombineKernelPointersEiiiiii"; }
+insns() { grep -E '^\s+/\*[0-9a-f]{4}\*/|^\s+/\* 0x[0-9a-f]{16} \*/' "$1"; }  # both encoding words
+for ref in e0_m0:"$(disp 0 0 0)" e0_m1:"$(disp 0 1 0)" e1_m0:"$(disp 1 0 0)" e1_m1:"$(disp 1 1 0)" lp_m1:"$(comb 1 0)"; do
+    tag=${ref%%:*} fun=${ref#*:} ref_file=/art/review/diag/ablate_ref_sass/$([[ $tag == lp_* ]] && echo comb || echo disp)_$tag.sass
+    "$cuobjdump" -sass -arch sm_100 -fun "$fun" "$lib" > "$out/sass/ctrl_$tag.sass" 2>&1
+    n=$(insns "$out/sass/ctrl_$tag.sass" | wc -l)
+    if (( n == 0 )); then echo "ABLATE_SASS_NOFUN $tag"
+    elif cmp -s <(insns "$ref_file") <(insns "$out/sass/ctrl_$tag.sass"); then echo "ABLATE_SASS_SAME $tag ($n lines)"
+    else echo "ABLATE_SASS_DIFF $tag ($(diff <(insns "$ref_file") <(insns "$out/sass/ctrl_$tag.sass") | grep -c '^[<>]') lines differ)"; fi
+done | tee "$out/sass.txt"
+for v in 1:S 2:S1 4:F 64:F8 8:L 16:A 32:SO 61:ALL; do
+    "$cuobjdump" -sass -arch sm_100 -fun "$(disp 1 1 ${v%%:*})" "$lib" > "$out/sass/disp_e1_m1_${v#*:}.sass" 2>&1
+    "$cuobjdump" -sass -arch sm_100 -fun "$(comb 1 ${v%%:*})" "$lib" > "$out/sass/comb_lp_m1_${v#*:}.sass" 2>&1
+done
+grep -q ABLATE_RES_OK "$out/res.txt" || { echo "BUILD_ABLATE_FAILED res (wheel kept in $out/dist; do not smoke/bench)"; exit 1; }
+SKIP_BUILD=1 GROUPS_ONLY=gpu_moe bash /art/build_and_test.sh "$label" 2>&1 | grep -v "^commit="
+grep -E '^(FAILED|ERROR)|passed|failed' "$out/test-gpu_moe.log" | tail -20
+[[ -s $out/test-gpu_moe.log ]] || { echo BUILD_ABLATE_FAILED no gpu_moe log; exit 1; }
+grep -qE '^(FAILED|ERROR)| failed' "$out/test-gpu_moe.log" && { echo BUILD_ABLATE_FAILED tests; exit 1; }
+echo BUILD_ABLATE_OK

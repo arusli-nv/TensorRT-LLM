@@ -1,0 +1,26 @@
+# RP028-TB (1 node): traceback of the per-commit failure at v5-pr 028bbbaacb:
+# test_resident_placement.py::test_static_placement_without_replicas_gets_restore_slots_with_ring_host_copies, -x off,
+# --tb=long -rA, with 028b's .py overlaid on the freeze wheel (same as V5PR-TESTS), to decide where the test belongs.
+# Second arm, MPI-SHORT: test_mpi_session.py::test_remote_mpi_session[flashinfer_temporary_cleanup] on the v5-pr tip
+# and v5-final overlays with --basetemp=/tmp/b (zmq ipc path ~90 chars, under the 107 limit). Rule (set before data):
+# passes on both -> V5PR-TESTS/MPISESSION-CTL failure is the long pytest basetemp path in our container, disclosed as
+# environmental; fails on either -> traceback to the monitor.
+# Output: review/diag/rp028-tb-<job>.txt. ~15 min; --time 00:25.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+out=$R/review/diag/rp028-tb-${SLURM_JOB_ID:-x}.txt
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    ARM_OUT=/dev/stdout bash $R/scratch-mpisession/run_full.sh $R/scratch-v5pr-commits/028bbbaacb $R/scratch-mpisession/list-rp.txt
+    echo RP028_TB_DONE
+    echo tests/unittest/llmapi/test_mpi_session.py > /tmp/list-mpi.txt
+    for arm in tip:scratch-v5pr-tip v5final:scratch-mpisession/v5final; do
+        echo "##### MPI-SHORT ${arm%%:*}"
+        PYTEST_EXTRA="--basetemp=/tmp/b-${arm%%:*} -k flashinfer_temporary_cleanup" ARM_OUT=/dev/stdout \
+            bash $R/scratch-mpisession/run_full.sh $R/${arm#*:} /tmp/list-mpi.txt
+    done
+    echo MPI_SHORT_DONE
+} > "$out" 2>&1

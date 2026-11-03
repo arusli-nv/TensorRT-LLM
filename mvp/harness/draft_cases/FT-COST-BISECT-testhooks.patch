@@ -1,0 +1,144 @@
+--- testhooks.py	2026-10-19 03:44:16.000000000 -0700
++++ testhooks.py.new	2026-10-19 08:33:32.000000000 -0700
+@@ -51,6 +51,17 @@
+ TLLM_TEST_EXPERT_STATISTIC_ITER_RANGE=a-b and TLLM_TEST_EXPERT_STATISTIC_PATH=dir set main's EXPERT_STATISTIC_*
+ (the launcher forwards only TLLM_* variables): every rank dumps per-slot routed-token counts of iterations [a, b),
+ which main runs without CUDA graphs.
++FT step-cost bisection (FT-COST-BISECT; healthy cases only, a peer loss may no longer recover):
++TLLM_TEST_FT_OFF=piece[,piece...] runs FT on without pieces of its healthy-path host work:
++- resp: the request/response taps (fetching_requests, broadcast_requests, requests_routed, gathering_responses,
++  responses_gathered) are RecoveryHook's no-ops: no response history, no owner bookkeeping on rank 0.
++- step: the step hooks (step_prepared, step_released, commit_step) are RecoveryHook's no-ops and
++  PeerLossRecovery.enabled is False, so the executor commits V2 context blocks and pauses recompute victims in
++  their own step, as without FT.
++- coll: MPIDist's host collectives run without _interruptible (no Get_failed after each, no in_host_collective).
++- watch: no PeerFailureWatch thread (no MPI_Test polling on a private communicator).
++Each rank logs WIDEEP_FT_OFF per patched module, WIDEEP_FT_OFF_ACTIVE serving=0|1 verified=<pieces> from the live
++executor when a serving loop starts, and WIDEEP_FT_OFF_CALL name=<tap> at the first call of each no-op tap.
+ Modules are patched when TRT-LLM imports them.
+ """
+ 
+@@ -83,6 +94,7 @@
+ RERUN_OWNER = os.environ.get("TLLM_TEST_KILL_RERUN_OWNER")
+ LATE_WRITE_DECODE = os.environ.get("TLLM_TEST_LATE_WRITE_IN_DECODE")
+ DELAY_ABORT_S = float(os.environ.get("TLLM_TEST_DELAY_ABORT_S", "0"))
++FT_OFF = frozenset(piece for piece in os.environ.get("TLLM_TEST_FT_OFF", "").split(",") if piece)
+ for _name in ("ITER_RANGE", "PATH"):
+     if os.environ.get(f"TLLM_TEST_EXPERT_STATISTIC_{_name}"):
+         os.environ[f"EXPERT_STATISTIC_{_name}"] = os.environ[f"TLLM_TEST_EXPERT_STATISTIC_{_name}"]
+@@ -507,6 +519,102 @@
+     _patch_populate(module)
+ 
+ 
++_FT_OFF_TAPS = {
++    "resp": ("fetching_requests", "broadcast_requests", "requests_routed", "gathering_responses", "responses_gathered"),
++    "step": ("step_prepared", "step_released", "commit_step"),
++}
++_COMMUNICATOR = "tensorrt_llm._torch.distributed.communicator"
++_RECOVERY = "tensorrt_llm._torch.pyexecutor.peer_loss_recovery"
++
++
++def _interruptible_code():
++    """The code object every _interruptible wrapper shares, or None before the communicator is imported."""
++    module = sys.modules.get(_COMMUNICATOR)
++    return None if module is None else module._interruptible(lambda self: None).__code__
++
++
++def _patch_ft_off_comm(module):
++    """TLLM_TEST_FT_OFF=coll: every host collective _interruptible wrapped runs bare."""
++    code = module._interruptible(lambda self: None).__code__
++    unwrapped = []
++    for cls in [value for value in vars(module).values() if isinstance(value, type)]:
++        for name, attr in list(vars(cls).items()):
++            if getattr(attr, "__code__", None) is code:
++                setattr(cls, name, attr.__wrapped__)
++                unwrapped.append(f"{cls.__name__}.{name}")
++    _say("WIDEEP_FT_OFF", f"module=communicator unwrapped={len(unwrapped)} {','.join(unwrapped)}")
++
++
++class _NoWatch:
++    """Stands in for PeerFailureWatch (TLLM_TEST_FT_OFF=watch): never fails, nothing to stop."""
++
++    failed = False
++
++    def stop(self) -> None:
++        pass
++
++
++def _no_watch(self) -> None:
++    self._watch = _NoWatch()
++
++
++def _first_call_logged(cls, name, replacement):
++    """``replacement`` as cls.name; the first call logs WIDEEP_FT_OFF_CALL and installs ``replacement`` itself."""
++
++    def first_call(self, *args, **kwargs):
++        setattr(cls, name, replacement)
++        _say("WIDEEP_FT_OFF_CALL", f"name={name}")
++        return replacement(self, *args, **kwargs)
++
++    return first_call
++
++
++def _patch_ft_off_recovery(module):
++    """TLLM_TEST_FT_OFF=resp,step,watch on PeerLossRecovery; for every piece, the serving loop's proof line."""
++    cls, base = module.PeerLossRecovery, module.RecoveryHook
++    originals = {}
++    for piece, taps in _FT_OFF_TAPS.items():
++        if piece in FT_OFF:
++            for name in taps:
++                originals[name] = getattr(cls, name)
++                setattr(cls, name, _first_call_logged(cls, name, getattr(base, name)))
++    if "step" in FT_OFF:
++        cls.enabled = False
++    if "watch" in FT_OFF:
++        cls._watch_peer_failures = _no_watch
++    _say("WIDEEP_FT_OFF", f"module=peer_loss_recovery taps={','.join(originals) or '-'} "
++         f"enabled={cls.enabled} watch={'stub' if 'watch' in FT_OFF else 'native'}")
++    run = cls.run
++
++    def proving_run(self, event_loop):
++        # What the live executor runs, piece by piece.
++        verified = []
++        for piece, taps in _FT_OFF_TAPS.items():
++            if all(name in originals and getattr(type(self), name) is not originals[name] for name in taps) and (
++                    piece != "step" or self.enabled is False):
++                verified.append(piece)
++        code = _interruptible_code()
++        if code is not None and getattr(type(self._executor.dist).tp_gather, "__code__", code) is not code:
++            verified.append("coll")
++        if type(self)._watch_peer_failures is _no_watch:
++            verified.append("watch")
++        try:
++            hang = module.fault_tolerance_config().hang_detection
++        except Exception as error:  # noqa: BLE001 - reported, not needed for the run
++            hang = f"unknown({type(error).__name__})"
++        _say("WIDEEP_FT_OFF_ACTIVE", f"serving={int(not self._executor.gather_all_responses)} "
++             f"verified={','.join(sorted(verified)) or '-'} hang_detection={hang}")
++        return run(self, event_loop)
++
++    cls.run = proving_run
++
++
++def _chain(name, patch):
++    """Add ``patch`` for module ``name`` after any patch it already has."""
++    previous = PATCHES.get(name)
++    PATCHES[name] = patch if previous is None else (lambda module: (previous(module), patch(module)))
++
++
+ PATCHES = {
+     "tensorrt_llm._torch.pyexecutor.cuda_graph_runner": _patch_graphs,
+     "tensorrt_llm._torch.autotuner": _patch_autotuner,
+@@ -530,6 +638,12 @@
+ if (KILL_HERE and (KILL_PREFILL or KILL_DECODE or STALL_DECODE or STICKY_DECODE or HOST_STALL_DECODE
+                    or GIL_HOG_DECODE or LATE_WRITE_DECODE)) or RERUN_OWNER:
+     PATCHES["tensorrt_llm._torch.pyexecutor.model_engine"] = _patch_engine
++if FT_OFF and RANK is not None:
++    if FT_OFF - {"resp", "step", "coll", "watch"}:
++        _say("WIDEEP_FT_OFF_ERROR", f"unknown pieces {sorted(FT_OFF - {'resp', 'step', 'coll', 'watch'})}")
++    _chain(_RECOVERY, _patch_ft_off_recovery)
++    if "coll" in FT_OFF:
++        _chain(_COMMUNICATOR, _patch_ft_off_comm)
+ 
+ 
+ class _Finder(importlib.abc.MetaPathFinder):

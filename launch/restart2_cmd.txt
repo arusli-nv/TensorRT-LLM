@@ -1,0 +1,31 @@
+# RESTART2 (16 nodes, two 8-node groups, segment 8). This decides slide 1's restart baseline with more runs: FT-off warm
+# restart after a rank kill, the COLD-RESTART harness and knobs of FIN6 J8 8206870 (launch/fin6_j8_cmd.txt, block D),
+# wheel build-freeze-58caa0fde6 without overlay (FT off is the same code in v5-final: the host-copy fixes act only with
+# FT on; review/diag/data_quality_audit.md section 1).
+# Rules (written before any RESTART2 data, review/OVERNIGHT_PLAN_2026-10-27.md): new runs pool with CLAIMS 224's 10
+# restarts per mode; slide 1 / Fig A4 update with the pooled means; every changed number logged in FINAL/OVERNIGHT_LOG.md.
+# Readout: COLD_RESTART lines in mvp/runs/COLD-RESTART{-A,,-B}-<job>/cold_restart.txt (+ rank-0 phase lines).
+# Runs (J8 measured: no EPLB 2 + ~11/run, offline 2 + ~12, online 2 + ~16):
+#   G0: no EPLB x3 (COLD-RESTART-A) + offline x3 (COLD-RESTART-B)   ~2+33 + 2+36 = ~73 min
+#   G8: online x4 (COLD-RESTART)                                    ~2+64       = ~66 min
+#   --time 01:35, group limit 5400 s.
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1
+B=build-freeze-58caa0fde6
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then C3=rank5 C4=rank5; else C3='rank5 rank5 rank5' C4='rank5 rank5 rank5 rank5'; fi
+KS=200
+D="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 WIDEEP_KILL_AFTER_STEPS=$KS"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$D CR_BENCH_CONFIG=std-noeplb.yaml CR_RUNS='$C3' $(run COLD-RESTART-A)"
+P0_2="$D CR_BENCH_CONFIG=std-offline-ft-filled.yaml CR_RUNS='$C3' $(run COLD-RESTART-B)"
+G0="{ $P0_1; $P0_2; }"
+P8_1="$D CR_BENCH_CONFIG=std-online.yaml CR_RUNS='$C4' $(run COLD-RESTART)"
+G8="{ $P8_1; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:5400:$G0" "8:8:5400:$G8"

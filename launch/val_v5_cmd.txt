@@ -1,0 +1,21 @@
+# VAL-V5 (16 nodes): validation of v5 f96a8c1a53 (v5 wheel 2ccc3e8e1c + overlay v5f-f96a8c1a53): design C, fence-always,
+# detector off, exec'd worker, and the launcher-selected transport (ob1 + sm). Every FT case launches as the feature
+# doc does: no pml/btl flags (WIDEEP_MPI_MCA keeps only btl_tcp_if_include and coll); trtllm-llmapi-launch picks ob1
+# with self,sm,tcp. Each group gates the changed unit files first (incl. test_mpi_survivors_ulfm: mpirun --mca reaches
+# the ranks' env).
+# Group 0: kills, standard config (R1 NVFP4 + MTP), 1 each:
+#   rank5 / node1: recover (KILL_FINAL_VERDICT PASS);
+#   rank0: not recoverable, the job must end on its own within 180 s (rank 0's leader is not exec'd);
+#   then healthy std-noeplb off|ft at 32/GPU: the rank-0 region log (MTP and NVFP4 signatures disjoint), the KV pool
+#   per rank FT vs off (design C's workspace), and step time vs v3 (n=1).
+# Group 8: twokill (second loss after the first commit) and stop (SIGSTOP, hang detection on, hang_confirm_s 30:
+#   the frozen-rank time with the detector off), then SHUTDOWN-R1 (ft-clean / ft-loss / noft-clean, rc 143, no
+#   leftovers).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5f-f96a8c1a53
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+g() { echo "PYTEST_ADDOPTS='-k \"not flashinfer_temporary_cleanup\"' bash $R/tools/units_gate.sh $R/logs/bundle/valv5-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $O-tests $R/overlays/build-src-2ccc3e8e1c $R/$B/point-units-f96a8c1a53-g$1 tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py tests/unittest/llmapi/test_mpi_session.py"; }
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=1 WIDEEP_MPI_MCA='$M' WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=25 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+S="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O WIDEEP_MPI_MCA='$M'"
+bash $R/bundle.sh "0:8:7000:$(g 0) && { $K KF_ROWS='rank5 node1 rank0' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft-doc' bash $R/mvp/harness/run_job.sh STD; }" \
+  "8:8:7000:$(g 8) && { $K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B; $S bash $R/mvp/harness/run_job.sh SHUTDOWN-R1; }"

@@ -1,0 +1,59 @@
+# THIN-CELLS (16 nodes, two 8-node groups = one DEP32 server each, segment 8): rerun the design doc's thin recovery cells
+# on v5-final 27442bd91d (overlays/fix-dropmap-9f1fd4cab4 on build-freeze-58caa0fde6) with the KILL-FINAL harness, knobs,
+# configs, victims and pass rule of V5F-REC 8269102 / V5F-REC-OFF 8283311 / REPL-REC 8285728, to raise n.
+# Rules (user ~23:30 PT 2026-10-25 via monitor, HANDOFF:1511-1512, review/OVERNIGHT_PLAN_2026-10-25.md:48-53), written
+# before any THIN-CELLS data: presented data may be extended or replaced where that helps; every replaced number is
+# disclosed next to the new one ("thin cells rerun decided 10-25 ~23:30 after the original n=1 was seen"); pass/claim
+# rules unchanged; a code change means refreeze + rerun.
+# Pass rule (unchanged): the standard KILL_FINAL rule, mvp/harness/job.sh kf_verdict (:3700-3826), per case
+# KILL_FINAL_VERDICT PASS iff served_again (state DONE + a resume line), lost_expected (failed ranks == the victims),
+# no_survivor_failed (client_cut <= max(lost_held, recovery_failed)), recovery_failed_bounded (<= 128 x victims; twokill
+# <= 128 + ceil(128 x 32/31)), no_capture_after_resume (0 captures/compiles/autotunes after the resume), H23
+# (val_verdicts.h23_checks: resume_s <= 10 s (twokill: and resume2_s; stop: timed from the hang confirmation),
+# est_tok_s_after / est_tok_s_before >= 0.8 x live/32, >= 20 requests in full after the loss); twokill also ft_watch PASS.
+# Readout: grep -h '^KILL_FINAL_VERDICT\|^KILL_FINAL_ROW' $R/mvp/runs/KILL-FINAL-{OFF-B,OFF-A,ON-A}-<job>/kill_final.txt
+# (KILL_FINAL_ROW = job.sh:3937-3953 per-row summary on node 0). A cell's pooled n counts every PASS/FAIL verdict.
+# Cells (current n from CLAIMS 193/202/203 and DESIGN_DOC_final.md:481-483, 512, 537) -> new cases -> pooled n:
+#   offline EPLB rank kill  n=1 (8283311) -> +2 (victims 5, 22)  -> n=3
+#   offline EPLB node kill  n=1 (8283311) -> +2 (nodes 1, 5)     -> n=3
+#   frozen rank (stop), online   n=1 (ON-A-8269102)  -> +1 (rank 2, SIGSTOP, 64/GPU) -> n=2
+#   frozen rank (stop), no EPLB  n=1 (OFF-A-8269102) -> +1 (rank 2)               -> n=2
+#   two losses (twokill), online n=1 (ON-A-8269102)  -> +1 (ranks 13 then 17, as rep 1) -> n=2
+#   two losses (twokill), no EPLB n=1 (OFF-A-8269102) -> +1 (ranks 5 then 9, as rep 1)  -> n=2
+# Victims: KF_REPEATS=2 rotates as V5F-REC/REPL-REC (rep 1 = rank 5 / node 1, rep 2 = rank 22 / node 5); twokill/stop
+# KF_REPEATS=1 = the same victims as the existing rows (stop is always rank 2).
+# Groups (measured case minutes, logs/bundle/{8283311,8269102,8285728}-*.log; a job's first case ~+2-3 min cold):
+#   G0 offline (std-offline-ft-filled.yaml, as V5F-REC-OFF): rank5-1 node1-1 rank5-2 node1-2 (14.6, 13.0, ~13, ~13) ~54
+#   G8 no-EPLB (std-noeplb-ft.yaml) twokill-1 stop-1 (11.2+~3, 11.1), then online (std-online.yaml) twokill-1 stop-1
+#      (16.4, 14.1) ~56. Groups end within ~2-5 min. + ~4 min startup = ~60 min; worst case 4 x 17 + 4 = 72 min.
+#   --time 01:30, group limit 4800 s; job.sh starts a case only with >= 15 min left.
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=${FIX_BUILD:-build-freeze-58caa0fde6}; MB=build-main-9cc37929e8  # FIX_BUILD: the fix wheel if it needs a rebuild
+FIX_OVERLAY=${FIX_OVERLAY:-$R/overlays/fix-dropmap-9f1fd4cab4}
+O=${FIX_OVERLAY:+MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1}  # FIX_OVERLAY: a Python-only fix overlaid on B
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=6,128=3 IT_HX=8=24,32=6,128=3,512=1 BURN=32:2 KI=4 KI32=8 KSTOP=4 CRR=rank5
+else
+    IT_MAIN=32=28,128=12 IT_HX=8=39,32=28,128=12,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 CRR='rank5 rank5'
+fi
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+KOFF="$K KF_BENCH_CONFIG=std-offline-ft-filled.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$KOFF KF_ROWS='rank5 node1' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-OFF-B)"
+G0="{ $P0_1; }"
+P8_1="$KNO KF_ROWS='twokill stop' KF_REPEATS=1 $(run KILL-FINAL-OFF-A)"
+P8_2="$KON KF_ROWS='twokill stop' KF_REPEATS=1 $(run KILL-FINAL-ON-A)"
+G8="{ $P8_1; $P8_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:4800:$G0" "8:8:4800:$G8"

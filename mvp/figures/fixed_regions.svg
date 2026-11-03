@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="680" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="white"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#1A1A1A"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#9A9A9A"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<text x="30" y="42" font-size="26" fill="#1A1A1A" text-anchor="start" font-weight="bold">Without FT</text>
+<text x="220" y="42" font-size="17" fill="#707070" text-anchor="start" font-weight="normal">receive buffer (written by peers over NVLink)</text>
+<text x="172" y="99" font-size="19" fill="#1A1A1A" text-anchor="end" font-weight="bold">step N</text>
+<rect x="190" y="66" width="1016.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="190.0" y="66" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="221.875" y="100" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">0</text>
+<rect x="253.75" y="66" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="285.625" y="100" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">1</text>
+<rect x="317.5" y="66" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="349.375" y="100" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">2</text>
+<rect x="381.25" y="66" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="413.125" y="100" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">3</text>
+<text x="172" y="209" font-size="19" fill="#1A1A1A" text-anchor="end" font-weight="bold">step N+1</text>
+<rect x="190" y="176" width="1016.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="190.0" y="176" width="123.5" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="253.75" y="210" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">0</text>
+<rect x="317.5" y="176" width="123.5" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<rect x="445.0" y="176" width="123.5" height="50" rx="7" fill="url(#hatch)" stroke="#C9C9C9" stroke-width="1.6"/>
+<text x="508.75" y="210" font-size="24" fill="#707070" text-anchor="middle" font-weight="bold">2</text>
+<rect x="572.5" y="176" width="123.5" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="636.25" y="210" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">3</text>
+<rect x="317.5" y="176" width="59.75" height="50" rx="7" fill="#FBE6E4" stroke="#C8372D" stroke-width="3"/>
+<text x="413.125" y="210" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">1</text>
+<line x1="349.375" y1="120" x2="349.375" y2="171" stroke="#C8372D" stroke-width="3" stroke-dasharray="8 5" marker-end="url(#red)"/>
+<text x="363.375" y="155.0" font-size="19" fill="#C8372D" text-anchor="start" font-weight="normal">late write (corrupting)</text>
+<line x1="30" y1="278" x2="1210" y2="278" stroke="#E6E6E6" stroke-width="2"/>
+<text x="30" y="326" font-size="26" fill="#76B900" text-anchor="start" font-weight="bold">With FT</text>
+<text x="220" y="326" font-size="17" fill="#707070" text-anchor="start" font-weight="normal">receive buffer: one fixed slot per sender</text>
+<text x="172" y="385" font-size="19" fill="#1A1A1A" text-anchor="end" font-weight="bold">step N</text>
+<rect x="190.0" y="352" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="190.0" y="352" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="221.875" y="386" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">0</text>
+<rect x="445.0" y="352" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="445.0" y="352" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="476.875" y="386" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">1</text>
+<rect x="700.0" y="352" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="700.0" y="352" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="731.875" y="386" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">2</text>
+<rect x="955.0" y="352" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="955.0" y="352" width="59.75" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="986.875" y="386" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">3</text>
+<text x="172" y="495" font-size="19" fill="#1A1A1A" text-anchor="end" font-weight="bold">step N+1</text>
+<rect x="190.0" y="462" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="190.0" y="462" width="123.5" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="253.75" y="496" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">0</text>
+<rect x="445.0" y="462" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="445.0" y="462" width="123.5" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="508.75" y="496" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">1</text>
+<rect x="700.0" y="462" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="700.0" y="462" width="123.5" height="50" rx="7" fill="url(#hatch)" stroke="#C9C9C9" stroke-width="1.6"/>
+<text x="795.625" y="496" font-size="24" fill="#707070" text-anchor="middle" font-weight="bold">2</text>
+<rect x="955.0" y="462" width="251.0" height="50" rx="7" fill="#FAFAFA" stroke="#DADADA" stroke-width="1.6"/>
+<rect x="955.0" y="462" width="123.5" height="50" rx="7" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<text x="1018.75" y="496" font-size="24" fill="#1A1A1A" text-anchor="middle" font-weight="bold">3</text>
+<rect x="700.0" y="462" width="59.75" height="50" rx="7" fill="#FBE6E4" stroke="#C8372D" stroke-width="3"/>
+<line x1="731.875" y1="406" x2="731.875" y2="457" stroke="#C8372D" stroke-width="3" stroke-dasharray="8 5" marker-end="url(#red)"/>
+<text x="745.875" y="441.0" font-size="19" fill="#C8372D" text-anchor="start" font-weight="normal">late write: lands in rank 2&#x27;s own slot</text>
+<rect x="190" y="600" width="1016.0" height="56" rx="10" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="2"/>
+<text x="700.0" y="625" font-size="19" fill="#1A1A1A" text-anchor="middle" font-weight="bold">Experts read each live slot&#x27;s sent rows in place; slot 2 is skipped</text>
+<text x="700.0" y="648" font-size="15" fill="#707070" text-anchor="middle" font-weight="normal">the routing sort reads the expert ids and weights from the same slots</text>
+<line x1="253.75" y1="516" x2="253.75" y2="596" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="508.75" y1="516" x2="508.75" y2="596" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="1018.75" y1="516" x2="1018.75" y2="596" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<text x="172" y="563.0" font-size="17" fill="#707070" text-anchor="end" font-weight="normal">no copy</text>
+</svg>

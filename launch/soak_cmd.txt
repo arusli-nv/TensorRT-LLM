@@ -1,0 +1,134 @@
+# SOAK (16 nodes, two 8-node groups, segment 8; SOAK_JOB=1..N picks the job of a chain of identical 2 h jobs, qos short,
+# --time 02:00:00): OPEN_ITEMS_2026-10-25 item 3. Is the 1/36 healthy-serving hang (CLAIMS 204, review/diag/
+# repl_hang_8285727.md: all ranks stalled in main's attention-DP Allgatherv, FT arm, ob1/TCP launcher) caused by the
+# ob1/TCP transport, by FT, or chance?
+# Arms (same code, seeds/pins, config and knobs as the finals online arms, V5F-W1A/REPL-COST: overlays/fix-dropmap-9f1fd4cab4
+# on build-freeze-58caa0fde6, seed STD-G1-8193512 pinned.json, std-online.yaml, HANG_DETECTION=1 CONFIRM_S=30):
+#   FT   = std-online-ft (FT on, ULFM mpirun) on ob1/TCP: WIDEEP_MPI_MCA = the string task.sh gives every FT arm.
+#   OFF  = std-online-ulfm (FT off under the same ULFM mpirun, job.sh:2971 mode noft-ulfm) on the SAME WIDEEP_MPI_MCA
+#          (task.sh:50 honours it). Both arms share ob1/TCP + ULFM; only FT's code differs. (SOAK_OFF_ARM=std-online, FT
+#          off under plain mpirun, is kept as an option but is not this design.)
+# Groups: odd SOAK_JOB: G0 = FT, G8 = OFF; even SOAK_JOB: swapped (node-set balance; Slurm picks new nodes per job).
+# Load: continuous healthy 32/GPU (1024 streams, 1k/1k) in segments. A segment = one case = startup + burn-in 32:6 +
+# warm + healthy-32 for W waves (~12 s each). Node 0 of each group sizes W from the time left so both groups end
+# ~SOAK_MARGIN_MIN before the Slurm end (W <= SOAK_WMAX = 150 for client memory and result size). A hang ends its case
+# (main's HangDetector 300 s -> MPI_Abort; FT arm ~600 s, CLAIMS 204; backstop the case stall guard WIDEEP_STALL_S=720
+# and the case timeout); the group then starts the next segment while one fits (>= SOAK_WMIN waves), so it does not idle.
+# Est per group (bundle start ~112 min before the Slurm end): segments 1 and 2 ~15 + 30 = ~45 min each (W 150), segment
+# 3 only if >= 23 min are left (usually not): ~1.0-1.1 loaded h per arm per job; 6 jobs ~6.3 loaded h per arm.
+# Per-job readout: when both groups are done (or after the bundle), one node writes review/diag/soak_<job>.txt
+# (tools/soak_stalls.py --verdict over this job's fillseg cases: per case/arm lines + 5 VERDICT lines, interim only).
+#
+# Rules (written before any soak data; OPEN_ITEMS_2026-10-25 item 3):
+# - Stall event: inside a load window of a case (a 32/GPU row of result.json: burnin-32 or healthy-32), two consecutive
+#   rank-0 iteration lines more than 60 s apart, or, for a row that did not finish (rc != 0, or the case ended before
+#   its row was written), the last rank-0 iteration more than 60 s before the window's end. A window starts at the first
+#   rank-0 iteration with num_scheduled_requests > 0 at or after the row's start_wall_s (the client's prompt generation is
+#   not load); it ends at the last iteration (finished row) or at start_wall_s + elapsed_s / MPIRUN_EXIT (unfinished).
+#   Exposure = the summed window lengths up to each window's last iteration. Readout: tools/soak_stalls.py (checked on STD-8285727: 1 event in
+#   std-online-ft-1, 0 in std-online-1). Hang = a stall event the server never recovers from (the case ends in it).
+# - Decision (counts per arm, all jobs of the chain pooled; a case with a new Xid/NVRM line or a node-health failure is
+#   excluded and listed):
+#   "The transport" below means ob1/TCP + the ULFM runtime together (both arms run them; this design cannot split them).
+#   * events in both arms -> the transport, not FT's code.
+#   * events in the FT arm only -> FT's code. With k events all in FT and equal exposure the chance of that under equal
+#     rates is 0.5^k: k = 1-4 is reported as "consistent with FT's code, not shown"; k >= 5 as "FT's code".
+#   * events in the OFF arm only -> the transport (FT's code is not needed for it).
+#   * none -> rare: report per arm the one-sided 95% Poisson upper bound on the rate per loaded hour (3.00 / hours for 0).
+# - Not concluded in any outcome: the root cause inside the transport or FT (no MPI-level trace); the rate under other
+#   loads, EPLB modes, scales, the finals' short-window load pattern or the default (UCX) transport; ob1/TCP vs the ULFM
+#   runtime (a "transport" result does not split them); anything about FT's hang path (CLAIMS 204 B stands).
+# - No rule above changes after soak data (memory: no-criteria-change-after-data).
+# TTFT locking test (written before data, 10-26). Each healthy row is cut into consecutive non-overlapping 300 s
+# sub-windows of whole waves, starting after the row's burn-in. Each sub-window is classified with
+# review/diag/why_ttft_restart_scripts (locked = median per-wave arrival spread <= 15 iterations). Its median TTFT comes
+# from the per-request records.
+# - Primary unit: the FIRST sub-window of each row, one per row, independent.
+# - Primary test: two-sided Fisher exact test on locked vs dispersed, FT vs OFF (std-online-ulfm). p < 0.05 means FT
+#   biases runs toward locking.
+# - Secondary, descriptive only: the locked fraction over all sub-windows per arm, and within-state median-TTFT FT - OFF
+#   with a bootstrap 95% CI resampled by row.
+# - If p >= 0.05 and both within-state CIs include 0: 'benchmark bistability, no FT TTFT cost at this load'.
+# - Caveat: OFF runs over the same ULFM ob1/TCP launch, not plain mpirun. CLAIMS 208 found the transport does not move TTFT.
+# - Known limitation (added 10-26 ~10:30, before unblinding): each healthy row starts with all 1024 streams together, so
+#   sub-window 0 may reflect the start-up state rather than steady state; the primary test therefore asks whether FT changes
+#   the start state (as the finals' 300 s windows measured); steady state is covered descriptively by sub-windows 1+.
+# - Disclosure: one FT row (STD-8304160-fillseg1) was classified during the readout script's mechanics check before
+#   unblinding (sub-window 0 locked, 1-4 dispersed); no arm comparison was made. Mechanics: review/drafts/soak_ttft_lock_NOTES.md.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+SELF=$(realpath "$0")
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=${FIX_BUILD:-build-freeze-58caa0fde6}; MB=build-main-9cc37929e8
+FIX_OVERLAY=${FIX_OVERLAY:-$R/overlays/fix-dropmap-9f1fd4cab4}
+O=${FIX_OVERLAY:+MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1}
+SMOKE=${SMOKE:-0}
+BURN=32:6; [[ $SMOKE == 1 ]] && BURN=32:2
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+# The FT arm's host transport, verbatim from launch/task.sh:52 (DEPLOY line of every FT arm, e.g. bundle/8285727-0.log:50).
+MCA="--mca pml ob1 --mca btl self,tcp --mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+E="$O MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=1 FT_COST_E2E_SEED=$SON WIDEEP_MPI_MCA='$MCA' WIDEEP_STALL_S=720"
+SOAK_WAVE_S=12 SOAK_OVH_MIN=15 SOAK_MARGIN_MIN=6 SOAK_WMAX=$((SMOKE ? 6 : 150)) SOAK_WMIN=$((SMOKE ? 6 : 10)) SOAK_SEGS=$((SMOKE ? 2 : 6))
+OFF_ARM=${SOAK_OFF_ARM:-std-online-ulfm}
+case $OFF_ARM in std-online|std-online-ulfm) ;; *) echo "DRY_RUN_FAIL SOAK_OFF_ARM must be std-online or std-online-ulfm"; exit 1 ;; esac
+[[ ${SOAK_JOB:-} =~ ^[1-9][0-9]*$ ]] || { echo "DRY_RUN_FAIL SOAK_JOB must be 1, 2, ..."; exit 1; }
+if (( SOAK_JOB % 2 )); then A0=std-online-ft A8=$OFF_ARM; else A0=$OFF_ARM A8=std-online-ft; fi
+runs=$R/mvp/runs soakdir=$R/logs/soak diag=$R/review/diag  # a CPU dry run (tools/dry_run.sh) writes only under its scratch dir
+[[ -n ${WIDEEP_DRY_RUN:-} ]] && runs=$WIDEEP_DRY_RUN/runs soakdir=$WIDEEP_DRY_RUN/soak diag=$WIDEEP_DRY_RUN
+mkdir -p "$soakdir"
+# This job's readout, written once (mkdir lock): every fillseg case of both groups, then the 5 VERDICT lines.
+readout() {
+    mkdir "$soakdir/$SLURM_JOB_ID.readout" 2>/dev/null || return 0
+    local out=$diag/soak_$SLURM_JOB_ID.txt
+    { echo "SOAK_READOUT job=$SLURM_JOB_ID SOAK_JOB=$SOAK_JOB G0=$A0 G8=$A8 smoke=$SMOKE via=$1 $(date '+%F %T %Z')"
+      timeout 600 python3 -I $R/tools/soak_stalls.py --verdict $runs/STD*-$SLURM_JOB_ID-fillseg*/std-online*-[0-9]
+      echo "SOAK_READOUT_RC $?"; } > "$out.tmp" 2>&1
+    mv "$out.tmp" "$out"
+    echo "SOAK_READOUT $out"
+}
+
+# One group's segments (bundle task: SLURM_NODEID / SLURM_NNODES are group-local). Node 0 decides each segment's waves
+# (0 = stop) into a shared file; every node follows it, so the 8 nodes never disagree on whether a case starts.
+if [[ -n ${SOAK_ARM:-} ]]; then
+    end=${SLURM_JOB_END_TIME:-$(( $(date +%s) + 115 * 60 ))}
+    dec=$soakdir/$SLURM_JOB_ID-$SOAK_TAG
+    for k in $(seq $SOAK_SEGS); do
+        if [[ $SLURM_NODEID == 0 ]]; then
+            left=$(( (end - $(date +%s)) / 60 ))
+            w=$(( (left - SOAK_MARGIN_MIN - SOAK_OVH_MIN) * 60 / SOAK_WAVE_S ))
+            (( w > SOAK_WMAX )) && w=$SOAK_WMAX
+            (( w >= SOAK_WMIN )) || w=0
+            echo "$w $left" > "$dec-seg$k.tmp" && mv "$dec-seg$k.tmp" "$dec-seg$k"
+        fi
+        for _ in $(seq 900); do [[ -s $dec-seg$k ]] && break; sleep 1; done
+        read -r w left < "$dec-seg$k" 2>/dev/null || w=0
+        echo "SOAK_SEG $SOAK_TAG seg=$k arm=$SOAK_ARM waves=${w:-0} left_min=${left:-?} node=$SLURM_NODEID $(date +%T)"
+        (( ${w:-0} > 0 )) || break
+        # Per node TCP counters around each segment (retransmits, timeouts; the harness collects only listen drops).
+        snap() { mkdir -p "$1"; cat /proc/net/snmp /proc/net/netstat > "$1/tcp-$SLURM_NODEID-$2.txt" 2>&1; }
+        run=$runs/$SOAK_JOB_NAME-$SLURM_JOB_ID-fillseg$k
+        snap "$run" before
+        env BUNDLE_FILL_ROUND=seg$k COST_LOADS=32 COST_LOAD_ITERATIONS=32=$w COST_MAX_WAVES=$w \
+            COST_CASE_TIMEOUT_S=$(( (left - 2) * 60 )) FT_COST_E2E_ARMS=$SOAK_ARM \
+            bash $R/mvp/harness/run_job.sh $SOAK_JOB_NAME
+        snap "$run" after
+    done
+    # Group done (a hung last segment ends its case, so this runs too): the second group's node 0 writes the readout.
+    if [[ $SLURM_NODEID == 0 ]]; then
+        touch "$soakdir/$SLURM_JOB_ID-$SOAK_TAG.done"
+        [[ -e $soakdir/$SLURM_JOB_ID-g0.done && -e $soakdir/$SLURM_JOB_ID-g8.done ]] && readout group-end
+    fi
+    exit 0
+fi
+run() { echo "SOAK_ARM=$1 SOAK_TAG=$2 SOAK_JOB_NAME=$3 bash $SELF"; }
+G0="$E SOAK_JOB=$SOAK_JOB SMOKE=$SMOKE SOAK_OFF_ARM=$OFF_ARM $(run $A0 g0 STD)"
+G8="$E SOAK_JOB=$SOAK_JOB SMOKE=$SMOKE SOAK_OFF_ARM=$OFF_ARM $(run $A8 g8 STD-G1)"
+echo "SOAK_JOB $SOAK_JOB G0=$A0 G8=$A8 smoke=$SMOKE"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:7000:$G0" "8:8:7000:$G8"
+# Fallback (a group's task ended by the bundle limit never marked done): node 0 writes the readout if nobody did.
+[[ ${SLURM_NODEID:-0} == 0 ]] && readout bundle-end

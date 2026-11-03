@@ -1,0 +1,6 @@
+# UNITS-POINT (1 node, 4 GPUs; PREFLIGHT 18): first GPU run of v5-zero b6f895cbc5's new/changed tests on the BUILD-ZERO2 wheel
+# build-v5zero-f9e6bc0f8b + overlay vzero-b6f895cbc5 (staging-room assert 53f788f831, PROTOCOL_VERSION 2 1bdb4baa6c) + -tests:
+# test_moe_a2a_recovery incl. the new two-round case (c134ce0284) and the polling late_writes control, each 3x; ring copies.
+# Submit only after BUILD-ZERO2 8164323's extras pass. Pass: POINT_UNITS_PASS; then these files may enter 16-node gates.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5zero-f9e6bc0f8b; O=$R/overlays/vzero-b6f895cbc5
+bash $R/tools/point_units.sh $R/$B/dist $O $O-tests $R/overlays/build-src-f9e6bc0f8b $R/$B/point-units-b6f895cbc5-${SLURM_JOB_ID:-x} tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py

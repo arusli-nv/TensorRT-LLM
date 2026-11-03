@@ -1,0 +1,8 @@
+# NSYS8 (09:07 PT): what is the ~165 ms device step that all 32 ranks run together, FT on, w/o EPLB 8/GPU, every 60
+# iterations after a wave start (ULFM8 per-rank logs)? One 8-node group, std-noeplb-ft then std-noeplb, 8/GPU only, one
+# 250-step nsys window on ranks 0 and 5 per case (it covers >= 3 of the 60-iteration stall positions; 12 ms steps -> ~3 s).
+# TLLM_TEST_LOG_EAGER=1 logs every generation step that replayed no CUDA graph (testhooks WIDEEP_EAGER_STEP).
+# Readout: per-step kernel count and duration at the stall step (an eager step = many launches; JIT/tuning = one long kernel).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+E="MVP_BUILD=$B FINAL_BUILD=$B STD_NSYS=1 WIDEEP_PROFILE_STEPS=250 TLLM_TEST_LOG_EAGER=1 WIDEEP_NO_SAMPLERS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=8 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:3300:$E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD"

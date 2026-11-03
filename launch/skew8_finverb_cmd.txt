@@ -1,0 +1,16 @@
+# SKEW8 (8 nodes): one shared cause for the 8/GPU timeout stalls (CLAIMS 153) and the serving-only a2a cost (C5)?
+# Arms off | ft | ulfm (FT off on FT's launcher), no EPLB, loads 8 and 32/GPU, same nodes, one round.
+# Every rank logs: WIDEEP_SKEW (host gap from its last host collective to its graph replay), WIDEEP_COLL (its time in
+# each host collective: completion spread), WIDEEP_FETCH / WIDEEP_ADMIT (when refills reach the rank and when the ADP
+# gate releases them). The timed client records each request's send time (closed loop: arrival spread per wave).
+# Readout per arm and load: launch spread = collective completion spread + host gap spread; refills per wave per rank;
+# timeout releases per wave; client arrival spread per wave.
+# + group 8, FINVERB (d diagnosis, DECISIONS 18:00): the shutdown trio (ft-clean, ft-loss after a recovery, noft-clean), detector on,
+#   v3 wheel + overlay v4bc-bdb01feb4f (no 3 s bound: the 30 s bound shows the natural finalize), Open MPI FT verbose 40:
+#   per-rank "quit message" / "suspected dead" / "DONE WITH FINALIZE" lines show where detector finalize stalls, clean and
+#   degraded; and why mpirun returns the lost rank's 137 instead of the stop's 143 (DECISIONS 18:20: a graceful stop exits 143).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+D="TLLM_TEST_LAUNCH_SKEW=500 TLLM_TEST_COLL_TIMES=1000 TLLM_TEST_COLL_RANKS=all TLLM_TEST_LOG_ADMIT=1 WIDEEP_TIMED_CLIENT=1"
+bash $R/bundle.sh "0:8:4800:$E $D COST_LOADS=8,32 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ulfm' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:3000:MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$R/overlays/v4bc-bdb01feb4f OMPI_MCA_mpi_ft_verbose=40 bash $R/mvp/harness/run_job.sh SHUTDOWN-R1"

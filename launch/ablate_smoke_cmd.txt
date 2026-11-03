@@ -1,0 +1,35 @@
+# ABLATE-SMOKE (1 node, 4 GB200, --time 00:25; DIAGNOSTIC gate before ABLATE, OPEN_ITEMS_2026-10-25 item 1). Runs only
+# after BUILD-ABLATE printed BUILD_ABLATE_OK (launch/ablate_build_cmd.txt). Never-run variants go to 1 node first.
+# What: tools/a2aep_ep.sh on wheel build-ablate-d47a3bcf88, EP4, T=64, stats on and off, every variant
+#   (0 S S1 F F8 L A SO ALL), 1 launch each = 18 launches. Each launch (a2aep_bench.py --ablate V) captures off, ft
+#   (TRTLLM_A2A_FT_ABLATE=V), off2 and ft0 (=0, unchanged FT kernel), after one eager round trip per variant on check
+#   inputs that must give off's combine output bit for bit and the expected gathered EPLB stats (A2A_EP_CHECK).
+# Gate (set before data): node 0 CODE_V5F_OK (the 5 .py of 27442bd91d + fix-dropmap overlay), ABLATE_RES_OK and the
+#   lib sha256 = build-ablate-d47a3bcf88/LIB_SHA256 (a2aep_ep.sh A2AEP_RES_*), 18 launches rc=0, 18 A2A_EP_CHECK ... OK
+#   lines, 18 A2A_EP timing lines -> SMOKE_ABLATE_OK. The EP4 numbers (tools/ablate_verdict.py <out> 4 64) are context
+#   only; no rule uses them (EP4 has 4 peers, so S/S1 should cut little). Fail -> stop, report, no bench.
+# Est: install + overlay ~5 min, 18 launches x ~15-20 s = ~5-6 min -> ~10-12 min; --time 00:25.
+# Output: review/diag/ablate-smoke-<job>/ (r1-ep4-s<stats>-v<V>.json, code-0, res-0, summary.txt, verdict.txt).
+#
+# Submit (after BUILD_ABLATE_OK): python3 $R/tools/presubmit.py --name ABLATE-SMOKE --nodes 1
+#   --build build-ablate-d47a3bcf88 --branch /tmp/claude-161238/wt-fix   (wt-fix HEAD d47a3bcf88) -> TOKEN; replace
+#   TOKEN below. slurm_submit: 1 node, 4 GPUs/node, one task, --time 00:25, mounts R:R:rw (as A2A-EP2-SMOKE 8281880);
+#   command: bash $R/launch/ablate_smoke_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/require_presubmit.sh ABLATE-SMOKE-0bbf5813ae || exit 1
+bash $R/tools/check_excluded_nodes.sh || exit 1
+[[ -s $R/build-ablate-d47a3bcf88/LIB_SHA256 ]] && grep -q ABLATE_RES_OK $R/build-ablate-d47a3bcf88/res.txt \
+    || { echo "ABLATE_NO_BUILD: run launch/ablate_build_cmd.txt first"; exit 1; }
+out=$R/review/diag/ablate-smoke-${SLURM_JOB_ID:-x}
+mkdir -p "$out"
+A2AEP_WHEEL=$R/build-ablate-d47a3bcf88/dist A2AEP_RES_TOOL=$R/tools/ablate_res.py A2AEP_RES_EXPECT=ok \
+A2AEP_NODES=1 A2AEP_REPS=1 A2AEP_LOADS=64 A2AEP_ABLATE_VARIANTS="0 S S1 F F8 L A SO ALL" \
+    bash $R/tools/a2aep_ep.sh "$out" > "$out/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+cat "$out/node-0.log"
+python3 $R/tools/ablate_verdict.py "$out" 4 64 | tee "$out/verdict.txt"
+log=$out/node-0.log
+checks=$(grep -c "^A2A_EP_CHECK .* OK$" "$log") timings=$(grep -c "^A2A_EP ep=4 " "$log") rc0=$(grep -c " rc=0$" "$log")
+echo "smoke: rc=$rc checks_ok=$checks/18 timing_lines=$timings/18 launches_rc0=$rc0/18"
+grep -q CODE_V5F_OK "$out/code-0.txt" && grep -q ABLATE_RES_OK "$out/res-0.txt" && ! grep -q LIB_SHA256_MISMATCH "$out/res-0.txt" \
+    && (( rc == 0 && checks == 18 && timings == 18 && rc0 == 18 )) && echo SMOKE_ABLATE_OK || { echo SMOKE_ABLATE_FAIL; exit 1; }

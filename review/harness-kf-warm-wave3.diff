@@ -1,0 +1,140 @@
+--- /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/mvp/harness/job.sh	2026-10-23 13:56:22.000000000 -0700
++++ /tmp/claude-161238/kfharness.2Idg/job.sh	2026-10-23 14:31:04.748498976 -0700
+@@ -3549,8 +3549,12 @@
+     #          (1319 questions, real MTP acceptance) on the survivors: the outputs after a recovery are sane
+     # -A = rows rank5 + node1, -B = rows twokill + stop (6 cases each, ~70-80 min); without a suffix all 12 cases
+     # (> 2 h: the time guard drops the tail). A case starts only if node 0 sees >= 15 min left.
+-    # The kill / stop lands 60-70 s into the load (KF_KILL_WINDOW; the source cases: 30-45 s): a wave prefills for
+-    # ~40-65 s, so the later window lands in steady decode and leaves a before-kill decode rate to compare.
++    # The kill / stop lands mid-decode in the load's third wave: KF_KILL_AFTER_STEPS (1260) full-load decode-only
++    # steps (bench.py --kill-after-steps); a 1k/1k wave gives ~505 such steps at 32, 64 and 128/GPU (MTP, one accepted
++    # token), so the load needs >= 4 waves for an after-kill window. KF_KILL_AFTER_STEPS=0: a random moment of
++    # KF_KILL_WINDOW instead.
++    # KF_WARM_LOADS (3,5; empty: none): one short wave per listed per-GPU concurrency after the warm-up, so every rank
++    # has run 3 and 5 contexts in one step before the kill (bench.py --warm-loads).
+     # Per case: KILL_FINAL_VERDICT (kill -> serving again, failed / re-run requests, rank-0 throughput before and
+     # after, PASS/FAIL), also in $out/kill_final.txt; a summary on node 0 at the end. Recoverable rows also check H23
+     # (h23_* fields first on the line): resume_s <= 10 s, est_tok_s_after / est_tok_s_before >= 0.8 x live / 32, and
+@@ -3588,6 +3592,12 @@
+     # KF_VICTIM_RANKS / KF_VICTIM_NODES (kf_case): never rank 0's node.
+     for kv in ${KF_VICTIM_RANKS:-5}; do (( kv >= 4 && kv < 32 )) || { echo "SMOKE_FAIL preflight: victim rank $kv (4-31)"; echo STD_DONE; exit 1; }; done
+     for kn in ${KF_VICTIM_NODES:-1}; do (( kn >= 1 && kn < 8 )) || { echo "SMOKE_FAIL preflight: victim node $kn (1-7)"; echo STD_DONE; exit 1; }; done
++    if (( ${KF_KILL_AFTER_STEPS:-1260} > 0 && ( ${KF_ITERATIONS:-4} < 4 || ${KF_STOP_ITERATIONS:-8} < 4 ) )); then
++        echo "SMOKE_FAIL preflight: a third-wave kill needs KF_ITERATIONS and KF_STOP_ITERATIONS >= 4"; echo STD_DONE; exit 1
++    fi
++    if [[ -n ${WIDEEP_KILL_AFTER_STEPS:-} ]]; then
++        echo "SMOKE_FAIL preflight: the kill rows take KF_KILL_AFTER_STEPS, not WIDEEP_KILL_AFTER_STEPS"; echo STD_DONE; exit 1
++    fi
+     kf_left_min() { local end=${SLURM_JOB_END_TIME:-$(( $(date +%s) - SECONDS + 7200 ))}; echo $(( (end - $(date +%s)) / 60 )); }
+     kf_go() {  # NAME: node 0 decides (>= 15 min left) and every node follows
+         local go=$out/$1.go
+@@ -3660,6 +3670,13 @@
+ after_steps = [x for x in iters if resumes and stamp(resumes[-1]) + 5 <= x[0] <= end]
+ (before, before_n), (after, after_n) = rate(before_steps), rate(after_steps)
+ live = 32 - len(expect)
++# Captures / compiles / autotunes after the first resume, in every survivor's log (a rank that logged the resume).
++ccat = {}
++for p in sorted(run.glob("rank-*.log"), key=lambda p: int(p.stem[5:]) if p.stem[5:].isdigit() else -1):
++    text = p.read_text(errors="replace") if p.stem[5:].isdigit() else ""
++    if "resumed serving without" in text:
++        ccat[int(p.stem[5:])] = len(re.findall(r"WIDEEP_(?:CAPTURE|COMPILE|AUTOTUNE)",
++                                               text.split("resumed serving without", 1)[1]))
+ fields = dict(
+     state=r.get("state"),
+     resume_s=round(r["all_resumed_seen_wall_s"] - t0, 2) if t0 and r.get("all_resumed_seen_wall_s") else None,
+@@ -3680,8 +3697,7 @@
+     r0_tok_s_before=before, r0_tok_s_after=after, r0_steps=f"{before_n}/{after_n}",
+     r0_sched_med="/".join(str(statistics.median(x[2] for x in s)) if s else "None" for s in (before_steps, after_steps)),
+     est_tok_s_before=before and before * 32, est_tok_s_after=after and after * live,
+-    after_resume_ccat=sum(1 for l in log.split("resumed serving without", 1)[1:2] for _ in
+-                          re.finditer(r"WIDEEP_(CAPTURE|COMPILE|AUTOTUNE)", l)),
++    after_resume_ccat=sum(ccat.values()), after_resume_ccat_ranks=",".join(f"{k}:{v}" for k, v in ccat.items() if v) or None,
+     slots=",".join(sorted(set(re.findall(r"num_slots = (\d+)", log)))),
+     trigger_to_kill_s=trigger_to_kill_s,
+ )
+@@ -3789,9 +3805,10 @@
+         # past its prefill).
+         # A 512/GPU wave on dep32-final ends ~200 s after the clients start: three keep a 200-230 s window inside the load.
+         # KF_ITERATIONS: more waves, for a steady post-recovery throughput window (>= 60 s after the resume).
+-        # WIDEEP_KILL_AFTER_STEPS=N: every failure fires after N full-load decode-only steps (bench.py), not at a random time.
+-        local load=(--mode failover --load "${KF_LOAD:-128}" --iterations "${KF_ITERATIONS:-$(( ${KF_LOAD:-128} >= 512 ? 3 : 2 ))}"
+-                    --kill-window-s "$window" --kill decode ${WIDEEP_KILL_AFTER_STEPS:+--kill-after-steps $WIDEEP_KILL_AFTER_STEPS})
++        local steps=${KF_KILL_AFTER_STEPS:-1260} warm=()
++        [[ -n ${KF_WARM_LOADS-3,5} ]] && warm=(--warm-loads "${KF_WARM_LOADS-3,5}")
++        local load=(--mode failover --load "${KF_LOAD:-128}" --iterations "${KF_ITERATIONS:-4}" "${warm[@]}"
++                    --kill-window-s "$window" --kill decode --kill-after-steps "$steps")
+         # KF_STACKS=1: every node dumps its ranks' native + Python stacks KF_STACKS_AFTER_S (45) s after the kill
+         # trigger, so a hang after the recovery shows where each rank waits (py-spy pauses each process briefly).
+         local dumper=""
+@@ -3828,7 +3845,9 @@
+          # rank5pf: rank 5 killed in its first context (prefill) step after the trigger.
+          rank5pf) export WIDEEP_VICTIM=$v TLLM_TEST_KILL_RANK=$v TLLM_TEST_KILL_TRIGGER=$out/trigger-$name
+                 export TLLM_TEST_KILL_IN_PREFILL=$TLLM_TEST_KILL_TRIGGER
+-                run_case "$name" ft "${load[@]/#decode/prefill}" ;;
++                # A prefill kill fires at the next context step: one wave earlier lands it in wave 3's prefill.
++                local pf=("${load[@]/#decode/prefill}"); pf[-1]=$(( steps > 505 ? steps - 505 : steps ))
++                run_case "$name" ft "${pf[@]}" ;;
+          # rank5upd (online EPLB): rank 5 killed right after starting an iteration that updates EPLB weights.
+          rank5upd) export WIDEEP_VICTIM=$v TLLM_TEST_KILL_RANK=$v TLLM_TEST_KILL_TRIGGER=$out/trigger-$name
+                 export TLLM_TEST_KILL_IN_EPLB_UPDATE=$TLLM_TEST_KILL_TRIGGER
+@@ -3840,15 +3859,14 @@
+                         --expect-failed $v,$v2 --second-trigger "$out/trigger-$name-rank$v2" > "$out/watch-$name.log" 2>&1 &
+                     watch=$!
+                 fi
+-                run_case "$name" ft --mode failover --load "${KF_LOAD:-128}" --iterations "${KF_ITERATIONS:-3}" --kill-window-s "$window" \
+-                    --kill decode ${WIDEEP_KILL_AFTER_STEPS:+--kill-after-steps $WIDEEP_KILL_AFTER_STEPS}
++                run_case "$name" ft "${load[@]}"
+                 [[ -n $watch ]] && { timeout 300 tail --pid="$watch" -f /dev/null; cat "$out/watch-$name.log"; } ;;
+          # stop: a 64/GPU wave runs ~23 s; the freeze -> resume (30 s hang confirm + recovery) takes ~37 s, so
+          # KF_STOP_ITERATIONS (8) waves leave ~2 min of full decode steps after the resume for H23's after-rate.
+          stop)  export WIDEEP_VICTIM=2 TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30
+                 export WIDEEP_FENCE_COMMAND=
+-                run_case "$name" ft --mode failover --load 64 --iterations "${KF_STOP_ITERATIONS:-8}" --kill-window-s "$window" --kill stop \
+-                    ${WIDEEP_KILL_AFTER_STEPS:+--kill-after-steps $WIDEEP_KILL_AFTER_STEPS} ;;
++                run_case "$name" ft --mode failover --load 64 --iterations "${KF_STOP_ITERATIONS:-8}" "${warm[@]}" \
++                    --kill-window-s "$window" --kill stop --kill-after-steps "$steps" ;;
+          # rank5acc: real MTP acceptance (forced acceptance changes the answers).
+          rank5acc) export WIDEEP_VICTIM=$v TLLM_TEST_KILL_RANK=$v TLLM_TEST_KILL_TRIGGER=$out/trigger-$name
+                 export TLLM_TEST_KILL_IN_DECODE=$TLLM_TEST_KILL_TRIGGER; unset TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS
+--- /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/mvp/harness/bench.py	2026-10-21 15:43:08.000000000 -0700
++++ /tmp/claude-161238/kfharness.2Idg/bench.py	2026-10-23 14:28:56.175943443 -0700
+@@ -337,6 +337,22 @@
+         """The CUDA graphs and prefill shapes of the coming loads, short outputs; not measured."""
+         self.load(f"warmup-{gpus}", load, gpus, 1, osl=64)
+ 
++    def warm_loads(self) -> None:
++        """--warm-loads: one unmeasured wave per listed per-GPU concurrency, all requests at once and short outputs, so
++        each rank prefills that many contexts in one step (the context-token buckets the steady load skips)."""
++        log = self.run / "rank-0.log"
++        for load in self.args.warm_loads:
++            offset = log.stat().st_size if log.exists() else 0
++            self.load(f"warm-{load}", load, WORLD, 1, osl=8)
++            with open(log, "rb") as lines:
++                lines.seek(offset)
++                chunk = lines.read().decode(errors="replace")
++            # Rank 0's local tokens (context + generation) of each step with a context request: the buckets it reached.
++            steps = [ast.literal_eval(m.group(4)) for m in steady_state.LINE.finditer(chunk)]
++            self.result.setdefault("warm_loads", []).append(dict(load_per_gpu=load, r0_ctx_step_tokens=sorted({
++                s["num_ctx_tokens"] + s.get("num_generation_tokens", 0) for s in steps if s.get("num_ctx_requests")})))
++            self.save()
++
+     def require_load_running(self, client: list) -> None:
+         """A kill under load must land while the load runs; otherwise the case tests nothing."""
+         if any(one.poll() is not None for one in client):
+@@ -514,6 +530,7 @@
+             self.result["first_token_wall_s"] = time.time()
+             self.save()
+         self.warmup(WORLD, self.args.load)
++        self.warm_loads()
+         self.result["healthy_first_token_s"] = first_token_s(self.args.port)
+         kind = self.args.kill
+         if kind == "idle":
+@@ -674,6 +691,8 @@
+     parser.add_argument("--kill", choices=("idle", "random", "decode", "prefill", "stop", "control", "freeze"), default="random",
+                         help="stop: SIGSTOP the victim under load (a hang the authority must confirm and fence)")
+     parser.add_argument("--load", type=int, default=256, help="failover: concurrent requests per GPU")
++    parser.add_argument("--warm-loads", type=lambda s: [int(n) for n in s.split(",") if n], default=[],
++                        help="failover: after the warm-up, one wave (osl 8) per listed per-GPU concurrency, e.g. 3,5")
+     parser.add_argument("--kill-after-steps", type=int, default=0, metavar="STEPS",
+                         help="failover: trigger the failure once rank 0 has logged STEPS full-load decode-only steps "
+                              "since the load started (instead of a random moment of --kill-window-s)")

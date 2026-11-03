@@ -1,0 +1,238 @@
+# Archive plan for /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude -> archive/2026-10-21/<same subpath>. Generated 2026-10-21 16:2x PT, read-only scan. AMBIG = flagged, defaults KEEP.
+KEEP	.claude	session config
+KEEP	archive	archive root (destination)
+KEEP	README.md	workspace index
+KEEP	cache	tokenizers/wheelhouse used by launch build_v3*, restart_modes, warm_restart, harness configs
+KEEP	.bashrc .bash_profile .profile .zshrc .zprofile .gitconfig .gitmodules .idea .vscode .ripgreprc .mcp.json	0-byte read-only sandbox placeholders; do not touch
+MOVE	.split_dir	scratch pointer to a dead /tmp mktemp dir
+MOVE	.wtest	empty write-test scratch
+MOVE	.wtest2	empty write-test scratch
+KEEP	build-v3-bcea8da496	running/next jobs: lay32, adpwait, finstack, pt_d, ncu32
+KEEP	build-v2-cef4670789	launch files >=10-20 (ulfm8, finals_std, nsys*, accuracy_final, build_v3.sh import smoke)
+KEEP	build-root	launch build_v3_cmd/build_final_cmd, tools/gtest_debug.sh, tools/v2_test_completion.sh
+KEEP	build-pr0-fc52f0adee	harness job.sh main_dist (lines 587/606/649), launch/stock_cmd.txt
+MOVE	build-root-main	unreferenced build dir (Oct 16)
+KEEP	ompi-ft-ucx	harness job.sh WIDEEP_MPI_PREFIX=$C/ompi-ft-ucx
+MOVE	ompi-ft-ucx-prrte-dl	unreferenced by harness/launch/tools (only AUDIT_2026-10-19, FT_ONE_SWITCH prose; mvp/launcher README)
+MOVE	ompi-ft-ucx-prrte-dl2	unreferenced
+KEEP	bundle.sh	harness; every launch file
+KEEP	build_and_test.sh	harness build_bench/k3_verify/prs_build, tools/cpu_*
+KEEP	install_wheel.sh	harness job.sh/serve.sh/run_integration
+KEEP	overlay_python.sh	harness run_integration/ftoff_sanity, tools/test_wheel, overlay_verify
+KEEP	restore_build.sh	tools/build_test_all.sh
+MOVE	final_validation.sh	root .sh not called by harness/launch/tools (Oct 16)
+MOVE	stack_check.sh	root .sh not called (Oct 18)
+MOVE	stack_tests.sh	root .sh not called (Oct 16)
+MOVE	port-stack-overlay.txt	unreferenced note (Oct 16)
+KEEP	dev	AMBIG: harness run_integration.sh default TESTS=$C/dev, ulfm_transport_check.sh uses $C/dev/tests; cited by CLAIMS/DESIGN_DOC
+MOVE	wt	worktrees reuse/sortgate; no $R/wt reference (ftoff_identity uses /tmp wt-review)
+MOVE	prs	PR trees main/phase1; prs_build.sh uses its own worktree, only DECISIONS prose
+KEEP	probe	AMBIG: probe/ghostmap modified 10-20 17:58 (<24 h) and HANDOFF cites out-8106132; one-off probe, move once HANDOFF no longer needs it
+MOVE	snapshots	empty dir
+KEEP	TRASH	AMBIG: empty; OPERATING_PROMPT names it as the mv target for deletions
+KEEP	tools	tools/* harness (incl. nsight-systems, pylib, wheels, this plan)
+KEEP	launch/std	seed json used by lay32/adpwait/ncu32
+MOVE	overlays/all-197752c9b2	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-4803f99e83	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-4803f99e83.list	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/all-4b7fcd1920	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/all-71ac3036a0	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/all-761d18a99f	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-761d18a99f.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-7c6b16e144	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-800347c9f4	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-800347c9f4.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/all-refs-20261019-1710.bundle	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/branches-20261019-1235.bundle	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/branches-20261019-1325.bundle	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/build-root-feat	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/build-root-short	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/build-root-v2	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/build-src-2077a4cf31	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-2945b0f5bb	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-3091edee7e	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-39b3cd2c29	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-42e9c29a0b	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-432b8907db	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-793ffd906d	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/build-src-8d0ec8cf1c	AMBIG: modified <24 h, not named by any launch/harness file
+MOVE	overlays/build-src-9c618db9e2	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/build-src-aae00e6c65	AMBIG: source tree at current wideep-ft-dev HEAD aae00e6c65; likely next build input
+MOVE	overlays/build-src-b054e35f21	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-b18f0b64ed	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/build-src-bcea8da496	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/build-src-cef4670789	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/build-src-f4afe429ba	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-f6bc16be99	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/build-src-slim-wip	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/ck-mpisess-68ff00e7da	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/ck-mpisess-fc52f0adee	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-04bb73802d	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-04bb73802d.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-2f5200c488	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-2f5200c488.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-4ca562e4a6	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-4ca562e4a6.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-7d7db818a8	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-7d7db818a8.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-8808c003b7.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-f4afe429ba	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/dev-f4afe429ba-vs-191988d1fb.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/diag-pin	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/final-40a0c5fb5c	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/glm-health-dsa	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/hang-a958187bfc	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/hangfence-4b7cb78358	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/health-0873faa1a9	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/health-0873faa1a9.list	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/merge-a470d307bb	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/mtp-aacdb2c918	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/mtp-debug	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/next-6e44d9a447	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/next-6e44d9a447.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/node-aff46e38b6	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/node-f7fa7c628d	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/node-f7fa7c628d.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/pin-4cf60b059d	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/pin-4cf60b059d.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/pin-py-4cf60b059d.list	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/py-a97ed5d7b8	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/py-final8-4de25459ce	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/pyonly-aaa7bed5f3	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/restore-80c61eec01	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/restore-9911149fa0	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/shutdown-next6e44-f4afe429ba	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/src-dev-f4afe429ba	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/src-final8-4de25459ce	AMBIG: modified <24 h, not named by any launch/harness file
+KEEP	overlays/stack-3e9027f4e4	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/stack-4c2929329c	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/stack-hang-1e30a368c4	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/tests-183d390691	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/tests-36fe8b4eb2	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/tests-8ec46695cc	named by rule-1 launch file or harness job.sh ($O-tests counted)
+MOVE	overlays/tests-mpisess-066b5189a9	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/tests-mpisess-183d390691	not named by running/next/>=10-20 launch files, harness or tools
+MOVE	overlays/tests-mpisess-fc52f0adee	not named by running/next/>=10-20 launch files, harness or tools
+KEEP	overlays/v4b-ee76f03e74	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4b1-d00215dd68	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4b2-38c2cab828	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4b3-3d75bf5da1	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4bc-957ac92c5f	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4bc-957ac92c5f-tests	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4bc-bdb01feb4f	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4bc-bdb01feb4f-tests	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4bcd-a02f262be7	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4bcd-a02f262be7-tests	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/v4c-f0b6d3f1c9	named by rule-1 launch file or harness job.sh ($O-tests counted)
+KEEP	overlays/.mcp.json	read-only placeholder
+MOVE	launch/final_cost_cmd.txt	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+MOVE	launch/final_tokens.txt	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+MOVE	launch/finals_cmd.txt	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+MOVE	launch/overlay-low-fixes.list	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+MOVE	launch/ulfm_survivor.c	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+MOVE	launch/run-ulfm2-7879022	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+MOVE	launch/run-ulfm2-7879072	launch file older than 2026-10-20, not a running/next job (final_cost_cmd, overlay-low-fixes: HANDOFF history pointer only)
+KEEP	launch/node_agent.py	called by launch/task.sh (10-21)
+KEEP	launch/remote_exec.py	called by launch/task.sh
+KEEP	launch/*_cmd.txt, *.sh, kf_rows-*, overlay-final*.list (79 files)	modified on/after 2026-10-20 (rule 1); includes running lay32/adpwait and next finstack/pt_d/ncu32
+MOVE	logs/slurm/slurm-*.out (335 files older than 2026-10-21)	glob: find logs/slurm -maxdepth 1 -type f ! -newermt 2026-10-21
+KEEP	logs/slurm (45 files from 2026-10-21)	current jobs; tools/watch_job.sh
+KEEP	logs/bundle	launch pt_d/pt_bc3 write here; current job logs
+KEEP	logs/presubmit	tools/presubmit.py, require_presubmit.sh tokens
+MOVE	logs/cpu-pytest-8078075.log	Oct 19 one-off log
+KEEP	logs/gtest-v2-*, install-test-*, nvl1s-*, smoke*-*, v2-cpu-*	modified <24 h (gtest-v2 named by kills_acc_final_cmd)
+KEEP	mvp/runs	CLAIMS cites them
+KEEP	mvp/CLAIMS.md	rule 1
+KEEP	mvp/PREFLIGHT.md	rule 1
+KEEP	mvp/SLIDES.md	rule 1
+KEEP	mvp/DESIGN_DOC.md	design doc
+KEEP	mvp/RETRO.md	RETRO protocol
+KEEP	mvp/OPERATING_PROMPT.md	rule 1
+KEEP	mvp/MORNING_SUMMARY.md	modified <24 h
+KEEP	mvp/harness	rule 1 (AMBIG inside: mvp/harness/.job.W1ce, a 242 KB Oct 20 01:16 temp copy of job.sh)
+KEEP	mvp/archive	already archive
+KEEP	mvp/launcher	AMBIG: PRRTE daemon-loss patch experiment (Oct 18-19), unreferenced; default KEEP
+KEEP	mvp/analysis/DECISIONS.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/FIXB_HANG.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/FT_COST_PROFILE_2026-10-19.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/FT_ONE_SWITCH.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/GHOST_PLACEMENT_RULE.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/INPLACE_SLOTS_BACKENDS.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/MTP_INPLACE.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/RANK0_MASK_TEST.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/V7_EXTRACT.md	DECISIONS (rule 1) or its chain / CLAIMS / OPERATING_PROMPT cite it
+KEEP	mvp/analysis/CPU_PYTEST_2026-10-19.md	tools/cpu_pytest.sh output
+KEEP	mvp/analysis/build_data.py	DECISIONS cites
+KEEP	mvp/analysis/profile_steps.py	FT_COST_PROFILE cites
+KEEP	mvp/analysis/fonts	harness curves.py
+KEEP	mvp/analysis/make_arch.py	generates fixed_regions.png (SLIDES); imported by fig_design.py
+KEEP	mvp/analysis/fig_design.py	generates fig1-fig5 design figures (DESIGN_DOC/SLIDES)
+KEEP	mvp/analysis/figs.py	generates downtime.png (SLIDES)
+KEEP	mvp/analysis/__pycache__	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/after_loss.txt	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/cost_fig.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/ctx_final.txt	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/delta_fig.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/doc_tables.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/eval_figs3.py	AMBIG: eval_figs* one-off superseded by std_figs/rec_figs, but modified 10-20 16:37 (<24 h)
+KEEP	mvp/analysis/finals_client_all.json	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/kill_collect.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/kill_timeline.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/kills_final_8115497.json	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/kills_prelim_8111350.json	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/metrics_fig.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/pareto_8099447.json	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/readout_final.json	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/readout_final.txt	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/rec_figs.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/slide_figs.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/std_collect.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/std_figs.py	modified <24 h (current figure/readout scripts and data)
+KEEP	mvp/analysis/std_prelim_8110144.json	modified <24 h (current figure/readout scripts and data)
+MOVE	mvp/analysis/eval_figs.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/eval_figs2.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/fig5_alt.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/placement_v2.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/plots_mock.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/moe_chain.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/steps.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/threads.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/resp_bookkeeping_bench.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+MOVE	mvp/analysis/run_recovery_tests_local.py	not referenced by harness/launch/tools/docs, older than 24 h (placement_v2 imports missing fig_design2)
+KEEP	mvp/figures/downtime.png.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig1_architecture.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig2_ghost_slots.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig3_ghost_slots.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig3_late_writes.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig4_late_writes.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig4_recovery_sequence.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fig5_placement.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/fixed_regions.*	DESIGN_DOC/SLIDES reference
+KEEP	mvp/figures/draft	rule 1 (DESIGN_DOC draft/ figures)
+KEEP	mvp/figures/slides	rule 1 (SLIDES)
+MOVE	mvp/figures/arch.png	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/arch.svg	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/descriptor.png	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/descriptor.svg	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/relative.png	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/fig2_recovery_sequence.png	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/fig2_recovery_sequence.svg	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/mock	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+MOVE	mvp/figures/results	not referenced by DESIGN_DOC/SLIDES or any harness/launch/tools file
+KEEP	review/HANDOFF.md	rule 1 review file
+KEEP	review/EXEC_PLAN.md	rule 1 review file
+KEEP	review/FREEZE_CHECKLIST.md	rule 1 review file
+KEEP	review/FINDINGS_2026-10-18.md	rule 1 review file
+KEEP	review/PR_PLAN.md	rule 1 review file
+KEEP	review/finals	modified <24 h; final readouts
+KEEP	review/finals_readout_F1.md	<24 h; HANDOFF cites
+KEEP	review/OWNER_REVIEW_SUMMARY.md	CLAIMS/HANDOFF cite
+KEEP	review/PR_FIX_LIST.md	CLAIMS cites
+KEEP	review/redteam	AMBIG: requested MOVE, but CLAIMS rows 132-141 cite redteam/, redteam3/ files and redteam3 modified 10-21 12:12
+MOVE	review/AUDIT_2026-10-19.md	dated audit (flag: HANDOFF line 3 and DECISIONS point here; update pointer)
+MOVE	review/CODE_REVIEW_2026-10-19.md	dated review (DECISIONS/OWNER_REVIEW_SUMMARY pointers)
+MOVE	review/DESIGN_DOC_NOTES_2026-10-19.md	dated notes, uncited
+MOVE	review/PR_PROPOSAL.md	Oct 19 proposal superseded by PR_PLAN/PR_FIX_LIST
+MOVE	review/RED_TEAM_QUEUE.md	Oct 19 queue, only cited by moved notes and PR_FIX_LIST
+MOVE	review/.wt	empty write-test scratch
+KEEP	review/.claude review/.mcp.json mvp/analysis/__pycache__ tools/__pycache__	session/runtime files

@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="458" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="#FFFFFF"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#2D3142"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#8C99A6"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<rect x="20" y="16" width="960" height="150" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="34" y="44" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold">One MoE layer on one GPU (captured in the CUDA graph)</text>
+<rect x="30" y="70" width="116" height="60" rx="8" fill="#EEF1F4" stroke="#8C99A6" stroke-width="2"/>
+<text x="88.0" y="96.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Router</text>
+<text x="88.0" y="118.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">top 8 experts</text>
+<rect x="166" y="70" width="110" height="60" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="3"/>
+<text x="221.0" y="96.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Dispatch</text>
+<text x="221.0" y="118.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">NVLink</text>
+<rect x="516" y="70" width="162" height="60" rx="8" fill="#EEF1F4" stroke="#8C99A6" stroke-width="2"/>
+<text x="597.0" y="96.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">moe_sort</text>
+<text x="597.0" y="118.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">group by local expert</text>
+<rect x="698" y="70" width="144" height="60" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="3"/>
+<text x="770.0" y="96.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Expert GEMMs</text>
+<text x="770.0" y="118.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">CuteDSL, NVFP4</text>
+<rect x="862" y="70" width="104" height="60" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="3"/>
+<text x="914.0" y="96.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Combine</text>
+<text x="914.0" y="118.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">NVLink</text>
+<rect x="301" y="69" width="200" height="52" rx="0" fill="#EAF4D6" stroke="#76B900" stroke-width="2.4000000000000004"/>
+<rect x="296" y="74" width="200" height="52" rx="0" fill="#EAF4D6" stroke="#76B900" stroke-width="3.0"/>
+<text x="396.0" y="96.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">All-to-all workspace</text>
+<text x="396.0" y="118.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">hidden states, routing</text>
+<line x1="146" y1="100.0" x2="162" y2="100.0" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="276" y1="100.0" x2="292" y2="100.0" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="504" y1="100.0" x2="512" y2="100.0" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="678" y1="100.0" x2="694" y2="100.0" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="842" y1="100.0" x2="858" y2="100.0" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<line x1="296" y1="126" x2="20" y2="186" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5"/>
+<line x1="501" y1="126" x2="980" y2="186" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5"/>
+<rect x="20" y="186" width="960" height="224" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="34" y="214" font-size="18" fill="#2D3142" text-anchor="start" font-weight="bold"></text>
+<path d="M 400 187 L 968 187 Q 979 187 979 198 L 979 398 Q 979 409 968 409 L 400 409 Z" fill="#F1F8E6" stroke="none"/>
+<line x1="400" y1="187" x2="400" y2="409" stroke="#D5D5D5" stroke-width="1.5"/>
+<text x="230" y="214" font-size="17" fill="#2D3142" text-anchor="middle" font-weight="bold">FT off</text>
+<text x="690" y="214" font-size="17" fill="#1B4F12" text-anchor="middle" font-weight="bold">FT on (remapping)</text>
+<text x="40" y="257" font-size="15" fill="#2D3142" text-anchor="start" font-weight="bold">step N</text>
+<text x="40" y="325" font-size="15" fill="#2D3142" text-anchor="start" font-weight="bold">step N+1</text>
+<rect x="130" y="236" width="200" height="32" rx="4" fill="white" stroke="#DADADA" stroke-width="1.3"/>
+<rect x="130" y="304" width="200" height="32" rx="4" fill="white" stroke="#DADADA" stroke-width="1.3"/>
+<rect x="130" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="142.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">0</text>
+<rect x="130" y="304" width="47" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="155.0" y="326" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">0</text>
+<rect x="155" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="167.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<rect x="180" y="304" width="47" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<rect x="180" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="192.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">2</text>
+<rect x="230" y="304" width="47" height="32" rx="4" fill="#EAEAEA" stroke="#8C99A6" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="255.0" y="326" font-size="15" fill="#8A8A8A" text-anchor="middle" font-weight="bold">2</text>
+<rect x="205" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="217.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">3</text>
+<rect x="280" y="304" width="47" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="305.0" y="326" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">3</text>
+<rect x="180" y="304" width="22" height="32" rx="4" fill="#FBE6E4" stroke="#C8372D" stroke-width="2.4"/>
+<text x="217.5" y="326" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<line x1="192.5" y1="270" x2="192.5" y2="300" stroke="#C8372D" stroke-width="2.4" stroke-dasharray="6 4" marker-end="url(#red)"/>
+<text x="200.5" y="292.0" font-size="14" fill="#C8372D" text-anchor="start" font-weight="bold">late write</text>
+<rect x="475" y="236" width="200" height="32" rx="4" fill="white" stroke="#DADADA" stroke-width="1.3"/>
+<rect x="475" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="487.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">0</text>
+<rect x="500" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="512.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<rect x="525" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="537.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">2</text>
+<rect x="550" y="236" width="22" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="562.5" y="258" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">3</text>
+<rect x="475" y="304" width="200" height="32" rx="4" fill="#EAEAEA" stroke="#8C99A6" stroke-width="1.5" stroke-dasharray="5 4"/>
+<rect x="525" y="304" width="22" height="32" rx="4" fill="#FBE6E4" stroke="#C8372D" stroke-width="2.4"/>
+<line x1="537.5" y1="270" x2="537.5" y2="300" stroke="#C8372D" stroke-width="2.4" stroke-dasharray="6 4" marker-end="url(#red)"/>
+<text x="545.5" y="292.0" font-size="14" fill="#C8372D" text-anchor="start" font-weight="bold">late write</text>
+<text x="575.0" y="356" font-size="14" fill="#2D3142" text-anchor="middle" font-weight="normal">old pages</text>
+<text x="815.0" y="290" font-size="14" fill="#1B4F12" text-anchor="middle" font-weight="bold">new pages, same addresses</text>
+<rect x="710" y="299" width="207" height="42" rx="6" fill="white" stroke="#76B900" stroke-width="1.8"/>
+<rect x="715" y="304" width="47" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="740.0" y="326" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">0</text>
+<rect x="765" y="304" width="47" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="790.0" y="326" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<rect x="815" y="304" width="47" height="32" rx="4" fill="#EAEAEA" stroke="#8C99A6" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="840.0" y="326" font-size="15" fill="#8A8A8A" text-anchor="middle" font-weight="bold">2</text>
+<rect x="865" y="304" width="47" height="32" rx="4" fill="#E3E8EE" stroke="#6B7A89" stroke-width="1.5"/>
+<text x="890.0" y="326" font-size="15" fill="#2D3142" text-anchor="middle" font-weight="bold">3</text>
+<rect x="724.5" y="356" width="28" height="26" rx="4" fill="#EAF4D6" stroke="#76B900" stroke-width="1.5"/>
+<text x="738.5" y="375" font-size="14" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<rect x="774.5" y="356" width="28" height="26" rx="4" fill="#EAF4D6" stroke="#76B900" stroke-width="1.5"/>
+<text x="788.5" y="375" font-size="14" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<rect x="824.5" y="356" width="28" height="26" rx="4" fill="#FBE6E4" stroke="#C8372D" stroke-width="1.5"/>
+<text x="838.5" y="375" font-size="14" fill="#2D3142" text-anchor="middle" font-weight="bold">0</text>
+<rect x="874.5" y="356" width="28" height="26" rx="4" fill="#EAF4D6" stroke="#76B900" stroke-width="1.5"/>
+<text x="888.5" y="375" font-size="14" fill="#2D3142" text-anchor="middle" font-weight="bold">1</text>
+<text x="712.5" y="375" font-size="15" fill="#2D3142" text-anchor="end" font-weight="bold">mask</text>
+<text x="724.5" y="402" font-size="14" fill="#2D3142" text-anchor="start" font-weight="normal">(1 = sender alive)</text>
+<rect x="40" y="428" width="22" height="16" rx="4" fill="#EAF4D6" stroke="#76B900" stroke-width="2.7"/>
+<text x="70" y="442" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">added or changed by FT</text>
+<rect x="270" y="428" width="22" height="16" rx="4" fill="#EEF1F4" stroke="#8C99A6" stroke-width="1.8"/>
+<text x="300" y="442" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">existing</text>
+<rect x="390" y="428" width="22" height="16" rx="4" fill="#FBE6E4" stroke="#C8372D" stroke-width="2.4"/>
+<text x="420" y="442" font-size="15" fill="#2D3142" text-anchor="start" font-weight="normal">late write lands</text>
+</svg>

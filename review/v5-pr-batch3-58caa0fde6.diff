@@ -1,0 +1,862 @@
+diff --git a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+index e33cbf6376..d43d59223e 100644
+--- a/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+@@ -213,13 +213,10 @@ def loaded_slot_layout(num_experts: int, num_local_experts: int,
+                        num_extra_local_experts: int) -> Tuple[int, int, int]:
+     """``(num_experts, num_local_experts, local_expert_offset)`` without each rank's extra slots.
+ 
+-    WideEP peer-loss recovery keeps the last ``num_extra_local_experts``
+-    local slots of every rank without an expert while healthy. MoE runners
+-    tune and key their tactics with the layout of only the loaded slots, the
+-    one the same deployment without recovery has. A slot without tokens adds
+-    no tile, and the tactics fix only the tile shapes, so those tactics serve
+-    the kernels over every local slot, also once a restore fills the extra
+-    ones.
++    WideEP peer-loss recovery keeps the last ``num_extra_local_experts`` local slots of every rank without an
++    expert while healthy. MoE runners tune and key their tactics on the loaded slots only (the layout without
++    recovery); a slot without tokens adds no tile and the tactics fix only tile shapes, so they serve the kernels
++    over every local slot, also once a restore fills the extra ones.
+     """
+     if not num_extra_local_experts:
+         return num_experts, num_local_experts, local_expert_offset
+diff --git a/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py b/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+index 4c86f3907b..e450d6f960 100644
+--- a/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
++++ b/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+@@ -231,12 +231,8 @@ def loaded_slot_moe_tuner_inputs(
+         num_extra_local_experts: int) -> List[Optional[torch.Tensor]]:
+     """``MoERunner`` inputs ``[x, fc1 weights, fc1 biases, fc2 weights, fc2 biases]`` of the loaded slots only.
+ 
+-    WideEP peer-loss recovery keeps the last ``num_extra_local_experts`` local
+-    slots of every rank without an expert while healthy. The kernel derives
+-    the expert count from the weights, so profiling the loaded slots' weights
+-    tunes and keys the tactics of the same deployment without recovery. Those
+-    tactics fix only the tile shapes, so they serve the kernels over every
+-    local slot (see ``loaded_slot_layout``).
++    The kernel derives the expert count from the weights, so profiling the loaded slots' weights tunes and keys
++    the tactics on the loaded slots (see ``loaded_slot_layout``).
+     """
+     if not num_extra_local_experts:
+         return inputs
+diff --git a/tensorrt_llm/_torch/distributed/communicator.py b/tensorrt_llm/_torch/distributed/communicator.py
+index 44bee57baa..4260406989 100644
+--- a/tensorrt_llm/_torch/distributed/communicator.py
++++ b/tensorrt_llm/_torch/distributed/communicator.py
+@@ -109,13 +109,11 @@ def _interruptible(func: Callable) -> Callable:
+     from an ``MPIDist`` method whenever a peer has failed.
+ 
+     ULFM can complete a collective that a peer dies in without an error on some
+-    ranks, with that peer's part of the result undefined. So a result only
+-    counts once no failure is known, and an exception from the collective
+-    counts as an interruption when ULFM reports a failed peer shortly after or
+-    the communicator was revoked: a garbled payload can fail to unpickle with
+-    any exception type, also inside mpi4py. With no failure known the exception
+-    is this rank's own and is raised as is. Without recovery the method runs
+-    unchanged.
++    ranks, with that peer's part undefined, so a result counts only once no
++    failure is known. An exception counts as an interruption when ULFM reports
++    a failed peer shortly after or the communicator was revoked (a garbled
++    payload can fail to unpickle with any exception type, also inside mpi4py);
++    otherwise it is raised as is. Without recovery the method runs unchanged.
+     """
+ 
+     @wraps(func)
+@@ -1025,11 +1023,10 @@ class MPIDist(Distributed):
+         """Agree with the other survivors on the failed ranks.
+ 
+         Collective over all surviving ranks; call after :meth:`revoke`. Builds
+-        the survivor communicator without using it yet, and returns the same
+-        failed set on every survivor. Called again before
+-        :meth:`install_survivors` (another peer failed during the recovery), it
+-        shrinks the survivor communicator it built; after it (a loss after a
+-        recovery), the installed one. Returns every rank failed so far.
++        the survivor communicator without using it yet and returns every rank
++        failed so far, the same set on every survivor. Before
++        :meth:`install_survivors` (a further loss during the recovery) it
++        shrinks the communicator it built; after it, the installed one.
+ 
+         Raises:
+             RuntimeError: Recovery is not enabled.
+@@ -1050,13 +1047,11 @@ class MPIDist(Distributed):
+     def install_survivors(self) -> None:
+         """Switch host collectives to the communicator built by :meth:`shrink`.
+ 
+-        Logical ranks keep their meaning afterwards: ``tp_rank``/``tp_size``
+-        are unchanged, roots name logical ranks, and gathers return one entry
+-        per logical rank, with the caller's ``departed`` for failed ranks.
+-
+-        The communicator it replaces is not freed: freeing one with failed
+-        members is not guaranteed to be local. A later loss shrinks the
+-        installed communicator again (see :meth:`shrink`).
++        Logical ranks keep their meaning: ``tp_rank``/``tp_size`` are unchanged,
++        roots name logical ranks, and gathers return one entry per logical rank,
++        with the caller's ``departed`` for failed ranks. The replaced
++        communicator is not freed (freeing one with failed members is not
++        guaranteed to be local).
+ 
+         Raises:
+             RuntimeError: :meth:`shrink` has not run.
+@@ -1075,10 +1070,9 @@ class MPIDist(Distributed):
+         before the returned watch is stopped; first store 1 to *abort_word*
+         (an int32 address) if it is not 0.
+ 
+-        Detects failures while this rank is outside host collectives, for
+-        example while it waits on the GPU. Collective over the current
+-        (survivor) world: posts a receive that no peer matches on a private
+-        duplicate, which ULFM completes with a process-failure error.
++        Covers time outside host collectives (e.g. GPU waits). Collective over
++        the current (survivor) world: posts a receive no peer matches on a
++        private duplicate, which ULFM completes with a process-failure error.
+ 
+         Raises:
+             RuntimeError: Recovery is not enabled.
+diff --git a/tensorrt_llm/_torch/distributed/mnnvl_memory.py b/tensorrt_llm/_torch/distributed/mnnvl_memory.py
+index bba55a4d78..99ecdc1880 100644
+--- a/tensorrt_llm/_torch/distributed/mnnvl_memory.py
++++ b/tensorrt_llm/_torch/distributed/mnnvl_memory.py
+@@ -965,16 +965,13 @@ class MnnvlMemory:
+     def remap(self, gather: Callable[[Any], Sequence[Any]]) -> None:
+         """Map fresh pages at the addresses :meth:`release_backing` kept, shared only among the live ranks.
+ 
+-        ``gather(value)`` collects ``value`` from every live rank: one entry per global rank, None for
+-        a departed one, whose row stays unmapped. Collective over the live ranks. The fresh pages are
+-        uninitialized.
+-
+-        The live ranks exchange whether their mapping succeeded: an import or a mapping fails on some ranks
+-        only (of the handle of a rank that is failing meanwhile, say), so every live rank either maps or
+-        raises. An exception of ``gather`` propagates at once, as the outcome exchange could not complete
+-        either. A failure, or an exception of ``gather``, leaves the allocation unmapped, so a later attempt
+-        may remap it; if releasing the fresh pages fails too, that is logged, the original error propagates,
+-        and the allocation is broken.
++        ``gather(value)`` collects ``value`` from every live rank: one entry per global rank, None for a departed
++        one, whose row stays unmapped. Collective over the live ranks. The fresh pages are uninitialized.
++
++        The live ranks exchange whether their mapping succeeded (it can fail on some ranks only), so every live
++        rank either maps or raises; an exception of ``gather`` propagates at once. Either leaves the allocation
++        unmapped, so a later attempt may remap it; if releasing the fresh pages fails too, that is logged, the
++        original error propagates, and the allocation is broken.
+ 
+         Raises:
+             RuntimeError: Mapping failed on some live rank.
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py b/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py
+index 85627753b4..083aa488a3 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py
+@@ -30,16 +30,12 @@ def _mask_tensor(health: EPGroupHealth) -> torch.Tensor:
+ class MoeExecutionState:
+     """Own the records that bound NVLinkOneSided kernels read at execution time.
+ 
+-    ``active_rank_mask`` is the device copy of the committed rank mask, and
+-    ``abort`` the native ``MoeA2AAbortState``: an ``int32[2]`` record
+-    ``(requested, status)`` in pinned host memory. Both are only edited in
+-    place, so CUDA graphs captured once keep running after :meth:`install_mask`
+-    changes the membership they observe. The bound workspaces keep their
+-    addresses across a recovery's remap, so the same graphs replay on the
+-    fresh pages.
+-
+-    :meth:`install_mask` and :meth:`rearm` are only valid while the model is
+-    idle. :meth:`request_abort` may be called from any thread while kernels run.
++    ``active_rank_mask`` is the device copy of the committed rank mask, and ``abort`` the native
++    ``MoeA2AAbortState``: an ``int32[2]`` record ``(requested, status)`` in pinned host memory. Both
++    are only edited in place, and the bound workspaces keep their addresses across a recovery's
++    remap, so CUDA graphs captured once keep running after :meth:`install_mask` changes the
++    membership. :meth:`install_mask` and :meth:`rearm` are only valid while the model is idle;
++    :meth:`request_abort` may be called from any thread while kernels run.
+     """
+ 
+     def __init__(self, ep_group_health: EPGroupHealth, device: torch.device) -> None:
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py b/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py
+index 8c25743176..adc5c9b35b 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py
+@@ -1022,9 +1022,9 @@ class NVLinkOneSided(Communication):
+                 committed membership for dispatch. Without an override, the committed mask and generation are
+                 captured together; combine reuses that mask and fails closed if the generation changes first.
+                 The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
+-                artifact, not valid model output. ``expert_to_slot`` (int32 [num_routed_experts], device) is each expert's
+-                single slot: ``token_selected_slots`` then holds expert ids, and the dispatch routes by and sends
+-                their slot ids, read from the table at execution time.
++                artifact, not valid model output. ``expert_to_slot`` (int32 [num_routed_experts], device) is each
++                expert's single slot: ``token_selected_slots`` then holds expert ids, and the dispatch routes by
++                and sends their slot ids, read from the table at execution time.
+ 
+         Returns:
+             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py b/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+index 874cc177dc..146acf3838 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+@@ -24,7 +24,8 @@ from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
+ from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+ from tensorrt_llm._torch.utils import EventType
+ from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
+-from tensorrt_llm.executor.recovery.config import fault_tolerance_config
++from tensorrt_llm.executor.recovery.config import (failure_domains,
++                                                     fault_tolerance_config)
+ from tensorrt_llm.logger import logger
+ from tensorrt_llm.mapping import Mapping
+ 
+@@ -1165,8 +1166,6 @@ class MoeLoadBalancer:
+ 
+     def _largest_failure_domain(self, hosts: List[str]) -> int:
+         """The most ranks one failure domain (FaultToleranceConfig.failure_domain) holds, ``hosts`` per rank."""
+-        from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import \
+-            failure_domains
+         return max(map(
+             len, failure_domains(hosts,
+                                  fault_tolerance_config().failure_domain)),
+@@ -1394,13 +1393,11 @@ class MoeLoadBalancer:
+             base: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
+         """Per layer, the ``[ep_size, slots_per_rank]`` placement to serve with after losing ``dead_ranks``.
+ 
+-        The current placement (or ``base``, per layer, the placement the
+-        survivors agreed on) with the slots of ``dead_ranks`` cleared. In a
+-        layer with host weights, each expert left without a replica takes over
+-        a slot of a replicated expert (``restore_lost_experts``), on the ranks
+-        that restored the fewest experts in the earlier layers, so the restored
+-        experts and their loading spread over the survivors. Every rank
+-        computes the same placements from the same base.
++        The current placement (or ``base``, per layer, the placement the survivors agreed on) with the slots
++        of ``dead_ranks`` cleared. In a layer with host weights, each expert left without a replica takes over
++        a slot of a replicated expert (``restore_lost_experts``) on the ranks that restored the fewest experts
++        in the earlier layers, so the restores spread over the survivors. Every rank computes the same
++        placements from the same base.
+ 
+         Raises:
+             ValueError: A rank is out of range, or an expert would be left
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py b/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
+index ba1e64deb6..9db5bb4993 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
+@@ -264,10 +264,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
+         return isinstance(self.moe.comm, NVLinkOneSided)
+ 
+     def _dispatch_slot_table(self) -> Optional[torch.Tensor]:
+-        """The expert -> slot table NVLinkOneSided dispatch looks the slots up in instead of route(), or None.
++        """The expert -> slot table (see ``one_slot_table``) NVLinkOneSided dispatch reads instead of route(), or None.
+ 
+-        Only with peer-loss recovery and one slot per expert. ExpertStatistic and the calibrator read the slot
+-        ids route() returns, so they keep it.
++        ExpertStatistic and the calibrator read the slot ids route() returns, so they keep route().
+         """
+         if not (
+             self._is_using_nvlink_one_sided()
+diff --git a/tensorrt_llm/_torch/pyexecutor/hang_evidence.py b/tensorrt_llm/_torch/pyexecutor/hang_evidence.py
+index 4bd522ae9f..0c9d8ea678 100644
+--- a/tensorrt_llm/_torch/pyexecutor/hang_evidence.py
++++ b/tensorrt_llm/_torch/pyexecutor/hang_evidence.py
+@@ -2,23 +2,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Report evidence of a hung peer to the recovery authority.
+ 
+-Each worker's reporter thread sends the authority a heartbeat (its executor
+-iteration, and whether the executor waits on something outside its rank) and
+-the all-to-all waits of its device that last longer than a threshold. A native
+-thread (``HeartbeatSender``) also sends a heartbeat with the iteration of the last
+-finished step, without the Python interpreter lock, so that a rank whose Python
+-threads are starved still counts as alive. The
+-device waits come from the rank's all-to-all progress row: its current round
+-(``flag_val``) and the completion flags its peers write into its workspace.
+-The row is copied to host memory on a side stream, so it is read whether the
+-step was launched eagerly or replayed from a CUDA graph. Evidence never
+-changes membership; the authority decides. The same thread carries out the
+-authority's ``Fence``: of its own rank (its main thread is stuck, this thread
+-still runs) by killing its process; of another rank (whose whole process may be
+-stopped) after a grace period, by asking the MPI runtime to kill that rank's
+-process (``pmix_fence``) on a separate thread, so that heartbeats keep flowing
+-while the runtime answers. On the authority's ``Restart`` (a hang no fence can
+-recover) it ends its process with ``STALLED_EXIT_CODE``.
++Each worker's reporter thread sends the authority heartbeats (the executor iteration, and whether the executor
++waits on something outside its rank) and its device's all-to-all waits longer than a threshold. These come from the
++rank's all-to-all progress row (its round ``flag_val`` and its peers' completion flags), which a side stream copies
++to host memory, so eager and CUDA-graph steps are both read. A native ``HeartbeatSender`` also sends the iteration of
++the last finished step without the Python interpreter lock, so a rank with starved Python threads still counts as
++alive. Evidence never changes membership; the authority decides. The thread carries out the authority's ``Fence``:
++of its own rank (whose main thread is stuck) by killing its process; of another rank (whose whole process may be
++stopped) after a grace period, through the MPI runtime (``pmix_fence``) on a separate thread so heartbeats keep
++flowing. On ``Restart`` (a hang no fence can recover) it ends its process with ``STALLED_EXIT_CODE``.
+ """
+ 
+ from __future__ import annotations
+diff --git a/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py b/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py
+index bd0025efc1..197397a3be 100644
+--- a/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py
++++ b/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py
+@@ -37,7 +37,11 @@ from tensorrt_llm._utils import (
+ )
+ from tensorrt_llm.bindings.executor import FinishReason
+ from tensorrt_llm.executor.recovery.config import CONFIG_ENV as FAULT_TOLERANCE_CONFIG_ENV
+-from tensorrt_llm.executor.recovery.config import fault_tolerance_config
++from tensorrt_llm.executor.recovery.config import (
++    FailureDomain,
++    failure_domains,
++    fault_tolerance_config,
++)
+ from tensorrt_llm.executor.utils import peer_loss_retryable_message
+ from tensorrt_llm.logger import logger
+ 
+@@ -78,14 +82,11 @@ if TYPE_CHECKING:
+ _REGISTRATION_TIMEOUT_S = 600.0
+ 
+ Responses = List[Tuple[int, LlmResponse]]
+-# One rank's part of a response gather: ``(responses, finished, streaming, progressed)``, or ``()`` when it has
+-# no responses and no progress to report. ``finished``: ids of the responses that are an error or a final result.
+-# ``streaming``: ids of the other responses whose request this rank had not answered yet. ``progressed``: ids of
+-# the interrupted requests that committed a step since this rank's last gather. Rank 0 reads these instead of
+-# every response it gathers. A plain tuple keeps rank 0's unpickling of every part cheap.
++# One rank's part of a response gather: ``(responses, finished, streaming, progressed)``, or ``()`` with nothing to
++# report. ``finished``: ids of error or final responses; ``streaming``: ids of the other responses whose request
++# this rank had not answered yet; ``progressed``: ids of interrupted requests that committed a step since this
++# rank's last gather. Rank 0 reads these instead of every response; a plain tuple keeps its unpickling cheap.
+ ResponseContribution = Union[Tuple[()], Tuple[Responses, List[int], List[int], List[int]]]
+-# A set of ranks lost together, as a sorted tuple: one rank or a whole node.
+-FailureDomain = Tuple[int, ...]
+ # A request and the context position, state, draft tokens and exclusion of its last generation logits it had
+ # before a step changed them.
+ StepChange = Tuple[LlmRequest, int, LlmRequestState, List[int], bool]
+@@ -116,22 +117,6 @@ def _tested_spec_dec(spec_config) -> bool:
+     )
+ 
+ 
+-def failure_domains(hosts: Sequence[str], failure_domain: str) -> List[FailureDomain]:
+-    """The rank sets to recover from: every rank but 0, then for ``node`` every node but rank 0's.
+-
+-    Args:
+-        hosts: Per rank, the host it runs on.
+-        failure_domain: ``rank`` or ``node`` (FaultToleranceConfig.failure_domain).
+-    """
+-    domains = [(rank,) for rank in range(1, len(hosts))]
+-    if failure_domain == "node":
+-        nodes: Dict[str, List[int]] = {}
+-        for rank, host in enumerate(hosts):
+-            nodes.setdefault(host, []).append(rank)
+-        domains += [tuple(ranks) for host, ranks in nodes.items() if host != hosts[0]]
+-    return list(dict.fromkeys(domains))
+-
+-
+ @functools.cache
+ def _register(
+     rank: int, recoverable_domains: Tuple[FailureDomain, ...]
+@@ -161,7 +146,7 @@ _startup_watch: Optional[PeerFailureWatch] = None
+ def watch_startup_peer_failures(dist: Distributed) -> None:
+     """End the job on a peer failure from now until a serving loop watches peers.
+ 
+-    Under ULFM the MPI runtime no longer ends the job when a process dies, and no loss before
++    Under ULFM the MPI runtime does not end the job when a process dies, and no loss before
+     serving (model loading, warmup, CUDA graph capture, KV cache estimation) is recovered: without
+     this, the survivors would wait out their timeouts. Collective over the world; does nothing
+     when peer-loss recovery is off.
+@@ -384,11 +369,11 @@ class PeerLossRecovery(RecoveryHook):
+     def create(cls, executor: "PyExecutor") -> RecoveryHook:
+         """Return the recovery hook of ``executor``: the do-nothing :class:`RecoveryHook` when it is off.
+ 
+-        The configuration must make a discarded step re-runnable: no guided decoding, beam search, KV
+-        connector or PEFT. Any speculative decoding method is accepted: a discard restores the draft tokens
+-        and reverts the draft KV, and target verification keeps the output exact; a method other than
+-        linear one-model MTP is untested and logs a warning. Requests with occurrence penalties are
+-        rejected; a discarded step can change the samples of a seeded request.
++        The configuration must make a discarded step re-runnable; the checks below list the requirements.
++        Any speculative decoding method is accepted: a discard restores the draft tokens and reverts the
++        draft KV, and target verification keeps the output exact; a method other than linear one-model MTP
++        is untested and logs a warning. Requests with occurrence penalties are rejected; a discarded step can
++        change the samples of a seeded request.
+ 
+         Raises:
+             ValueError: Recovery is enabled for a configuration it does not
+@@ -700,22 +685,12 @@ class PeerLossRecovery(RecoveryHook):
+     def commit_step(self, batch: ScheduledRequests, sample_state: Optional["SampleState"]) -> None:
+         """Accept the oldest prepared step, ``batch``, unless a peer failed while it ran.
+ 
+-        Waits for the step's sampler event, which ``update_requests`` waits on
+-        next: it follows the step's MoE collectives on the stream (``create``
+-        requires a generation sampler, which records one every step). A step
+-        without a sample state failed before sampling and has no event; for it,
+-        the commit waits for the stream, so that the step's MoE collectives
+-        finished before the abort record is read and before the executor
+-        publishes the step's context blocks. A peer that stops responding
+-        without dying is bounded by the MoE kernels' device timeout, which
+-        fails stop.
+-
+-        Survivors may decide differently on the same step: one that finished it
+-        before the loss was reported commits it, another discards it. Both are
+-        correct because the step is committed only if this rank's abort record
+-        is clear: every collective of the step then read every active source's
+-        complete data, and a peer whose dispatch was released publishes no
+-        further round flag, so none of its outputs reached this rank (see
++        Waits for the step's sampler event, which follows the step's MoE collectives on the stream (``create``
++        requires a generation sampler, which records one every step), or for the stream if the step failed
++        before sampling. So the collectives finished before the abort record is read and before the executor
++        publishes the step's context blocks. A peer that stops responding without dying is bounded by the MoE
++        kernels' device timeout, which fails stop. Survivors may decide differently on the same step; each
++        commits it only if its own abort record is clear, which makes the step valid on that rank (see
+         ``MoeA2AAbortState``).
+ 
+         Raises:
+@@ -1199,13 +1174,11 @@ class PeerLossRecovery(RecoveryHook):
+     def _shrink(self) -> frozenset:
+         """Agree with the other survivors on the failed ranks.
+ 
+-        With hang detection, the ranks this rank sees failed are ended first: a rank Open MPI's failure detector
+-        declared failed may still be alive (a stopped process), and the agreement does not complete until it
+-        ends, so the detector's verdict counts as its failure. Every survivor does so for what it sees: the kills
+-        are idempotent, and one that fails leaves the authority's fence before Propose to fail closed. Failed
+-        ranks are always ended through the MPI runtime before a plan is proposed (rank 0, at the authority's
+-        request); hang detection additionally confirms and fences a hung (alive) rank. Without it, a stopped
+-        rank holds this agreement until it ends.
++        With hang detection, each survivor first ends the ranks it sees failed: a rank Open MPI's failure detector
++        declared failed may still be alive (a stopped process), and the agreement completes only once it ends.
++        The kills are idempotent, and one that fails leaves the authority's fence before Propose to fail closed.
++        Without hang detection, a stopped rank holds the agreement until it ends. Either way, rank 0 ends the
++        failed ranks through the MPI runtime at the authority's request before a plan is proposed.
+         """
+         dist = self._executor.dist
+         if fault_tolerance_config().hang_detection:
+@@ -1379,14 +1352,12 @@ class PeerLossRecovery(RecoveryHook):
+     def _remap_workspaces(self, failed: frozenset, deadline: float) -> None:
+         """Back the all-to-all workspaces with fresh pages that ``failed`` never mapped, before anything uses them.
+ 
+-        The failed ranks' kernels may still write the pages they mapped; those stay allocated for them alone,
+-        and every survivor maps fresh pages at the same addresses, so captured graphs stay valid. Pages no
+-        failed rank maps are freed once every survivor released them, so room is made only after that, from
+-        the KV cache if need be; the failed ranks' pages are freed only when their processes end, so a commit
+-        returns that share once the memory is free (:meth:`_return_remap_room`). Without the room, page
+-        creation fails on this rank and the exchange fails the recovery on every survivor.
+-
+-        Its exchanges block without a deadline, so ``deadline`` is checked before and after them.
++        The failed ranks' kernels may still write the pages they mapped, so those stay allocated for them alone
++        and every survivor maps fresh pages at the same addresses (captured graphs stay valid). Room is made, from
++        the KV cache if need be, only after every survivor released the pages no failed rank maps; the failed
++        ranks' pages are freed when their processes end, and :meth:`_return_remap_room` returns that share. Without
++        the room, the remap fails the recovery on every survivor. Its exchanges block without a deadline, so
++        ``deadline`` is checked before and after them.
+ 
+         Raises:
+             RecoveryInterrupted: Another survivor failed during the remap.
+@@ -1540,11 +1511,10 @@ class PeerLossRecovery(RecoveryHook):
+     def _requeue_unscheduled_requests(self, served: List[Optional[Set[int]]]) -> None:
+         """Admit again the requests that were received but never scheduled.
+ 
+-        A peer loss can interrupt the broadcast of new requests, leaving them on some ranks and
+-        not others. Rank 0 holds every such request, so it broadcasts again the ones no survivor
+-        started, in arrival order, and records the owner of the ones a survivor did start; the
+-        other ranks drop theirs. Cancellations and shutdown of that broadcast are sent again after
+-        them; applying them twice has no further effect. Profiler items are not.
++        A peer loss can interrupt the broadcast of new requests, leaving them on some ranks only. Rank 0 holds
++        every such request: it broadcasts again the ones no survivor started, in arrival order, and records the
++        owner of the ones a survivor started; the other ranks drop theirs. Cancellations and shutdown from that
++        broadcast are sent again after them (applying them twice has no further effect); profiler items are not.
+ 
+         Args:
+             served: Per rank, the ids of the requests it serves (None for a departed rank).
+@@ -1614,14 +1584,12 @@ class PeerLossRecovery(RecoveryHook):
+     ) -> Tuple[List[int], int]:
+         """Deliver what the interrupted gathers owed their clients.
+ 
+-        Collective over the survivors. Every survivor resends its parts of the
+-        gathers rank 0 did not process, and the ``buffered`` error responses it
+-        held for the next synchronized flush, then terminates the requests they
+-        finished. Every survivor fails rank 0's ``quarantined`` requests (see ``_quarantine``).
+-        Rank 0 also takes over the requests that were running on a departed
+-        attention-DP rank, whose KV cache left with it: those that delivered nothing run again
+-        from their prompt; the others fail, and cancelled ones end cancelled. Like a quarantined
+-        request, a departed rank's request that a loss interrupted before and that reported no
++        Collective over the survivors. Every survivor resends its parts of the gathers rank 0 did not process and
++        the ``buffered`` error responses it held for the next synchronized flush, terminates the requests they
++        finished, and fails rank 0's ``quarantined`` requests (see ``_quarantine``). Rank 0 also takes over the
++        requests that were running on a departed attention-DP rank, whose KV cache left with it: those that
++        delivered nothing run again from their prompt; the others fail, and cancelled ones end cancelled. Like a
++        quarantined request, a departed rank's request that a loss interrupted before and that reported no
+         committed step since (in a response gather rank 0 processed) fails.
+ 
+         Returns:
+@@ -1773,14 +1741,11 @@ def install_recovery_placement(
+ ) -> int:
+     """Serve without ``failed_ranks`` (every rank lost so far): route MoE traffic by ``placements``, then mask them.
+ 
+-    ``placements`` come from ``MoeLoadBalancer.recovery_placements``: resident
+-    replicas, plus experts restored into survivors' slots from host weights.
+-    Only while the model is idle. Routing must exclude the failed ranks before
+-    their mask is installed, because the MoE kernels silently skip routes to a
+-    masked rank. The caller has validated the placements (their digest, sent
+-    with Ready); the ranks are validated here before anything changes. An error
+-    after that (from the native routing update, a slot load or the device)
+-    leaves the state mixed and ends the job.
++    ``placements`` come from ``MoeLoadBalancer.recovery_placements`` (resident replicas, plus experts restored into
++    survivors' slots from host weights). Only while the model is idle. Routing must exclude the failed ranks before
++    their mask is installed, because the MoE kernels silently skip routes to a masked rank. The caller validated
++    the placements; the ranks are validated here before anything changes, and a later error leaves the state mixed
++    and ends the job.
+ 
+     Returns:
+         The number of slots restored.
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor.py b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+index fa5d56c73d..0586d1eeaa 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+@@ -420,7 +420,7 @@ class PyExecutor:
+     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+ 
+     # Attention-DP context balance: decisions without arrivals after which a burst
+-    # of arrivals counts as ended. A burst reaches every rank within 1-3 decisions.
++    # of arrivals counts as ended.
+     ADP_BURST_QUIET_ITERS = 4
+ 
+     # The recovery hook for a peer process loss; the do-nothing base when recovery is off.
+@@ -5600,8 +5600,7 @@ class PyExecutor:
+ 
+         A negative ``delta`` returns memory to the driver; pages that no longer
+         fit move to the host tier. Only while the model is idle: no forward in
+-        flight and every step committed or discarded. Peer-loss recovery uses
+-        it, which refuses a KV cache transceiver and so remote-tail attention DP.
++        flight and every step committed or discarded.
+         """
+         mgr = self.kv_cache_manager
+         paused = [
+@@ -7029,11 +7028,8 @@ class PyExecutor:
+                         < self.attention_dp_min_generation_requests):
+                     timeout_iters = self.attention_dp_low_occupancy_timeout_iters
+                 timeout_reached = self.adp_ctx_waiting_iters_count >= timeout_iters
+-                # After a burst of arrivals (at least one per serving rank within the
+-                # timeout window) has gone quiet, no more context is coming to align
+-                # with: a rank still holding context would wait out the timeout for
+-                # nothing, and in a closed loop its users would stay out of phase with
+-                # the next burst. A burst takes a few iterations to reach every rank.
++                # Once a burst of arrivals (at least one per serving rank within the timeout
++                # window) has gone quiet, no more context is coming to align with, so release it.
+                 burst_ended = (
+                     all_ranks_have_free_ctx_slots
+                     and len(self.waiting_queue) == 0
+diff --git a/tensorrt_llm/_torch/pyexecutor/request_utils.py b/tensorrt_llm/_torch/pyexecutor/request_utils.py
+index 8d93f01f08..6e630cfc0d 100644
+--- a/tensorrt_llm/_torch/pyexecutor/request_utils.py
++++ b/tensorrt_llm/_torch/pyexecutor/request_utils.py
+@@ -120,9 +120,9 @@ def can_process_attention_dp_request(
+     Returns:
+         True if the request can be processed, False otherwise. With peer-loss
+         recovery, a request pinned to a rank that is not serving is returned as
+-        processable so the ADP router can fail it instead of leaving it queued
+-        forever. Without it, every rank serves and the target indexes the
+-        ranks in order (a negative one counts from the last).
++        processable so the ADP router fails it. Without it, every rank serves
++        and the target indexes the ranks in order (a negative one counts from
++        the last).
+     """
+     scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+     if scheduling_params is None:
+diff --git a/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py b/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py
+index aec8ecd233..b6da70253e 100644
+--- a/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py
++++ b/tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py
+@@ -235,7 +235,7 @@ class ADPRouter(ABC):
+         place. With peer-loss recovery, a relaxed request targeting a rank that
+         is not serving is load balanced; :meth:`split_unservable_requests`
+         removes strict ones first. Without it, every rank serves and the
+-        target's count is looked up by position, as in a per-rank list.
++        target's count is looked up by position.
+         """
+         remaining: List["RequestQueueItem"] = []
+         for req_item in requests:
+diff --git a/tensorrt_llm/executor/ipc.py b/tensorrt_llm/executor/ipc.py
+index 6ee347e01a..f5d51824aa 100644
+--- a/tensorrt_llm/executor/ipc.py
++++ b/tensorrt_llm/executor/ipc.py
+@@ -61,7 +61,8 @@ class ZeroMqQueue:
+             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
+             name (str, optional): The name of the queue. Defaults to None.
+             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+-            socket_options (dict[int, Any], optional): ZeroMQ socket options set before the socket binds or connects, e.g. {zmq.MAXMSGSIZE: 65536}. Defaults to None.
++            socket_options (dict[int, Any], optional): ZeroMQ socket options set before the socket binds or connects,
++            e.g. {zmq.MAXMSGSIZE: 65536}. Defaults to None.
+         '''
+ 
+         if not use_hmac_encryption:
+diff --git a/tensorrt_llm/executor/recovery/authority.py b/tensorrt_llm/executor/recovery/authority.py
+index abb0406d7f..3b9b452ff1 100644
+--- a/tensorrt_llm/executor/recovery/authority.py
++++ b/tensorrt_llm/executor/recovery/authority.py
+@@ -99,23 +99,18 @@ class _Violation(Exception):
+ class RecoveryAuthority:
+     """State machine for recovering from the loss of admitted failure domains, one recovery after another.
+ 
+-    A failure domain is a set of worker ranks lost together: a single rank or a whole
+-    node. A loss recovers only if every survivor reports the same failed set (every rank
+-    lost so far) and that set is a union of admitted domains; the survivors check that
+-    their slots still serve every expert without it. The survivors' agreement on the failed
+-    set may rest on a failure detector's suspicion (a stopped process is alive), so with
+-    ``fence_departed`` the authority has rank 0 end through the MPI runtime, before proposing, every
+-    failed rank it has not fenced itself, and aborts if one cannot be ended.
+-
+-    The authority performs no I/O: ``handle`` and ``expire`` return the messages to
+-    send as ``(routing_id, message)`` pairs. A protocol violation during registration or
+-    a recovery, an unrecoverable loss, or a recovery that does not commit within
+-    ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts
+-    ``Abort``; a violation while serving, or an object that is not a message, is refused
+-    to its sender alone. A message that no registered member can have sent on its route
+-    (an unregistered route, or another rank than the route's) is dropped, and so is a
+-    worker's message that :meth:`receive` finds stale (a replay). Its attributes are
+-    read-only for callers.
++    A failure domain is a set of worker ranks lost together: a single rank or a whole node. A loss recovers only if
++    every survivor reports the same failed set (every rank lost so far) and that set is a union of admitted domains;
++    the survivors check that their slots still serve every expert without it. That agreement may rest on a failure
++    detector's suspicion (a stopped process is alive), so with ``fence_departed`` rank 0 ends every failed rank the
++    authority has not fenced itself through the MPI runtime before proposing; one that cannot be ended aborts.
++
++    The authority performs no I/O: ``handle`` and ``expire`` return ``(routing_id, message)`` pairs to send. A
++    protocol violation during registration or a recovery, an unrecoverable loss, or a recovery that does not commit
++    within ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts ``Abort``; a violation
++    while serving, or an object that is not a message, is refused to its sender alone. A message no registered
++    member can have sent on its route (an unregistered route, or another rank than the route's) is dropped, and so
++    is a worker's message :meth:`receive` finds stale (a replay). Its attributes are read-only for callers.
+ 
+     Args:
+         world_size: Number of worker ranks that must register. Every worker must
+@@ -125,12 +120,10 @@ class RecoveryAuthority:
+         hang_monitor: Judges the workers' heartbeats and device waits; None ignores them. A stall of every
+             rank it reports, or a hung rank whose loss is not admitted (rank 0), aborts (terminal) and has
+             every worker end with ``STALLED_EXIT_CODE``.
+-        fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason,
+-            host and pid): called if the rank's loss has not started a recovery
+-            ``COMMAND_FENCE_GRACE_S`` after the authority sent ``Fence`` to the rank's own
+-            evidence thread and to another rank's (which has the MPI runtime end it). It
+-            must end that process, whose loss then recovers as any other. None relies on
+-            the workers alone.
++        fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason, host and pid), called
++            if its loss has not started a recovery ``COMMAND_FENCE_GRACE_S`` after ``Fence`` went to the rank's own
++            evidence thread and to another rank's (which has the MPI runtime end it). It must end that process,
++            whose loss then recovers as any other. None relies on the workers alone.
+         config_digest: The ``FaultToleranceConfig.digest()`` every worker must register with
+             (default: that of the default settings).
+         fence_departed: Have rank 0 end every failed rank before each proposal (the deployment always does,
+diff --git a/tensorrt_llm/executor/recovery/config.py b/tensorrt_llm/executor/recovery/config.py
+index 75e88c2b0f..b36d4efc06 100644
+--- a/tensorrt_llm/executor/recovery/config.py
++++ b/tensorrt_llm/executor/recovery/config.py
+@@ -14,14 +14,21 @@ import hashlib
+ import json
+ import os
+ from pathlib import Path
+-from typing import Literal, Optional
++from typing import Dict, List, Literal, Optional, Sequence, Tuple
+ 
+ import yaml
+ from pydantic import ConfigDict, Field, PositiveFloat, model_validator
+ 
+ from tensorrt_llm.llmapi.utils import StrictBaseModel
+ 
+-__all__ = ["CONFIG_ENV", "STALLED_EXIT_CODE", "FaultToleranceConfig", "fault_tolerance_config"]
++__all__ = [
++    "CONFIG_ENV",
++    "STALLED_EXIT_CODE",
++    "FailureDomain",
++    "FaultToleranceConfig",
++    "failure_domains",
++    "fault_tolerance_config",
++]
+ 
+ CONFIG_ENV = "TLLM_FAULT_TOLERANCE_CONFIG"
+ # A worker asks the MPI runtime to kill a hung rank this long after it received the authority's Fence, unless the
+@@ -35,6 +42,8 @@ COMMAND_FENCE_GRACE_S = 5.0
+ # The exit code of a worker the authority told that the deployment hangs and no fence can recover it (EX_TEMPFAIL):
+ # the deployment must restart.
+ STALLED_EXIT_CODE = 75
++# A set of ranks lost together, as a sorted tuple: one rank or a whole node.
++FailureDomain = Tuple[int, ...]
+ 
+ 
+ class FaultToleranceConfig(StrictBaseModel):
+@@ -147,3 +156,19 @@ def fault_tolerance_config() -> FaultToleranceConfig:
+     if not isinstance(fields, dict):
+         raise ValueError(f"{CONFIG_ENV}={path} must hold a mapping of settings")
+     return FaultToleranceConfig(**fields)
++
++
++def failure_domains(hosts: Sequence[str], failure_domain: str) -> List[FailureDomain]:
++    """The rank sets to recover from: every rank but 0, then for ``node`` every node but rank 0's.
++
++    Args:
++        hosts: Per rank, the host it runs on.
++        failure_domain: ``rank`` or ``node`` (FaultToleranceConfig.failure_domain).
++    """
++    domains = [(rank,) for rank in range(1, len(hosts))]
++    if failure_domain == "node":
++        nodes: Dict[str, List[int]] = {}
++        for rank, host in enumerate(hosts):
++            nodes.setdefault(host, []).append(rank)
++        domains += [tuple(ranks) for host, ranks in nodes.items() if host != hosts[0]]
++    return list(dict.fromkeys(domains))
+diff --git a/tensorrt_llm/executor/recovery/hang_monitor.py b/tensorrt_llm/executor/recovery/hang_monitor.py
+index 93dbc98e72..25f3c7df84 100644
+--- a/tensorrt_llm/executor/recovery/hang_monitor.py
++++ b/tensorrt_llm/executor/recovery/hang_monitor.py
+@@ -45,21 +45,16 @@ class _RankEvidence:
+ class HangMonitor:
+     """Confirm a hung rank, or a stall of every rank, once it has held for ``confirm_s``.
+ 
+-    A rank ``r`` is hung when, for ``confirm_s``, every other rank with a fresh
+-    heartbeat waits on it and ``r`` made no progress (its iteration did not rise;
+-    any rise restarts the window). A peer waits on ``r`` when its device waits on
+-    ``r`` in an all-to-all, or when it waits on the host (a collective, or new
+-    requests) while ``r`` does not or has no fresh heartbeat. A rank whose own
+-    device waits on another rank is a victim further down a chain, not the culprit.
+-
+-    The deployment is stalled when no rank made progress for ``confirm_s``, every
+-    rank with a fresh heartbeat has had its device wait on a peer for as long, and no
+-    rank is waited on by every peer: no fence can help, so it must restart. An idle
+-    deployment has no device waits and never matches.
+-
+-    No decision is made while fewer than half the ranks' heartbeats are fresh: the
+-    authority has then lost its view of the deployment, not the ranks their progress.
+-    A rank is watched from its first heartbeat on, and confirmed hung at most once.
++    A rank ``r`` is hung when, for ``confirm_s``, every other rank with a fresh heartbeat waits on it and ``r`` made
++    no progress (any rise of its iteration restarts the window). A peer waits on ``r`` when its device waits on ``r``
++    in an all-to-all, or when it waits on the host (a collective, or new requests) while ``r`` does not or has no
++    fresh heartbeat. A rank whose own device waits on another rank is a victim further down a chain, not the culprit.
++
++    The deployment is stalled (no fence can help; it must restart) when no rank made progress for ``confirm_s``,
++    every rank with a fresh heartbeat has had its device wait on a peer for as long, and no rank is waited on by
++    every peer. An idle deployment has no device waits and never matches. No decision is made while fewer than half
++    the ranks' heartbeats are fresh (the authority lost its view, not the ranks their progress). A rank is watched
++    from its first heartbeat on, and confirmed hung at most once.
+ 
+     Args:
+         ranks: The ranks that may be watched.
+diff --git a/tensorrt_llm/llmapi/mpi_session.py b/tensorrt_llm/llmapi/mpi_session.py
+index afdcbf4132..31ba162660 100644
+--- a/tensorrt_llm/llmapi/mpi_session.py
++++ b/tensorrt_llm/llmapi/mpi_session.py
+@@ -156,11 +156,10 @@ def _mpi_finalize() -> int:
+ def _finalize_and_exit(status: int, where: str) -> NoReturn:
+     """Finalize MPI (*where* names the exit path in the logs), then end this process with *status*.
+ 
+-    ULFM's MPI_Finalize can block for good, and it holds every process that
+-    reached it; after ``_FINALIZE_GRACE_S`` this process exits with *status*
+-    without it. If that cannot run, native timers that need no GIL dump the
+-    stacks at twice the grace and then end the process by SIGALRM. Exit handlers do not run, so the peer-failure watch they
+-    would stop is stopped first.
++    ULFM's MPI_Finalize can block for good, holding every process that reached it, so after
++    ``_FINALIZE_GRACE_S`` this process exits with *status* without it; if that cannot run, native timers that
++    need no GIL dump the stacks at twice the grace and end the process by SIGALRM. Exit handlers do not run, so
++    the peer-failure watch they would stop is stopped first.
+     """
+     recovery = sys.modules.get(
+         "tensorrt_llm._torch.pyexecutor.peer_loss_recovery")
+@@ -220,14 +219,12 @@ _worker_rank_cleanup: Optional[Callable[[], None]] = None
+ def _exit(status: int) -> NoReturn:
+     """``os._exit(status)``, without exit handlers.
+ 
+-    In a worker rank that ``run_worker_rank`` serves under peer-loss recovery,
+-    first runs the rank's cleanup, and ends any non-zero *status* by SIGKILL
+-    instead: the MPI runtime survives a killed process, but a second non-zero
+-    exit status ends the whole job. The stalled exit (``STALLED_EXIT_CODE``),
+-    which is meant to end the job, calls ``os._exit`` directly. Exits that never
+-    reach Python (a native ``exit(1)``, a failure before ``run_worker_rank``)
+-    still end the job, and a signal death leaves the launcher's fallback
+-    temporary FlashInfer workspace behind.
++    In a worker rank that ``run_worker_rank`` serves under peer-loss recovery, first runs the rank's cleanup,
++    and ends any non-zero *status* by SIGKILL instead: the MPI runtime survives a killed process, but a second
++    non-zero exit status ends the whole job. The stalled exit (``STALLED_EXIT_CODE``), meant to end the job,
++    calls ``os._exit`` directly. Exits that never reach Python (a native ``exit(1)``, a failure before
++    ``run_worker_rank``) still end the job, and a signal death leaves the launcher's fallback temporary
++    FlashInfer workspace behind.
+     """
+     if _worker_rank_cleanup is not None:
+         _worker_rank_cleanup()
+@@ -241,15 +238,12 @@ def run_worker_rank(serve: Callable[[], None],
+                     lock_fd: Optional[int] = None) -> None:
+     """Run *serve*, the loop of an MGMN worker rank, then end this process.
+ 
+-    Under peer-loss recovery trtllm-llmapi-launch execs this process, so that
+-    the MPI runtime sees its end directly, and passes the launcher's duties
+-    on: this process keeps the FlashInfer workspace lock on *lock_fd* (made
+-    non-inheritable, so that no exec'd descendant keeps a dead rank's slot
+-    locked), removes the temporary FlashInfer workspace
+-    *temporary_workspace* on every exit that runs Python, and ends any
+-    failure by SIGKILL (see ``_exit``); a clean end finalizes MPI (see
+-    ``exit_fault_tolerant_process``). Without recovery, runs *serve* and
+-    returns.
++    Under peer-loss recovery trtllm-llmapi-launch execs this process, so the MPI runtime sees its end directly,
++    and passes the launcher's duties on: this process keeps the FlashInfer workspace lock on *lock_fd* (made
++    non-inheritable, so no exec'd descendant keeps a dead rank's slot locked), removes the temporary FlashInfer
++    workspace *temporary_workspace* on every exit that runs Python, and ends any failure by SIGKILL (see
++    ``_exit``); a clean end finalizes MPI (see ``exit_fault_tolerant_process``). Without recovery, runs *serve*
++    and returns.
+     """
+     if not (ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled()):
+         serve()
+diff --git a/tensorrt_llm/serve/openai_server.py b/tensorrt_llm/serve/openai_server.py
+index f95af0100f..9f71464862 100644
+--- a/tensorrt_llm/serve/openai_server.py
++++ b/tensorrt_llm/serve/openai_server.py
+@@ -1216,7 +1216,6 @@ class OpenAIServer(_VideoRoutesMixin):
+         if is_context_length_exceeded_message(message):
+             code = CONTEXT_LENGTH_EXCEEDED_CODE
+         elif fault_tolerance_mode() and is_peer_loss_retryable_message(message):
+-            # Recovery from a peer loss takes about a second.
+             err_type = "ServiceUnavailableError"
+             status_code = HTTPStatus.SERVICE_UNAVAILABLE
+             code, headers = PEER_LOSS_RETRYABLE_CODE, {"Retry-After": "1"}
+diff --git a/tests/unittest/_torch/executor/test_peer_loss_recovery.py b/tests/unittest/_torch/executor/test_peer_loss_recovery.py
+index 4315999194..5349638813 100644
+--- a/tests/unittest/_torch/executor/test_peer_loss_recovery.py
++++ b/tests/unittest/_torch/executor/test_peer_loss_recovery.py
+@@ -2574,22 +2574,6 @@ def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
+     executor.dist.enable_peer_loss_recovery.assert_not_called()
+ 
+ 
+-def test_failure_domains_are_every_rank_then_every_host_but_rank_0_s():
+-    hosts = ["a"] * 4 + ["b"] * 4
+-    assert peer_loss_recovery.failure_domains(hosts, "rank") == [(r,) for r in range(1, 8)]
+-    assert peer_loss_recovery.failure_domains(hosts, "node") == [
+-        *((r,) for r in range(1, 8)),
+-        (4, 5, 6, 7),
+-    ]
+-    # Ranks mapped round-robin over the hosts: a node is the ranks on one host, not a block of ranks.
+-    assert peer_loss_recovery.failure_domains(["a", "b", "a", "b"], "node")[-1] == (1, 3)
+-    assert peer_loss_recovery.failure_domains(["a", "b", "c", "d"], "node") == [
+-        (1,),
+-        (2,),
+-        (3,),
+-    ]
+-
+-
+ @pytest.mark.parametrize("failure_domain, refused", [("rank", False), ("node", True)])
+ def test_create_refuses_a_failure_domain_the_slots_cannot_cover(
+     monkeypatch, failure_domain, refused
+diff --git a/tests/unittest/executor/test_recovery_config.py b/tests/unittest/executor/test_recovery_config.py
+index d6b717dfc3..721a764548 100644
+--- a/tests/unittest/executor/test_recovery_config.py
++++ b/tests/unittest/executor/test_recovery_config.py
+@@ -5,7 +5,11 @@
+ import pytest
+ 
+ from tensorrt_llm.executor.recovery import config as config_module
+-from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConfig
++from tensorrt_llm.executor.recovery.config import (
++    CONFIG_ENV,
++    FaultToleranceConfig,
++    failure_domains,
++)
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -103,3 +107,19 @@ def test_digest_is_stable_and_changes_with_any_field():
+     assert changed.keys() == FaultToleranceConfig.model_fields.keys()
+     digests = {FaultToleranceConfig(**{name: value}).digest() for name, value in changed.items()}
+     assert digest not in digests and len(digests) == len(changed)
++
++
++def test_failure_domains_are_every_rank_then_every_host_but_rank_0_s():
++    hosts = ["a"] * 4 + ["b"] * 4
++    assert failure_domains(hosts, "rank") == [(r,) for r in range(1, 8)]
++    assert failure_domains(hosts, "node") == [
++        *((r,) for r in range(1, 8)),
++        (4, 5, 6, 7),
++    ]
++    # Ranks mapped round-robin over the hosts: a node is the ranks on one host, not a block of ranks.
++    assert failure_domains(["a", "b", "a", "b"], "node")[-1] == (1, 3)
++    assert failure_domains(["a", "b", "c", "d"], "node") == [
++        (1,),
++        (2,),
++        (3,),
++    ]

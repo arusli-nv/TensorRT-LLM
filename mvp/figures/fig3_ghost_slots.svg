@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="530" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="white"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#1A1A1A"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#9A9A9A"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<text x="40" y="42" font-size="17" fill="#1A1A1A" text-anchor="start" font-weight="bold">Healthy: 8 active expert slots + 2 ghost slots per GPU</text>
+<rect x="40" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="81.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e0</text>
+<rect x="128" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="169.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e1</text>
+<rect x="216" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="257.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e2</text>
+<rect x="304" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="345.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e3</text>
+<rect x="392" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="433.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e4</text>
+<rect x="480" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="521.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e5</text>
+<rect x="568" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="609.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e6</text>
+<rect x="656" y="60" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="697.0" y="100" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e7</text>
+<rect x="744" y="60" width="82" height="64" rx="8" fill="url(#hatch)" stroke="#9A9A9A" stroke-width="1.8" stroke-dasharray="5 4"/>
+<text x="785.0" y="93" font-size="15" fill="#707070" text-anchor="middle" font-weight="normal">ghost</text>
+<text x="785.0" y="112" font-size="12" fill="#707070" text-anchor="middle" font-weight="normal">no memory</text>
+<rect x="832" y="60" width="82" height="64" rx="8" fill="url(#hatch)" stroke="#9A9A9A" stroke-width="1.8" stroke-dasharray="5 4"/>
+<text x="873.0" y="93" font-size="15" fill="#707070" text-anchor="middle" font-weight="normal">ghost</text>
+<text x="873.0" y="112" font-size="12" fill="#707070" text-anchor="middle" font-weight="normal">no memory</text>
+<text x="40" y="148" font-size="13" fill="#707070" text-anchor="start" font-weight="normal">ghost slots: virtual addresses reserved at startup and captured by the CUDA graphs</text>
+<rect x="960" y="75" width="240" height="34" rx="6" fill="#F7F7F7" stroke="#9A9A9A" stroke-width="1.5"/>
+<rect x="960" y="75" width="240.0" height="34" rx="6" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.5"/>
+<text x="1080" y="98" font-size="14" fill="#1A1A1A" text-anchor="middle" font-weight="normal">KV cache: full size</text>
+<text x="40" y="232" font-size="17" fill="#1A1A1A" text-anchor="start" font-weight="bold">After a failure: a lost expert restored into a ghost slot</text>
+<rect x="40" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="81.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e0</text>
+<rect x="128" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="169.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e1</text>
+<rect x="216" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="257.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e2</text>
+<rect x="304" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="345.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e3</text>
+<rect x="392" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="433.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e4</text>
+<rect x="480" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="521.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e5</text>
+<rect x="568" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="609.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e6</text>
+<rect x="656" y="250" width="82" height="64" rx="8" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="697.0" y="290" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e7</text>
+<rect x="744" y="250" width="82" height="64" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2.4"/>
+<text x="785.0" y="283" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="bold">e37</text>
+<text x="785.0" y="302" font-size="12" fill="#707070" text-anchor="middle" font-weight="normal">restored</text>
+<rect x="832" y="250" width="82" height="64" rx="8" fill="url(#hatch)" stroke="#9A9A9A" stroke-width="1.8" stroke-dasharray="5 4"/>
+<text x="873.0" y="283" font-size="15" fill="#707070" text-anchor="middle" font-weight="normal">ghost</text>
+<text x="873.0" y="302" font-size="12" fill="#707070" text-anchor="middle" font-weight="normal">no memory</text>
+<rect x="960" y="265" width="240" height="34" rx="6" fill="#F7F7F7" stroke="#9A9A9A" stroke-width="1.5"/>
+<rect x="960" y="265" width="211.2" height="34" rx="6" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.5"/>
+<text x="1080" y="288" font-size="14" fill="#1A1A1A" text-anchor="middle" font-weight="normal">KV cache: lends memory</text>
+<path d="M 1080 299 L 1080 350 L 805 350 L 805 318" fill="none" stroke="#76B900" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#green)"/>
+<text x="942" y="368" font-size="13" fill="#707070" text-anchor="middle" font-weight="normal">memory mapped (CudaVirtualMemoryManager)</text>
+<rect x="400" y="380" width="300" height="70" rx="10" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="2.0"/>
+<text x="550.0" y="411.0" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="bold">Host copy of e37</text>
+<text x="550.0" y="434.0" font-size="15" fill="#707070" text-anchor="middle" font-weight="normal">CPU memory, local or a neighbour</text>
+<path d="M 700 415 L 765 415 L 765 318" fill="none" stroke="#76B900" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#green)"/>
+<text x="778" y="410" font-size="13" fill="#707070" text-anchor="start" font-weight="normal">weights copied in (over NVLink from a neighbour node)</text>
+<text x="620" y="505" font-size="13" fill="#707070" text-anchor="middle" font-weight="normal">320 slots = 256 experts + 64 ghost (DeepSeek-R1, 32 GPUs); with online EPLB, 288 EPLB slots + 32 ghost</text>
+</svg>

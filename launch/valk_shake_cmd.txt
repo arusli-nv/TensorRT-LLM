@@ -1,0 +1,42 @@
+# VAL-K (16 nodes, two 8-node groups, < 2 h): kill freeze validation of the freeze build (v5-zero rebased onto current
+# main, no overlay): design C, fence-always, exec'd worker. Hang detection on in every FT case (hang_confirm_s 30, as
+# VAL-H); Open MPI's in-band detector OFF (user, option A: frozen-rank detection is the 30 s hang confirm, a stated limit).
+# Every FT case launches as the feature doc does: no pml/btl flags (WIDEEP_MPI_MCA keeps only btl_tcp_if_include and
+# coll), so trtllm-llmapi-launch picks ob1 with self,tcp. std-noeplb-ft.yaml (R1 NVFP4 + MTP), node failure domain, kill
+# in steady decode, 1 case per row. Each group first runs the short in-job unit gate (as VAL-H1, ~6 min).
+# Group 0:
+#   rank5 / node1 at 128/GPU: recover (C38); rank0: not recoverable, the job ends on its own within 180 s (C38);
+#   rank5pf: rank 5 killed in a context step (H31); deadline: rank 5 killed, survivor rank 9 alone reacts 45 s late,
+#   past the others' 30 s recovery deadline (hang detection off in this row): ends within 180 s, no rank starts
+#   revoke/shrink/watch after its own deadline line (C10); rank5 at 512/GPU (KF_LOAD 512, window past the prefill; C19).
+# Group 8:
+#   twokill: rank 5, then rank 9 after the first commit (C18/H6; incl. ft_watch); stop: rank 2 SIGSTOPped at 64/GPU,
+#   fenced by hang detection (C7/C38), 8 waves (KF_STOP_ITERATIONS) so the after-rate window has ~2 min of steps;
+#   SHUTDOWN-R1: ft-clean / ft-loss / noft-clean, rc 143, no leftovers (C38, C4); rank5upd on std-online.yaml: rank 5
+#   killed right after starting an iteration that updates EPLB weights (C8).
+# Pass: KILL_FINAL_VERDICT PASS per recoverable row incl. H23 (val_verdicts.h23_checks): resume_s <= 10 s (stop: from
+# the hang confirmation; h23_confirm_s reported apart, ~30-36 s expected), est_tok_s_after / before >= 0.8 x live/32
+# (h23_tput_ratio=N/A when the after-window is empty: not a fail), >= 20 requests in full after the loss. rank0 /
+# deadline: ended_s <= 180 (+ deadline checks). SHUTDOWN_VERDICT PASS.
+# Readout: KILL_FINAL_VERDICT in $R/mvp/runs/KILL-FINAL-*-<job>/kill_final.txt; SHUTDOWN_VERDICT in
+# $R/mvp/runs/SHUTDOWN-R1-<job>/*/shutdown_verdict.txt.
+# Estimate (KILL-SMOKE 8167545: short gate 2.5 min, kill cases 9-12 min; SHUTDOWN-R1-8139740 ~30 min):
+#   group 0 ~6 + rank5 12 + node1 10 + rank0 9 + rank5pf 10 + deadline 11 + rank5@512 ~18 = ~76 min;
+#   group 8 ~6 + twokill 12 + stop ~13 + SHUTDOWN-R1 ~30 + rank5upd ~14 = ~75 min; limit 7000 s (117 min).
+# Submit (16 nodes, segment 8) after the freeze build passed:
+#   bash $R/tools/require_presubmit.sh <token> && bash $R/launch/val_k_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# SHAKEDOWN: harness validation of VAL-K on the pre-freeze candidate (f9e6 wheel + vzero-65a39b411d); not freeze evidence.
+B=build-v5zero-f9e6bc0f8b; SRC=$R/overlays/build-src-f9e6bc0f8b; O=$R/overlays/vzero-65a39b411d
+# The unit gate's overlay arguments: the source snapshot itself when the wheel carries all of the Python (no overlay).
+OV=${O:-$SRC}; OT=${O:+$O-tests}; OT=${OT:-$SRC}
+T="tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/executor/test_py_executor.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/valkshake-gate$1-\$SLURM_JOB_ID $R/$B/dist $OV $OT $SRC $R/$B/point-units-valkshake-g$1 $T"; }
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+H="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=${O:+1} WIDEEP_MPI_MCA='$M' $H WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+S="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O WIDEEP_MPI_MCA='$M' $H"
+bash $R/bundle.sh "0:8:7000:$(g 0) && { $K KF_ROWS='rank5 node1 rank0 rank5pf deadline' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K KF_ROWS=rank5 KF_LOAD=512 KF_ITERATIONS=3 KF_KILL_WINDOW=200,230 WIDEEP_CLIENT_MAX_CONCURRENCY=2048 bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF; }" \
+  "8:8:7000:$(g 8) && { $K KF_ROWS='twokill stop' KF_STOP_ITERATIONS=8 bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B; $S bash $R/mvp/harness/run_job.sh SHUTDOWN-R1; $K KF_ROWS=rank5upd KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B; }"

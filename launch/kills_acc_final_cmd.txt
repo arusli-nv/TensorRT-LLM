@@ -1,0 +1,14 @@
+# FINAL KILLS + ACCURACY on build-v2-cef4670789 (packing approved 00:05). Decode-only kills, rows interleaved, KF_ITERATIONS=4,
+# graph sizes +136,148, node failure domain. Labels: rank5 = one rank killed; node1 = all ranks of one node killed (host up).
+# G0 first runs the v2 C++ gtests (moeLoadBalancerTest) on its node 0; a failure stops G0.
+# G0 (~115 min): w/o EPLB rank5+node1 x3 (OFF-A) -> online rank5 x2 (ON-B, rows "rank5") -> accuracy: acc-killdur-final-1
+#   (ACCURACY-KILL-ON, FT on, rank 5 killed during GSM8K) -> acc-ref-final (ACCURACY-KILL-OFF, FT off). The accuracy cases get
+#   the group's remaining time (GROUP_LIMIT_S from the group start) and are skipped, not cut, if it runs short.
+# G1 (~102 min): offline rank5+node1 x3 (OFF-B, rows "rank5 node1") -> online node1 x2 (ON-A, rows "node1") -> online rank5 x1
+#   (KILL-FINAL-ON, rows "rank5"). Online: rank n=3, node n=2. Rows files written right after submit:
+#   kf_rows-<job>-KILL-FINAL-ON-B=rank5, -OFF-B="rank5 node1", -ON-A=node1, -ON=rank5.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1"
+A="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_POLLUTION_CHECKS=1"
+bash $R/bundle.sh "0:8:6900:T0=\$(date +%s); F=$R/logs/gtest-v2-cef4670789-\$SLURM_JOB_ID.rc; if [[ \$SLURM_NODEID == 0 ]]; then $R/overlays/build-root-feat/cpp-build-oot/tests/unit_tests/runtime/moeLoadBalancerTest --gtest_filter='GhostSlotMemoryTest.*:MoeLoadBalancerRestoreTest.*:MoeLoadBalancerMaskOnlyTest.*:MoeLoadBalancerUnusableSlotTest.*:MoeLoadBalancerTests/*:MoeLoadBalancerFaultTolerance*' > $R/logs/gtest-v2-cef4670789-\$SLURM_JOB_ID.txt 2>&1; echo \$? > \$F.tmp; mv \$F.tmp \$F; fi; for i in \$(seq 600); do [[ -s \$F ]] && break; sleep 1; done; [[ \$(cat \$F 2>/dev/null) == 0 ]] || { echo GTEST_FAILED; exit 1; }; $K KF_REPEATS=3 KF_BENCH_CONFIG=std-noeplb-ft.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K KF_REPEATS=2 KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B; GROUP_LIMIT_S=\$((6840 - \$(date +%s) + T0)) $A ACC_KILL_DURING=1 ACC_REPS=1 ACC_REFS= bash $R/mvp/harness/run_job.sh ACCURACY-KILL-ON; GROUP_LIMIT_S=\$((6840 - \$(date +%s) + T0)) $A ACC_REPS=0 ACC_REFS=ref-final bash $R/mvp/harness/run_job.sh ACCURACY-KILL-OFF" \
+  "8:8:6900:$K KF_REPEATS=3 KF_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B; $K KF_REPEATS=2 KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A; $K KF_REPEATS=1 KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON"

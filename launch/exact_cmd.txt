@@ -1,0 +1,34 @@
+# EXACT (16 nodes, two 8-node groups, segment 8). This decides slide 3's "survivors' requests continue exactly" on
+# v5-final 27442bd91d (overlays/fix-dropmap-9f1fd4cab4 on build-freeze-58caa0fde6): the exact-token check after a rank
+# kill on the standard configs, real MTP acceptance (job.sh EXACT-FINAL, tokens/frontend.py), first run of this case.
+# The only exact-token evidence so far is CLAIMS 95 (older build, small config, n=2).
+# Pass rule (job.sh EXACT-FINAL header, unchanged; draft_cases/val_verdicts.py), written before data: PASS iff the
+# reference is deterministic and unchanged by the victim prompt on rank 1, the kill landed mid-generation, the victim's
+# request ran again exactly once, pre-kill tokens equal the reference exactly, the placement proof holds, and after the
+# kill the first-diff positions are no earlier (sorted position by position) than the no-kill perturbed-batch control's.
+# Rules (review/OVERNIGHT_PLAN_2026-10-27.md): results go to slide 3 / B9 notes with a CLAIMS row; a FAIL is reported as is.
+# Groups (EXACT-FINAL budget: 3 starts x ~7.5-9 min + <1 min serving = ~30 min per deployment):
+#   G0: std-noeplb-ft.yaml, then std-offline-ft-filled.yaml   ~60 min
+#   G8: std-online.yaml twice                                  ~60-66 min
+# Labels EXACT-FINAL, -B, -C, -D (job.sh case pattern extended 10-27 for one run dir per config; no logic change).
+#   --time 01:40, group limit 5700 s. A broken case fails both groups fast (no idle allocation).
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1
+B=build-freeze-58caa0fde6
+O="MVP_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4 COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' WIDEEP_POLLUTION_CHECKS=1"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$K EXACT_CONFIG=std-noeplb-ft.yaml $(run EXACT-FINAL)"
+P0_2="$K EXACT_CONFIG=std-offline-ft-filled.yaml $(run EXACT-FINAL-B)"
+G0="{ $P0_1; $P0_2; }"
+P8_1="$K EXACT_CONFIG=std-online.yaml $(run EXACT-FINAL-C)"
+P8_2="$K EXACT_CONFIG=std-online.yaml $(run EXACT-FINAL-D)"
+G8="{ $P8_1; $P8_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:5700:$G0" "8:8:5700:$G8"

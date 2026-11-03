@@ -1,0 +1,35 @@
+# TIP-SWEEP2 (1 node): TIP-SWEEP 8279968's main arm stopped _torch/executor at collection
+# (test_error_classification.py reads tensorrt_llm/_torch/pyexecutor/error_classification.py from the tree, and the
+# main export had no tensorrt_llm/; now exported from 9cc37929e8). Both sides counted by the same method:
+# tests/unittest/_torch/executor (+ _torch/disaggregation again) with --continue-on-collection-errors, tip (freeze wheel + tip .py, tip tests) and
+# main (main wheel, main tests). The tip's .py are copied into the installed package (as serve.sh applies an
+# overlay), not overlaid through a symlink tree: TIP-SWEEP's tip-only disaggregation failure (blob/
+# test_testing_isolation: deep_gemm resolves outside the symlinked pkg dir) was an artifact of that symlink overlay.
+# Rule (set before data, as TIP-SWEEP): a test failing/erroring at the tip and passing
+# or absent at main is a stack regression (fix test-only in the introducing commit, or stop and report if it needs
+# product code); failing at both is pre-existing (listed). Output: review/diag/tipsweep2-<job>.txt (+ dir). --time 01:00.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+job=${SLURM_JOB_ID:-x}; out=$R/review/diag/tipsweep2-$job.txt; full=$R/review/diag/tipsweep2-$job; mkdir -p $full
+D=tests/unittest/_torch/executor
+ids() { grep -h "^FAILED\|^ERROR" "$@" | sed -E 's#.*tests/unittest/##; s/ - .*//' | sort -u; }
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    echo "##### tip"
+    pkg=$(cd / && python3 -c "import importlib.util as u, os; print(os.path.dirname(u.find_spec('tensorrt_llm').origin))")
+    (cd $R/scratch-v5pr-tip/tensorrt_llm && find . -name '*.py' -print0) | while IFS= read -r -d '' f; do
+        mkdir -p "$pkg/$(dirname "$f")"; cp "$R/scratch-v5pr-tip/tensorrt_llm/$f" "$pkg/$f"
+    done
+    echo "tip .py copied into $pkg"
+    PYTEST_EXTRA=--continue-on-collection-errors OVERLAY=0 bash $R/scratch-v5pr-tip/run_dirs.sh $R/scratch-v5pr-tip $full/tip $D tests/unittest/_torch/disaggregation
+    echo "##### main"
+    bash $R/install_wheel.sh $R/build-main-9cc37929e8/dist /tmp/i2.log || { tail -20 /tmp/i2.log; exit 1; }
+    PYTEST_EXTRA=--continue-on-collection-errors OVERLAY=0 bash $R/scratch-v5pr-tip/run_dirs.sh $R/scratch-mpisession/main $full/main $D tests/unittest/_torch/disaggregation
+    echo "##### tip-only failures/errors"; comm -23 <(ids $full/tip-*.txt) <(ids $full/main-*.txt)
+    echo "##### both"; comm -12 <(ids $full/tip-*.txt) <(ids $full/main-*.txt)
+    echo "##### main-only"; comm -13 <(ids $full/tip-*.txt) <(ids $full/main-*.txt)
+    echo TIPSWEEP2_DONE
+} > "$out" 2>&1

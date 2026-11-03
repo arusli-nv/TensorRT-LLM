@@ -1,0 +1,10 @@
+# SHUTDOWN-DET: why FT's clean shutdown takes 44.8 s vs 16.7 s FT off (v2 SHUTDOWN-R1 8102532: every rank waits the
+# 30 s MPI_Finalize bound). SHUTDOWN-R1 with SHUTDOWN_DETECTOR_AB=2: ft-clean with Open MPI's in-band detector (as
+# deployed) vs WIDEEP_NO_DETECTOR, alternating, n=2 each, v3 wheel, no overlay. Decides whether the detector is the cause
+# (then the fix targets it) or not (park, document). Lead rule: detector = cause if both nodet cases end without
+# "did not end within 30 s" and >= 20 s faster than both det cases.
+# Then the v4 b+c unit files, one per node (nodes 0-4), on the v3 wheel + overlay v4bc-957ac92c5f (point_units.sh).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+U="bash $R/tools/point_units.sh $R/$B/dist $R/overlays/v4bc-957ac92c5f $R/overlays/v4bc-957ac92c5f-tests $R/overlays/build-src-bcea8da496 $R/$B/point-units-v4bc"
+UNITS="tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/_torch/moe/test_resident_placement.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/_torch/moe/test_moe_load_balancer.py"
+bash $R/bundle.sh "0:8:5000:MVP_BUILD=$B FINAL_BUILD=$B SHUTDOWN_DETECTOR_AB=2 bash $R/mvp/harness/run_job.sh SHUTDOWN-R1; units=($UNITS); n=\$SLURM_NODEID; [[ -n \${units[\$n]:-} ]] && $U-node\$n \${units[\$n]}"

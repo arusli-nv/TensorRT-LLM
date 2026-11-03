@@ -1,0 +1,10 @@
+# BISECT-BC: which v4 patch makes the first step after a kill hang (PT-BC2 8130062: 2/2 hung on b+c)? One rank5 kill per
+# arm, w/o EPLB (std-noeplb-ft.yaml), settings as KILLS-V3, KF_STACKS=1 (py-spy stacks on every node 45 s after the kill).
+# Group A: v3 control (no overlay), then b only (v4b-ee76f03e74). Group B: c only (v4c-f0b6d3f1c9), then b+c (v4bc-957ac92c5f).
+# Rows: launch/kf_rows-<job>-<case> = rank5 (written right after submit). Distinct case names keep the run dirs apart.
+# PASS per arm: first_step phase logged after the resume and KILL_FINAL_VERDICT PASS. A hanging arm names the patch;
+# a hanging control means the hang predates v4.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays
+K="MVP_BUILD=$B FINAL_BUILD=$B KF_ALLOW_OVERLAY=1 KF_STACKS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1"
+bash $R/bundle.sh "0:8:4500:$K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K MVP_OVERLAY=$O/v4b-ee76f03e74 bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A" \
+  "8:8:4500:$K MVP_OVERLAY=$O/v4c-f0b6d3f1c9 bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF; $K MVP_OVERLAY=$O/v4bc-957ac92c5f bash $R/mvp/harness/run_job.sh KILL-FINAL-ON"

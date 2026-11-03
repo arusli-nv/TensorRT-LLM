@@ -1,0 +1,164 @@
+# STACK-STRESS (16 nodes, two 8-node groups, segment 8, qos short, --time 02:00:00): high-saturation stress of the WideEP
+# fault-tolerance build on the newer upstream main (wheel build-stack-966d3788b3). DRAFT, written 2026-10-30, before any data.
+# Modelled on launch/stress_s2s5_cmd.txt and launch/stress_s1_cmd.txt; same harness (job.sh STRESS case, bench.py --mode
+# stress, stress_client.py, stress_readout.py, configs/std-online-stress.yaml, serve.sh memory sampler).
+#
+# Code: MVP_BUILD = FINAL_BUILD = build-stack-966d3788b3, NO overlay (MVP_OVERLAY and KF_ALLOW_OVERLAY are not set; the
+#   job.sh STRESS preflight requires MVP_BUILD == FINAL_BUILD and no overlay). It is a newer upstream main, so NO pinned
+#   autotuner tactics from older runs (the s2s5/s1 files' STRESS_SEED=mvp/runs/STD-G1-8193512/autotuner/pinned.json is NOT
+#   used): the servers tune at startup (see "Unsure" 1 for how the harness is satisfied).
+# Mounts: $R (claude dir) rw AND /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro (model root;
+#   presubmit does not check it).
+#
+# Design: one serving case per 8-node group, online EPLB (std-online-stress.yaml = std-online, max_seq_len 6400), FT on
+# (std-online-ft), node failure domain, 32 GPUs.
+#   G0 (nodes 0-7, job STRESS):    "saturation": Poisson arrivals at 1.0 x the case's own closed-loop calib-32 request rate
+#                                  (bench.py --load-fraction 1.0), one SIGKILL of one random non-0 rank in minutes 10-40.
+#   G1 (nodes 8-15, job STRESS-G1): "over-saturated": 1.25 x the case's own calib-32 request rate (--load-fraction 1.25;
+#                                  the queue grows), one node kill (all 4 ranks of one random non-0 node) in minutes 10-40.
+#   Load as S2: input uniform 127-4096, output 63-2048 tokens (--isl 2112 --osl 1056 --range-ratio 0.9394), random token ids,
+#   ignore_eos, MTP forced acceptance, 90% /v1/completions + 10% /v1/chat/completions, all streamed, no concurrency cap.
+#   Calibration: warm-up, then closed-loop calib-32 (6 x 1024 requests); rate = fraction x its request_throughput.
+#   Kill time and victim are drawn AT LAUNCH by python3 random.Random(20261030) (seed fixed here, before any data):
+#   kill second = randint(600, 2400) after the load starts (G0 first, then G1), G0 rank = randint(1, 31), G1 node =
+#   randint(1, 7) (ranks 4n..4n+3). They are echoed in the STRESS_STACK line of the job log. Kill mechanism as S2 (victims
+#   SIGKILL themselves at their next decode step that serves a request, TLLM_TEST_KILL_TRIGGER_FOR).
+#   Knobs as S2: hang detection on (confirm 30 s), MCA string M, D-state sampler 2 s, pollution checks, memory sampler 60 s.
+#
+# Timing estimate (load shortened from S2's 62 min to 55 min; the 2 h QOS limit is what forces it):
+#   S2's case was ~83 min with a 62 min load (startup ~12, warm-up + calib ~3, prompt generation ~2, load 62, closed-loop
+#   row ~2, teardown ~2). G0 at 1.0x: 12 + 3 + 2 + 55 + ~3 drain + 2 (calib-end) + 2 = ~79 min (about 80).
+#   G1 at 1.25x does not end when the arrivals do: the queue must drain before the case ends. Backlog at the end of the
+#   load, worst case a node kill at minute 10 (capacity 0.875 afterwards): offered 1.25 vs capacity 1.0 for 10 min plus
+#   1.25 vs 0.875 for 45 min = 2.5 + 16.9 = ~19.4 capacity-minutes, drained at 0.875 = ~22 min. G1: 12 + 3 + 2 + 55 + ~22
+#   + 2 (teardown; no calib-end row: --calib-end-waves 0) = ~96 min = ~5760 s. With the 62 min load it would be ~103-106 min
+#   (6200-6360 s) with no margin for an un-pinned (tuning) startup, so 62 was rejected; 55 min keeps the kill window (10-40 min)
+#   and >= 15 min of degraded load after the latest kill. Bundle limit 6900 s per group (115 min); --time 02:00:00;
+#   the harness caps the case at min(job time left - 120 s, 6600 s) (CASE_TIMEOUT_S). If startup tuning adds > ~15 min, G1
+#   could hit that cap while draining (then its calib/latency rows are lost, the kill and load-time data are not).
+#
+# Pass rules (written before any data; adapted from S2):
+#   P1 recovery commits: rank 0 logs "resumed serving without ranks [<victims>] at membership generation 1", the driver saw
+#      the commit (no recovery_error) -- STRESS_KILL resumed_line=True, recovery_error=None.
+#   P2 no request other than the lost ranks' in-flight requests fails; each such failure is well formed and retryable:
+#      exactly one error event {type server_error, code peer_loss_retryable, message "[peer_loss_retryable]"} then exactly
+#      one [DONE] and nothing after it (or HTTP 503 with Retry-After); the failed ones name a lost rank, end between the
+#      kill and 60 s after the resume, and number <= rank 0's "failed F". Overload must not produce failures: at 1.25x
+#      requests queue, they do not error -- any non-lost failure (timeout, 5xx, reset, short stream) is a FAIL.
+#      (STRESS_UNASSIGNED lines empty; no_other_request_failed and errors_well_formed True.)
+#   P3 no stall > 60 s: no two consecutive rank-0 iterations > 60 s apart and no 60 s without a streamed chunk while a
+#      request is open, from the load's start to its last arrival (no STRESS_STALL line).
+#   P4 host and GPU memory growth within S2's thresholds, over [load start + 600 s, last arrival], median of the last 5
+#      per-minute samples minus the median of the first 5: every GPU <= 256 MiB, every rank process's RssAnon <= 512 MiB,
+#      every node's used memory (-MemAvailable) <= 2048 MiB (STRESS_MEMORY line, ok=True). Caveat declared now: node 0
+#      also runs the client and the server's queue grows in G1, so G1's node-0 host number is reported with that caveat
+#      and judged on the ranks' RssAnon and the other nodes.
+#   P5 /health reaches degraded: in [kill - 1 s, resume + 60 s] the sampled states are healthy, recovering (HTTP 503),
+#      degraded (HTTP 200) in that order, no other state (terminal, unprotected, unknown, no answer).
+#   Reported, NOT gated: at saturation, the output throughput after / before the kill (STRESS_KILL tok_s_before, tok_s_after,
+#      ratio; STRESS_CAPACITY calib-end/calib), the queue behaviour (arrival vs completion counts, requests still open at
+#      the last arrival, drain time after it) and TTFT/TPOT p50/p99 before and after (STRESS_LATENCY). In G1 the TTFT
+#      growth is expected and is not a failure.
+#   A case is INVALID (not an FT result) if the kill did not land while the load ran (bench.py HarnessInvalid) or a node
+#   shows a new Xid/NVRM line (kernel-*-before/after.txt).
+#   How the readout is used: stress_readout.py case --test s2 prints a STRESS_VERDICT that also GATES throughput
+#   (k1_tput >= 0.85/0.75, k1_capacity), which is not a pass rule here. Judge P1-P5 from the individual lines/checks above
+#   (k1_recovery_commits, k1_failed_match_server, no_other_request_failed, errors_well_formed, no_stall, k1_health,
+#   one_kill, STRESS_MEMORY); a FAIL only on k1_tput / k1_capacity is a reported result, not a failure of this test.
+#
+# Guards kept from the existing files: the node-0 EXCLUDE_NODES check and tools/check_excluded_nodes.sh (every allocated
+#   node); the presubmit token line (TOKEN is a PLACEHOLDER, replace with the token tools/presubmit.py prints); idle-node
+#   guards (serve.sh waits for a GPU-free node and fails NODE_BUSY; stale /dev/shm check; run_job.sh stall watchdog,
+#   MVP_STALL_MIN 30 min); time limits (--time 02:00:00, bundle limit 6900 s, CASE_TIMEOUT_S). Nothing in this file removes
+#   files (no rm).
+# Presubmit: python3 $R/tools/presubmit.py --name STACK-STRESS --nodes 16 --segment 8 --job STRESS
+#   --build build-stack-966d3788b3     (no --overlay)
+# Dry run: bash $R/tools/dry_run.sh launch/stack_stress_cmd.txt 16 0 8
+#
+# Unsure about in the harness (could not confirm by reading; none of these is a variable I invented, but I did not verify):
+#   1. STRESS_SEED: job.sh's STRESS preflight FAILS unless STRESS_SEED names a non-empty file (it then copies it to
+#      the case's TLLM_AUTOTUNER_CACHE_PATH). With no pinned tactics wanted, this file writes an EMPTY cache
+#      '{"metadata": {}, "shared": {}}' (the stub serve.sh's dry run writes) to $marks/stack-empty-tactics.json and passes
+#      that. I did not read the real (non-dry-run) part of serve.sh to confirm the server accepts such a file and tunes
+#      and writes its own cache, nor how long startup then takes (my estimate assumes ~12 min plus slack).
+#   2. build-stack-966d3788b3/dist: I could not list it (Lustre search timed out); whether it holds the wheel (serve.sh's
+#      dry run checks for dist/*.whl), whether install_wheel.sh accepts it, and whether FINAL_HOST_CACHE_SIZE
+#      (job.sh default 17179869184) and the other hooks (testhooks TLLM_TEST_KILL_TRIGGER_*, ft_watch, node failure
+#      domain, WIDEEP_FAILURE_DOMAIN, TLLM_FAULT_TOLERANCE_HANG_*) exist in this newer upstream-main build are unchecked.
+#   3. configs/std-online-stress.yaml (max_seq_len 6400, num_slots 288, max_batch 512) is the file the s2s5 runs used on
+#      the older build; I did not check it against the newer main's config schema, nor that it starts there.
+#   4. bench.py --load-fraction (default 0.8) is read as a multiplier on calib-32's request_throughput (run_stress line
+#      "rate = args.stress_rate or args.load_fraction * calib['request_throughput']"); 1.25 > 1 is not rejected there, but
+#      I did not read the argparse validation nor the client (stress_client.py) for a cap on open streams/connections
+#      or client memory with a growing backlog at 1.25x (the s2s5 runs never exceeded 0.8).
+#   5. How finish() / the client end when a backlog exists: I assumed the case waits for every request to finish (drain)
+#      before the calib-end row; if it instead cancels at some deadline, G1's tail differs from the estimate above.
+#   6. stress_readout.py: the --test s2 checks that gate throughput (above); memory ok is printed but not part of the s2
+#      verdict; the stall/latency/memory functions' behaviour with a growing queue was not read.
+#   7. MPI/MCA string M and WIDEEP_MPI_MCA, WIDEEP_HOST_CACHE (set by job.sh from FINAL_HOST_CACHE_SIZE), the EXCLUDE_NODES
+#      file path (mvp/EXCLUDE_NODES.txt, as the s2s5 file uses; harness dir has an EXCLUDE_NODES without .txt) are copied
+#      from the s2s5 file and were not re-verified against the newer build or node pool.
+#   8. Whether tools/dry_run.sh accepts the python3 draw and the empty-seed write below (it sets WIDEEP_DRY_RUN, which
+#      redirects $marks to its scratch dir; the draw itself needs only python3).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+SELF=$(realpath "$0")
+runs=$R/mvp/runs diag=$R/review/diag marks=$R/logs/stress
+[[ -n ${WIDEEP_DRY_RUN:-} ]] && runs=$WIDEEP_DRY_RUN/runs diag=$WIDEEP_DRY_RUN marks=$WIDEEP_DRY_RUN/marks
+mkdir -p "$marks"
+# This job's readout, written once (mkdir lock) when both groups are done or after the bundle.
+readout() {
+    mkdir "$marks/$SLURM_JOB_ID.readout" 2>/dev/null || return 0
+    local out=$diag/stack_stress_$SLURM_JOB_ID.txt d f b
+    { echo "STACK_STRESS_READOUT job=$SLURM_JOB_ID via=$1 $(date '+%F %T %Z')"
+      for d in "$runs"/STRESS*-"$SLURM_JOB_ID"/stk-*/; do
+          [[ -s $d/result.json ]] || { echo "STRESS_VERDICT ${d%/} s2 MISSING"; continue; }
+          timeout 600 python3 -I "$R/mvp/harness/stress_readout.py" case "$d" --test s2
+          for f in "$d"kernel-*-after.txt; do
+              b=${f/-after/-before}; [[ -e $b ]] && grep -iE 'xid|nvrm' "$f" | grep -vxFf "$b" | sed "s|^|NEW_KERNEL_LINE ${d%/} |"
+          done
+      done
+    } > "$out.tmp" 2>&1
+    mv "$out.tmp" "$out"
+    echo "STRESS_READOUT $out"
+}
+if [[ -n ${STRESS_GROUP_DONE:-} ]]; then  # a group's last step (its node 0)
+    touch "$marks/$SLURM_JOB_ID-$STRESS_GROUP_DONE.done"
+    [[ -e $marks/$SLURM_JOB_ID-g0.done && -e $marks/$SLURM_JOB_ID-g8.done ]] && readout group-end
+    exit 0
+fi
+bash $R/tools/require_presubmit.sh STACK-STRESS-5c6a30317f || exit 1
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-stack-966d3788b3
+# No pinned tactics (newer main): the harness needs a non-empty STRESS_SEED, so give it an empty tactic cache.
+SON=$marks/stack-empty-tactics.json
+[[ -s $SON ]] || { echo '{"metadata": {}, "shared": {}}' > "$SON.$$" && mv "$SON.$$" "$SON"; }
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+S="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_POLLUTION_CHECKS=1"
+S="$S WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2 WIDEEP_MEM_SAMPLER_S=60 STRESS_SEED=$SON STRESS_ARM=std-online-ft"
+S="$S STRESS_LENGTHS=${STRESS_LENGTHS:-}"  # empty (4k in / 2k out), or fallback as in the s2s5 file
+SMOKE=${SMOKE:-0}
+LOAD_MIN=55; [[ $SMOKE == 1 ]] && LOAD_MIN=12
+# Kill draws (seed fixed in the header): seconds into the load, G0 rank, G1 node.
+read -r T0 RANK0 T1 NODE1 < <(python3 -I -c 'import random; r = random.Random(20261030); print(r.randint(600, 2400), r.randint(1, 31), r.randint(600, 2400), r.randint(1, 7))')
+[[ -n ${NODE1:-} ]] || { echo "DRY_RUN_FAIL kill draw failed"; exit 1; }
+N4=$((NODE1 * 4)); NODE_RANKS="$N4+$((N4 + 1))+$((N4 + 2))+$((N4 + 3))"
+case=(stk-g0-sat-rank$RANK0 stk-g1-over-node$NODE1) kills=(at:$T0:$RANK0 at:$T1:$NODE_RANKS)
+frac=(1.0 1.25) calibend=(6 0)
+# SMOKE=1 (a short check of the whole path, not data): 12 min load, kills at 300 s.
+[[ $SMOKE == 1 ]] && kills=("at:300:$RANK0" "at:300:$NODE_RANKS")
+run() {  # NAME KILL JOB GROUP FRACTION CALIB_END_WAVES
+    echo "{ $S STRESS_NAME=$1 STRESS_KILLS='$2' STRESS_BENCH='--stress-minutes $LOAD_MIN --load-fraction $5 --calib-end-waves $6'" \
+         "bash $R/mvp/harness/run_job.sh $3;" \
+         "[[ \$SLURM_NODEID == 0 ]] && STRESS_GROUP_DONE=$4 bash $SELF; }"
+}
+G0=$(run "${case[0]}" "${kills[0]}" STRESS g0 "${frac[0]}" "${calibend[0]}")
+G8=$(run "${case[1]}" "${kills[1]}" STRESS-G1 g8 "${frac[1]}" "${calibend[1]}")
+echo "STRESS_STACK build=$B lengths=${STRESS_LENGTHS:-default} load_min=$LOAD_MIN G0=${case[0]}:${kills[0]}@x${frac[0]} G1=${case[1]}:${kills[1]}@x${frac[1]} smoke=$SMOKE"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:6900:$G0" "8:8:6900:$G8"
+[[ ${SLURM_NODEID:-0} == 0 ]] && readout bundle-end

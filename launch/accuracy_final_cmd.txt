@@ -1,0 +1,9 @@
+# ACCURACY on the clean wheel build-v2-cef4670789: GSM8K (full 1319, 5-shot, greedy, real MTP acceptance) through
+# trtllm-serve, dep32-final.yaml. acc-killdur-final-1 (FT on, rank 5 SIGKILLed 15-30 s after the eval's first answer). then
+# acc-ref-final (FT off, no kill). Verdict (OFF group's end): strict within 2 combined stderr, rank 0 resumed once
+# without [5], plus the question-by-question diff (accuracy_diff.py: right->wrong / wrong->right / answers differ).
+# ~25 min per group; job limit 1 h.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+A="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_POLLUTION_CHECKS=1 GROUP_LIMIT_S=3300"
+# One 8-node group, sequential, so the OFF group's summary sees both cases (8-node job, segment 8).
+bash $R/bundle.sh "0:8:3300:$A ACC_KILL_DURING=1 ACC_REPS=1 ACC_REFS= bash $R/mvp/harness/run_job.sh ACCURACY-KILL-ON; $A ACC_REPS=0 ACC_REFS=ref-final bash $R/mvp/harness/run_job.sh ACCURACY-KILL-OFF"

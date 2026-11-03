@@ -1,0 +1,46 @@
+# STRESS-SMOKE (1 node, 4 GPUs, qos short, --time 00:40:00; draft for launch/stress_smoke_cmd.txt): the one-node check
+# of the stress path before the 16-node STRESS-S2S5 jobs (rule: never-run tests go to a 1-node job first).
+# DeepSeek-V3-Lite NVFP4 (MoE only), EP4, online EPLB (lite4-online.yaml), FT on, rank failure domain (a node domain
+# needs other nodes to restore to), v5-final = overlays/fix-dropmap-9f1fd4cab4 on build-freeze-58caa0fde6.
+# Needs review/drafts/stress_harness.patch applied (review/drafts/stress_apply.sh --apply).
+#
+# What it checks (not data; no claim). The case must end DONE, with each of the following present:
+# - stress_client.py runs: bench/{calib-32,stress,stress-chat,calib-end-32}.sse.jsonl have records, and the
+#   /v1/chat/completions path with prompt_token_ids answers (stress-chat rows ok, no chat_client_error);
+# - the open-loop load starts (bench/load_start) and runs at --load-fraction x calib-32's rate;
+# - the kill fires under Poisson traffic with TLLM_TEST_KILL_TRIGGER_ANY_STEP (rank 2's WIDEEP_SELF_KILL line), and
+#   the recovery commits (rank 0 "resumed serving without ranks [2] at membership generation 1");
+# - health.jsonl shows healthy > recovering > degraded; mem-0.log has gpu/host/proc lines each minute;
+# - stress_readout.py prints STRESS_CASE / STRESS_KILL / STRESS_VERDICT lines from real files. Its PASS/FAIL is not
+#   judged here: the capacity floor is R1's, and 3 of 4 GPUs is 0.75 of capacity.
+# - Failed lost-rank streams carry the error-event format (STRESS_KILL client_failed vs server_failed;
+#   STRESS_CASE retryable / bad counts). If V3-Lite delivers every in-flight stream before the kill, failed may be 0;
+#   that is reported as is.
+# Lengths: input 60-1140, output 30-570 (--isl 600 --osl 300 --range-ratio 0.9; fits lite4's max_seq_len 2304).
+# Load 14 min, kill at 420 s (rerun 1: the readout's pre-kill window [load+300 s, kill) and memory window [load+600 s,
+# end) both get samples; 8292365 ran 6 min with the kill at 120 s and exercised neither). Closed-loop rows: 2 waves at 32/GPU.
+# After the kill 3/4 GPUs = 0.75 of capacity < the 0.8 load fraction: post-kill latency is overload by design here.
+# Est: startup ~5 min (V3-Lite), calibration ~1, load 14 + client start ~1, closed-loop row ~1, teardown ~1:
+# ~23-26 min; --time 00:40:00, bundle limit 2100 s.
+# Presubmit (after the patch): python3 $R/tools/presubmit.py --name STRESS-SMOKE --nodes 1 --job STRESS
+#   --build build-freeze-58caa0fde6 --overlay overlays/fix-dropmap-9f1fd4cab4 --branch /tmp/claude-161238/wt-split
+# Dry run: bash $R/tools/dry_run.sh review/drafts/stress_smoke_cmd.txt 1 0
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1
+B=build-freeze-58caa0fde6
+FIX_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json  # required by the STRESS preflight; lite4 runs without the autotuner
+LITE=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-V3-Lite/nvfp4_moe_only
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+S="MVP_OVERLAY=$FIX_OVERLAY KF_ALLOW_OVERLAY=1 MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' WIDEEP_POLLUTION_CHECKS=1"
+S="$S TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30 WIDEEP_MEM_SAMPLER_S=60"
+S="$S WIDEEP_WORLD=4 WIDEEP_MODEL=$LITE STRESS_CONFIG=lite4-online.yaml STRESS_FAILURE_DOMAIN=rank STRESS_SEED=$SON"
+S="$S STRESS_ARM=std-online-ft STRESS_NAME=smoke-rank2 STRESS_KILLS='at:420:2'"
+S="$S STRESS_BENCH='--isl 600 --osl 300 --range-ratio 0.9 --stress-minutes 14 --calib-waves 2 --calib-end-waves 2'"
+G0="{ $S bash $R/mvp/harness/run_job.sh STRESS; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:1:2100:$G0"

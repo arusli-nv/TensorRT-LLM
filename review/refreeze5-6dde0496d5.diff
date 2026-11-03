@@ -1,0 +1,159 @@
+commit 6dde0496d5535e6dd68849983af50eafbdf220af
+Author: Andrew Rusli <arusli@nvidia.com>
+Date:   Fri Oct 23 14:23:06 2026 -0700
+
+    [None][fix] Refuse peer-loss recovery while Open MPI's hcoll collectives are on
+    
+    trtllm-llmapi-launch excludes hcoll and ucc by default under recovery; enable_peer_loss_recovery refuses unless hcoll is disabled, excluded or not selected.
+    
+    FT-off guards:
+    FT-on only (the launcher's recovery branch and enable_peer_loss_recovery).
+    
+    Signed-off-by: Andrew Rusli <arusli@nvidia.com>
+
+diff --git a/tensorrt_llm/_torch/distributed/communicator.py b/tensorrt_llm/_torch/distributed/communicator.py
+index f52e6bd438..44bee57baa 100644
+--- a/tensorrt_llm/_torch/distributed/communicator.py
++++ b/tensorrt_llm/_torch/distributed/communicator.py
+@@ -902,6 +902,17 @@ class PeerFailureWatch:
+             self._comm.Free()
+ 
+ 
++def _coll_component_excluded(name: str) -> bool:
++    """Whether Open MPI's environment keeps collective component ``name`` out: disabled, excluded, or not listed."""
++    if os.environ.get(f"OMPI_MCA_coll_{name}_enable") in ("0", "false"):
++        return True
++    selection = os.environ.get("OMPI_MCA_coll", "")
++    components = {c.strip() for c in selection.lstrip("^").split(",")}
++    if selection.startswith("^"):
++        return name in components
++    return bool(selection) and name not in components
++
++
+ class MPIDist(Distributed):
+     tp_comm: MPI.Comm
+ 
+@@ -961,6 +972,10 @@ class MPIDist(Distributed):
+             raise RuntimeError(
+                 "Peer-loss recovery requires Open MPI's ob1 messaging layer; "
+                 "launch through trtllm-llmapi-launch or with `--mca pml ob1`")
++        if not _coll_component_excluded("hcoll"):
++            raise RuntimeError(
++                "Peer-loss recovery requires Open MPI's hcoll collectives off; "
++                "launch through trtllm-llmapi-launch or with `--mca coll ^hcoll,ucc`")
+         try:
+             mpi_failed_ranks(mpi_comm())
+             mpi_comm().Is_revoked()
+diff --git a/tensorrt_llm/llmapi/trtllm-llmapi-launch b/tensorrt_llm/llmapi/trtllm-llmapi-launch
+index b596dc284f..5a0021cd10 100755
+--- a/tensorrt_llm/llmapi/trtllm-llmapi-launch
++++ b/tensorrt_llm/llmapi/trtllm-llmapi-launch
+@@ -198,10 +198,11 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
+ tllm_mpi_size=$(mpi_world_size)
+ export tllm_mpi_size
+ 
+-# Peer-loss recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too. Each worker's MPI_Init reads
+-# these, so a user's own `--mca pml` / `--mca btl` choice (exported the same way) wins.
++# Peer-loss recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too, without the hcoll and ucc
++# collectives. Each worker's MPI_Init reads these, so a user's own `--mca pml` / `--mca btl` / `--mca coll` choice
++# (exported the same way) wins.
+ if peer_loss_recovery_enabled; then
+-    export OMPI_MCA_pml=${OMPI_MCA_pml:-ob1} OMPI_MCA_btl=${OMPI_MCA_btl:-self,tcp}
++    export OMPI_MCA_pml=${OMPI_MCA_pml:-ob1} OMPI_MCA_btl=${OMPI_MCA_btl:-self,tcp} OMPI_MCA_coll=${OMPI_MCA_coll:-^hcoll,ucc}
+ fi
+ log_stderr "tllm_mpi_size: $tllm_mpi_size"
+ configure_flashinfer_workspace
+diff --git a/tests/unittest/_torch/distributed/test_mpi_survivors.py b/tests/unittest/_torch/distributed/test_mpi_survivors.py
+index e42b149c2e..d84df5b20f 100644
+--- a/tests/unittest/_torch/distributed/test_mpi_survivors.py
++++ b/tests/unittest/_torch/distributed/test_mpi_survivors.py
+@@ -198,6 +198,7 @@ def fake_mpi(monkeypatch):
+     monkeypatch.setattr(communicator, "MPI", fake)
+     monkeypatch.setenv("OMPI_MCA_mpi_ft_enable", "1")
+     monkeypatch.setenv("OMPI_MCA_pml", "ob1")
++    monkeypatch.setenv("OMPI_MCA_coll", "^hcoll,ucc")
+     monkeypatch.setattr(
+         communicator,
+         "is_mpi_peer_failure",
+@@ -581,6 +582,23 @@ def test_peer_failures_stay_mpi_errors_without_recovery(world):
+         dist.broadcast_int64([0])
+ 
+ 
++@pytest.mark.parametrize(
++    "variable, value",
++    [("OMPI_MCA_coll", "^hcoll,ucc"), ("OMPI_MCA_coll", "tuned,basic"), ("OMPI_MCA_coll_hcoll_enable", "0")],
++)
++def test_recovery_requires_hcoll_off(variable, value, world, fake_mpi, monkeypatch):
++    monkeypatch.delenv("OMPI_MCA_coll", raising=False)
++    monkeypatch.delenv("OMPI_MCA_coll_hcoll_enable", raising=False)
++    for selection in ("", "hcoll,tuned", "^ucc"):
++        if selection:
++            monkeypatch.setenv("OMPI_MCA_coll", selection)
++        with pytest.raises(RuntimeError, match="hcoll"):
++            MPIDist(_mapping()).enable_peer_loss_recovery()
++    monkeypatch.delenv("OMPI_MCA_coll")
++    monkeypatch.setenv(variable, value)
++    MPIDist(_mapping()).enable_peer_loss_recovery()
++
++
+ def test_recovery_requires_mpi4py_ulfm_launch_and_thread_multiple(world, fake_mpi, monkeypatch):
+     dist = MPIDist(_mapping())
+     monkeypatch.setenv("OMPI_MCA_pml", "ucx")
+diff --git a/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py b/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py
+index 2e2a1ad158..461f0de16d 100644
+--- a/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py
++++ b/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py
+@@ -30,7 +30,7 @@ _LAUNCHER = Path(__file__).resolve().parents[3] / "tensorrt_llm" / "llmapi" / "t
+ _FAKE_PYTHON = """#!/bin/bash
+ if [ "$2" = tensorrt_llm.llmapi.mgmn_worker_node ]; then
+     if [ -e /proc/$$/fd/200 ]; then lock=open; else lock=closed; fi
+-    echo "$$ $PPID $lock ${OMPI_MCA_pml:-unset} ${OMPI_MCA_btl:-unset} ${*:3}"
++    echo "$$ $PPID $lock ${OMPI_MCA_pml:-unset} ${OMPI_MCA_btl:-unset} ${OMPI_MCA_coll:-unset} ${*:3}"
+     exit "${FAKE_WORKER_STATUS:-0}"
+ fi
+ exec %s "$@"
+@@ -48,6 +48,7 @@ _CLEARED_ENV = (
+     "TLLM_FAULT_TOLERANCE_AUTHORITY",
+     "OMPI_MCA_pml",
+     "OMPI_MCA_btl",
++    "OMPI_MCA_coll",
+ )
+ 
+ 
+@@ -78,8 +79,8 @@ def _launch_worker(
+         command = [str(_LAUNCHER)]
+     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True)
+     stdout, _ = process.communicate(timeout=60)
+-    pid, ppid, lock, pml, btl, *args = stdout.split()
+-    return process.pid, process.returncode, int(pid), int(ppid), lock, args, (pml, btl)
++    pid, ppid, lock, pml, btl, coll, *args = stdout.split()
++    return process.pid, process.returncode, int(pid), int(ppid), lock, args, (pml, btl, coll)
+ 
+ 
+ @pytest.mark.parametrize("status", [0, 3])
+@@ -90,20 +91,20 @@ def test_recovery_execs_the_worker_holding_the_workspace_lock(status, tmp_path):
+     assert lock == "open"
+     assert args == ["--flashinfer-lock-fd", "200"]
+     assert (tmp_path / "home" / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-1").is_dir()
+-    # Recovery runs on ob1 over TCP.
+-    assert transport == ("ob1", "self,tcp")
++    # Recovery runs on ob1 over TCP, without the hcoll and ucc collectives.
++    assert transport == ("ob1", "self,tcp", "^hcoll,ucc")
+ 
+ 
+ def test_recovery_keeps_the_users_transport_choice(tmp_path):
+-    *_, transport = _launch_worker(tmp_path, True, OMPI_MCA_btl="self,sm,tcp")
+-    assert transport == ("ob1", "self,sm,tcp")
++    *_, transport = _launch_worker(tmp_path, True, OMPI_MCA_btl="self,sm,tcp", OMPI_MCA_coll="^hcoll")
++    assert transport == ("ob1", "self,sm,tcp", "^hcoll")
+ 
+ 
+ @pytest.mark.parametrize("status", [0, 3, 137])
+ def test_without_recovery_the_worker_is_a_child_without_the_lock(status, tmp_path):
+     launcher, returncode, pid, ppid, lock, args, transport = _launch_worker(tmp_path, False, status)
+     assert pid != launcher and ppid == launcher and returncode == status
+-    assert lock == "closed" and args == [] and transport == ("unset", "unset")
++    assert lock == "closed" and args == [] and transport == ("unset", "unset", "unset")
+ 
+ 
+ def test_recovery_passes_the_temporary_workspace_on(tmp_path):

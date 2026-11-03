@@ -1,0 +1,16 @@
+# ABEXP (16 nodes): v5-exp eb3950a3f8 (wheel build-v5x-eb3950a3f8: token-major slots + hoisted loads + late receive PDL
+# trigger) vs v5 (wheel build-v5-2ccc3e8e1c + overlay v5g = 5ebf7f72a2, arm ft-oldk) vs off (exp wheel; FT-off paths
+# unchanged). Gate: BUILD-EXP 8157331's tests (tools/require_build_pass.sh in the submit command). Arms on each group's own
+# nodes, loads 24 and 32 in one launch, one round per group, group 8 in reverse order.
+# Readout (dist32 trim mean per load and group; pre-registered): (ft-exp - off) <= 1/3 of (ft-v5 - off) at 32 in both
+# groups -> exp recovers >= 2/3: bisect the three commits before landing any; 1/3-2/3 -> bisect too; <= 1/3 -> the
+# restructurings are not the carrier (stop the perf hunt for this kernel; the 32/GPU gap goes to the user as a documented
+# mechanism with options). Independent of perf: if exp is neutral or better and passes the full gate + kills, propose
+# landing it for the design (FT's FC1/FC2 on FT-off's path, -112 lines) with the red team's 4 minors fixed.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5x-eb3950a3f8; X=$R/overlays/vexp-d1065858eb
+# Non-blocking first step (landing evidence, not this A/B's code): the red team's new T < capacity bind test and the
+# combine fixes (5499f61df7..9c63b05060, Python overlay vexp-d1065858eb) on the exp wheel; each case reinstalls the wheel.
+m() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/abexp-minors$1-\$SLURM_JOB_ID $R/$B/dist $X $X-tests $R/overlays/build-src-eb3950a3f8 $R/$B/point-units-d1065858eb-g$1 tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B OLDK_BUILD=build-v5-2ccc3e8e1c OLDK_OVERLAY=$R/overlays/v5g-5ebf7f72a2 COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=24,32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:7000:$(m 0); $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft-oldk std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(m 8); $E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb-ft-oldk std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

@@ -1,0 +1,5 @@
+# SERIES-SMOKE-V5PR (1 node): per-commit import + unit-test collection smoke of the restacked v5-pr series (25 commits on
+# 9cc37929e8, tree == 1117f7e0e7), in the real container on the build-freeze-1117f7e0e7 wheel's compiled parts.
+# Owed by CLEANUP_PLAN.md section 2. Pass: SERIES_SMOKE_OK.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/require_presubmit.sh series-smoke-v5pr-8081254de5 && bash $R/tools/series_import_smoke.sh $R/build-freeze-1117f7e0e7/dist $R/overlays/build-src-8c52d11469 9cc37929e8 v5-pr

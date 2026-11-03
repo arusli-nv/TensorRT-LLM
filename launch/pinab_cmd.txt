@@ -1,0 +1,13 @@
+# PIN-AB (user GO via monitor 15:5x): ghost vs empty x LB/busy threads unpinned vs pinned, + noft control, online
+# dep32-final at 32/GPU waves, diag wheel build-diag-da13f20b76 (online path = final; EPLB_UPDATE_LOG), seeded pinned
+# tactics, 2 rounds per group rotated (Latin square; group B offset), n=4 per cell. -pin arms: serve.sh WIDEEP_PIN_BUSY
+# -> pin_busy.py at server_ready+45 s (each busy thread its own core on its socket, rest confined to other cores),
+# validity = pin-<node>.log PIN_SAMPLE >=3 busy/rank + threads-pinned-<node>.log affinities. Failed cases rerun once
+# after the rounds (TAIL_MAKEUP, name ARM-9R). ~10.5 min/case: 10 cases + makeup -> 02:30 limit.
+# Decision rule (fixed before data): ghost worse if unpinned mean lost% exceeds empty's by more than empty's own
+# max-min AND ghost >= empty in >=3 of 4 paired (group, round); pinning explains it if both pinned arms' lost% fall
+# below every unpinned run of the same arm AND ghost-pin vs empty-pin no longer meets the ghost-worse rule.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-diag-da13f20b76
+T="MVP_BUILD=$B FINAL_BUILD=$B FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node COST_CASE_TIMEOUT_S=2400 TAIL_ROUNDS=2 FT_COST_E2E_ROUND_MIN=55 TAIL_ITERATIONS=4 TAIL_PAIRS='ft-empty-w:ft-w ft-empty-pin-w:ft-pin-w ft-w:ft-pin-w ft-empty-w:ft-empty-pin-w noft-w:ft-w' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+bash $R/bundle.sh "0:8:8700:$T FT_COST_E2E_ARMS='ft-w ft-empty-w ft-pin-w ft-empty-pin-w noft-w' bash $R/mvp/harness/run_job.sh TAIL-CTRL" \
+  "8:8:8700:$T FT_COST_E2E_ARMS='ft-empty-pin-w ft-pin-w ft-empty-w ft-w noft-w' bash $R/mvp/harness/run_job.sh TAIL-CTRL-B"

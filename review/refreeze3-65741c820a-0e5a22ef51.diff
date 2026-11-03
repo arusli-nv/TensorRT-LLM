@@ -1,0 +1,145 @@
+diff --git a/tensorrt_llm/_torch/distributed/mnnvl_memory.py b/tensorrt_llm/_torch/distributed/mnnvl_memory.py
+index 00575df7a2..bba55a4d78 100644
+--- a/tensorrt_llm/_torch/distributed/mnnvl_memory.py
++++ b/tensorrt_llm/_torch/distributed/mnnvl_memory.py
+@@ -268,7 +268,7 @@ class _LiveRowsComm:
+     """An allocation's communicator restricted to its live members, for :meth:`MnnvlMemory.remap`.
+ 
+     ``gather(value)`` returns one entry per global rank, None for a departed one; :meth:`allgather`
+-    orders them by the allocation's communicator ranks.
++    orders them by the allocation's communicator ranks. ``gather_failed`` records that an exchange raised.
+     """
+ 
+     def __init__(
+@@ -276,6 +276,7 @@ class _LiveRowsComm:
+     ) -> None:
+         self._record = record
+         self._gather = gather
++        self.gather_failed = False
+ 
+     def Get_rank(self) -> int:
+         return self._record.comm_rank
+@@ -284,7 +285,11 @@ class _LiveRowsComm:
+         return self._record.comm_size
+ 
+     def allgather(self, value: Any) -> list[Any]:
+-        by_rank = self._gather(value)
++        try:
++            by_rank = self._gather(value)
++        except BaseException:
++            self.gather_failed = True
++            raise
+         return [by_rank[member] for member in self._record.comm_membership]
+ 
+ 
+@@ -966,7 +971,8 @@ class MnnvlMemory:
+ 
+         The live ranks exchange whether their mapping succeeded: an import or a mapping fails on some ranks
+         only (of the handle of a rank that is failing meanwhile, say), so every live rank either maps or
+-        raises. A failure, or an exception of ``gather``, leaves the allocation unmapped, so a later attempt
++        raises. An exception of ``gather`` propagates at once, as the outcome exchange could not complete
++        either. A failure, or an exception of ``gather``, leaves the allocation unmapped, so a later attempt
+         may remap it; if releasing the fresh pages fails too, that is logged, the original error propagates,
+         and the allocation is broken.
+ 
+@@ -977,16 +983,19 @@ class MnnvlMemory:
+         record = cls.allocated_map[self.ptr]
+         if record.state is not _MnnvlAllocationState.UNMAPPED:
+             raise RuntimeError(f"Cannot remap MNNVL allocation in {record.state.value} state")
++        comm = _LiveRowsComm(record, gather)
+         handles, error = None, None
+         try:
+             handles = cls._create_and_map_handles(
+-                _LiveRowsComm(record, gather),
++                comm,
+                 record.aligned_size,
+                 record.start_address,
+                 record.rank_stride,
+                 record.address_offset,
+             )
+         except Exception as failure:
++            if comm.gather_failed:
++                raise
+             error = f"{type(failure).__name__}: {failure}"
+         try:
+             failures = [
+diff --git a/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py b/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py
+index 78c18824c2..f0936f8c5d 100644
+--- a/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py
++++ b/tensorrt_llm/_torch/pyexecutor/peer_loss_recovery.py
+@@ -1086,6 +1086,9 @@ class PeerLossRecovery(RecoveryHook):
+             self._interrupted.difference_update(*(entry[3] for entry in gathered if entry))
+         held = [entry and entry[0] for entry in gathered]
+         executor.iter_counter = max(entry[1] for entry in gathered if entry)
++        # Records the owners of the requests a survivor started before their routing reached rank 0, which
++        # the quarantine needs.
++        self._requeue_unscheduled_requests(held)
+         quarantined = self._quarantine(set().union(*(entry[2] for entry in gathered if entry)))
+         # Rank 0 counts what fails: the quarantined requests and the departed ranks' requests that do not run again.
+         failed_requests = len(quarantined) + self._departed_requests(failed)
+@@ -1096,7 +1099,6 @@ class PeerLossRecovery(RecoveryHook):
+         self._log_phase("committed", generation)
+         self._return_remap_room()
+ 
+-        self._requeue_unscheduled_requests(held)
+         rerun, failing = self._deliver_responses(failed, buffered, quarantined)
+         # Rank 0's re-run requests not routed yet, including those an earlier recovery re-admitted.
+         self._rerouting = set(dist.broadcast([*self._rerouting, *rerun], root=0))
+diff --git a/tests/unittest/_torch/executor/test_peer_loss_recovery.py b/tests/unittest/_torch/executor/test_peer_loss_recovery.py
+index e2dfe32398..4315999194 100644
+--- a/tests/unittest/_torch/executor/test_peer_loss_recovery.py
++++ b/tests/unittest/_torch/executor/test_peer_loss_recovery.py
+@@ -885,6 +885,22 @@ def test_recovery_does_not_rebroadcast_a_request_a_survivor_started():
+         assert recovery._request_owners[3][0] == 1
+ 
+ 
++def test_rank0_marks_interrupted_a_started_request_whose_routing_the_loss_cut_off():
++    """Rank 1 started request 3 in the discarded step while rank 0 saw its broadcast interrupted: rank 0 learns
++    its owner before the quarantine, so the request is marked interrupted and a second loss without progress
++    fails it."""
++    recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
++    executor = recovery._executor
++    _broadcast(recovery, [_queued(3)], interrupted=True)
++    gathered = [(set(), 0, set(), set()), ({3}, 0, {3}, set()), None, (set(), 0, set(), set())]
++    executor.dist.allgather.side_effect = lambda value, departed: gathered
++
++    recovery._recover(_interrupted())
++
++    assert recovery._request_owners[3][0] == 1
++    assert recovery._interrupted == {3}
++
++
+ def test_survivors_resume_from_the_same_iteration():
+     """A loss can stop survivors one iteration apart; they resume from the furthest one."""
+     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
+diff --git a/tests/unittest/_torch/test_mnnvl_memory_remap.py b/tests/unittest/_torch/test_mnnvl_memory_remap.py
+index ec5ac0d343..69792ba65d 100644
+--- a/tests/unittest/_torch/test_mnnvl_memory_remap.py
++++ b/tests/unittest/_torch/test_mnnvl_memory_remap.py
+@@ -242,6 +242,26 @@ def test_a_peer_lost_during_the_outcome_exchange_leaves_the_allocation_unmapped(
+     assert memory.mapped
+ 
+ 
++def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_exchange(monkeypatch):
++    """The exchange that failed could not report an outcome either: the loss reaches the recovery at once."""
++    memory, driver = _memory(monkeypatch)
++    memory.release_backing()
++    driver.released.clear()
++    calls = []
++
++    def gather(value):
++        calls.append(value)
++        raise _PeerLost()
++
++    with pytest.raises(_PeerLost):
++        memory.remap(gather)
++    assert len(calls) == 1
++    assert driver.mapped == {} and not memory.mapped
++    assert len(driver.released) == 1
++    memory.remap(_gather_without({2}))
++    assert memory.mapped
++
++
+ def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(monkeypatch):
+     """A peer lost during the outcome exchange stays the error the recovery sees, even if releasing the fresh
+     pages fails too; that failure is logged and the allocation is not remapped again."""

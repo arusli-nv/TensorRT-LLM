@@ -1,0 +1,117 @@
+# MOEMODULE-IMA (DRAFT, not submitted; 1 GB200 node, runs use GPU 0 only): A/B for the TEST-INFRA 8293032 (b) failure.
+# Failing id: test_moe_module.py::test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=1-dtype=torch.bfloat16-
+# backend=DENSEGEMM-quant=NVFP4-routing=Renormalize], CUDA IMA raised in autotuner._create_tensor_like under
+# cute_dsl_nvfp4_dense_gemm_fc2_blackwell. Triage: review/diag/moemodule_ima_triage.md.
+#
+# RULE (set before data; verbatim from the monitor, 2026-10-25 22:3x PT). Each outcome has a fixed next step:
+# (1) Fails only in arm A (v5-final .py): FT Python is involved; next, bisect the files changed by e9c313962a.
+# (2) Fails in both arms: a C++ cause is still open, because the freeze wheel carries v5-final's C++. Next, run once on
+#     a main wheel built at the merge base (9cc37929e8 = arm C; the rule first said 0829689c52, a wrong base the dev gave, corrected before data). If it fails there, the issue is GB200 or main itself, untested
+#     in CI. If it passes there, the cause is our C++.
+# (3) Passes in both arms in isolation: the failure depends on test order. Next, run the full ordered prefix of
+#     test_moe_module up to and including the failing id, in both arms.
+# Definitions (also set before data): an arm "fails" when any of its runs (3 isolated + 1 window) reports F or E for
+# the failing id, or any CUDA error. "In isolation" = the 3 isolated runs. Fails only in arm B: not covered by the
+# rule -> report the tracebacks, no conclusion. A run that times out or fails to collect is INVALID, not a pass/fail.
+#
+# Arms (same container, same node, same freeze wheel build-freeze-58caa0fde6 for A and B, tests from the v5final tree;
+# test_moe_module.py, moe_test_utils.py, quantize_utils.py and the conftests are identical at main and v5-final):
+#   A = freeze wheel + overlays/fix-dropmap-9f1fd4cab4 (= v5-final 27442bd91d .py), as testinfra_cmd.txt.
+#   B = freeze wheel + main's version of every tensorrt_llm/**/*.py that v5-final modifies vs its main parent.
+#       Main parent: v5-final was rebased onto upstream main 9cc37929e8 (git merge-base 27442bd91d 9cc37929e8 =
+#       9cc37929e8; 0829689c52 is the older base, 47 upstream commits earlier). Copying 0829689c52's .py would also
+#       revert 47 upstream commits (150 files, incl. 033f2ea020 in cute_dsl_custom_ops.py) against 9cc3-based C++,
+#       so B uses 9cc37929e8's .py, read from the build-main-9cc37929e8 wheel (verify_wheel: 0 differ vs 9cc37929e8).
+#       The 37 files: git diff --name-only --diff-filter=M 9cc37929e8 27442bd91d -- 'tensorrt_llm/*.py'. The 11 files
+#       v5-final adds stay installed; main's .py does not import them.
+#   C = build-main-9cc37929e8 wheel, its own .py and C++ (= main at v5-final's parent). This is the "main wheel at the
+#       merge base" of outcome (2); it already exists, so it runs in this job and is read ONLY under outcome (2).
+# Per arm: 3 fresh processes with only the failing id, then 1 fresh process with the 10 ids collected just before it
+# plus the failing id (10, not 5: in 8293032 only 2 of the 5 preceding ids ran, the rest were runtime skips).
+# All runs CUDA_LAUNCH_BLOCKING=1 (names the faulting kernel; can hide a timing race, which then lands in outcome (3)).
+# Prior evidence (context, not part of the rule): the same id passed on this same freeze wheel in V5PR-RERUN A1 8279013
+# (a6c0, 71d7) and A2 8279691 (b954; b954's .py differs from v5-final only in docstrings on this path).
+# Output: review/diag/moemodule-ima-<job>.txt + per-run logs review/diag/moemodule-ima-<job>-<arm>-<run>.log.
+# Est: 3 installs ~4 min each + 12 runs ~1.5-2 min each (import + CuTe DSL JIT) ~35-40 min; --time 01:00.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+job=${SLURM_JOB_ID:-x}
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+# The tests spawn their own MPI pools (MPIPoolExecutor): drop the outer srun's PMIx/Slurm env (see testinfra_cmd.txt).
+for var in $(compgen -e | grep -E '^(PMIX_|PMI_|SLURM_|OMPI_MCA_ess|PRTE_MCA_ras)'); do unset "$var"; done
+out=$R/review/diag/moemodule-ima-$job.txt; T=$R/scratch-mpisession/v5final
+TF=$T/tests/unittest/_torch/moe/test_moe_module.py
+ID='test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=1-dtype=torch.bfloat16-backend=DENSEGEMM-quant=NVFP4-routing=Renormalize]'
+FREEZE=$R/build-freeze-58caa0fde6/dist; MAIN=$R/build-main-9cc37929e8/dist
+BASE_FILES="tensorrt_llm/_torch/alltoall_watchdog.py tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+tensorrt_llm/_torch/distributed/communicator.py tensorrt_llm/_torch/distributed/mnnvl_memory.py
+tensorrt_llm/_torch/mnnvl_alltoall_workspace.py tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py
+tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py
+tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py tensorrt_llm/_torch/moe/fused_moe/impl_base.py
+tensorrt_llm/_torch/moe/fused_moe/impl_blocks.py tensorrt_llm/_torch/moe/fused_moe/interface.py
+tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
+tensorrt_llm/_torch/moe/fused_moe/wide_ep_ft.py tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py
+tensorrt_llm/_torch/pyexecutor/engine/runners/common.py tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/inputs.py
+tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/metadata.py tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py
+tensorrt_llm/_torch/pyexecutor/executor_request_queue.py tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+tensorrt_llm/_torch/pyexecutor/llm_request.py tensorrt_llm/_torch/pyexecutor/model_engine.py
+tensorrt_llm/_torch/pyexecutor/py_executor.py tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
+tensorrt_llm/_torch/pyexecutor/request_utils.py tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py
+tensorrt_llm/_utils.py tensorrt_llm/executor/ipc.py tensorrt_llm/executor/utils.py tensorrt_llm/llmapi/mgmn_leader_node.py
+tensorrt_llm/llmapi/mgmn_worker_node.py tensorrt_llm/llmapi/mpi_session.py tensorrt_llm/serve/openai_server.py"
+pt() {  # pt LOG NODEID...: one fresh pytest process on GPU 0
+    local log=$1; shift
+    (cd /tmp && CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$T/tests/unittest:$T/tests timeout -k 30 900 \
+        python3 -m pytest -q -p no:cacheprovider --tb=short -rA --basetemp=/tmp/bt-ima "$@" > "$log" 2>&1)
+    echo "rc=$? | $(grep -F -- "$ID" "$log" | grep -E '^(PASSED|FAILED|ERROR|SKIPPED)' | cut -c1-8 | tr '\n' ' ')| $(tail -1 "$log")"
+}
+arm() {  # arm NAME: collect, 3 isolated runs, 1 window run
+    local a=$1 pre
+    (cd /tmp && PYTHONPATH=$T/tests/unittest:$T/tests timeout 600 python3 -m pytest --collect-only -q -p no:cacheprovider \
+        "$TF" 2>&1 | grep '::' > /tmp/ids-$a.txt)
+    pre=$(python3 - /tmp/ids-$a.txt "$ID" "$TF" <<'PY'
+import sys
+ids = open(sys.argv[1]).read().split()
+i = next((k for k, x in enumerate(ids) if x.endswith("::" + sys.argv[2])), None)
+# Collected ids are relative to tests/unittest; pytest runs from /tmp, so give it the absolute file path.
+print("COLLECT_FAIL" if i is None else " ".join(sys.argv[3] + "::" + x.split("::", 1)[1] for x in ids[max(0, i - 10):i + 1]))
+PY
+)
+    echo "## arm $a: collected $(wc -l < /tmp/ids-$a.txt); window: $pre"
+    [[ $pre == COLLECT_FAIL ]] && { echo "## arm $a INVALID (failing id not collected)"; return; }
+    local fid=${pre##* }
+    for r in 1 2 3; do echo "## arm $a iso$r $(pt $R/review/diag/moemodule-ima-$job-$a-iso$r.log "$fid")"; done
+    echo "## arm $a window $(pt $R/review/diag/moemodule-ima-$job-$a-window.log $pre)"
+    grep -hE '^(PASSED|FAILED|ERROR)' $R/review/diag/moemodule-ima-$job-$a-window.log | cut -c1-200
+}
+{
+    hostname; nvidia-smi -L | head -1
+    bash $R/install_wheel.sh $FREEZE /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    pkg=$(cd / && python3 -c "import importlib.util as u, os; print(os.path.dirname(u.find_spec('tensorrt_llm').origin))")
+    # Arm A: v5-final .py (freeze wheel + overlay), exactly as testinfra_cmd.txt.
+    (cd $R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm && find . -name '*.py' -print0) | while IFS= read -r -d '' f; do
+        cp "$R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm/$f" "$pkg/$f"; done
+    md5sum $pkg/_torch/custom_ops/cute_dsl_custom_ops.py $pkg/_torch/moe/fused_moe/moe_load_balancer.py
+    arm A
+    # Arm B: reinstall the freeze wheel (truncating the marker forces it), then main 9cc37929e8's .py for the 37 files.
+    : > /tmp/.wideep-installed
+    bash $R/install_wheel.sh $FREEZE /tmp/i2.log || { tail -20 /tmp/i2.log; exit 1; }
+    python3 - "$MAIN" "$(dirname $pkg)" $BASE_FILES <<'PY' || { echo ARM_B_SETUP_FAILED; exit 1; }
+import glob, sys, zipfile
+dist, site, files = sys.argv[1], sys.argv[2], sys.argv[3:]
+z = zipfile.ZipFile(glob.glob(dist + "/*.whl")[0])
+for f in files:
+    open(f"{site}/{f}", "wb").write(z.read(f))
+print(f"arm B: {len(files)} files from {z.filename}")
+PY
+    md5sum $pkg/_torch/custom_ops/cute_dsl_custom_ops.py $pkg/_torch/moe/fused_moe/moe_load_balancer.py
+    arm B
+    # Arm C: main wheel 9cc37929e8 (C++ and .py); read only under outcome (2).
+    bash $R/install_wheel.sh $MAIN /tmp/i3.log || { tail -20 /tmp/i3.log; exit 1; }
+    md5sum $pkg/_torch/custom_ops/cute_dsl_custom_ops.py
+    arm C
+    echo MOEMODULE_IMA_DONE
+} > "$out" 2>&1

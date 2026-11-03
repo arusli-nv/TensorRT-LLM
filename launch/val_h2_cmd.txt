@@ -1,0 +1,33 @@
+# VAL-H2 (16 nodes, two 8-node groups, < 2 h): online EPLB healthy validation of the freeze build (v5-zero rebased onto
+# current main, no overlay): C21/C22 (DECISIONS 12:09; CLAIMS 170). Split from VAL-H: online cases at 32 and 128 run
+# ~19 min each, so 3 same-node rounds of both arms at both loads (~115 min) plus a gate fit no group; each group takes
+# one load instead (online cases ~15.5 min at one load: STD-8147471 at 128, 14-20 min).
+#   Both groups at load 32/GPU (monitor 16:45: the C21 cell, CLAIMS 149; 128 had no FT ctx cost, CLAIMS 170). Arms off = std-online (plain mpirun, UCX) | ft = std-online-ft (ob1
+#   self,tcp eth0, hang detection on, hang_confirm_s 30). 2 rounds rotated (AB, BA), group 8
+#   starts with ft: n=2 per arm per load on the same nodes.
+#   Each group first runs the short in-job unit gate (as VAL-H1, ~6 min).
+#   Tuning pass of both online arms on this build first (C14: no v2 seed; PIN_CHECK OK per case), which leaves room
+#   for 2 rounds, not 3 (monitor 16:35).
+# Pass / readout (pre-registered, DECISIONS 12:09): context-step, stall and whole-window FT - off within the off-vs-off
+# spread (round to round, same arm, same nodes) closes C21 as not reproducible on the freeze build; decode trim gap at
+# each load (C22, expected ~0 with online EPLB: replicas routed, ghost slots appended).
+#   python3 -I $R/mvp/analysis/ctx_stall_cost.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job>   (ctx / stall-band / refill
+#     trains / whole-window, FT off -> on, per group and load)
+#   python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job> --off std-online-1
+#   python3 -I $R/tools/ctx_classify.py --load healthy-32 --full-pos 5 --off <run>/std-online-{1,2} --on <run>/std-online-ft-{1,2}
+#     (decode/mixed/refill/backlog classes + matched-step FT - off; the CLAIMS 170 metric, t_ctx_classify.py)
+# Estimate per group: gate ~6 + tuning 2 x ~13 + 4 cases x ~15.5 + ~2 = ~96 min of 117 (7000 s); a round starts only with 34 min left.
+# Submit (16 nodes, segment 8) after VAL-H1's gate passed on the same wheel:
+#   bash $R/tools/require_presubmit.sh <token> && bash $R/launch/val_h2_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# Freeze 759787cb17 = the wheel of 5330b899f0 (BUILD-FREEZE 8173212; tensorrt_llm/ and cpp/ identical); snapshot build-src-5330b899f0 holds 759787cb17.
+B=build-freeze-5330b899f0; SRC=$R/overlays/build-src-5330b899f0; O=
+# The unit gate's overlay arguments: the source snapshot itself when the wheel carries all of the Python (no overlay).
+OV=${O:-$SRC}; OT=${O:+$O-tests}; OT=${OT:-$SRC}
+T="tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py tests/unittest/_torch/executor/test_multimodal_scheduler.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/executor/test_py_executor.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/valh2-gate$1-\$SLURM_JOB_ID $R/$B/dist $OV $OT $SRC $R/$B/point-units-valh2-g$1 $T"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=${O:+1} WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=34 STD_TUNE_ARMS='std-online std-online-ft'"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E COST_LOADS=32 FT_COST_E2E_ARMS='std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && $E COST_LOADS=32 FT_COST_E2E_ARMS='std-online-ft std-online' bash $R/mvp/harness/run_job.sh STD-G1"

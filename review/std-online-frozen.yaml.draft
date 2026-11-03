@@ -1,0 +1,49 @@
+# Arm std-online-ft-frozen (diagnostic): std-online.yaml with EPLB's weight updates off (layer_updates_per_iter 0),
+# so the same 288 slots and default placement route statically; FT appends its ghost slot per rank as with updates.
+# Standard DEP32 recipe (perf-sanity aggregated GB200 R1 FP4 v2, deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml
+# r1_fp4_v2_dep8_mtp1_1k1k, at DEP32). The six std-*.yaml files share this body byte for byte and differ only in
+# moe_config.load_balancer. Run every arm with TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1 (the recipe's
+# server_env_var). Deviations from the recipe, the same in every arm:
+# - max_seq_len 2304 (recipe: unset, i.e. the model's 163840). ISL+OSL+draft = 2049 fits; startup memory scales with
+#   it (CLAIMS #82: the 8k recipe's executor resources OOM), and no DEP32 run has started without it.
+# - stream_interval 10 (recipe: unset = 1) and num_postprocess_workers 4 (recipe: 0): at 512/GPU the frontend
+#   streams 16k requests; 10 is a database/curated value (examples/configs/database: 10 or 20; wide_ep's slurm config 20), 4 the DEP32 gen
+#   configs' value. With 1/0 the single frontend, not the engine, would set throughput.
+# - print_iter_log true (recipe: false): the harness's steady-step readout (steady_state.py, ab_stats.py) reads it.
+# - gpus_per_node 4: the recipe's hardware.gpus_per_node, written into the LLM config for the mpirun launch.
+# Recipe defaults not written: disable_overlap_scheduler false, enable_lm_head_tp_in_adp false, finalize fusion on.
+# The harness itself sets kv_cache_config.host_cache_size (FINAL_HOST_CACHE_SIZE, all arms) for final-build packs.
+# Arm: online EPLB, FT off and FT on (one file). num_slots 288, one layer's placement updated per iteration
+# (wide_ep README / examples/wide_ep/slurm_scripts/config.yaml). FT on appends its ghost/empty slots at load
+# (node domain: 1 per GPU); TLLM_FAULT_TOLERANCE_EXTRA_SLOTS unset.
+tensor_parallel_size: 32
+moe_expert_parallel_size: 32
+enable_attention_dp: true
+gpus_per_node: 4
+max_batch_size: 512
+max_num_tokens: 8192
+max_seq_len: 2304
+attn_backend: TRTLLM
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 0
+  timeout_iters: 60
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 512
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 1
+stream_interval: 10
+num_postprocess_workers: 4
+print_iter_log: true
+moe_config:
+  backend: CUTEDSL
+  use_low_precision_moe_combine: true
+  load_balancer:
+    num_slots: 288
+    layer_updates_per_iter: 0

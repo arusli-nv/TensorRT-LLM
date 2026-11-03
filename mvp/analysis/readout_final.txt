@@ -1,0 +1,180 @@
+# FT healthy-cost finals readout
+runs: STD-8116111, STD-G1-8116111, STD-8118573, STD-G1-8118573, STD-8118134, STD-G1-8118134; groups: 6; cost % = (FT on - off) / off, positive = FT slower
+
+## 1. Inclusion
+
+| group | case | PIN_CHECK | autotune | startup ok | healthy rows | excluded |
+|---|---|---|---|---|---|---|
+| STD-8116111 | std-noeplb-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8116111 | std-noeplb-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8116111 | std-offline-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8116111 | std-offline-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118134 | std-offline-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118134 | std-offline-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118134 | std-online-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118134 | std-online-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118573 | std-offline-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118573 | std-offline-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118573 | std-online-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-8118573 | std-online-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8116111 | std-noeplb-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8116111 | std-noeplb-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8116111 | std-online-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8116111 | std-online-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118134 | std-noeplb-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118134 | std-noeplb-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118134 | std-noeplb-lb-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118134 | std-online-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118573 | std-noeplb-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118573 | std-noeplb-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118573 | std-online-1 | OK | 0 | yes | 8,32,128,512 | no |
+| STD-G1-8118573 | std-online-ft-1 | OK | 0 | yes | 8,32,128,512 | no |
+
+## 2. Primary: rank-0 host loop-step median, FT on vs off (group-paired)
+
+| mode | load | n | per-group cost % | mean % | sd | one-sided UB95 % | pass (<+1%) | two-sided 95% CI | delta us | off step ms | on step ms | off tok/s/GPU | on tok/s/GPU | Holm p |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| noeplb | 8 | 4 | -0.01 -0.19 +0.03 -0.15 | -0.08 | 0.10 | +0.04 | PASS | [-0.25, +0.08] | -10 | 11.904 | 11.894 | 1344 | 1345 | 0.001 |
+| noeplb | 32 | 4 | +2.76 +1.53 +3.97 +2.45 | +2.68 | 1.01 | +3.86 | fail | [+1.08, +4.28] | +369 | 13.812 | 14.181 | 4634 | 4513 | 0.978 |
+| noeplb | 128 | 4 | +0.20 +0.54 +0.47 +0.62 | +0.46 | 0.18 | +0.67 | PASS | [+0.17, +0.75] | +113 | 24.633 | 24.746 | 10393 | 10345 | 0.029 |
+| noeplb | 512 | 4 | -0.96 -0.41 -0.66 -0.17 | -0.55 | 0.34 | -0.15 | not tested | [-1.09, -0.01] | -391 | 71.269 | 70.878 | 14369 | 14448 | - |
+| offline | 8 | 3 | -0.20 -0.35 -0.23 | -0.26 | 0.08 | -0.13 | PASS | [-0.45, -0.06] | -32 | 12.473 | 12.441 | 1283 | 1286 | 0.005 |
+| offline | 32 | 3 | +1.02 +0.24 +0.16 | +0.47 | 0.47 | +1.27 | fail | [-0.70, +1.65] | +67 | 14.163 | 14.230 | 4519 | 4498 | 0.194 |
+| offline | 128 | 3 | -0.14 -0.35 -0.37 | -0.28 | 0.13 | -0.07 | PASS | [-0.60, +0.04] | -69 | 24.413 | 24.343 | 10487 | 10517 | 0.012 |
+| offline | 512 | 3 | -0.18 +0.11 -1.17 | -0.42 | 0.67 | +0.72 | not tested | [-2.08, +1.25] | -291 | 68.891 | 68.600 | 14867 | 14928 | - |
+| online | 8 | 4 | +0.49 +0.73 +0.63 +0.37 | +0.56 | 0.16 | +0.74 | PASS | [+0.31, +0.80] | +75 | 13.442 | 13.517 | 1190 | 1184 | 0.029 |
+| online | 32 | 4 | -0.58 -0.42 +0.40 +0.73 | +0.03 | 0.63 | +0.78 | PASS | [-0.97, +1.04] | +5 | 14.619 | 14.624 | 4378 | 4377 | 0.082 |
+| online | 128 | 4 | +0.63 -0.51 -0.22 -0.42 | -0.13 | 0.52 | +0.48 | PASS | [-0.96, +0.70] | -29 | 22.140 | 22.111 | 11564 | 11579 | 0.045 |
+| online | 512 | 4 | +0.99 +0.35 +1.44 +1.01 | +0.94 | 0.45 | +1.47 | not tested | [+0.23, +1.66] | +568 | 60.081 | 60.649 | 17044 | 16885 | - |
+
+Every-cell claim (IUT, all 9 headline cells UB95 < +1%): fail. Holm (9 cells, H0 cost >= 1%) established < 1%: noeplb/8, noeplb/128, offline/8, offline/128, online/8, online/128.
+
+Load attainment over the row's decode steps: share of steps with num_active >= 0.9 x load (and share of decode time), median num_active; per arm:
+
+- noeplb/512 std-noeplb: STD-8116111 43.7% of steps (75.5% of time), median active 129; STD-G1-8116111 50.6% of steps (80.6% of time), median active 500; STD-G1-8118134 49.2% of steps (80.3% of time), median active 410; STD-G1-8118573 51.2% of steps (80.9% of time), median active 511
+- noeplb/512 std-noeplb-ft: STD-8116111 44.9% of steps (73.0% of time), median active 379; STD-G1-8116111 52.4% of steps (81.1% of time), median active 512; STD-G1-8118134 45.9% of steps (74.4% of time), median active 377; STD-G1-8118573 51.9% of steps (80.9% of time), median active 511
+- offline/512 std-offline: STD-8116111 52.0% of steps (80.5% of time), median active 512; STD-8118134 12.1% of steps (21.4% of time), median active 189; STD-8118573 50.9% of steps (80.0% of time), median active 511
+- offline/512 std-offline-ft: STD-8116111 50.9% of steps (79.2% of time), median active 511; STD-8118134 48.7% of steps (73.7% of time), median active 379; STD-8118573 45.9% of steps (72.9% of time), median active 435
+- online/512 std-online: STD-8118134 48.5% of steps (76.7% of time), median active 360; STD-8118573 48.0% of steps (76.4% of time), median active 332; STD-G1-8116111 48.0% of steps (76.2% of time), median active 326; STD-G1-8118573 51.2% of steps (77.6% of time), median active 511
+- online/512 std-online-ft: STD-8118134 49.3% of steps (76.1% of time), median active 415; STD-8118573 37.5% of steps (68.7% of time), median active 4; STD-G1-8116111 48.3% of steps (76.6% of time), median active 349; STD-G1-8118134 49.3% of steps (76.9% of time), median active 413; STD-G1-8118573 52.4% of steps (77.6% of time), median active 512
+
+CLAIMS-ready lines:
+- noeplb/8/GPU: FT cost -0.08% [one-sided 95% UB +0.04%], n=4 groups (STD-8116111, STD-G1-8116111, STD-G1-8118134, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- noeplb/32/GPU: FT cost +2.68% [one-sided 95% UB +3.86%], n=4 groups (STD-8116111, STD-G1-8116111, STD-G1-8118134, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- noeplb/128/GPU: FT cost +0.46% [one-sided 95% UB +0.67%], n=4 groups (STD-8116111, STD-G1-8116111, STD-G1-8118134, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- noeplb/512/GPU: FT cost -0.55% [one-sided 95% UB -0.15%], n=4 groups (STD-8116111, STD-G1-8116111, STD-G1-8118134, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load, beyond recipe, not tested
+- offline/8/GPU: FT cost -0.26% [one-sided 95% UB -0.13%], n=3 groups (STD-8116111, STD-8118134, STD-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- offline/32/GPU: FT cost +0.47% [one-sided 95% UB +1.27%], n=3 groups (STD-8116111, STD-8118134, STD-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- offline/128/GPU: FT cost -0.28% [one-sided 95% UB -0.07%], n=3 groups (STD-8116111, STD-8118134, STD-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- offline/512/GPU: FT cost -0.42% [one-sided 95% UB +0.72%], n=3 groups (STD-8116111, STD-8118134, STD-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load, beyond recipe, not tested
+- online/8/GPU: FT cost +0.56% [one-sided 95% UB +0.74%], n=4 groups (STD-8118134, STD-8118573, STD-G1-8116111, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- online/32/GPU: FT cost +0.03% [one-sided 95% UB +0.78%], n=4 groups (STD-8118134, STD-8118573, STD-G1-8116111, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- online/128/GPU: FT cost -0.13% [one-sided 95% UB +0.48%], n=4 groups (STD-8118134, STD-8118573, STD-G1-8116111, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load
+- online/512/GPU: FT cost +0.94% [one-sided 95% UB +1.47%], n=4 groups (STD-8118134, STD-8118573, STD-G1-8116111, STD-G1-8118573), rank-0 host loop-step median, decode-only num_active >= 0.9 load, beyond recipe, not tested
+
+## 3. Client (descriptive; rows with > 5% failed/short requests dropped): median over groups [min-max]
+
+| mode | load | arm | n | TPOT median ms | TPOT mean ms | out tok/s/GPU |
+|---|---|---|---|---|---|---|
+| noeplb | 8 | std-noeplb | 4 | 6.36 [6.26-6.54] | 6.41 [6.30-6.49] | 1114.65 [1076.40-1140.15] |
+| noeplb | 8 | std-noeplb-ft | 4 | 6.50 [6.40-6.87] | 6.50 [6.39-6.78] | 1069.50 [1051.11-1120.00] |
+| noeplb | 32 | std-noeplb | 4 | 8.52 [8.43-8.64] | 8.62 [8.51-8.66] | 2998.96 [2966.42-3023.36] |
+| noeplb | 32 | std-noeplb-ft | 4 | 8.57 [8.47-8.58] | 8.65 [8.61-8.68] | 2982.00 [2965.04-3010.93] |
+| noeplb | 128 | std-noeplb | 4 | 19.23 [19.13-19.29] | 19.14 [19.09-19.26] | 4929.62 [4902.71-4942.97] |
+| noeplb | 128 | std-noeplb-ft | 4 | 19.43 [19.37-19.74] | 19.41 [19.31-19.61] | 4885.25 [4837.62-4913.66] |
+| noeplb | 512 | std-noeplb | 4 | 62.19 [61.93-63.49] | 61.97 [61.79-62.36] | 5796.09 [5689.06-5817.13] |
+| noeplb | 512 | std-noeplb-ft | 4 | 62.18 [62.12-62.28] | 61.77 [61.63-62.00] | 5810.01 [5794.44-5835.23] |
+| offline | 8 | std-offline | 3 | 6.49 [6.46-6.56] | 6.45 [6.44-6.57] | 1152.79 [1111.97-1154.80] |
+| offline | 8 | std-offline-ft | 3 | 6.50 [6.37-6.71] | 6.51 [6.42-6.71] | 1095.97 [1067.77-1157.57] |
+| offline | 32 | std-offline | 3 | 8.10 [8.06-8.19] | 8.12 [8.11-8.24] | 3366.14 [3341.68-3394.05] |
+| offline | 32 | std-offline-ft | 3 | 8.24 [8.19-8.57] | 8.29 [8.20-8.58] | 3308.92 [3241.61-3332.77] |
+| offline | 128 | std-offline | 3 | 16.49 [16.41-16.63] | 16.46 [16.34-16.55] | 6303.57 [6261.89-6323.72] |
+| offline | 128 | std-offline-ft | 3 | 16.61 [16.44-16.72] | 16.57 [16.39-16.57] | 6319.07 [6259.65-6351.52] |
+| offline | 512 | std-offline | 3 | 49.85 [46.05-50.08] | 49.39 [44.01-49.61] | 7963.61 [7328.66-7970.59] |
+| offline | 512 | std-offline-ft | 3 | 50.13 [49.07-50.30] | 49.63 [48.68-49.70] | 7930.74 [7911.53-7972.64] |
+| online | 8 | std-online | 4 | 7.33 [7.12-7.43] | 7.37 [7.14-7.39] | 980.07 [958.64-983.79] |
+| online | 8 | std-online-ft | 5 | 7.32 [7.29-7.48] | 7.36 [7.27-7.53] | 977.94 [942.84-997.92] |
+| online | 32 | std-online | 4 | 8.84 [8.73-8.91] | 8.94 [8.82-8.98] | 3001.44 [2920.78-3012.98] |
+| online | 32 | std-online-ft | 5 | 9.01 [8.78-9.18] | 9.07 [8.86-9.22] | 2933.68 [2829.82-2968.56] |
+| online | 128 | std-online | 4 | 17.20 [16.95-17.41] | 17.26 [17.02-17.44] | 5562.56 [5457.29-5672.69] |
+| online | 128 | std-online-ft | 5 | 17.50 [17.25-17.54] | 17.46 [17.25-17.52] | 5432.17 [5409.95-5619.85] |
+| online | 512 | std-online | 4 | 47.92 [47.31-48.22] | 48.33 [47.47-48.87] | 7483.43 [7293.59-7747.45] |
+| online | 512 | std-online-ft | 5 | 48.57 [47.38-51.74] | 48.59 [47.70-52.93] | 7446.52 [7018.73-7705.06] |
+
+## 4. Stall share (% of steady time in steps > 2x the row median), FT on - off in points
+
+Rule: Hodges-Lehmann <= +0.5 points and no single pair > +2 points. Wilcoxon p descriptive (floor 1/2^n).
+
+| mode | load | n | off % per group | on % per group | HL | max pair | rule | Wilcoxon p (floor) |
+|---|---|---|---|---|---|---|---|---|
+| noeplb | 8 | 4 | 7.9 4.4 6.6 4.7 | 12.3 5.6 8.3 6.6 | +1.86 | +4.40 | fail | 0.062 (0.062) |
+| noeplb | 32 | 4 | 2.8 5.7 4.3 5.3 | 6.2 2.5 5.7 2.4 | -0.30 | +3.34 | fail | 0.562 (0.062) |
+| noeplb | 128 | 4 | 1.6 1.1 1.5 2.2 | 2.2 2.2 2.1 2.2 | +0.58 | +1.08 | fail | 0.125 (0.062) |
+| noeplb | 512 | 4 | 1.5 1.0 1.3 1.2 | 2.3 1.4 1.4 1.4 | +0.35 | +0.73 | PASS | 0.062 (0.062) |
+| offline | 8 | 3 | 0.8 2.9 0.6 | 1.9 0.5 4.6 | +0.94 | +4.08 | fail | 0.375 (0.125) |
+| offline | 32 | 3 | 3.1 1.0 3.1 | 3.3 2.3 1.9 | +0.11 | +1.29 | PASS | 0.375 (0.125) |
+| offline | 128 | 3 | 0.5 0.4 1.1 | 1.3 0.8 1.1 | +0.38 | +0.77 | PASS | 0.250 (0.125) |
+| offline | 512 | 3 | 0.7 0.0 0.2 | 0.9 0.7 1.1 | +0.63 | +0.86 | fail | 0.125 (0.125) |
+| online | 8 | 4 | 6.5 3.0 6.7 7.2 | 5.7 7.9 5.0 4.9 | -1.06 | +4.90 | fail | 0.688 (0.062) |
+| online | 32 | 4 | 2.2 4.1 3.5 3.4 | 2.6 4.4 3.6 7.4 | +0.39 | +3.95 | fail | 0.062 (0.062) |
+| online | 128 | 4 | 0.7 1.1 1.2 1.5 | 2.2 0.9 0.7 1.6 | -0.00 | +1.46 | PASS | 0.562 (0.062) |
+| online | 512 | 4 | 1.1 0.8 0.8 0.9 | 0.9 3.0 0.3 0.8 | -0.17 | +2.22 | fail | 0.688 (0.062) |
+
+## 5. 32/GPU cost within KV-fill bins (5 quantile bins of both arms' cached_kv_tokens, weighted by min steps per bin)
+
+| mode | metric | per-group binned cost % | n | mean % | one-sided UB95 % | two-sided 95% CI |
+|---|---|---|---|---|---|---|
+| noeplb | host loop-step | STD-8116111:+2.70 STD-G1-8116111:+1.87 STD-G1-8118134:+4.07 STD-G1-8118573:+2.32 | 4 | +2.74 | +3.86 | [+1.23, +4.25] |
+| noeplb | device step | STD-8116111:+2.45 STD-G1-8116111:+2.27 STD-G1-8118134:+2.27 STD-G1-8118573:+2.16 | 4 | +2.29 | +2.43 | [+2.10, +2.48] |
+| offline | host loop-step | STD-8116111:+1.10 STD-8118134:+0.31 STD-8118573:+0.24 | 3 | +0.55 | +1.36 | [-0.64, +1.74] |
+| offline | device step | STD-8116111:+0.90 STD-8118134:+0.83 STD-8118573:+0.99 | 3 | +0.90 | +1.04 | [+0.71, +1.10] |
+| online | host loop-step | STD-8118134:-0.52 STD-8118573:-0.26 STD-G1-8116111:+0.58 STD-G1-8118573:+0.66 | 4 | +0.11 | +0.81 | [-0.83, +1.05] |
+| online | device step | STD-8118134:+0.13 STD-8118573:+0.23 STD-G1-8116111:+0.11 STD-G1-8118573:+0.13 | 4 | +0.15 | +0.21 | [+0.07, +0.23] |
+
+## 6. Sensitivity
+
+Job-averaged: the groups of one job averaged first, t over jobs. Slow-mode launch: 8/GPU step median > 1.05 x the median of its mode's FT-off cases; its group pair is dropped for that mode.
+
+- slow-mode launches noeplb: none
+- slow-mode launches offline: none
+- slow-mode launches online: none
+
+| mode | load | variant | n | mean % | one-sided UB95 % | pass | agrees with primary |
+|---|---|---|---|---|---|---|---|
+| noeplb | 8 | job-averaged | 3 | -0.07 | +0.08 | PASS | yes |
+| noeplb | 8 | without slow-mode | 4 | -0.08 | +0.04 | PASS | yes |
+| noeplb | 32 | job-averaged | 3 | +2.85 | +4.50 | fail | yes |
+| noeplb | 32 | without slow-mode | 4 | +2.68 | +3.86 | fail | yes |
+| noeplb | 128 | job-averaged | 3 | +0.49 | +0.70 | PASS | yes |
+| noeplb | 128 | without slow-mode | 4 | +0.46 | +0.67 | PASS | yes |
+| noeplb | 512 | job-averaged | 3 | -0.50 | -0.01 | not tested | - |
+| noeplb | 512 | without slow-mode | 4 | -0.55 | -0.15 | not tested | - |
+| offline | 8 | job-averaged | 3 | -0.26 | -0.13 | PASS | yes |
+| offline | 8 | without slow-mode | 3 | -0.26 | -0.13 | PASS | yes |
+| offline | 32 | job-averaged | 3 | +0.47 | +1.27 | fail | yes |
+| offline | 32 | without slow-mode | 3 | +0.47 | +1.27 | fail | yes |
+| offline | 128 | job-averaged | 3 | -0.28 | -0.07 | PASS | yes |
+| offline | 128 | without slow-mode | 3 | -0.28 | -0.07 | PASS | yes |
+| offline | 512 | job-averaged | 3 | -0.42 | +0.72 | not tested | - |
+| offline | 512 | without slow-mode | 3 | -0.42 | +0.72 | not tested | - |
+| online | 8 | job-averaged | 3 | +0.56 | +0.68 | PASS | yes |
+| online | 8 | without slow-mode | 4 | +0.56 | +0.74 | PASS | yes |
+| online | 32 | job-averaged | 3 | -0.01 | +0.85 | PASS | yes |
+| online | 32 | without slow-mode | 4 | +0.03 | +0.78 | PASS | yes |
+| online | 128 | job-averaged | 3 | -0.02 | +0.95 | PASS | yes |
+| online | 128 | without slow-mode | 4 | -0.13 | +0.48 | PASS | yes |
+| online | 512 | job-averaged | 3 | +1.03 | +1.68 | not tested | - |
+| online | 512 | without slow-mode | 4 | +0.94 | +1.47 | not tested | - |
+
+## 7. Static-LB control (std-noeplb vs std-noeplb-lb vs std-noeplb-ft), host loop-step median
+
+| group | load | noeplb ms | lb ms | ft ms | lb vs noeplb % | ft vs lb % | ft vs noeplb % |
+|---|---|---|---|---|---|---|---|
+| STD-G1-8118134 | 8 | 11.919 | 12.025 | 11.922 | +0.89 | -0.86 | +0.03 |
+| STD-G1-8118134 | 32 | 13.796 | 13.824 | 14.344 | +0.20 | +3.76 | +3.97 |
+| STD-G1-8118134 | 128 | 24.609 | 24.747 | 24.725 | +0.56 | -0.09 | +0.47 |
+| STD-G1-8118134 | 512 | 71.065 | 71.677 | 70.594 | +0.86 | -1.51 | -0.66 |
+
+Unpaired FT cases (reported, not in any cell): STD-G1-8118134:std-online-ft
+
+json: /tmp/claude-161238/readout_final.json

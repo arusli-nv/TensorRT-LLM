@@ -1,0 +1,8 @@
+# TUNE-FREEZE-NOEPLB (monitor-drafted 2026-10-23, 8 nodes): no-EPLB tactic table for the finals on build-freeze-8c52d11469.
+# Tuning pass at 128/GPU writes mvp/runs/STD-<job>/autotuner/pinned.json (FT_COST_E2E_SEED for no-EPLB finals), then one
+# short descriptive round at 32/GPU. Companion of tune_freeze_cmd.txt (online + offline).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+B=build-freeze-8c52d11469
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=32:6 COST_LOADS=32 TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30 FT_COST_E2E_ROUNDS=1"
+bash $R/bundle.sh "0:8:7000:$E STD_TUNE_ARMS='std-noeplb std-noeplb-ft' FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD"

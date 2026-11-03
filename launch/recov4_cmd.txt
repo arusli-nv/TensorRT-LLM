@@ -1,0 +1,45 @@
+# RECOV4 (16 nodes, two 8-node groups = one DEP32 server each, segment 8). This raises the thinnest bars of the slide
+# figures on v5-final 27442bd91d (overlays/fix-dropmap-9f1fd4cab4 on build-freeze-58caa0fde6), with RECOV2/3's harness,
+# knobs, configs and pass rule (launch/recov3_cmd.txt), only the rows differ.
+# Rules (written 10-27 ~08:00 PT before any RECOV4 data; user 10-27 07:40 "run what affects claims or graphs"): new runs
+# extend the pooled cells; every presented number that changes is logged in FINAL/OVERNIGHT_LOG.md with its CLAIMS row;
+# pass/claim rules unchanged; code frozen. Slide 13 (throughput after a loss) adds the new decode kills by the same
+# client-throughput method (CLAIMS 209, 220).
+# Pass rule (unchanged): the standard KILL_FINAL rule, mvp/harness/job.sh kf_verdict, per case KILL_FINAL_VERDICT PASS.
+# Cells (current n) -> new cases -> pooled n:
+#   offline EPLB rank kill (slides 11, 13)    n=3 -> +2 -> 5
+#   offline EPLB node kill (slides 11, 13)    n=3 -> +2 -> 5
+#   frozen rank, each EPLB mode (slide 11)    n=2 -> +1 -> 3 per mode
+# Labels (directory names only; the config is set by KF_BENCH_CONFIG): G0 OFF-B = offline rank/node; G8 OFF = no-EPLB
+# stop, ON-B = online stop, OFF-A = offline stop.
+# Groups (RECOV2/3 measured ~11-17 min per case, first case +2-3 min cold):
+#   G0: offline rank5, node1 x2 (victims 5/22, nodes 1/5)            ~4 cases ~60 min
+#   G8: stop x1 for no EPLB, online, offline (rank 2, 64/GPU)         ~3 cases ~50 min
+#   --time 01:20, group limit 4500 s; job.sh starts a case only with >= 15 min left.
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1
+B=build-freeze-58caa0fde6
+FIX_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4
+O="MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1"
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then KI=4 KSTOP=4; else KI=4 KSTOP=8; fi
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+KOFF="$K KF_BENCH_CONFIG=std-offline-ft-filled.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$KOFF KF_ROWS='rank5 node1' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-OFF-B)"
+G0="{ $P0_1; }"
+P8_1="$KNO KF_ROWS='stop' KF_REPEATS=1 $(run KILL-FINAL-OFF)"
+P8_2="$KON KF_ROWS='stop' KF_REPEATS=1 $(run KILL-FINAL-ON-B)"
+P8_3="$KOFF KF_ROWS='stop' KF_REPEATS=1 $(run KILL-FINAL-OFF-A)"
+G8="{ $P8_1; $P8_2; $P8_3; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:4500:$G0" "8:8:4500:$G8"

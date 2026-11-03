@@ -1,0 +1,22 @@
+--- a/mvp/harness/testhooks.py
++++ b/mvp/harness/testhooks.py
+@@ -48,6 +48,9 @@
+ Diagnosis only: TLLM_TEST_WATCH_POLL_S=s sets the peer-failure watcher's poll interval;
+ TLLM_TEST_ALLOC_STATS_S=s logs, every s seconds, one WIDEEP_ALLOC line with the CUDA caching allocator's
+ retries and device allocations/frees, the process RSS and its page faults (host-side reads only).
++TLLM_TEST_EXPERT_STATISTIC_ITER_RANGE=a-b and TLLM_TEST_EXPERT_STATISTIC_PATH=dir set main's EXPERT_STATISTIC_*
++(the launcher forwards only TLLM_* variables): every rank dumps per-slot routed-token counts of iterations [a, b),
++which main runs without CUDA graphs.
+ Modules are patched when TRT-LLM imports them.
+ """
+ 
+@@ -80,6 +83,9 @@
+ RERUN_OWNER = os.environ.get("TLLM_TEST_KILL_RERUN_OWNER")
+ LATE_WRITE_DECODE = os.environ.get("TLLM_TEST_LATE_WRITE_IN_DECODE")
+ DELAY_ABORT_S = float(os.environ.get("TLLM_TEST_DELAY_ABORT_S", "0"))
++for _name in ("ITER_RANGE", "PATH"):
++    if os.environ.get(f"TLLM_TEST_EXPERT_STATISTIC_{_name}"):
++        os.environ[f"EXPERT_STATISTIC_{_name}"] = os.environ[f"TLLM_TEST_EXPERT_STATISTIC_{_name}"]
+ 
+ 
+ def _say(event: str, extra: str = "") -> None:

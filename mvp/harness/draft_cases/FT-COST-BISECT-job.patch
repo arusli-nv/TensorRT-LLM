@@ -1,0 +1,102 @@
+--- job.sh	2026-10-19 08:29:36.000000000 -0700
++++ job.sh.new	2026-10-19 08:37:03.000000000 -0700
+@@ -2549,7 +2549,7 @@
+     fi
+     echo STD_DONE
+     ;;
+-FT-COST-E2E|FT-COST-ATTR|FT-COST-MECH|FT-COST-PROF|C-COMBINE4-PIN|FT-COST-AUTO)
++FT-COST-E2E|FT-COST-ATTR|FT-COST-MECH|FT-COST-PROF|C-COMBINE4-PIN|FT-COST-AUTO|FT-COST-BISECT)
+     export CASE_TIMEOUT_S=1500 BENCH_CONFIG=dep32-final.yaml TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
+     if [[ $dist != *fcc86b10b2* || -n "${MVP_OVERLAY:-}" ]]; then
+         echo "SMOKE_FAIL preflight: MVP_BUILD must be build-next-fcc86b10b2 without MVP_OVERLAY ($dist, overlay '${MVP_OVERLAY:-}')"
+@@ -2583,6 +2583,47 @@
+         arms=${FT_COST_E2E_ARMS:-noft-stack noft-ulfm-nodet noft-ulfm}
+         load=(--mode sweep --loads 8,128 --iterations 2 --isl 1024 --osl 1024 --warm-each-load)
+     fi
++    # BISECT (CLAIMS #104: ft +2.09% steady step at 128/GPU vs noft-ulfm; nsys could not resolve it): which part of
++    # FT's mechanism costs it, at full fidelity. Third arm: ft with one group of FT's healthy-path work removed by
++    # benchmark-only hooks (TLLM_TEST_FT_OFF, testhooks.py; healthy cases only). Default ft-noH: the serving thread's FT
++    # host work (resp + step + coll). Seeded with #104's pinned tactics. Design: draft_cases/FT-COST-BISECT.md.
++    if [[ $job == FT-COST-BISECT ]]; then
++        arms=${FT_COST_E2E_ARMS:-noft-ulfm ft ft-noH}
++        export FT_COST_E2E_SEED=${FT_COST_E2E_SEED:-$C/mvp/runs/FT-COST-E2E-8059717/autotuner/pinned.json}
++        # ~10.5 min per 128-only case: a round starts only with room for all of it.
++        export FT_COST_E2E_ROUNDS=${FT_COST_E2E_ROUNDS:-4}
++        export FT_COST_E2E_ROUND_MIN=${FT_COST_E2E_ROUND_MIN:-$(( 11 * $(wc -w <<< "$arms") + 2 ))}
++        load=(--mode sweep --loads 128 --iterations 2 --isl 1024 --osl 1024 --warm-each-load)
++    fi
++    ft_off_pieces() {  # ARM: TLLM_TEST_FT_OFF of a hook arm, sorted as WIDEEP_FT_OFF_ACTIVE lists them; empty otherwise
++        case $1 in
++        ft-noH) echo coll,resp,step ;;
++        ft-noT) echo watch ;;
++        ft-noresp) echo resp ;;
++        ft-nostep) echo step ;;
++        ft-nocoll) echo coll ;;
++        esac
++    }
++    hook_ok() {  # CASE ARM (node 0): the case is DONE and its rank logs prove ARM's hooks took effect, or that none ran
++        local d=$out/$1 want; want=$(ft_off_pieces "$2")
++        local logs=("$d"/rank-*.log)
++        local lines errors proven wrapped calls finished missing=""
++        lines=$(cat "${logs[@]}" 2>/dev/null | grep -c WIDEEP_FT_OFF)
++        errors=$(cat "${logs[@]}" 2>/dev/null | grep -c WIDEEP_FT_OFF_ERROR)
++        proven=$(grep -l "WIDEEP_FT_OFF_ACTIVE rank [0-9]* t=[0-9.]* serving=1 verified=${want:--} hang_detection=False" \
++            "${logs[@]}" 2>/dev/null | wc -l)
++        wrapped=$(grep -l "WIDEEP_FT_OFF rank [0-9]* t=[0-9.]* module=communicator unwrapped=12 " "${logs[@]}" 2>/dev/null | wc -l)
++        calls=$(grep -o "WIDEEP_FT_OFF_CALL rank 0 t=[0-9.]* name=[a-z_]*" "$d/rank-0.log" 2>/dev/null | sed 's/.*name=//' | sort -u)
++        [[ $want == *resp* ]] && for c in fetching_requests broadcast_requests requests_routed gathering_responses responses_gathered; do
++            grep -qx "$c" <<< "$calls" || missing+="$c,"; done
++        [[ $want == *step* ]] && for c in step_prepared commit_step; do grep -qx "$c" <<< "$calls" || missing+="$c,"; done
++        finished=$(grep -c '"state": "DONE"' "$d/result.json" 2>/dev/null)
++        echo "HOOK_CHECK $1 want=${want:-none} done=$finished ranks=${#logs[@]} proven=$proven unwrapped12=$wrapped lines=$lines" \
++            "errors=$errors rank0_calls=$(paste -sd, <<< "$calls") missing=${missing:--}" | tee -a "$out/hook_check.txt"
++        [[ $finished == 1 ]] || return 1
++        [[ -z $want ]] && { (( lines == 0 )); return; }
++        (( ${#logs[@]} == 32 && proven == 32 && errors == 0 )) && [[ -z $missing ]] && [[ $want != *coll* || $wrapped == 32 ]]
++    }
+     tuner=$out/autotuner; pinned=$tuner/pinned.json
+     mkdir -p "$tuner"
+     arm_case() {  # NAME ARM CACHE [bench.py args...]: one case of ARM reading CACHE
+@@ -2593,6 +2634,7 @@
+          noft-ulfm) run_case "$name" noft-ulfm "$@" ;;
+          noft-ulfm-nodet) (export WIDEEP_NO_DETECTOR=1; run_case "$name" noft-ulfm "$@") ;;
+          ft) run_case "$name" ft "$@" ;;
++         ft-no*) (export TLLM_TEST_FT_OFF=$(ft_off_pieces "$arm"); run_case "$name" ft "$@") ;;
+          lay-eplb0) (export BENCH_CONFIG=dep32-eplb0.yaml; run_case "$name" noft "$@") ;;
+          lay-ghost320) (export BENCH_CONFIG=dep32-b2-320.yaml TLLM_TEST_EMPTY_EXTRA_SLOTS=1 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost
+                         run_case "$name" noft "$@") ;;
+@@ -2655,6 +2697,12 @@
+                     "$(python3 $H/draft_cases/merge_pin_tactics.py check "$pinned" "$cache" 2>&1 | tail -1)" \
+                     | tee -a "$out/tactic_check.txt"
+             fi
++            # BISECT: every case's hook proof; an arm whose first case lacks it ends the job.
++            if [[ $job == FT-COST-BISECT && $r == 1 ]]; then
++                node0_decides "$out/hook-$a.ok" hook_ok $a-$r $a || { echo "SMOKE_FAIL hook check $a-$r (hook_check.txt)"; echo STD_DONE; exit 1; }
++            elif [[ $job == FT-COST-BISECT && $SLURM_NODEID == 0 ]]; then
++                hook_ok $a-$r $a || echo "HOOK_CHECK_FAIL $a-$r: exclude it from the analysis"
++            fi
+         done
+     done
+     if [[ $SLURM_NODEID == 0 ]]; then
+@@ -2662,6 +2710,21 @@
+             [[ $b == ft ]] || python3 $H/ab_stats.py "$out" $b ft > "$out/ab_stats-$b-vs-ft.txt" 2>&1; done
+         [[ $arms == *noft-ulfm* ]] && python3 $H/ab_stats.py "$out" noft-stack noft-ulfm > "$out/ab_stats-noft-stack-vs-noft-ulfm.txt" 2>&1
+         [[ $job == C-COMBINE4-PIN ]] && { set -- $arms; python3 $H/ab_stats.py "$out" "$1" "$2" > "$out/ab_stats-$1-vs-$2.txt" 2>&1; }
++        if [[ $job == FT-COST-BISECT ]]; then
++            # Per hook arm at 128/GPU (steady step): FT's cost (noft-ulfm -> ft), what the arm saves (it -> ft), what
++            # remains (noft-ulfm -> it), each "cost % [95% CI]"; recovered = saved / FT's cost (decision rules: the .md).
++            at128() { awk '/^steady_step_ms/ {s = 1; next} s && $1 == 128 {print $5 " [" $6 "]"; exit}' "$1"; }
++            for b in $arms; do
++                [[ -n $(ft_off_pieces "$b") ]] || continue
++                python3 $H/ab_stats.py "$out" noft-ulfm "$b" > "$out/ab_stats-noft-ulfm-vs-$b.txt" 2>&1
++                ft_cost=$(at128 "$out/ab_stats-noft-ulfm-vs-ft.txt"); saved=$(at128 "$out/ab_stats-$b-vs-ft.txt")
++                echo "BISECT $b ($(ft_off_pieces "$b")) steady_step 128/GPU: ft_cost=$ft_cost saved=$saved" \
++                    "residual=$(at128 "$out/ab_stats-noft-ulfm-vs-$b.txt")" \
++                    "recovered=$(awk -v s="${saved%% *}" -v f="${ft_cost%% *}" 'BEGIN { if (f + 0 > 0) printf "%.2f", s / f; else print "n/a" }')" \
++                    | tee -a "$out/bisect.txt"
++            done
++            cat "$out/hook_check.txt"
++        fi
+         [[ $arms == *noft-ulfm-nodet* ]] && { python3 $H/ab_stats.py "$out" noft-stack noft-ulfm-nodet > "$out/ab_stats-noft-stack-vs-noft-ulfm-nodet.txt" 2>&1
+             python3 $H/ab_stats.py "$out" noft-ulfm-nodet noft-ulfm > "$out/ab_stats-noft-ulfm-nodet-vs-noft-ulfm.txt" 2>&1; }
+         python3 $H/burst_counts.py "$out" > "$out/burst_counts.txt" 2>&1

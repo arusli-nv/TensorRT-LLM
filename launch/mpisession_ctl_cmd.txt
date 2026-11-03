@@ -1,0 +1,25 @@
+# MPISESSION-CTL (1 node): is V5PR-TESTS 8276994's tip failure test_mpi_session.py::test_remote_mpi_session
+# [flashinfer_temporary_cleanup] a v5-pr regression? test_mpi_session.py (each tree's own copy), -x off, --tb=long -rA,
+# three ways: (1) v5-pr tip .py overlay on the freeze wheel; (2) v5-final 27442bd91d .py overlay on the freeze wheel;
+# (3) main: build-main-9cc37929e8 wheel, no overlay, main's test file. Rule (set before data): fails in (2) and (3)
+# the same way -> environmental, disclosed; fails only in (1) -> v5-pr regression to fix. Output:
+# review/diag/mpisession-ctl-<job>.txt (driver) + -{tip,v5final,main}.txt (full pytest output per arm). ~20 min; --time 00:45.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+out=$R/review/diag/mpisession-ctl-${SLURM_JOB_ID:-x}.txt
+T=tests/unittest/llmapi/test_mpi_session.py
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    echo "$T" > /tmp/list.txt
+    for arm in tip:scratch-v5pr-tip v5final:scratch-mpisession/v5final; do
+        echo "##### ${arm%%:*}: ${arm#*:} (overlay on freeze wheel)"
+        ARM_OUT=$R/review/diag/mpisession-ctl-${SLURM_JOB_ID:-x}-${arm%%:*}.txt bash $R/scratch-mpisession/run_full.sh $R/${arm#*:} /tmp/list.txt
+    done
+    echo "##### main wheel, no overlay"
+    bash $R/install_wheel.sh $R/build-main-9cc37929e8/dist /tmp/i2.log || { tail -20 /tmp/i2.log; exit 1; }
+    (cd /tmp && PYTHONPATH=$R/scratch-mpisession/main/tests/unittest:$R/scratch-mpisession/main/tests timeout 1200 python3 -m pytest -p no:cacheprovider --tb=long -rA $R/scratch-mpisession/main/$T > $R/review/diag/mpisession-ctl-${SLURM_JOB_ID:-x}-main.txt 2>&1; echo "pytest rc=$? -> main.txt")
+    echo MPISESSION_CTL_DONE
+} > "$out" 2>&1

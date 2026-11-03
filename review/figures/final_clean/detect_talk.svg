@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="252" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="#FFFFFF"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#2D3142"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#8C99A6"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<defs><marker id="mid" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#6B6B6B"/></marker></defs>
+<rect x="30" y="30" width="180" height="60" rx="8" fill="#FBE6E4" stroke="#C8372D" stroke-width="2" stroke-dasharray="7 4"/>
+<text x="120.0" y="56.0" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">Rank 2 hangs</text>
+<text x="120.0" y="78.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">opt-in detection</text>
+<line x1="210" y1="60" x2="246" y2="60" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<rect x="250" y="28" width="200" height="64" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="350.0" y="56.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Authority</text>
+<text x="350.0" y="78.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">all peers stuck 30 s</text>
+<rect x="250" y="28" width="200" height="64" rx="8" fill="none" stroke="#2D3142" stroke-width="2.6"/>
+<line x1="350" y1="92" x2="350" y2="146" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<text x="360" y="125" font-size="16" fill="#2D3142" text-anchor="start" font-weight="normal">kill</text>
+<rect x="250" y="150" width="200" height="60" rx="8" fill="#FBE6E4" stroke="#C8372D" stroke-width="2" stroke-dasharray="7 4"/>
+<text x="350.0" y="176.0" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">Rank 2 dies</text>
+<text x="350.0" y="198.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">killed or crashed</text>
+<line x1="450" y1="180" x2="486" y2="180" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="490" y="150" width="140" height="60" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="560.0" y="176.0" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">ULFM</text>
+<text x="560.0" y="198.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">marks it failed</text>
+<line x1="630" y1="180" x2="666" y2="180" stroke="#8C99A6" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="670" y="150" width="150" height="60" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="745.0" y="176.0" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">Failure watch</text>
+<text x="745.0" y="198.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">every 20 ms</text>
+<path d="M 820 170 L 834 170 L 834 148 L 846 148" fill="none" stroke="#76B900" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#green)"/>
+<path d="M 820 190 L 834 190 L 834 212 L 846 212" fill="none" stroke="#76B900" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#green)"/>
+<rect x="850" y="124" width="140" height="48" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="920.0" y="144.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Abort flag</text>
+<text x="920.0" y="166.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">kernels return</text>
+<rect x="850" y="188" width="140" height="48" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="920.0" y="208.0" font-size="18" fill="#2D3142" text-anchor="middle" font-weight="bold">Recovery</text>
+<text x="920.0" y="230.0" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">survivors recover</text>
+<rect x="560" y="34" width="22" height="16" rx="4" fill="#EAF4D6" stroke="#76B900" stroke-width="2.7"/>
+<text x="590" y="48" font-size="16" fill="#2D3142" text-anchor="start" font-weight="normal">added by FT</text>
+<rect x="780" y="34" width="22" height="16" rx="4" fill="#FBE6E4" stroke="#C8372D" stroke-width="1.8" stroke-dasharray="4 2"/>
+<text x="810" y="48" font-size="16" fill="#2D3142" text-anchor="start" font-weight="normal">lost rank</text>
+<rect x="560" y="68" width="22" height="16" rx="4" fill="#EAF4D6" stroke="#2D3142" stroke-width="2.6"/>
+<text x="590" y="82" font-size="16" fill="#2D3142" text-anchor="start" font-weight="normal">own process</text>
+<line x1="780" y1="76" x2="808" y2="76" stroke="#6B6B6B" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#mid)"/>
+<text x="816" y="82" font-size="16" fill="#2D3142" text-anchor="start" font-weight="normal">ZeroMQ message</text>
+</svg>

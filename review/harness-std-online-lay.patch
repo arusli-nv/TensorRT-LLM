@@ -1,0 +1,13 @@
+--- /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/mvp/harness/job.sh	2026-10-23 14:55:30.000000000 -0700
++++ /tmp/claude-161238/lay.gAJn/job.sh	2026-10-23 17:30:06.375484155 -0700
+@@ -2994,6 +2994,10 @@
+          # TLLM_TEST_EMPTY_EXTRA_SLOTS), so the MoE kernels see FT's slot count without FT.
+          std-noeplb-lay320) (export BENCH_CONFIG=std-noeplb-ft.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost TLLM_TEST_EMPTY_EXTRA_SLOTS=1
+                         run_case "$name" noft "$@") ;;
++         # FT off with std-online-ft's layout under FT: 288 slots + 1 ghost slot per rank (testhooks
++         # TLLM_TEST_EMPTY_EXTRA_SLOTS), so the MoE kernels and EPLB's updates see FT's slot count without FT.
++         std-online-lay) (export BENCH_CONFIG=std-online.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost TLLM_TEST_EMPTY_EXTRA_SLOTS=1
++                        run_case "$name" noft "$@") ;;
+          std-offline-ft|std-online-ft) (export BENCH_CONFIG=${arm/std-online-ft/std-online}.yaml; unset TLLM_FAULT_TOLERANCE_EXTRA_SLOTS
+                         run_case "$name" ft "$@") ;;
+          std-online-ft-sm) (export BENCH_CONFIG=std-online.yaml WIDEEP_MPI_MCA="$WIDEEP_SM_MCA"; unset TLLM_FAULT_TOLERANCE_EXTRA_SLOTS

@@ -1,0 +1,9 @@
+# ULFMDET: which part of the ULFM runtime makes the w/o EPLB 8/GPU 60-iteration stalls (ULFM8 8123150: FT off under
+# `mpirun --with-ft ulfm` reproduces them; plain mpirun does not)? Arms: FT off under ULFM, FT on (is a detector setting a usable mitigation?) and plain FT off; 8/GPU, samplers on as ULFM8.
+# G0: --mca mpi_ft_detector false for ulfm, ft and plain (plain mpirun ignores it).
+# G1: a slow detector (period 3 s, timeout 15 s), order ft, ulfm, plain.
+# If the stalls vanish in G0 or change in G1, the in-band failure detector is the cause (launch/task.sh WIDEEP_MPIRUN_EXTRA).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=55 WIDEEP_BURNIN=32:6 COST_LOADS=8 TLLM_PROFILE_LOG_RANKS=all STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:4500:$E WIDEEP_MPIRUN_EXTRA='--mca mpi_ft_detector false' FT_COST_E2E_ARMS='std-noeplb-ulfm-loc std-noeplb-ft-loc std-noeplb-loc' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:4500:$E WIDEEP_MPIRUN_EXTRA='--mca mpi_ft_detector true --mca mpi_ft_detector_period 3 --mca mpi_ft_detector_timeout 15' FT_COST_E2E_ARMS='std-noeplb-ft-loc std-noeplb-ulfm-loc std-noeplb-loc' bash $R/mvp/harness/run_job.sh STD-G1"

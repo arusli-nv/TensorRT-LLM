@@ -1,0 +1,18 @@
+# FINALS (healthy cost) on the clean wheel build-v2-cef4670789 (v2 cef4670789; no overlay). Standard configs, 3 EPLB modes,
+# FT off/on, loads 8/32/128/512 (>=150 s each, COST_LOAD_ITERATIONS default 8=20,32=15,128=7,512=3), burn-in 32/GPU x 6
+# waves (unmeasured), seed launch/std/std-seed2.json (PIN_CHECK must be OK per case; a FAIL case is invalid and rerun in a
+# later job), offline placement from STD-8109649 (validated identical to the kills' filled config), no TLLM_TEST_POPULATE.
+# Design (red-team B, adopted 22:20): the node group is the unit of replication; each group runs two modes, one case
+# per arm, mirrored (X-off X-on Y-on Y-off, or X-on X-off Y-off Y-on), modes rotated: w/o EPLB, offline and online
+# each on 5 groups; F4 G1 adds std-noeplb-lb vs std-noeplb (the static-LB path, 256 slots, FT off). Pre-registered
+# protocol: review/HANDOFF.md 'FINALS PROTOCOL'. FT order alternates within groups and across jobs. 4 jobs x 2 groups x 4 cases: every mode/arm n=5 groups,
+# std-noeplb-lb (static LB 256, FT off) n=1 in F4 (a case name repeats if an arm runs twice in one group). Submit each with its job's line; ROUND_MIN 90 so a 4-case group always runs.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=90 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+# F1 (the v2 C++ gtests run in the test-completion job 8115508, not here)
+bash $R/bundle.sh "0:8:6900:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-offline-ft std-offline' bash $R/mvp/harness/run_job.sh STD" "8:8:6900:$E FT_COST_E2E_ARMS='std-online-ft std-online std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD-G1"
+# F2
+bash $R/bundle.sh "0:8:6900:$E FT_COST_E2E_ARMS='std-offline std-offline-ft std-online-ft std-online' bash $R/mvp/harness/run_job.sh STD" "8:8:6900:$E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD-G1"
+# F3' (00:05 amendment: G0 offline+online, G1 the static-LB triad + online-ft; offline on 3 groups)
+bash $R/bundle.sh "0:8:6900:$E FT_COST_E2E_ARMS='std-offline-ft std-offline std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD" "8:8:6900:$E FT_COST_E2E_ARMS='std-noeplb-lb std-noeplb-ft std-noeplb std-online-ft' bash $R/mvp/harness/run_job.sh STD-G1"
+# F4: dropped (00:05 amendment).

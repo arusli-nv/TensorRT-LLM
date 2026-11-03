@@ -1,0 +1,4 @@
+# Nodes to exclude from jobs (one per line, with the reason). The broker slurm_submit has no exclude field, so this list
+# is applied when submitting with sbatch --exclude; with the broker, check the allocated NodeList against it at start.
+# (nvl72020-T04 removed 2026-10-22 14:41: 8162957 was cancelled by the Occupied Idle Job Reaper; its PRRTE error was teardown, not the node)
+nvl72151-T07 2026-10-23 19:50 PT: went non-responding (sinfo allocated*) mid-weight-load in FIN6-J7 8206864 G8 rank0-1; all its processes and monitors stopped at once

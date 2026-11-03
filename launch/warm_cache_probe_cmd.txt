@@ -1,0 +1,31 @@
+# WARM-CACHE-PROBE (1 node, 4 GPUs; DIAGNOSTIC for the ft-hostmem reservation fix): STD-8272666 failed at load
+# with cuMemCreate(HOST_NUMA) of 1.48 GiB OOM on NUMA node 1 (MemFree 55 GB, FilePages 231 GB of checkpoint page
+# cache). scratch-hostmem/warm_cache_probe.py: 4 workers (2 per NUMA node) each allocate 86 GiB of HOST_NUMA memory
+# in 1.48 GiB pieces at once. Phases: late = evict the checkpoint, warm the page cache on node 1 (16 reader threads
+# pinned to node 1, 64 MiB sequential reads of DeepSeek-R1-0528-FP4-V2), then allocate (repro; node 0 is the control);
+# evict = posix_fadvise(DONTNEED) the checkpoint, then allocate; early = evict, allocate (reserve) first, then warm
+# while holding it (the fix); reclaim = node 1 at ~200 GB checkpoint FilePages and ~50 GB MemFree (anon ballast), then
+# one 100 GiB cuMemCreate and 1.48 GiB pieces up to 100 GiB from GPU 2: does the driver reclaim clean page cache?
+# MEMINFO/BUDDY per node at each step; SAMPLE (0.5 s node MemFree/FilePages) and PIECE (before/after each
+# cuMemCreate) lines during allocations; PROBE_ALLOC per worker, PROBE_RECLAIM, PROBE_VERDICT per phase.
+# Output: review/diag/warm-cache-probe-<job>.txt. Order late,reclaim,early,evict; capped at 35 min; --time 00:40.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/warm-cache-probe-${SLURM_JOB_ID:-x}.txt
+{
+    uname -r; nvidia-smi --query-gpu=index,pci.bus_id,driver_version --format=csv,noheader; free -g
+    export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+    mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+    if ! python3 -c "from cuda.bindings import driver" 2>/dev/null && ! python3 -c "from cuda import cuda" 2>/dev/null; then
+        echo "cuda-python missing; installing"
+        pip install -q --user "cuda-python>=13" > /tmp/warm-pip.log 2>&1 || { tail -5 /tmp/warm-pip.log; pip install -q --user "cuda-python<13" > /tmp/warm-pip.log 2>&1 || tail -5 /tmp/warm-pip.log; }
+    fi
+    cd /tmp
+    timeout 2100 python3 $R/scratch-hostmem/warm_cache_probe.py \
+        --ckpt /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-R1-0528-FP4-V2 \
+        --warm-node 1 --per-rank-gib 86 --piece-gib 1.48 --threads 16 --chunk-mib 64 --warm-timeout 360 \
+        --phases late,reclaim,early,evict --reclaim-cache-gib 200 --reclaim-free-gib 50 --reclaim-gib 100
+    echo "probe rc=$?"
+    free -g | head -2
+    echo WARM_CACHE_PROBE_DONE
+} > "$out" 2>&1

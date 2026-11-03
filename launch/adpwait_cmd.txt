@@ -1,0 +1,11 @@
+# ADPWAIT: attention_dp_config.batching_wait_iters 0 (our R1 reference) vs 10 (TRT-LLM's gpt-oss references) at 8 and
+# 32/GPU: does batching ADP context admissions remove the out-of-phase all-rank eager steps (8/GPU w/o EPLB stall
+# trains; online TTFT) without costing FT-off throughput? Group A w/o EPLB, group B online; per group FT off/on x
+# wait 0/10 on the same nodes, order mirrored (off-w0, off-w10, ft-w10, ft-w0). v3 wheel, finals settings (seed2 pins,
+# burn-in 32x6, samplers off), TLLM_TEST_LOG_EAGER=1 + all-rank node-local iteration logs (eager step counts).
+# Decision: if w10 cuts the all-rank eager steps at 8/GPU (EAGER count, stall trains) and online TTFT, and FT-off step
+# median / output throughput move < 1% at 8 and 32, the finals use w10 for both arms (documented). n=1 per cell: lead.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B TLLM_TEST_LOG_EAGER=1 TLLM_PROFILE_LOG_RANKS=all WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=8,32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:5100:$E FT_COST_E2E_ARMS='std-noeplb-loc std-noeplb-loc-aw10 std-noeplb-ft-loc-aw10 std-noeplb-ft-loc' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:5100:$E FT_COST_E2E_ARMS='std-online-loc std-online-loc-aw10 std-online-ft-loc-aw10 std-online-ft-loc' bash $R/mvp/harness/run_job.sh STD-G1"

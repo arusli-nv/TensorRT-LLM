@@ -1,0 +1,40 @@
+# HOSTMEM-PROBE (1 node, 4 GPUs; DIAGNOSTIC for the compaction-stall fix): can the EPLB host copies live in CUDA
+# driver-allocated host memory (cuMemCreate at CU_MEM_LOCATION_TYPE_HOST_NUMA, POSIX-fd export, peer import + map,
+# cuMemSetAccess for CPU and GPU), and do its readers escape the compaction stalls COMPACT-PROBE (8268725) showed?
+# scratch-hostmem/hostmem_probe.py. Part A, feasibility only (4 GiB segments, --no-copy): fd passing via pidfd_getfd,
+# via pidfd_getfd with PR_SET_PTRACER_ANY, and via SCM_RIGHTS. Part B, 60 GiB segments under the forced compaction of
+# COMPACT-PROBE (40 s quiet, 80 s fragmenting): control = compact_probe.py mapped /dev/shm, page-locked dst (same
+# node, same job), then hostmem with page-locked, GPU (torch copy_) and pageable destinations.
+# Output: review/diag/hostmem-probe-<job>.txt. Devel image torch + cuda-python (pip-installed if missing; no wheel).
+# ~20 min; --time 00:40.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/hostmem-probe-${SLURM_JOB_ID:-x}.txt
+{
+    uname -r; cat /proc/sys/vm/compaction_proactiveness /proc/sys/vm/compact_unevictable_allowed /proc/sys/kernel/yama/ptrace_scope 2>&1
+    ulimit -l; nvidia-smi --query-gpu=index,pci.bus_id,driver_version --format=csv,noheader; nvidia-smi topo -m 2>&1 | head -12
+    cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag 2>&1
+    df -h /dev/shm; free -g
+    export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+    mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+    if ! python3 -c "from cuda.bindings import driver" 2>/dev/null && ! python3 -c "from cuda import cuda" 2>/dev/null; then
+        echo "cuda-python missing; installing"
+        pip install -q --user "cuda-python>=13" > /tmp/hostmem-pip.log 2>&1 || { tail -5 /tmp/hostmem-pip.log; pip install -q --user "cuda-python<13" > /tmp/hostmem-pip.log 2>&1 || tail -5 /tmp/hostmem-pip.log; }
+    fi
+    python3 -c "import importlib.metadata as m; print('cuda-python', m.version('cuda-python'))" 2>&1
+    cd /tmp
+    P=$R/scratch-hostmem/hostmem_probe.py
+    echo "### A1 feasibility fd-pass=pidfd";              timeout 300 python3 $P --no-copy --seg-gb 4 --fd-pass pidfd --barrier-timeout 240
+    echo "### A2 feasibility fd-pass=pidfd ptracer-any"; timeout 300 python3 $P --no-copy --seg-gb 4 --fd-pass pidfd --ptracer-any --barrier-timeout 240
+    echo "### A3 feasibility fd-pass=scm";                timeout 300 python3 $P --no-copy --seg-gb 4 --fd-pass scm --barrier-timeout 240
+    free -g | head -2
+    echo "### B0 control shm mapped / dest pinned"
+    timeout 600 python3 $R/scratch-compact/compact_probe.py --mode mapped --dest pinned --seg-gb 60 --quiet-s 40 --frag-s 80
+    free -g | head -2
+    for dest in pinned gpu anon; do
+        echo "### B hostmem / dest $dest"
+        timeout 900 python3 $P --dest $dest --seg-gb 60 --quiet-s 40 --frag-s 80 --barrier-timeout 600
+        free -g | head -2
+    done
+    echo HOSTMEM_PROBE_DONE
+} > "$out" 2>&1

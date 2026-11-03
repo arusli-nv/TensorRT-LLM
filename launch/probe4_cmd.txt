@@ -1,0 +1,21 @@
+# PROBE4 (1 node; DIAGNOSTIC, decisive): PROBE3 (8271169) compacted the fragmenter's own pages, not the sources'. scratch-probe3/probe4.c targets each source: per 5 s block it creates a 16 GiB source interleaved in 64 MiB chunks with an anon neighbour on GPU0's NUMA node (a pinned ballast holds the rest of that node), frees the neighbour and faults MADV_HUGEPAGE memory there for 1 s while 16 readers copy from the source. Sources cycle S1 shm pre-faulted, S2 shm lazy, S3 cuMemCreate HOST_NUMA, 10 triplets. Output: review/diag/probe4-<job>.txt (PROBE4 / PROBE4_SRC / BLOCK / DSTATE lines). ~8 min; --time 00:30.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/probe4-${SLURM_JOB_ID:-x}.txt
+{
+    uname -a; ulimit -l; nvidia-smi -L
+    for f in /proc/sys/vm/compaction_proactiveness /proc/sys/vm/compact_unevictable_allowed /proc/sys/vm/extfrag_threshold \
+             /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag \
+             /sys/kernel/mm/transparent_hugepage/shmem_enabled /sys/kernel/mm/transparent_hugepage/hpage_pmd_size; do
+        echo "$f: $(cat $f 2>&1)"
+    done
+    df -h /dev/shm; free -g
+    bin=$(mktemp -d)
+    gcc -O2 -std=gnu11 -Wall -I/usr/local/cuda/include $R/scratch-probe3/probe4.c -o $bin/probe4 \
+        -L/usr/local/cuda/lib64/stubs -lcuda -lpthread -lrt || { echo PROBE4_BUILD_FAILED; exit 1; }
+    ldd $bin/probe4 | grep -i cuda
+    cd $bin && timeout 900 ./probe4
+    echo "probe4 rc=$?"
+    free -g | head -2
+    echo PROBE4_CMD_DONE
+} > "$out" 2>&1

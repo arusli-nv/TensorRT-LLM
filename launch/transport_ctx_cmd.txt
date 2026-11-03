@@ -1,0 +1,38 @@
+# UPDATE 11:25: code is v5-zero 95d6a64a73 = the same Python as 981fd845e2 plus 7 test fixes (ZERO-AB 8161823's gate
+# failures, all test bugs); overlays vzero-95d6a64a73 (Python) and vzero-95d6a64a73-tests (every test changed since 6645ce1848).
+# TRANSPORT-CTX (16 nodes, same nodes, two 8-node groups mirrored; after ZERO-AB): the host MPI transport's cost on
+# CONTEXT steps (the refill bursts of online EPLB 288 at 128/GPU, 1k/1k, std-online.yaml), on v5-zero 981fd845e2 = wheel
+# build-v5zero-6645ce1848 + Python overlay vzero-981fd845e2 (COST_DIAG_OVERLAY=1) in every arm. No in-job unit gate:
+# submit only after a zero_smoke / zero_ab unit gate passed on this wheel + overlay.
+# Arms (one round per group, group 8 in reverse order; COST_LOADS 128):
+#   off           = std-online         plain mpirun, Open MPI's defaults (UCX), FT off
+#   off-ulfm      = std-online-ulfm    FT's launcher with FT off: mpirun --with-ft ulfm, ob1 self,tcp on eth0
+#   ft-zero       = std-online-ft      FT on, ob1 self,tcp on eth0
+#   ft-zero-2nic  = std-online-ft-2nic FT on, ob1 self,tcp on eth0,eth1 (both 200 Gb/s, mtu 9000; logs/net-8161178.txt)
+#   ft-zero-uct   = std-online-ft-uct  FT on, ob1 self,uct,tcp with btl_uct_memory_domains = the node's mlx5 devices;
+#                   only if tools/uct_check.sh (kbench/t2_launch_check.sh uct-ib under ULFM, every node of the group,
+#                   <= 180 s) accepts it; otherwise that group skips the arm (UCT_CHECK rejected in its bundle log).
+# Every case logs on ranks 0 and 31 (testhooks TLLM_TEST_BCAST_LOG=0,31; every rank logs WIDEEP_BCAST applied ...
+# log=0|1): each broadcast of new requests (WIDEEP_BCAST n ms bytes) and each step that schedules context (WIDEEP_CTX
+# reqs tokens sched_ms).
+# Readout:
+#   python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job> --off std-online-1
+#   for s in -ulfm -ft -ft-2nic -ft-uct; do CTX_ON_SUFFIX=$s python3 $R/mvp/analysis/ctx_stall_cost.py \
+#       $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job>; done   (context-step ms, stall share, whole-window tok/s vs off)
+#   python3 -I $R/mvp/analysis/bcast_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job>
+#       (per arm and rank: broadcast ms and bytes, MB/s, context-step schedule ms, broadcast share of it)
+# Decision rule (pre-registered; context-step mean ms from ctx_stall_cost, both groups same sign):
+#   - ft-zero ~ off (within the off-vs-off group spread): v5-zero already removed the context-step cost.
+#   - off-ulfm - off ~ ft-zero - off: the cost is the host transport, not FT logic. Then the broadcast log decides
+#     between TCP stack cost and link speed: ft-zero-2nic ~ ft-zero (no gain from a second 200 Gb/s link) and the
+#     broadcast ms (MB/s) of off-ulfm / ft-zero well above off's means TCP stack cost vs UCX RDMA: the fix is ob1 over
+#     RDMA (ft-zero-uct, if accepted and ~ off). ft-zero-2nic closing the gap instead means bandwidth: if_include both NICs.
+#   - otherwise (ft-zero - off well above off-ulfm - off): the residual is FT logic: profile it.
+# Estimate: uct check <= 6 min; ~16-20 min per online case at 128 (ONLINE128-SM 8147471: 14.6-20.5 min), 5 cases
+# = ~90 min per group of the 117 min limit (4 cases if uct is rejected).
+# Submit (16 nodes, segment 8): bash $R/tools/require_presubmit.sh <token> && bash $R/launch/transport_ctx_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5zero-6645ce1848; O=$R/overlays/vzero-95d6a64a73
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=70 WIDEEP_BURNIN=32:6 COST_LOADS=128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_BCAST_LOG=0,31"
+u() { echo "U=; bash $R/tools/uct_check.sh $R/logs/bundle/tctx-uct$1-\$SLURM_JOB_ID && U=std-online-ft-uct"; }
+bash $R/bundle.sh "0:8:7000:$(u 0); $E FT_COST_E2E_ARMS=\"std-online std-online-ulfm std-online-ft std-online-ft-2nic \$U\" bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(u 8); $E FT_COST_E2E_ARMS=\"\$U std-online-ft-2nic std-online-ft std-online-ulfm std-online\" bash $R/mvp/harness/run_job.sh STD-G1"

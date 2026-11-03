@@ -1,0 +1,26 @@
+--- /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/mvp/harness/job.sh	2026-10-23 14:55:30.000000000 -0700
++++ /tmp/claude-161238/decomp2.K4pB/job.sh	2026-10-23 17:58:28.108044194 -0700
+@@ -2950,7 +2950,7 @@
+                         run_case "$name" noft "$@") ;;
+          # STD: std-noeplb-ft's 64 extra slots are ghost restore slots (healthy routing = std-noeplb); offline and
+          # online EPLB with FT on keep their replicas routed and append ghost slots (extra_slots unset).
+-         std-noeplb|std-offline|std-online) (export BENCH_CONFIG=$arm.yaml; run_case "$name" noft "$@") ;;
++         std-noeplb|std-offline|std-online|std-online-frozen) (export BENCH_CONFIG=$arm.yaml; run_case "$name" noft "$@") ;;
+          # std-noeplb with the attention-DP gate fix under test (GATEFIX_OVERLAY replaces MVP_OVERLAY for this arm).
+          std-noeplb-gatefix) (export BENCH_CONFIG=std-noeplb.yaml MVP_OVERLAY=$GATEFIX_OVERLAY; run_case "$name" noft "$@") ;;
+          std-noeplb-ft-gatefix) (export BENCH_CONFIG=std-noeplb-ft.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost \
+@@ -2994,6 +2994,14 @@
+          # TLLM_TEST_EMPTY_EXTRA_SLOTS), so the MoE kernels see FT's slot count without FT.
+          std-noeplb-lay320) (export BENCH_CONFIG=std-noeplb-ft.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost TLLM_TEST_EMPTY_EXTRA_SLOTS=1
+                         run_case "$name" noft "$@") ;;
++         # Online FT decomposition (supported configs only): FT's extra slot per rank as `empty` (allocated, never
++         # routed) instead of ghost, and FT with online EPLB's updates off (std-online-frozen.yaml: same 288 slots and
++         # default placement, layer_updates_per_iter 0; FT off on it: std-online-frozen), each on the same nodes as its
++         # comparison arms.
++         std-online-ft-empty) (export BENCH_CONFIG=std-online.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=empty
++                        run_case "$name" ft "$@") ;;
++         std-online-ft-frozen) (export BENCH_CONFIG=std-online-frozen.yaml; unset TLLM_FAULT_TOLERANCE_EXTRA_SLOTS
++                        run_case "$name" ft "$@") ;;
+          std-offline-ft|std-online-ft) (export BENCH_CONFIG=${arm/std-online-ft/std-online}.yaml; unset TLLM_FAULT_TOLERANCE_EXTRA_SLOTS
+                         run_case "$name" ft "$@") ;;
+          std-online-ft-sm) (export BENCH_CONFIG=std-online.yaml WIDEEP_MPI_MCA="$WIDEEP_SM_MCA"; unset TLLM_FAULT_TOLERANCE_EXTRA_SLOTS

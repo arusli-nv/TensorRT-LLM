@@ -1,0 +1,17 @@
+# NVL-REPEAT (1 node): build 8143012 failed the first case of test_nvlink_one_sided.py and then hung. It ran that file
+# Also the gate pass of test_nvlink_one_sided.py on v5 (test fix e452975950: a bound workspace's watchdog stays idle).
+# right after test_moe_a2a_late_writes.py, whose tests kill peers. NVL-DBG 8144936 ran the file first on a fresh node,
+# and it passed.
+# Hypothesis: state that late_writes leaves behind (orphan workers, GPU contexts) breaks the next file.
+# Steps: late_writes, then nvlink_one_sided (the build's order), then nvlink_one_sided again, with a process/GPU
+# snapshot after each step. -x stops at the first failure; faulthandler dumps every thread after 200 s in one test.
+# Pass rule: nvlink fails only after late_writes with leftover processes in the snapshot -> test isolation (fix
+# late_writes cleanup). It fails both times on a clean node -> a real defect in the file. It passes everywhere -> a
+# flake whose rate is unmeasured; it stays a lead.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5b-409d2bd1f8; T=$R/overlays/v5d-e452975950-tests; S=$R/overlays/build-src-2ccc3e8e1c; D=$R/$B/nvl-repeat
+snap() { mkdir -p $D; { echo "== $1 $(date +%T)"; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; ps -eo pid,ppid,stat,etime,cmd | grep -E 'python|prte|orted|mpirun' | grep -v grep; } >> $D/snapshots.txt 2>&1; }
+export PYTEST_ADDOPTS='-x -vv -o faulthandler_timeout=200 -k "not flashinfer_temporary_cleanup"'
+snap start
+bash $R/tools/point_units.sh $R/$B/dist $O $T $S $D/1-late tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py; snap after-late
+bash $R/tools/point_units.sh $R/$B/dist $O $T $S $D/2-nvl tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py; snap after-nvl1
+bash $R/tools/point_units.sh $R/$B/dist $O $T $S $D/3-nvl tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py; snap after-nvl2

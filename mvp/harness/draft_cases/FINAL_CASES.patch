@@ -1,0 +1,368 @@
+--- job.sh
++++ job.sh
+@@ -8,8 +8,16 @@
+ # The wheel of the code under test; every MVP result uses it (see ../README.md).
+ dist=$C/${MVP_BUILD:-build-final-b1d7fa789d}/dist
+ copy_dist=$C/build-final-97e13f42b6/dist  # FT experts read a local copy, for the before/after check
+-H=/tmp/mvp-harness; rm -rf $H; cp -r $C/mvp/harness $H
+-out=$C/mvp/runs/$job-$SLURM_JOB_ID
++# The final benchmark's wheel (analysis/FINAL_BENCHMARK_PLAN.md): the LADDER, GHOST-COST, FINAL-AUTO and KILL-MATRIX
++# preflights require MVP_BUILD=$FINAL_BUILD. TODO: set to the one full build of record before any of them is submitted.
++FINAL_BUILD=${FINAL_BUILD:-build-final-TODO}
++if [[ -n ${JOB_PARENT_OUT:-} ]]; then
++    # A piece of a composed job (KILL-MATRIX*): the parent's private harness copy, results under the parent's run dir.
++    H=/tmp/mvp-harness; out=$JOB_PARENT_OUT/$job
++else
++    H=/tmp/mvp-harness; rm -rf $H; cp -r $C/mvp/harness $H
++    out=$C/mvp/runs/$job-$SLURM_JOB_ID
++fi
+ mkdir -p "$out"
+ # Node settings that can stall long-running processes (THP compaction, NUMA balancing), for the record.
+ grep -H . /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag \
+@@ -23,9 +31,13 @@
+     for (i = 1; i <= NF; i++) if (k[i] == "ListenOverflows" || k[i] == "ListenDrops") printf "%s=%s ", k[i], $i }' \
+     /proc/net/netstat; }
+ export WIDEEP_LAUNCHER_GRACE_S=180  # profiled cases: time to write the nsys reports
+-case_index=0
++case_index=${JOB_CASE_INDEX_BASE:-0}
+ run_case() {  # NAME MODE [bench.py args...]
+     local name=$1; shift
++    # JOB_CASES (a composed job's subset of a case block): run only the named cases; require_done passes a skipped one.
++    if [[ -n ${JOB_CASES:-} && " $JOB_CASES " != *" $name "* ]]; then
++        echo "CASE $name skipped (not in JOB_CASES)"; touch "$out/$name.skipped"; return 0
++    fi
+     case_index=$((case_index + 1))
+     echo "CASE $name start $(date +%T)"
+     echo "CASE $name net before: $(listen_drops)"
+@@ -35,6 +47,7 @@
+ }
+ require_done() {  # NAME: fail fast (efficiency rule 4): end the job on every node unless case NAME finished DONE
+     local result=$out/$1/result.json
++    [[ -e $out/$1.skipped ]] && return 0
+     for _ in $(seq 60); do [[ -s $result ]] && break; sleep 1; done
+     grep -q '"state": "DONE"' "$result" 2>/dev/null && return 0
+     echo "SMOKE_FAIL $1: $(grep -o '"state": "[^"]*"' "$result" 2>/dev/null)"
+@@ -2549,14 +2562,72 @@
+     fi
+     echo STD_DONE
+     ;;
+-FT-COST-E2E|FT-COST-ATTR|FT-COST-MECH|FT-COST-PROF|C-COMBINE4-PIN|FT-COST-AUTO|FT-COST-BISECT|GHOST-TAC|GHOST-TAC-B)
++FT-COST-E2E|FT-COST-ATTR|FT-COST-MECH|FT-COST-PROF|C-COMBINE4-PIN|FT-COST-AUTO|FT-COST-BISECT|GHOST-TAC|GHOST-TAC-B|LADDER|LADDER-B|GHOST-COST|GHOST-COST-B|FINAL-AUTO)
+     export CASE_TIMEOUT_S=1500 BENCH_CONFIG=dep32-final.yaml TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
+-    if [[ $dist != *fcc86b10b2* || -n "${MVP_OVERLAY:-}" ]]; then
+-        echo "SMOKE_FAIL preflight: MVP_BUILD must be build-next-fcc86b10b2 without MVP_OVERLAY ($dist, overlay '${MVP_OVERLAY:-}')"
++    # The final benchmark's jobs run the final build (FINAL_BUILD); the older ones the wheel they were designed on.
++    want_build=build-next-fcc86b10b2
++    [[ $job == LADDER* || $job == GHOST-COST* || $job == FINAL-AUTO ]] && want_build=$FINAL_BUILD
++    if [[ $dist != "$C/$want_build/dist" || -n "${MVP_OVERLAY:-}" ]]; then
++        echo "SMOKE_FAIL preflight: MVP_BUILD must be $want_build without MVP_OVERLAY ($dist, overlay '${MVP_OVERLAY:-}')"
+         echo STD_DONE; exit 1
+     fi
+     arms=${FT_COST_E2E_ARMS:-noft-stack ft}
+     load=(--mode sweep --loads 8,32,128 --iterations 2 --isl 1024 --osl 1024 --warm-each-load)
++    tune_arms=""      # arms of the tuning pass (default: every arm)
++    ab_pairs=""       # "BASE:TEST ..." pairs for ab_stats/burst_ranksum (default: every arm vs ft, noft-stack vs ft)
++    # LADDER / LADDER-B (FINAL_BENCHMARK_PLAN L1/L2): FT's healthy cost on the final build and what the cost fixes
++    # bought, dep32-final.yaml, 8/32/128 per GPU, pinned tactics. Arms: noft (final wheel, FT off), ft-base (FT on,
++    # fixes off: FINAL_BASE_BUILD wheel or FINAL_BASE_OVERLAY reverting the fix commits), ft (FT on, all fixes). One
++    # noft-main tail case (main's wheel, FT off) per job if room: FT-off noft-main vs noft (n<=2, coarse check only).
++    # LADDER tunes noft + ft once (one layout, so ft-base reads the same table); LADDER-B requires FT_COST_E2E_SEED =
++    # LADDER's autotuner/pinned.json. Budget per job (QOS 2 h; FT-COST-E2E-8059717/8064963: ~12.5 min per 3-load case,
++    # tuning noft + ft ~21 min incl. first start): LADDER 21 + 2 rounds x 3 x 12.5 = 96 min (round 3 needs 41 more:
++    # starts only if FT_COST_E2E_ROUND_MIN fits, i.e. cases ran <=11 min) + tail 13 = ~109 min; LADDER-B 3 x 37.5 =
++    # 113 min (+ tail only if room). Expect 5 runs per arm over L1+L2 (6 if L1 is seeded from a preflight tuning).
++    if [[ $job == LADDER* ]]; then
++        arms=${FT_COST_E2E_ARMS:-noft ft-base ft}; tune_arms=${LADDER_TUNE_ARMS:-noft ft}
++        ab_pairs="noft:ft noft:ft-base ft-base:ft noft:noft-main"
++        export FT_COST_E2E_ROUNDS=${FT_COST_E2E_ROUNDS:-3}
++        export FT_COST_E2E_ROUND_MIN=${FT_COST_E2E_ROUND_MIN:-$(( 13 * $(wc -w <<< "$arms") + 2 ))}
++        base_ok=0
++        [[ -n ${FINAL_BASE_BUILD:-} && -z ${FINAL_BASE_OVERLAY:-} ]] && compgen -G "$C/$FINAL_BASE_BUILD/dist/*.whl" > /dev/null && base_ok=1
++        [[ -z ${FINAL_BASE_BUILD:-} && -n ${FINAL_BASE_OVERLAY:-} && -d ${FINAL_BASE_OVERLAY:-/none}/tensorrt_llm ]] && base_ok=1
++        if [[ $base_ok != 1 || ( $job == LADDER-B && -z ${FT_COST_E2E_SEED:-} ) ]]; then
++            echo "SMOKE_FAIL preflight: ft-base needs exactly one of FINAL_BASE_BUILD (wheel dir) / FINAL_BASE_OVERLAY" \
++                "(dir with tensorrt_llm/); LADDER-B needs FT_COST_E2E_SEED (got '${FT_COST_E2E_SEED:-}')"
++            echo STD_DONE; exit 1
++        fi
++    fi
++    # GHOST-COST / GHOST-COST-B (FINAL_BENCHMARK_PLAN G1/G2): the layout cost of ghost slots, which must reach ~0%.
++    # GHOST-COST: static, FT off: lay-eplb0 (256 slots) vs lay-ghost320 (256 + 64 ghost, the R1 FT layout).
++    # GHOST-COST-B: mixed, FT on: ft (online EPLB 288, dep32-final.yaml) vs ft-mixed (online 288 + 32 ghost,
++    # MIXED_EPLB_GHOST.md; FINAL_MIXED_CONFIG names its yaml in configs/). Each tunes its own two arms at 128/GPU
++    # (layouts differ, GHOST-TAC) unless FT_COST_E2E_SEED is set: a seeded rerun of either label adds rounds.
++    # Budget (C-COMBINE4-PIN-8066483: tuning both arms ~28 min, eplb0 ~6 / ghost320 ~11 min per 128 case, +~2 min
++    # for load 32; FT cases ~12.5; ROUND_MIN 28): GHOST-COST 28 + 3 rounds x 21 = 91 min (a 4th only if cases run
++    # faster); GHOST-COST-B 25 + 3 x 27 = 106 min; a seeded rerun 5 (static, ~105 min) / 4 (mixed, ~108 min) rounds.
++    # >=6 per arm needs one seeded rerun per pair (FINAL_CASES.md).
++    if [[ $job == GHOST-COST* ]]; then
++        arms=${FT_COST_E2E_ARMS:-lay-eplb0 lay-ghost320}; ab_pairs="lay-eplb0:lay-ghost320"
++        if [[ $job == GHOST-COST-B ]]; then
++            arms=${FT_COST_E2E_ARMS:-ft ft-mixed}; ab_pairs="ft:ft-mixed"
++            if [[ ! -s $H/configs/${FINAL_MIXED_CONFIG:-none} ]]; then
++                # TODO(mixed EPLB+ghost feature): the config form is owner decision 13 (EPLB num_slots 288 + G=1 ghost
++                # per rank = 320 slots); add configs/<yaml> and pass FINAL_MIXED_CONFIG=<yaml>.
++                echo "SMOKE_FAIL preflight: FINAL_MIXED_CONFIG '${FINAL_MIXED_CONFIG:-}' is not in configs/"; echo STD_DONE; exit 1
++            fi
++        fi
++        export FT_COST_E2E_ROUNDS=${FT_COST_E2E_ROUNDS:-6}
++        export FT_COST_E2E_ROUND_MIN=${FT_COST_E2E_ROUND_MIN:-$(( 13 * $(wc -w <<< "$arms") + 2 ))}
++        load=(--mode sweep --loads ${GHOST_COST_LOADS:-32,128} --iterations 2 --isl 1024 --osl 1024 --warm-each-load)
++    fi
++    # FINAL-AUTO (A1): FT-COST-AUTO's tune-once-per-arm design on the final build, arms noft vs ft, 2 rounds.
++    # Budget (FT-COST-AUTO-8066486: ~23 min startup tuning per untuned start): round 1 2 x ~36 = 72 min, round 2
++    # 2 x 12.5 = 25 min: ~97 min.
++    if [[ $job == FINAL-AUTO ]]; then
++        arms=${FT_COST_E2E_ARMS:-noft ft}; ab_pairs="noft:ft"
++        export FT_COST_E2E_ROUNDS=${FT_COST_E2E_ROUNDS:-2}
++    fi
+     # ATTR (CLAIMS #93: ft costs ~1.6% at 8 and 128/GPU vs main's FT-off launch): which FT-required launch piece costs it,
+     # all arms FT off: noft-stack (UCX) vs noft-ulfm-nodet (ULFM ob1/TCP, no detector) vs noft-ulfm (ob1/TCP + detector).
+     # MECH (CLAIMS #98: transport + detector ~0.3% at 128/GPU): FT's own mechanism, ft vs noft-ulfm (same launch).
+@@ -2642,7 +2713,12 @@
+         local name=$1 arm=$2 cache=$3; shift 3
+         (export TLLM_AUTOTUNER_CACHE_PATH=$cache
+          case $arm in
+-         noft-stack) run_case "$name" noft "$@" ;;
++         noft-stack|noft) run_case "$name" noft "$@" ;;
++         noft-main) (dist=$C/build-pr0-fc52f0adee/dist; run_case "$name" noft "$@") ;;
++         # Per-arm wheel: serve.sh installs the dist it is given (install_wheel.sh reinstalls when the wheel changes).
++         ft-base) (if [[ -n ${FINAL_BASE_BUILD:-} ]]; then dist=$C/$FINAL_BASE_BUILD/dist; else export MVP_OVERLAY=${FINAL_BASE_OVERLAY:-}; fi
++                   run_case "$name" ft "$@") ;;
++         ft-mixed) (export BENCH_CONFIG=${FINAL_MIXED_CONFIG:-} TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost; run_case "$name" ft "$@") ;;
+          noft-ulfm) run_case "$name" noft-ulfm "$@" ;;
+          noft-ulfm-nodet) (export WIDEEP_NO_DETECTOR=1; run_case "$name" noft-ulfm "$@") ;;
+          ft) run_case "$name" ft "$@" ;;
+@@ -2671,7 +2747,7 @@
+     smoke=1
+     # AUTO (user: final comparisons also with auto-tuned arms, like real launches): no pinning; each arm tunes its own
+     # cache in its first case and reuses it (own per-rank tactic draw, as a real launch).
+-    if [[ $job == FT-COST-AUTO ]]; then
++    if [[ $job == *-AUTO ]]; then
+         echo "FT_COST_AUTO: no tuning pass, no pinning"
+     elif [[ -n "${FT_COST_E2E_SEED:-}" ]]; then
+         echo "FT_COST_E2E_SEED $FT_COST_E2E_SEED"
+@@ -2682,12 +2758,12 @@
+         node0_decides "$tuner/pinned.go" seed_ok || { echo "SMOKE_FAIL seed $FT_COST_E2E_SEED"; echo STD_DONE; exit 1; }
+     else
+         # Tune every arm once (the arms' layouts may differ, e.g. C-COMBINE4-PIN), then merge and pin.
+-        tune_load=8; [[ $job == C-COMBINE4-PIN ]] && tune_load=128
+-        for a in $arms; do
++        tune_load=8; [[ $job == C-COMBINE4-PIN || $job == GHOST-COST* ]] && tune_load=128
++        for a in ${tune_arms:-$arms}; do
+             arm_case tune-$a $a "$tuner/tune-$a.json" --mode sweep --loads $tune_load --iterations 1 --isl 1024 --osl 1024
+             require_done tune-$a
+         done
+-        merge() { python3 $H/draft_cases/merge_pin_tactics.py merge "$pinned.tmp" $(for a in $arms; do echo "$tuner/tune-$a.json"; done) \
++        merge() { python3 $H/draft_cases/merge_pin_tactics.py merge "$pinned.tmp" $(for a in ${tune_arms:-$arms}; do echo "$tuner/tune-$a.json"; done) \
+             > "$out/merge_pin.txt" 2>&1 && mv "$pinned.tmp" "$pinned"; }
+         node0_decides "$tuner/pinned.go" merge || { echo "SMOKE_FAIL merge (merge_pin.txt)"; echo STD_DONE; exit 1; }
+         smoke=0
+@@ -2701,13 +2777,14 @@
+         node0_decides "$out/round-$r.go" room || { echo "FT_COST_E2E_STOP before round $r ($(left_min) min left)"; break; }
+         order=$(for i in "${!first[@]}"; do echo "${first[(i + r - 1) % ${#first[@]}]}"; done | tr '\n' ' ')
+         echo "FT_COST_E2E_ROUND $r $order"
++        last_round=$r
+         for a in $order; do
+             cache=$tuner/case-$a-$r.json
+             # AUTO: each arm tunes its own cache once (its first case, ~23 min of startup tuning) and reuses it in
+             # later rounds, as a real deployment tunes once per launch configuration.
+-            [[ $job == FT-COST-AUTO ]] && { cache=$tuner/auto-$a.json; export CASE_TIMEOUT_S=3600; }
++            [[ $job == *-AUTO ]] && { cache=$tuner/auto-$a.json; export CASE_TIMEOUT_S=3600; }
+             src=$pinned; [[ $a == *-etac ]] && src=$tuner/pinned-etac.json
+-            [[ $job != FT-COST-AUTO && $SLURM_NODEID == 0 ]] && cp "$src" "$cache.tmp" && mv "$cache.tmp" "$cache"
++            [[ $job != *-AUTO && $SLURM_NODEID == 0 ]] && cp "$src" "$cache.tmp" && mv "$cache.tmp" "$cache"
+             arm_case $a-$r $a "$cache" "${load[@]}"
+             [[ $smoke == 1 ]] && require_done $a-$r
+             smoke=0
+@@ -2727,8 +2804,29 @@
+             fi
+         done
+     done
++    # LADDER: one noft-main case (main's wheel, FT off, the job's pinned table) after the last round, if it fits.
++    if [[ $job == LADDER* && ${LADDER_MAIN_TAIL:-1} == 1 ]]; then
++        main_room() { (( $(left_min) >= 15 )); }
++        if node0_decides "$out/main-tail.go" main_room; then
++            [[ $SLURM_NODEID == 0 ]] && cp "$pinned" "$tuner/case-noft-main.tmp" && mv "$tuner/case-noft-main.tmp" "$tuner/case-noft-main.json"
++            arm_case noft-main-${last_round:-1} noft-main "$tuner/case-noft-main.json" "${load[@]}"
++        else
++            echo "LADDER_MAIN_TAIL skipped ($(left_min) min left)"
++        fi
++    fi
++    if [[ $SLURM_NODEID == 0 && -n $ab_pairs ]]; then
++        # The final benchmark's jobs: steady step / throughput A/B and the burst rank-sum per named pair.
++        python3 $H/burst_counts.py "$out" > "$out/burst_counts.txt" 2>&1
++        for pair in $ab_pairs; do
++            a=${pair%%:*} b=${pair#*:}
++            python3 $H/ab_stats.py "$out" "$a" "$b" > "$out/ab_stats-$a-vs-$b.txt" 2>&1
++            python3 $H/draft_cases/burst_ranksum.py "$a" "$b" "$out/burst_counts.txt" > "$out/burst_ranksum-$a-vs-$b.txt" 2>&1
++            cat "$out/ab_stats-$a-vs-$b.txt" "$out/burst_ranksum-$a-vs-$b.txt"
++        done
++        cat "$out/tactic_check.txt" 2>/dev/null
++    fi
+     if [[ $SLURM_NODEID == 0 ]]; then
+-        for b in $arms; do
++        [[ -z $ab_pairs ]] && for b in $arms; do
+             [[ $b == ft ]] || python3 $H/ab_stats.py "$out" $b ft > "$out/ab_stats-$b-vs-ft.txt" 2>&1; done
+         [[ $arms == *noft-ulfm* ]] && python3 $H/ab_stats.py "$out" noft-stack noft-ulfm > "$out/ab_stats-noft-stack-vs-noft-ulfm.txt" 2>&1
+         [[ $job == C-COMBINE4-PIN ]] && { set -- $arms; python3 $H/ab_stats.py "$out" "$1" "$2" > "$out/ab_stats-$1-vs-$2.txt" 2>&1; }
+@@ -2756,9 +2854,11 @@
+         fi
+         [[ $arms == *noft-ulfm-nodet* ]] && { python3 $H/ab_stats.py "$out" noft-stack noft-ulfm-nodet > "$out/ab_stats-noft-stack-vs-noft-ulfm-nodet.txt" 2>&1
+             python3 $H/ab_stats.py "$out" noft-ulfm-nodet noft-ulfm > "$out/ab_stats-noft-ulfm-nodet-vs-noft-ulfm.txt" 2>&1; }
+-        python3 $H/burst_counts.py "$out" > "$out/burst_counts.txt" 2>&1
+-        python3 $H/draft_cases/burst_ranksum.py noft-stack ft "$out/burst_counts.txt" > "$out/burst_ranksum.txt" 2>&1
+-        cat "$out/ab_stats-noft-stack-vs-ft.txt" "$out/burst_ranksum.txt"
++        if [[ -z $ab_pairs ]]; then
++            python3 $H/burst_counts.py "$out" > "$out/burst_counts.txt" 2>&1
++            python3 $H/draft_cases/burst_ranksum.py noft-stack ft "$out/burst_counts.txt" > "$out/burst_ranksum.txt" 2>&1
++            cat "$out/ab_stats-noft-stack-vs-ft.txt" "$out/burst_ranksum.txt"
++        fi
+         # Deployment per case: the mpirun transport line, whether an authority ran, the a2a dispatch path.
+         for d in "$out"/*-[0-9]*/ "$out"/tune-*/; do
+             [[ -d $d ]] || continue
+@@ -2818,8 +2918,8 @@
+     export CASE_TIMEOUT_S=1200 BENCH_CONFIG=dep32-final.yaml TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
+     export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1
+     export WIDEEP_GRACEFUL_STOP=${SHUTDOWN_SIGNAL:-TERM} WIDEEP_GRACEFUL_STOP_S=${SHUTDOWN_BOUND_S:-120}
+-    if [[ $dist != *build-next-* && $dist != *build-dev-* ]]; then
+-        echo "SMOKE_FAIL preflight: MVP_BUILD must be a next- or dev-build wheel (build-next-fcc86b10b2 or later), got $dist"
++    if [[ $dist != *build-next-* && $dist != *build-dev-* && $dist != "$C/$FINAL_BUILD/dist" ]]; then
++        echo "SMOKE_FAIL preflight: MVP_BUILD must be a next- or dev-build wheel (build-next-fcc86b10b2 or later) or $FINAL_BUILD, got $dist"
+         echo STD_DONE; exit 1
+     fi
+     ms=${MVP_OVERLAY:+$MVP_OVERLAY/tensorrt_llm/llmapi/mpi_session.py}
+@@ -2904,3 +3004,134 @@
+     echo STD_DONE
+     ;;
+ esac
++case $job in
++KILL-MATRIX|KILL-MATRIX-B)
++    # Correctness on the final build (FINAL_BENCHMARK_PLAN K1/K2), composed from existing case blocks: each piece is
++    # `bash $H/job.sh LABEL` on this job's private harness copy with JOB_PARENT_OUT (results in $out/LABEL/),
++    # JOB_CASES (the block's cases to run; require_done passes the skipped ones) and its own environment (a piece's
++    # exports cannot leak into the next). A piece starts only if node 0 sees its budget left; a piece's SMOKE_FAIL
++    # ends that piece only. Budgets from KILL-MTP-R1-8059722, TWOKILL-R1B-8062252, HANG-SET-C30-8063189,
++    # DETECTOR-NEG-8061184 (case-to-case ~10.5-13 min, ~17 min for a 45 s host stall, first start ~12 min).
++    # K1 KILL-MATRIX (~109 min): KILL-MTP-R1 all 6 cases (exact tokens x3 on the small MTP+overlap config, rank 5
++    #   decode / rank 2 prefill / node 1 decode at 128 on dep32-final) 58 min; SHUTDOWN-R1 ft-clean + ft-loss (rc 0
++    #   also after a recovery, survivors finalize, no leftovers; its fold-exit0 preflight) 26 min; TWOKILL-R1B
++    #   (quarantine, node 1 then rank 9 = second loss) 25 min.
++    # K2 KILL-MATRIX-B (~111 min): KILL-FEATURES (new: ring host copies rank/node kill, mixed EPLB+ghost rank/node kill,
++    #   phase-B streaming continuation) 65 min; HANG-SET-C30 stop-c30 (SIGSTOP must fence) + gil45-default-c30 (must
++    #   not fence) 27 min; DETECTOR-NEG host45-node1 (must not fence, detector as shipped) 19 min, if room.
++    #   The SIGSTOP case is the job's only hang-prone case (RETRO 2026-10-17); it runs after the feature kills.
++    # Deviation from the plan table: the SIGSTOP / host / GIL controls moved from K1 to K2 (K1 with them is ~150 min).
++    if [[ $dist != "$C/$FINAL_BUILD/dist" || -n "${MVP_OVERLAY:-}" ]]; then
++        echo "SMOKE_FAIL preflight: MVP_BUILD must be $FINAL_BUILD without MVP_OVERLAY ($dist, overlay '${MVP_OVERLAY:-}')"
++        echo STD_DONE; exit 1
++    fi
++    km_left_min() { local end=${SLURM_JOB_END_TIME:-$(( $(date +%s) - SECONDS + 7200 ))}; echo $(( (end - $(date +%s)) / 60 )); }
++    km_n=0
++    piece() {  # LABEL MINUTES "CASES" [VAR=VALUE...]: one existing case block as a piece, if node 0 sees MINUTES left
++        local label=$1 need=$2 cases=$3 go; shift 3
++        km_n=$((km_n + 1)); go=$out/piece-$km_n-$label.go
++        if [[ $SLURM_NODEID == 0 ]]; then
++            if (( $(km_left_min) >= need )); then echo 1 > "$go.tmp"; else echo 0 > "$go.tmp"; fi
++            mv "$go.tmp" "$go"
++        fi
++        for _ in $(seq 600); do [[ -s $go ]] && break; sleep 1; done
++        if [[ $(cat "$go" 2>/dev/null) != 1 ]]; then echo "KILL_MATRIX_SKIP $label ($(km_left_min) min left, needs $need)"; return 0; fi
++        echo "KILL_MATRIX_PIECE $label start $(date +%T) cases='$cases' env='$*'"
++        # STD_DONE / SMOKE_FAIL of a piece are renamed: job watchers end on those markers.
++        env JOB_PARENT_OUT="$out" JOB_CASES="$cases" JOB_CASE_INDEX_BASE=$((km_n * 20)) "$@" bash "$H/job.sh" "$label" 2>&1 \
++            | sed -u "s/^STD_DONE\$/PIECE_DONE $label/; s/^SMOKE_FAIL/PIECE_SMOKE_FAIL $label:/"
++        echo "KILL_MATRIX_PIECE $label end $(date +%T)"
++    }
++    if [[ $job == KILL-MATRIX ]]; then
++        piece KILL-MTP-R1 58 "mtp-tokens-ref mtp-tokens-inflight-1 mtp-tokens-inflight-2 mtp-decode-rank5 mtp-prefill-rank2 mtp-node1-decode"
++        piece SHUTDOWN-R1 26 "ft-clean ft-loss"
++        piece TWOKILL-R1B 25 "twokill-rerun-quarantine twokill-node1-rank9"
++    else
++        piece KILL-FEATURES 65 "ring-rank5-decode ring-node1-decode mixed-rank5-decode mixed-node1-decode phaseb-stream-rank5"
++        piece HANG-SET-C30 27 "stop-c30 gil45-default-c30"
++        piece DETECTOR-NEG 19 "host45-node1"
++    fi
++    if [[ $SLURM_NODEID == 0 ]]; then
++        # RERUN_VERDICT (KILL-MTP-R1) is in the job log only; the other verdicts are also in files.
++        grep -rh --include='*.txt' --include='watch-*.log' 'SHUTDOWN_VERDICT\|TWOKILL_VERDICT\|KILL_FEATURES_' "$out" 2>/dev/null | cut -c1-300
++        grep -H '"state"' "$out"/*/*/result.json 2>/dev/null | sed 's/^.*runs\///' | cut -c1-200
++        ls "$out"/*/*.skipped 2>/dev/null | sed 's/^.*runs\//SKIPPED /'
++    fi
++    echo STD_DONE
++    ;;
++KILL-FEATURES)
++    # K2's new features end to end (run as a KILL-MATRIX-B piece; standalone too). TODO STUBS: every launch knob below is
++    # a placeholder until its feature lands; the preflight refuses to run while one is unset. 128/GPU, rank kills of
++    # rank 5 (node 1) and node kills of node 1 (ranks 4-7) in a decode step, FT on, ~12.5 min per case.
++    # Expectations (PASS needs all; numbers are recorded, not gated, unless stated):
++    # 1) ring-rank5-decode (SHARDED_HOST_COPIES.md; static 320, ghost slots, ring host copies): state DONE; 31 ranks
++    #    resume; rank 5's experts restored from node 0 (node i's copies live on node i-1), sources round-robin over
++    #    node 0's 4 GPUs, staged through the target's a2a workspace (no fabric map at recovery); /dev/shm per node
++    #    holds only the next node's experts (~46 GB vs ~368 GB full, ESTIMATE: record); restore copy ms recorded.
++    # 2) ring-node1-decode: the same with WIDEEP_FAILURE_DOMAIN=node; 28 ranks resume; all of node 1's experts from
++    #    node 0; every restored slot published only at commit.
++    # 3) mixed-rank5-decode (MIXED_EPLB_GHOST.md; online EPLB 288 + 32 ghost): state DONE; no ghost slot mapped (a
++    #    rank loss fits the EPLB slots: 9 x 31 = 279 >= 256); restore prefers replica slots (~20 ms class, CLAIMS #1/#72);
++    #    online EPLB updates continue after "resumed serving".
++    # 4) mixed-node1-decode: ghost slots mapped (9 x 28 = 252 < 256), only where replicas cannot cover; EPLB keeps
++    #    updating after the resume and never places a replica in an unbacked ghost slot (no error, no SIGBUS).
++    # 5) phaseb-stream-rank5 (READMISSION.md phase B; tokens oracle as KILL-MTP-R1's in-flight cases): a streaming
++    #    request on rank 5 killed after its first tokens continues on a survivor: delivered prefix + continuation equal
++    #    the healthy reference (greedy; exactness informative if the batch differs), no duplicated or missing token at
++    #    the seam, one continuation logged on rank 0, survivors' outputs exact.
++    # All: no WIDEEP_CAPTURE / WIDEEP_COMPILE / WIDEEP_AUTOTUNE after "resumed serving" (v7 invariant 3).
++    export CASE_TIMEOUT_S=1200 TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
++    export TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1
++    mkdir -p "$out/autotuner"
++    todo=""
++    # TODO(ring host copies): the launch knob, e.g. FINAL_RING_ENV="TLLM_FAULT_TOLERANCE_HOST_COPIES=ring".
++    [[ -n ${FINAL_RING_ENV:-} ]] || todo+=" FINAL_RING_ENV"
++    # TODO(mixed EPLB+ghost): the yaml in configs/ (owner decision 13 sets the config form).
++    [[ -s $H/configs/${FINAL_MIXED_CONFIG:-none} ]] || todo+=" FINAL_MIXED_CONFIG"
++    # TODO(phase B): tokens/frontend.py streaming-continuation mode and its result fields, e.g. "--stream".
++    [[ -n ${PHASEB_TOKENS_ARGS:-} ]] || todo+=" PHASEB_TOKENS_ARGS"
++    if [[ -n $todo ]]; then echo "SMOKE_FAIL preflight: TODO stubs unset:$todo"; echo STD_DONE; exit 1; fi
++    load=(--mode failover --load 128 --iterations 2 --kill-window-s 30,45 --kill decode)
++    feature_kill() {  # NAME rank|node: one decode kill of rank 5 or node 1 (environment set by the caller)
++        local name=$1 trigger=$out/trigger-$1
++        (export TLLM_TEST_KILL_TRIGGER=$trigger TLLM_TEST_KILL_IN_DECODE=$trigger
++         if [[ $2 == node ]]; then export WIDEEP_FAILURE_DOMAIN=node WIDEEP_VICTIM=4 WIDEEP_LOST=4 TLLM_TEST_KILL_RANK=4,5,6,7
++         else export WIDEEP_VICTIM=5 TLLM_TEST_KILL_RANK=5; fi
++         run_case "$name" ft "${load[@]}")
++        case_index=$((case_index + 1))
++    }
++    (export BENCH_CONFIG=dep32-b2-320.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/ring.json
++     # shellcheck disable=SC2086
++     export $FINAL_RING_ENV
++     feature_kill ring-rank5-decode rank
++     feature_kill ring-node1-decode node)
++    case_index=$((case_index + 2))
++    # No smoke gate here: one feature failing does not predict the others; KILL-MATRIX-B's piece budget bounds it.
++    (export BENCH_CONFIG=$FINAL_MIXED_CONFIG TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/mixed.json
++     feature_kill mixed-rank5-decode rank
++     feature_kill mixed-node1-decode node)
++    case_index=$((case_index + 2))
++    trigger=/tmp/wideep-kill-$SLURM_JOB_ID-phaseb
++    (export TOKENS_CONFIG=config-small-mtp-overlap.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=empty TLLM_TEST_ORACLE_EXCLUDE_RANK=2
++     unset TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS
++     export TLLM_TEST_KILL_RANK=5 TLLM_TEST_KILL_IN_DECODE=$trigger TLLM_TEST_KILL_WHEN_BUSY=1
++     export TOKENS_ARGS="--inflight-after 1 --max-tokens 400 --no-probe --trigger $trigger $PHASEB_TOKENS_ARGS"
++     run_case phaseb-stream-rank5 ft)
++    case_index=$((case_index + 1))
++    if [[ $SLURM_NODEID == 0 ]]; then
++        # TODO(verdicts): per-case PASS/FAIL lines once the features' log lines exist (ring source node, ghost map count,
++        # EPLB update after resume, phase-B continuation); until then the facts below are judged by hand.
++        for d in "$out"/*/; do
++            [[ -s $d/result.json ]] || continue
++            n=$(basename "$d")
++            echo "KILL_FEATURES_FACTS $n state=$(grep -o '"state": "[^"]*"' "$d/result.json" | head -1)" \
++                "resumed=$(grep -c 'resumed serving without' "$d/rank-0.log" 2>/dev/null)" \
++                "restored='$(grep -o 'Restored .* expert slots[^,]*' "$d/rank-0.log" 2>/dev/null | head -1 | cut -c1-120)'" \
++                "eplb_after_resume=$(awk '/resumed serving without/ {r = 1} r && /EPLB weight updates/ {n++} END {print n + 0}' "$d/rank-0.log" 2>/dev/null)" \
++                "after_resume_capture=$(awk '/resumed serving without/ {r = 1} r && /WIDEEP_(CAPTURE|COMPILE|AUTOTUNE)/ {n++} END {print n + 0}' "$d/rank-0.log" 2>/dev/null)" \
++                | tee -a "$out/kill_features.txt"
++        done
++    fi
++    echo STD_DONE
++    ;;
++esac

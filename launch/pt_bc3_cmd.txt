@@ -1,0 +1,12 @@
+# PT-BC3: v4 b+c with the install_mask fix (bdb01feb4f; b had returned before state.install_mask(), so the kernels kept
+# the lost rank active and the first post-recovery collective hung: PT-BC2, BISECT-BC). Point-test order: the unit
+# files first (one per node 0-4, every node waits for all), then the kill smoke as KILLS-V3 group A (w/o EPLB, rank5 +
+# node1), overlay v4bc-bdb01feb4f, KF_STACKS=1.
+# PASS: every unit file rc=0; both KILL_FINAL_VERDICT PASS with first_step logged; rank-0.log without the futures
+# traceback and with "mpi4py futures manager thread ended"; recovery_s within the v3 range (n=1: lead).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays/v4bc-bdb01feb4f
+U="bash $R/tools/point_units.sh $R/$B/dist $O $O-tests $R/overlays/build-src-bcea8da496 $R/$B/point-units-bdb01feb4f"
+UNITS="tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/_torch/moe/test_resident_placement.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/_torch/moe/test_moe_load_balancer.py"
+M=$R/logs/bundle/units-done-\$SLURM_JOB_ID
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=1 KF_STACKS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1"
+bash $R/bundle.sh "0:8:5100:units=($UNITS); n=\$SLURM_NODEID; mkdir -p $M; [[ -n \${units[\$n]:-} ]] && $U-node\$n \${units[\$n]}; touch $M/\$n; for _ in \$(seq 1800); do (( \$(ls $M | wc -l) >= 8 )) && break; sleep 1; done; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A"

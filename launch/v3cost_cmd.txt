@@ -1,0 +1,8 @@
+# V3-COST: v3 (bcea8da496) healthy-cost check against the v2 finals: w/o EPLB at 32 and 128/GPU, std-noeplb vs std-noeplb-ft,
+# two groups mirrored, finals settings (seed2 pins, PIN_CHECK must be OK; burn-in 32x6; samplers off). Decides whether v3's
+# changes (CuteDSL source-slot tuning key, abort_state schema, bind-time refusal) move the step cost (v2 finals: +2.68% at 32,
+# +0.46% at 128).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=50 WIDEEP_BURNIN=32:6 COST_LOADS=32,128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:4200:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:4200:$E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

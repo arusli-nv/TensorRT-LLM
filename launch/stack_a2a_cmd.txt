@@ -1,0 +1,23 @@
+# STACK-A2A (8 nodes, segment 8, one NVL72 domain): the FT all-to-all round trip of the PR stack (wheel build-stack-966d3788b3,
+# no overlay; its kernels carry the stats-loop ballot and the 8-byte round-state load, PR 07) against FT off, EP32,
+# T=64 tokens/rank, with EPLB stats (online) and without, 3 repeats; A2A-EP2's driver (tools/a2aep_ep.sh +
+# tools/a2aep_bench.py), --ablate 0 so every launch also checks that FT reproduces FT off's combine output and the
+# exact gathered stats bit for bit (TRTLLM_A2A_FT_ABLATE is not read by these kernels, so ft and ft0 are both the stack's).
+# PRE-REGISTERED (2026-10-30, before data): D = median over launches of (M_ft - M_off), per stats arm. Reference on
+# v5-final (CLAIMS 205/210 control): +2.96 to +3.00 us with stats, +0.85 to +0.88 us without. Expected (code read and
+# CLAIMS 210 ablation): about +1.2 us with stats, about +0.7 us without. PASS if every A2A_EP_CHECK is OK, D(stats)
+# <= 2.0 us and D(no stats) <= 1.0 us; validity |N| < 0.3 us per cell (else INCONCLUSIVE, no rerun without a reason).
+# Est ~6 min install + 12 launches x ~25 s -> ~15 min; --time 00:35.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/require_presubmit.sh stack-a2a-966d3788b3-fae5e73af2 || exit 1
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/stack-a2a-${SLURM_JOB_ID:-x}
+mkdir -p "$out"
+A2AEP_WHEEL=$R/build-stack-966d3788b3/dist A2AEP_OVERLAY= A2AEP_CODE_CHECK=0 A2AEP_NODES=8 A2AEP_REPS=3 A2AEP_LOADS=64 \
+A2AEP_ABLATE_VARIANTS=0 bash $R/tools/a2aep_ep.sh "$out" > "$out/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+if (( SLURM_NODEID == 0 )); then
+    cat "$out/node-0.log"
+    echo "checks_ok=$(grep -c '^A2A_EP_CHECK .* OK$' "$out/node-0.log")/6"
+fi
+exit $rc

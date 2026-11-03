@@ -1,0 +1,42 @@
+# Attribution of the standard config's gain (E0), FT off only: the FT config (dep32.yaml) with ONE change.
+# Change: no EPLB placement (256 slots, as dep32-standard.yaml).
+# DeepSeek-R1 NVFP4 on 32 GB200 GPUs (DEP32), aggregated serving; identical for FT off and FT on.
+# Standard TRT-LLM perf settings (tests/scripts/perf-sanity, examples/configs/curated) where FT allows them:
+# FT needs the non-overlap scheduler, no MTP, no attention-DP balancing, and EPLB copies of every expert,
+# so the static 288-slot placement below holds a second copy of each of rank 1, 2, 30 and 31's experts.
+tensor_parallel_size: 32
+moe_expert_parallel_size: 32
+enable_attention_dp: true
+enable_lm_head_tp_in_adp: false
+gpus_per_node: 4
+max_batch_size: 512
+max_num_tokens: 8192
+max_seq_len: 2304
+attn_backend: TRTLLM
+disable_overlap_scheduler: true
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 192
+  - 256
+  - 384
+  - 512
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+moe_config:
+  backend: CUTEDSL
+  use_low_precision_moe_combine: true
+  disable_finalize_fusion: true
+stream_interval: 10
+num_postprocess_workers: 4
+print_iter_log: true

@@ -1,0 +1,46 @@
+# EXACT-SMALL3 (16 nodes, two 8-node groups, segment 8). This decides whether survivors' tokens equal a no-failure run
+# on v5-final 27442bd91d (overlays/fix-dropmap-9f1fd4cab4 on build-freeze-58caa0fde6) after a rank kill, with MTP real
+# acceptance and the overlap scheduler, on a config whose healthy runs are token-deterministic:
+# tokens/config-small-mtp-overlap.yaml (CLAIMS 95's config: static 288, MTP 1, overlap, small batch).
+# Why this config (decided 10-27 ~02:55 PT, after EXACT 8354988, disclosed): on the standard configs two healthy runs
+# of the same greedy requests already differ (CLAIMS 230), so the standard-config check cannot decide; the check needs
+# a deterministic reference. Same R1 DEP32 deployment shape, smaller batch/graph sizes; not the benchmark config.
+# Victim rank 30 (node 7): in this placement only ranks 1, 2, 30, 31 have every expert replicated (the oracle routes
+# around the victim from startup); 1-2 share rank 0's node (fails closed with the node failure domain), 31 serves a
+# compared request. job.sh EXACT_VICTIM (harness-only change 10-27, backup TRASH/2026-10-27/job.sh.pre-exact-victim).
+# Pass rule (job.sh EXACT-FINAL header, unchanged; draft_cases/val_verdicts.py exact), written before data: PASS iff the
+# reference is deterministic and unchanged by the victim prompt on rank 1, the kill landed mid-generation, the victim's
+# request ran again exactly once, pre-kill tokens equal the reference exactly, the placement proof holds, and after the
+# kill the first-diff positions are no earlier (sorted position by position) than the no-kill perturbed-batch control's.
+# Rules (review/OVERNIGHT_PLAN_2026-10-27.md): results go to slide 3 / B9 / B14 notes with a CLAIMS row; a FAIL is
+# reported as is.
+# Groups: one deployment per group (a second deployment in the same group hit a missing /dev/null in 8354988), n=2:
+#   G0: EXACT-FINAL   (ref + pert + kill, ~3 starts x ~6-8 min)   ~25 min
+#   G8: EXACT-FINAL-C (same)                                       ~25 min
+#   --time 00:50, group limit 2700 s. A reference that does not serve ends the group at once (EXACT_FINAL_SKIP).
+# EXACT-SMALL2 (decided 10-27 ~05:50 PT, after EXACT-SMALL 8356173, disclosed): the same run with print_iter_log on
+# (tokens/config-small-mtp-overlap-iterlog.yaml = the same config + print_iter_log: true, host logging only). In 8356173
+# every token check passed but the verdict was FAIL because the control-placement proof reads rank 0's iteration log,
+# which that config does not print (CLAIMS 231). Pass rule unchanged; this run reports its own verdict, n=2.
+# EXACT-SMALL3 (10-27 ~07:45 PT, user OK to run more jobs): EXACT-SMALL2 again after fixing a harness bug in the pass
+# rule's placement check (draft_cases/val_verdicts.py rank0_two_request_iters read currank_total_requests, a running count;
+# it now reads the per-iteration num_scheduled_requests; backup TRASH/2026-10-27/val_verdicts.py.pre-placement). The rule's
+# intent is unchanged (reference: rank 0 never runs 2 requests at once; perturbed control: it does). Fixed after seeing
+# CLAIMS 231/233, disclosed; old runs are not re-verdicted. This run's verdict stands as is, n=2.
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1
+B=build-freeze-58caa0fde6
+O="MVP_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4 COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' WIDEEP_POLLUTION_CHECKS=1"
+X="EXACT_CONFIG=../tokens/config-small-mtp-overlap-iterlog.yaml EXACT_VICTIM=30"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+G0="$K $X $(run EXACT-FINAL)"
+G8="$K $X $(run EXACT-FINAL-C)"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:2700:$G0" "8:8:2700:$G8"

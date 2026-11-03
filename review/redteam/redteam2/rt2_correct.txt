@@ -1,0 +1,38 @@
+rt2-correct (worktree /tmp/claude-161238/work/wt-rt2a, base fix-final8 445a9c8f42), 8 commits, net -25 lines. Not pushed.
+
+#1  69c0d511a6  net +31  _rerouting: assigned per recovery from rank 0's broadcast of its not-yet-routed re-run ids
+    (rank 0's set already drops routed/started ids, so an earlier recovery's still-waiting re-runs survive; other
+    ranks' stale ids go). New hook requests_cancelled() (called in _handle_canceled_requests) drops cancelled ids.
+    requests_routed compares against dist.tp_rank. Unservable path needs no drop: re-run items have their pin
+    relaxed (_relax_attention_dp_pin), so split_unservable_requests never removes them.
+    Tests: test_each_recovery_takes_the_rerun_requests_rank0_has_not_routed,
+           test_rank0_keeps_an_earlier_unrouted_rerun_request_across_a_recovery,
+           test_only_the_rank_a_rerun_request_is_routed_to_watches_its_progress (fake dist now has tp_rank)
+#3  28cb0838f3  net +7   create() requires executor.sampler.is_generation_model(): only EarlyStopSampler /
+    EarlyStopWithMMResult record no sampler event (TorchSampler, SpecSampler always do). Fallback sync remains only
+    for sample_state None (sampling error path).
+    Tests: test_create_rejects_configurations_a_discarded_step_cannot_rerun[...a generation sampler]
+#2  eaca1d5507  net +10  Lazy capture after warmup cannot happen: CUDAGraphRunner.needs_capture/maybe_get_cuda_graph
+    require _capture_allowed (set only in allow_capture() during warmup_and_capture / cuda_graph_capture), piecewise
+    capture requires capture_piecewise_cuda_graph(True) (prefill warmup only), BCG captures in warmup, autotuner
+    captures only in tuning mode. Added assert in _start_hang_evidence that capture is closed.
+    Tests: test_run_reports_hang_evidence_only_when_enabled (extended)
+#19 1e9d6e3aff  net -4   _populate_in_background docstring without measurements.
+#20 c9ac580e53  net -32  PeerLossRecovery class, _recover, revert_prepare_resources docstrings trimmed to contracts.
+#21 7bf82c491c  net -24  tp_cp_allgather back to main's body (+ _DEPARTED_GROUP removed); after a loss it still
+    fails stop via tp_allgather. TorchDist's departed= kept (it implements the abstract signature).
+    Tests: tests/unittest/_torch/distributed/test_mpi_survivors.py::test_install_survivors_keeps_logical_ranks
+#23 7222a8aecb  net -9   _run_event_loop inlined.
+    Tests: test_crashed_loop_exits_only_this_rank_when_peers_can_recover (mocks recovery.run)
+#24 3ff5d44558  net -4   _end_departed_rank inlined.
+    Tests: test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan,
+           test_a_departed_rank_the_runtime_cannot_end_is_reported_and_the_recovery_ends,
+           test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed
+#22 SKIPPED: inlining `.pin_memory()` into execution_state.py fails the check-pinned-memory pre-commit hook (raw
+    .pin_memory() is allowed only in _utils.py), and maybe_pin_memory / pin_memory=prefer_pinned() do not guarantee
+    the pinned (device-mapped) memory the kernels need. The helper stays.
+
+Not run here (no torch); every file py_compiles and pre-commit is clean. Run on a torch node:
+  pytest tests/unittest/_torch/executor/test_peer_loss_recovery.py
+  pytest tests/unittest/_torch/distributed/test_mpi_survivors.py
+  pytest tests/unittest/_torch/misc/test_autotuner.py -k tp_cp

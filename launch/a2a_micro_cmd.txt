@@ -1,0 +1,21 @@
+# A2A-MICRO (1 node, 4 GPUs; DIAGNOSTIC): does FT's +3.65 us/call dispatch floor (NSYS-STEADY, DEP32) show up in the
+# fence-path A2A kernels alone? scratch-a2abench/a2a_bench.py: four ranks on one node's MNNVL workspace, R1 NVFP4
+# shapes (hidden 7168, top-8 of 256), loads 8 and 32 tokens/rank, off (no rank mask) vs ft (rank mask + abort record)
+# in alternating blocks, CUDA events, no ncu; the GPU sleeps while the host enqueues each block (--queue-ahead), so events time GPU work (8267120 ran eagerly: host-paced). PDL on, as served, then off. On the freeze wheel
+# (build-freeze-58caa0fde6). A2A-MICRO4: queued with EPLB stats (online instantiation), then CUDA graph replays (as served) without and with EPLB stats; 8267268 covered queued PDL on/off. Output: review/diag/a2a-micro-<job>.txt. ~15 min; --time 00:45.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+out=$R/review/diag/a2a-micro-${SLURM_JOB_ID:-x}.txt
+for var in $(compgen -e | grep -E '^(PMIX_|PMI_|SLURM_|OMPI_MCA_ess|PRTE_MCA_ras)'); do unset "$var"; done
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/a2a-install.log || { tail -20 /tmp/a2a-install.log; exit 1; }
+    nvidia-smi -L
+    cd /tmp
+    B="timeout 900 python3 $R/scratch-a2abench/a2a_bench.py --loads 8,32 --blocks 10 --calls 200"
+    echo "### PDL on, queued ahead, EPLB stats"; TRTLLM_ENABLE_PDL=1 $B --queue-ahead 1e8 --eplb
+    echo "### PDL on, CUDA graph"; TRTLLM_ENABLE_PDL=1 $B --graph
+    echo "### PDL on, CUDA graph, EPLB stats"; TRTLLM_ENABLE_PDL=1 $B --graph --eplb
+    echo A2A_MICRO_DONE
+} > "$out" 2>&1

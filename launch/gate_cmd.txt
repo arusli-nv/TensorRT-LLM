@@ -1,0 +1,20 @@
+# GATE pack on build-final-066b5189a9 (fix-cost 066b5189a9: R1-R3 static prefetch, Option 1 online empty slots, ring
+# replan bounds, capture-time watchdog skip, bounded MPI_Finalize). Submit only after build 8093887 passes its gtests and
+# unit groups. One 16-node bundle, groups balanced to ~80 min each (reaper). Presubmit each group's job name.
+# Group 0 (online, dep32-final): nsys pair noft vs ft at 32/GPU (1 round, seeded) -> kill smoke rank5+node1 at 512/GPU
+#   (KF_LOAD=512, KF_KILL_WINDOW past the prefill) -> SHUTDOWN-R1 (bounded Finalize; all cases expect rc 143).
+# Group 1 (static, b2-320): nsys pair lay-eplb0 vs ft-ghost320 at 32/GPU (1 round, seeded) -> kill smoke OFF rank5+node1
+#   at 128 -> LADDER-style 512 harness check? (no: the full set runs 512; the kill smoke at 512 exercises the client path).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-final-066b5189a9
+E="MVP_BUILD=$B FINAL_BUILD=$B FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node"
+P="$E PROF_ON_FINAL=1 PROF_LOADS=32 FT_COST_E2E_ROUNDS=1"
+ON="$P FT_COST_E2E_ARMS='noft ft' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+OFF="$P FT_COST_E2E_ARMS='lay-eplb0 ft-ghost320' FT_COST_E2E_SEED=$R/mvp/runs/GHOST-COST-8087786/autotuner/pinned.json"
+K="$E KF_REPEATS=1"
+bash $R/bundle.sh \
+  "0:8:6900:$ON bash $R/mvp/harness/run_job.sh FT-COST-PROF; $K KF_LOAD=512 KF_KILL_WINDOW=200,230 WIDEEP_CLIENT_MAX_CONCURRENCY=2048 bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A; $E bash $R/mvp/harness/run_job.sh SHUTDOWN-R1" \
+  "8:8:6900:$OFF bash $R/mvp/harness/run_job.sh FT-COST-PROF-B; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B"
+# Readout (live too): python3 $R/mvp/harness/step_readout.py $R/mvp/runs/FT-COST-PROF-<job> (rank-0 decode device step, period-60).
+# Read: nsys deltas vs #126/#127 (online H2D memcpy and the period-60 stall gone; static dispatch +2 us/layer smaller);
+# kill verdicts incl. client_reset/client_cut at 512, recovery_s and install phase vs #121 (CPU copies now); SHUTDOWN
+# rc 143 for all three and the "MPI_Finalize (...) did not end within 30 s" line count; shm-<node>.log on every case.

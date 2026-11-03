@@ -1,0 +1,14 @@
+# V5PR-FOLD-TEST (1 node): test_ring_host_copies.py on the restacked v5-pr: the folded host-copy commit 7c6fef3528 and the
+# next commit touching those files (6922263d92); the tip e413edcf46 has the tree of 19b0e90251 (tested 8264887). Output:
+# review/diag/v5pr-fold-test-<job>.txt. ~12 min; --time 00:30.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+out=$R/review/diag/v5pr-fold-test-${SLURM_JOB_ID:-x}.txt
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/fixtest-install.log || { tail -20 /tmp/fixtest-install.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/fixtest-pip.log 2>&1 || tail -5 /tmp/fixtest-pip.log
+    for c in 7c6fef3528 6922263d92; do echo "### $c"; bash $R/scratch-v5pr/run.sh $R/scratch-v5pr/$c; done
+    echo V5PR_FOLD_TEST_DONE
+} > "$out" 2>&1

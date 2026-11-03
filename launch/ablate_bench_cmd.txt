@@ -1,0 +1,59 @@
+# ABLATE bench (8 nodes, 4 GB200 each, segment 8 = one NVL72 domain; DIAGNOSTIC, OPEN_ITEMS_2026-10-25 items 1-2,
+# CLAIMS 200/200b/205; no server, no product change). Question: which FT-only work in the fence a2a kernels makes the
+# FT round trip slower at EP32 T=64 (CLAIMS 205 CTRL: no stats +0.85 us, stats +2.96 us per round trip)?
+# Items and switches: review/diag/a2a_ft_work_coderead.md; code: a2a-ablate d47a3bcf88 (review/drafts/ablate_NOTES.md).
+# Runs only after BUILD_ABLATE_OK and SMOKE_ABLATE_OK (launch/ablate_build_cmd.txt, launch/ablate_smoke_cmd.txt).
+# Method: A2A-EP2's driver (tools/a2aep_ep.sh + tools/a2aep_bench.py: one CUDA graph of 200 dispatch+combine round trips
+#   per variant, 20 recorded cycles + 1 warm-up, rotating order, PDL on, R1 NVFP4 shapes), wheel build-ablate-d47a3bcf88
+#   + overlay fix-dropmap (the .py are v5-final's). EP32 (8 nodes), T=64, stats (online) and no stats (offline).
+#   One launch per (repeat, stats, variant V) for V in 0 S S1 F F8 L A SO ALL; 3 repeats -> 54 launches. Each launch
+#   captures off, ft (TRTLLM_A2A_FT_ABLATE=V), off2 and ft0 (TRTLLM_A2A_FT_ABLATE=0, the unchanged v5-final FT kernel)
+#   and rotates all four, so the control runs in every launch. The variant order rotates by 3 per repeat; repeat 2 runs
+#   no stats first. Before capture every variant must reproduce off's combine output bit for bit and the expected
+#   gathered stats (A2A_EP_CHECK), else the launch fails.
+# Code check, every node: CODE_V5F_OK (5 .py sha256 of 27442bd91d), tools/ablate_res.py on the installed lib gives
+#   ABLATE_RES_OK, and its sha256 = build-ablate-d47a3bcf88/LIB_SHA256. Any mismatch stops the job.
+# Est: install + overlay ~6 min; launch ~15-25 s (one load, four graphs) x 54 = ~14-23 min -> ~20-30 min; --time 00:45.
+# Output: review/diag/ablate-<job>/ (r<rep>-ep32-s<stats>-v<V>.json, code-*, res-*, summary.txt), verdict.txt
+#   (tools/ablate_verdict.py <out>).
+#
+# PRE-REGISTERED (written 2026-10-25 before any data; the user approves before submission):
+# Statistic: block = min over ranks of replay time / 200; M_g = median over 20 blocks per graph g. Per launch:
+#   D = M_ft - M_off, D0 = M_ft0 - M_off, cut = M_ft0 - M_ft (= control D minus variant D, paired in the launch),
+#   N = M_off2 - M_off. Per (stats, V) cell: D, D0, cut, N = medians over the 3 launches, Nmax = max |N|.
+# Decision cells: EP32, T=64, stats=1 and stats=0, each variant.
+# Validity (as A2A-EP2): per cell |N| < 0.3 us and Nmax < 0.5 us, else that cell is INCONCLUSIVE (report, no rerun
+#   without the user). All code checks above pass. V=0 (ft and ft0 the same kernel) reports the null cut; |cut(0)| >=
+#   0.3 us is flagged (ABLATE_NOTE), not a gate. Control D0 vs CLAIMS 205 CTRL (+0.85 / +2.96) differing by > 0.4 us is
+#   flagged, not a gate.
+# Rule: an item EXPLAINS the cost in an arm if removing it cuts >= 0.3 us at EP32 T=64 in that arm (stats or no stats,
+#   stated per line): cut(V) >= 0.3 us. Otherwise NO.
+# Expectations (code read; stated before data, not part of the rule): S and S1 cut ~2.1 us with stats and ~0 without
+#   (S1 ~= S means the ballot rewrite is the fix); F 0.15-0.35 us in both arms (F8 <= F: the 8-byte load before the
+#   fence recovers most of it); L 0.1-0.2; A 0.02-0.05; SO 0.01-0.02; ALL ~ the whole control D0.
+#   If D(ALL) > 0.3 us at no stats, something not in the list contributes (ABLATE_ALL_RESIDUAL UNLISTED).
+#   Sum of single cuts (S F L A SO) vs cut(ALL) is reported, informational.
+# Scope: kernel-only, back to back, as CLAIMS 200/205; says nothing about serving (CLAIMS 194) by itself. The variants
+#   are not fault tolerant: this measures cost, it does not ship anything.
+#
+# Submit (after SMOKE_ABLATE_OK and the user's OK): python3 $R/tools/presubmit.py --name ABLATE --nodes 8 --segment 8
+#   --build build-ablate-d47a3bcf88 --branch /tmp/claude-161238/wt-fix   (wt-fix HEAD must be d47a3bcf88)
+#   -> TOKEN; replace TOKEN below. slurm_submit: 8 nodes, segment 8, 4 GPUs/node, one task per node, --time 00:45,
+#   mounts R:R:rw (as A2A-EP2 8282103); command: bash $R/launch/ablate_bench_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/require_presubmit.sh ABLATE-8c9bd92bcf || exit 1
+bash $R/tools/check_excluded_nodes.sh || exit 1
+[[ -s $R/build-ablate-d47a3bcf88/LIB_SHA256 ]] && grep -q ABLATE_RES_OK $R/build-ablate-d47a3bcf88/res.txt \
+    || { echo "ABLATE_NO_BUILD: run launch/ablate_build_cmd.txt first"; exit 1; }
+out=$R/review/diag/ablate-${SLURM_JOB_ID:-x}
+mkdir -p "$out"
+A2AEP_WHEEL=$R/build-ablate-d47a3bcf88/dist A2AEP_RES_TOOL=$R/tools/ablate_res.py A2AEP_RES_EXPECT=ok \
+A2AEP_NODES=8 A2AEP_REPS=3 A2AEP_LOADS=64 A2AEP_ABLATE_VARIANTS="0 S S1 F F8 L A SO ALL" \
+    bash $R/tools/a2aep_ep.sh "$out" > "$out/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+if (( SLURM_NODEID == 0 )); then
+    cat "$out/node-0.log"
+    echo "checks_ok=$(grep -c '^A2A_EP_CHECK .* OK$' "$out/node-0.log")/54"
+    python3 $R/tools/ablate_verdict.py "$out" 32 64 | tee "$out/verdict.txt"
+fi
+exit $rc

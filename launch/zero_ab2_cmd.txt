@@ -1,0 +1,50 @@
+# ZERO-AB2 (16 nodes, same nodes, two 8-node groups mirrored): follow-up of ZERO-AB 8164194, whose partial readout (trim,
+# n=1) has ft-zero ~ lb (+0.11-0.13 ms over off) and noghost ~0.08 faster than ft-zero; ft-zero's logs do not prove the
+# dispatch uses the expert-to-slot table (else it pays main's route() kernel, which alone would explain ft-zero ~ lb).
+# Code: v5-zero b6f895cbc5 = wheel build-v5zero-f9e6bc0f8b (BUILD-ZERO2 8165145) + Python overlay vzero-b6f895cbc5
+# (moe_load_balancer staging-room assert, recovery PROTOCOL_VERSION 2), COST_DIAG_OVERLAY=1. moe_scheduler.py and
+# interface.py are f9e6bc0f8b = b6f895cbc5 (the hooks' anchors: t_slot real_anchors PASS on both).
+# Arms on each group's own nodes, load 32 only, one round per group, group 8 in reverse order:
+#   off = std-noeplb | lb = std-noeplb-lb | ft-zero = std-noeplb-ft | ft-zero-noslottable = std-noeplb-ft-noslottable
+#   (bound path, route() writes the slot ids, no table; testhooks TLLM_TEST_FT_NO_SLOT_TABLE, t_bind PASS) |
+#   ft-zero-noghost = std-noeplb-ft-noghost (bound path on 256 slots; TLLM_TEST_FT_NO_GHOST).
+# Slot-table proof: TLLM_TEST_LOG_SLOT_TABLE=1 job-wide (every arm pays the same hook; CPU-only, a set lookup per eager
+# call, no Python in graph replays): every rank logs WIDEEP_SLOT_TABLE layer=<i> used=0|1 [reason=...] once per layer,
+# and WIDEEP_ROUTE_CALLS layer=<i> n=1 / n=100 when route() runs (none: route() never ran). Expected: ft-zero used=1 and
+# no ROUTE_CALLS; noslottable used=0 reason=test_hook + ROUTE_CALLS; noghost used=1; off/lb ROUTE_CALLS only.
+#   grep -h "WIDEEP_SLOT_TABLE\|WIDEEP_ROUTE_CALLS" $R/mvp/runs/STD{,-G1}-<job>/std-noeplb-ft-1/rank-*.log | sed 's/ t=[0-9.]*//' | sort | uniq -c | sort -rn | head
+# Gate: each group first runs the in-job unit gate on the wheel + overlay: BUILD-ZERO2's EXTRA_TESTS (from
+# build_zero2_cmd.txt, deduplicated) minus test_moe_a2a_recovery.py and test_ring_host_copies.py, whose newest versions
+# (vzero-b6f895cbc5-tests) go to the 1-node UNITS-POINT (units_point_cmd.txt) first. Tests from the f9e6bc0f8b snapshot
+# (= what BUILD-ZERO2 ran; tests overlay: empty). No -k: f9e6bc0f8b's polling late_writes control passed in BUILD-ZERO2.
+# test_mpi_session's C12 case is deselected by known_failures.txt. A FAIL ends the group.
+# Pre-registered readout (review/DECISION_TREE.md, ZERO-AB rows that still apply, verbatim):
+#   Validity first: off G0 vs off G8 within 0.1 ms; cache_miss equal across arms (192 baseline); PIN_CHECK OK; noghost
+#   ACTIVE line shows num_slots=256. Any failure -> fix the harness, don't read the numbers.
+#   | ft-zero ~ lb (+0.10-0.15) and noghost ~ ft-zero | residual = indirection (expert_to_slot in no-EPLB) | accept per user ("as good as main"); confirm online EPLB arm shows ~0 in VAL-H |
+#   | noghost < ft-zero by >= 0.04 | ghost-slot layout still costs | land G2 384 routing tier (patch ready) in the C++ batch |
+#   | ft-zero between lb and v5land, noghost ~ ft-zero | unexplained FT path cost | use the monitor's pre-staged diagnostic table (zpred); 1 job of hook arms |
+#   | groups disagree in sign | noise > effect | second round on the same nodes, n=2 before any call |
+# Added for ZERO-AB2 (pre-registered before submit):
+#   - ft-zero logs used=0 on any rank/layer -> the table is not in use, which explains ft-zero ~ lb; fix that None
+#     condition (the reason= field names it), then rerun ft-zero vs lb.
+#   - used=1 (every rank, every layer, no ROUTE_CALLS in ft-zero) and noslottable ~ ft-zero -> the table costs the same
+#     as route(); the residual is elsewhere.
+#   - noghost < ft-zero by >= 0.04 ms in BOTH groups -> the ghost layout costs; G2 384-tier.
+#   python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job> --off std-noeplb-1
+# Estimate: gate ~25 min (BUILD-ZERO2 extras ~10 min of pytest + install + per-file startup; ZERO-AB's 17-file gate took
+# 12 min); ~12 min per case at 32 only (ZERO-AB 8164194 group 0 at 32+128: off 16, lb 20, ft 15 min; load 128 ~4.5 min
+# of each), 5 cases ~62 min + startup ~3 = ~90 min per group of the 117 min limit (ROUND_MIN 66).
+# Submit (16 nodes, segment 8), after ZERO-AB 8164194 ends and BUILD-ZERO2 8165145 passed:
+#   KNOWN_FAIL='test_remote_mpi_session[flashinfer_temporary_cleanup]' bash $R/tools/require_build_pass.sh \
+#     $R/logs/slurm/slurm-8165145.out tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py $R/build-v5zero-f9e6bc0f8b/test-extra.log \
+#   && bash $R/tools/require_presubmit.sh <token> && bash $R/launch/zero_ab2_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5zero-f9e6bc0f8b; SRC=$R/overlays/build-src-f9e6bc0f8b; O=$R/overlays/vzero-b6f895cbc5
+# Short gate (reaper: an in-job gate on node 0 idles the other 7 nodes; >~25 min got KILL-SMOKE 8162957/8164530
+# cancelled by the Occupied Idle Job Reaper). The wheel's full FT suite passed in BUILD-ZERO2 8165145; the overlay
+# b6f895cbc5 changes moe_load_balancer.py (staging-room assert) and protocol.py (version 2): run the tests of those.
+T="tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/zab2-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $O-tests $SRC $R/$B/point-units-zab2-g$1 $T"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 TLLM_TEST_LOG_SLOT_TABLE=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=66 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-lb std-noeplb-ft std-noeplb-ft-noslottable std-noeplb-ft-noghost' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && $E FT_COST_E2E_ARMS='std-noeplb-ft-noghost std-noeplb-ft-noslottable std-noeplb-ft std-noeplb-lb std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

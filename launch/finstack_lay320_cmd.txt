@@ -1,0 +1,10 @@
+# FINSTACK + LAY320 (16 nodes, two independent 8-node groups).
+# Group 0, FINSTACK: FT shutdown with and without the ULFM detector, stacks at +25 s (C4: why Finalize waits 30 s).
+# Group 8, LAY320: LAY32's lay320 arm failed on v3 (8134758: C++ "expertId=-1" check, moeLoadBalancer.cpp:518, accepts
+# empty slots only under TLLM_FAULT_TOLERANCE_MODE=1). testhooks now sets that variable around the load balancer's
+# setup calls only. Arms at 32/GPU, 2 rotated rounds on the same 8 nodes: lb (FT off, 256 slots) vs lay320 (FT off,
+# + 64 empty ghost slots) = the ghost layout's own cost. Check WIDEEP_EMPTY_EXTRA_SLOTS mode=ghost in the rank logs.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:3000:MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$R/overlays/v4bc-bdb01feb4f SHUTDOWN_DETECTOR_AB=1 SHUTDOWN_STACKS_S=25 bash $R/mvp/harness/run_job.sh SHUTDOWN-R1" \
+  "8:8:4000:$E FT_COST_E2E_ARMS='std-noeplb-lb std-noeplb-lay320' bash $R/mvp/harness/run_job.sh STD"

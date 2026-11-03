@@ -1,0 +1,75 @@
+# FIN_H4 (16 nodes, two 8-node groups, segment 8, limit 7000 s): H main healthy set: on/no groups, FT off vs on at 32+128/GPU, 600 s windows.
+# Block H (+ R fill, C); figures 1, 2 (32/128), C; R fill: 5-8 (FINALS_PLAN v4).
+# Group 0 [H-on]: gate 5.0 + tune std-online+std-online-ft 35.8 + std-online 33.5 + std-online-ft 34.9 + end 1 = 110 min.
+# Group 8 [H-no]: gate 5.0 + tune std-noeplb+std-noeplb-ft 24.4 + std-noeplb 28.9 + std-noeplb-ft 29.9 + no:rank5 x1 12.1 + no:node1 x1 9.9 + invocation 2.0 + end 1 = 113 min.
+# Fixed (FINALS_PLAN v4): R1 NVFP4 DEP32, std-*.yaml recipe (MTP1 forced acceptance; GSM8K uses real acceptance),
+# 1k/1k, refrozen wheel only, fence a2a (CFT off), hang detection on in every FT case (hang_confirm_s 30), Open MPI
+# in-band detector off, warm restarts. Every group: EXCLUDED_NODE guard, then the short in-job unit gate (VAL-K's 9
+# files). Limit 7000 s per group (117 min); target <= ~114 min (1.9 h); groups within ~10 min of each other.
+# Healthy: one launch per arm sweeps its loads; WIDEEP_BURNIN=32:6 in every arm (6 waves x ~500 steps, far past
+# std-online's 58-iteration update cycle); identical windows per load (COST_LOAD_ITERATIONS). One tactic table per
+# mode per group: the group's own tuning pass on this wheel (STD_TUNE_ARMS, 128/GPU), merged and pinned for every arm
+# it runs (TACTIC_CHECK: priming_failed=0, cache_miss equal); no seed (FT_COST_E2E_SEED unused). One off/on pair per
+# group (AB or BA, first arm alternating across groups): 4 cases of a 32+128 600 s sweep (~120-140 min) plus a
+# tuning pass do not fit 1.9 h, so v4's 8 pairs = 8 groups x 1 pair instead of 4 groups x ABBA x 2.
+# WINDOW CAP: job.sh's STD sweep passes --iterations 20 (job.sh:2819), so today a load runs min(20, waves): 32/GPU
+# ~218 s (not 600), 128/GPU ~520 s (not 600), 8/GPU ~153 s (not 300). The planned windows need that cap lifted (no
+# knob today); the estimates assume the planned windows (with the cap, cases end earlier).
+# Kills: KILL-FINAL, doc launch (WIDEEP_MPI_MCA without pml/btl), node failure domain, KF_REPEATS=1 unless noted.
+# Fixed trigger WIDEEP_KILL_AFTER_STEPS=$KS for rank5/node1/rank0/deadline/rank5pf/rank5upd; job.sh's twokill and
+# stop rows never pass it (they keep WIDEEP_KILL_IN_DECODE_STEADY / KF_KILL_WINDOW). Victims are fixed in job.sh
+# (rank 5; node 1 = ranks 4-7; twokill 5 then 9; stop rank 2): v4's rotation (5/13/22/29, nodes 1/3/5/7) has no
+# knob, so the 4 repeats of a row reuse one victim. Every row x mode reaches n=4 over the campaign (FINALS_SCHEDULE.md).
+# Case times: gate 4.3-6.0 (8169315/8169329/8178388/8178389); no-EPLB tune 11.4-12.6 (8178389); ready_s no-EPLB
+# 303 s (STD-8178389), online off 547-587 s / ft 646-670 s (STD-8169329, STD-8147471); wave s 8: 7.7, 32: 10.7-11.1,
+# 128: 24-27, 512: 91 (STD-8137627, 8155543, 8140516, 8169329). case = ready + burn-in 1.1 + warm-ups + windows
+# + ~1 + ~0.75 per load (fits 8169329 32-only 15.1-18.1, 8164194 32+128 14.1-16.0, 8137627 4 loads 25.1-25.7).
+# Unmeasured on std (estimates): online/offline tunes = no-EPLB tune + ready_s delta (online +4.5 / +5.9, offline-ft
+# +~3); offline ready = no-EPLB + 0.5 (off) / + 3 (ft); main = our FT off (C30 8138133: 14.3-15.0 vs 14.3-16.8).
+# Kill rows (8169315 / 8178388, std-noeplb-ft.yaml): rank5 11.7/12.5, node1 9.8/9.9, rank0 9.0/9.0, rank5pf
+# 9.7/9.8, deadline 9.4, twokill 11.3/12.2, stop 10.5/11.0; online rank5upd 13.0 (8169315); other online rows =
+# no-EPLB + ~1.5 (ready_s 552 vs 457-498 s); rank5@32 unmeasured (~11.5 / ~13); + ~2 per KILL-FINAL invocation.
+# Readout (run dirs STD-<job>, STD-G1-<job>; first cat <run>/tactic_check.txt and std_layout.txt):
+#   python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job> --off <off-arm>-1
+#     (PRIMARY decode trim mean gap + stall ms/step; END-TO-END client tok/s/GPU over the steady window)
+#   python3 -I $R/mvp/analysis/ctx_stall_cost.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job>   (block C)
+#   python3 -I $R/tools/ctx_classify.py --load healthy-32 --full-pos 5 --off <run>/<off-arm>-1 --on <run>/<ft-arm>-1
+#   KILL_FINAL_VERDICT (incl. H23) in $R/mvp/runs/KILL-FINAL-*-<job>/kill_final.txt (KILL_FINAL_SUMMARY in
+#   $R/logs/bundle/<job>-{0,8}.log); rank0 / deadline pass when the deployment ends on its own <= 180 s.
+# Submit (16 nodes, segment 8) after the refrozen build passed (require_build_pass + verify_wheel 0 differ):
+#   bash $R/tools/require_presubmit.sh <token> && bash $R/launch/fin_h4_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# TODO hash: the refrozen wheel and its source snapshot (no overlay); dry-run again on the real hash before submitting.
+B=build-FREEZE-HASH; SRC=$R/overlays/build-src-FREEZE-HASH; O=
+# SMOKE=1: the same arms, loads, modes, rows, knobs and readouts, short: ~120 s windows, burn-in 2 waves, fewest
+# kill waves, 1 repeat, 1 restart, 1 GSM8K kill. FIN_GROUP=0|8 [FIN_PART=n]: run only that group's command (or its
+# n-th part) in the caller's 8-node group, without the gate (the thin driver launch/fin_smoke_cmd.txt).
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=11,128=5 IT_HX=8=16,512=1 BURN=32:2 KI=3 KI32=8 KSTOP=4 KREP=1 CRR=rank5 ACCR=1
+else
+    IT_MAIN=32=55,128=23 IT_HX=8=40,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 KREP=2 CRR='rank5 rank5 rank5 rank5' ACCR=2
+fi
+# The unit gate's overlay arguments: the source snapshot itself when the wheel carries all of the Python (no overlay).
+OV=${O:-$SRC}; OT=${O:+$O-tests}; OT=${OT:-$SRC}
+T="tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py tests/unittest/_torch/executor/test_multimodal_scheduler.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/executor/test_py_executor.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/finh4-gate$1-\$SLURM_JOB_ID $R/$B/dist $OV $OT $SRC $R/$B/point-units-finh4-g$1 $T"; }
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=${O:+1} WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1"
+# TODO N: fixed kill trigger = rank 0's full-load decode-only steps before the kill (FREEZE_CHECKLIST H4 open).
+KS=200
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=${O:+1} WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 WIDEEP_KILL_AFTER_STEPS=$KS KF_STOP_ITERATIONS=$KSTOP"
+P0_1="$E COST_LOADS=32,128 COST_LOAD_ITERATIONS=$IT_MAIN FT_COST_E2E_ROUND_MIN=$((SMOKE ? 15 : 70)) STD_TUNE_ARMS='std-online std-online-ft' FT_COST_E2E_ARMS='std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD"
+G0="$P0_1"
+P8_1="$E COST_LOADS=32,128 COST_LOAD_ITERATIONS=$IT_MAIN FT_COST_E2E_ROUND_MIN=$((SMOKE ? 15 : 61)) STD_TUNE_ARMS='std-noeplb std-noeplb-ft' FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD-G1"
+P8_2="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_ROWS='rank5 node1' KF_REPEATS=1 bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF"
+G8="{ $P8_1; $P8_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${FIN_PART:-} ]] && v=P${FIN_GROUP}_$FIN_PART
+    [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:7000:$(g 0) && $G0" "8:8:7000:$(g 8) && $G8"

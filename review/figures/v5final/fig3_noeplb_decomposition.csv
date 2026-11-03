@@ -1,0 +1,17 @@
+metric,series,mode,load,group,pct
+trim,FT on vs FT off,noeplb,32,8270779@n0,1.0610124552217135
+trim,FT on vs FT off,noeplb,32,8270779@n8,0.9785465957151475
+trim,FT on vs FT off,noeplb,32,8271451@n0,0.7070183702665165
+trim,FT on vs FT off,noeplb,32,8271451@n8,1.1105562835393767
+trim,FT on vs FT off,noeplb,128,8270779@n0,0.9712467189149098
+trim,FT on vs FT off,noeplb,128,8270779@n8,0.31029602849170446
+trim,FT on vs FT off,noeplb,128,8271451@n0,0.4442937361634803
+trim,FT on vs FT off,noeplb,128,8271451@n8,0.4026909104688782
+client,FT on vs FT off,noeplb,32,8270779@n0,-0.710551073639297
+client,FT on vs FT off,noeplb,32,8270779@n8,2.11527287627764
+client,FT on vs FT off,noeplb,32,8271451@n0,0.029530007692714348
+client,FT on vs FT off,noeplb,32,8271451@n8,0.5809926332800723
+client,FT on vs FT off,noeplb,128,8270779@n0,0.8059131906133846
+client,FT on vs FT off,noeplb,128,8270779@n8,-1.8481500644665174
+client,FT on vs FT off,noeplb,128,8271451@n0,-1.3037529934449528
+client,FT on vs FT off,noeplb,128,8271451@n8,-2.238742315524655

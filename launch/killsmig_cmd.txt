@@ -1,0 +1,11 @@
+# PRELIMINARY kills + MIG-AB bundle (slot B, after build 8108177's tests).
+# G0 (final build 2f635c962d, standard configs, decode-steady kills, graph sizes +136,148, n=1 per row):
+#   KILL-FINAL-OFF-A = w/o EPLB (std-noeplb-ft.yaml) rank5+node1; KILL-FINAL-ON-A = online (std-online.yaml) rank5+node1;
+#   KILL-FINAL-OFF-B = offline (std-offline-ft-filled.yaml, placement from STD job 1) rows from
+#   launch/kf_rows-<job>-KILL-FINAL-OFF-B = "rank5 node1" (written right after submit).
+# G1 (diag build da13f20b76, MIG-AB one group): noft-main-w (smoke) ft-hpin-w ft-w ft-nolog-w, 2 rounds.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-rc1-78836d1723; D=build-diag-da13f20b76
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_REPEATS=1 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1"
+T="MVP_BUILD=$D FINAL_BUILD=$D FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node COST_CASE_TIMEOUT_S=2400 TAIL_ROUNDS=2 FT_COST_E2E_ROUND_MIN=45 TAIL_ITERATIONS=4 TAIL_PAIRS='ft-w:ft-hpin-w ft-w:ft-nolog-w noft-main-w:ft-w' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+bash $R/bundle.sh "0:8:6900:$K KF_BENCH_CONFIG=std-noeplb-ft.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K KF_BENCH_CONFIG=std-online.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A; $K KF_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B" \
+  "8:8:6900:$T FT_COST_E2E_ARMS='noft-main-w ft-hpin-w ft-w ft-nolog-w' bash $R/mvp/harness/run_job.sh TAIL-CTRL-B"

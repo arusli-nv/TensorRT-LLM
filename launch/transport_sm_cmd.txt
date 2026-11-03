@@ -1,0 +1,14 @@
+# TRANSPORT-SM (16 nodes, v5 wheel 2ccc3e8e1c + overlay v5b-409d2bd1f8 = exec'd FT worker): C33.
+# Group 0: KILL-FINAL-OFF-A rows (rank5: node-mates 4,6,7 share its node; node1; ...) with FT's host transport on
+#   ob1 self,sm,tcp + CMA (shared memory within a node), detector off. Pass: every kill recovers (the old sm shrink hang
+#   was node-mates never learning of the failure: the exec'd worker should fix it); detect_s / resume_s comparable to TCP.
+# Group 8: v5 overlay unit gate (launcher exec + exit paths), then healthy A/B at 8 and 32/GPU, same nodes:
+#   off | ft (TCP) | ft-sm. Pass: ft-sm's host-collective p50 near off's (COLL hook) and the 8/GPU late-refill rate /
+#   client cost of ft closes toward off (CLAIMS 155).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5b-409d2bd1f8
+SM="--mca pml ob1 --mca btl self,sm,tcp --mca btl_tcp_if_include eth0 --mca smsc cma --mca coll ^hcoll,ucc"
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=1 WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+g() { echo "PYTEST_ADDOPTS='-k \"not flashinfer_temporary_cleanup\"' bash $R/tools/units_gate.sh $R/logs/bundle/tsm-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $O-tests $R/overlays/build-src-2ccc3e8e1c $R/$B/point-units-409d2bd1f8-g$1 tests/unittest/llmapi/test_mpi_session.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=8,32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_COLL_TIMES=1000 TLLM_TEST_COLL_RANKS=all TLLM_TEST_LOG_ADMIT=1 WIDEEP_TIMED_CLIENT=1"
+bash $R/bundle.sh "0:8:6000:$(g 0) && $K WIDEEP_MPI_MCA='$SM' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A" \
+  "8:8:6000:$(g 8) && $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ft-sm' bash $R/mvp/harness/run_job.sh STD"

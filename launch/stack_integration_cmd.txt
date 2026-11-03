@@ -1,0 +1,12 @@
+# STACK-INTEGRATION (1 node, 4 GPUs): the stack's WideEP integration tests (DeepSeek-V3-Lite NVFP4, EP4) on wheel
+# build-stack-966d3788b3, tests from the snapshot /checkout (= ft-rebase 966d3788b3), TLLM_REQUIRE_ULFM=1 (ULFM Open MPI from the
+# harness). Also the mpi4py install script of commit M6 in a scratch venv (pass: it installs 4.1.2 and the
+# TRTLLM_USE_MPI_KVCACHE patch applies). Pass: every test passes; MPI4PY_INSTALL_OK.
+bash /art/tools/require_presubmit.sh stack-integ-966d3788b3-c7f186b1f0 && [[ $(git -c safe.directory='*' -C /checkout rev-parse --short=10 HEAD) == 966d3788b3 ]] || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+( d=$(mktemp -d) && python3 -m venv --system-site-packages "$d/venv" && . "$d/venv/bin/activate" && cd "$d" \
+  && bash /checkout/docker/common/install_mpi4py.sh > "$d/install.log" 2>&1 \
+  && python3 -c "import mpi4py; assert mpi4py.__version__ == '4.1.2', mpi4py.__version__; import mpi4py.futures._core as c; src = open(c.__file__).read(); assert 'TRTLLM_USE_MPI_KVCACHE' in src; assert 'import os' in src, 'os is not imported'" \
+  && echo MPI4PY_INSTALL_OK || { echo MPI4PY_INSTALL_FAILED; tail -30 "$d/install.log"; } )
+TLLM_REQUIRE_ULFM=1 TESTS=/checkout bash /art/mvp/harness/run_integration.sh build-stack-966d3788b3

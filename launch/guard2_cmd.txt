@@ -1,0 +1,11 @@
+# GUARD2 (16 nodes): the attention-DP gate fix's high-load guard at n>=2 (GATEAB 8153353 group 0 had +1.00 % / +0.87 %
+# whole-window at 128/512 with n=1; CLAIMS 166). FT off, v5 wheel + overlay v5f (base) or vgate-2d08fc1144 (fix, the formatted 733ef6d445),
+# same nodes per group, 2 rounds alternating, group 8 in reverse order: n=4 per arm. The admission log
+# (TLLM_TEST_LOG_ADMIT) shows whether the quiet-burst release fires at high load at all.
+# Pass rule: mean whole-window and client tok/s cost of the fix at 128 and at 512 within 1 % (mean of 4 pairs). If not,
+# read where the rule released early (hold-length histogram) before landing.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5f-f96a8c1a53; G=$R/overlays/vgate-2d08fc1144
+g() { echo "PYTEST_ADDOPTS='-k \"Adp\"' bash $R/tools/units_gate.sh $R/logs/bundle/guard2-gate$1-\$SLURM_JOB_ID $R/$B/dist $G $G-tests $R/overlays/build-src-2ccc3e8e1c $R/$B/point-units-2d08fc1144-g$1 tests/unittest/_torch/executor/test_py_executor.py"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O GATEFIX_OVERLAY=$G COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=128,512 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_LOG_ADMIT=1"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-gatefix' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && $E FT_COST_E2E_ARMS='std-noeplb-gatefix std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

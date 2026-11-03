@@ -1,0 +1,11 @@
+# STRIDE32 (8 nodes): is FT's no-EPLB 32/GPU decode cost the bound dispatch's fixed-slot stride? (review/hostfix/
+# moe_path.md: FT adds no kernels; per-kernel deltas ~1.5 us/layer; the rest is cross-rank wait. Suspect 1: receive
+# rows at s*max_num_tokens+i, 32 regions ~29 MB apart vs ~7 MB packed.) Host taps are excluded (BISECT32-8 round 1:
+# ft-noH = ft). One variable: max_num_tokens 8192 vs 2048 (4x smaller stride), in both arms, so the 2048 side effects
+# (prefill chunking, KV sizing) cancel in the ft-off gap. Same 8 nodes, 2 rounds rotated, v3 wheel (as BISECT32-8).
+# Pass rule (rank-0 stall-free trim mean and median step, healthy-32): gap(2048) <= 1/2 gap(8192) in both rounds ->
+# the stride is the cost (fix: size the slots by the decode capacity or pack within a fixed region). gap(2048) ~
+# gap(8192) -> not the stride; next suspect: the bound dispatch's per-source receive barrier (moe_path.md #2).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:6600:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-mnt2048 std-noeplb-ft-mnt2048' bash $R/mvp/harness/run_job.sh STD"

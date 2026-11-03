@@ -1,0 +1,12 @@
+# A2A-EP2-SMOKE (1 node; monitor-approved gate before A2A-EP2): tools/a2aep_ep.sh with EP4 only, 1 repeat, 20 cycles
+# (both instantiations). Gate (set before data): CODE_V5F_OK on node 0, and the CLAIMS 191 tie at EP4, T=32: stats
+# +0.68 us, no stats +0.57 us, each within 0.4 us. Pass -> submit launch/a2aep_cmd.txt (8 nodes). Fail -> stop, send
+# the numbers to the monitor, change nothing to make it match. Output: review/diag/a2aep-<job>/. ~10 min; --time 00:20.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/a2aep-smoke-${SLURM_JOB_ID:-x}
+mkdir -p "$out"
+A2AEP_NODES=1 A2AEP_REPS=1 A2AEP_CYCLES=20 bash $R/tools/a2aep_ep.sh "$out" > "$out/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+cat "$out/node-0.log"
+exit $rc

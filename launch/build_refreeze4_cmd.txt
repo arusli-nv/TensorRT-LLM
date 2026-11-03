@@ -1,0 +1,8 @@
+# BUILD-REFREEZE4 (1 node, --time 01:10:00): Python-only repackage of v5-final 1117f7e0e7 = refreeze2 65741c820a +
+# 3d10673082/1117f7e0e7 (rank 0 records the owners of requests a survivor started before the quarantine, pure
+# bookkeeping; the readmission stays after the commit, so an aborted recovery still resumes nothing) + 0e5a22ef51 (a
+# failed exchange inside MnnvlMemory.remap propagates without a second exchange). Supersedes BUILD-REFREEZE3 (its
+# 0e5a22ef51 moved the whole requeue before the commit and failed abort_at_commit). Recovery-time only; incremental
+# on build-root-v2 (last built 0e5a22ef51). Snapshot overlays/build-src-8c52d11469 at 1117f7e0e7.
+bash /art/tools/require_presubmit.sh build-refreeze4-1117f7e0e7-bcf068b070 && [[ $(git -c safe.directory='*' -C /checkout rev-parse --short=10 HEAD) == 1117f7e0e7 ]] && TEST_GROUPS='executor' EXTRA_TESTS='tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/_torch/test_mnnvl_memory_remap.py tests/unittest/_torch/test_mnnvl_alltoall_workspace.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/executor/test_py_executor.py tests/unittest/_torch/executor/test_multimodal_scheduler.py tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py tests/unittest/_torch/executor/test_kv_cache_revert.py' bash /art/tools/build_test_all.sh freeze-1117f7e0e7 || exit 1
+echo REFREEZE4_JOB_DONE

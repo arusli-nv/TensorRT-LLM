@@ -1,0 +1,6 @@
+# GATE-V5E (1 node): v5 at c7b13ceb85 on the v5 wheel (2ccc3e8e1c) + overlay v5e-c7b13ceb85. Closes the v5 unit gate's
+# open files (GATE-V5C 8145339): test_mpi_session (test fix 1149eea3aa) and launch_exit (point_units now overlays the
+# source tree); the late-write negative control (mixed-shared must contaminate at 0/3/50 ms, e62f7dc0fc); the
+# bind-time region log (c7b13ceb85) under test_nvlink_one_sided and test_moe_execution_state.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5e-c7b13ceb85
+PYTEST_ADDOPTS='-v -k "not flashinfer_temporary_cleanup"' bash $R/tools/point_units.sh $R/$B/dist $O $O-tests $R/overlays/build-src-2ccc3e8e1c $R/$B/gate-v5e tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py

@@ -1,0 +1,13 @@
+check_removed,case,us_saved,n,min_us,max_us,measured_ft_total_us,ft_off_round_trip_us
+S,with EPLB stats,2.13,3 launches,2.13,2.16,3.00,38.40
+S,without EPLB stats,0.02,3 launches,0.00,0.03,0.88,28.14
+F,with EPLB stats,0.48,3 launches,0.48,0.51,3.00,38.40
+F,without EPLB stats,0.45,3 launches,0.44,0.45,0.88,28.14
+L,with EPLB stats,0.45,3 launches,0.43,0.46,3.00,38.40
+L,without EPLB stats,0.49,3 launches,0.49,0.50,0.88,28.14
+A,with EPLB stats,0.10,3 launches,0.07,0.11,3.00,38.40
+A,without EPLB stats,0.05,3 launches,0.05,0.06,0.88,28.14
+SO,with EPLB stats,0.03,3 launches,0.02,0.04,3.00,38.40
+SO,without EPLB stats,0.03,3 launches,0.02,0.05,0.88,28.14
+ALL,with EPLB stats,2.86,3 launches,2.86,2.88,3.00,38.40
+ALL,without EPLB stats,0.85,3 launches,0.84,0.85,0.88,28.14

@@ -1,0 +1,33 @@
+all modes                load 8-64 all  FT-ob1 11/323  OFF-ucx 4/371  OFF-ob1(ulfm) 0/27  p(FT,OFF)=0.039  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes                load 8-64 mid  FT-ob1 4/323  OFF-ucx 0/371  OFF-ob1(ulfm) 0/27  p(FT,OFF)=0.046  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes                load 8-64 late FT-ob1 5/323  OFF-ucx 1/371  OFF-ob1(ulfm) 0/27  p(FT,OFF)=0.102  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes                load 128-512 all  FT-ob1 35/222  OFF-ucx 65/330  OFF-ob1(ulfm) 2/24  p(FT,OFF)=0.261  p(FT,ULFM)=0.547  p(ULFM,OFF)=0.277
+all modes                load 128-512 mid  FT-ob1 33/222  OFF-ucx 54/330  OFF-ob1(ulfm) 1/24  p(FT,OFF)=0.721  p(FT,ULFM)=0.216  p(ULFM,OFF)=0.147
+all modes                load 128-512 late FT-ob1 34/222  OFF-ucx 57/330  OFF-ob1(ulfm) 2/24  p(FT,OFF)=0.561  p(FT,ULFM)=0.545  p(ULFM,OFF)=0.395
+EPLB online+offline      load 8-64 all  FT-ob1 11/208  OFF-ucx 2/199  OFF-ob1(ulfm) 0/21  p(FT,OFF)=0.021  p(FT,ULFM)=0.605  p(ULFM,OFF)=1.000
+EPLB online+offline      load 8-64 mid  FT-ob1 4/208  OFF-ucx 0/199  OFF-ob1(ulfm) 0/21  p(FT,OFF)=0.124  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+EPLB online+offline      load 8-64 late FT-ob1 5/208  OFF-ucx 0/199  OFF-ob1(ulfm) 0/21  p(FT,OFF)=0.061  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+EPLB online+offline      load 128-512 all  FT-ob1 29/161  OFF-ucx 32/161  OFF-ob1(ulfm) 2/21  p(FT,OFF)=0.776  p(FT,ULFM)=0.537  p(ULFM,OFF)=0.375
+EPLB online+offline      load 128-512 mid  FT-ob1 28/161  OFF-ucx 28/161  OFF-ob1(ulfm) 1/21  p(FT,OFF)=1.000  p(FT,ULFM)=0.206  p(ULFM,OFF)=0.206
+EPLB online+offline      load 128-512 late FT-ob1 29/161  OFF-ucx 29/161  OFF-ob1(ulfm) 2/21  p(FT,OFF)=1.000  p(FT,ULFM)=0.537  p(ULFM,OFF)=0.537
+all modes, from 10-19    load 8-64 all  FT-ob1 10/270  OFF-ucx 2/283  OFF-ob1(ulfm) 0/16  p(FT,OFF)=0.019  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes, from 10-19    load 8-64 mid  FT-ob1 3/270  OFF-ucx 0/283  OFF-ob1(ulfm) 0/16  p(FT,OFF)=0.116  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes, from 10-19    load 8-64 late FT-ob1 4/270  OFF-ucx 0/283  OFF-ob1(ulfm) 0/16  p(FT,OFF)=0.056  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes, from 10-19    load 128-512 all  FT-ob1 2/173  OFF-ucx 7/252  OFF-ob1(ulfm) 0/16  p(FT,OFF)=0.321  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes, from 10-19    load 128-512 mid  FT-ob1 1/173  OFF-ucx 0/252  OFF-ob1(ulfm) 0/16  p(FT,OFF)=0.407  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+all modes, from 10-19    load 128-512 late FT-ob1 1/173  OFF-ucx 1/252  OFF-ob1(ulfm) 0/16  p(FT,OFF)=1.000  p(FT,ULFM)=1.000  p(ULFM,OFF)=1.000
+low-load late or mid bursts:
+  2026-10-18 09:19 GLM53-SCOUT-8045347 glm53-noft ('off-default', 'default(ucx)')  build-borrow-57fd045971    samplers=on nvl72127-T01 {'label': 'healthy-64', 'load': '64', 'win_off_s': 30, 'len_s': 20, 'drop_off_s': 140, 'excess_s': 12.9, 'min_steps': 6}
+  2026-10-16 08:16 L1-LOSS-7993394 sweep-ft-loss ('ft-on', 'ob1-tcp') offline build-final-b1d7fa789d n/a(sett  unknown samplers=off nvl72132-T03 {'label': 'healthy-64', 'load': '64', 'win_off_s': 150, 'len_s': 20, 'drop_off_s': 517, 'excess_s': 6.3, 'min_steps': 262}
+  2026-10-20 21:52 STD-8110144 std-offline-ft-1 ('ft-on', 'ob1-tcp') offline build-rc1-78836d1723 False ghost full(>150G) samplers=on nvl72166-T01 {'label': 'healthy-8', 'load': '8', 'win_off_s': 100, 'len_s': 20, 'drop_off_s': 125, 'excess_s': 7.9, 'min_steps': 388}
+  2026-10-23 15:36 STD-8202865 std-online-ft-1 ('ft-on', 'ob1-tcp') online build-freeze-58caa0fde6 True ghost full(>150G) samplers=off nvl72028-T01 {'label': 'healthy-32', 'load': '32', 'win_off_s': 240, 'len_s': 20, 'drop_off_s': 697, 'excess_s': 8.1, 'min_steps': 198}
+  2026-10-23 18:01 STD-8206860 std-online-ft-1 ('ft-on', 'ob1-tcp') online build-freeze-58caa0fde6 True ghost full(>150G) samplers=off nvl72122-T02 {'label': 'healthy-32', 'load': '32', 'win_off_s': 20, 'len_s': 30, 'drop_off_s': 159, 'excess_s': 11.5, 'min_steps': 158}
+  2026-10-24 14:50 STD-8245492 std-online-ft-1 ('ft-on', 'ob1-tcp') online build-freeze-58caa0fde6 True ghost full(>150G) samplers=off nvl72167-T01 {'label': 'healthy-32', 'load': '32', 'win_off_s': 270, 'len_s': 40, 'drop_off_s': 400, 'excess_s': 13.1, 'min_steps': 219}
+FT-ob1 EPLB arms, load 8-64, by hang_detection: False: late 1/109 mid 1; True: late 3/55 mid 2; n/a(settings: late 1/44 mid 1
+FT-ob1 EPLB arms, load 8-64, by extra_kind: : late 1/81 mid 1; borrowed: late 0/6 mid 0; empty: late 0/10 mid 0; ghost: late 4/111 mid 3
+FT-ob1 EPLB arms, load 8-64, by shm: full(>150G): late 4/176 mid 3; unknown: late 1/32 mid 1
+FT-ob1 EPLB arms, load 8-64, by mode: offline: late 2/69 mid 2; online: late 3/139 mid 2
+FT-ob1 EPLB arms, load 8-64, by samplers: off: late 4/97 mid 3; on: late 1/111 mid 1
+FT-ob1 EPLB arms, load 8-64, by ulfm_detector: False: late 4/104 mid 3; True: late 1/104 mid 1
+FT-ob1 EPLB arms, load 8-64, by day: 2026-10-16: late 1/5 mid 1; 2026-10-17: late 0/24 mid 0; 2026-10-18: late 0/20 mid 0; 2026-10-19: late 0/28 mid 0; 2026-10-20: late 1/51 mid 1; 2026-10-21: late 0/23 mid 0; 2026-10-22: late 0/1 mid 0; 2026-10-23: late 2/12 mid 1; 2026-10-24: late 1/44 mid 1
+FT-ob1 EPLB arms, load 8-64, by build: : late 0/38 mid 0; build-all2-a4aa5440e0: late 0/2 mid 0; build-borrow-57fd045971: late 0/6 mid 0; build-dev-28ea730a19: late 0/3 mid 0; build-dev-4c27cd5a98: late 0/3 mid 0; build-dev-cf36fc9386: late 0/3 mid 0; build-devs-f4afe429ba: late 0/2 mid 0; build-diag-da13f20b76: late 0/10 mid 0; build-final-183d390691: late 0/3 mid 0; build-final-2945b0f5bb: late 0/7 mid 0; build-final-547a6aa7ed: late 0/2 mid 0; build-final-aae00e6c65: late 0/8 mid 0; build-final-b1d7fa789d: late 1/5 mid 1; build-freeze-1117f7e0e7: late 0/1 mid 0; build-freeze-58caa0fde6: late 3/53 mid 2; build-freeze-7e8dfb37df: late 0/2 mid 0; build-mtp-3430226df5: late 0/2 mid 0; build-next-6b2a752418: late 0/2 mid 0; build-next-fcc86b10b2: late 0/15 mid 0; build-pr8-937403a6cc: late 0/7 mid 0; build-rc1-78836d1723: late 1/2 mid 1; build-restore2-9911149fa0: late 0/8 mid 0; build-v2-cef4670789: late 0/11 mid 0; build-v3-bcea8da496: late 0/12 mid 0; build-v5zero-f9e6bc0f8b: late 0/1 mid 0

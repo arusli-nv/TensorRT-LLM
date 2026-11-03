@@ -1,0 +1,62 @@
+V2 C++ review fixes (#6, #9). Branch v2-cpp in worktree /tmp/claude-161238/wt-v2cpp, based on ft-final2 (8d0ec8cf1c).
+Nothing was built or run: there is no CUDA toolchain, torch or nanobind here. Pre-commit passes on every commit, and py_compile passes on the changed .py files.
+
+#6 restorePlacement race / FT-off install
+  2bf00c666a [None][fix] Restore an EPLB placement only under fault tolerance and while quiesced
+    cpp/tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.cpp +4/-0
+      TLLM_CHECK_WITH_INFO(mFaultToleranceMode, ...) right after the finalized check.
+      TLLM_CHECK_WITH_INFO(mWorkerDoneIterId == mIterId, "...only be restored while quiesced.") after the queue check.
+      Both reuse existing state and match resetUpdateSchedule.
+    cpp/tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h +1/-1 (doc)
+    cpp/tests/unit_tests/runtime/moeLoadBalancerTest.cpp +40/-0
+      MoeLoadBalancerRestoreTest.RestorePlacementNeedsQuiesce: startIter, wait for the GPU stage (the worker has
+        popped the iteration), endIter, then restore throws and the placement is unchanged. Set the CPU stage,
+        quiesce, and the same restore installs (slot loaded).
+      MoeLoadBalancerFaultToleranceOffTest.RestorePlacementIsRejected: with FT off, restore throws and the placement
+        is unchanged.
+  Verified the finding as real: the worker pops the queue and walks the layers unlocked, so the old
+  !mIterActive && queue.empty() check passed mid-walk. The Python caller (peer_loss_recovery.py:931) already quiesces
+  online EPLB first. With static EPLB, startIter is never called, so mIterId == mWorkerDoneIterId == -1 and the
+  check passes.
+  Skipped the "restore 2-3 gtests" part because it is stale for ft-final2: that file still has all 9
+  MoeLoadBalancerRestoreTest cases driving the real restorePlacement/validatePlacement/updater. All of them call
+  restore at construction or after runUpdate()+quiesce, so the new checks keep them passing.
+  Not done: moving moeLoadBalancerTest to add_tllm_gtest. It is not a new test, and main still uses add_gtest for it.
+
+#9 PR 4 peer-failure watch
+  4d629cf3cd [None][fix] Detach the peer-failure watch thread when its own callback destroys the watch
+    cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.cpp +31/-8
+      When destroyed on the watch thread, the destructor now calls mThread.detach() plus the MPI request release
+      under the existing once_flag, instead of stop(). Before, stop() returned false and ~std::thread hit
+      std::terminate. The cancel/wait is factored into releaseRequest().
+    tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py +9/-3
+      In the "replan" case, the survivor watch's callback drops the last reference to its watch, so the real native
+      watch is destroyed on its own thread.
+    No gtest: PeerFailureWatch sits in an anonymous namespace in a nanobind TU and needs ULFM MPI, so there is no
+    gtest target for it. The ULFM test is the only real-native coverage, and it skips without ULFM (as in CI today).
+  1e966a7a2b [None][fix] Refuse a peer-failure watch before recovery is enabled and a survivor barrier before shrink
+    tensorrt_llm/_torch/distributed/communicator.py +14/-1
+      watch_peer_failures raises RuntimeError without enable_peer_loss_recovery().
+      barrier_among_survivors raises RuntimeError without a prior shrink().
+    tests/unittest/_torch/distributed/test_mpi_survivors.py +7/-0
+      test_survivor_calls_refuse_to_run_before_their_setup
+  65888ccf8c [None][fix] Report failed MPI ranks as unsupported under mpi4py<4 instead of raising AttributeError
+    tensorrt_llm/_utils.py +5/-1
+      mpi_failed_ranks raises NotImplementedError("...requires mpi4py>=4") when comm has no Get_failed.
+    tests/unittest/_torch/distributed/test_mpi_survivors.py +6/-0
+      test_failed_ranks_need_mpi4py_4
+    The startup fail-fast already existed: MPIDist.enable_peer_loss_recovery raises "Peer-loss recovery requires
+    mpi4py>=4" at worker startup (peer_loss_recovery.py:170/462), and there is a test for it. The unprotected path
+    was mpi_session._num_failed_ranks in the session/parent process. It now takes its existing NotImplementedError
+    branch (returns 0), so the worker's startup error surfaces instead of an AttributeError. mpi_exit.py does not
+    exist in ft-final2 (the move was reverted). I did not add a startup check to peer_loss_recovery_enabled(): it is
+    also called from serve error paths, where a raise would hide the real error.
+
+Compile risk (low)
+  peerFailureWatch.cpp: the new private members stopForDestruction/releaseRequest are used from the destructor,
+    stop() and a call_once lambda, which is fine inside a class.
+  moeLoadBalancerTest.cpp: uses only helpers already in the file.
+Residual risk (#9): after the detach, the watch thread finishes report()/watch() after the object is freed. It
+  touches no member after onFailure returns. The std::function (nanobind pyfunc wrapper) is destroyed during its own
+  call; after the Python call returns, nanobind does not read its members, but this relies on that implementation.
+  Untested at runtime until a ULFM run executes the replan case.

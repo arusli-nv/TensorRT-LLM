@@ -1,0 +1,6 @@
+case,rank,release_ms,barrier_ms,make_room_ms,cxg_ms,rest_ms,other_ms,import_map_ms,outcome_ms,other_printed_ms,import_map_printed_ms,outcome_printed_ms,total_ms,min_total_ms,max_total_ms,max_import_map_ms
+KILL-FINAL-OFF-8308514/rank5-1,9,11.5,42.4,18.7,21.8,2.7,97.1,347.9,475.5,97,348,475,920.5,895.3,942.0,822.4
+KILL-FINAL-OFF-8308514/rank5-2,9,13.8,84.4,34.0,23.3,2.8,158.3,820.8,13.3,158,821,13,992.4,978.6,998.1,833.1
+KILL-FINAL-OFF-B-8308514/rank5-1,28,10.7,115.1,29.5,23.2,2.7,181.2,811.1,15.6,181,811,16,1007.9,909.9,1008.4,825.9
+KILL-FINAL-ON-8308514/rank5-1,19,11.4,19.9,28.0,14.7,2.6,76.6,315.8,4.1,76,316,4,396.5,396.2,397.0,318.9
+KILL-FINAL-ON-8308514/rank5-2,15,10.8,25.1,20.0,15.4,2.6,73.9,332.0,1.0,74,332,1,406.9,399.1,407.3,332.1

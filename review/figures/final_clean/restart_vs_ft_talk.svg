@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="792pt" height="266.4pt" viewBox="0 0 792 266.4" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-10-27T07:18:25.011035</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.6.3, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 266.4 
+L 792 266.4 
+L 792 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 110.88 223.776 
+L 776.16 223.776 
+L 776.16 55.44 
+L 110.88 55.44 
+z
+" style="fill: #ffffff"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1">
+      <path d="M 197.845193 223.776 
+L 197.845193 55.44 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke-dasharray: 0.8,1.32; stroke-dashoffset: 0; stroke: #d5d5d5; stroke-width: 0.8"/>
+     </g>
+     <g id="line2d_2"/>
+     <g id="text_1">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: middle" x="197.845193" y="237.587875" transform="rotate(-0 197.845193 237.587875)">1 s</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_3">
+      <path d="M 364.165193 223.776 
+L 364.165193 55.44 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke-dasharray: 0.8,1.32; stroke-dashoffset: 0; stroke: #d5d5d5; stroke-width: 0.8"/>
+     </g>
+     <g id="line2d_4"/>
+     <g id="text_2">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: middle" x="364.165193" y="237.587875" transform="rotate(-0 364.165193 237.587875)">10 s</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_5">
+      <path d="M 493.587309 223.776 
+L 493.587309 55.44 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke-dasharray: 0.8,1.32; stroke-dashoffset: 0; stroke: #d5d5d5; stroke-width: 0.8"/>
+     </g>
+     <g id="line2d_6"/>
+     <g id="text_3">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: middle" x="493.587309" y="237.587875" transform="rotate(-0 493.587309 237.587875)">1 min</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_7">
+      <path d="M 659.907309 223.776 
+L 659.907309 55.44 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke-dasharray: 0.8,1.32; stroke-dashoffset: 0; stroke: #d5d5d5; stroke-width: 0.8"/>
+     </g>
+     <g id="line2d_8"/>
+     <g id="text_4">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: middle" x="659.907309" y="237.587875" transform="rotate(-0 659.907309 237.587875)">10 min</text>
+     </g>
+    </g>
+    <g id="text_5">
+     <text style="fill: #4f5d75; font: 15px 'Lato'; text-anchor: middle" x="443.52" y="255.621781" transform="rotate(-0 443.52 255.621781)">time to serve again after losing one rank (log scale)</text>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_9"/>
+     <g id="text_6">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: end" x="107.38" y="96.303574" transform="rotate(-0 107.38 96.303574)">No EPLB</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_10"/>
+     <g id="text_7">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: end" x="107.38" y="147.314483" transform="rotate(-0 107.38 147.314483)">Offline EPLB</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="line2d_11"/>
+     <g id="text_8">
+      <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: end" x="107.38" y="198.325392" transform="rotate(-0 107.38 198.325392)">Online EPLB</text>
+     </g>
+    </g>
+   </g>
+   <g id="line2d_12">
+    <path d="M 227.252977 91.147636 
+L 618.753186 91.147636 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke: #d5d5d5; stroke-width: 2; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_13">
+    <path d="M 215.676355 142.158545 
+L 625.261298 142.158545 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke: #d5d5d5; stroke-width: 2; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_14">
+    <path d="M 188.611551 193.169455 
+L 662.99451 193.169455 
+" clip-path="url(#p1a637106fc)" style="fill: none; stroke: #d5d5d5; stroke-width: 2; stroke-linecap: round"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 110.88 223.776 
+L 776.16 223.776 
+" style="fill: none; stroke: #bfc0c0; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_9">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: end" x="211.134904" y="95.463652" transform="rotate(-0 211.134904 95.463652)">1.50 s</text>
+   </g>
+   <g id="text_10">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: start" x="634.871259" y="95.463652" transform="rotate(-0 634.871259 95.463652)">5.7 min</text>
+   </g>
+   <g id="text_11">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: middle" x="423.003082" y="80.473391" transform="rotate(-0 423.003082 80.473391)">226× faster</text>
+   </g>
+   <g id="text_12">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: end" x="199.558282" y="146.474561" transform="rotate(-0 199.558282 146.474561)">1.28 s</text>
+   </g>
+   <g id="text_13">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: start" x="641.379371" y="146.474561" transform="rotate(-0 641.379371 146.474561)">6.2 min</text>
+   </g>
+   <g id="text_14">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: middle" x="420.468826" y="131.4843" transform="rotate(-0 420.468826 131.4843)">290× faster</text>
+   </g>
+   <g id="text_15">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: end" x="172.493478" y="197.48547" transform="rotate(-0 172.493478 197.48547)">0.88 s</text>
+   </g>
+   <g id="text_16">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: start" x="679.112583" y="197.48547" transform="rotate(-0 679.112583 197.48547)">10.4 min</text>
+   </g>
+   <g id="text_17">
+    <text style="fill: #2d3142; font: 700 15px 'Lato'; text-anchor: middle" x="425.80303" y="182.495209" transform="rotate(-0 425.80303 182.495209)">712× faster</text>
+   </g>
+   <g id="line2d_15">
+    <defs>
+     <path id="m3cc5d8ee2d" d="M 0 8.5 
+C 2.254226 8.5 4.416429 7.604386 6.010408 6.010408 
+C 7.604386 4.416429 8.5 2.254226 8.5 0 
+C 8.5 -2.254226 7.604386 -4.416429 6.010408 -6.010408 
+C 4.416429 -7.604386 2.254226 -8.5 0 -8.5 
+C -2.254226 -8.5 -4.416429 -7.604386 -6.010408 -6.010408 
+C -7.604386 -4.416429 -8.5 -2.254226 -8.5 0 
+C -8.5 2.254226 -7.604386 4.416429 -6.010408 6.010408 
+C -4.416429 7.604386 -2.254226 8.5 0 8.5 
+z
+" style="stroke: #458f19; stroke-width: 1.5"/>
+    </defs>
+    <g clip-path="url(#p1a637106fc)">
+     <use xlink:href="#m3cc5d8ee2d" x="227.252977" y="91.147636" style="fill: #76b900; stroke: #458f19; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_16">
+    <defs>
+     <path id="ma00d8361fc" d="M 0 8.5 
+C 2.254226 8.5 4.416429 7.604386 6.010408 6.010408 
+C 7.604386 4.416429 8.5 2.254226 8.5 0 
+C 8.5 -2.254226 7.604386 -4.416429 6.010408 -6.010408 
+C 4.416429 -7.604386 2.254226 -8.5 0 -8.5 
+C -2.254226 -8.5 -4.416429 -7.604386 -6.010408 -6.010408 
+C -7.604386 -4.416429 -8.5 -2.254226 -8.5 0 
+C -8.5 2.254226 -7.604386 4.416429 -6.010408 6.010408 
+C -4.416429 7.604386 -2.254226 8.5 0 8.5 
+z
+" style="stroke: #2d3142; stroke-width: 1.5"/>
+    </defs>
+    <g clip-path="url(#p1a637106fc)">
+     <use xlink:href="#ma00d8361fc" x="618.753186" y="91.147636" style="fill: #8c99a6; stroke: #2d3142; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_17">
+    <g clip-path="url(#p1a637106fc)">
+     <use xlink:href="#m3cc5d8ee2d" x="215.676355" y="142.158545" style="fill: #76b900; stroke: #458f19; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_18">
+    <g clip-path="url(#p1a637106fc)">
+     <use xlink:href="#ma00d8361fc" x="625.261298" y="142.158545" style="fill: #8c99a6; stroke: #2d3142; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_19">
+    <g clip-path="url(#p1a637106fc)">
+     <use xlink:href="#m3cc5d8ee2d" x="188.611551" y="193.169455" style="fill: #76b900; stroke: #458f19; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_20">
+    <g clip-path="url(#p1a637106fc)">
+     <use xlink:href="#ma00d8361fc" x="662.99451" y="193.169455" style="fill: #8c99a6; stroke: #2d3142; stroke-width: 1.5"/>
+    </g>
+   </g>
+  </g>
+  <g id="legend_1">
+   <g id="line2d_21">
+    <defs>
+     <path id="m3fd1e92921" d="M 0 6.5 
+C 1.72382 6.5 3.377269 5.815119 4.596194 4.596194 
+C 5.815119 3.377269 6.5 1.72382 6.5 0 
+C 6.5 -1.72382 5.815119 -3.377269 4.596194 -4.596194 
+C 3.377269 -5.815119 1.72382 -6.5 0 -6.5 
+C -1.72382 -6.5 -3.377269 -5.815119 -4.596194 -4.596194 
+C -5.815119 -3.377269 -6.5 -1.72382 -6.5 0 
+C -6.5 1.72382 -5.815119 3.377269 -4.596194 4.596194 
+C -3.377269 5.815119 -1.72382 6.5 0 6.5 
+z
+" style="stroke: #458f19"/>
+    </defs>
+    <g>
+     <use xlink:href="#m3fd1e92921" x="52.448" y="19.77" style="fill: #76b900; stroke: #458f19"/>
+    </g>
+   </g>
+   <g id="text_18">
+    <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: start" x="72.048" y="25.3" transform="rotate(-0 72.048 25.3)">FT on, recovery</text>
+   </g>
+   <g id="line2d_22">
+    <defs>
+     <path id="mfca97fb77b" d="M 0 6.5 
+C 1.72382 6.5 3.377269 5.815119 4.596194 4.596194 
+C 5.815119 3.377269 6.5 1.72382 6.5 0 
+C 6.5 -1.72382 5.815119 -3.377269 4.596194 -4.596194 
+C 3.377269 -5.815119 1.72382 -6.5 0 -6.5 
+C -1.72382 -6.5 -3.377269 -5.815119 -4.596194 -4.596194 
+C -5.815119 -3.377269 -6.5 -1.72382 -6.5 0 
+C -6.5 1.72382 -5.815119 3.377269 -4.596194 4.596194 
+C -3.377269 5.815119 -1.72382 6.5 0 6.5 
+z
+" style="stroke: #2d3142"/>
+    </defs>
+    <g>
+     <use xlink:href="#mfca97fb77b" x="199.165812" y="19.77" style="fill: #8c99a6; stroke: #2d3142"/>
+    </g>
+   </g>
+   <g id="text_19">
+    <text style="fill: #4f5d75; font: 14px 'Lato'; text-anchor: start" x="218.765812" y="25.3" transform="rotate(-0 218.765812 25.3)">restart without FT</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p1a637106fc">
+   <rect x="110.88" y="55.44" width="665.28" height="168.336"/>
+  </clipPath>
+ </defs>
+</svg>

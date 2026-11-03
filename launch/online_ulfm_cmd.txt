@@ -1,0 +1,12 @@
+# ONLINE-ULFM (16 nodes): is online EPLB's FT context-step cost (+15% at 32, +7% at 128 median, CLAIMS 149) the ULFM
+# launcher/transport (ob1, TCP also within a node) or FT's own work? Arms std-online | std-online-ulfm (FT off on FT's
+# launcher) | std-online-ft at 32 and 128/GPU, same nodes, mirrored order across two node sets (n=1 per set).
+# Readout per arm and load: decode median, context-step median, slow-step rate (ctx_stall_cost.py), host-collective
+# times on every rank (WIDEEP_COLL). Prediction if transport: ulfm ~ ft on context steps, both above off.
+# BUNDLE_FILL: a group that ends early reruns off|ft at 32 (STD-G2/-G3) until the other group ends.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32,128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_COLL_TIMES=1000 TLLM_TEST_COLL_RANKS=all"
+export BUNDLE_FILL_0="$E COST_LOADS=32 FT_COST_E2E_ARMS='std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD-G2"
+export BUNDLE_FILL_8="$E COST_LOADS=32 FT_COST_E2E_ARMS='std-online-ft std-online' bash $R/mvp/harness/run_job.sh STD-G3"
+bash $R/bundle.sh "0:8:6300:$E FT_COST_E2E_ARMS='std-online std-online-ulfm std-online-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:6300:$E FT_COST_E2E_ARMS='std-online-ft std-online-ulfm std-online' bash $R/mvp/harness/run_job.sh STD-G1"

@@ -1,0 +1,7 @@
+# NSYS32 (8 nodes): where FT's own no-EPLB 32/GPU decode cost goes (CLAIMS 155: ft +3.7%, ulfm +0.7%; C5).
+# Arms off | ft at 32/GPU, STD_NSYS=1: one 50-step nsys window (the length that worked, PDL-AB 8121996) on ranks 0+5,
+# 20 s into the load, kernels + host (no Python sampling, to keep the window light). Readout: per-step time by kernel
+# (dispatch, combine, sort, GEMMs, attention) and the host gaps between graph replays, ft vs off.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:3600:$E STD_NSYS=1 WIDEEP_LAUNCHER_GRACE_S=300 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD"

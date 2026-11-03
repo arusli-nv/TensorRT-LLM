@@ -1,0 +1,11 @@
+# BUILD-REFREEZE2 (1 node): Python-only repackage of v5-final 7e8dfb37df = e25e638054 + ddc2658518 (FT-off guard back in
+# _note_step_change: the refreeze's FT-off + overlap-scheduler P0 that failed TUNE-FREEZE 8183157/8183167) + 7e8dfb37df
+# (test-only: FT-off sync/overlap integration case). C++ unchanged since 8c52d11469 (build-root-v2's last build): incremental.
+# Mounts as BUILD-REFREEZE (build-root-v2:/art/build-root, overlays/build-src-8c52d11469 now at 7e8dfb37df:/checkout).
+# Then a negative control: the new FT-off overlap case on the OLD wheel build-freeze-8c52d11469 must fail (NEGCTL rc!=0).
+bash /art/tools/require_presubmit.sh build-refreeze2-7e8dfb37df-20a81d9d02 && [[ $(git -c safe.directory='*' -C /checkout rev-parse --short=10 HEAD) == 7e8dfb37df ]] && TEST_GROUPS='executor' EXTRA_TESTS='tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/_torch/executor/test_py_executor.py tests/unittest/_torch/executor/kv_cache/test_kv_pool_rebalance.py tests/unittest/_torch/executor/test_multimodal_scheduler.py tests/unittest/_torch/executor/test_kv_cache_revert.py' bash /art/tools/build_test_all.sh freeze-7e8dfb37df || exit 1
+C=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+out=$C/mvp/runs/NEGCTL-8c52d11469-$SLURM_JOB_ID; mkdir -p $out
+bash $C/install_wheel.sh $C/build-freeze-8c52d11469/dist $out/install.log && (cd /checkout/tests/integration/defs && LLM_MODELS_ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common timeout 1500 python3 -m pytest -v -p no:cacheprovider --timeout=1200 --basetemp=$out/pytest "wide_ep_ft/test_peer_loss_recovery.py::test_serving_without_fault_tolerance[overlap]" > $out/test.log 2>&1; echo "NEGCTL rc=$? (expect nonzero)" | tee -a $out/test.log)
+grep -rlE "_note_step_change|has no attribute 'append'" $out/pytest 2>/dev/null | head -3
+echo REFREEZE2_JOB_DONE

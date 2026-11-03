@@ -1,0 +1,159 @@
+commit d91ce454b34019b79d1eeb5ee06b23cc7564c2be
+Author: Andrew Rusli <arusli@nvidia.com>
+Date:   Fri Oct 23 14:22:57 2026 -0700
+
+    [None][fix] Keep the recovery HMAC key out of child processes
+    
+    load_key() caches the key and scrubs it from the environment at its first call; the authority's fence command gets an environment without it.
+    
+    FT-off guards:
+    FT-on only: the key is read only when peer-loss recovery is enabled.
+    
+    Signed-off-by: Andrew Rusli <arusli@nvidia.com>
+
+diff --git a/tensorrt_llm/executor/recovery/authority.py b/tensorrt_llm/executor/recovery/authority.py
+index 4f5a6d27da..abb0406d7f 100644
+--- a/tensorrt_llm/executor/recovery/authority.py
++++ b/tensorrt_llm/executor/recovery/authority.py
+@@ -31,7 +31,7 @@ import zmq
+ 
+ from ...logger import logger
+ from ..ipc import ZeroMqQueue
+-from .client import CONNECTION_OPTIONS, load_key, unauthenticated
++from .client import AUTHORITY_KEY_ENV, CONNECTION_OPTIONS, load_key, unauthenticated
+ from .config import COMMAND_FENCE_GRACE_S, CONFIG_ENV, FaultToleranceConfig, fault_tolerance_config
+ from .hang_monitor import HangMonitor, HungRank
+ from .protocol import (
+@@ -808,7 +808,12 @@ def command_fence(template: str) -> Callable[[HungRank], None]:
+             return
+         command = [arg.format(host=hung.host, pid=hung.pid) for arg in arguments]
+         try:
+-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
++            process = subprocess.Popen(
++                command,
++                stdin=subprocess.DEVNULL,
++                start_new_session=True,
++                env={k: v for k, v in os.environ.items() if k != AUTHORITY_KEY_ENV},
++            )
+         except OSError as error:
+             logger.error(
+                 f"Recovery authority: fencing rank {hung.rank} with {command} failed: {error}"
+diff --git a/tensorrt_llm/executor/recovery/client.py b/tensorrt_llm/executor/recovery/client.py
+index 2bd88863c0..108ffea8ba 100644
+--- a/tensorrt_llm/executor/recovery/client.py
++++ b/tensorrt_llm/executor/recovery/client.py
+@@ -16,6 +16,7 @@ import zmq
+ from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
+ 
+ from ..ipc import ZeroMqQueue
++from ..utils import _scrub_process_env_value
+ from .config import fault_tolerance_config
+ from .protocol import MAX_MESSAGE_BYTES, Abort, Message, Register, Registered, Sent, is_message
+ 
+@@ -51,14 +52,22 @@ CONNECTION_OPTIONS = {
+ }
+ 
+ _M = TypeVar("_M")
++# The HMAC key, once read from the environment (which no longer holds it).
++_KEY: bytes | None = None
+ 
+ 
+ def load_key() -> bytes:
+     """Return the HMAC key held in ``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`` as hex.
+ 
++    The first call removes the key from the environment, so no child process inherits it; later calls return it
++    again.
++
+     Raises:
+         ValueError: The key is missing, not hex, or shorter than 16 bytes.
+     """
++    global _KEY
++    if _KEY is not None:
++        return _KEY
+     text = os.environ.get(AUTHORITY_KEY_ENV)
+     if not text:
+         raise ValueError(f"{AUTHORITY_KEY_ENV} is not set")
+@@ -68,6 +77,9 @@ def load_key() -> bytes:
+         raise ValueError(f"{AUTHORITY_KEY_ENV} is not a hex string") from error
+     if len(key) < _MIN_KEY_BYTES:
+         raise ValueError(f"{AUTHORITY_KEY_ENV} must hold at least {_MIN_KEY_BYTES} bytes")
++    _scrub_process_env_value(AUTHORITY_KEY_ENV, text)
++    os.environ.pop(AUTHORITY_KEY_ENV, None)
++    _KEY = key
+     return key
+ 
+ 
+diff --git a/tests/unittest/executor/test_recovery_authority.py b/tests/unittest/executor/test_recovery_authority.py
+index f588c85a2c..d2d14460fb 100644
+--- a/tests/unittest/executor/test_recovery_authority.py
++++ b/tests/unittest/executor/test_recovery_authority.py
+@@ -3,6 +3,7 @@
+ """Recovery authority state machine, wire protocol, and client."""
+ 
+ import hmac
++import os
+ import pickle  # nosec B403
+ import threading
+ import time
+@@ -609,6 +610,12 @@ def test_malformed_datagrams_are_rejected(payload):
+     assert protocol.decode_datagram(payload + tag, KEY) is None
+ 
+ 
++@pytest.fixture(autouse=True)
++def _key_not_loaded(monkeypatch):
++    """Each test starts before the process read its HMAC key."""
++    monkeypatch.setattr(recovery_client, "_KEY", None)
++
++
+ def test_load_key_validates_the_environment(monkeypatch):
+     env = recovery_client.AUTHORITY_KEY_ENV
+     monkeypatch.delenv(env, raising=False)
+@@ -624,6 +631,14 @@ def test_load_key_validates_the_environment(monkeypatch):
+     assert recovery_client.load_key() == KEY
+ 
+ 
++def test_load_key_removes_the_key_from_the_environment(monkeypatch):
++    """No child process inherits the key; the process still has it."""
++    monkeypatch.setenv(recovery_client.AUTHORITY_KEY_ENV, KEY.hex())
++    assert recovery_client.load_key() == KEY
++    assert recovery_client.AUTHORITY_KEY_ENV not in os.environ
++    assert recovery_client.load_key() == KEY
++
++
+ def test_client_from_env(monkeypatch):
+     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
+diff --git a/tests/unittest/executor/test_recovery_hang_monitor.py b/tests/unittest/executor/test_recovery_hang_monitor.py
+index 8d29b73d9c..70b3425a48 100644
+--- a/tests/unittest/executor/test_recovery_hang_monitor.py
++++ b/tests/unittest/executor/test_recovery_hang_monitor.py
+@@ -4,6 +4,7 @@
+ 
+ import hashlib
+ import hmac
++import os
+ import pickle  # nosec B403
+ import socket
+ import subprocess
+@@ -406,6 +407,21 @@ def test_command_fence_fills_host_and_pid_and_runs_without_a_shell():
+     assert launched == [["ssh", "node-7", "kill", "-KILL", "4242"]]
+ 
+ 
++def test_command_fence_never_passes_the_hmac_key(monkeypatch):
++    """The fence command does not inherit the authority's key, even while the environment still holds it."""
++    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY_KEY", "00" * 32)
++    envs = []
++    monkeypatch.setattr(
++        authority_module.subprocess,
++        "Popen",
++        lambda command, **kwargs: envs.append(kwargs.get("env")) or Mock(wait=lambda: 0),
++    )
++    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", "node-7", 4242))
++    (env,) = envs
++    assert env is not None and "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY" not in env
++    assert env["PATH"] == os.environ["PATH"]
++
++
+ def test_command_fence_reaps_the_command_and_logs_its_failure(monkeypatch):
+     processes, errors = [], []
+     popen = subprocess.Popen

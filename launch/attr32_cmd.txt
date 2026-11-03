@@ -1,0 +1,22 @@
+# ATTR32 (16 nodes): attribute the no-EPLB FT cost (+2.7% v2 finals, +4.4% LAY32 n=1/set).
+# Known (HANDOFF 06:00, nsys 8119878): the extra time is inside FT's all-to-all kernels (dispatch +2.8 us, combine
+# +3.4 us per layer at 32/GPU); expert GEMMs unchanged; PDL at most a third (PDL-AB 8121996). Not known: why those
+# kernels are slower at EP32 (1-node EP4 microbench shows no gap, A2A-BENCH 8121588) and why only near 32/GPU.
+# Group 0 (no profiler), loads 8/32/64/128 per GPU (16 dropped: short QOS caps a job at 120 min), arms in order off, ft, ulfm (the key pair first): off | off on FT's ULFM launcher | FT on. The FT - off curve over
+#   tokens per rank (load x 2 with MTP1) tells a fixed per-call cost (falls as messages grow) from a size-regime step
+#   (bucket / CTA-count threshold) or a load-specific effect; ulfm - off is the launcher's share at each load. The
+#   320-slot layout's share at 32 comes from FINLAY 8136440 (lb vs lay320). n=1 per cell: a lead.
+#   Monitor's hypothesis: FT's host collectives on the ULFM transport lengthen context steps and let ADP ranks drift
+#   out of admission phase (more eager stalls at low load). Readout per arm and load: decode median, ctx-step median,
+#   >=150 ms steps per minute (ctx_stall_cost.py), and rank 0's host-collective times (TLLM_TEST_COLL_TIMES=2000:
+#   WIDEEP_COLL lines). ulfm ~ ft on both means the fix is in the transport config, not FT code.
+# Group 8: NCU32's hardware set on rank 1 (dispatch/prepare/combine kernels, ~1 step, 60 s into 32/GPU): duration, DRAM,
+#   L2, NVLink bytes for off | lay320 | ft: more bytes or more waiting. The window opens at full-load decode, so each
+#   rank carries ~64 tokens per launch (32 requests x 2 with MTP1, ADP-balanced); rank 0's iteration lines over the
+#   window give the exact count for normalizing bytes. (Long nsys windows hang the profiled ranks in this
+#   harness, 8119878/8124393, so no nsys here.)
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+X='[[ $SLURM_NODEID == 0 ]] && for f in '"$R"'/mvp/runs/$J-$SLURM_JOB_ID/*/ncu-rank1.ncu-rep; do ncu=$(command -v ncu || ls /usr/local/cuda/bin/ncu /opt/nvidia/nsight-compute/*/ncu 2>/dev/null | head -1); $ncu --import "$f" --csv --page raw > "${f%.ncu-rep}.csv" 2>&1; echo "NCU_CSV $f $(wc -l < "${f%.ncu-rep}.csv")"; done'
+bash $R/bundle.sh "0:8:6600:$E COST_LOADS=8,32,64,128 TLLM_TEST_COLL_TIMES=2000 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ulfm' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:5100:$E COST_LOADS=32 WIDEEP_LAUNCHER_GRACE_S=240 FT_COST_E2E_ARMS='std-noeplb-ft-ncuhw std-noeplb-lay320-ncuhw std-noeplb-ncuhw' bash $R/mvp/harness/run_job.sh STD-G1; J=STD-G1; $X"

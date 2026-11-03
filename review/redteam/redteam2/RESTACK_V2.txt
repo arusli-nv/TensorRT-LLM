@@ -1,0 +1,409 @@
+RESTACK V2: WideEP FT in two waves (DRAFT, local branches only; nothing pushed, no PR opened)
+Written 22:43 PT by the restack integrator.
+
+== SOURCE AND BASE ==
+- Base: prmain-all = 6837295b9c = upstream/main 0829689c52 + merges of the rewritten one-commit prmain/01..07
+  (6ffa651379 c29ff974f0 192c29b269 969c1ec487 98c6d90bab 5e8929a8ac 4bac439bae). Old merge chain kept as prmain-all-old.
+- Source of truth: ft-final f8b425ea0a.
+  - rt2's tree (626f39b405, checked at 21:45) equals ft-src = fix-final8 4de25459ce + the 4 rt2-org moves.
+  - ft-src2 adds the prmain rewording (docker script, test_kv_cache_revert docstring).
+  - ft-src3 (c3601e76c0) adds the PR-2 CFT dead-code deletion.
+  - ft-final adds 4357379af6 (recompute-victim pause) and f8b425ea0a (guide limits).
+- fix-final8-lean = ft-final + 9e1717743b "[None][test] Trim the WideEP FT tests ..." (the test cuts below).
+
+== TREE-EQUALITY PROOF ==
+- git diff fix-final8-lean ftwave2/09-ghost-slots-ring-copies                    -> empty (whole tree)
+- git diff ft-final ftwave2/09-... -- tensorrt_llm cpp/tensorrt_llm docs examples -> empty
+- git diff ft-final ftwave2/09-... -- . ':!tensorrt_llm' ':!cpp' ':!docs' ':!tests' ':!examples' -> empty
+- git diff ft-final ftwave2/09-... -- tests cpp/tests -> only the test cuts (28 files, +2128/-4262), = 9e1717743b.
+  (The coordinator's guard "git diff ft-final <top> -- tensorrt_llm cpp tests docs is empty apart from test trimming" holds;
+  cpp/tests/unit_tests/runtime/moeLoadBalancerTest.cpp is one of the trimmed test files.)
+
+== CHECKS PER BOUNDARY (all 11 branches) ==
+- pre-commit run --files <files changed vs the previous branch>: rc=0, no file modified, on every branch.
+- py_compile + pyflakes on every .py changed vs prmain-all (pyflakes findings that also exist in ft-final ignored):
+  0 problems at every stage.
+- Import-name check (every tensorrt_llm name imported or used as module.attr exists in that tree): 0 problems at every stage.
+- test-db: every added entry resolves to an existing file at its stage (an entry appears from the stage where its
+  file/test exists).
+- Core standalone: grep of every +line of ftcore/10 vs prmain-all for ghost|ring|heartbeat|pmix|hang evidence|hang
+  monitor|fence|staging|hung. The only hits are the kernel "fence path" (main's term), ZeroMQ ZMTP heartbeat options,
+  the words "during" or "gathering", and the integration test stripping PMIX_/SLURM_ launcher env. There are no
+  wave-2 references.
+- NOT done: no C++ build, no pytest (no torch or GPU on this host). Agents ran torch-free stubs for the R config,
+  launcher, authority and hang-monitor tests (pass at every stage) and for the mpi_session FT tests.
+- Commits: one per branch, git commit -s (Andrew Rusli), no Co-Authored-By or AI lines.
+
+== STACK (bottom first; lines = diff vs the previous branch) ==
+PR 1/10  ftcore/01-ft-config  8bb66916f8
+  [None][feat] WideEP FT 1/10: Add the fault-tolerance config and mode switch
+  8 files | product +141/-10, tests +142, docs 0 | C++ no | deps: prmain wave 1
+  Files: _utils.py (env names, fault_tolerance_mode, peer_loss_recovery_enabled), executor/recovery/{__init__,config}.py
+    (core fields: extra_slots Literal["empty"]="empty", failure_domain(s), recovery_timeout_s), wide_ep_ft.py,
+    llmapi/trtllm-llmapi-launch, tests test_recovery_config.py, test_trtllm_llmapi_launch_exit.py, l0_cpu.yml.
+  Owners: trt-llm-runtime-devs, trt-llm-moe-devs, trt-llm-devs, trt-llm-infra-devs (test-db)
+  FT-off: wide_ep_ft reads the mode through the helper (same result). The launcher exits through exit_with_worker_status,
+    which does `exit $status` as before; the workspace removal is factored into a function with the same behaviour.
+
+PR 2/10  ftcore/02-a2a-ft-kernels  b5332b17a9
+  [None][feat] WideEP FT 2/10: Add rank mask, abort record and fixed receive slots to the NVLinkOneSided all-to-all
+  19 files | product +1077/-148, tests +1114/-22, docs +6 | C++ YES | deps: 1
+  Files: moeAlltoAllKernels.{cu,h}, moeAlltoAllOp.cpp, alltoall_watchdog.py, cpp_custom_ops.py, mnnvl_memory.py,
+    communication/{execution_state (new), nvlink_one_sided}.py, impl_contract.py, wide_ep_ft.py (drop the CUDA-graph
+    refusal), _utils.device_visible_host_zeros, MOE_DEVELOPER_GUIDE.md; tests test_moe_a2a_abort (new),
+    multi_gpu/test_moe_a2a_late_writes (new), test_moe_execution_state (new), test_alltoall_watchdog, test_moe_comm;
+    l0_b200 + l0_gb200_multi_gpus entries.
+  Also: the dead expert_to_slot path in the CFT counted-write kernel is gone (it never appears in the stack). The
+    launcher TLLM_CHECK and the op TORCH_CHECK reject expert_to_slot with CFT.
+  Owners: trt-llm-moe-devs, trt-llm-runtime-devs, trt-llm-multi-gpu-ci-review, trt-llm-devs, trt-llm-infra-devs
+  FT-off:
+    - The mask-free instantiations compile the new branches away; wait_round_flag gets abort=nullptr and still traps.
+    - The fence dispatch is templated on USE_EXPERT_TO_SLOT, which doubles its instantiations (binary size only).
+    - FLAG_VAL reserves 8 bytes instead of 4, so later workspace offsets can shift (disclose this).
+    - The op's argument checks were restructured; they are equivalent for main's callers.
+    - Python: per-dispatch `state is None` checks; the watchdog makes no CUDA query without a shared watchdog (tested).
+
+PR 3/10  ftcore/03-moe-receive-slots  b26eb43380
+  [None][feat] WideEP FT 3/10: Read all-to-all receive slots in place in the Cutlass and CuteDSL MoE
+  18 files | product +484/-73, tests +237 | C++ YES | deps: 2
+  Files: cutlass moe_kernels.{h,cu}, moe_util_kernels.h, thop moeOp.cpp, moeUtilOp.cpp, torch_custom_ops.py,
+    fused_moe_cutlass.py, fused_moe_cute_dsl.py, cute_dsl_custom_ops.py, blockscaled gather kernel, impl_blocks.py,
+    impl_contract.py, moe_scheduler.py; X: DecoderRunner/model_engine bind MoeExecutionState.for_model (first in-tree
+    caller of PR 2's state); tests test_moe_slot_gather (new), test_cute_dsl_moe.
+  Owners: trt-llm-moe-devs, trt-llm-runtime-devs, trt-llm-disagg-devs, trt-llm-devs, trt-llm-infra-devs
+  FT-off:
+    - expandInputRowsKernel is a wrapper over the same body; one extra kernel instantiation exists (binary size).
+    - moeOp takes num_rows from token_selected_experts, which is equal with FT off.
+    - The CuteDSL tuning and compile keys gain constant elements, and the kernel takes 2 unused Int32 args.
+    - The scheduler and the decoder runner each read peer_loss_recovery_enabled() once at init.
+
+PR 4/10  ftcore/04-ulfm-survivors  f6d2040c0d
+  [None][feat] WideEP FT 4/10: Add ULFM survivor communicators and a bounded MPI Finalize
+  13 files | product +898/-19, tests +863 | C++ YES (peerFailureWatch.{h,cpp} whole files + 1 line each in nanobind
+    CMakeLists/bindings.cpp) | deps: 1, prmain mpi4py 4.1.2
+  Files: communicator.py (HostCollectiveInterrupted, interruptible collectives, PeerFailureWatch use, revoke/shrink,
+    survivor broadcast/barrier), _utils MPI peer-failure helpers, mpi_session.py, executor/recovery/mpi_exit.py,
+    mgmn_leader/worker_node.py; tests test_mpi_survivors(_ulfm), test_mpi_session.
+  Owners: trt-llm-runtime-devs, trt-llm-devs
+  FT-off:
+    - Each MPIDist host collective does one `_host_world is None` check.
+    - mpi_session does a cached num_failed_ranks() read per task and at shutdown.
+    - The task-end barrier is wrapped in try/except.
+
+PR 5/10  ftcore/05-recovery-authority  596a864337
+  [None][feat] WideEP FT 5/10: Add the external recovery authority
+  9 files | product +1057/-5, tests +854 | C++ no | deps: 1, 4
+  Files: executor/recovery/{authority,authority_server,client,protocol}.py, config.py (authority_timeout_s, digest),
+    executor/ipc.py (socket_options); tests test_recovery_authority, l0_cpu.
+  Owners: trt-llm-runtime-devs, trt-llm-devs, trt-llm-infra-devs
+  FT-off: ZeroMqQueue.__init__ iterates an empty socket-options dict; nothing else.
+
+PR 6/10  ftcore/06-eplb-restore-empty-slots  8145106471
+  [None][feat] WideEP FT 6/10: Restore a lost rank's experts into empty extra EPLB slots
+  19 files | product +1048/-117, tests +941/-7 | C++ YES (moeLoadBalancer.{h,cpp}, moeLoadBalanceKernels.{cu,h},
+    moeLoadBalanceOp.cpp, moeBindings.cpp) | deps: 1, 2, 3, prmain 05/06/07
+  Files: moe_load_balancer.py, eplb_recovery.py (restore_lost_experts), C++ restorePlacement/quiesce/one-slot table,
+    impl_blocks slot_rows, interface.py, CuteDSL extra slots, scheduler _dispatch_slot_table; tests
+    test_resident_placement (new), test_moe_load_balancer (FT shm/host-copy tests), test_cute_dsl_moe,
+    test_moe_slot_gather, gtest QuiesceReleasesTheLayersAnInterruptedForwardDidNotReach.
+  Owners: trt-llm-moe-devs, trt-llm-runtime-devs
+  FT-off:
+    - end_iter passes interrupted=False.
+    - finalize_model joins populate threads (all None).
+    - one_slot_table() returns a table only when slots == experts; the dispatch uses it only under recovery.
+    - moeComputeRouteDevice gets oneSlotPerExpert, which is true with FT off only when slots == experts (main's
+      branch anyway).
+    - The updateWeights range-check message text changed.
+    - The reconfigure_mask_only last-replica error text changed.
+
+PR 7a/10 ftcore/07a-executor-recovery  4e70af4ce0
+  [None][feat] WideEP FT 7a/10: Recover the executor from a lost WideEP rank
+  27 files | product +1866/-102, tests +1916/-32 | C++ no | deps: 1-6, prmain KV v2 rollback
+  Files: peer_loss_recovery.py (new), py_executor.py (incl. the ft-final recompute-victim fix), py_executor_creator,
+    executor_request_queue, request_utils, llm_request (logits/output checkpoint), kv_cache_manager_v2, cuda_graph_runner,
+    adp_router, engine/runners/{common,decoder/*}, executor/utils.py (peer_loss_retryable_message), communicator
+    departed gathers/live_ranks, config.shrink_timeout_s; tests test_peer_loss_recovery (unit), test_adp_absent_ranks,
+    test_adp_router/host_exchange, test_executor_request_queue, test_py_executor, test_request_utils, test_mpi_session
+    (+17), disaggregation fakes (live_ranks).
+  Owners: trt-llm-runtime-devs, trt-llm-disagg-devs, trt-llm-kv-cache-manager-devs
+  FT-off:
+    - The event loop runs through RecoveryHook.run; the base hook's step and response hooks are no-ops.
+    - Responses are published in the same order.
+    - The tp gathers take departed= and `live_ranks`; both give the same result with no departed rank.
+    - Per-rank active counts become a dict keyed by rank (same routing).
+
+PR 7b/10 ftcore/07b-executor-recovery-requests-e2e  236462b274
+  [None][feat] WideEP FT 7b/10: Quarantine twice-interrupted requests, answer 503, add the peer-loss e2e tests
+  11 files | product +140/-20, tests +828/-4 | C++ no | deps: 7a
+  Files: peer_loss_recovery.py/py_executor.py (quarantine), executor/utils.py (is_peer_loss_retryable_message),
+    openai_server.py (503 + Retry-After, SSE code), tests: unit quarantine tests, test_stream_error_events,
+    integration wide_ep_ft/{peer_loss_driver,test_peer_loss_recovery,worker_hooks}: [sync], [overlap],
+    two_ranks_lost_together, rank_lost_during_recovery, restore_into_appended_empty_slots (GB200 x4 post-merge).
+  Owners: trt-llm-runtime-devs, trt-llm-disagg-devs, trt-llm-multi-gpu-ci-review, trt-llm-qa-function, trt-llm-devs,
+    trt-llm-infra-devs
+  FT-off:
+    - _handle_canceled_requests calls a no-op hook.
+    - The openai_server error paths do a cached env read, then follow main's behaviour.
+
+PR 10/10 ftcore/10-health-and-guide  b45ef3861a   (TOP OF CORE)
+  [None][feat] WideEP FT 10/10: Report FT states on /health and document WideEP fault tolerance
+  13 files | product +185/-2, tests +264/-2, docs +279 | C++ no | deps: 5, 7b
+  Files: serve/fault_tolerance_status.py (new), openai_server /health, protocol Installed.failed_requests use, the core
+    guide docs/source/features/wide-ep-fault-tolerance.md, including the ft-final limit bullets; also index.rst,
+    feature-combination-matrix.md and examples/wide_ep/README.md. Tests: test_fault_tolerance_health, status probe
+    tests, integration test_authority_lost_while_serving.
+  Owners: trt-llm-runtime-devs, trt-llm-doc-owners, trt-llm-multi-gpu-ci-review, trt-llm-qa-function, trt-llm-devs,
+    trt-llm-infra-devs
+  FT-off: RecoveryStatusProbe.from_env() at server init returns None; /health does one getattr plus an env read before
+    main's 200.
+
+--- WAVE 2 (opened later, stacked on ftcore/10) ---
+PR 8/10  ftwave2/08-hang-detection-fencing  28d832780a
+  [None][feat] WideEP FT 8/10: Detect and fence hung WideEP ranks
+  30 files | product +1576/-34, tests +1164/-21, docs +80/-16 | C++ YES (heartbeatSender.{h,cpp} whole files + 1 line
+    each in nanobind CMakeLists/bindings.cpp) | deps: 10
+  Files: hang_evidence.py, executor/recovery/hang_monitor.py, distributed/pmix_fence.py, authority/server/protocol/client
+    hang, fence and evidence paths, config hang fields, peer_loss_recovery (_wait_for_proposal/_end_ranks, runtime
+    kills before shrink), py_executor waiting_for_requests, execution_state progress_comm, launcher exit 75, guide
+    sections; tests test_hang_evidence, test_recovery_hang_monitor, test_hung_rank_fenced (e2e).
+  Owners: trt-llm-runtime-devs, trt-llm-moe-devs, trt-llm-doc-owners, trt-llm-multi-gpu-ci-review, trt-llm-qa-function,
+    trt-llm-devs, trt-llm-infra-devs
+  FT-off: Distributed.__init__ sets in_host_collective=False; 2 attribute writes around the request queue get; nanobind
+    registers HeartbeatSender.
+
+PR 9/10  ftwave2/09-ghost-slots-ring-copies  e7e2e01911   (TOP == fix-final8-lean)
+  [None][feat] WideEP FT 9/10: Back extra EPLB slots with ghost memory and keep ring host copies
+  32 files | product +1889/-110, tests +1460/-24, docs +21/-13 | C++ YES (ghostSlotMemory.{h,cpp} new,
+    hostAccessibleDeviceAllocator.{h,cpp}, runtime/CMakeLists, moeLoadBalancer.{h,cpp}, moeLoadBalanceOp.cpp,
+    moeBindings.cpp) | deps: 6, 8
+  Files: GhostSlotMemory + GDRCopy host access, restore backing/release, KV cache cut, ring host copies and staging
+    (eplb_recovery ring helpers, execution_state staging workspace, nvlink_one_sided source_write_ranges), config
+    extra_slots Optional["empty","ghost"] default None -> ghost; guide sections; tests test_ring_host_copies (FT-only
+    file), multi_gpu/test_ring_restore_staging, GhostSlotMemoryTest (7 gtests), test_restore_into_ghost_slots[static|online].
+  Owners: trt-llm-moe-devs, trt-llm-runtime-devs, trt-llm-disagg-devs, trt-llm-doc-owners, trt-llm-multi-gpu-ci-review,
+    trt-llm-qa-function, trt-llm-devs, trt-llm-infra-devs
+  FT-off:
+    - addSingleWeightSlot asks GhostSlotMemory::contains() per slot at registration.
+    - copyWeightsCpu goes through a lambda.
+    - The HostAccessibleDeviceAllocator singleton is never destroyed, and its allocation map gains a shared_mutex.
+    - make_tensor_host_accessible checks ghost_slots first.
+
+C++ BOUNDARIES (for the one build-only job): ftcore/02, ftcore/03, ftcore/04, ftcore/06, ftwave2/08, ftwave2/09.
+  (01, 05, 07a, 07b, 10 change no C++; their trees build iff their parent builds.) Top = fix-final8-lean = ft-final in cpp/tensorrt_llm.
+
+== TEST CUTS (all in fix-final8-lean 9e1717743b; per-test detail with reasons in /tmp/claude-161238/restack/ledger/{K,E,R,X}.md "TEST CUTS") ==
+Totals: tests/ and cpp/tests/ vs ft-final: 28 files, +2128/-4262 (net -2134 lines). Every regression guard named by a fix commit
+is kept (the ledgers map fix commit -> test).
+- cpp moeLoadBalancerTest.cpp (FT +877 -> +446): only gtests for NEW C++ components stay, plus one regression guard.
+  - Kept: GhostSlotMemoryTest x7 (new component, PR 9) and QuiesceReleasesTheLayersAnInterruptedForwardDidNotReach (PR 6),
+    the only guard of the real EPLB-worker hang.
+  - Cut (MoeLoadBalancer is an existing component): MoeLoadBalancerFaultToleranceOffTest x3, MoeLoadBalancerRestoreTest x9
+    with their helper, and QuiesceWaitsForTheWorkerAndTheGpuStage (pins no bug).
+  - Restore stays covered by the Python tests, by e2e and by multi_gpu/test_ring_restore_staging.
+- unit test_peer_loss_recovery.py (2526 -> ~1900 lines, 120 -> 73 tests).
+  - Cut: tests of mock plumbing, log text, "accepted" checks, and tests duplicated elsewhere (thread re-raise trivia,
+    phase-log order, DSA/KV-reuse acceptance, a node loss as "one transaction", failure_domains, which belongs to the
+    config tests).
+  - Near-duplicates were merged into parametrized tests.
+  - Added in the lean file: the ft-final recompute-victim test (kept).
+  - Fixed: the fence test now uses assert_called_with (see OPEN ISSUES 1).
+- integration wide_ep_ft: one e2e per failure type.
+  - Cut the `idle` mode (inflight is strictly stronger) and test_peer_loss_recovery_under_load with the driver's --per-rank
+    (same failure type, bigger batch).
+  - Ids are now test_peer_loss_recovery[sync|overlap] (test-db updated).
+- test_recovery_authority (1155 -> 1055; 834 at PR 5): duplicate phase/message parametrizations trimmed. Cut: log-text,
+  abort-after-discard, other-key frames, departed-replay, other-settings registration, frame-recovers and
+  status-after-abort, each covered by a kept test.
+- test_recovery_hang_monitor (631 -> 480): the "no hang" scenarios (9) and "hung" scenarios (6) became two table tests;
+  pickle round-trip trivia cut.
+- test_mpi_session (FT +398 -> +345): the private _live_worker_futures test cut; 3 leave-world tests -> 1 parametrized.
+- test_mpi_survivors (556 -> 474) and _ulfm (176 -> 169): compact fakes; duplicates merged.
+- test_recovery_config: description trivia and the PositiveFloat parameter cut. launch_exit: 12 -> 6 (+1 at PR 8) cases.
+- test_moe_a2a_abort (734 -> 576): covered valid-count variants folded; reject/trap tests merged.
+  - Added cases for two kernel fixes that had no test.
+- multi_gpu/test_moe_a2a_late_writes (305 -> 212): only the late-write isolation check stays; the post-kill
+  rearm/replay part is covered by single-process tests and e2e.
+- multi_gpu/test_nvlink_one_sided: the 4-GPU slot-table test cut (covered by the single-process replay test; its CFT case
+  is moot after the dead-code deletion).
+- test_moe_execution_state (340 -> 210): trivial error-path and duplicate record tests cut; the scheduler tests moved to
+  test_moe_slot_gather.
+- test_resident_placement (594 -> 497): validation-only and same-result restore tests cut or merged.
+- test_ring_host_copies: now an FT-only file (ring tests, PR 9; 463 lines).
+  - The base sharer tests stay in prmain/07's test_moe_host_sharer_expert_ids.py.
+  - The core /dev/shm tests moved to test_moe_load_balancer.py (PR 6).
+  - 7 redundant ring tests cut or folded.
+- smaller: test_adp_absent_ranks, test_executor_request_queue, test_stream_error_events, test_hang_evidence,
+  test_cute_dsl_moe and test_alltoall_watchdog each lose 1-3 tests that were covered or trivia.
+- fake_dist.py: ft-final's unused `tp_allgather_int64(..., fill_value=0)` kwarg dropped (no caller; the real method's kwarg
+  is `departed=`), so the lean file equals the base.
+Test lines vs product lines per PR:
+- At or under product: 1 (=), 3, 4, 5, 6 (+941 vs +1048), 8, 9.
+- Over: 2 (+1114 vs +1077), 7a (+1916 vs +1866), 7b (e2e tests; product +140) and
+  10 (+264 vs +185, plus 279 doc lines).
+- The rest is regression guards or the required e2e tests.
+
+== OPEN ISSUES ==
+1. SOURCE TEST BUG (affects the build's unit run of ft-final): in ft-final,
+   test_peer_loss_recovery.py::test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan asserts
+   `recovery._end_ranks.assert_called_once_with([FAILED_RANK])`. But peer_loss_recovery._shrink also calls
+   `_end_ranks(sorted(reported))`, so the mock is called twice and the assert should fail. fix-final8-lean's version uses
+   assert_called_with. Product is unaffected.
+2. PR 7a is ~3.9k lines (product 1.87k + tests 1.92k), above the ~3.5k cap even after the 7a/7b split. A further split
+   (e.g. ADP absent ranks + departed gathers as their own PR before 7a) is possible but was not done.
+3. Later PRs rewrite a few lines of earlier ones (kept minimal; the source is frozen):
+   - PR 9 renames the core's appended_slot_count/with_appended_slots to ghost_slot_count/with_ghost_slots (~13 lines),
+     because the core may not say "ghost". If the user accepts a product rename in the source, use the neutral names in
+     the source and the rename disappears.
+   - PR 7b edits 7a's recovery allgather tuple, _deliver_responses, and two _forget -> _retire calls.
+   - PR 8: the Propose wait becomes _wait_for_proposal; 3 lines of the authority's Sent docstring/_sequences key change;
+     the launcher comment rewrap.
+   - PR 9: Stopped(...) gains barrier kwargs and the resume log line gains "lent N bytes".
+4. "No in-tree caller inside the PR" (a reviewer pattern from #16632), inherent to the stack order:
+   - PR 2's MoeExecutionState is first bound in PR 3.
+   - The PR 4/5/6 APIs are first called by PR 7a.
+   - Each description names the caller PR.
+5. Nothing built or run: no C++ build (boundaries 02, 03, 04, 06, 08, 09), no pytest, no GPU.
+6. redteam2/cpp.md findings NOT applied (the product equals the frozen source): A1 PDL trigger order, A3 abort_state schema
+   annotation, A5/A6 launcher checks, A7 dead runMoe default body, #26 marker store, #39/#40/#41, the PeerFailureWatch
+   destructor.
+   - FT-off disclosure needed in PR 2: FLAG_VAL reserves 8 bytes instead of 4.
+7. Core cost: until PR 9, static placements without replicas keep FULL host copies of every expert on every node in
+   /dev/shm (no ring).
+   - The core guide keeps the Open MPI in-band detector paragraph. Without PR 8, a SIGSTOPped rank can hold the shrink
+     until hang_detection_timeout ends the job; the guide lists hung ranks as not covered.
+8. authority_server.serve(..., key, ...) keeps an argument that only PR 8 reads (avoids a signature change in PR 8).
+9. CI gaps:
+   - The ULFM tests skip without a ULFM image, and the e2e tests are post-merge only (GB200 x4).
+   - The GhostSlotMemory host-access gtests skip without GDRCopy.
+   - test_mpi_survivors* run in l0_cpu only through the unittest/_torch/distributed directory entry; ULFM ids
+     [exit|replan] are in PR 4 and [fenced] in PR 8.
+10. Cleanup queue (no rm was run):
+    - scratch worktrees: /tmp/claude-161238/work/wt-rsg-{K,E,R,X}, /tmp/claude-161238/work/wt-rs (prmain-all, detached),
+      /tmp/claude-161238/work/wt-src (fix-final8-lean), $TMPDIR/restack/wt-{asm-I,asm-test,build,pm} and the agents'
+      wt-asm-<G>;
+    - five empty files in /tmp/claude-161238/xst/trash/;
+    - helper branches ft-src, ft-src2, ft-src3, prmain-all-old, rsg/*.
+11. Titles use [None]; the user may swap in a JIRA epic. PR descriptions: /tmp/claude-161238/redteam2/PR_DESCRIPTIONS_V2.md
+    (11 bodies in the template; PERF tables are <PERF_TBD> with FT-off rows first; PR numbers #TBD).
+
+== HOW TO REBUILD ==
+/tmp/claude-161238/restack/build_branches.py rebuilds all 11 branches from the rsg/<G> stage commits + msgs/ +
+testdb_final/. Checks: assemble.py <stage> <wt>. Group rebuild scripts: /tmp/claude-161238/K/build.sh,
+$TMPDIR/rsgE/rebuild.sh, /tmp/claude-161238/xst/build.sh (R: in its ledger).
+
+== PROGRESS LOG ==
+- 21:16 prmain-all created (upstream/main 0829689c52 + prmain/01..07 merged, clean).
+- ft-src = fix-final8 (4de25459ce) + the 4 rt2-org move commits cherry-picked (clean). rt2 (2ae0cd8372) lacks
+- 4 group agents launched (K kernels/a2a/backends, E EPLB, R runtime/ULFM/authority/config, X executor/serve/docs/e2e),
+- 21:40 prmain/* rewritten upstream of us: prmain-all rebuilt = 6837295b9c (merges of the new one-commit prmain/01..07;
+- 21:52 Build answer written to redteam2/RESTACK_V2_ANSWER_BUILD.txt: build ft-src3 (= ft-src2 + the CFT dead-code deletion c3601e76c0).
+- 21:45 rt2 check: rt2 = 626f39b405 contains fix-final8 and shows the moves; its tree is IDENTICAL to ft-src. Source of truth = rt2 tree (= ft-src), plus the prmain rewording (ft-src2) and the CFT deletion (ft-src3).
+- 22:17 Groups K (rsg/K f17d092b40), E (db41c2ee0b), R (6138a1f286) done; product tops equal ft-src3. X (executor/docs/e2e) still cutting test_peer_loss_recovery.py. Cross-stage checks running.
+- 22:23 Source switched to ft-final f8b425ea0a (coordinator); X folding 4357379af6 into c07a and f8b425ea0a into c10. ETA ftcore ~23:15, ftwave2 ~23:45. Reply in RESTACK_V2_ANSWER_ETA.txt.
+- 22:44 All 11 branches built, checked, pre-commit clean; top == fix-final8-lean; descriptions written. DONE.
+- 22:47 Follow-up (monitor review): K trimming c02 tests and X trimming c07a tests and adding FT-off lines and a reviewing order to the descriptions. Item 1 (rename) dropped by the coordinator; PR 9's description will say it renames the core's appended extra slots to ghost slots (13 lines). Item 5: the _end_ranks call-count test lives at PR 8 (merged into the parametrized fence test) and already uses assert_called_with at 8 and 9.
+- 22:53 Coordinator: build failed on a circular import (mpi_session -> executor.recovery.mpi_exit). The 4 rt2-org moves are reverted; the new source is ft-final2 (SHA pending). Stack to be redone from ft-final2 with the pending items.
+- 23:38 ft-final2 stack built (ftcore/* and ftwave2/*, copies under ftf2/*). Product diff against ft-final2 is empty and ft-final2-lean (1ec74fc11c) equals the top. Pre-commit fails at 04 and 07a: ruff-legacy D202 in test_mpi_session.py; R is fixing it. Folding v2 into rsg-v2/<G>: K and E done, R and X running.
+- INCIDENT, repaired: a path bug in my verify script ran a test checkout plus a commit in the main repo. It added commit 17fb28a9f0 on wideep-ft-dev and left a partial checkout.
+  Repaired with git reset --mixed aae00e6c65 and git restore. wideep-ft-dev is back at aae00e6c65 and its tracked files are clean.
+  The 122 stray untracked files it created were moved, not deleted, to /tmp/claude-161238/restack/quarantine_mainrepo/; the list is in list.txt. Queue that directory for deletion.
+  Also queue for deletion: agent R's scratch worktrees at /tmp/claude-161238/work/repo/restack/wt-asm-R-*, which are registered git worktrees and need git worktree remove.
+
+== ft-final2 STACK (23:57); copies under ftf2/<name> ==
+Source ft-final2 8d0ec8cf1c (no rt2-org moves). Lean: ft-final2-lean e477fa6c4b == top over the whole tree.
+git diff ft-final2 <top> -- tensorrt_llm cpp/tensorrt_llm docs examples: EMPTY. Non-FT paths: EMPTY. Tests: 28 files +2388/-4809 (trims).
+Pre-commit rc=0 with no modification at all 11 boundaries; assemble checks 0 problems; test-db entries resolve.
+ftcore/01-ft-config                          4d4cf3a2b3 files=8 prod +117/-10 test +142/-0 doc +0/-0 cpp=no
+ftcore/02-a2a-ft-kernels                     18c2cbe3bb files=19 prod +1077/-148 test +984/-22 doc +6/-0 cpp=yes
+ftcore/03-moe-receive-slots                  ca1c52f356 files=18 prod +484/-73 test +237/-0 doc +0/-0 cpp=yes
+ftcore/04-ulfm-survivors                     3c2643c066 files=12 prod +878/-22 test +873/-0 doc +0/-0 cpp=yes
+ftcore/05-recovery-authority                 dddbec7290 files=8 prod +1036/-5 test +854/-0 doc +0/-0 cpp=no
+ftcore/06-eplb-restore-empty-slots           3d8ee31b3a files=20 prod +1066/-117 test +967/-7 doc +0/-0 cpp=yes
+ftcore/07a-executor-recovery                 16c05f5ef7 files=27 prod +1858/-103 test +1746/-34 doc +0/-0 cpp=no
+ftcore/07b-executor-recovery-requests-e2e    a0ff2f2f48 files=11 prod +140/-20 test +828/-4 doc +0/-0 cpp=no
+ftcore/10-health-and-guide                   e889864d2a files=13 prod +185/-2 test +264/-2 doc +279/-0 cpp=no
+ftwave2/08-hang-detection-fencing            5b07fd75eb files=29 prod +1568/-34 test +1165/-21 doc +80/-16 cpp=yes
+ftwave2/09-ghost-slots-ring-copies           9e05b3e1e8 files=31 prod +1878/-107 test +1462/-23 doc +21/-13 cpp=yes
+
+== FINAL STACK, CUT FROM v2 (00:40 PT) ==
+Source: v2 = cef4670789. That is ft-final2 8d0ec8cf1c (no rt2-org moves) + the 13 fix commits + 2 test-only commits
+(6a673be32f, cef4670789). Every fix is folded into the PR that owns the code it changes, as a fixup, not as a new PR.
+Lean: fix-final8-lean = v2 + 052627db76 (test trims only).
+Equality:
+- git diff v2 ftwave2/09 -- tensorrt_llm cpp/tensorrt_llm docs examples        -> EMPTY
+- git diff v2 ftwave2/09 -- non-FT paths (outside tensorrt_llm cpp docs tests examples) -> EMPTY
+- git diff v2 ftwave2/09 -- tests cpp/tests     -> 28 files +2581/-4938 (the trims)
+- git diff fix-final8-lean ftwave2/09          -> EMPTY (whole tree)
+Checks at all 11 boundaries:
+- pre-commit (incl. ruff-legacy) rc=0 with no file modified;
+- py_compile, pyflakes and the import-name check: 0 problems;
+- every test-db entry resolves;
+- the core (ftcore/10) diff has no ghost, ring, hang-evidence, heartbeat or PMIx reference. Main's executor
+  hang_detection_timeout check remains.
+Commits are signed off with no AI lines. Not built and not run (no C++ build, no torch here).
+C++ boundaries for the build job: 02, 03, 04, 06, 08, 09.
+
+Branch                                      SHA        product        tests        docs
+ftcore/01-ft-config                          f46f30f63f  +117/-10  +142/-0  +0/-0
+ftcore/02-a2a-ft-kernels                     af1f012297  +1084/-148  +993/-22  +6/-0
+ftcore/03-moe-receive-slots                  4b3c78b25d  +484/-73  +237/-0  +0/-0
+ftcore/04-ulfm-survivors                     df059d0b5f  +921/-22  +892/-0  +0/-0
+ftcore/05-recovery-authority                 016fd00c19  +1036/-5  +854/-0  +0/-0
+ftcore/06-eplb-restore-empty-slots           8478c17e38  +1071/-117  +1086/-7  +0/-0
+ftcore/07a-executor-recovery                 b8d020d5ac  +1863/-105  +1761/-34  +0/-0
+ftcore/07b-executor-recovery-requests-e2e    d24c2cbbc7  +161/-31  +852/-6  +0/-0
+ftcore/10-health-and-guide                   264c357baf  +184/-1  +289/-2  +285/-0
+ftwave2/08-hang-detection-fencing            1bfb5d1eba  +1581/-34  +1190/-23  +83/-17
+ftwave2/09-ghost-slots-ring-copies           f1a810619e  +1878/-108  +1460/-23  +21/-13
+(Copies: ftv2/<name> = this stack; ftf2/<name> = the ft-final2 stack (lean ft-final2-lean e477fa6c4b).)
+
+Where the v2 fixes landed:
+- 02: a0851f0458. Refuse CUDA graph capture of an unbound rank-mask dispatch; covers nvlink_one_sided, the guide
+  sentence, wide_ep_ft docstring, and the test.
+- 04: 1d050d20d4 and fd7b37ba54 (peerFailureWatch), e670111c20 (communicator guards), 168e3982da (_utils, mpi4py<4),
+  with their tests.
+- 06: ea0e20f338. Restore only under FT and while quiesced: C++ checks plus 2 gtests, kept as the coordinator's exception
+  for a real fix, with a lean RestorePlacementLayer helper.
+- 07a: c31ce145fd. Pin outside the ADP ranks indexed by position as on main; covers adp_router, request_utils and the tests.
+  Also cef4670789 (negative pin vs last rank's capacity, test) and 6a673be32f (test fixture).
+- 07b: 44cb071834. Progress reported with the responses; the gather part becomes a 4-tuple, editing 7a's 3-tuple lines.
+  Also 96ebd05a84 (openai_server keyed on fault_tolerance_mode()).
+- 10: 4f24c7d10e (/health 200 for an unknown phase), f1b5c697f1 (failed_requests doc), c4a9495bfd (guide names main's fixed
+  hang detector).
+- 08: 37551d6035 (kill and fence before a proposal only with hang detection; fence_departed in the authority, tests).
+
+Follow-up items:
+1. Rename churn: dropped, per the coordinator. PR 9 renames the core's appended_slot_count/with_appended_slots to ghost
+   names (13 lines), as stated in its description.
+2. Test trims against the 15-20% target:
+   - PR 02: tests went from 1114 to 993 (about 11%; the v2 guard test was added back). K merged the replay test into the
+     execution-state GPU test, install refusal into the bind test, and the two watchdog coordinator tests into one; shared
+     the _dispatch and _peer_words helpers; cut the schema/fake-signature plumbing test; and dropped the [16|3] row widths.
+   - PR 07a: tests went from 1916 to 1761 (about 8% net). X's c07a files lost 172 lines; 21 lines moved to 06 with
+     failure_domains, and v2 guards were added back. Merges include:
+     - the protocol-mismatch test into the 10-param transition test;
+     - run/recover with the startup-watch takeover;
+     - step order commit/discard;
+     - discard resources and padding [True|False];
+     - discard request changes, logits and outputs;
+     - executor hand-off of interruptions;
+     - unscheduled requests on rank 0 [0|1];
+     - three readmission tests into one;
+     - departed rerun/fail/cancel into one;
+     - routed tracking;
+     - gathered parts;
+     - resend [0|1|2];
+     - create pass-through/warn.
+     The full id map is in ledger X.md.
+   - Both are short of 15-20%: K and X stopped where further cuts would drop a behaviour or regression guard.
+3. PR 7a stays one PR (~3.76k). Its description has "Reviewing order" (commit/discard and KV revert, then the protocol
+   loop and placement install, then replay and requests) and "Why one PR".
+4. Every PR description has an explicit **FT-off delta:** line (11 of 11). Line counts are updated to this stack.
+5. The _end_ranks call-count test lives in PR 8, merged into the parametrized fence test, and uses assert_called_with
+   at 08 and 09. v2's call_args_list variant is equivalent.
+Other changes in this round:
+- With the moves reverted, peer_loss_recovery.py now first appears in PR 06. It holds only FailureDomain/failure_domains,
+  which MoeLoadBalancer imports lazily, plus their unit test. PR 07a grows the module.
+- R fixed a ruff-legacy D202 regression in test_mpi_session.py (04/07a).
+- Open: the core guide does not say that, without hang detection, a stopped process holds the survivors' agreement until it
+  ends. Only PR 8's text says it. Consider one sentence in PR 10.

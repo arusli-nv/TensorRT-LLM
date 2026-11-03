@@ -1,0 +1,13 @@
+# GATE-RECV2 (1 node): unit gate of wheel build-v5r-b0ad558bcb (A + B' + Tier<384,8>). Its build BUILD-RECVFIX2 8153345 again failed nvlink_one_sided's first case and hung, this time NOT after late_writes (order swapped), so C43 is the build run, not late_writes. Same three steps as GATE-RECV after BUILD-RECVFIX 8150629 timed out in
+# test_nvlink_one_sided.py (rc=124, first case F then a hang, right after test_moe_a2a_late_writes.py; the v5 build
+# 8143012 showed the same, and NVL-REPEAT 8145422 passed it in separate invocations with a wheel reinstall between).
+# 1) late_writes then nvlink back to back in one point_units call (the build's order, no reinstall in between), -x,
+#    faulthandler after 200 s, process/GPU snapshots: reproduces the isolation failure or not.
+# 2) nvlink alone in a fresh call: the new kernel's own pass/fail.
+# 3) the files the killed build never ran (moe/a2a, recovery, llmapi incl. launch_exit).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5r-b0ad558bcb; E=$R/overlays/empty; S=$R/overlays/build-src-b0ad558bcb; D=$R/$B/gate-recv2
+snap() { mkdir -p $D; { echo "== $1 $(date +%T)"; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; ps -eo pid,ppid,stat,etime,cmd | grep -E 'python|prte|orted|mpirun' | grep -v grep; } >> $D/snapshots.txt 2>&1; }
+snap start
+PYTEST_ADDOPTS='-x -vv -o faulthandler_timeout=200 -k "not flashinfer_temporary_cleanup"' bash $R/tools/point_units.sh $R/$B/dist $E $E $S $D/1-order tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py; snap after-order
+PYTEST_ADDOPTS='-vv -o faulthandler_timeout=200 -k "not flashinfer_temporary_cleanup"' bash $R/tools/point_units.sh $R/$B/dist $E $E $S $D/2-alone tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py; snap after-alone
+PYTEST_ADDOPTS='-k "not flashinfer_temporary_cleanup"' bash $R/tools/point_units.sh $R/$B/dist $E $E $S $D/3-rest tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py tests/unittest/_torch/moe/test_moe_a2a_abort.py tests/unittest/_torch/moe/test_moe_comm.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_slot_gather.py tests/unittest/_torch/thop/parallel/test_cute_dsl_moe.py tests/unittest/executor/test_recovery_authority.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py

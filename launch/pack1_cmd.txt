@@ -1,0 +1,25 @@
+# PACK1 (16 nodes): LOADCURVE (group 0) + WATCHAB (group 8, run dir STD-G1), packed to run two tests per job slot.
+# Group 0's fill (after its curve) adds off|ft|ft-noT rounds at 32/GPU for WATCHAB's n (run dir STD-G2-fill<k>).
+# LOADCURVE (8 nodes): the shape of FT's no-EPLB steady decode cost over load. ATTR32 gives ~0 at 8, ~0.45 ms at 32,
+# ~0.12 at 64, ~0.09 at 128 (absolute). A sharp peak (a threshold such as FT's +32 dispatch receive CTAs tipping an SM
+# wave, or the routing kernel's small-batch path) vs a smooth hump points at different causes. One launch per arm sweeps
+# 16/24/32/40/48/64/GPU on the same 8 nodes; a second round (order reversed) runs if the time guard allows.
+# Readout: per load, rank-0 decode-only trim-mean step (stall-free) ft - off in ms; a jump between adjacent loads of more
+# than half the peak names a threshold. v3 wheel as STRIDE32/BISECT32-8.
+# Pre-registered prediction (review/hostfix/kernels_a.md H1, SM budget on 152 SMs: dispatch token CTAs = tokens/rank,
+# FT adds 32 receive CTAs; with the routing cluster (8) and the aux shared-expert GEMM (56) FT needs 2*load+96 CTAs vs
+# off 2*load+64): FT fits at 24 (144) and overflows at 32 (160) and 40 (176) while off fits up to 40 (144). H1 holds if
+# the ft - off trim-mean gap at 24 is <= 1/3 of the gap at 32 and the gap at 40 is >= the gap at 32's; at >= 48 both
+# overflow and the gap should shrink.
+# WATCHAB (8 nodes): does the peer-failure watch thread (5 ms MPI_Test polling) cause FT's extra 32/GPU stalls?
+# BISECT32-8 (CLAIMS 159): round 1 noT at off's stall level, round 2 no separation; n=2 is a lead. Before coding the
+# event-driven watch (review/hostfix/watch.md, C++), confirm the effect. Arms on the same 8 nodes, 3 rounds rotated:
+# off | ft | ft-noT (TLLM_TEST_FT_OFF=watch). v3 wheel as BISECT32-8.
+# Pass rule (rank-0 decode-only, dist32 metrics, healthy-32): ft-noT's stall ms/step below ft's in 3/3 rounds and the
+# mean of (ft - noT) >= 0.15 ms -> the watch thread is a cause; build the event-driven watch. Otherwise drop it as a cause.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+X="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+export BUNDLE_FILL_LIMIT_S=2700
+export BUNDLE_FILL_0="$X FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=36 COST_LOADS=32 FT_COST_E2E_ARMS='std-noeplb-ft-noT std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G2"
+bash $R/bundle.sh "0:8:7000:$X FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=65 COST_LOADS=16,24,32,40,48,64 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$X FT_COST_E2E_ROUNDS=3 FT_COST_E2E_ROUND_MIN=36 COST_LOADS=32 FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft std-noeplb-ft-noT' bash $R/mvp/harness/run_job.sh STD-G1"

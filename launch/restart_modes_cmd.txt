@@ -1,0 +1,9 @@
+# RESTART-MODES: FT off's warm restart after a rank5 decode kill for w/o EPLB (std-noeplb.yaml) and offline EPLB
+# (std-offline-ft-filled.yaml: the same body serves FT off; no EPLB host copies), page cache kept, with the COLD_RESTART
+# phase breakdown, plus py-spy stacks of every rank 150 s into each relaunch (during weight_population, 156-165 s
+# warm or cold in the online run 8131417): is loading standard TRT-LLM work (safetensors -> FP4 repack per rank) or ours?
+# v3 wheel, FT off as deployed. One group per mode. n=1 per mode: lead.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 CR_RUNS=rank5 CR_LOAD_STACKS=150 WIDEEP_POLLUTION_CHECKS=1"
+bash $R/bundle.sh "0:8:4200:$E CR_BENCH_CONFIG=std-noeplb.yaml bash $R/mvp/harness/run_job.sh COLD-RESTART-A" \
+  "8:8:4200:$E CR_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh COLD-RESTART-B"

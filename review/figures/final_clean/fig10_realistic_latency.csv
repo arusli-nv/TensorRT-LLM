@@ -1,0 +1,29 @@
+metric,pair,ft_off_ms,ft_on_ms,change_pct
+ttft_p50_ms,pair1,816.9,816.6,-0.04
+ttft_p50_ms,pair2,827.1,831.9,+0.58
+ttft_p50_ms,pair3,819.6,826.9,+0.89
+ttft_p50_ms,pair4,815.3,829.8,+1.78
+ttft_p50_ms,pair5,827.4,825.3,-0.25
+ttft_p50_ms,pair6,816.9,835.1,+2.23
+ttft_p50_ms,MEAN n=6,820.53,827.60,+0.86
+ttft_p99_ms,pair1,2018.0,2052.5,+1.71
+ttft_p99_ms,pair2,2039.5,2049.9,+0.51
+ttft_p99_ms,pair3,2000.1,2046.7,+2.33
+ttft_p99_ms,pair4,1998.4,2016.4,+0.90
+ttft_p99_ms,pair5,2108.0,2016.4,-4.35
+ttft_p99_ms,pair6,2004.9,2337.8,+16.60
+ttft_p99_ms,MEAN n=6,2028.15,2086.62,+2.88
+tpot_p50_ms,pair1,11.7,11.8,+0.85
+tpot_p50_ms,pair2,11.8,11.9,+0.85
+tpot_p50_ms,pair3,11.7,11.8,+0.85
+tpot_p50_ms,pair4,11.8,11.9,+0.85
+tpot_p50_ms,pair5,11.8,11.9,+0.85
+tpot_p50_ms,pair6,11.8,11.8,+0.00
+tpot_p50_ms,MEAN n=6,11.77,11.85,+0.71
+tpot_p99_ms,pair1,13.4,13.5,+0.75
+tpot_p99_ms,pair2,13.7,13.6,-0.73
+tpot_p99_ms,pair3,13.5,13.4,-0.74
+tpot_p99_ms,pair4,13.4,13.6,+1.49
+tpot_p99_ms,pair5,19.8,13.5,-31.82
+tpot_p99_ms,pair6,13.4,14.5,+8.21
+tpot_p99_ms,MEAN n=6,14.53,13.68,-5.85

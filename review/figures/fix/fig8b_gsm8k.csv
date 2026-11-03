@@ -1,0 +1,3 @@
+arm,job,case,strict,strict_se,verdict
+FT off,8244019,acc-ref-final,0.9484,0.0061,ref
+"FT on, after a rank kill",8244019,acc-kill-final-1,0.9401,0.0065,PASS

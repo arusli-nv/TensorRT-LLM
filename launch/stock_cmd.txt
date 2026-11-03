@@ -1,0 +1,9 @@
+# STOCK (user 21:25 via monitor: "is this because of the way we run tests? make sure"): main's wheel (build-pr0-fc52f0adee),
+# std configs, 32/GPU, 4 waves (TAIL-CTRL load), 2x2 per group: {stock launch (serve.sh WIDEEP_STOCK: no hooks, samplers,
+# rank wrapper, iteration log, overrides, info logging or pinned tactics; self-tuned startup ~23 min), harness launch}
+# x {online EPLB 288, w/o EPLB}. Client-only readout for every arm: harness/itl_stalls.py (benchmark_serving chunk gaps);
+# harness arms also burst_counts. Tokens stock1-e9feed2a6a (TAIL-CTRL), stock1-a94260d6aa (TAIL-CTRL-B).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-pr0-fc52f0adee
+S="MVP_BUILD=$B MVP_STALL_MIN=45 TAIL_STD=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 COST_CASE_TIMEOUT_S=3000 TAIL_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TAIL_PAIRS='std-noeplb-main-w:std-online-main-w'"
+bash $R/bundle.sh "0:8:6900:$S FT_COST_E2E_ARMS='std-online-main-stock-w std-online-main-w std-noeplb-main-stock-w std-noeplb-main-w' bash $R/mvp/harness/run_job.sh TAIL-CTRL" \
+  "8:8:6900:$S FT_COST_E2E_ARMS='std-online-main-w std-online-main-stock-w std-noeplb-main-w std-noeplb-main-stock-w' bash $R/mvp/harness/run_job.sh TAIL-CTRL-B"

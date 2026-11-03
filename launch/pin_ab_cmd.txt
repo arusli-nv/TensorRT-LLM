@@ -1,0 +1,49 @@
+# PIN-AB (16 nodes, two groups of 8, segment 8; option B fix validation, gated on COMPACT-PROBE): does page-locking each
+# rank's own EPLB host-copy segment (fix-pin overlay) remove the mid-window late-rank / burst stalls of online EPLB?
+# Per group, same 8 nodes: std-online-ft-ovA (v5-final 27442bd91d = overlay fix-dropmap-9f1fd4cab4), std-online-ft-ovB
+# (v5-final + pin = PIN_OVERLAY), std-online (FT off); G0 in that order, G1 reversed (B, A, off). Cost sequence
+# (burn-in 32:6, healthy-8 39 waves, healthy-32 28 waves), all-rank iteration logs, D-state sampler (2 s), hostpressure
+# and NUMA/vmstat samplers (compaction counters). Then G0: offline FT on ovA x1; G1: online rank5 kill on the pin
+# overlay (restore time). Readout: rank-0 stall + bursts per window, late-rank events and their D-thread wchan, drop
+# stalls (tools/drop_stalls.py), compaction counters. Diagnostic arms (samplers + all-rank logs): not cost numbers.
+# Est per group 3 x ~21 + ~20 = ~83 min; --time 01:55.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-freeze-58caa0fde6; MB=build-main-9cc37929e8
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=6,128=3 IT_HX=8=24,32=6,128=3,512=1 BURN=32:2 KI=4 KI32=8 KSTOP=4 CRR=rank5
+else
+    IT_MAIN=32=28,128=12 IT_HX=8=39,32=28,128=12,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 CRR='rank5 rank5'
+fi
+SNO=$R/mvp/runs/STD-8193512/autotuner/pinned.json
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+SOFF=$R/mvp/runs/STD-8194123/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1 COST_MAX_WAVES=40 COST_CASE_TIMEOUT_S=3000"
+MAIN="COST_LOADS=32,128 COST_LOAD_ITERATIONS=$IT_MAIN"
+HX="COST_LOADS=8,32,128,512 COST_LOAD_ITERATIONS=$IT_HX"
+KS=200
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+D="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 WIDEEP_KILL_AFTER_STEPS=$KS"
+A="MVP_BUILD=$B FINAL_BUILD=$B $HD"
+PIN_OVERLAY=${PIN_OVERLAY:?set PIN_OVERLAY}
+export OVERLAY_A=$R/overlays/fix-dropmap-9f1fd4cab4 OVERLAY_B=$PIN_OVERLAY
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+SMP="WIDEEP_NO_SAMPLERS= WIDEEP_NUMA_SAMPLER=1 WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2 TLLM_PROFILE_LOG_RANKS=all"
+CS="COST_LOADS=8,32 COST_LOAD_ITERATIONS=8=39,32=28 COST_DIAG_OVERLAY=1 FT_COST_E2E_SEED=$SON FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 62))"
+P0_1="$E $SMP $CS FT_COST_E2E_ARMS='std-online-ft-ovA std-online-ft-ovB std-online' $(run STD)"
+P0_2="$E $SMP COST_LOADS=8,32 COST_LOAD_ITERATIONS=8=39,32=28 COST_DIAG_OVERLAY=1 FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 21)) FT_COST_E2E_ARMS='std-offline-ft-ovA' $(run STD-G2)"
+P1_1="$E $SMP $CS FT_COST_E2E_ARMS='std-online-ft-ovB std-online-ft-ovA std-online' $(run STD-G1)"
+P1_2="$K KF_ALLOW_OVERLAY=1 MVP_OVERLAY=$PIN_OVERLAY KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13' KF_VICTIM_NODES='3' KF_ROWS='rank5' KF_REPEATS=1 $(run KILL-FINAL-ON)"
+G0="{ $P0_1; $P0_2; }"
+G1="{ $P1_1; $P1_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:6800:$G0" "8:8:6800:$G1"

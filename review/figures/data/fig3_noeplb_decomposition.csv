@@ -1,0 +1,5 @@
+metric,series,mode,load,group,pct
+trim,FT on vs FT off,noeplb,32,8193512@n0,0.8614365547992836
+trim,FT on vs FT off,noeplb,128,8193512@n0,0.33842938022379787
+client,FT on vs FT off,noeplb,32,8193512@n0,-0.9898157268495488
+client,FT on vs FT off,noeplb,128,8193512@n0,0.9843971610335772

@@ -1,0 +1,15 @@
+# GATEAB (16 nodes): the attention-DP gate fix (prmain/adp-gate-quiet 733ef6d445: release a held context once a burst
+# of arrivals has ended; review/hostfix/gate_c.md, gate_redteam.md) on FT OFF. Main's scheduler; the bistable
+# low-load mode shows in both FT arms (CLAIMS 153/158). v5 wheel + overlay v5f-f96a8c1a53 (base) or
+# vgate-733ef6d445 (fix = base + py_executor.py). The changed unit tests are gated in-job first.
+# Each group alternates base|fix at 8 and 32/GPU (2 launches per arm per group, so 4 per arm), then the 128/512 guard.
+# Pass rule: no fix launch above 2 timeout releases per wave at 8 or 32/GPU (WIDEEP_ADMIT holds >= 50 calls, as
+# transport_v3_skew.md); 32/GPU context steps per minute and the share of releases covering < 50% of ranks no worse
+# than base (lone-rank context steps); 128/512 client tok/s within 1% of base (mean of the pairs).
+# Group 8 ends with FT on vs FT on + fix at 32/GPU (same nodes): does the fix also cut FT's extra 32/GPU stalls
+# (stall ms/step, dist32; WATCHAB/BISECT32-8 show FT ~2-3x off's)? Group 0 alone carries the 128/512 guard (n=1).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5f-f96a8c1a53; G=$R/overlays/vgate-733ef6d445
+g() { echo "PYTEST_ADDOPTS='-k \"Adp\"' bash $R/tools/units_gate.sh $R/logs/bundle/gateab-gate$1-\$SLURM_JOB_ID $R/$B/dist $G $G-tests $R/overlays/build-src-2ccc3e8e1c $R/$B/point-units-733ef6d445-g$1 tests/unittest/_torch/executor/test_py_executor.py"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O GATEFIX_OVERLAY=$G COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=32 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_LOG_ADMIT=1 WIDEEP_TIMED_CLIENT=1"
+bash $R/bundle.sh "0:8:7000:$(g 0) && { $E COST_LOADS=8,32 FT_COST_E2E_ARMS='std-noeplb std-noeplb-gatefix' bash $R/mvp/harness/run_job.sh STD; $E FT_COST_E2E_ROUNDS=1 COST_LOADS=128,512 FT_COST_E2E_ARMS='std-noeplb std-noeplb-gatefix' bash $R/mvp/harness/run_job.sh STD-G2; }" \
+  "8:8:7000:$(g 8) && { $E COST_LOADS=8,32 FT_COST_E2E_ARMS='std-noeplb-gatefix std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1; $E FT_COST_E2E_ROUNDS=1 COST_LOADS=32 FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb-ft-gatefix' bash $R/mvp/harness/run_job.sh STD-G3; }"

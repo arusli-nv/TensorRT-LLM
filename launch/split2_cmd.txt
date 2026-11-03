@@ -1,0 +1,14 @@
+# SPLIT2 (16 nodes; SPLIT 8156552 lost its unit gate to the known C12 failure, which this gate now deselects as every other gate does): one-variable split of the bound path's no-EPLB 32/GPU decode cost on the v5 wheel build-v5-2ccc3e8e1c
+# + overlay v5h (v5 head 2e8d6d7da1 incl. the gate fix, the freeze line; in-job unit gate on its 7 changed test files). Arms on each group's own nodes, one round per group, group 8 in
+# reverse order: off | ft | ft-noghost (bound, 256 slots: testhooks TLLM_TEST_FT_NO_GHOST) | ft-unbound (main's a2a +
+# sanitize + route(): TLLM_TEST_FT_UNBOUND) | ft-noslottable (bound, route() instead of the dispatch's table lookup:
+# TLLM_TEST_FT_NO_SLOT_TABLE). Readout (dist32 trim mean, healthy-32, per group; ABFIX ft-oldk - off +0.32/+0.28):
+#   ft - ft-noghost = cost of the 320-slot layout + routing tier under the bound path (lay320 predicts ~0.06).
+#   ft-noslottable - ft = route()'s cost inside the bound path (CLAIMS 164 predicts ~0.12 from another run); it fixes the
+#   same-run size of the bound path's own work: (ft - off) vs (ft-unbound - off - route).
+#   Each hook arm's proof lines in every rank's log (ACTIVE + CALL, no REFUSED); noghost needs tactic_check cache_miss equal to off's in the same group (192 = the 6 memory-profiling-pass misses per rank, every arm).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5-2ccc3e8e1c; O=$R/overlays/v5h-2e8d6d7da1
+g() { echo "PYTEST_ADDOPTS='-k \"not flashinfer_temporary_cleanup\"' bash $R/tools/units_gate.sh $R/logs/bundle/split2-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $O-tests $R/overlays/build-src-2ccc3e8e1c $R/$B/point-units-2e8d6d7da1-g$1 tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py tests/unittest/_torch/executor/test_py_executor.py"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-lb std-noeplb-ft std-noeplb-ft-noghost std-noeplb-ft-unbound std-noeplb-ft-noslottable' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && $E FT_COST_E2E_ARMS='std-noeplb-ft-noslottable std-noeplb-ft-unbound std-noeplb-ft-noghost std-noeplb-ft std-noeplb-lb std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

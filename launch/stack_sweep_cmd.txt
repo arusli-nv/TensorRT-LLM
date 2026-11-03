@@ -1,0 +1,12 @@
+# STACK-SWEEP (1 node, 4 GPUs): the PR stack's Python at ft-rebase 4a0a2d4e3a (overlays/stack-py-4a0a2d4e3a) on wheel build-stack-966d3788b3
+# (C++ of 966d3788b3..4a0a2d4e3a differs by one comment), first whole test directories the stack touches plus every other unit file it
+# touches (incl. 4-GPU multi_gpu files); then the directories with upstream main's Python and tests (overlays/main-py-78145f88ea)
+# on the same wheel as the baseline. A failure in the stack run that main's run does not have is the stack's.
+# Logs: review/diag/stack-sweep-<job>/{stack,main}/.
+bash /art/tools/require_presubmit.sh stack-sweep-4a0a2d4e3a-6c9afe7778 || exit 1
+W=/art/build-stack-966d3788b3/dist; S=/checkout; out=/art/review/diag/stack-sweep-${SLURM_JOB_ID:-x}
+T="tests/unittest/_torch/executor tests/unittest/_torch/disaggregation tests/unittest/llmapi/apps tests/unittest/executor tests/unittest/_torch/distributed tests/unittest/_torch/modules/test_alltoall_watchdog.py tests/unittest/_torch/speculative/hw_agnostic tests/unittest/llmapi/test_mpi_session.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/moe/test_resident_placement.py tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/_torch/moe/test_moe_a2a_fake_ops.py tests/unittest/_torch/moe/fused_moe/test_configurable_moe.py"
+X="tests/unittest/_torch/modeling/test_modeling_deepseekv41.py tests/unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py tests/unittest/_torch/moe/test_moe_a2a_abort.py tests/unittest/_torch/moe/test_moe_comm.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_runner.py tests/unittest/_torch/test_mnnvl_alltoall_workspace.py tests/unittest/_torch/test_mnnvl_memory_remap.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py"
+bash /art/tools/point_units.sh $W /art/overlays/stack-py-4a0a2d4e3a /art/overlays/stack-py-4a0a2d4e3a $S $out/stack $T $X
+mv /tmp/ut /tmp/ut-stack
+bash /art/tools/point_units.sh $W /art/overlays/main-py-78145f88ea /art/overlays/main-py-78145f88ea $S $out/main $T

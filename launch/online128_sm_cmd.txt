@@ -1,0 +1,9 @@
+# ONLINE128-SM (8 nodes): C33 at online 128/GPU, where the transport shows a measured cost (CLAIMS 157: off->ulfm ctx
+# mean +3.4/+5.7%, client tok/s +1.2/+0.9%; ulfm->ft ~0). v3 wheel + overlay v3c33-0fed8d8141, the build and overlay
+# TRANSPORT-V3 8145956 gated in-job (same files). Arms on the same 8 nodes, 2 rounds, order rotated:
+# std-online | std-online-ft (TCP) | std-online-ft-sm.
+# Pass rule: ft-sm's ctx-step mean cost vs off < 1/3 of ft's in both rounds, and client tok/s pair delta of ft-sm vs
+# off within 1% (mean of 2). Otherwise the transport is not the online-128 cost: a lead for a code read.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays/v3c33-0fed8d8141
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json TLLM_TEST_COLL_TIMES=1000 TLLM_TEST_COLL_RANKS=all TLLM_TEST_PHASE_TIMES=2000"
+bash $R/bundle.sh "0:8:6600:$E FT_COST_E2E_ARMS='std-online std-online-ft std-online-ft-sm' bash $R/mvp/harness/run_job.sh STD"

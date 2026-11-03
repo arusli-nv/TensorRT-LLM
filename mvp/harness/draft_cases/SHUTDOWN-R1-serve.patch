@@ -1,0 +1,24 @@
+--- serve.sh	2026-10-19 03:45:10.000000000 -0700
++++ serve.sh	2026-10-19 08:39:33.206405051 -0700
+@@ -193,6 +193,21 @@
+ WIDEEP_NO_ULFM=$([[ $mode == ft || $mode == noft-ulfm ]] || echo 1) WIDEEP_STALL_S=${WIDEEP_STALL_S:-5400} \
+     WIDEEP_CASE_TAG=$tag bash "$L/task.sh" "$run" 4 bash "$H/rank.sh" "$run" "${program[@]}" || rc=$?
+ # mpirun has exited (node 0) or node 0 wrote done (other nodes): whatever of the case still runs here is left over.
++# Clean-shutdown cases record it before the sweep kills it: after a graceful stop, a case process still alive
++# WIDEEP_LEFTOVER_GRACE_S after mpirun exited is one the deployment would leave behind (CASE_LEFTOVER fails the case).
++if [[ -n "${WIDEEP_GRACEFUL_STOP:-}" ]]; then
++    left=""
++    for _ in $(seq "${WIDEEP_LEFTOVER_GRACE_S:-15}"); do
++        left=$(tagged_pids "$tag" | paste -sd,)
++        [[ -z $left ]] && break
++        sleep 1
++    done
++    if [[ -n $left ]]; then
++        echo "CASE_LEFTOVER $SLURM_NODEID $(date +%s.%N) $(ps -o pid=,args= -p "$left" 2>/dev/null | cut -c1-160 | tr '\n' ';')" >> "$run/timeline"
++    else
++        echo "CASE_NO_LEFTOVER $SLURM_NODEID $(date +%s.%N)" >> "$run/timeline"
++    fi
++fi
+ sweep "$tag" NODE_SWEEP
+ # Teardown is complete on this node once no GPU has a compute process left.
+ for _ in $(seq 1200); do

@@ -1,0 +1,39 @@
+# UPDATE 12:13: the gate deselects late_writes' no-remap NEGATIVE CONTROL (it checks the test's detection power, not the
+# product): it missed the victim's writes in ZERO-AB 8162956 group 0 (timing) and passed in group 8; a robust control is
+# being fixed on v5-zero and point-tested on 1 node first. The remap cases (the guarantee) stay in the gate.
+# UPDATE 11:25: code is v5-zero 95d6a64a73 = the same Python as 981fd845e2 plus 7 test fixes (ZERO-AB 8161823's gate
+# failures, all test bugs); overlays vzero-95d6a64a73 (Python) and vzero-95d6a64a73-tests (every test changed since 6645ce1848).
+# ZERO-AB (16 nodes, same nodes, two 8-node groups mirrored): v5-zero 981fd845e2 (wheel build-v5zero-6645ce1848 + Python
+# overlay vzero-981fd845e2, COST_DIAG_OVERLAY=1) vs v5-land 9f2f1892f0 (wheel build-v5land-9f2f1892f0, no overlay: arm
+# ft-oldk with OLDK_OVERLAY empty).
+# Arms on each group's own nodes, loads 32 and 128 in one launch, one round per group, group 8 in reverse order:
+#   off = std-noeplb | lb = std-noeplb-lb | ft-zero = std-noeplb-ft | ft-zero-noghost = std-noeplb-ft-noghost
+#   (bound path on 256 slots, testhooks TLLM_TEST_FT_NO_GHOST; anchors checked on 981fd845e2, t_bind PASS) |
+#   ft-v5land = std-noeplb-ft-oldk; all on the zero wheel except ft-v5land. Launch and seed as ABEXP/SPLIT2.
+# Gate: each group first runs the in-job unit gate on the wheel + overlay: every test file of tests overlay
+# vzero-981fd845e2-tests (incl. the fixed test_moe_a2a_late_writes and test_moe_a2a_recovery, 4 GPUs) and VAL-K's FT
+# set except test_mpi_session (~7 min; the overlay does not touch it; zero_smoke's gate runs it on the same code);
+# a FAIL ends the group. BUILD-ZERO 8160496's other results are read before submitting (its extras: late_writes, fixed
+# in the overlay, and test_ring_host_copies failed).
+# Readout (pre-registered, review/INTEGRATION_PLAN.md, monitor-amended 09:20; verbatim):
+#   - headline ft-zero - off with its decomposition (lb - off = indirection, rest = FT); ft-zero may beat lb if G1b keeps
+#     the dispatch-side lookup instead of route();
+#   - trim: ft-zero - lb <= 0.05 ms at 32, and <= 0.4 % of off's trim at 128, same sign in both groups; one group pass +
+#     one fail -> a second round, never a call from n=1;
+#   - stall ms/step: ft-zero within lb + the off-vs-off spread (FT's extra stalls, CLAIMS 159/163, do not show in trim);
+#   - client and whole-window within 1 %.
+# Added arm (monitor, user OK): ft-zero - ft-zero-noghost = the ghost slot layout's cost on v5-zero's path; noghost needs
+# its proof lines in every rank's log (WIDEEP_FT_NO_GHOST_ACTIVE ... num_slots=256 ghost=0, _CALL, no _REFUSED).
+#   python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> $R/mvp/runs/STD-G1-<job> --off std-noeplb-1
+# Estimate: gate ~18 min; ~17 min per case at 32+128 (ABEXP 8158617: 15.5-17.7 min per case at 24+32, same harness),
+# 5 cases + startup ~3 = ~106 min per group of the 117 min limit; both loads fit in both groups, no split (an overrun
+# loses group 0's ft-v5land and group 8's off case: then rerun that pair).
+# Submit (16 nodes, segment 8): bash $R/tools/require_presubmit.sh <token> && bash $R/launch/zero_ab_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5zero-6645ce1848; SRC=$R/overlays/build-src-6645ce1848; O=$R/overlays/vzero-95d6a64a73
+T="tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py tests/unittest/_torch/executor/test_py_executor.py"
+T="$T tests/unittest/_torch/executor/test_adp_absent_ranks.py tests/unittest/_torch/executor/test_adp_host_exchange.py tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/_torch/modeling/test_modeling_deepseekv41.py::test_adp_replay_counts_follow_final_execution tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_runner.py tests/unittest/_torch/test_mnnvl_alltoall_workspace.py tests/unittest/_torch/test_mnnvl_memory_remap.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/moe/test_ring_host_copies.py"
+# + test_ring_host_copies.py (fixed in 4a30682ead: BUILD-ZERO 8160496 ran it against the old _kernel_writes signature).
+g() { echo "PYTEST_ADDOPTS='-k \"not no-remap\"' bash $R/tools/units_gate.sh $R/logs/bundle/zab-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $O-tests $SRC $R/$B/point-units-zab-g$1 $T"; }
+E="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O COST_DIAG_OVERLAY=1 OLDK_BUILD=build-v5land-9f2f1892f0 OLDK_OVERLAY= WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=85 WIDEEP_BURNIN=32:6 COST_LOADS=32,128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-lb std-noeplb-ft std-noeplb-ft-noghost std-noeplb-ft-oldk' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && $E FT_COST_E2E_ARMS='std-noeplb-ft-oldk std-noeplb-ft-noghost std-noeplb-ft std-noeplb-lb std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

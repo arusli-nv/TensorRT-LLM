@@ -1,0 +1,109 @@
+--- job.sh	2026-10-19 08:39:22.000000000 -0700
++++ job.sh	2026-10-19 08:40:46.281156253 -0700
+@@ -2772,3 +2772,106 @@
+     echo STD_DONE
+     ;;
+ esac
++case $job in
++SHUTDOWN-R1)
++    # Clean shutdown (v7 1d.1 bounded teardown; analysis/LAUNCHER_SURVIVAL.md section 5): every other case ends with
++    # task.sh SIGTERMing mpirun (rc=1), so the graceful path (frontend exit -> mgmn_leader_node --action stop -> MPI
++    # shutdown) was never run. Here task.sh stops the deployment as an orchestrator does: SIGTERM (SHUTDOWN_SIGNAL) to
++    # trtllm-serve once the load is done, then mpirun must exit on its own within WIDEEP_GRACEFUL_STOP_S, and no process
++    # of the case may be left on any node 15 s later (serve.sh: CASE_LEFTOVER) or on a GPU (NODE_LEFTOVER).
++    # 1) ft-clean: FT on, healthy load, stop. Expect mpirun rc 0.
++    # 2) ft-loss: FT on, rank 5 SIGKILLed in a decode step under load, survivors resume, load finishes, stop. Expect
++    #    mpirun rc 0: rank 0 and the survivors finalize MPI on their own (mpi_session._leave_degraded_world, rank 0
++    #    logs "finalizing the MPI world, which lost a rank"), and PRRTE does not count the SIGKILLed rank of a
++    #    --with-ft ulfm (recoverable) job. "ending the MPI world" in rank-0.log (MPI_Abort) fails the case.
++    # 3) noft-clean: FT off as deployed (plain mpirun, UCX), same load, stop. Expect rc 0 (the control).
++    # SHUTDOWN_VERDICT per case on node 0: PASS / FAIL / INVALID (load not done, or no recovery in ft-loss).
++    export CASE_TIMEOUT_S=1200 BENCH_CONFIG=dep32-final.yaml TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
++    export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1
++    export WIDEEP_GRACEFUL_STOP=${SHUTDOWN_SIGNAL:-TERM} WIDEEP_GRACEFUL_STOP_S=${SHUTDOWN_BOUND_S:-120}
++    if [[ $dist != *build-next-* ]]; then
++        echo "SMOKE_FAIL preflight: MVP_BUILD must be a next-build wheel (build-next-fcc86b10b2 or later), got $dist"
++        echo STD_DONE; exit 1
++    fi
++    ms=${MVP_OVERLAY:+$MVP_OVERLAY/tensorrt_llm/llmapi/mpi_session.py}
++    if ! { [[ -n $ms && -f $ms ]] && grep -q _leave_degraded_world "$ms"; } &&
++        ! unzip -p "$dist"/tensorrt_llm-*.whl tensorrt_llm/llmapi/mpi_session.py 2>/dev/null | grep -q _leave_degraded_world; then
++        echo "SMOKE_FAIL preflight: ft-loss expects rc 0, so MVP_OVERLAY or the wheel must carry fold-exit0 (_leave_degraded_world)"
++        echo STD_DONE; exit 1
++    fi
++    mkdir -p "$out/autotuner"
++    shutdown_verdict() {  # NAME EXPECT (clean|loss): node 0 judges the case's teardown from its timeline and logs
++        [[ $SLURM_NODEID == 0 ]] || return 0
++        local t=$out/$1/timeline
++        for _ in $(seq 180); do (( $(grep -c '^NODE_CLEAN ' "$t" 2>/dev/null) >= SLURM_NNODES )) && break; sleep 1; done
++        python3 - "$out/$1" "$2" "$SLURM_NNODES" "$WIDEEP_GRACEFUL_STOP_S" <<'PY' | tee "$out/$1/shutdown_verdict.txt"
++import json, re, sys
++from pathlib import Path
++run, expect, nnodes, bound = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
++lines = (run / "timeline").read_text(errors="replace").splitlines() if (run / "timeline").exists() else []
++first = lambda tag: next((l.split() for l in lines if l.startswith(tag + " ")), None)
++count = lambda tag: sum(l.startswith(tag + " ") for l in lines)
++try:
++    result = json.loads((run / "result.json").read_text())
++except (OSError, ValueError):
++    result = {}
++rank0 = (run / "rank-0.log").read_text(errors="replace") if (run / "rank-0.log").exists() else ""
++stop, end = first("GRACEFUL_STOP"), first("MPIRUN_EXIT")
++rc = int(end[2].split("=")[1]) if end else None
++elapsed = float(end[1]) - float(stop[1]) if stop and end else None
++codes = {k: re.findall(rf"{k} exit code: (-?\d+)", rank0)
++         for k in ("Task", "MPI Comm server", "MGMN leader node", "Subshell")}
++abort_line = "ending the MPI world" in rank0
++finalize_line = "finalizing the MPI world, which lost a rank" in rank0
++facts = dict(state=result.get("state"), resumed="all_resumed_seen_wall_s" in result, stop_sent=bool(stop),
++             stop_pids=" ".join(stop[3:]) if stop else None, mpirun_rc=rc, elapsed_s=elapsed,
++             timeout=count("GRACEFUL_TIMEOUT"), no_frontend=count("GRACEFUL_NO_FRONTEND"),
++             case_leftover=count("CASE_LEFTOVER"), case_clean_nodes=count("CASE_NO_LEFTOVER"),
++             gpu_leftover=count("NODE_LEFTOVER"), node_clean=count("NODE_CLEAN"), abort_line=abort_line,
++             finalize_line=finalize_line,
++             rank0_exit_codes=codes)
++problems = []
++if facts["state"] != "DONE" or (expect == "loss" and not facts["resumed"]):
++    verdict = "INVALID"
++    problems.append("load not DONE" if facts["state"] != "DONE" else "no recovery before the stop")
++else:
++    if not stop or stop[3] == "pids=[]" or facts["no_frontend"]:
++        problems.append("no trtllm-serve to signal")
++    if facts["timeout"] or rc is None or elapsed is None or elapsed > bound:
++        problems.append(f"mpirun did not exit within {bound:.0f} s of the stop")
++    if rc != 0:
++        problems.append(f"rc {rc}, expected 0")
++    if expect == "loss" and (abort_line or not finalize_line):
++        problems.append(f"abort line {abort_line} / finalize line {finalize_line}: expected the survivors to finalize")
++    if facts["case_leftover"] or facts["case_clean_nodes"] < nnodes:
++        problems.append(f"leftovers: {facts['case_leftover']} nodes with case processes, "
++                        f"{facts['case_clean_nodes']}/{nnodes} reported clean")
++    if facts["gpu_leftover"]:
++        problems.append(f"{facts['gpu_leftover']} nodes with a GPU process left")
++    verdict = "FAIL" if problems else "PASS"
++print(f"SHUTDOWN_VERDICT {run.name} {verdict} expect={expect} " + "; ".join(problems))
++print("SHUTDOWN_FACTS " + json.dumps(facts))
++for l in lines:
++    if l.startswith(("GRACEFUL_", "MPIRUN_EXIT", "CASE_LEFTOVER", "NODE_LEFTOVER", "RANK_EXIT")):
++        print("  " + l[:300])
++PY
++    }
++    (export TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/ft.json
++     run_case ft-clean ft --mode sweep --loads 64 --iterations 2 --isl 1024 --osl 1024)
++    case_index=$((case_index + 1))
++    shutdown_verdict ft-clean clean
++    require_done ft-clean
++    (export TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/ft.json
++     export WIDEEP_VICTIM=5 TLLM_TEST_KILL_RANK=5 TLLM_TEST_KILL_TRIGGER=$out/trigger-rank5
++     export TLLM_TEST_KILL_IN_DECODE=$TLLM_TEST_KILL_TRIGGER
++     run_case ft-loss ft --mode failover --load 64 --iterations 2 --kill-window-s 20,30 --kill decode)
++    case_index=$((case_index + 1))
++    shutdown_verdict ft-loss loss
++    (export TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/noft.json
++     run_case noft-clean noft --mode sweep --loads 64 --iterations 2 --isl 1024 --osl 1024)
++    case_index=$((case_index + 1))
++    shutdown_verdict noft-clean clean
++    [[ $SLURM_NODEID == 0 ]] && grep -h '^SHUTDOWN_VERDICT' "$out"/*/shutdown_verdict.txt
++    echo STD_DONE
++    ;;
++esac

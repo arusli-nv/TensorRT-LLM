@@ -1,0 +1,44 @@
+# DROPMAP-AB (8 nodes, one group, segment 8; DIAGNOSTIC, follow-up to the fix; user decision: not in today's numbers): does
+# 9f1fd4cab4 (a rank drops its own host-copy page-table entries after writing them) remove the cold-start stall residual
+# left by d71f169e4b (no peer prefault)? Same 8 nodes: std-offline (FT off; first case = fresh node, not in the cold
+# verdict), then std-offline-ft-ovA (d71f169e4b) vs std-offline-ft-ovB (9f1fd4cab4), 2 rounds ABBA (A, B, B, A), short
+# 32/128 windows (14/6 waves), offline seed; then std-offline again (FT off on the now-used node: the same-node
+# reference); then online rank5 x1 on 087d (KF_ALLOW_OVERLAY) for restore time. Finals-build FT reference: POPULATE-AB's
+# populate-on cases (other nodes, labelled). Cold readout: rank-0 step time over ~2 min after each case's page-cache
+# drop. Est 17 + 4 x 17 + 17 + 2 + 13 + 4 = ~121 min; --time 01:59 (the last case may be cut; it is the kill row).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-freeze-58caa0fde6; MB=build-main-9cc37929e8
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=6,128=3 IT_HX=8=24,32=6,128=3,512=1 BURN=32:2 KI=4 KI32=8 KSTOP=4 CRR=rank5
+else
+    IT_MAIN=32=28,128=12 IT_HX=8=39,32=28,128=12,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 CRR='rank5 rank5'
+fi
+SNO=$R/mvp/runs/STD-8193512/autotuner/pinned.json
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+SOFF=$R/mvp/runs/STD-8194123/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1 COST_MAX_WAVES=40 COST_CASE_TIMEOUT_S=3000"
+MAIN="COST_LOADS=32,128 COST_LOAD_ITERATIONS=$IT_MAIN"
+HX="COST_LOADS=8,32,128,512 COST_LOAD_ITERATIONS=$IT_HX"
+KS=200
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+D="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 WIDEEP_KILL_AFTER_STEPS=$KS"
+A="MVP_BUILD=$B FINAL_BUILD=$B $HD"
+export OVERLAY_A=$R/overlays/fix-nopopulate-d71f169e4b OVERLAY_B=$R/overlays/fix-dropmap-9f1fd4cab4
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$E COST_LOADS=32,128 COST_LOAD_ITERATIONS=32=14,128=6 FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 17)) FT_COST_E2E_ARMS='std-offline' $(run STD-G2)"
+P0_2="$E COST_LOADS=32,128 COST_LOAD_ITERATIONS=32=14,128=6 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 36)) FT_COST_E2E_ARMS='std-offline-ft-ovA std-offline-ft-ovB' COST_DIAG_OVERLAY=1 $(run STD)"
+P0_3="$E COST_LOADS=32,128 COST_LOAD_ITERATIONS=32=14,128=6 FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 17)) FT_COST_E2E_ARMS='std-offline' $(run STD-G3)"
+P0_4="$K KF_ALLOW_OVERLAY=1 MVP_OVERLAY=$OVERLAY_B KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13' KF_VICTIM_NODES='3' KF_ROWS='rank5' KF_REPEATS=1 $(run KILL-FINAL-ON)"
+G0="{ $P0_1; $P0_2; $P0_3; $P0_4; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:7100:$G0"

@@ -1,0 +1,101 @@
+--- a/job.sh	2026-10-18 21:45:07.480026162 -0700
++++ b/job.sh	2026-10-18 21:45:07.496026109 -0700
+@@ -1429,13 +1429,13 @@
+     echo STD_DONE
+     ;;
+ BORROW-LITE)
+-    # KV-borrowed extra slots (TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=borrowed) on one node: DeepSeek-V3-Lite EP4, static
++    # KV-borrowed extra slots (TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost) on one node: DeepSeek-V3-Lite EP4, static
+     # 144 slots (18 empty per rank). Exact tokens across a decode kill of rank 2 (the oracle restores rank 2's
+     # experts into the borrowed slots at startup); GSM8K FT off vs after losing rank 2 idle with the memory taken
+     # from the KV cache (TLLM_TEST_BORROW_FROM_KV=1); decode kills of rank 2 under load from free memory and from
+     # the KV cache. MVP_BUILD = a wheel with the borrowed slots, no overlay.
+     export WIDEEP_WORLD=4 WIDEEP_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-V3-Lite/nvfp4_moe_only
+-    export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=borrowed TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1
++    export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1
+     unset MVP_OVERLAY
+     trigger=/tmp/wideep-kill-$SLURM_JOB_ID-$case_index
+     (export TOKENS_CONFIG=../configs/lite4-sync.yaml TLLM_TEST_ORACLE_EXCLUDE_RANK=2 TLLM_TEST_KILL_RANK=2
+@@ -1545,7 +1545,7 @@
+     export BENCH_CONFIG=dep32-b2-288.yaml TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0
+     mkdir -p "$out/autotuner"
+     for round in 1 2 3; do
+-        arms="empty borrowed"; [[ $round == 2 ]] && arms="borrowed empty"
++        arms="empty ghost"; [[ $round == 2 ]] && arms="ghost empty"
+         for a in $arms; do
+             (export TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=$a TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/$a.json
+              run_case $a-$round ft --mode sweep --loads ${BORROW_LOADS:-8,32,128,256} --iterations 2 --isl 1024 --osl 1024 \
+@@ -1553,7 +1553,7 @@
+             case_index=$((case_index + 1))
+         done
+     done
+-    [[ $SLURM_NODEID == 0 ]] && { python3 $H/ab_stats.py "$out" empty borrowed > "$out/ab_stats.txt" 2>&1; cat "$out/ab_stats.txt"; }
++    [[ $SLURM_NODEID == 0 ]] && { python3 $H/ab_stats.py "$out" empty ghost > "$out/ab_stats.txt" 2>&1; cat "$out/ab_stats.txt"; }
+     [[ $SLURM_NODEID == 0 ]] && grep -h "WIDEEP_MEM" "$out"/*-1/rank-0.log | cut -c1-200 | head -4
+     echo STD_DONE
+     ;;
+@@ -1577,7 +1577,7 @@
+     # Decode kills of rank 2 under load on V3-Lite EP4 static 144, extra slots borrowed (memory from free memory,
+     # GPU copies) or, for BORROW-KILL-EMPTY, empty (the CPU-copy baseline); twice each, with a kill window the Lite
+     # load outlasts. Compare the "Restored ... in" times of the two modes. MVP_BUILD = a borrowed-slot wheel.
+-    mode=borrowed; [[ $job == *-EMPTY ]] && mode=empty
++    mode=ghost; [[ $job == *-EMPTY ]] && mode=empty
+     export WIDEEP_WORLD=4 WIDEEP_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-V3-Lite/nvfp4_moe_only
+     export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=$mode
+     export TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1 BENCH_CONFIG=lite4-sync.yaml WIDEEP_KILL_WINDOW=10,20
+@@ -1642,7 +1642,7 @@
+     # _populate_in_background): borrowed-slot decode kills twice; compare "Restored ... in" with BORROW-KILL's
+     # 156-219 ms (cold host pages) and BORROW-KILL-EMPTY's 27 ms (CPU copies).
+     export WIDEEP_WORLD=4 WIDEEP_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-V3-Lite/nvfp4_moe_only
+-    export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=borrowed
++    export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost
+     export TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1 BENCH_CONFIG=lite4-sync.yaml WIDEEP_KILL_WINDOW=10,20
+     kill_case prefault-decode8-1 decode 8
+     kill_case prefault-decode8-2 decode 8
+@@ -2037,7 +2037,7 @@
+         (export TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/$a.json BENCH_CONFIG=dep32-eplb0.yaml
+          [[ $a == empty288 || $a == borrow288 ]] && export BENCH_CONFIG=dep32-b2-288.yaml TLLM_TEST_EMPTY_EXTRA_SLOTS=1
+          [[ $a == online288 ]] && export BENCH_CONFIG=dep32-eplb288.yaml
+-         [[ $a == borrow288 ]] && export TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=borrowed
++         [[ $a == borrow288 ]] && export TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost
+          run_case $a-$k noft --mode sweep --loads 128 --iterations 2 --isl 1024 --osl 1024 --warm-each-load)
+         case_index=$((case_index + 1))
+         [[ $n == 1 ]] && require_done $a-$k
+@@ -2053,7 +2053,7 @@
+     # (single-rank loss: its undelivered requests fail); 2) node 1 (ranks 4-7) killed in a decode step (node loss:
+     # its undelivered requests run again on survivors). Pass: recovery commits, borrowed slots backed, serving
+     # resumes, the load finishes; the counts of failed and re-run requests match the NR1 rule.
+-    export BENCH_CONFIG=dep32-b2-320.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=borrowed WIDEEP_FAILURE_DOMAIN=node
++    export BENCH_CONFIG=dep32-b2-320.yaml TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost WIDEEP_FAILURE_DOMAIN=node
+     export TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/ft.json
+     export TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1
+     mkdir -p "$out/autotuner"
+@@ -2067,7 +2067,7 @@
+      export TLLM_TEST_KILL_IN_DECODE=$TLLM_TEST_KILL_TRIGGER
+      run_case borrow-node1-decode ft "${load[@]}" --kill decode)
+     case_index=$((case_index + 1))
+-    [[ $SLURM_NODEID == 0 ]] && grep -h "Restored .* expert slots\|resumed serving without\|Running .* requests of the lost ranks again\|borrow\|not recoverable\|RuntimeError" \
++    [[ $SLURM_NODEID == 0 ]] && grep -h "Restored .* expert slots\|resumed serving without\|Running .* requests of the lost ranks again\|ghost\|not recoverable\|RuntimeError" \
+         "$out"/*/rank-0.log 2>/dev/null | cut -c1-240 | sort | uniq -c | head -20
+     [[ $SLURM_NODEID == 0 ]] && grep -H '"state"\|fault_tolerance_status' "$out"/*/result.json | cut -c1-400
+     echo STD_DONE
+@@ -2090,7 +2090,7 @@
+         n=$((n + 1)); round[$a]=$((${round[$a]:-0} + 1)); k=${round[$a]}
+         (export TLLM_AUTOTUNER_CACHE_PATH=$out/autotuner/$a.json BENCH_CONFIG=dep32-eplb0.yaml
+          case $a in
+-         ghost288) export BENCH_CONFIG=dep32-b2-288.yaml TLLM_TEST_EMPTY_EXTRA_SLOTS=1 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=borrowed ;;
++         ghost288) export BENCH_CONFIG=dep32-b2-288.yaml TLLM_TEST_EMPTY_EXTRA_SLOTS=1 TLLM_FAULT_TOLERANCE_EXTRA_SLOTS=ghost ;;
+          replicas288) export BENCH_CONFIG=dep32-b2-288.yaml ;;
+          online288) export BENCH_CONFIG=dep32-eplb288.yaml ;;
+          esac
+--- a/testhooks.py	2026-10-18 21:45:07.488026135 -0700
++++ b/testhooks.py	2026-10-18 21:45:07.499026099 -0700
+@@ -196,7 +196,7 @@
+         finalize(self)
+         if self.ep_rank != int(EXCLUDE):
+             mode = self.extra_slots_mode() if hasattr(self, "extra_slots_mode") else module.extra_slots_mode()
+-            if mode in ("empty", "borrowed"):
++            if mode in ("empty", "ghost"):
+                 # The excluded rank's experts have no other replica: restore them as the survivors will.
+                 self.install_recovery_placement([int(EXCLUDE)], self.recovery_placements([int(EXCLUDE)]))
+             else:

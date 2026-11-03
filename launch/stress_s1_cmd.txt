@@ -1,0 +1,137 @@
+# STRESS-S1 (16 nodes, two 8-node groups, segment 8, qos short, --time 02:00:00): review/PRODUCT_STRESS_PLAN.md test
+# Installed 2026-10-26 ~01:00: STRESS_RATE = 51.0 req/s = STRESS_RATE_MEDIAN of S2 job 1 8299473 only (cases 50.7, 51.3;
+# S2 job 2 not run). Readout disclosure (memory check, decided after the 8298880 smoke data, accepted by the monitor):
+# stress_readout.py memory ok needs a growth value of every kind (>= 10 samples per series); before ~22:17 PT 10-25 too
+# few samples gave a vacuous ok=True; thresholds and window unchanged; backup mvp/harness/stress_readout.py.pre-memvalid.
+# S1 (realistic traffic, healthy), FT on vs off on the same nodes, after STRESS-S2S5 (its open-loop rate is this job's).
+# DRAFT (review/drafts/stress_NOTES.md): needs review/drafts/stress_harness.patch applied first.
+#
+# Plan text (verbatim, written before any data):
+#   1. **Realistic traffic, healthy (S1).**
+#      - Load: Poisson arrivals at ~80% of the 32/GPU throughput, input 128-4k and output 64-2k tokens (random range
+#        ratio), FT on vs off, 1 h each, same nodes.
+#      - Pass: no stall > 60 s; FT-on throughput and p50/p99 TTFT/TPOT reported vs off; no memory growth (GPU and host
+#        sampled each minute).
+#   Runs on v5-final (overlays/fix-dropmap-9f1fd4cab4), online EPLB, 32 GB200, both mounts.
+#
+# Design:
+# - Each group runs one FT off / FT on pair on its 8 nodes, in opposite orders (G0 off then on, G8 on then off: ABBA
+#   over the job). FT off = std-online (plain mpirun, FT off as deployed), FT on = std-online-ft; both on
+#   std-online-stress.yaml, the finals' online seed tactics, the same knobs.
+# - CHANGED FROM THE PLAN's "1 h each" (monitor decision 2026-10-25 17:25 PT, before data; cause: the 2 h qos short
+#   limit): 70 loaded minutes per arm over two 35-min servers on two node sets, not 60 min on one server.
+# - "1 h each" does not fit two arms per group in the 2 h QOS (an arm is ~18 min of startup, calibration and
+#   teardown plus its load): each arm's open-loop load is S1_LOAD_MIN = 35 min, so each arm gets 2 x 35 = 70 loaded
+#   minutes over the job (two servers, two node sets), not 60 min on one server. S1_LOAD_MIN=60 with a 03:00 time limit
+#   (qos normal, if it allows it) is the plan's literal 1 h per server; the uptime side is S4 (overnight soak).
+# - Load: as S2 (input 127-4096, output 63-2048, random ids, ignore_eos, MTP forced acceptance, 90% completions / 10%
+#   chat, streamed). Rate fixed for all four arms: STRESS_RATE (requests/s) = STRESS_RATE_MEDIAN of the S2S5 jobs
+#   (review/diag/stress_s2_<job>.txt; 0.8 x the FT-on closed-loop 32/GPU request rate there, so FT off runs a little
+#   under 80% of its own). Each arm first runs the closed-loop 32/GPU row (calib-32, 6 x 1024 requests): the
+#   closed-loop throughput comparison. No closed-loop row after the load (time).
+# - Samplers: per minute per node GPU memory used, MemAvailable / Shmem / AnonPages, /dev/shm, and every case
+#   process's VmRSS / RssAnon / RssShmem (WIDEEP_MEM_SAMPLER_S=60); dmon as the finals; the 1 s host samplers off
+#   (WIDEEP_NO_SAMPLERS=1, as every cost arm).
+#
+# Pre-declared fallback (coordinator decision 2026-10-25 17:25 PT, a plan change made before any stress measurement):
+# Fallback config declared 17:30 PT 2026-10-25, before data (option a): configs/std-online-stress-fb.yaml = std-online
+#   with max_seq_len 3200 (the only change; 2304 cannot hold 2048 + 1024 + 1 draft), mix input 128-2k / output 64-1k.
+#   if std-online-stress.yaml (max_seq_len 6400) runs out of memory or fails at startup in S2's first case, the length
+#   mix of ALL stress cases (S2, S5, S1, S3) becomes input 128-2k / output 64-1k: STRESS_LENGTHS=fallback (input
+#   uniform 127-2048, output 63-1024: --isl 1088 --osl 544 --range-ratio 0.8824) on std-online-stress-fb.yaml, nothing
+#   else changed. That config is std-online.yaml with max_seq_len 3200, because 2048 + 1024 + 1 draft = 3073 does not
+#   fit the standard 2304 (std-online.yaml itself cannot serve this mix).
+# Readout rules (stress_readout.py, written before any data):
+# - no stall > 60 s (per arm): no two consecutive rank-0 iterations > 60 s apart and no 60 s without a streamed chunk
+#   while a request is open, from the open-loop load's start to its last arrival.
+# - FT-on throughput and p50/p99 TTFT/TPOT reported vs off (per pair, then the two pairs' mean): calib-32 output
+#   tok/s (closed loop), open-loop served output tok/s and p50/p99 TTFT / TPOT of the "ok" requests that start
+#   >= 300 s into the load (STRESS_PAIR line, on vs off %). Reported, no pass bar (none in the plan).
+# - no memory growth (per arm): over [load start + 600 s, last arrival], median of the last 5 per-minute samples minus
+#   median of the first 5, for every GPU <= 256 MiB, every rank process's RssAnon <= 512 MiB, every node's used memory
+#   (-MemAvailable) <= 2048 MiB. These thresholds were added 17:25 PT 2026-10-25, before data (the plan says only
+#   "no memory growth"; approved by the monitor); the FT-on minus FT-off growth is reported next to each.
+# - Also reported: client failures (expected 0 in both arms), the arm's state, Xid/NVRM lines.
+# Job readout: review/diag/stress_s1_<job>.txt (per-arm STRESS_VERDICT lines + two STRESS_PAIR lines), written by the
+# group that ends last (fallback: after the bundle).
+#
+# Est: arm = ~12 startup + ~3 warm-up and calib-32 + ~2 client prompt generation + 35 load + ~1 drain + ~2 teardown =
+# ~55 min; group ~110 min of the bundle's 6900 s. The second arm of a group starts only with >= 52 min left (else the
+# group ends: no partial arm). Both groups run the same structure and end within ~5 min of each other.
+# Mounts: $R (claude dir) rw AND /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro (model root; presubmit does not check it).
+# Presubmit (after the patch): python3 $R/tools/presubmit.py --name STRESS-S1 --nodes 16 --segment 8 --job STRESS
+#   --build build-freeze-58caa0fde6 --overlay overlays/fix-dropmap-9f1fd4cab4 --branch /tmp/claude-161238/wt-split
+# Dry run: STRESS_RATE=60 bash $R/tools/dry_run.sh review/drafts/stress_s1_cmd.txt 16 0 8
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+SELF=$(realpath "$0")
+runs=$R/mvp/runs diag=$R/review/diag marks=$R/logs/stress
+[[ -n ${WIDEEP_DRY_RUN:-} ]] && runs=$WIDEEP_DRY_RUN/runs diag=$WIDEEP_DRY_RUN marks=$WIDEEP_DRY_RUN/marks
+mkdir -p "$marks"
+readout() {
+    mkdir "$marks/$SLURM_JOB_ID.readout" 2>/dev/null || return 0
+    local out=$diag/stress_s1_$SLURM_JOB_ID.txt d g
+    { echo "STRESS_S1_READOUT job=$SLURM_JOB_ID rate=$STRESS_RATE via=$1 $(date '+%F %T %Z')"
+      for d in "$runs"/STRESS*-"$SLURM_JOB_ID"/s1-*/; do
+          [[ -s $d/result.json ]] || { echo "STRESS_VERDICT ${d%/} s1 MISSING"; continue; }
+          timeout 600 python3 -I "$R/mvp/harness/stress_readout.py" case "$d" --test s1
+          for f in "$d"kernel-*-after.txt; do
+              b=${f/-after/-before}; [[ -e $b ]] && grep -iE 'xid|nvrm' "$f" | grep -vxFf "$b" | sed "s|^|NEW_KERNEL_LINE ${d%/} |"
+          done
+      done
+      for g in "$runs"/STRESS-"$SLURM_JOB_ID" "$runs"/STRESS-G1-"$SLURM_JOB_ID"; do
+          [[ -s $g/s1-off/result.json && -s $g/s1-on/result.json ]] \
+              && timeout 600 python3 -I "$R/mvp/harness/stress_readout.py" pair "$g/s1-off" "$g/s1-on"
+      done
+    } > "$out.tmp" 2>&1
+    mv "$out.tmp" "$out"
+    echo "STRESS_READOUT $out"
+}
+if [[ -n ${STRESS_GROUP_DONE:-} ]]; then
+    touch "$marks/$SLURM_JOB_ID-$STRESS_GROUP_DONE.done"
+    [[ -e $marks/$SLURM_JOB_ID-g0.done && -e $marks/$SLURM_JOB_ID-g8.done ]] && readout group-end
+    exit 0
+fi
+# One group: two arms in ORDER; the second only with >= S1_SECOND_MIN minutes left (decided by the group's node 0).
+if [[ -n ${S1_ORDER:-} ]]; then
+    i=0
+    for arm in $S1_ORDER; do
+        i=$((i + 1))
+        if (( i > 1 )); then
+            go=$marks/$SLURM_JOB_ID-$S1_JOB_NAME-arm$i
+            if [[ $SLURM_NODEID == 0 ]]; then
+                left=$(( (${SLURM_JOB_END_TIME:-$(( $(date +%s) + 3600 ))} - $(date +%s)) / 60 ))
+                (( left >= ${S1_SECOND_MIN:-52} )) && echo 1 > "$go.tmp" || echo 0 > "$go.tmp"
+                mv "$go.tmp" "$go"
+            fi
+            for _ in $(seq 600); do [[ -s $go ]] && break; sleep 1; done
+            [[ $(cat "$go" 2>/dev/null) == 1 ]] || { echo "STRESS_S1_SKIP arm $i ($arm): not enough time left"; break; }
+        fi
+        name=s1-off; [[ $arm == std-online-ft ]] && name=s1-on
+        STRESS_NAME=$name STRESS_ARM=$arm bash $R/mvp/harness/run_job.sh "$S1_JOB_NAME"
+    done
+    [[ $SLURM_NODEID == 0 ]] && STRESS_GROUP_DONE=$S1_TAG bash "$SELF"
+    exit 0
+fi
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+[[ ${STRESS_RATE:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "DRY_RUN_FAIL STRESS_RATE (req/s, the S2S5 jobs' STRESS_RATE_MEDIAN) is required"; exit 1; }
+B=build-freeze-58caa0fde6
+FIX_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+SMOKE=${SMOKE:-0}
+LOAD_MIN=${S1_LOAD_MIN:-35}; [[ $SMOKE == 1 ]] && LOAD_MIN=10
+S="MVP_OVERLAY=$FIX_OVERLAY KF_ALLOW_OVERLAY=1 MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_POLLUTION_CHECKS=1"
+S="$S WIDEEP_NO_SAMPLERS=1 WIDEEP_DMON=1 WIDEEP_MEM_SAMPLER_S=60 STRESS_SEED=$SON"
+S="$S STRESS_BENCH='--stress-minutes $LOAD_MIN --stress-rate $STRESS_RATE --calib-end-waves 0'"
+S="$S STRESS_LENGTHS=${STRESS_LENGTHS:-}"  # empty, or fallback (header)
+G0="$S S1_ORDER='std-online std-online-ft' S1_JOB_NAME=STRESS S1_TAG=g0 STRESS_RATE=$STRESS_RATE bash $SELF"
+G8="$S S1_ORDER='std-online-ft std-online' S1_JOB_NAME=STRESS-G1 S1_TAG=g8 STRESS_RATE=$STRESS_RATE bash $SELF"
+echo "STRESS_S1 lengths=${STRESS_LENGTHS:-default} rate=$STRESS_RATE load_min=$LOAD_MIN smoke=$SMOKE"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:6900:$G0" "8:8:6900:$G8"
+[[ ${SLURM_NODEID:-0} == 0 ]] && readout bundle-end

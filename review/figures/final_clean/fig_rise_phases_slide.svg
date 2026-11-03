@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="380" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="#FFFFFF"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#2D3142"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#9A9A9A"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<rect x="40" y="20" width="460" height="86" rx="8" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="270.0" y="47" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">Phase 1</text>
+<text x="270.0" y="69" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">Survive a loss</text>
+<text x="270.0" y="88" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">keep serving on N−k ranks</text>
+<rect x="40" y="146" width="460" height="86" rx="8" fill="white" stroke="#6E6E6E" stroke-width="2"/>
+<text x="270.0" y="173" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">Phase 2</text>
+<text x="270.0" y="195" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">Restore back to N</text>
+<text x="270.0" y="214" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">lost ranks rejoin</text>
+<line x1="270.0" y1="110" x2="270.0" y2="140" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="40" y="272" width="460" height="86" rx="8" fill="white" stroke="#6E6E6E" stroke-width="2"/>
+<text x="270.0" y="299" font-size="20" fill="#2D3142" text-anchor="middle" font-weight="bold">Phase 3</text>
+<text x="270.0" y="321" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">Planned scaling</text>
+<text x="270.0" y="340" font-size="16" fill="#4F5D75" text-anchor="middle" font-weight="normal">grow or shrink: N ↔ M</text>
+<line x1="270.0" y1="236" x2="270.0" y2="266" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<text x="522" y="69.0" font-size="18" fill="#1B4F12" text-anchor="start" font-weight="bold">this talk</text>
+</svg>

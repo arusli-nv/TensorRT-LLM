@@ -1,0 +1,19 @@
+# PT-D: v4 d (a02f262be7: MPI_Finalize bounded at 3 s under Open MPI's in-band failure detector) on b+c+d
+# (overlay v4bcd-a02f262be7, v3 wheel). Unit gate first (units_gate.sh: test_mpi_session.py on node 0, the known
+# flashinfer_temporary_cleanup env failure deselected; every node stops unless PASS), then SHUTDOWN-R1 as deployed:
+# ft-clean, ft-loss (rank5 killed, survivors resume, then stop), noft-clean.
+# PASS: units PASS; every SHUTDOWN_VERDICT PASS (rc 143, nodes clean, no leftovers); ft-clean and ft-loss stop in
+# <= 20 s (v3: 43.9/44.9 s; FT off 16.7 s) with "did not end within 3 s" (not 30 s) where Finalize is bounded.
+# + group 8, PARITY (C30 lead): FT off on our v3 wheel vs main's wheel (build-pr0-fc52f0adee: main at fc52f0adee, not
+#   v3's merge base 0829689c52, so main's own changes in between are mixed in; the validation run uses a main build at
+#   the merge base). No EPLB, 32 and 128/GPU, 2 rotated rounds on the same 8 nodes.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays/v4bcd-a02f262be7
+G="PYTEST_ADDOPTS='-k \"not flashinfer_temporary_cleanup\"' bash $R/tools/units_gate.sh $R/logs/bundle/ptd-gate-\$SLURM_JOB_ID $R/$B/dist $O $O-tests $R/overlays/build-src-bcea8da496 $R/$B/point-units-a02f262be7 tests/unittest/llmapi/test_mpi_session.py"
+# Group 8 first runs v5's unit gate (v5 = v3 + fence-always fa884734ad; all Python, so v3 wheel + overlay v5-fa884734ad):
+# authority, peer_loss_recovery (incl. test_rank_lost_during_recovery, C28), mpi_session, a2a abort. Its verdict gates
+# nothing in this job (parity does not use v5); it gates every later job that uses v5.
+V5=$R/overlays/v5-fa884734ad
+V="PYTEST_ADDOPTS='-k \"not flashinfer_temporary_cleanup\"' bash $R/tools/units_gate.sh $R/logs/bundle/v5-gate-\$SLURM_JOB_ID $R/$B/dist $V5 $V5-tests $R/overlays/build-src-bcea8da496 $R/$B/point-units-fa884734ad tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/_torch/moe/test_moe_a2a_abort.py"
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32,128 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:4800:$G && MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O bash $R/mvp/harness/run_job.sh SHUTDOWN-R1" \
+  "8:8:6300:$V; $E FT_COST_E2E_ARMS='std-noeplb std-noeplb-main' bash $R/mvp/harness/run_job.sh STD"

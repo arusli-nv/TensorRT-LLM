@@ -1,0 +1,12 @@
+# TUNE-FREEZE (monitor-drafted 2026-10-23 while the dev session was unreachable; 16 nodes, two 8-node groups):
+# per-mode tactic tables for the finals on the refreeze wheel build-freeze-8c52d11469 (= v5-final e25e638054, no overlay).
+# G0: online EPLB (std-online + std-online-ft), G8: offline EPLB (std-offline + std-offline-ft). Each group's tuning pass
+# (STD_TUNE_ARMS, at 128/GPU) writes mvp/runs/STD{,-G1}-<job>/autotuner/pinned.json = the FT_COST_E2E_SEED for that mode's
+# finals; then one short round at 32/GPU (descriptive, not finals evidence). No unit gate (refreeze validated by
+# BUILD-REFREEZE 8179984 + UNITS-REFREEZE 8181837). No-EPLB tuning runs in tune_freeze_noeplb_cmd.txt (8 nodes).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+B=build-freeze-8c52d11469
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30 FT_COST_E2E_ROUNDS=1"
+bash $R/bundle.sh "0:8:7000:$E STD_TUNE_ARMS='std-online std-online-ft' FT_COST_E2E_ARMS='std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$E STD_TUNE_ARMS='std-offline std-offline-ft' FT_COST_E2E_ARMS='std-offline-ft std-offline' bash $R/mvp/harness/run_job.sh STD-G1"

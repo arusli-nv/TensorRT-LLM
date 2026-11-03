@@ -1,0 +1,62 @@
+rt2 tip: 626f39b405 (branch rt2 in /tmp/claude-161238/work/wt-rt2c)
+rt2-org: pure code moves for redteam2/python.md #14-#18 (no logic changes)
+Worktree: /tmp/claude-161238/work/wt-rt2c. Not pushed.
+
+Base note: fix-final8 was reset at 20:19 PT from 445a9c8f42 to 90435f7b99. At 21:03 PT it then took the rt2-correct
+commits (8, ending 3ff5d44558), the rt2-hotpath commits (4, ending eb2fab6c64) and 15 more, ending at 4de25459ce.
+Cherry-picking rt2-correct and rt2-hotpath again would give empty commits, so rt2 = fix-final8 (4de25459ce) + the 4
+moves below. Every cherry-pick applied cleanly; no move had to be redone. rt2-correct and rt2-hotpath had no new
+commits since 20:33 PT (checked at 21:44 PT).
+
+Moves (SHA on rt2-org -> SHA on rt2):
+#18 667f031664 -> 7f90e2eb14  failure_domains + FailureDomain: _torch/pyexecutor/peer_loss_recovery.py ->
+    executor/recovery/config.py. moe_load_balancer imports it at module level (the lazy moe->pyexecutor import is
+    removed). Files: config.py, peer_loss_recovery.py, moe_load_balancer.py, tests/.../test_peer_loss_recovery.py.
+#17 4e7eaf469e -> 8099b0996d  FT exit path: llmapi/mpi_session.py -> new executor/recovery/mpi_exit.py
+    (num_failed_ranks, is_departed_peer_failure, leave_degraded_world, exit_fault_tolerant_process and the
+    private _FAILED_RANK_EVIDENCE_S, _FINALIZE_GRACE_S, _mpi_finalize, _finalize_and_exit). The three names
+    mpi_session calls lost their leading underscore. mpi_session calls mpi_exit.X. mgmn_worker_node and
+    mgmn_leader_node import exit_fault_tolerant_process from mpi_exit. In test_mpi_session.py the monkeypatch
+    targets moved to mpi_exit (num_failed_ranks, leave_degraded_world, _FAILED_RANK_EVIDENCE_S,
+    _FINALIZE_GRACE_S, _mpi_finalize, faulthandler, logging, global_mpi_rank, mpi4py, mpi_failed_ranks,
+    ENABLE_MULTI_DEVICE, is_mpi_peer_failure, os._exit). The _fake_ulfm_mpi fixture patches
+    peer_loss_recovery_enabled on both modules and keeps mpi4py on mpi_session, because its error callback
+    still catches mpi4py.MPI.Exception. The sys.modules lookup of peer_loss_recovery.stop_startup_watch is
+    unchanged: replacing it with a registered hook would be a logic change.
+#15 52d4766544 -> 6b4bb1e187  authority.py split: authority.py keeps Phase, RecoveryAuthority, Outbound and
+    _REJECTION_LOG_INTERVAL_S, and no longer imports zmq, ipc or client. New authority_server.py holds serve,
+    _send, _receive_datagrams, datagram_socket, router_queue, _plain_host, command_fence, main and the
+    transport constants. authority.py ends with `if __name__ == "__main__": from .authority_server import main;
+    main()`, so `python -m tensorrt_llm.executor.recovery.authority` (harness, docs, integration test) still
+    works. Tests: test_recovery_authority.py and test_recovery_hang_monitor.py use authority_server.X for the
+    moved names, including monkeypatch(authority_server, "_MAX_DATAGRAMS_PER_PASS").
+#14 628a7ad713 -> 626f39b405  New _torch/moe/fused_moe/eplb_recovery.py gets the module-level planning
+    functions: restore_lost_experts, staging_halves, ring_copy_nodes, and staging_room / no_staging_room /
+    next_piece (formerly underscored; now imported by moe_load_balancer). It uses
+    HostMoeTensorSharer.align_size through a call-time import (_align_size), because moe_load_balancer
+    imports eplb_recovery. Tests: test_ring_host_copies.py, test_resident_placement.py and
+    multi_gpu/test_ring_restore_staging.py import these functions from eplb_recovery.
+    Not moved: the MoeLoadBalancer methods recovery_placements, restore_copy_plan, stage_restored_slots and
+    placement_digest. Making them free functions would change how peer_loss_recovery calls them and the ~40
+    mock assertions in test_peer_loss_recovery.py (load_balancer.restore_copy_plan.return_value and so on),
+    so it is not a mechanical move. The moe_load_balancer.py shrink is ~110 lines, not ~600.
+#16 SKIPPED (not a clean move). (b) _recover, shrink, fencing and placement are methods of PeerLossRecovery
+    that share its state, so they would need a mixin or free functions taking self. (c) _register and
+    watch_startup_peer_failures depend on _torch.distributed (Distributed, MPIDist, PeerFailureWatch), so
+    putting them in executor/recovery would add an executor -> _torch layering inversion. Also, 28 monkeypatches
+    target peer_loss_recovery.X, and rt2-correct and rt2-hotpath are editing the file at the same time.
+    The only clean part, failure_domains, is #18.
+
+Checks (rt2 and rt2-org):
+- pre-commit run --files <the 17 changed files>: clean, with no file modified on rerun at rt2.
+- py_compile on all 17 changed files: OK.
+- Grep for old paths and names (peer_loss_recovery.failure_domains; mpi_session._num_failed_ranks,
+  _leave_degraded_world, _is_departed_peer_failure, _finalize_and_exit, _mpi_finalize, _FINALIZE_GRACE_S,
+  _FAILED_RANK_EVIDENCE_S; mpi_session import exit_fault_tolerant_process; authority_module.{serve,
+  router_queue, datagram_socket, command_fence, _send, _receive_datagrams, _ROUTER_RCVHWM,
+  _MAX_DATAGRAMS_PER_PASS, subprocess}; moe_load_balancer.{ring_copy_nodes, restore_lost_experts,
+  staging_halves, _staging_room, _next_piece}) across *.py, *.sh, *.md and *.groovy: no hits.
+- The diff fix-final8..rt2 is identical to the diff 445a9c8f42..rt2-org (the 4 moves).
+- Not run: pytest and runtime imports. This host has no torch, so the moved tests (test_mpi_session,
+  test_recovery_authority, test_recovery_hang_monitor, test_ring_host_copies, test_resident_placement,
+  test_peer_loss_recovery) still need a run in the container.

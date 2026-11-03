@@ -1,0 +1,8 @@
+# KILLS-V3: does v3 (bcea8da496: 5 fix-minors + 6 review fixes) serve and recover like v2? Kill smoke, decode-only, settings as the
+# v2 finals kills (8115497). G0: w/o EPLB rank5 + node1 x1. G1: offline rank5 + node1 x1. It exercises the changed paths:
+# Register protocol_version, the bind-time do_finalize refusal (a model with an unfinalized combine hook would now refuse at
+# startup), the fence Popen reaper, probe close at shutdown, the abort_state schema.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1"
+bash $R/bundle.sh "0:8:4200:$K KF_BENCH_CONFIG=std-noeplb-ft.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A" \
+  "8:8:4200:$K KF_BENCH_CONFIG=std-offline-ft-filled.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B"

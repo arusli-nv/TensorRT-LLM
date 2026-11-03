@@ -1,0 +1,3 @@
+# VAL-H was split (2026-10-22 15:50): VAL-H1 = launch/val_h1_cmd.txt (healthy no-EPLB off|ft|ft-noslottable at 32),
+# VAL-H2 = launch/val_h2_cmd.txt (online EPLB C21/C22). See review/VAL_PLAN.md. This file must not be submitted.
+echo "VAL-H is split: submit launch/val_h1_cmd.txt and launch/val_h2_cmd.txt"; exit 1

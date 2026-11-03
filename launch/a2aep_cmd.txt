@@ -1,0 +1,63 @@
+# A2A-EP2 (8 nodes, 4 GB200 each, segment 8 = one NVL72 domain; DIAGNOSTIC for POST_FINAL_ANALYSIS_PLAN item 2, no server,
+# no product change). Question: FT's steady cost at DEP32 is a fixed ~84 us/step of GPU time (EPLB modes pooled,
+# review/diag/steady_cost_analysis.md section 1). The a2a kernels explain ~34-48 us at EP4 (A2A-MICRO, CLAIMS 191:
+# +0.57-0.81 us per round trip x 59 a2a calls per step). Does the per-round-trip FT delta grow with EP size and load,
+# so that at EP32 and the served 64 / 256 tokens/rank it explains all ~84 us?
+# Method: tools/a2aep_bench.py = scratch-a2abench/a2a_bench.py --graph (A2A-MICRO's driver) as one MPI rank per
+# GPU, run by tools/a2aep_ep.sh (tools/a2a_microbench_ep.sh's per-node scheme, which ran A2A-EP 8121785 to
+# completion on 8 nodes through launch/task.sh). Raw moe_a2a_dispatch + moe_a2a_combine on a real MNNVL workspace,
+# fence path, R1 NVFP4 shapes (hidden 7168, FP4 + FP8 scales, top-8 of 256, low-precision combine), 32/64/256
+# tokens/rank (32 ties to CLAIMS 191; 64 and 256 are served decode at 32 and 128/GPU with MTP-1), one CUDA graph of
+# 200 back-to-back round trips per variant, PDL on (TRTLLM_ENABLE_PDL=1, serve.sh:230).
+# Arms (variants, same workspace, same graph shape): off = no rank mask; ft = rank mask (all live) + abort record, as a
+#   bound MoeExecutionState passes them; off2 = a second captured graph of off (the off/off noise control).
+#   Order: 21 cycles per load (cycle 0 = warm-up, dropped), each replaying off, ft, off2 once in an order rotated by one
+#   per cycle. Instantiations: with EPLB local stats (online) and without (offline), separate launches.
+# EP 4/8/16/32 on the first 1/2/4/8 nodes; 3 repeats (repeat 2 reverses the EP order and the stats order), every launch a
+#   fresh process set + MNNVL workspace: 4 EP x 2 instantiations x 3 = 24 launches.
+# Code: v5-final 27442bd91d = build-freeze-58caa0fde6 wheel + overlays/fix-dropmap-9f1fd4cab4 (applied as serve.sh
+#   applies MVP_OVERLAY), checked on every node against 27442bd91d's sha256 of nvlink_one_sided.py, execution_state.py,
+#   mnnvl_memory.py, moe_load_balancer.py, ep_group_health.py (a mismatch stops the job before any launch). The a2a C++
+#   is unchanged 58caa0fde6..27442bd91d (git diff --stat: moe_load_balancer.py + two tests only).
+# Est: A2A-EP 8121785 launches took 19-22 s each through task.sh (build-v2-cef4670789/a2a-microbench-ep/ep*/timeline
+#   MPIRUN_START..EXIT), mostly process start + import; per launch here + 3 loads x (3 captures + 63 replays of
+#   200 x ~20-45 us) = ~+5 s -> ~25-30 s x 24 = ~12 min; install + overlay <= ~6 min (8121785: submit 07:10, sweep
+#   07:16:47-07:19:47 PT). ~20 min total; --time 00:40.
+# Output: review/diag/a2aep-<job>/ (r<rep>-ep<EP>-s<stats>.json raw per-rank per-block data, task logs, fabric-<node>.txt
+#   clique ids, code-<node>.txt hashes, summary.txt), log lines A2A_EP ... per launch and load.
+#
+# PRE-REGISTERED (written 2026-10-25 before any data; the user approves before submission):
+# Statistic, per launch, EP, instantiation and load T: x_b = min over ranks of (replay time / 200) for block b; M_v =
+#   median over the 20 blocks of variant v; delta = M_ft - M_off; noise = M_off2 - M_off. Per cell (EP, instantiation,
+#   T): D = median over the 3 launches of delta, N = median over launches of noise, Nmax = max |noise| over launches.
+#   Printed by `a2aep_bench.py --summarize` (summary.txt), with 59 x D in us/step.
+# Decision cell: EP32, T = 64, each instantiation (stats = online, no stats = offline). Thresholds from the plan:
+#   1.3 us x 59 = 77 us/step (of ~84); 0.7 us = A2A-MICRO's EP4 level.
+#   Validity: |N| < 0.3 us and Nmax < 0.5 us (half the 0.6 us gap between the plan's two levels); else that cell is
+#     INCONCLUSIVE (report, no rerun without the user).
+#   A. D >= 1.3 us in both instantiations -> the a2a kernels explain the whole steady cost; D1 (steady_cost_audit.md:31-35)
+#      is the target.
+#   B. D <= 0.9 us in both -> the rest (~84 - 59 x D us/step) is outside the a2a kernels; next: the same-node serving pair
+#      with an FT-on / plain-a2a testhook arm (as CLAIMS 167's ft-unbound).
+#   C. Otherwise (0.9 < D < 1.3, or the instantiations disagree) -> PARTIAL: the a2a kernels explain 59 x D us/step per
+#      instantiation; report that share against the online (69/97) and offline (83/89) us/step cells of CLAIMS 194 and
+#      do both follow-ups only with the user.
+#   Context, reported with the verdict, never changing it: D at EP4/8/16 and T = 32/256 (growth with EP and load);
+#   tie to CLAIMS 191 = EP4, T = 32: stats +0.68, no stats +0.57 us; if either differs by > 0.4 us the report flags
+#   this sweep as not comparable to A2A-MICRO (driver/launch difference) before any verdict is quoted.
+#   Scope: kernel-only and back to back (no MoE GEMMs between the a2a calls, payload not in the workspace, 256 slots
+#   in both arms, no expert_to_slot); a B verdict therefore does not exclude PDL/overlap interactions with the
+#   neighbouring kernels in serving: those belong to the serving pair.
+#
+# Submit (after the user's OK): python3 $R/tools/presubmit.py --name A2A-EP2 --nodes 8 --segment 8
+#   --build build-freeze-58caa0fde6 --overlay $R/overlays/fix-dropmap-9f1fd4cab4 --branch /tmp/claude-161238/wt-split
+#   -> TOKEN; slurm_submit: 8 nodes, segment 8, 4 GPUs/node, one task per node, --time 00:40, mounts R:R:rw
+#   (as A2A-MICRO / A2A-EP 8121785); command: bash $R/tools/require_presubmit.sh TOKEN && bash $R/launch/a2aep_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/a2aep-${SLURM_JOB_ID:-x}
+mkdir -p "$out"
+bash $R/tools/a2aep_ep.sh "$out" > "$out/node-${SLURM_NODEID}.log" 2>&1
+rc=$?
+(( SLURM_NODEID == 0 )) && cat "$out/node-0.log"
+exit $rc

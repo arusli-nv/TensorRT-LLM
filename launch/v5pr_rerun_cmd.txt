@@ -1,0 +1,43 @@
+# V5PR-RERUN (1 node per part; PART=A1|A2|B in the job command): per-commit unit tests of the restacked PR stack
+# v5-pr-restack ed506cefd7 (tip tree == v5-pr b27007aca1; 028b's ring pieces moved into b0ee, da91 squashed into 663d).
+# Commits: the 3 changed ones (a6c0ac7595 = new 028b, 71d70e8afa = b0ee, a0826a3abb = 663d+da91), the commit after
+# each, and the 8 never run (e20a..250d by new hash). Unchanged-tree commits reuse their old exports (tree equality
+# checked). Tests per commit: tools/select_commit_tests.sh = touched test files + test files importing a changed
+# FT-core module (moe_load_balancer, peer_loss_recovery, mpi_session, executor/recovery/*, nvlink_one_sided).
+# Each commit's .py overlaid on the freeze wheel, collect-only gate first, no -x, --basetemp=/tmp/bt (short: zmq ipc
+# paths stay under 107 chars). Part B also reruns MPI-SHORT on the tip (lost to truncation in 8278741), own file.
+# Pass rule (set before data): every selected test file passes at every commit (skips only for missing GPUs or
+# launchers); any failure gets a traceback and blocks "each commit tested" until fixed or explained.
+# Output: review/diag/v5pr-rerun-$PART-<job>.txt (summary) + review/diag/v5pr-rerun-<job>/<commit>.txt (full).
+# test_moe_module.py (main's MoE kernel matrix, ~40 min; imports moe_load_balancer) hits the 900 s per-file limit at
+# a6c0/71d7 in A1; A2 runs it with PYTEST_FILE_TIMEOUT=3600 at b954, where every moe_load_balancer change is in.
+# Times: A1 ~70 min (--time 01:30), A2 ~60 min (--time 01:30), B ~25 min (--time 00:45).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+job=${SLURM_JOB_ID:-x}; out=$R/review/diag/v5pr-rerun-$PART-$job.txt; full=$R/review/diag/v5pr-rerun-$job; mkdir -p $full
+D=$R/scratch-v5pr-commits
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    echo "##### collect-only"
+    fail=0
+    while read -r c dir tests; do
+        printf '%s\n' $tests > /tmp/list-$c.txt
+        r=$(bash $R/scratch-v5pr-tip/collect_check.sh $D/$dir /tmp/list-$c.txt); echo "$c: $r"; grep -q COLLECT_FAIL <<< "$r" && fail=1
+    done < $D/plan-rerun-$PART.txt
+    (( fail )) && { echo V5PR_RERUN_STOPPED_AT_COLLECTION; exit 0; }
+    while read -r c dir tests; do
+        echo "##### commit $c (export $dir)"
+        PYTEST_FILE_TIMEOUT=$([[ $PART == A2 ]] && echo 3600 || echo 900) bash $R/scratch-v5pr-tip/run_commit_tests.sh $D/$dir /tmp/list-$c.txt $full/$c.txt
+    done < $D/plan-rerun-$PART.txt
+    if [[ $PART == B ]]; then
+        echo "##### MPI-SHORT tip"
+        echo tests/unittest/llmapi/test_mpi_session.py > /tmp/list-mpi.txt
+        PYTEST_EXTRA="--basetemp=/tmp/b-tip -k flashinfer_temporary_cleanup" ARM_OUT=$full/mpi-short-tip.txt \
+            bash $R/scratch-mpisession/run_full.sh $R/scratch-v5pr-tip /tmp/list-mpi.txt
+        tail -3 $full/mpi-short-tip.txt
+    fi
+    echo V5PR_RERUN_DONE
+} > "$out" 2>&1

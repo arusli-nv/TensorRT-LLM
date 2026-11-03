@@ -1,0 +1,13 @@
+load,mode,n,trim_mean_pct,ci_lo,ci_hi,extra_us_per_step,trim_off_ms,trim_on_ms
+32,noeplb,8,+0.87,+0.72,+1.02,120.0,13.831,13.951
+32,offline,8,+0.50,+0.34,+0.66,70.3,14.123,14.194
+32,online,8,+0.35,-0.04,+0.75,51.1,14.634,14.685
+"32 (original n=4, CLAIMS 194)",noeplb,4,+0.96,,,133.2,,
+"32 (original n=4, CLAIMS 194)",offline,4,+0.59,,,82.5,,
+"32 (original n=4, CLAIMS 194)",online,4,+0.48,,,69.4,,
+128,noeplb,8,+0.56,+0.38,+0.74,150.0,26.782,26.932
+128,offline,8,+0.39,+0.24,+0.54,102.7,26.428,26.531
+128,online,8,+0.40,+0.28,+0.53,99.4,24.674,24.773
+"128 (original n=4, CLAIMS 194)",noeplb,4,+0.53,,,141.9,,
+"128 (original n=4, CLAIMS 194)",offline,4,+0.34,,,88.9,,
+"128 (original n=4, CLAIMS 194)",online,4,+0.39,,,96.6,,

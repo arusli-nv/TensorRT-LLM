@@ -1,0 +1,5 @@
+# A2A microbench (submit at 07:00; the user's 06:15 rule holds until then): NVLinkOneSided dispatch+combine, FT off vs on
+# (bound), EP 4 on 1 node, tokens/rank 16-256, R1 NVFP4 shapes, payload in workspace, expert_to_slot in FT as in serving.
+# Reviewed against v2 (crash in bound combine shape, host launch gaps in timing, num_experts, expert_to_slot: fixed).
+# slurm_submit: 1 node, 4 GPUs, short qos, 0:30, mounts as A2A-MPIRUN 8120397 (R:R:rw, R:/art, build-src-cef4670789:/checkout:ro, common:ro).
+bash /art/tools/require_presubmit.sh a2abench-cef4670789-21a2b9b5d7 && bash /art/tools/a2a_microbench.sh v2-cef4670789

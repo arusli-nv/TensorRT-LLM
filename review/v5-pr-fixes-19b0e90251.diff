@@ -1,0 +1,167 @@
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py b/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+index f3c124a574..3ad1f0523c 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+@@ -29,8 +29,8 @@ from tensorrt_llm.executor.recovery.config import (failure_domains,
+ from tensorrt_llm.logger import logger
+ from tensorrt_llm.mapping import Mapping
+ 
+-# madvise(2) advice that builds this process's page-table entries for resident pages (Linux 5.14+).
+-_MADV_POPULATE_READ = 22
++# madvise(2) advice that removes this process's page-table entries for a range (a shared mapping's data stays).
++_MADV_DONTNEED = 4
+ # Where multiprocessing.shared_memory keeps the EPLB host copies on Linux.
+ _SHM_MOUNT = "/dev/shm"
+ 
+@@ -69,28 +69,16 @@ def _reserve_shm(shm: shared_memory.SharedMemory, layer_id: int) -> None:
+         os.close(fd)
+ 
+ 
+-def _start_populate(
+-        segments: List[shared_memory.SharedMemory]) -> threading.Thread:
+-    """Start prefaulting the pages of host copies that other local ranks wrote, so that restore copies do not
+-    page-fault; MoeLoadBalancer.finalize_model joins it. Best effort: older kernels reject the advice."""
++def _unmap_pages(shm: shared_memory.SharedMemory) -> None:
++    """Drop this process's page-table entries for ``shm``; its data stays in the segment and the next access
++    faults the pages back in. Best effort: a failure only keeps the entries."""
++    address = np.frombuffer(shm.buf, dtype=np.uint8).ctypes.data
+     libc = ctypes.CDLL(None, use_errno=True)
+-    spans = [(np.frombuffer(segment.buf,
+-                            dtype=np.uint8).ctypes.data, segment.size)
+-             for segment in segments]
+-
+-    def populate() -> None:
+-        for address, size in spans:
+-            if libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(size),
+-                            _MADV_POPULATE_READ):
+-                logger.debug("Prefaulting EPLB host copies failed: "
+-                             f"{os.strerror(ctypes.get_errno())}")
+-                return
+-
+-    thread = threading.Thread(target=populate,
+-                              name="eplb_host_copy_populate",
+-                              daemon=True)
+-    thread.start()
+-    return thread
++    if libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(shm.size),
++                    _MADV_DONTNEED):
++        logger.debug(
++            f"Unmapping the EPLB host copies' pages failed: {os.strerror(ctypes.get_errno())}"
++        )
+ 
+ 
+ # Whether ghost slot memory is host accessible on every rank; set by the first _ghost_slot_memory_host_accessible().
+@@ -179,7 +167,6 @@ class HostMoeTensorSharer:
+         self.own_shm = None
+         self.own_shm_linked = False
+         self.imported_shms = []
+-        self.populate_thread: Optional[threading.Thread] = None
+ 
+         self.shared_tensors = {}
+         self.names = []
+@@ -409,8 +396,10 @@ class HostMoeTensorSharer:
+                 add_host_weight_fn(key[0], key[1], t)
+ 
+         self.host_weights.clear()
+-        if peer_loss_recovery_enabled():
+-            self.populate_thread = _start_populate(self.imported_shms)
++        if peer_loss_recovery_enabled() and self.own_shm is not None:
++            # Between restores only online EPLB's updates read the host copies, faulting in what they read; a
++            # process that maps none of their pages is not interrupted when the kernel migrates them (compaction).
++            _unmap_pages(self.own_shm)
+ 
+     def pre_shutdown_cleanup(self):
+         """
+@@ -1306,11 +1295,6 @@ class MoeLoadBalancer:
+         # All shared memory mapping after this barrier.
+         for single_layer_load_balancer in self.single_layer_load_balancers:
+             single_layer_load_balancer.py_finalize_model()
+-        # Prefaulting the host copies finishes before serving: during the first requests it stalls their steps.
+-        for single_layer_load_balancer in self.single_layer_load_balancers:
+-            sharer = single_layer_load_balancer.host_tensor_sharer
+-            if sharer is not None and sharer.populate_thread is not None:
+-                sharer.populate_thread.join()
+         if peer_loss_recovery_enabled():
+             # Every rank mapped its peers' shared memory, which nothing opens by name again: ranks that
+             # are killed leave nothing in /dev/shm.
+diff --git a/tests/unittest/_torch/moe/test_ring_host_copies.py b/tests/unittest/_torch/moe/test_ring_host_copies.py
+index 369a830cb5..25fa9f49fd 100644
+--- a/tests/unittest/_torch/moe/test_ring_host_copies.py
++++ b/tests/unittest/_torch/moe/test_ring_host_copies.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """EPLB host copies of a subset of the experts, as WideEP fault tolerance keeps them in a ring of nodes."""
+ 
++import ctypes
+ import errno
+ import threading
+ from multiprocessing import shared_memory
+@@ -107,22 +108,59 @@ def _shared_layer(local_size: int, expert_count: int) -> list:
+ 
+ 
+ @pytest.mark.parametrize("recovery", [False, True])
+-def test_host_copies_are_prefaulted_only_with_peer_loss_recovery(monkeypatch, recovery):
++def test_peer_host_copies_are_not_prefaulted(monkeypatch, recovery):
++    # A restore faults in only the pages it copies: no rank prefaults its peers' copies.
+     monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: recovery)
+-    populate = Mock()
+-    monkeypatch.setattr(f"{_MLB}._start_populate", populate)
++    libc = Mock()
++    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: libc)
+     sharers = _shared_layer(2, 2)
+     try:
+         for sharer in sharers:
+             sharer.finalize_layer_weights()
+         for sharer in sharers:
+             sharer.finalize_host_tensor_sharing()
+-        assert populate.call_count == (len(sharers) if recovery else 0)
+-        # finalize_model joins these before serving.
+-        assert all(
+-            sharer.populate_thread is (populate.return_value if recovery else None)
+-            for sharer in sharers
+-        )
++        # No advice is MADV_POPULATE_READ (22), which builds page-table entries ahead of use.
++        assert all(advice.args[2] != 22 for advice in libc.madvise.call_args_list)
++    finally:
++        for sharer in sharers:
++            sharer.pre_shutdown_cleanup()
++        for sharer in sharers:
++            sharer.post_shutdown_cleanup()
++
++
++def _resident_bytes(segment_name: str) -> int:
++    """This process's resident bytes (smaps Rss) in mappings of /dev/shm/``segment_name``."""
++    total, current = 0, False
++    with open("/proc/self/smaps") as smaps:
++        for line in smaps:
++            fields = line.split()
++            if "-" in fields[0] and ":" not in fields[0]:
++                current = fields[-1] == f"/dev/shm/{segment_name}"
++            elif current and fields[0] == "Rss:":
++                total += int(fields[1]) * 1024
++    return total
++
++
++@pytest.mark.parametrize("recovery", [False, True])
++def test_a_rank_keeps_no_pages_of_its_written_host_copies_mapped_with_recovery(
++    monkeypatch, recovery
++):
++    monkeypatch.setattr(f"{_MLB}.peer_loss_recovery_enabled", lambda: recovery)
++    sharers = _shared_layer(2, 2)
++    try:
++        for sharer in sharers:
++            sharer.finalize_layer_weights()
++        for sharer in sharers:
++            sharer.finalize_host_tensor_sharing()
++        for sharer in sharers:
++            name = sharer.get_shared_memory_name()
++            assert (_resident_bytes(name) == 0) == recovery
++            # The data stays: reading faults the pages back in.
++            expert = sharer.own_expert_ids[0]
++            assert (
++                np.frombuffer(sharer.own_shm.buf, dtype=np.float32, count=4).tolist()
++                == [float(expert)] * 4
++            )
+     finally:
+         for sharer in sharers:
+             sharer.pre_shutdown_cleanup()

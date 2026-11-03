@@ -1,0 +1,5 @@
+# UNITS-REFREEZE (1 node): the two test files fixed after BUILD-REFREEZE 8179984 (test-only commits; wheel unchanged), on the
+# refreeze wheel build-freeze-8c52d11469 with tests from v5-final e25e638054 (snapshot build-src-8c52d11469 now at e25e638054),
+# plus the whole cpu-group file set they belong to. Pass: POINT_UNITS_PASS.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-freeze-8c52d11469; S=$R/overlays/build-src-8c52d11469
+bash $R/tools/point_units.sh $R/$B/dist $S $S $S $R/$B/point-units-e25e638054-${SLURM_JOB_ID:-x} tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/moe/test_moe_execution_state.py

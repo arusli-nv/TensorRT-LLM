@@ -1,0 +1,47 @@
+# NCU-A2A-OFF: rerun of NCU-A2A (8255773, cancelled) on offline EPLB. In 8255773's first case (std-online, FT off) rank 1
+# stopped inside the first CUDA graph replay after /start_profile (19:05:48; 0 kernels profiled) and main's 300 s
+# executor hang detector killed the case. Likely cause: online EPLB's per-iteration host/GPU stage handshake
+# (MoeLoadBalancer start_iter/end_iter: GPU wait kernels spin on flags a host thread sets) cannot progress while ncu
+# serializes the process's CUDA work. Offline EPLB is static routing: no handshake. Arms std-offline vs
+# std-offline-ft (SLOTS-AB measured an offline FT cost; the dispatch template is the same EPLB instantiation).
+# NCU-A2A (8 nodes, one group, segment 8; DIAGNOSTIC, attribution only; NSYS-STEADY 8245564 confirmed the
+# dispatch per-call floor +3.65 us on the same nodes): where FT's per-call dispatch/combine time goes. Nsight Compute on rank 1 only
+# (rank.sh TLLM_TEST_NCU_*), capture from the /start_profile window that STD_NSYS opens 20 s into the steady load
+# (nsys stays on ranks 0+5, a different rank). Online, 8/GPU; std-online (FT off) vs std-online-ft, same nodes, two
+# metric sets: run STD = set A (timing + instruction counts, one pass), run STD-G1 = set B (stall sampling). One step =
+# 59 dispatch + 59 combine launches (58 MoE + MTP): skip one step, keep two (count 236). Hang detection off (ncu pauses
+# rank 1; peers wait in dispatch). Plan: review/diag/ncu_plan.md. Est 4 x ~17 + 4 = ~72 min; --time 01:25.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-freeze-58caa0fde6; MB=build-main-9cc37929e8
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=6,128=3 IT_HX=8=24,32=6,128=3,512=1 BURN=32:2 KI=4 KI32=8 KSTOP=4 CRR=rank5
+else
+    IT_MAIN=32=28,128=12 IT_HX=8=39,32=28,128=12,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 CRR='rank5 rank5'
+fi
+SNO=$R/mvp/runs/STD-8193512/autotuner/pinned.json
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+SOFF=$R/mvp/runs/STD-8194123/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1 COST_MAX_WAVES=40 COST_CASE_TIMEOUT_S=3000"
+MAIN="COST_LOADS=32,128 COST_LOAD_ITERATIONS=$IT_MAIN"
+HX="COST_LOADS=8,32,128,512 COST_LOAD_ITERATIONS=$IT_HX"
+KS=200
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+D="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 WIDEEP_KILL_AFTER_STEPS=$KS"
+A="MVP_BUILD=$B FINAL_BUILD=$B $HD"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+
+P0_1="$E COST_LOADS=8 COST_LOAD_ITERATIONS=8=8 STD_NSYS=1 TLLM_FAULT_TOLERANCE_HANG_DETECTION=0 TLLM_TEST_NCU_RANKS=1 TLLM_TEST_NCU_KERNELS='moeA2A(Dispatch|Combine)Kernel<' TLLM_TEST_NCU_COUNT=236 TLLM_TEST_NCU_ARGS='--launch-skip 118 --section LaunchStats --section Occupancy --metrics gpu__time_duration.sum,smsp__inst_executed.sum,smsp__inst_executed_op_global_ld.sum,smsp__inst_executed_op_shared_ld.sum,sm__cycles_active.max,smsp__cycles_active.avg --clock-control none --cache-control none --kernel-name-base demangled --import-source yes' FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 34)) FT_COST_E2E_ARMS='std-offline std-offline-ft' $(run STD)"
+P0_2="$E COST_LOADS=8 COST_LOAD_ITERATIONS=8=8 STD_NSYS=1 TLLM_FAULT_TOLERANCE_HANG_DETECTION=0 TLLM_TEST_NCU_RANKS=1 TLLM_TEST_NCU_KERNELS='moeA2A(Dispatch|Combine)Kernel<' TLLM_TEST_NCU_COUNT=236 TLLM_TEST_NCU_ARGS='--launch-skip 118 --section WarpStateStats --section SourceCounters --section SchedulerStats --section SpeedOfLight --clock-control none --cache-control none --kernel-name-base demangled' FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 34)) FT_COST_E2E_ARMS='std-offline std-offline-ft' $(run STD-G1)"
+G0="{ $P0_1; $P0_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:5000:$G0"

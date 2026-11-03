@@ -1,0 +1,10 @@
+# PT-BC: point test of v4 patches b (recovery logs deferred to its end; watch thread logs after releasing waiters) and
+# c (one-line log for the mpi4py futures manager a departed peer ends), Python-only: overlay v4bc-957ac92c5f on the v3
+# wheel. Kill smoke as KILLS-V3 group A (w/o EPLB, rank5 + node1, n=1 each). Unit files run separately (1 node).
+# PASS: both KILL_FINAL_VERDICT PASS, client_failed 0; rank-0.log has no "Exception in thread" mpi4py futures traceback
+# and has "mpi4py futures manager thread ended"; on every survivor the recovery's lines ("host collective interrupted",
+# "Mapped", "Staged", "Restored", phase lines) follow "a peer failed" and directly precede "resumed serving";
+# recovery_s within the v3 range (rank5 0.55 s, node1 1.36 s; n=1 = lead). FAIL otherwise.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$R/overlays/v4bc-957ac92c5f KF_ALLOW_OVERLAY=1 WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1"
+bash $R/bundle.sh "0:8:4200:$K KF_BENCH_CONFIG=std-noeplb-ft.yaml bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A"

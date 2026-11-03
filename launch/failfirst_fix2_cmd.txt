@@ -1,0 +1,17 @@
+# FAILFIRST-FIX2 (1 node, CPU-only checks in the devel image): fail-first + pass of the two fix commits' unit tests, after
+# the wheel install (the FIX-REC prelude ran before it and is INVALID). Fix 1 d71f169e4b (no peer prefault):
+# scratch-fixtest/run.sh; fix 2 087d1e7f19 (drop own mappings): scratch-fixtest2/run.sh. Each: the new test must FAIL on
+# the wheel's Python (build-freeze-58caa0fde6) and test_ring_host_copies.py must PASS with the fix's
+# moe_load_balancer.py overlaid. Output: review/diag/fixtest-<job>.txt. ~15 min; --time 00:30.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+out=$R/review/diag/fixtest-${SLURM_JOB_ID}.txt
+{
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/fixtest-install.log || { tail -20 /tmp/fixtest-install.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/fixtest-pip.log 2>&1 || { tail -5 /tmp/fixtest-pip.log; exit 1; }
+    echo "### FIX 1 skipped (passed in FAILFIRST-FIX 8253005)"
+    echo "### FIX 2 (9f1fd4cab4)"; bash $R/scratch-fixtest2/run.sh
+    echo FAILFIRST_FIX_DONE
+} > "$out" 2>&1

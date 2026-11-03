@@ -1,0 +1,14 @@
+# BUILD-REFREEZE5 (1 node, --time 01:10:00): Python/launcher-only repackage of v5-final 58caa0fde6 = refreeze4 1117f7e0e7 +
+# d91ce454b3 (HMAC key scrubbed from the environment at load, kept out of the fence command) + 6dde0496d5 (launcher
+# excludes hcoll/ucc under recovery; enable_peer_loss_recovery refuses hcoll) + 58caa0fde6 (SIGALRM default before the
+# MPI_Finalize backstop). No C++ change: incremental on build-root-v2 (last built 1117f7e0e7). Snapshot
+# overlays/build-src-8c52d11469 at 58caa0fde6. Then FAILFIRST: the 5 new tests on 1117f7e0e7's Python must fail.
+bash /art/tools/require_presubmit.sh build-refreeze5-58caa0fde6-7d96306beb && [[ $(git -c safe.directory='*' -C /checkout rev-parse --short=10 HEAD) == 58caa0fde6 ]] && TEST_GROUPS='executor' EXTRA_TESTS='tests/unittest/executor/test_recovery_authority.py tests/unittest/executor/test_recovery_hang_monitor.py tests/unittest/executor/test_recovery_config.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py tests/unittest/llmapi/test_mpi_session.py tests/unittest/_torch/executor/test_peer_loss_recovery.py tests/unittest/_torch/executor/test_py_executor.py tests/unittest/_torch/test_mnnvl_memory_remap.py tests/unittest/llmapi/apps/test_fault_tolerance_health.py' PYTEST_ADDOPTS='-k "not flashinfer_temporary_cleanup"' bash /art/tools/build_test_all.sh freeze-58caa0fde6 || exit 1
+echo "=== failfirst"
+bash /art/tools/failfirst_tests.sh /checkout 1117f7e0e7 58caa0fde6 \
+    tests/unittest/executor/test_recovery_authority.py::test_load_key_removes_the_key_from_the_environment \
+    tests/unittest/executor/test_recovery_hang_monitor.py::test_command_fence_never_passes_the_hmac_key \
+    tests/unittest/_torch/distributed/test_mpi_survivors.py::test_recovery_requires_hcoll_off \
+    tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py::test_recovery_execs_the_worker_holding_the_workspace_lock \
+    tests/unittest/llmapi/test_mpi_session.py::test_finalize_and_exit_arms_the_alarm_with_its_default_action
+echo REFREEZE5_JOB_DONE

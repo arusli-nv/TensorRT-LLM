@@ -1,0 +1,10 @@
+# TAIL CONTROL on build-diag-da13f20b76 (fix-slim 36fe8b4eb2 + diag EPLB update log), online dep32-final at 32/GPU, waves.
+# Both groups run the same TAIL-CTRL: arms noft, noft-main (main's wheel, no diag log), ft (Option 2 ghost), ft-empty
+# (Option 1), 2 interleaved rounds per group -> n=4 per arm over 2 groups (noft-vs-noft spread = the noise floor).
+# ~12 min per case x 4 arms x 2 rounds = ~96 min per group. TLLM_EPLB_UPDATE_LOG=1 + TLLM_LOG_LEVEL=INFO for the log.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-diag-da13f20b76
+T="MVP_BUILD=$B FINAL_BUILD=$B FINAL_BASE_BUILD=build-devs-f4afe429ba WIDEEP_FAILURE_DOMAIN=node COST_CASE_TIMEOUT_S=2400 TLLM_LOG_LEVEL=INFO TAIL_ROUNDS=2 FT_COST_E2E_ROUND_MIN=50 TAIL_ITERATIONS=4 FT_COST_E2E_ARMS='noft-w noft-main-w ft-w ft-empty-w' TAIL_PAIRS='noft-w:ft-w noft-w:ft-empty-w noft-w:noft-main-w ft-w:ft-empty-w' FT_COST_E2E_SEED=$R/mvp/runs/LADDER-8087786/autotuner/pinned.json"
+# Group B runs the arms in the reverse order, so no arm always runs first.
+bash $R/bundle.sh "0:8:6900:$T bash $R/mvp/harness/run_job.sh TAIL-CTRL" \
+  "8:8:6900:$T FT_COST_E2E_ARMS='ft-empty-w ft-w noft-main-w noft-w' bash $R/mvp/harness/run_job.sh TAIL-CTRL-B"
+# 14:2x: 8100046 failed (MARKERS_FAILED: FINAL_BUILD unset -> markers); resubmitted with FINAL_BUILD=$B.

@@ -1,0 +1,127 @@
+## Validity (PRE-REG 5/6, decided before any cost)
+
+Window check: all planned waves completed; Xid/NVRM checked on all 8 nodes in 24 of 24 arms.
+
+- all pairs valid
+- note STD-8269103 std-online-ft-1: 58 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-8270779 std-online-ft-1: 57 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-8271451 std-online-ft-1: 59 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G1-8269103 std-online-ft-1: 61 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G1-8270779 std-offline-ft-1: 60 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G1-8271451 std-offline-ft-1: 58 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G2-8269103 std-offline-ft-1: 58 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G2-8270779 std-noeplb-ft-1: 57 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G2-8271451 std-noeplb-ft-1: 60 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G3-8269103 std-offline-ft-1: 59 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G3-8270779 std-noeplb-ft-1: 58 fault lines after the last row (server teardown; not a healthy-window fault)
+- note STD-G3-8271451 std-noeplb-ft-1: 56 fault lines after the last row (server teardown; not a healthy-window fault)
+
+## Pairs (% = (on - off) / off; step metrics + = FT slower, tok/s - = FT slower)
+
+| group | first node | mode | load | first | rounds | trim % | full % | stall % | stall ms diff | client % | window tok/s % | trim off/on ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8269103@n0 | n0 | offline | 32 | ft | 1 | +0.43 | +0.78 | +35.94 | +0.057 | -1.50 | -0.67 | 14.143/14.204 |
+| 8269103@n0 | n0 | offline | 128 | ft | 1 | +0.01 | +0.33 | +16.20 | +0.102 | -0.44 | -0.39 | 26.702/26.704 |
+| 8269103@n0 | n0 | online | 32 | off | 1 | +1.23 | +2.02 | +34.43 | +0.122 | -1.76 | -1.49 | 14.533/14.712 |
+| 8269103@n0 | n0 | online | 128 | off | 1 | +0.49 | +0.37 | -12.86 | -0.041 | -1.43 | -1.28 | 24.635/24.756 |
+| 8269103@n8 | n8 | offline | 32 | off | 1 | +0.63 | +1.01 | +26.75 | +0.056 | -3.33 | -3.08 | 14.107/14.197 |
+| 8269103@n8 | n8 | offline | 128 | off | 1 | +0.48 | -0.11 | -24.68 | -0.192 | +0.99 | +0.86 | 26.368/26.494 |
+| 8269103@n8 | n8 | online | 32 | ft | 1 | +0.08 | +0.56 | +21.77 | +0.069 | -0.02 | -0.02 | 14.714/14.726 |
+| 8269103@n8 | n8 | online | 128 | ft | 1 | +0.43 | +0.68 | +20.71 | +0.062 | +0.51 | +0.63 | 24.788/24.896 |
+| 8270779@n0 | n0 | noeplb | 32 | ft | 1 | +1.06 | +1.01 | -0.17 | -0.001 | -0.71 | -1.05 | 13.868/14.015 |
+| 8270779@n0 | n0 | noeplb | 128 | ft | 1 | +0.97 | -1.25 | -64.51 | -0.711 | +0.81 | +0.43 | 26.653/26.912 |
+| 8270779@n0 | n0 | online | 32 | off | 1 | +0.39 | +0.26 | -1.77 | -0.008 | +0.26 | +0.81 | 14.681/14.737 |
+| 8270779@n0 | n0 | online | 128 | off | 1 | +0.12 | +0.25 | +14.85 | +0.036 | -0.18 | -0.01 | 24.723/24.753 |
+| 8270779@n8 | n8 | noeplb | 32 | off | 1 | +0.98 | -1.94 | -48.85 | -0.468 | +2.12 | +0.92 | 13.749/13.883 |
+| 8270779@n8 | n8 | noeplb | 128 | off | 1 | +0.31 | +1.08 | +56.52 | +0.244 | -1.85 | -1.28 | 26.538/26.620 |
+| 8270779@n8 | n8 | offline | 32 | ft | 1 | +0.44 | +0.84 | +29.82 | +0.063 | -1.14 | -0.95 | 14.065/14.127 |
+| 8270779@n8 | n8 | offline | 128 | ft | 1 | +0.42 | -0.69 | -37.49 | -0.347 | +1.71 | +1.69 | 26.132/26.242 |
+| 8271451@n0 | n0 | noeplb | 32 | off | 1 | +0.71 | +0.76 | +3.55 | +0.018 | +0.03 | -0.44 | 13.861/13.959 |
+| 8271451@n0 | n0 | noeplb | 128 | off | 1 | +0.44 | +1.84 | +88.75 | +0.422 | -1.30 | -0.95 | 26.798/26.917 |
+| 8271451@n0 | n0 | online | 32 | ft | 1 | +0.20 | -0.32 | -19.39 | -0.091 | +0.79 | +0.38 | 14.661/14.690 |
+| 8271451@n0 | n0 | online | 128 | ft | 1 | +0.52 | +0.78 | +31.70 | +0.088 | +0.89 | +0.68 | 24.715/24.843 |
+| 8271451@n8 | n8 | noeplb | 32 | ft | 1 | +1.11 | +0.87 | -5.98 | -0.026 | +0.58 | +0.54 | 13.792/13.945 |
+| 8271451@n8 | n8 | noeplb | 128 | ft | 1 | +0.40 | +2.05 | +105.46 | +0.521 | -2.24 | -1.55 | 26.646/26.753 |
+| 8271451@n8 | n8 | offline | 32 | off | 1 | +0.84 | +4.31 | +300.16 | +0.543 | -2.15 | -1.99 | 14.072/14.190 |
+| 8271451@n8 | n8 | offline | 128 | off | 1 | +0.45 | +2.86 | +327.55 | +0.760 | -3.65 | -3.38 | 26.258/26.377 |
+
+## Cells (mean % over pairs, 95% t-CI, one-sided 95% bounds)
+
+| mode | load | metric | n | mean % | 95% CI | one-sided 95% LB | one-sided 95% UB |
+|---|---|---|---|---|---|---|---|
+| noeplb | 32 | trim mean step | 4 | +0.96 | [+0.68, +1.25] | +0.75 | +1.18 |
+| noeplb | 32 | full mean step | 4 | +0.18 | [-2.08, +2.43] | -1.49 | +1.84 |
+| noeplb | 32 | stall ms/step | 4 | -12.86 | [-51.55, +25.82] | -41.47 | +15.74 |
+| noeplb | 32 | client tok/s/GPU | 4 | +0.50 | [-1.40, +2.41] | -0.91 | +1.91 |
+| noeplb | 32 | rank-0 window tok/s/GPU | 4 | -0.01 | [-1.44, +1.42] | -1.07 | +1.05 |
+| noeplb | 128 | trim mean step | 4 | +0.53 | [+0.06, +1.01] | +0.18 | +0.88 |
+| noeplb | 128 | full mean step | 4 | +0.93 | [-1.48, +3.34] | -0.85 | +2.71 |
+| noeplb | 128 | stall ms/step | 4 | +46.56 | [-75.62, +168.73] | -43.79 | +136.90 |
+| noeplb | 128 | client tok/s/GPU | 4 | -1.15 | [-3.31, +1.01] | -2.74 | +0.45 |
+| noeplb | 128 | rank-0 window tok/s/GPU | 4 | -0.84 | [-2.24, +0.57] | -1.87 | +0.20 |
+| offline | 32 | trim mean step | 4 | +0.59 | [+0.28, +0.89] | +0.36 | +0.81 |
+| offline | 32 | full mean step | 4 | +1.73 | [-1.00, +4.47] | -0.29 | +3.76 |
+| offline | 32 | stall ms/step | 4 | +98.17 | [-116.19, +312.53] | -60.35 | +256.69 |
+| offline | 32 | client tok/s/GPU | 4 | -2.03 | [-3.56, -0.49] | -3.16 | -0.89 |
+| offline | 32 | rank-0 window tok/s/GPU | 4 | -1.67 | [-3.42, +0.07] | -2.97 | -0.38 |
+| offline | 128 | trim mean step | 4 | +0.34 | [-0.02, +0.69] | +0.08 | +0.60 |
+| offline | 128 | full mean step | 4 | +0.60 | [-1.90, +3.09] | -1.25 | +2.44 |
+| offline | 128 | stall ms/step | 4 | +70.40 | [-204.82, +345.61] | -133.12 | +273.91 |
+| offline | 128 | client tok/s/GPU | 4 | -0.35 | [-4.13, +3.43] | -3.14 | +2.45 |
+| offline | 128 | rank-0 window tok/s/GPU | 4 | -0.30 | [-3.84, +3.23] | -2.92 | +2.31 |
+| online | 32 | trim mean step | 4 | +0.48 | [-0.35, +1.30] | -0.14 | +1.09 |
+| online | 32 | full mean step | 4 | +0.63 | [-0.95, +2.22] | -0.54 | +1.80 |
+| online | 32 | stall ms/step | 4 | +8.76 | [-29.47, +46.98] | -19.51 | +37.03 |
+| online | 32 | client tok/s/GPU | 4 | -0.18 | [-1.94, +1.57] | -1.48 | +1.12 |
+| online | 32 | rank-0 window tok/s/GPU | 4 | -0.08 | [-1.66, +1.50] | -1.25 | +1.09 |
+| online | 128 | trim mean step | 4 | +0.39 | [+0.10, +0.68] | +0.18 | +0.61 |
+| online | 128 | full mean step | 4 | +0.52 | [+0.12, +0.92] | +0.23 | +0.81 |
+| online | 128 | stall ms/step | 4 | +13.60 | [-16.59, +43.79] | -8.73 | +35.92 |
+| online | 128 | client tok/s/GPU | 4 | -0.05 | [-1.67, +1.57] | -1.25 | +1.15 |
+| online | 128 | rank-0 window tok/s/GPU | 4 | +0.01 | [-1.45, +1.46] | -1.07 | +1.08 |
+
+## Per mode (headline loads [32, 128] averaged within each pair first; modes not pooled)
+
+| mode | metric | n | mean % | 95% CI | one-sided 95% LB | one-sided 95% UB |
+|---|---|---|---|---|---|---|
+| noeplb | trim mean step | 4 | +0.75 | [+0.44, +1.06] | +0.52 | +0.98 |
+| noeplb | full mean step | 4 | +0.55 | [-0.99, +2.09] | -0.58 | +1.69 |
+| noeplb | stall ms/step | 4 | +16.85 | [-44.98, +78.68] | -28.87 | +62.57 |
+| noeplb | client tok/s/GPU | 4 | -0.32 | [-1.09, +0.45] | -0.89 | +0.25 |
+| noeplb | rank-0 window tok/s/GPU | 4 | -0.42 | [-0.78, -0.06] | -0.69 | -0.16 |
+| offline | trim mean step | 4 | +0.46 | [+0.17, +0.76] | +0.24 | +0.68 |
+| offline | full mean step | 4 | +1.17 | [-1.42, +3.75] | -0.75 | +3.08 |
+| offline | stall ms/step | 4 | +84.28 | [-160.14, +328.71] | -96.47 | +265.03 |
+| offline | client tok/s/GPU | 4 | -1.19 | [-3.27, +0.90] | -2.73 | +0.35 |
+| offline | rank-0 window tok/s/GPU | 4 | -0.99 | [-3.03, +1.05] | -2.50 | +0.52 |
+| online | trim mean step | 4 | +0.43 | [-0.03, +0.90] | +0.09 | +0.77 |
+| online | full mean step | 4 | +0.57 | [-0.14, +1.29] | +0.04 | +1.11 |
+| online | stall ms/step | 4 | +11.18 | [-0.00, +22.36] | +2.91 | +19.45 |
+| online | client tok/s/GPU | 4 | -0.12 | [-1.77, +1.54] | -1.34 | +1.11 |
+| online | rank-0 window tok/s/GPU | 4 | -0.04 | [-1.47, +1.40] | -1.10 | +1.02 |
+
+## Claim (PRE-REG 3, IUT over every mode x [32, 128] cell)
+
+- trim mean: every upper bound < 1.0%: no; full mean: no
+- rule A (pre-registered: trim AND full mean): per-step 'FT cost < 1%' NOT claimed
+- rule B (trim mean only; added 10-23 after the rehearsal's n=1 reading): per-step 'FT cost < 1%' NOT claimed
+- client tok/s: estimate +/- CI only (no < 1% claim at this n)
+
+## Checks only (PRE-REG 7: not used to adjust)
+
+| mode | load | metric | off first: n, mean % | ft first: n, mean % | n0: n, mean % | n8: n, mean % |
+|---|---|---|---|---|---|---|
+| noeplb | 32 | trim | 2, +0.84 | 2, +1.09 | 2, +0.88 | 2, +1.04 |
+| noeplb | 32 | full | 2, -0.59 | 2, +0.94 | 2, +0.89 | 2, -0.53 |
+| noeplb | 128 | trim | 2, +0.38 | 2, +0.69 | 2, +0.71 | 2, +0.36 |
+| noeplb | 128 | full | 2, +1.46 | 2, +0.40 | 2, +0.29 | 2, +1.57 |
+| offline | 32 | trim | 2, +0.74 | 2, +0.43 | 1, +0.43 | 3, +0.64 |
+| offline | 32 | full | 2, +2.66 | 2, +0.81 | 1, +0.78 | 3, +2.05 |
+| offline | 128 | trim | 2, +0.46 | 2, +0.21 | 1, +0.01 | 3, +0.45 |
+| offline | 128 | full | 2, +1.37 | 2, -0.18 | 1, +0.33 | 3, +0.69 |
+| online | 32 | trim | 2, +0.81 | 2, +0.14 | 3, +0.61 | 1, +0.08 |
+| online | 32 | full | 2, +1.14 | 2, +0.12 | 3, +0.65 | 1, +0.56 |
+| online | 128 | trim | 2, +0.31 | 2, +0.48 | 3, +0.38 | 1, +0.43 |
+| online | 128 | full | 2, +0.31 | 2, +0.73 | 3, +0.47 | 1, +0.68 |
+
+CSV: /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/review/v5f_pairs_full.csv

@@ -1,0 +1,111 @@
+# STRESS-S3 (8 nodes = the plan's 32 GB200, segment 8, qos short, --time 01:40:00; S3_NODES=16 adds a second case on
+# Installed 2026-10-26 ~04:30 (stress harness patch applied 10-25). Readout additions agreed before data: record the
+# recovery authority's own state transitions (authority log) next to /health (/health is cached 1 s,
+# review/diag/health_recovering_gap.md); memory-check disclosure as in launch/stress_s1_cmd.txt (.pre-memvalid).
+# a second group): review/PRODUCT_STRESS_PLAN.md test S3 (second loss later), FT only, after S2S5 and S1.
+# DRAFT (review/drafts/stress_NOTES.md): needs review/drafts/stress_harness.patch applied first.
+#
+# Plan text (verbatim, written before any data):
+#   3. **Second loss later (S3).**
+#      - A kill, 15 min degraded, then a second kill of a different rank.
+#      - Pass: both recover (or the job ends cleanly if the slots cannot cover); no hang.
+#   Runs on v5-final (overlays/fix-dropmap-9f1fd4cab4), online EPLB, 32 GB200, both mounts.
+#
+# Design: one serving case, S2's load (bench.py --mode stress: input 127-4096, output 63-2048, Poisson at 0.8 x the
+# case's own closed-loop 32/GPU request rate, 90% completions / 10% chat, streamed, 62 min), S2's knobs. First kill:
+# rank 29 at 730 s after the open-loop load starts; second kill: rank 14, 900 s (15 min) after the first recovery
+# resumed (both ranks and the 730 s drawn with Python random.Random(20261025) on 2026-10-25 before any data: ranks
+# uniform over 1-31, the first time uniform 600-1500 s, so the second kill lands by ~41 min and >= 20 min of load
+# follow it). S3_NODES=16: G8 runs a second case, rank 12 at 1221 s then rank 31 900 s after its resume (same draw).
+# A second loss the remaining slots cannot cover ends the job by design (doc: "survives a further loss only while its
+# remaining slots hold every expert without it"); two single ranks of 32 are expected to be covered.
+#
+# Pre-declared fallback (coordinator decision 2026-10-25 17:25 PT, a plan change made before any stress measurement):
+# Fallback config declared 17:30 PT 2026-10-25, before data (option a): configs/std-online-stress-fb.yaml = std-online
+#   with max_seq_len 3200 (the only change; 2304 cannot hold 2048 + 1024 + 1 draft), mix input 128-2k / output 64-1k.
+#   if std-online-stress.yaml (max_seq_len 6400) runs out of memory or fails at startup in S2's first case, the length
+#   mix of ALL stress cases (S2, S5, S1, S3) becomes input 128-2k / output 64-1k: STRESS_LENGTHS=fallback (input
+#   uniform 127-2048, output 63-1024: --isl 1088 --osl 544 --range-ratio 0.8824) on std-online-stress-fb.yaml, nothing
+#   else changed. That config is std-online.yaml with max_seq_len 3200, because 2048 + 1024 + 1 draft = 3073 does not
+#   fit the standard 2304 (std-online.yaml itself cannot serve this mix).
+# Memory-growth thresholds (added 17:25 PT 2026-10-25, before data; approved by the monitor): over [load start + 600 s,
+#   last arrival], median of the last 5 per-minute samples minus median of the first 5: every GPU <= 256 MiB, every
+#   rank process's RssAnon <= 512 MiB, every node's used memory (-MemAvailable) <= 2048 MiB.
+#   (reported in S3, judged in S1.)
+# Readout rules (stress_readout.py case --test s3, written before any data):
+# - both recover: rank 0 logs "resumed serving without ranks [...] at membership generation 1" with the first victim
+#   and "... generation 2" with both, and the driver saw both commits; OR the job ends cleanly: the driver saw the
+#   second recovery fail, mpirun exited on its own within 180 s of the second kill, and every node logged NODE_CLEAN.
+# - no hang: no two consecutive rank-0 iterations > 60 s apart and no 60 s without a streamed chunk while a request is
+#   open, from the load's start to its last arrival (or mpirun's exit).
+# - Also judged as in S2/S5 (same rules): no request other than the lost ranks' fails (a second-loss quarantine,
+#   "interrupted this request a second time", counts as the second kill's), each error retryable and well formed.
+# - Reported: per kill resume time, client/server failed counts, rerun counts, /health sequence (healthy > recovering
+#   > degraded > recovering > degraded expected), open-loop tok/s before/after each kill vs S2's floors, p50/p99
+#   TTFT/TPOT, memory, calib-end-32 / calib-32.
+# Job readout: review/diag/stress_s3_<job>.txt.
+#
+# Est: as an S2 case (~83 min: ~12 startup, ~3 calibration, ~2 client start, 62 load, ~2 closed-loop row, ~2
+# teardown); --time 01:40:00, bundle limit 5700 s. With S3_NODES=16 both groups have the same structure.
+# Mounts: $R (claude dir) rw AND /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro (model root; presubmit does not check it).
+# Presubmit (after the patch): python3 $R/tools/presubmit.py --name STRESS-S3 --nodes 8 --segment 8 --job STRESS
+#   --build build-freeze-58caa0fde6 --overlay overlays/fix-dropmap-9f1fd4cab4 --branch /tmp/claude-161238/wt-split
+# Dry run: bash $R/tools/dry_run.sh review/drafts/stress_s3_cmd.txt 8 0   (S3_NODES=16: ... 16 0 8)
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+SELF=$(realpath "$0")
+runs=$R/mvp/runs diag=$R/review/diag marks=$R/logs/stress
+[[ -n ${WIDEEP_DRY_RUN:-} ]] && runs=$WIDEEP_DRY_RUN/runs diag=$WIDEEP_DRY_RUN marks=$WIDEEP_DRY_RUN/marks
+mkdir -p "$marks"
+NODES=${S3_NODES:-8}
+readout() {
+    mkdir "$marks/$SLURM_JOB_ID.readout" 2>/dev/null || return 0
+    local out=$diag/stress_s3_$SLURM_JOB_ID.txt d
+    { echo "STRESS_S3_READOUT job=$SLURM_JOB_ID nodes=$NODES via=$1 $(date '+%F %T %Z')"
+      for d in "$runs"/STRESS*-"$SLURM_JOB_ID"/s3-*/; do
+          [[ -s $d/result.json ]] || { echo "STRESS_VERDICT ${d%/} s3 MISSING"; continue; }
+          timeout 600 python3 -I "$R/mvp/harness/stress_readout.py" case "$d" --test s3
+          for f in "$d"kernel-*-after.txt; do
+              b=${f/-after/-before}; [[ -e $b ]] && grep -iE 'xid|nvrm' "$f" | grep -vxFf "$b" | sed "s|^|NEW_KERNEL_LINE ${d%/} |"
+          done
+      done
+    } > "$out.tmp" 2>&1
+    mv "$out.tmp" "$out"
+    echo "STRESS_READOUT $out"
+}
+if [[ -n ${STRESS_GROUP_DONE:-} ]]; then
+    touch "$marks/$SLURM_JOB_ID-$STRESS_GROUP_DONE.done"
+    [[ -e $marks/$SLURM_JOB_ID-g0.done && ( $NODES == 8 || -e $marks/$SLURM_JOB_ID-g8.done ) ]] && readout group-end
+    exit 0
+fi
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+[[ $NODES == 8 || $NODES == 16 ]] || { echo "DRY_RUN_FAIL S3_NODES must be 8 or 16"; exit 1; }
+B=build-freeze-58caa0fde6
+FIX_OVERLAY=$R/overlays/fix-dropmap-9f1fd4cab4
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+S="MVP_OVERLAY=$FIX_OVERLAY KF_ALLOW_OVERLAY=1 MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_POLLUTION_CHECKS=1"
+S="$S WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2 WIDEEP_MEM_SAMPLER_S=60 STRESS_SEED=$SON STRESS_ARM=std-online-ft"
+S="$S STRESS_LENGTHS=${STRESS_LENGTHS:-}"  # empty, or fallback (header)
+SMOKE=${SMOKE:-0}
+LOAD_MIN=62 K0='at:730:29 after:900:14' K8='at:1221:12 after:900:31'
+# SMOKE=1 (a short check of the whole path, not data): 14 min load, first kill at 240 s, second 240 s after it.
+[[ $SMOKE == 1 ]] && LOAD_MIN=14 K0='at:240:29 after:240:14' K8='at:240:12 after:240:31'
+run() {  # NAME KILLS JOB GROUP
+    echo "{ $S STRESS_NAME=$1 STRESS_KILLS='$2' STRESS_BENCH='--stress-minutes $LOAD_MIN' bash $R/mvp/harness/run_job.sh $3;" \
+         "[[ \$SLURM_NODEID == 0 ]] && S3_NODES=$NODES STRESS_GROUP_DONE=$4 bash $SELF; }"
+}
+G0=$(run s3-rank29-rank14 "$K0" STRESS g0)
+G8=$(run s3-rank12-rank31 "$K8" STRESS-G1 g8)
+echo "STRESS_S3 lengths=${STRESS_LENGTHS:-default} nodes=$NODES G0=$K0 G8=$([[ $NODES == 16 ]] && echo "$K8" || echo none) smoke=$SMOKE"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+if [[ $NODES == 16 ]]; then
+    bash $R/bundle.sh "0:8:5700:$G0" "8:8:5700:$G8"
+else
+    bash $R/bundle.sh "0:8:5700:$G0"
+fi
+[[ ${SLURM_NODEID:-0} == 0 ]] && readout bundle-end

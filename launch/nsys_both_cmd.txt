@@ -1,0 +1,7 @@
+# NSYS-BOTH: the two attribution profiles in one 16-node job (~45-50 min; submit only if it ends by 06:15, else after 07:00).
+# G0 = NSYS-ONLINE128 (online 128/GPU FT off vs on, 300-step windows for the context steps); G1 = NSYS32 (w/o EPLB 32/GPU:
+# off, static LB, ft; 50-step windows). Both: v2 wheel, seed2, nsys on ranks 0 and 5, samplers off.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+E="MVP_BUILD=$B FINAL_BUILD=$B STD_NSYS=1 WIDEEP_NO_SAMPLERS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=30 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:3300:$E WIDEEP_PROFILE_STEPS=300 COST_LOADS=128 COST_LOAD_ITERATIONS=128=4 FT_COST_E2E_ARMS='std-online std-online-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:3300:$E COST_LOADS=32 COST_LOAD_ITERATIONS=32=8 FT_COST_E2E_ARMS='std-noeplb std-noeplb-lb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD-G1"

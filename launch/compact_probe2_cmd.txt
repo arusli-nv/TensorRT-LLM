@@ -1,0 +1,25 @@
+# COMPACT-PROBE2 (1 node, 4 GPUs; burst-fix decision): COMPACT-PROBE (8268725) with an unmovable copy destination, as in
+# production (GPU-side slots). Runs: pinned_all (every reader registers its own and its peer segment) + GPU dst (copy-engine DMA from registered memory); pinned (owner only) + GPU dst; pinned + page-locked dst;
+# lazy (fix 2) + GPU dst. Same forced compaction.
+# review/diag/compact-probe2-<job>.txt. ~16 min; --time 00:35.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/compact-probe2-${SLURM_JOB_ID:-x}.txt
+{
+    uname -r; free -g | head -2
+    cd /tmp
+    for run in "pinned_all gpu" "pinned gpu" "pinned pinned" "lazy gpu"; do
+        set -- $run
+        echo "### $1 / dest $2"; timeout 600 python3 $R/scratch-compact/compact_probe.py --mode $1 --dest $2 --seg-gb 60 --quiet-s 40 --frag-s 80
+        free -g | head -2
+    done
+    echo COMPACT_PROBE2_DONE
+    # Unit tests of the pin commits (after the probe): test_ring_host_copies.py on each, every .py overlaid on the wheel.
+    export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+    mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+    bash $R/install_wheel.sh $R/build-freeze-58caa0fde6/dist /tmp/fixtest-install.log || { tail -20 /tmp/fixtest-install.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/fixtest-pip.log 2>&1 || tail -5 /tmp/fixtest-pip.log
+    for c in 5b42dabe65 85ea85de95; do echo "### unit tests $c"; bash $R/scratch-v5pr/run.sh $R/scratch-v5pr/$c; done
+    echo "### test_resident_placement 85ea85de95"; bash $R/scratch-v5pr/run.sh $R/scratch-v5pr/85ea85de95 test_resident_placement.py
+    echo UNIT_DONE
+} > "$out" 2>&1

@@ -1,0 +1,27 @@
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# STOP-RERUN (8 nodes, one group, < 1 h): the stop row again on v5-zero 65a39b411d = wheel build-v5zero-f9e6bc0f8b +
+# Python overlay vzero-65a39b411d (KF_ALLOW_OVERLAY=1; 4ea75fe97d: any error deserializing a host collective's payload
+# counts as a transport error), with rank5 as the control. Same recipe as zero_smoke_cmd.txt group 8: design C,
+# fence-always, Open MPI's in-band detector off, std-noeplb-ft.yaml (R1 NVFP4 + MTP), node failure domain, kill in
+# steady decode, hang detection on (hang_confirm_s 30), 1 case per row.
+# Gate first (units_gate.sh on the wheel + overlay, ~5 min, under the idle-reaper's 10 min): test_mpi_survivors.py and
+# every test file of tests overlay vzero-65a39b411d-tests (test_moe_a2a_recovery on 4 GPUs, test_ring_host_copies).
+# A gate FAIL ends the group: no kill runs on top of it.
+# Rows (job.sh KILL-FINAL):
+#   stop: rank 2 SIGSTOPped at 64/GPU; with the detector off only the hang confirm window (30 s) detects it, so H23
+#     times the resume from the confirmation (authority "is hung ... fencing it" or the detect phase): h23_resume_s
+#     <= 10 s, h23_confirm_s reported apart. KILL-FINAL-OFF-B-8167545/stop-1 failed lost_expected (rank 16 fenced
+#     too), recovery_failed_bounded and h23_resume (14.43 s from the confirmation).
+#   rank5: rank 5 SIGKILLed in a decode step at 128/GPU (control: recovers, KILL_FINAL_VERDICT PASS).
+# Pass: KILL_FINAL_VERDICT PASS on both rows. Readout: $R/mvp/runs/KILL-FINAL-OFF-B-<job>/kill_final.txt.
+# Estimates: gate ~5 min + stop ~17 + rank5 ~15 = ~40 min; limit 3600 s.
+# Submit (8 nodes, segment 8): bash $R/tools/require_presubmit.sh <token> && bash $R/launch/stop_rerun_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+B=build-v5zero-f9e6bc0f8b; SRC=$R/overlays/build-src-f9e6bc0f8b; O=$R/overlays/vzero-65a39b411d; OT=$O-tests
+T="tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py tests/unittest/_torch/moe/test_ring_host_copies.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/stoprerun-gate$1-\$SLURM_JOB_ID $R/$B/dist $O $OT $SRC $R/$B/point-units-stoprerun-g$1 $T"; }
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+H="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+K="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=${O:+1} WIDEEP_MPI_MCA='$M' $H WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml"
+bash $R/bundle.sh "0:8:3600:$(g 0) && $K KF_ROWS='stop rank5' bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B"

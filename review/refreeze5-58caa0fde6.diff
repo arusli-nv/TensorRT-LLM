@@ -1,0 +1,76 @@
+commit 58caa0fde66d863979922aadafd7389985df4a49
+Author: Andrew Rusli <arusli@nvidia.com>
+Date:   Fri Oct 23 14:23:06 2026 -0700
+
+    [None][fix] Give SIGALRM its default action before arming the MPI_Finalize backstop
+    
+    FT-off guards:
+    FT-on only: _finalize_and_exit runs only when a fault-tolerant process ends.
+    
+    Signed-off-by: Andrew Rusli <arusli@nvidia.com>
+
+diff --git a/tensorrt_llm/llmapi/mpi_session.py b/tensorrt_llm/llmapi/mpi_session.py
+index 35b879569f..afdcbf4132 100644
+--- a/tensorrt_llm/llmapi/mpi_session.py
++++ b/tensorrt_llm/llmapi/mpi_session.py
+@@ -184,8 +184,11 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
+     watchdog.daemon = True
+     watchdog.start()
+     # Backstops that need no GIL, should the Timer still not run: the stacks, then SIGALRM's default action ends the
+-    # process by a signal (not an exit status, which the MPI runtime would count as a job-ending failure).
++    # process by a signal (not an exit status, which the MPI runtime would count as a job-ending failure). A Python
++    # handler would run only once the main thread leaves MPI_Finalize, so SIGALRM gets its default action back.
+     faulthandler.dump_traceback_later(2 * _FINALIZE_GRACE_S, exit=False)
++    if threading.current_thread() is threading.main_thread():
++        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+     signal.alarm(int(2 * _FINALIZE_GRACE_S) + 1)
+     error = _mpi_finalize()
+     if error:
+diff --git a/tests/unittest/llmapi/test_mpi_session.py b/tests/unittest/llmapi/test_mpi_session.py
+index eedf74bd35..49b2b2176d 100644
+--- a/tests/unittest/llmapi/test_mpi_session.py
++++ b/tests/unittest/llmapi/test_mpi_session.py
+@@ -4,6 +4,7 @@
+ import json
+ import os
+ import shlex
++import signal
+ import subprocess  # nosec B404
+ import sys
+ import threading
+@@ -1291,7 +1292,10 @@ def _fake_world(monkeypatch: pytest.MonkeyPatch):
+     monkeypatch.setattr(mpi_session, "faulthandler", calls.faulthandler)
+     calls.alarm = Mock()
+     monkeypatch.setattr(mpi_session.signal, "alarm", calls.alarm)
+-    return calls
++    # _finalize_and_exit restores SIGALRM's default action; the test process keeps its own.
++    previous = signal.getsignal(signal.SIGALRM)
++    yield calls
++    signal.signal(signal.SIGALRM, previous)
+ 
+ 
+ @pytest.mark.cpu_only
+@@ -1385,6 +1389,23 @@ def test_finalize_and_exit_stops_the_startup_watch_first(
+     assert order == ["stop_startup_watch", "finalize"]
+ 
+ 
++@pytest.mark.cpu_only
++def test_finalize_and_exit_arms_the_alarm_with_its_default_action(_fake_world):
++    """A Python SIGALRM handler would run only after MPI_Finalize returned: the backstop must end the process."""
++    from tensorrt_llm.llmapi import mpi_session
++
++    armed = []
++    _fake_world.alarm.side_effect = lambda seconds: armed.append(
++        (seconds, signal.getsignal(signal.SIGALRM)))
++    previous = signal.signal(signal.SIGALRM, lambda signum, frame: None)
++    try:
++        with pytest.raises(_Exit):
++            mpi_session._finalize_and_exit(0, "process end")
++    finally:
++        signal.signal(signal.SIGALRM, previous)
++    assert armed[0] == (61, signal.SIG_DFL)
++
++
+ @pytest.mark.cpu_only
+ @pytest.mark.parametrize("recovery", [False, True])
+ def test_exit_fault_tolerant_process_finalizes_only_with_recovery(

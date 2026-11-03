@@ -1,0 +1,69 @@
+# HEALTHY128 (16 nodes, two 8-node groups, segment 8; REPL_JOB=1|2|3 picks one of three jobs). This decides slide 15's
+# right panel (128/GPU, n=4 pairs per mode, CLAIMS 194) with a replication of 4 more pairs per mode at 128/GPU only, same
+# code (overlays/fix-dropmap-9f1fd4cab4 on build-freeze-58caa0fde6), seeds/pins, method, windows and knobs as REPL-COST
+# (launch/repl_cost_cmd.txt) and V5F-W1A/W1B; only COST_LOADS=128 (128=12 waves). Pair order per cell: 2 off-first + 2
+# ft-first over the three jobs (same assignment table as REPL-COST).
+# Rules (written before any HEALTHY128 data; review/OVERNIGHT_PLAN_2026-10-27.md, as REPL-COST's 10-25 rules): the
+# replication is decided on 10-27 after the original n=4 was seen; report the replication's own mean and 95% CI and the
+# pooled n=8 per cell, with that timing disclosed; no pass/claim rule changes; slide 15 / Figs 5, 6, A1 update to pooled
+# n=8 at 128/GPU as the 32/GPU cells did (CLAIMS 206).
+# Est per pair (128-only: ready + burn-in + 12 waves at 128): online ~36, offline ~30, no-EPLB ~28 min; groups ~60-72 min;
+# --time 01:30 per job.
+# Statistic: as CLAIMS 194/206 (finals_stats, trimmed per-step mean and client tok/s/GPU at 128, per pair FT vs off).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=${FIX_BUILD:-build-freeze-58caa0fde6}; MB=build-main-9cc37929e8  # FIX_BUILD: the fix wheel if it needs a rebuild
+FIX_OVERLAY=${FIX_OVERLAY:-$R/overlays/fix-dropmap-9f1fd4cab4}
+O=${FIX_OVERLAY:+MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1}  # FIX_OVERLAY: a Python-only fix overlaid on B
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    IT_MAIN=32=6,128=3 IT_HX=8=24,32=6,128=3,512=1 BURN=32:2 KI=4 KI32=8 KSTOP=4 CRR=rank5
+else
+    IT_MAIN=32=28,128=12 IT_HX=8=39,32=28,128=12,512=4 BURN=32:6 KI=4 KI32=16 KSTOP=8 CRR='rank5 rank5'
+fi
+SNO=$R/mvp/runs/STD-8193512/autotuner/pinned.json
+SON=$R/mvp/runs/STD-G1-8193512/autotuner/pinned.json
+SOFF=$R/mvp/runs/STD-8194123/autotuner/pinned.json
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+E="$O MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_DMON=1 WIDEEP_BURNIN=$BURN STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml $HD FT_COST_E2E_ROUNDS=1 COST_MAX_WAVES=40 COST_CASE_TIMEOUT_S=3000"
+KS=200
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+D="MVP_BUILD=$B FINAL_BUILD=$B CR_KEEP_PAGE_CACHE=1 WIDEEP_KILL_AFTER_STEPS=$KS"
+A="MVP_BUILD=$B FINAL_BUILD=$B $HD"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+R32="COST_LOADS=128 COST_LOAD_ITERATIONS=128=12"
+ON="FT_COST_E2E_SEED=$SON FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 36))"
+OFFL="FT_COST_E2E_SEED=$SOFF FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 30))"
+NO="FT_COST_E2E_SEED=$SNO FT_COST_E2E_ROUND_MIN=$((SMOKE ? 10 : 28))"
+case ${REPL_JOB:-1} in
+1) P0_1="$E $R32 $ON FT_COST_E2E_ARMS='std-online std-online-ft' $(run STD)"
+   P0_2="$E $R32 $OFFL FT_COST_E2E_ARMS='std-offline-ft std-offline' $(run STD-G2)"
+   P8_1="$E $R32 $NO FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' $(run STD-G1)"
+   P8_2="$E $R32 $ON FT_COST_E2E_ARMS='std-online-ft std-online' $(run STD-G3)" ;;
+2) P0_1="$E $R32 $OFFL FT_COST_E2E_ARMS='std-offline std-offline-ft' $(run STD)"
+   P0_2="$E $R32 $NO FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' $(run STD-G2)"
+   P8_1="$E $R32 $ON FT_COST_E2E_ARMS='std-online std-online-ft' $(run STD-G1)"
+   P8_2="$E $R32 $OFFL FT_COST_E2E_ARMS='std-offline-ft std-offline' $(run STD-G3)" ;;
+3) P0_1="$E $R32 $ON FT_COST_E2E_ARMS='std-online-ft std-online' $(run STD)"
+   P0_2="$E $R32 $NO FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' $(run STD-G2)"
+   P8_1="$E $R32 $OFFL FT_COST_E2E_ARMS='std-offline std-offline-ft' $(run STD-G1)"
+   P8_2="$E $R32 $NO FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' $(run STD-G3)" ;;
+4) P0_1="$E $R32 $ON FT_COST_E2E_ARMS='std-online std-online-ft' $(run STD)" ;;
+*) echo "DRY_RUN_FAIL REPL_JOB must be 1, 2, 3 or 4"; exit 1 ;;
+esac
+G0="{ $P0_1; $P0_2; }"
+G8="{ $P8_1; $P8_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+if [[ ${REPL_JOB:-1} == 4 ]]; then
+    G0="{ $P0_1; }"
+    bash $R/bundle.sh "0:8:3000:$G0"
+else
+    bash $R/bundle.sh "0:8:5100:$G0" "8:8:5100:$G8"
+fi

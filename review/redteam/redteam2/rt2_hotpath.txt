@@ -1,0 +1,68 @@
+RT2 hot-path fixes (python.md #6-#10). Branch rt2-hotpath in /tmp/claude-161238/work/wt-rt2b, on fix-final8 (445a9c8f42). Not pushed.
+Net lines are product code only (tests separate). Pre-commit clean on every commit. No torch here, so no test was run; py_compile only.
+
+#6  a5f95f40ae  [None][perf] Skip the WideEP recovery hooks and receive-slot lookups when peer-loss recovery is off
+    product +68/-42 (net +26); tests +39/-7
+    - py_executor: each per-step RecoveryHook call is gated on the cached class bool _peer_loss_recovery.enabled:
+      step_prepared (x2 loops), commit_step (x2), fetching_requests, broadcast_requests (calls the broadcaster directly),
+      requests_routed, validate_request, step_outputs_appending, gathering_responses, responses_gathered.
+      _note_step_change in _update_request_states_tp is gated on _step_changes. Rare paths are unchanged (run,
+      exits_alone, step_released, defer_terminations).
+    - moe_scheduler: ExternalCommMoEScheduler caches peer_loss_recovery_enabled() at construction (class default False
+      for __new__-built test schedulers). _dispatch_slot_table, _compact_receive_slots (x2) and _build_comm_plan's
+      source-slot lookup run only when it is True. Only recovery binds layers (MoeExecutionState.for_model), so with it
+      off source_slots is always None.
+    - nvlink_one_sided: dispatch publishes only when there is a mask and state is None. Dispatch and combine pass
+      self._rank_mask_record, so combine never republishes (its mask must match dispatch's). With FT off the record
+      stays None, the same value main passes.
+    Calls removed with FT off (static count; not measured, no torch here):
+      per step (overlap loop, KV v2, attention DP): 8 hook calls (step_prepared, commit_step, fetching_requests,
+      broadcast_requests, requests_routed, step_outputs_appending, gathering_responses, responses_gathered). Add
+      1 validate_request per new request and 1 _note_step_change per scheduled context request.
+      per MoE layer per eager forward (NVLinkOneSided + EPLB): 6-8 Python calls (_dispatch_slot_table plus its
+      peer_loss_recovery_enabled(); _compact_receive_slots plus supports_dispatch_receive_slots() [plus
+      dispatch_source_slots()]; supports_dispatch_receive_slots() [plus dispatch_source_slots()] in _build_comm_plan;
+      2x _publish_rank_mask(None)). CUDA graph replays never ran these.
+    Left in place: RecoveryHook's no-op step_prepared, commit_step, etc. are now unused when recovery is off. Removing
+      them means touching peer_loss_recovery.py, which the module-move owners have; do it after their move.
+
+#7  cd8e47da25  [None][perf] Republish the detection-only WideEP rank mask only when the committed generation changes
+    product +25/-18 (net +7); tests +20
+    _publish_rank_mask takes the ActiveRankMaskSnapshot. If committed_generation equals the last one published, it
+    returns before mask.tolist(). A caller's mask (generation None) is still compared word by word, and publishing it
+    resets the cached generation. The generation is cached only after a validated write.
+    Still in place (also in main): capture_active_rank_mask builds the CPU mask tensor on every detection-only
+    dispatch.
+
+#8  44f59cb539  [None][perf] Build the logical TP ranks once instead of on every live_ranks read
+    product +2/-1 (net +1); tests +1
+    Distributed.__init__ builds tuple(range(tp_size)) once and live_ranks returns it. MPIDist's survivor override is
+    unchanged.
+
+#9  eb2fab6c64  [None][perf] Filter fetched requests only when a wake item is among them
+    product +3/-3 (net 0); tests +2/-1
+    One any() pass (empty in most decode steps). The filtering list comprehension runs only when a wake item is present.
+
+#10 SKIPPED. slot_tokens is fixed per deployment: it is NVLinkOneSided.max_num_tokens_per_rank of the one workspace
+    (nvlink_one_sided.py _bound_layout). source_tokens is runtime_max_tokens_per_rank, a per-forward value, and it is
+    baked into the functools.partial ConstraintSpec that sizes input `a` during tuning. ConstraintSpec.infer_shape only
+    receives input_shapes. Keying on (source_tokens > 0, slot_tokens) would therefore reuse a stale source_tokens: tuning
+    inputs would be sized wrong, with possible out-of-bounds reads while profiling. Passing the geometry at call time
+    needs an autotuner API change, so it is not trivial. The current cost is bounded: at most one small TuningConfig per
+    distinct source_tokens (<= slot_tokens) per (unique_id, extra slots). The autotuner profile key sets constraint dims
+    to -1, so none of these entries triggers a re-tune.
+
+Tests to run (GPU CI nodes; torch is needed by every file):
+  CPU-style unit tests, new or changed:
+    pytest tests/unittest/_torch/moe/test_moe_execution_state.py -k "slots or publish"   (test_backends_get_the_slots_or_a_compact_copy, test_dispatch_looks_up_the_slots_only_with_peer_loss_recovery, test_detection_only_publish_rewrites_the_mask_only_on_a_new_generation)
+    pytest tests/unittest/_torch/executor/test_peer_loss_recovery.py   (new: test_rank0_gathers_responses_without_hook_calls_when_recovery_is_off)
+    pytest tests/unittest/_torch/distributed/test_mpi_survivors.py     (test_install_survivors_keeps_logical_ranks extended)
+    pytest -m cpu_only tests/unittest/_torch/executor/test_executor_request_queue.py   (test_wake_releases_a_blocked_get_without_a_request extended)
+  Regression:
+    pytest tests/unittest/_torch/moe/test_moe_execution_state.py   (whole file, incl. GPU collective rounds)
+    pytest tests/unittest/_torch/moe/test_moe_backend.py tests/unittest/_torch/peft/test_moe_lora_model_path.py
+    pytest tests/unittest/_torch/executor/test_py_executor.py tests/unittest/_torch/executor/test_adp_host_exchange.py tests/unittest/_torch/executor/test_adp_absent_ranks.py
+    pytest tests/unittest/_torch/disaggregation/test_benchmark_disagg.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py
+  GPU/integration: the WideEP FT GB200 standard recipe, both FT off (parity and perf, 1% budget) and FT on with a
+    kill. Run detection-only (TLLM_FAULT_TOLERANCE_MODE=1 without an authority) too: it is the path that
+    _publish_rank_mask and the combine record change (#6/#7).

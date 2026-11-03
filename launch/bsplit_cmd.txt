@@ -1,0 +1,10 @@
+# BSPLIT: which part of v4 patch b triggers the post-recovery a2a hang (BISECT-BC 8130746: b-only and b+c hung, v3 and
+# c-only passed)? One rank5 kill per arm, w/o EPLB, KILLS-V3 settings, KF_STACKS=1.
+# Group A: v3 control #1, b1 (watch-thread log after release only), b2 (recovery-log deferral only).
+# Group B: v3 control #2, b3 (b2 with the detect log written before request_abort), b (full, positive control).
+# PASS per arm: first_step logged after resume + KILL_FINAL_VERDICT PASS. Reading: b1 hangs -> watch-thread order;
+# b2 hangs and b3 passes -> the abort lands earlier (i); b2 and b3 hang -> faster exit from recovery (ii).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496; O=$R/overlays
+K="MVP_BUILD=$B FINAL_BUILD=$B KF_ALLOW_OVERLAY=1 KF_STACKS=1 KF_BENCH_CONFIG=std-noeplb-ft.yaml WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=4 WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_REPEATS=1"
+bash $R/bundle.sh "0:8:5100:$K bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-A; $K MVP_OVERLAY=$O/v4b1-d00215dd68 bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-A; $K MVP_OVERLAY=$O/v4b2-38c2cab828 bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF" \
+  "8:8:5100:$K bash $R/mvp/harness/run_job.sh KILL-FINAL-ON; $K MVP_OVERLAY=$O/v4b3-3d75bf5da1 bash $R/mvp/harness/run_job.sh KILL-FINAL-ON-B; $K MVP_OVERLAY=$O/v4b-ee76f03e74 bash $R/mvp/harness/run_job.sh KILL-FINAL-OFF-B"

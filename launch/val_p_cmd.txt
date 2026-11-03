@@ -1,0 +1,37 @@
+# VAL-P (16 nodes, two 8-node groups, < 2 h): parity and token validation of the freeze build (v5-zero rebased onto
+# current main, no overlay). Each group first runs the short in-job unit gate (as VAL-H1, ~6 min).
+# Group 0 (C30, main parity): STD on one set of nodes, arms std-noeplb-main (main's wheel MAIN_BUILD, FT off, no
+#   overlay) and std-noeplb (this build, FT off), both plain mpirun (UCX), at 32 and 128/GPU in every case. Tuning pass
+#   at 128/GPU of both arms, merged into one pinned table; then 2 rounds rotated: main, ours | ours, main (ABBA).
+#   Pass: TACTIC_CHECK of the -main cases priming_failed=0 cache_miss=0 (one table across two wheels), then per load
+#   the trim-mean gap std-noeplb vs std-noeplb-main with its spread, n=2 per arm (C30: UB < 1% or explained).
+# Group 8: (1) C17: EXACT-FINAL on std-noeplb-ft.yaml (EXACT_CONFIG), FT on as the feature doc launches it, hang
+#   detection on: a no-kill reference, a no-kill perturbed control (victim prompt pinned to rank 0: rank 0's batch
+#   1 -> 2, as when a rerun lands there) and a rank-5 kill, ~30 min. Pass: EXACT_FINAL_VERDICT std PASS (pre-kill
+#   exact; after the kill no more/earlier sorted first diffs than the control; rank-0 iter log shows 2 requests in pert
+#   only). (2) H26: STD-G1 std-noeplb (plain mpirun) vs std-noeplb-ulfm (FT's ULFM launcher, ob1 self,tcp, FT off) at
+#   32/GPU, tuning pass of std-noeplb only (same wheel and config in both arms), 2 rounds rotated (ABBA). Pass: the
+#   ulfm arm's trim-mean gap = the launcher's share of the deployable FT cost.
+# Readout: python3 -I $R/tools/trim_readout.py $R/mvp/runs/STD-<job> --off std-noeplb-main-1 and
+#   $R/mvp/runs/STD-G1-<job>; EXACT_FINAL_VERDICT in $R/logs/bundle/<job>-8.log.
+# Estimate: group 0 ~6 + tuning 2 x ~10 + 4 cases x ~16 (ZERO-AB 8164194 at 32+128: 15-20 min) + ~2 = ~92 min
+# (round 2 needs 36 min left); group 8 ~6 + C17 ~30 + tuning ~10 + 4 cases x ~11.5 + ~2 = ~94 min; limit 117 min.
+# Submit (16 nodes, segment 8) after the freeze build and MAIN_BUILD both passed verify_wheel:
+#   bash $R/tools/require_presubmit.sh <token> && bash $R/launch/val_p_cmd.txt
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+# Refuse a node listed in mvp/EXCLUDE_NODES.txt (the broker cannot pass --exclude): end at once instead of hanging a case.
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+# Freeze 759787cb17 = the wheel of 5330b899f0 (BUILD-FREEZE 8173212; tensorrt_llm/ and cpp/ identical); snapshot build-src-5330b899f0 holds 759787cb17.
+B=build-freeze-5330b899f0; SRC=$R/overlays/build-src-5330b899f0; O=
+# Main at the rebase target 9cc37929e8 (BUILD-MAIN, verify_wheel).
+# verify_wheel), not build-main-0829689c52 (the v5 merge-base; BUILD-MAIN 8168840, used for the dry run only).
+MB=build-main-9cc37929e8
+# The unit gate's overlay arguments: the source snapshot itself when the wheel carries all of the Python (no overlay).
+OV=${O:-$SRC}; OT=${O:+$O-tests}; OT=${OT:-$SRC}
+T="tests/unittest/_torch/moe/test_ring_host_copies.py tests/unittest/executor/test_recovery_authority.py tests/unittest/_torch/moe/test_moe_execution_state.py tests/unittest/_torch/moe/test_moe_load_balancer.py tests/unittest/_torch/distributed/test_mpi_survivors.py tests/unittest/_torch/distributed/test_mpi_survivors_ulfm.py tests/unittest/_torch/executor/test_py_executor.py"
+g() { echo "bash $R/tools/units_gate.sh $R/logs/bundle/valp-gate$1-\$SLURM_JOB_ID $R/$B/dist $OV $OT $SRC $R/$B/point-units-valp-g$1 $T"; }
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+E="MVP_BUILD=$B FINAL_BUILD=$B MAIN_BUILD=$MB MVP_OVERLAY=$O COST_DIAG_OVERLAY=${O:+1} WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 WIDEEP_BURNIN=32:6 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_ROUNDS=2 FT_COST_E2E_ROUND_MIN=36"
+X="MVP_BUILD=$B FINAL_BUILD=$B MVP_OVERLAY=$O KF_ALLOW_OVERLAY=${O:+1} WIDEEP_MPI_MCA='$M' TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30 EXACT_CONFIG=std-noeplb-ft.yaml"
+bash $R/bundle.sh "0:8:7000:$(g 0) && $E COST_LOADS=32,128 FT_COST_E2E_ARMS='std-noeplb-main std-noeplb' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$(g 8) && { $X bash $R/mvp/harness/run_job.sh EXACT-FINAL; $E COST_LOADS=32 STD_TUNE_ARMS=std-noeplb FT_COST_E2E_ARMS='std-noeplb std-noeplb-ulfm' bash $R/mvp/harness/run_job.sh STD-G1; }"

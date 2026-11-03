@@ -1,0 +1,24 @@
+# V5PR-TESTS (1 node; closes TESTS-GAP for the PR stack v5-pr b27007aca1): (1) tools/import_smoke.sh on the v5-pr tip
+# .py over the freeze wheel; (2) pytest of every unit-test file the stack touches (vs main 9cc37929e8, 38 files) at the
+# tip; (3) at each of the 20 commits that touch unit tests, that commit's own touched test files, with the commit's .py
+# overlaid on build-freeze-58caa0fde6 (v5-pr's C++ differs from the freeze build only in comments). Pass rule (set before
+# data): import smoke OK, and every test file passes (skips allowed only for missing GPUs/launchers, the same skip as
+# at v5-final in earlier runs); any failure blocks "v5-pr = measured code" until explained.
+# Output: review/diag/v5pr-tests-<job>.txt. --time 01:30.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/v5pr-tests-${SLURM_JOB_ID:-x}.txt
+{
+    echo "### import smoke"; if bash $R/tools/import_smoke.sh $R/build-freeze-58caa0fde6/dist $R/scratch-v5pr-tip > /tmp/import-smoke.log 2>&1 && grep -q IMPORT_SMOKE_OK /tmp/import-smoke.log; then echo IMPORT_SMOKE_PASS; else echo IMPORT_SMOKE_FAIL; tail -40 /tmp/import-smoke.log; fi
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/fixtest-pip.log 2>&1 || tail -5 /tmp/fixtest-pip.log
+    first=$(head -1 $R/scratch-v5pr-commits/plan.txt); c0=${first%% *}; printf '%s\n' ${first#* } > /tmp/list-c0.txt
+    echo "##### collect-only (tip + first commit)"
+    col=$(bash $R/scratch-v5pr-tip/collect_check.sh $R/scratch-v5pr-tip $R/scratch-v5pr-tests.txt; bash $R/scratch-v5pr-tip/collect_check.sh $R/scratch-v5pr-commits/$c0 /tmp/list-c0.txt)
+    echo "$col"; grep -q COLLECT_FAIL <<< "$col" && { echo V5PR_TESTS_STOPPED_AT_COLLECTION; exit 0; }
+    echo "##### tip b27007aca1"; bash $R/scratch-v5pr-tip/run_tests.sh $R/scratch-v5pr-tip $R/scratch-v5pr-tests.txt
+    while read -r c tests; do
+        echo "##### commit $c"; printf '%s\n' $tests > /tmp/list-$c.txt
+        bash $R/scratch-v5pr-tip/run_tests.sh $R/scratch-v5pr-commits/$c /tmp/list-$c.txt
+    done < $R/scratch-v5pr-commits/plan.txt
+    echo V5PR_TESTS_DONE
+} > "$out" 2>&1

@@ -1,0 +1,7 @@
+# PROBES-COMBO (1 node; one slot for two 1-node probes): HOSTMEM-PROBE first (option B premise: driver-allocated host
+# memory, FD sharing, CPU access, readers under forced compaction; launch/hostmem_probe_cmd.txt), then COMPACT-PROBE2
+# (pinned_all / owner-pin evidence + the pin commits' unit tests; launch/compact_probe2_cmd.txt). Outputs:
+# review/diag/hostmem-probe-<job>.txt, review/diag/compact-probe2-<job>.txt. ~20 + ~30 min; --time 01:15.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/launch/hostmem_probe_cmd.txt
+bash $R/launch/compact_probe2_cmd.txt

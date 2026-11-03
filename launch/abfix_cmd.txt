@@ -1,0 +1,15 @@
+# ABFIX (16 nodes): the bound-path fixes and their bisection at 32/GPU on the new wheel build-v5r2-b0ad558bcb
+# (v5-recvfix: A warp-per-source receive + B' per-lane pre-wait loads + Tier<384,8>). Gate: BUILD-RECVFIX2 8153345's
+# tests (tools/require_build_pass.sh in the submit command). Arms on each group's own nodes, one round per group,
+# group 8 in reverse order:
+#   off | ft-oldk (wheel build-v5-2ccc3e8e1c + overlay v5f) | ft (new wheel) | ft-unbound (FT on, MoE comms unbound:
+#   main's a2a with sanitize and route(); testhooks TLLM_TEST_FT_UNBOUND) | ft-noinplace (bound, FC1 gets compacted
+#   rows; TLLM_TEST_FT_NO_INPLACE_SLOTS).
+# Readout (dist32 trim mean, healthy-32, per group; CLAIMS 164 baseline ft-oldk - off ~0.35, lb-level ~+0.12-0.18):
+#   (ft - off) <= 1/3 of (ft-oldk - off) in both groups -> A + B' + tier fix the shift; land on v5.
+#   ft-unbound - off ~ lb level (<= 0.2) -> the bound path carries FT's extra; ft-noinplace closing it names the
+#   in-place slot read. Each hook arm's proof lines must be in every rank's log (ACTIVE + CALL, no REFUSED).
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v5r-b0ad558bcb; OLD=$R/overlays/v5f-f96a8c1a53
+E="MVP_BUILD=$B FINAL_BUILD=$B OLDK_BUILD=build-v5-2ccc3e8e1c OLDK_OVERLAY=$OLD COST_DIAG_OVERLAY=1 WIDEEP_NO_SAMPLERS=1 WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:7000:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft-oldk std-noeplb-ft std-noeplb-ft-unbound std-noeplb-ft-noinplace' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:7000:$E FT_COST_E2E_ARMS='std-noeplb-ft-noinplace std-noeplb-ft-unbound std-noeplb-ft std-noeplb-ft-oldk std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

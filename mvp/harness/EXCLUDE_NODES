@@ -1,0 +1,2 @@
+# Nodes that caused job failures (advisory: the Slurm broker has no --exclude field yet).
+# node  job  date  what

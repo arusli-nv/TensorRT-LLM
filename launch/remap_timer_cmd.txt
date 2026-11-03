@@ -1,0 +1,60 @@
+# REMAP-TIMER (16 nodes, two 8-node groups = one DEP32 server each, segment 8). DIAGNOSTIC ONLY, not a product claim:
+# every timing in this job runs with extra logging (overlays/remap-timer-943a1e7841 = v5-final 27442bd91d + the remap
+# phase timer, branch remap-timer 943a1e7841, on build-freeze-58caa0fde6); DIAGNOSTIC: it may enter CLAIMS as a DIAGNOSTIC row and the doc as a
+# labelled explanation of the remap two-speed (which step, by how much). It never replaces a v5-final recovery number,
+# since this is an instrumented overlay.
+# Purpose: explain why the all-to-all workspace remap after a rank kill is slow (~810-1000 ms) for static routing (no EPLB
+# 12/12 since the host-copy overlays, offline EPLB 2/2) but fast for online EPLB (~385-530 ms, 41/41)
+# (review/diag/why_remap_noeplb.md). The timer adds one INFO line per remap per rank next to "Remapped ...":
+#   "Remap phases ms: release=.. (sync=.. unmap=..) barrier1=.. make_room=..(empty_cache=y freed=..|n free_before=..
+#    free_after=..) create=.. export=.. gather=.. import_map=.. outcome=.. remap_rest=.. barrier2=.. total=.."
+#   Host perf_counter times. release, release sync, empty_cache and remap_rest (reset + sync + watchdog restart) include
+#   device syncs the code already does; create/export/import_map are blocking driver calls; gather/outcome/barriers
+#   include the wait for the slowest survivor. Phases summed over the workspaces.
+# Rule (written before any REMAP-TIMER data): the remap sub-phase whose time differs by >= 300 ms between the slow arms
+# (no-EPLB, offline) and online explains the slow remap; if no phase differs by >= 300 ms, report the breakdown, no
+# conclusion.
+# Readout: grep -h 'Remap phases ms\|Remapped' $R/mvp/runs/KILL-FINAL-{OFF,OFF-B,ON}-<job>/rank5-*/rank-*.log
+# Arms (rank kills, KILL-FINAL knobs/victims of V5F-REC / V5F-REC-OFF / THIN-CELLS):
+#   G0: no EPLB (std-noeplb-ft.yaml) rank5 x2 (victims 5, 22), then offline EPLB (std-offline-ft-filled.yaml) rank5 x1
+#   G8: online (std-online.yaml) rank5 x2 (victims 13, 29)
+# Time (measured case minutes, logs/bundle/{8269102,8285728,8283311}-*.log; a run_job's first case is cold):
+#   G0: noeplb rank5 13.3-13.9 cold + 10.2-10.4, offline rank5 14.6 cold = ~39 min
+#   G8: online rank5 16.8 cold + 13.2 = ~30 min. + ~4 min startup = ~43 min; --time 01:05, group limit 3600 s.
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-freeze-58caa0fde6
+FIX_OVERLAY=$R/overlays/remap-timer-943a1e7841
+O="MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1"
+# Import smoke of the overlay on the wheel in this container (py_compile alone is not enough): every node, before any
+# case; a failure ends the job here.
+if [[ -z ${WIDEEP_DRY_RUN:-} ]]; then
+    bash $R/tools/import_smoke.sh $R/$B/dist $FIX_OVERLAY > /tmp/import-smoke.log 2>&1; grep -q IMPORT_SMOKE_OK /tmp/import-smoke.log \
+        || { echo "IMPORT_SMOKE_FAIL node ${SLURM_NODEID:-0}"; tail -30 /tmp/import-smoke.log; exit 1; }
+    echo "IMPORT_SMOKE_OK node ${SLURM_NODEID:-0}"
+fi
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    KI=4 KSTOP=4
+else
+    KI=4 KSTOP=8
+fi
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+KOFF="$K KF_BENCH_CONFIG=std-offline-ft-filled.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$KNO KF_ROWS='rank5' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-OFF)"
+P0_2="$KOFF KF_ROWS='rank5' KF_REPEATS=1 $(run KILL-FINAL-OFF-B)"
+G0="{ $P0_1; $P0_2; }"
+P8_1="$KON KF_ROWS='rank5' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-ON)"
+G8="{ $P8_1; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:3600:$G0" "8:8:3600:$G8"

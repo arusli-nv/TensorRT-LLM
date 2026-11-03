@@ -1,0 +1,101 @@
+# MOEMODULE-PREFIX (DRAFT, not submitted; 1 GB200 node): outcome (3) follow-up of MOEMODULE-IMA 8300459, whose arms A and B
+# passed the failing id in isolation (3/3 each) and in a 10-id window. Per that job's rule, outcome (3) "the failure
+# depends on test order; next, run the full ordered prefix of test_moe_module up to and including the failing id, in
+# both arms". Failing id: test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=1-dtype=torch.bfloat16-backend=DENSEGEMM-
+# quant=NVFP4-routing=Renormalize] (TEST-INFRA 8293032: CUDA IMA under cute_dsl_nvfp4_dense_gemm_fc2_blackwell).
+# Conditions as 8293032 (to reproduce it): all 4 GPUs visible, no CUDA_LAUNCH_BLOCKING, one pytest process over the
+# ordered prefix (collected order, ids 1..i), outer timeout 900 s
+# (8293032 reached the failing id 540 s into test_moe_module: file start 21:35:32, IMA 21:44:32; 900 s ~ 1.7x). Arms A and B exactly as MOEMODULE-IMA (same wheel,
+# same container; B = 9cc37929e8 .py for the 37 files v5-final modifies). Each arm runs the prefix twice (fresh processes).
+# RULE (proposed by dev, to be fixed by the monitor before data):
+# (a) The failing id (or any earlier id) gets F/E with a CUDA error in arm A only: FT Python involved through test order;
+#     next, bisect the files of e9c313962a in arm A's prefix.
+# (b) Both arms reproduce it: not FT Python; next, run the prefix on the main 9cc37929e8 wheel (C++ question, as
+#     MOEMODULE-IMA outcome (2)).
+# (c) Neither arm reproduces it in 2 prefix runs each: the 8293032 IMA did not reproduce (4 ordered runs + 6 isolated +
+#     2 windows on this code); report it as unreproduced with every log, no claim either way; no further GPU run unless
+#     the monitor decides.
+# (d) Only arm B reproduces: report the tracebacks, no conclusion (as in MOEMODULE-IMA).
+# An arm "reproduces" if any of its 2 prefix runs reports F or E or a CUDA error. A run that times out or collects
+# nothing is INVALID (re-check the first log as soon as it lands: it must show passed/failed/error counts).
+# Each run's wall time is recorded (the failing id is the prefix's last id, so it is the time to reach and run it).
+# Output: review/diag/moemodule-prefix-<job>.txt + per-run logs. Est: install ~4 min x2 + collect ~1 min x2 + 4 runs
+# <= 900 s each + 10 min slack: --time 01:25.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+job=${SLURM_JOB_ID:-x}
+bash $R/tools/check_excluded_nodes.sh || exit 1
+export HOME=/tmp/wideep-home PYTHONUSERBASE=/tmp/wideep-home/.local PIP_CACHE_DIR=/tmp/wideep-home/.cache/pip
+mkdir -p "$PYTHONUSERBASE" "$PIP_CACHE_DIR"
+# The tests spawn their own MPI pools (MPIPoolExecutor): drop the outer srun's PMIx/Slurm env (see testinfra_cmd.txt).
+for var in $(compgen -e | grep -E '^(PMIX_|PMI_|SLURM_|OMPI_MCA_ess|PRTE_MCA_ras)'); do unset "$var"; done
+out=$R/review/diag/moemodule-prefix-$job.txt; T=$R/scratch-mpisession/v5final
+TF=$T/tests/unittest/_torch/moe/test_moe_module.py
+ID='test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=1-dtype=torch.bfloat16-backend=DENSEGEMM-quant=NVFP4-routing=Renormalize]'
+FREEZE=$R/build-freeze-58caa0fde6/dist; MAIN=$R/build-main-9cc37929e8/dist
+BASE_FILES="tensorrt_llm/_torch/alltoall_watchdog.py tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py
+tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
+tensorrt_llm/_torch/distributed/communicator.py tensorrt_llm/_torch/distributed/mnnvl_memory.py
+tensorrt_llm/_torch/mnnvl_alltoall_workspace.py tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py
+tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py
+tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py tensorrt_llm/_torch/moe/fused_moe/impl_base.py
+tensorrt_llm/_torch/moe/fused_moe/impl_blocks.py tensorrt_llm/_torch/moe/fused_moe/interface.py
+tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py
+tensorrt_llm/_torch/moe/fused_moe/wide_ep_ft.py tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py
+tensorrt_llm/_torch/pyexecutor/engine/runners/common.py tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/inputs.py
+tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/metadata.py tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py
+tensorrt_llm/_torch/pyexecutor/executor_request_queue.py tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+tensorrt_llm/_torch/pyexecutor/llm_request.py tensorrt_llm/_torch/pyexecutor/model_engine.py
+tensorrt_llm/_torch/pyexecutor/py_executor.py tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
+tensorrt_llm/_torch/pyexecutor/request_utils.py tensorrt_llm/_torch/pyexecutor/scheduler/adp_router.py
+tensorrt_llm/_utils.py tensorrt_llm/executor/ipc.py tensorrt_llm/executor/utils.py tensorrt_llm/llmapi/mgmn_leader_node.py
+tensorrt_llm/llmapi/mgmn_worker_node.py tensorrt_llm/llmapi/mpi_session.py tensorrt_llm/serve/openai_server.py"
+pt() {  # pt LOG NODEID...: one fresh pytest process, all GPUs visible
+    local log=$1 t0=$SECONDS; shift
+    (cd /tmp && PYTHONPATH=$T/tests/unittest:$T/tests timeout -k 30 900 \
+        python3 -m pytest -q -p no:cacheprovider --tb=short -rA --basetemp=/tmp/bt-prefix "$@" > "$log" 2>&1)
+    local rc=$? el=$((SECONDS - t0))
+    echo "rc=$rc wall=${el}s | $(grep -F -- "$ID" "$log" | grep -E '^(PASSED|FAILED|ERROR|SKIPPED)' | cut -c1-8 | tr '\n' ' ')| $(tail -1 "$log")"
+}
+arm() {  # arm NAME: collect, 2 runs of the ordered prefix
+    local a=$1 pre
+    (cd /tmp && PYTHONPATH=$T/tests/unittest:$T/tests timeout 600 python3 -m pytest --collect-only -q -p no:cacheprovider \
+        "$TF" 2>&1 | grep '::' > /tmp/ids-$a.txt)
+    pre=$(python3 - /tmp/ids-$a.txt "$ID" "$TF" <<'PY'
+import sys
+ids = open(sys.argv[1]).read().split()
+i = next((k for k, x in enumerate(ids) if x.endswith("::" + sys.argv[2])), None)
+# Collected ids are relative to tests/unittest; pytest runs from /tmp, so give it the absolute file path.
+print("COLLECT_FAIL" if i is None else " ".join(sys.argv[3] + "::" + x.split("::", 1)[1] for x in ids[:i + 1]))
+PY
+)
+    echo "## arm $a: collected $(wc -l < /tmp/ids-$a.txt); window: $pre"
+    [[ $pre == COLLECT_FAIL ]] && { echo "## arm $a INVALID (failing id not collected)"; return; }
+    echo "## arm $a prefix length $(echo $pre | wc -w)"
+    for r in 1 2; do echo "## arm $a prefix$r $(pt $R/review/diag/moemodule-prefix-$job-$a-prefix$r.log $pre)"
+        grep -hE '^(FAILED|ERROR)' $R/review/diag/moemodule-prefix-$job-$a-prefix$r.log | head -5 | cut -c1-250; done
+}
+{
+    hostname; nvidia-smi -L | head -1
+    bash $R/install_wheel.sh $FREEZE /tmp/i1.log || { tail -20 /tmp/i1.log; exit 1; }
+    pip install -q -r $R/scratch-fixtest/requirements-dev-only.txt > /tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+    pkg=$(cd / && python3 -c "import importlib.util as u, os; print(os.path.dirname(u.find_spec('tensorrt_llm').origin))")
+    # Arm A: v5-final .py (freeze wheel + overlay), exactly as testinfra_cmd.txt.
+    (cd $R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm && find . -name '*.py' -print0) | while IFS= read -r -d '' f; do
+        cp "$R/overlays/fix-dropmap-9f1fd4cab4/tensorrt_llm/$f" "$pkg/$f"; done
+    md5sum $pkg/_torch/custom_ops/cute_dsl_custom_ops.py $pkg/_torch/moe/fused_moe/moe_load_balancer.py
+    arm A
+    # Arm B: reinstall the freeze wheel (truncating the marker forces it), then main 9cc37929e8's .py for the 37 files.
+    : > /tmp/.wideep-installed
+    bash $R/install_wheel.sh $FREEZE /tmp/i2.log || { tail -20 /tmp/i2.log; exit 1; }
+    python3 - "$MAIN" "$(dirname $pkg)" $BASE_FILES <<'PY' || { echo ARM_B_SETUP_FAILED; exit 1; }
+import glob, sys, zipfile
+dist, site, files = sys.argv[1], sys.argv[2], sys.argv[3:]
+z = zipfile.ZipFile(glob.glob(dist + "/*.whl")[0])
+for f in files:
+    open(f"{site}/{f}", "wb").write(z.read(f))
+print(f"arm B: {len(files)} files from {z.filename}")
+PY
+    md5sum $pkg/_torch/custom_ops/cute_dsl_custom_ops.py $pkg/_torch/moe/fused_moe/moe_load_balancer.py
+    arm B
+    echo MOEMODULE_PREFIX_DONE
+} > "$out" 2>&1

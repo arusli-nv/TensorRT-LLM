@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="470" font-family="Lato, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" fill="white"/><defs>
+<marker id="ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#1A1A1A"/></marker>
+<marker id="green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#76B900"/></marker>
+<marker id="gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#9A9A9A"/></marker>
+<marker id="red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 z" fill="#C8372D"/></marker>
+<pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#F4F4F4"/><line x1="0" y1="0" x2="0" y2="8" stroke="#D2D2D2" stroke-width="3"/></pattern></defs>
+<rect x="20" y="16" width="960" height="244" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="34" y="44" font-size="18" fill="#1A1A1A" text-anchor="start" font-weight="bold">GPU 0 (restores 1 of rank 2&#x27;s 8 lost experts)</text>
+<rect x="20" y="274" width="960" height="180" rx="12" fill="#FAFAFA" stroke="#E2E2E2" stroke-width="1.5"/>
+<text x="34" y="302" font-size="18" fill="#1A1A1A" text-anchor="start" font-weight="bold"></text>
+<text x="500" y="302" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="bold">Expert backups in host memory</text>
+<text x="40" y="82" font-size="17" fill="#1A1A1A" text-anchor="start" font-weight="bold">Expert slots</text>
+<text x="40" y="104" font-size="16" fill="#1A1A1A" text-anchor="start" font-weight="normal">(virtual)</text>
+<text x="40" y="190" font-size="17" fill="#1A1A1A" text-anchor="start" font-weight="bold">GPU memory</text>
+<text x="40" y="212" font-size="16" fill="#1A1A1A" text-anchor="start" font-weight="normal">(physical)</text>
+<rect x="196" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="231.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e0</text>
+<rect x="196" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="231.0" y1="114" x2="231.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="273" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="308.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e1</text>
+<rect x="273" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="308.0" y1="114" x2="308.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="350" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="385.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e2</text>
+<rect x="350" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="385.0" y1="114" x2="385.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="427" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="462.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e3</text>
+<rect x="427" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="462.0" y1="114" x2="462.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="504" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="539.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e4</text>
+<rect x="504" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="539.0" y1="114" x2="539.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="581" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="616.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e5</text>
+<rect x="581" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="616.0" y1="114" x2="616.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="658" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="693.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e6</text>
+<rect x="658" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="693.0" y1="114" x2="693.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="735" y="62" width="70" height="50" rx="6" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.8"/>
+<text x="770.0" y="93.0" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="normal">e7</text>
+<rect x="735" y="140" width="70" height="44" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="1.6"/>
+<line x1="770.0" y1="114" x2="770.0" y2="136" stroke="#9A9A9A" stroke-width="2.2" marker-end="url(#gray)"/>
+<rect x="812" y="62" width="70" height="50" rx="6" fill="#EAF4D6" stroke="#76B900" stroke-width="2.2"/>
+<text x="847.0" y="84" font-size="17" fill="#1A1A1A" text-anchor="middle" font-weight="bold">e16</text>
+<text x="847.0" y="103" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="normal">lost</text>
+<rect x="889" y="62" width="70" height="50" rx="6" fill="url(#hatch)" stroke="#9A9A9A" stroke-width="1.8" stroke-dasharray="5 4"/>
+<text x="924.0" y="132" font-size="14" fill="#1A1A1A" text-anchor="middle" font-weight="normal">unmapped</text>
+<rect x="196" y="194" width="763" height="56" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.6"/>
+<text x="496" y="228" font-size="18" fill="#1A1A1A" text-anchor="middle" font-weight="bold">KV cache</text>
+<rect x="817" y="199" width="60" height="46" rx="3" fill="#EAF4D6" stroke="#76B900" stroke-width="2.4"/>
+<line x1="847.0" y1="114" x2="847.0" y2="195" stroke="#76B900" stroke-width="2.2" marker-end="url(#green)"/>
+<text x="855.0" y="174" font-size="14" fill="#1A1A1A" text-anchor="start" font-weight="normal">CUDA VMM</text>
+<rect x="40" y="316" width="266" height="118" rx="10" fill="white" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="52" y="340" font-size="16" fill="#1A1A1A" text-anchor="start" font-weight="bold">Node 0</text>
+<rect x="48" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="77" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 0</text>
+<rect x="112" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="141" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 1</text>
+<rect x="176" y="350" width="58" height="28" rx="4" fill="#FBE6E4" stroke="#C8372D" stroke-width="1.8"/>
+<text x="205" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 2</text>
+<rect x="240" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="269" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 3</text>
+<rect x="53" y="389" width="244" height="28" rx="0" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.6"/>
+<rect x="48" y="394" width="244" height="28" rx="0" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="2"/>
+<text x="170.0" y="415.0" font-size="14" fill="#1A1A1A" text-anchor="middle" font-weight="bold">Grace memory: Node 1&#x27;s e32-e63</text>
+<rect x="326" y="316" width="266" height="118" rx="10" fill="white" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="338" y="340" font-size="16" fill="#1A1A1A" text-anchor="start" font-weight="bold">Node 1</text>
+<rect x="334" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="363" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 4</text>
+<rect x="398" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="427" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 5</text>
+<rect x="462" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="491" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 6</text>
+<rect x="526" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="555" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 7</text>
+<rect x="339" y="389" width="244" height="28" rx="0" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.6"/>
+<rect x="334" y="394" width="244" height="28" rx="0" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="2"/>
+<text x="456.0" y="415.0" font-size="14" fill="#1A1A1A" text-anchor="middle" font-weight="bold">Grace memory: Node 2&#x27;s e64-e95</text>
+<rect x="672" y="316" width="266" height="118" rx="10" fill="white" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="684" y="340" font-size="16" fill="#1A1A1A" text-anchor="start" font-weight="bold">Node 7</text>
+<rect x="680" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="709" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 28</text>
+<rect x="744" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="773" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 29</text>
+<rect x="808" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="837" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 30</text>
+<rect x="872" y="350" width="58" height="28" rx="4" fill="#F1F1F1" stroke="#9A9A9A" stroke-width="1.8"/>
+<text x="901" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 31</text>
+<rect x="685" y="389" width="244" height="28" rx="0" fill="#EAF4D6" stroke="#76B900" stroke-width="1.6"/>
+<rect x="680" y="394" width="244" height="28" rx="0" fill="#EAF4D6" stroke="#76B900" stroke-width="2"/>
+<text x="802.0" y="415.0" font-size="14" fill="#1A1A1A" text-anchor="middle" font-weight="bold">Grace memory: Node 0&#x27;s e0-e31</text>
+<text x="632" y="383.0" font-size="26" fill="#1A1A1A" text-anchor="middle" font-weight="bold">...</text>
+<rect x="48" y="350" width="58" height="28" rx="4" fill="#E4ECF4" stroke="#5B7FA3" stroke-width="2.4"/>
+<text x="77" y="369" font-size="13" fill="#1A1A1A" text-anchor="middle" font-weight="bold">GPU 0</text>
+<rect x="20" y="16" width="960" height="244" rx="12" fill="none" stroke="#5B7FA3" stroke-width="2.4"/>
+<line x1="48" y1="350" x2="20" y2="260" stroke="#5B7FA3" stroke-width="1.5" stroke-dasharray="4 4"/>
+<line x1="106" y1="350" x2="380" y2="260" stroke="#5B7FA3" stroke-width="1.5" stroke-dasharray="4 4"/>
+<path d="M 805.0 316 L 805.0 266 L 847.0 266 L 847.0 249" fill="none" stroke="#76B900" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#green)"/>
+<text x="815.0" y="304" font-size="15" fill="#1A1A1A" text-anchor="start" font-weight="normal">e16 over NVLink</text>
+</svg>

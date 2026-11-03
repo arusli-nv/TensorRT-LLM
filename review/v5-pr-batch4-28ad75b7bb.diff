@@ -1,0 +1,1032 @@
+diff --git a/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.cpp b/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.cpp
+index c338b5d06f..74608312e2 100644
+--- a/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.cpp
++++ b/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.cpp
+@@ -1,18 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ 
+ #include "heartbeatSender.h"
+@@ -85,8 +73,8 @@ Tag hmacSha256(std::string const& key, std::string const& message)
+ //!
+ //! Every interval, starting at construction, it sends one UDP datagram to the authority's host and port: the JSON
+ //! payload of a `NativeHeartbeat` message (rank, pid, a count of the datagrams sent and the last published executor
+-//! iteration) followed by its HMAC-SHA256 tag, as `tensorrt_llm.executor.recovery.protocol.encode_datagram` does. A
+-//! datagram that cannot be sent is dropped.
++//! iteration) followed by its HMAC-SHA256 tag, which `tensorrt_llm.executor.recovery.protocol.decode_datagram`
++//! checks. A datagram that cannot be sent is dropped.
+ class HeartbeatSender
+ {
+ public:
+diff --git a/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.h b/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.h
+index ad1bbde4ac..32b29064e8 100644
+--- a/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.h
++++ b/cpp/tensorrt_llm/nanobind/runtime/heartbeatSender.h
+@@ -1,18 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ 
+ #pragma once
+diff --git a/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.cpp b/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.cpp
+index 92c11c3eec..785d50cce8 100644
+--- a/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.cpp
++++ b/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.cpp
+@@ -1,18 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ 
+ #include "peerFailureWatch.h"
+diff --git a/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.h b/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.h
+index 47ad493477..90556a9363 100644
+--- a/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.h
++++ b/cpp/tensorrt_llm/nanobind/runtime/peerFailureWatch.h
+@@ -1,18 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ 
+ #pragma once
+diff --git a/cpp/tensorrt_llm/runtime/CMakeLists.txt b/cpp/tensorrt_llm/runtime/CMakeLists.txt
+index 9b2936cc4f..48627d1f32 100644
+--- a/cpp/tensorrt_llm/runtime/CMakeLists.txt
++++ b/cpp/tensorrt_llm/runtime/CMakeLists.txt
+@@ -27,8 +27,8 @@ set(SRCS
+     ipcUtils.cpp
+     ipcSocket.cpp
+     mcastDeviceMemory.cpp
+-    moeLoadBalancer/ghostSlotMemory.cpp
+     moeLoadBalancer/gdrwrap.cpp
++    moeLoadBalancer/ghostSlotMemory.cpp
+     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
+     moeLoadBalancer/moeLoadBalancer.cpp
+     moeLoadBalancer/topologyDetector.cpp
+diff --git a/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.cpp b/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.cpp
+index 4178ce770c..3bca7b2ad3 100644
+--- a/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.cpp
++++ b/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.cpp
+@@ -1,18 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ 
+ #include "ghostSlotMemory.h"
+diff --git a/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h b/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h
+index 32bb357edd..addaa42a66 100644
+--- a/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h
++++ b/cpp/tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h
+@@ -1,18 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ 
+ #pragma once
+diff --git a/docker/common/install_mpi4py.sh b/docker/common/install_mpi4py.sh
+index 9cf89ab1b5..b21f8a8f7c 100644
+--- a/docker/common/install_mpi4py.sh
++++ b/docker/common/install_mpi4py.sh
+@@ -1,6 +1,4 @@
+ #!/bin/bash
+-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-# SPDX-License-Identifier: Apache-2.0
+ 
+ set -ex
+ 
+diff --git a/tensorrt_llm/_torch/distributed/communicator.py b/tensorrt_llm/_torch/distributed/communicator.py
+index 4260406989..314fabb568 100644
+--- a/tensorrt_llm/_torch/distributed/communicator.py
++++ b/tensorrt_llm/_torch/distributed/communicator.py
+@@ -973,7 +973,8 @@ class MPIDist(Distributed):
+         if not _coll_component_excluded("hcoll"):
+             raise RuntimeError(
+                 "Peer-loss recovery requires Open MPI's hcoll collectives off; "
+-                "launch through trtllm-llmapi-launch or with `--mca coll ^hcoll,ucc`")
++                "launch through trtllm-llmapi-launch or with `--mca coll ^hcoll,ucc`"
++            )
+         try:
+             mpi_failed_ranks(mpi_comm())
+             mpi_comm().Is_revoked()
+diff --git a/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py b/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+index 146acf3838..f3c124a574 100644
+--- a/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
++++ b/tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+@@ -25,7 +25,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+ from tensorrt_llm._torch.utils import EventType
+ from tensorrt_llm._utils import is_mpi_peer_failure, peer_loss_recovery_enabled
+ from tensorrt_llm.executor.recovery.config import (failure_domains,
+-                                                     fault_tolerance_config)
++                                                   fault_tolerance_config)
+ from tensorrt_llm.logger import logger
+ from tensorrt_llm.mapping import Mapping
+ 
+@@ -1451,7 +1451,10 @@ class MoeLoadBalancer:
+     def placement_digest(dead_ranks: Iterable[int],
+                          placements: List[np.ndarray],
+                          copy_plan: Optional[np.ndarray] = None) -> str:
+-        """A digest of ``placements``, ``dead_ranks`` and ``copy_plan``: ranks that agree on it route and restore alike."""
++        """A digest of ``placements``, ``dead_ranks`` and ``copy_plan``.
++
++        Ranks that agree on it route and restore alike.
++        """
+         digest = hashlib.sha256(
+             np.asarray(sorted(set(dead_ranks)), dtype=np.int64).tobytes())
+         for placement in placements:
+diff --git a/tensorrt_llm/_torch/pyexecutor/hang_evidence.py b/tensorrt_llm/_torch/pyexecutor/hang_evidence.py
+index 0c9d8ea678..e745a87f70 100644
+--- a/tensorrt_llm/_torch/pyexecutor/hang_evidence.py
++++ b/tensorrt_llm/_torch/pyexecutor/hang_evidence.py
+@@ -26,9 +26,10 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
++from tensorrt_llm._torch.alltoall_watchdog import _COMPLETION_FLAG_MASK
+ from tensorrt_llm._torch.distributed.pmix_fence import PmixUnavailable, kill_rank
+-from tensorrt_llm._utils import prefer_pinned
+-from tensorrt_llm.executor.recovery.client import AUTHORITY_ENV, load_key
++from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, prefer_pinned
++from tensorrt_llm.executor.recovery.client import load_key
+ from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_GRACE_S, STALLED_EXIT_CODE
+ from tensorrt_llm.executor.recovery.protocol import (
+     DeviceWait,
+@@ -47,7 +48,6 @@ __all__ = [
+     "start_native_heartbeat",
+ ]
+ 
+-_FLAG_MASK = 0xFFFFFFFF
+ # How long stop() waits for the reporter thread, which may be blocked in a device or socket call.
+ _STOP_TIMEOUT_S = 10.0
+ 
+@@ -68,13 +68,13 @@ def lagging_peers(row: ProgressRow, active: Iterable[int], rank: int) -> set[int
+     round's value into the matching flag. Between steps every peer has finished
+     the last round, so a rank that is not waiting reports no laggard.
+     """
+-    current = row.flag_val & _FLAG_MASK
++    current = row.flag_val & _COMPLETION_FLAG_MASK
+     return {
+         peer
+         for peer in active
+         if peer != rank
+-        and row.dispatch_flags[peer] & _FLAG_MASK != current
+-        and row.combine_flags[peer] & _FLAG_MASK != current
++        and row.dispatch_flags[peer] & _COMPLETION_FLAG_MASK != current
++        and row.combine_flags[peer] & _COMPLETION_FLAG_MASK != current
+     }
+ 
+ 
+@@ -136,7 +136,7 @@ class ProgressRowReader:
+             return None
+         row = None
+         if self._pending:
+-            values = [int(v) & _FLAG_MASK for v in self._host.tolist()]
++            values = [int(v) & _COMPLETION_FLAG_MASK for v in self._host.tolist()]
+             n = self._ep_size
+             row = ProgressRow(values[0], tuple(values[1 : 1 + n]), tuple(values[1 + n :]))
+         with torch.cuda.stream(self._stream):
+@@ -155,7 +155,7 @@ def start_native_heartbeat(rank: int, interval_s: float):
+     Returns:
+         The running ``HeartbeatSender``: publish each finished step's iteration to it, and stop it.
+     """
+-    endpoint = os.environ[AUTHORITY_ENV]
++    endpoint = os.environ[FAULT_TOLERANCE_AUTHORITY_ENV]
+     if not endpoint.startswith("tcp://"):
+         return None
+     try:
+diff --git a/tensorrt_llm/_utils.py b/tensorrt_llm/_utils.py
+index 52ef8b0b22..125c4ccd77 100644
+--- a/tensorrt_llm/_utils.py
++++ b/tensorrt_llm/_utils.py
+@@ -610,15 +610,10 @@ def _peer_failure_error_classes() -> frozenset:
+     return frozenset(classes - generic - {None})
+ 
+ 
+-def is_mpi_peer_failure_class(error_class: int) -> bool:
+-    """Whether MPI *error_class* reports a failed peer or a revoked communicator."""
+-    return error_class in _peer_failure_error_classes()
+-
+-
+ def is_mpi_peer_failure(error: BaseException) -> bool:
+     """Whether *error* reports a failed MPI peer or a revoked communicator."""
+     return (isinstance(error, MPI.Exception)
+-            and is_mpi_peer_failure_class(error.Get_error_class()))
++            and error.Get_error_class() in _peer_failure_error_classes())
+ 
+ 
+ def mpi_world_ranks(group: "MPI.Group") -> tuple[int, ...]:
+diff --git a/tensorrt_llm/executor/recovery/authority.py b/tensorrt_llm/executor/recovery/authority.py
+index 3b9b452ff1..c49844df50 100644
+--- a/tensorrt_llm/executor/recovery/authority.py
++++ b/tensorrt_llm/executor/recovery/authority.py
+@@ -100,17 +100,11 @@ class RecoveryAuthority:
+     """State machine for recovering from the loss of admitted failure domains, one recovery after another.
+ 
+     A failure domain is a set of worker ranks lost together: a single rank or a whole node. A loss recovers only if
+-    every survivor reports the same failed set (every rank lost so far) and that set is a union of admitted domains;
+-    the survivors check that their slots still serve every expert without it. That agreement may rest on a failure
+-    detector's suspicion (a stopped process is alive), so with ``fence_departed`` rank 0 ends every failed rank the
+-    authority has not fenced itself through the MPI runtime before proposing; one that cannot be ended aborts.
+-
++    every survivor reports the same failed set (every rank lost so far) and that set is a union of admitted domains.
+     The authority performs no I/O: ``handle`` and ``expire`` return ``(routing_id, message)`` pairs to send. A
+     protocol violation during registration or a recovery, an unrecoverable loss, or a recovery that does not commit
+-    within ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts ``Abort``; a violation
+-    while serving, or an object that is not a message, is refused to its sender alone. A message no registered
+-    member can have sent on its route (an unregistered route, or another rank than the route's) is dropped, and so
+-    is a worker's message :meth:`receive` finds stale (a replay). Its attributes are read-only for callers.
++    within ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts ``Abort``. Its attributes
++    are read-only for callers.
+ 
+     Args:
+         world_size: Number of worker ranks that must register. Every worker must
+@@ -126,9 +120,9 @@ class RecoveryAuthority:
+             whose loss then recovers as any other. None relies on the workers alone.
+         config_digest: The ``FaultToleranceConfig.digest()`` every worker must register with
+             (default: that of the default settings).
+-        fence_departed: Have rank 0 end every failed rank before each proposal (the deployment always does,
+-            so no process of a failed rank runs on beside the survivors); False recovers without the MPI runtime's
+-            job control (protocol tests).
++        fence_departed: Have rank 0 end every failed rank the authority has not fenced itself through the MPI
++            runtime before each proposal, so no process of a failed rank runs on beside the survivors; a rank
++            that cannot be ended aborts.
+     """
+ 
+     def __init__(
+diff --git a/tensorrt_llm/executor/recovery/client.py b/tensorrt_llm/executor/recovery/client.py
+index 108ffea8ba..13d32075e9 100644
+--- a/tensorrt_llm/executor/recovery/client.py
++++ b/tensorrt_llm/executor/recovery/client.py
+@@ -21,7 +21,6 @@ from .config import fault_tolerance_config
+ from .protocol import MAX_MESSAGE_BYTES, Abort, Message, Register, Registered, Sent, is_message
+ 
+ __all__ = [
+-    "AUTHORITY_ENV",
+     "AUTHORITY_KEY_ENV",
+     "CONNECTION_OPTIONS",
+     "RecoveryAborted",
+@@ -33,7 +32,6 @@ __all__ = [
+     "unauthenticated",
+ ]
+ 
+-AUTHORITY_ENV = FAULT_TOLERANCE_AUTHORITY_ENV
+ AUTHORITY_KEY_ENV = "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY"
+ 
+ _MIN_KEY_BYTES = 16
+@@ -145,7 +143,7 @@ class RecoveryClient:
+         """Connect to the authority named by the environment; None when recovery is disabled."""
+         if not peer_loss_recovery_enabled():
+             return None
+-        return cls(os.environ[AUTHORITY_ENV], load_key(), rank)
++        return cls(os.environ[FAULT_TOLERANCE_AUTHORITY_ENV], load_key(), rank)
+ 
+     def register(
+         self, recoverable_domains: tuple[tuple[int, ...], ...], deadline: float
+diff --git a/tensorrt_llm/executor/recovery/hang_monitor.py b/tensorrt_llm/executor/recovery/hang_monitor.py
+index 25f3c7df84..27d25d4ca0 100644
+--- a/tensorrt_llm/executor/recovery/hang_monitor.py
++++ b/tensorrt_llm/executor/recovery/hang_monitor.py
+@@ -177,8 +177,8 @@ class HangMonitor:
+             f"{self.confirm_s:.0f}s, with no single rank to blame"
+         )
+ 
+-    def live_helpers(self, hung: int, now: float, count: int = 2) -> list[int]:
+-        """Up to ``count`` ranks, lowest first, that can act for the deployment.
++    def live_helpers(self, hung: int, now: float) -> list[int]:
++        """Up to two ranks, lowest first, that can act for the deployment.
+ 
+         Their heartbeats are fresh and no evidence points at them.
+         """
+@@ -186,7 +186,7 @@ class HangMonitor:
+             rank
+             for rank, evidence in sorted(self._evidence.items())
+             if rank != hung and rank not in self._suspected_since and self._fresh(evidence, now)
+-        ][:count]
++        ][:2]
+ 
+     def _fresh(self, evidence: _RankEvidence, now: float) -> bool:
+         return now - evidence.heartbeat <= self.heartbeat_timeout_s
+diff --git a/tensorrt_llm/executor/recovery/protocol.py b/tensorrt_llm/executor/recovery/protocol.py
+index ed183c7514..c33fbd69e9 100644
+--- a/tensorrt_llm/executor/recovery/protocol.py
++++ b/tensorrt_llm/executor/recovery/protocol.py
+@@ -39,7 +39,6 @@ __all__ = [
+     "Stopped",
+     "datagram_address",
+     "decode_datagram",
+-    "encode_datagram",
+     "is_message",
+ ]
+ 
+@@ -283,14 +282,6 @@ def _datagram_tag(key: bytes, payload: bytes) -> bytes:
+     return hmac.new(key, b"\x00" + payload, hashlib.sha256).digest()
+ 
+ 
+-def encode_datagram(message: Message, key: bytes) -> bytes:
+-    """Serialize ``message`` into one datagram: the JSON payload, then its HMAC tag."""
+-    body = dataclasses.asdict(message)
+-    body["type"] = type(message).__name__
+-    payload = json.dumps(body, sort_keys=True).encode()
+-    return payload + _datagram_tag(key, payload)
+-
+-
+ def decode_datagram(datagram: bytes, key: bytes) -> NativeHeartbeat | None:
+     """The native heartbeat in ``datagram``, or None if it does not authenticate or is not one."""
+     payload, tag = datagram[:-_TAG_BYTES], datagram[-_TAG_BYTES:]
+diff --git a/tensorrt_llm/llmapi/mpi_session.py b/tensorrt_llm/llmapi/mpi_session.py
+index 31ba162660..934449bd1d 100644
+--- a/tensorrt_llm/llmapi/mpi_session.py
++++ b/tensorrt_llm/llmapi/mpi_session.py
+@@ -202,14 +202,14 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
+     _exit(status)
+ 
+ 
+-def exit_fault_tolerant_process(status: int = 0) -> None:
++def exit_fault_tolerant_process() -> None:
+     """End this process through a bounded MPI_Finalize under peer-loss recovery.
+ 
+-    With recovery enabled, exits with *status* (see ``_finalize_and_exit``);
++    With recovery enabled, exits with status 0 (see ``_finalize_and_exit``);
+     otherwise returns.
+     """
+     if ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled():
+-        _finalize_and_exit(status, "process end")
++        _finalize_and_exit(0, "process end")
+ 
+ 
+ # Set by ``run_worker_rank`` under peer-loss recovery (see ``_exit``).
+diff --git a/tensorrt_llm/serve/fault_tolerance_status.py b/tensorrt_llm/serve/fault_tolerance_status.py
+index b345214453..c4df8faa37 100644
+--- a/tensorrt_llm/serve/fault_tolerance_status.py
++++ b/tensorrt_llm/serve/fault_tolerance_status.py
+@@ -15,9 +15,9 @@ from typing import Optional
+ 
+ import zmq
+ 
+-from tensorrt_llm._utils import peer_loss_recovery_enabled
++from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
+ from tensorrt_llm.executor.ipc import ZeroMqQueue
+-from tensorrt_llm.executor.recovery.client import AUTHORITY_ENV, load_key, unauthenticated
++from tensorrt_llm.executor.recovery.client import load_key, unauthenticated
+ from tensorrt_llm.executor.recovery.protocol import MAX_MESSAGE_BYTES, Status, StatusQuery
+ 
+ __all__ = ["SERVING_STATES", "RecoveryStatusProbe", "health_state", "status_body"]
+@@ -108,7 +108,7 @@ class RecoveryStatusProbe:
+         """A probe for the authority named by the environment; None when recovery is disabled."""
+         if not peer_loss_recovery_enabled():
+             return None
+-        return cls(os.environ[AUTHORITY_ENV], load_key())
++        return cls(os.environ[FAULT_TOLERANCE_AUTHORITY_ENV], load_key())
+ 
+     def status(self) -> Optional[Status]:
+         """The authority's status, at most ``max_age_s`` old; None if it did not answer."""
+diff --git a/tests/unittest/_torch/distributed/test_mpi_survivors.py b/tests/unittest/_torch/distributed/test_mpi_survivors.py
+index 148b123a9e..101826d78a 100644
+--- a/tests/unittest/_torch/distributed/test_mpi_survivors.py
++++ b/tests/unittest/_torch/distributed/test_mpi_survivors.py
+@@ -584,7 +584,11 @@ def test_peer_failures_stay_mpi_errors_without_recovery(world):
+ 
+ @pytest.mark.parametrize(
+     "variable, value",
+-    [("OMPI_MCA_coll", "^hcoll,ucc"), ("OMPI_MCA_coll", "tuned,basic"), ("OMPI_MCA_coll_hcoll_enable", "0")],
++    [
++        ("OMPI_MCA_coll", "^hcoll,ucc"),
++        ("OMPI_MCA_coll", "tuned,basic"),
++        ("OMPI_MCA_coll_hcoll_enable", "0"),
++    ],
+ )
+ def test_recovery_requires_hcoll_off(variable, value, world, fake_mpi, monkeypatch):
+     monkeypatch.delenv("OMPI_MCA_coll", raising=False)
+diff --git a/tests/unittest/_torch/moe/multi_gpu/_mnnvl_recovery_utils.py b/tests/unittest/_torch/moe/multi_gpu/_mnnvl_recovery_utils.py
+new file mode 100644
+index 0000000000..f246e2938d
+--- /dev/null
++++ b/tests/unittest/_torch/moe/multi_gpu/_mnnvl_recovery_utils.py
+@@ -0,0 +1,55 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Helpers of the MNNVL MoE All-to-All tests that run one process per GPU over a TCPStore."""
++
++import pickle
++from typing import Any
++
++import torch
++from torch.distributed import TCPStore
++
++from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
++from tensorrt_llm.bindings import internal
++
++
++class StoreComm:
++    """The communicator subset MnnvlMemory uses, over a TCPStore."""
++
++    def __init__(self, store: TCPStore, rank: int, size: int) -> None:
++        self.store, self.rank, self.size, self.calls = store, rank, size, 0
++
++    def Get_rank(self) -> int:
++        return self.rank
++
++    def Get_size(self) -> int:
++        return self.size
++
++    def exchange(self, value: Any, live: list[int]) -> list[Any]:
++        """``value`` of every rank in ``live`` by rank, None for the others. Collective over ``live``."""
++        self.calls += 1
++        self.store.set(f"gather/{self.calls}/{self.rank}", pickle.dumps(value))
++        return [
++            pickle.loads(self.store.get(f"gather/{self.calls}/{r}")) if r in live else None
++            for r in range(self.size)
++        ]
++
++    def allgather(self, value: Any) -> list[Any]:
++        return self.exchange(value, list(range(self.size)))
++
++    def barrier(self) -> None:
++        self.allgather(None)
++
++
++def workspace_offset(meta: torch.Tensor, name: str) -> int:
++    """The offset of region ``name`` (``MOE_A2A_<name>_OFFSET_INDEX``) in a workspace row of layout ``meta``."""
++    return int(meta[int(getattr(internal.thop, f"MOE_A2A_{name}_OFFSET_INDEX"))])
++
++
++def mnnvl_skip_reason(ep_size: int) -> str | None:
++    """Why a test of ``ep_size`` processes cannot run here, or None."""
++    if torch.cuda.device_count() < ep_size:
++        return f"Requires {ep_size} local GPUs"
++    MnnvlMemory.initialize()
++    if not MnnvlMemory.supports_mnnvl():
++        return "Requires an NVLink fabric supported by MNNVL"
++    return None
+diff --git a/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py b/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
+index 65580d5a9b..69ed611102 100644
+--- a/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
++++ b/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
+@@ -17,7 +17,6 @@ rows.
+ 
+ import itertools
+ import os
+-import pickle
+ import subprocess
+ import sys
+ import time
+@@ -27,6 +26,7 @@ from typing import Any
+ 
+ import pytest
+ import torch
++from _mnnvl_recovery_utils import StoreComm, mnnvl_skip_reason, workspace_offset
+ from torch.distributed import TCPStore
+ 
+ import tensorrt_llm  # noqa: F401
+@@ -47,33 +47,6 @@ _POLL_S, _CONTROL_DEADLINE_S = 0.05, 10.0
+ _TIMEOUT = timedelta(seconds=300)
+ 
+ 
+-class _StoreComm:
+-    """The communicator subset MnnvlMemory uses, over a TCPStore."""
+-
+-    def __init__(self, store: TCPStore, rank: int) -> None:
+-        self.store, self.rank, self.calls = store, rank, 0
+-
+-    def Get_rank(self) -> int:
+-        return self.rank
+-
+-    def Get_size(self) -> int:
+-        return _EP_SIZE
+-
+-    def allgather(self, value: Any) -> list[Any]:
+-        self.calls += 1
+-        self.store.set(f"allgather/{self.calls}/{self.rank}", pickle.dumps(value))
+-        return [
+-            pickle.loads(self.store.get(f"allgather/{self.calls}/{r}")) for r in range(_EP_SIZE)
+-        ]
+-
+-    def barrier(self) -> None:
+-        self.allgather(None)
+-
+-
+-def _offset(meta: torch.Tensor, name: str) -> int:
+-    return int(meta[int(getattr(internal.thop, f"MOE_A2A_{name}_OFFSET_INDEX"))])
+-
+-
+ def _rows(source: int) -> torch.Tensor:
+     """[_CAPACITY, _HIDDEN] bf16 rows, each distinct: columns 0-2 encode the token and the source, exactly in
+     bf16 (integers up to 256), so a misplaced or mixed-up row reads as wrong values."""
+@@ -174,12 +147,12 @@ def _survivor(
+     # moeA2ADispatchOp returns each payload's receive buffer as [ep_size, runtime tokens, ...] from
+     # DISPATCH_PAYLOAD_OFFSET: source s's rows are [s, :] (moeA2ADispatchKernel writes source s's token at row
+     # s * max_tokens_per_rank + target_index).
+-    assert offset == _offset(meta, "COMBINE_INPUT")
++    assert offset == workspace_offset(meta, "COMBINE_INPUT")
+     assert [tuple(r.shape) for r in received] == [
+         (_EP_SIZE, _CAPACITY, _HIDDEN),
+         (_EP_SIZE, _CAPACITY, 1),
+     ]
+-    assert received[0].data_ptr() == row.data_ptr() + _offset(meta, "DISPATCH_PAYLOAD")
++    assert received[0].data_ptr() == row.data_ptr() + workspace_offset(meta, "DISPATCH_PAYLOAD")
+ 
+     torch.cuda.synchronize()
+     store.set("go", "1")
+@@ -270,7 +243,7 @@ def _worker(rank: int, port: int, mode: str) -> None:
+     torch.cuda.set_device(rank)
+     mapping = Mapping(_EP_SIZE, rank, _EP_SIZE, tp_size=_EP_SIZE, moe_ep_size=_EP_SIZE)
+     MnnvlMemory.initialize()
+-    comm = _StoreComm(store, rank)
++    comm = StoreComm(store, rank, _EP_SIZE)
+     MnnvlMemory.comm = comm
+     MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
+     meta = NVLinkOneSided._make_workspace_layout(
+@@ -287,15 +260,6 @@ def _worker(rank: int, port: int, mode: str) -> None:
+         _victim(store, workspace, meta)
+ 
+ 
+-def _mnnvl_skip_reason() -> str | None:
+-    if torch.cuda.device_count() < _EP_SIZE:
+-        return f"Requires {_EP_SIZE} local GPUs"
+-    MnnvlMemory.initialize()
+-    if not MnnvlMemory.supports_mnnvl():
+-        return "Requires an NVLink fabric supported by MNNVL"
+-    return None
+-
+-
+ @pytest.mark.parametrize(
+     "mode, kill_delay_s",
+     [
+@@ -312,7 +276,7 @@ def test_lost_peer_late_writes_land_only_on_orphaned_pages(
+     """After the remap the survivor's results stay exact and none of its bytes change, whether the victim was
+     killed mid-dispatch (``killed``) or keeps writing to the end (``writing``); ``no-remap`` is the negative
+     control, whose victim writes must reach the survivor's live rows."""
+-    reason = _mnnvl_skip_reason()
++    reason = mnnvl_skip_reason(_EP_SIZE)
+     if reason:
+         pytest.skip(reason)
+     store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, timeout=_TIMEOUT)
+diff --git a/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py b/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py
+index 8a18619e25..f4da9601cb 100644
+--- a/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py
++++ b/tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_recovery.py
+@@ -24,7 +24,6 @@ MoeExecutionState; dispatch and combine are the fence ops.
+ 
+ import itertools
+ import os
+-import pickle
+ import subprocess
+ import sys
+ import time
+@@ -34,6 +33,7 @@ from typing import Any
+ 
+ import pytest
+ import torch
++from _mnnvl_recovery_utils import StoreComm, mnnvl_skip_reason, workspace_offset
+ from torch.distributed import TCPStore
+ 
+ import tensorrt_llm  # noqa: F401
+@@ -65,38 +65,10 @@ _KERNEL_TIMEOUT_S = 60
+ _TIMEOUT = timedelta(seconds=300)
+ 
+ 
+-class _StoreComm:
+-    """The communicator subset MnnvlMemory uses, over a TCPStore."""
+-
+-    def __init__(self, store: TCPStore, rank: int) -> None:
+-        self.store, self.rank, self.calls = store, rank, 0
+-
+-    def Get_rank(self) -> int:
+-        return self.rank
+-
+-    def Get_size(self) -> int:
+-        return _EP_SIZE
+-
+-    def exchange(self, value: Any, live: list[int]) -> list[Any]:
+-        """``value`` of every rank in ``live`` by rank, None for the others. Collective over ``live``."""
+-        self.calls += 1
+-        self.store.set(f"gather/{self.calls}/{self.rank}", pickle.dumps(value))
+-        return [
+-            pickle.loads(self.store.get(f"gather/{self.calls}/{r}")) if r in live else None
+-            for r in range(_EP_SIZE)
+-        ]
+-
+-    def allgather(self, value: Any) -> list[Any]:
+-        return self.exchange(value, _EVERYONE)
+-
+-    def barrier(self) -> None:
+-        self.exchange(None, _EVERYONE)
+-
+-
+ class _Survivors:
+     """The survivor collectives of Distributed after shrink(), over the TCPStore."""
+ 
+-    def __init__(self, comm: _StoreComm, live: list[int]) -> None:
++    def __init__(self, comm: StoreComm, live: list[int]) -> None:
+         self.comm, self.live = comm, live
+ 
+     def allgather_among_survivors(self, obj: Any) -> list[Any]:
+@@ -107,10 +79,6 @@ class _Survivors:
+         self.comm.exchange(None, self.live)
+ 
+ 
+-def _offset(meta: torch.Tensor, name: str) -> int:
+-    return int(meta[int(getattr(internal.thop, f"MOE_A2A_{name}_OFFSET_INDEX"))])
+-
+-
+ def _tokens(seed: int, source: int, live: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+     """Source's [_CAPACITY, _HIDDEN] bf16 rows and [_CAPACITY, 1] target ranks, on the host; every rank rebuilds
+     every source's. Columns 0-3 encode the token, the source and the seed exactly in bf16 (integers below 128,
+@@ -161,7 +129,7 @@ def _await(
+ def _reset_row(ctx: "_Rank") -> torch.Tensor:
+     """A workspace row as moe_a2a_initialize leaves it: zeros, with both parities' receive counters at -1."""
+     reset = torch.zeros(ctx.size, dtype=torch.uint8)
+-    recv = _offset(ctx.meta, "RECV_COUNTERS")
++    recv = workspace_offset(ctx.meta, "RECV_COUNTERS")
+     reset[recv : recv + 2 * _EP_SIZE * 4] = 0xFF
+     return reset
+ 
+@@ -180,7 +148,7 @@ class _Rank:
+         torch.cuda.set_device(rank)
+         mapping = Mapping(_EP_SIZE, rank, _EP_SIZE, tp_size=_EP_SIZE, moe_ep_size=_EP_SIZE)
+         MnnvlMemory.initialize()
+-        self.comm = MnnvlMemory.comm = _StoreComm(store, rank)
++        self.comm = MnnvlMemory.comm = StoreComm(store, rank, _EP_SIZE)
+         MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
+         self.meta = NVLinkOneSided._make_workspace_layout(
+             _EP_SIZE, 1, _CAPACITY, _HIDDEN, torch.bfloat16, None, 0, False, False
+@@ -274,7 +242,7 @@ class _Rank:
+ 
+     def round_flags(self) -> list[int]:
+         """This rank's round counter and released-round word: flag_val[0] and flag_val[1]."""
+-        offset = _offset(self.meta, "FLAG_VAL")
++        offset = workspace_offset(self.meta, "FLAG_VAL")
+         return self.workspace[self.rank, offset : offset + 8].view(torch.int32).tolist()
+ 
+ 
+@@ -616,15 +584,6 @@ def _worker(test: str, rank: int, port: int, mode: str) -> None:
+ # ---- launcher ----
+ 
+ 
+-def _mnnvl_skip_reason() -> str | None:
+-    if torch.cuda.device_count() < _EP_SIZE:
+-        return f"Requires {_EP_SIZE} local GPUs"
+-    MnnvlMemory.initialize()
+-    if not MnnvlMemory.supports_mnnvl():
+-        return "Requires an NVLink fabric supported by MNNVL"
+-    return None
+-
+-
+ def _launch(test: str, mode: str) -> tuple[TCPStore, list[subprocess.Popen]]:
+     store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, timeout=_TIMEOUT)
+     # Keep the workers off any enclosing launcher's process-management interface: one may be killed.
+@@ -665,7 +624,7 @@ def test_remap_orphans_late_writer(mode: str) -> None:
+     among themselves. Their rows then hold exactly the reset state for _WRITE_S, their masked round trips are
+     exact, and the released pages stay allocated while rank 2 lives (``stop``) and are freed once it is
+     SIGKILLed (``kill``)."""
+-    reason = _mnnvl_skip_reason()
++    reason = mnnvl_skip_reason(_EP_SIZE)
+     if reason:
+         pytest.skip(reason)
+     store, workers = _launch("remap", mode)
+@@ -693,7 +652,7 @@ def test_second_loss_orphans_importer_of_remapped_pages() -> None:
+     writing a pattern into rows 0 and 1, which their polls see; ranks 0 and 1 remap without ranks 2 and 3. Their
+     rows then hold exactly the reset state, polled over _WRITE_S of rank 2's writes, and their masked round trips
+     are exact."""
+-    reason = _mnnvl_skip_reason()
++    reason = mnnvl_skip_reason(_EP_SIZE)
+     if reason:
+         pytest.skip(reason)
+     _store, workers = _launch("replan", "")  # the store serves the workers until they exit
+@@ -708,7 +667,7 @@ def test_aborted_round_with_runahead_rank(mode: str) -> None:
+     """``runahead``: rank 1, released by an abort, runs _AHEAD_ROUNDS rounds; its peers' next round waits, returns
+     aborted on request without trapping, and after a rearm every round trip is exact. ``graph-mask``: a graph
+     captured with every rank replays exactly among ranks 0-2 after they install a mask without rank 3."""
+-    reason = _mnnvl_skip_reason()
++    reason = mnnvl_skip_reason(_EP_SIZE)
+     if reason:
+         pytest.skip(reason)
+     _store, workers = _launch("runahead", mode)  # the store serves the workers until they exit
+diff --git a/tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py b/tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py
+index a4aa01c058..3d2b48976f 100644
+--- a/tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py
++++ b/tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py
+@@ -11,17 +11,16 @@ workspace.
+ """
+ 
+ import os
+-import pickle
+ import subprocess
+ import sys
+ import time
+ from datetime import timedelta
+-from typing import Any
+ from unittest.mock import Mock
+ 
+ import numpy as np
+ import pytest
+ import torch
++from _mnnvl_recovery_utils import StoreComm, mnnvl_skip_reason
+ from torch.distributed import TCPStore
+ 
+ import tensorrt_llm  # noqa: F401
+@@ -51,27 +50,12 @@ _TOKENS, _HIDDEN = 128, 7168
+ _TIMEOUT = timedelta(seconds=300)
+ 
+ 
+-class _StoreComm:
+-    """The communicator subset MnnvlMemory uses, and a barrier of the survivors, over a TCPStore."""
++class _StoreComm(StoreComm):
++    """``StoreComm`` with a barrier of the survivors."""
+ 
+     def __init__(self, store: TCPStore, rank: int) -> None:
+-        self.store, self.rank, self.calls, self.survivor_calls = store, rank, 0, 0
+-
+-    def Get_rank(self) -> int:
+-        return self.rank
+-
+-    def Get_size(self) -> int:
+-        return _EP_SIZE
+-
+-    def allgather(self, value: Any) -> list[Any]:
+-        self.calls += 1
+-        self.store.set(f"allgather/{self.calls}/{self.rank}", pickle.dumps(value))
+-        return [
+-            pickle.loads(self.store.get(f"allgather/{self.calls}/{r}")) for r in range(_EP_SIZE)
+-        ]
+-
+-    def barrier(self) -> None:
+-        self.allgather(None)
++        super().__init__(store, rank, _EP_SIZE)
++        self.survivor_calls = 0
+ 
+     def survivor_barrier(self) -> None:
+         self.survivor_calls += 1
+@@ -157,17 +141,8 @@ def _worker(rank: int, port: int) -> None:
+     comm.barrier()
+ 
+ 
+-def _mnnvl_skip_reason() -> str | None:
+-    if torch.cuda.device_count() < _EP_SIZE:
+-        return f"Requires {_EP_SIZE} local GPUs"
+-    MnnvlMemory.initialize()
+-    if not MnnvlMemory.supports_mnnvl():
+-        return "Requires an NVLink fabric supported by MNNVL"
+-    return None
+-
+-
+ def test_ring_restore_stages_through_peer_workspaces_bit_exactly() -> None:
+-    reason = _mnnvl_skip_reason()
++    reason = mnnvl_skip_reason(_EP_SIZE)
+     if reason:
+         pytest.skip(reason)
+     store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, timeout=_TIMEOUT)
+diff --git a/tests/unittest/_torch/test_mnnvl_memory_remap.py b/tests/unittest/_torch/test_mnnvl_memory_remap.py
+index 69792ba65d..cd533bb903 100644
+--- a/tests/unittest/_torch/test_mnnvl_memory_remap.py
++++ b/tests/unittest/_torch/test_mnnvl_memory_remap.py
+@@ -1,17 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-# http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+ """MnnvlMemory.release_backing/remap against a fake CUDA driver: same addresses, live rows only."""
+ 
+ import itertools
+@@ -242,7 +230,9 @@ def test_a_peer_lost_during_the_outcome_exchange_leaves_the_allocation_unmapped(
+     assert memory.mapped
+ 
+ 
+-def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_exchange(monkeypatch):
++def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_exchange(
++    monkeypatch,
++):
+     """The exchange that failed could not report an outcome either: the loss reaches the recovery at once."""
+     memory, driver = _memory(monkeypatch)
+     memory.release_backing()
+diff --git a/tests/unittest/executor/test_recovery_config.py b/tests/unittest/executor/test_recovery_config.py
+index 721a764548..2e9157d022 100644
+--- a/tests/unittest/executor/test_recovery_config.py
++++ b/tests/unittest/executor/test_recovery_config.py
+@@ -5,11 +5,7 @@
+ import pytest
+ 
+ from tensorrt_llm.executor.recovery import config as config_module
+-from tensorrt_llm.executor.recovery.config import (
+-    CONFIG_ENV,
+-    FaultToleranceConfig,
+-    failure_domains,
+-)
++from tensorrt_llm.executor.recovery.config import CONFIG_ENV, FaultToleranceConfig, failure_domains
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+diff --git a/tests/unittest/executor/test_recovery_hang_monitor.py b/tests/unittest/executor/test_recovery_hang_monitor.py
+index 70b3425a48..c4dd4641db 100644
+--- a/tests/unittest/executor/test_recovery_hang_monitor.py
++++ b/tests/unittest/executor/test_recovery_hang_monitor.py
+@@ -2,8 +2,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Hang and stall confirmation from worker heartbeats and device waits, and the authority acting on it."""
+ 
++import dataclasses
+ import hashlib
+ import hmac
++import json
+ import os
+ import pickle  # nosec B403
+ import socket
+@@ -41,6 +43,14 @@ CONFIRM, HB_TIMEOUT = 10.0, 3.0
+ KEY = b"k" * 32
+ 
+ 
++def _encode_datagram(message, key: bytes) -> bytes:
++    """The reference datagram encoder: the JSON payload, then HMAC-SHA256 over a zero byte and it."""
++    body = dataclasses.asdict(message)
++    body["type"] = type(message).__name__
++    payload = json.dumps(body, sort_keys=True).encode()
++    return payload + hmac.new(key, b"\x00" + payload, hashlib.sha256).digest()
++
++
+ def _monitor() -> HangMonitor:
+     return HangMonitor(RANKS, confirm_s=CONFIRM, heartbeat_timeout_s=HB_TIMEOUT)
+ 
+@@ -416,7 +426,9 @@ def test_command_fence_never_passes_the_hmac_key(monkeypatch):
+         "Popen",
+         lambda command, **kwargs: envs.append(kwargs.get("env")) or Mock(wait=lambda: 0),
+     )
+-    authority_module.command_fence("ssh {host} kill -KILL {pid}")(HungRank(2, "hung", "node-7", 4242))
++    authority_module.command_fence("ssh {host} kill -KILL {pid}")(
++        HungRank(2, "hung", "node-7", 4242)
++    )
+     (env,) = envs
+     assert env is not None and "TLLM_FAULT_TOLERANCE_AUTHORITY_KEY" not in env
+     assert env["PATH"] == os.environ["PATH"]
+@@ -532,11 +544,9 @@ def _drain(authority, receiver, now):
+ 
+ def _send_forgeries(sender, now):
+     """Datagrams reporting progress that must not count: a replay, another process, another key."""
+-    sender.send(protocol.encode_datagram(NativeHeartbeat(2, 102, 1, 99 + now), KEY))
+-    sender.send(protocol.encode_datagram(NativeHeartbeat(2, 7, 10_000 + now, 99 + now), KEY))
+-    sender.send(
+-        protocol.encode_datagram(NativeHeartbeat(2, 102, 10_000 + now, 99 + now), b"x" * 32)
+-    )
++    sender.send(_encode_datagram(NativeHeartbeat(2, 102, 1, 99 + now), KEY))
++    sender.send(_encode_datagram(NativeHeartbeat(2, 7, 10_000 + now, 99 + now), KEY))
++    sender.send(_encode_datagram(NativeHeartbeat(2, 102, 10_000 + now, 99 + now), b"x" * 32))
+ 
+ 
+ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced():
+@@ -551,7 +561,7 @@ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced(
+                 route = f"evidence-{rank}".encode()
+                 authority.handle(route, Heartbeat(rank, 0, True, "node", 100 + rank), float(now))
+             # A step every 5 s, within the window.
+-            sender.send(protocol.encode_datagram(NativeHeartbeat(2, 102, now, now // 5), KEY))
++            sender.send(_encode_datagram(NativeHeartbeat(2, 102, now, now // 5), KEY))
+             assert _drain(authority, receiver, float(now)) == []
+             assert authority.expire(float(now)) == [], now
+         # Its native heartbeat stops reporting steps after one at 60 s: every peer waits on it, so it is fenced
+@@ -561,7 +571,7 @@ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced(
+             for rank in PEERS:
+                 route = f"evidence-{rank}".encode()
+                 authority.handle(route, Heartbeat(rank, 0, True, "node", 100 + rank), float(now))
+-            sender.send(protocol.encode_datagram(NativeHeartbeat(2, 102, now, 12), KEY))
++            sender.send(_encode_datagram(NativeHeartbeat(2, 102, now, 12), KEY))
+             _send_forgeries(sender, now)
+             _drain(authority, receiver, float(now))
+             if outbound := authority.expire(float(now)):
+@@ -603,7 +613,7 @@ def test_the_native_heartbeat_wire_format():
+     payload = b'{"beat": 3, "iteration": 41, "pid": 4321, "rank": 2, "type": "NativeHeartbeat"}'
+     tag = hmac.new(KEY, b"\x00" + payload, hashlib.sha256).digest()
+     assert protocol.decode_datagram(payload + tag, KEY) == NativeHeartbeat(2, 4321, 3, 41)
+-    assert protocol.encode_datagram(NativeHeartbeat(2, 4321, 3, 41), KEY) == payload + tag
++    assert _encode_datagram(NativeHeartbeat(2, 4321, 3, 41), KEY) == payload + tag
+     assert protocol.decode_datagram(payload + tag, b"y" * 32) is None
+     assert protocol.decode_datagram(tag, KEY) is None
+     # A connection's message (a pickle, then its HMAC-SHA256 tag) does not authenticate as a datagram, nor a
+@@ -612,7 +622,7 @@ def test_the_native_heartbeat_wire_format():
+     signed = data + hmac.new(KEY, data, hashlib.sha256).digest()
+     assert protocol.decode_datagram(signed, KEY) is None
+     assert hmac.new(KEY, payload, hashlib.sha256).digest() != tag
+-    other = protocol.encode_datagram(Heartbeat(2, 1, False, "node", 4321), KEY)
++    other = _encode_datagram(Heartbeat(2, 1, False, "node", 4321), KEY)
+     assert protocol.decode_datagram(other, KEY) is None
+     assert protocol.datagram_address("tcp://10.1.2.3:5555") == ("10.1.2.3", 5555)
+     assert protocol.datagram_address("tcp://*:5555") == ("0.0.0.0", 5555)
+diff --git a/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py b/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py
+index 461f0de16d..3401b46214 100644
+--- a/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py
++++ b/tests/unittest/llmapi/test_trtllm_llmapi_launch_exit.py
+@@ -1,18 +1,5 @@
+-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+-# All rights reserved.
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-# http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+ """Tests for how trtllm-llmapi-launch runs and ends its MGMN worker."""
+ 
+ import os
+@@ -96,7 +83,9 @@ def test_recovery_execs_the_worker_holding_the_workspace_lock(status, tmp_path):
+ 
+ 
+ def test_recovery_keeps_the_users_transport_choice(tmp_path):
+-    *_, transport = _launch_worker(tmp_path, True, OMPI_MCA_btl="self,sm,tcp", OMPI_MCA_coll="^hcoll")
++    *_, transport = _launch_worker(
++        tmp_path, True, OMPI_MCA_btl="self,sm,tcp", OMPI_MCA_coll="^hcoll"
++    )
+     assert transport == ("ob1", "self,sm,tcp", "^hcoll")
+ 
+ 

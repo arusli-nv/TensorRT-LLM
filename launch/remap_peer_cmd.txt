@@ -1,0 +1,68 @@
+# REMAP-PEER (16 nodes, two 8-node groups = one DEP32 server each, segment 8). DIAGNOSTIC ONLY, not a product claim:
+# every timing in this job runs with extra logging (overlays/remap-peer-0fb4b69496 = remap-timer 943a1e7841 (v5-final
+# 27442bd91d + the remap phase timer) + per-peer import_map timer, branch remap-peer 0fb4b69496, on
+# build-freeze-58caa0fde6); it may enter CLAIMS as a DIAGNOSTIC row and the doc as a labelled explanation of the remap
+# two-speed. It never replaces a v5-final recovery number, since this is an instrumented overlay.
+# Purpose: REMAP-TIMER 8308514 (review/diag/remap_timer_8308514.md) put the slow remap in import_map (~810-833 ms slow
+# arms vs ~319-332 ms online); review/diag/import_map_slow.md: a node-level blocking event (victim teardown) vs every
+# call slower is open. This job tells them apart. Besides REMAP-TIMER's "Remap phases ms" line, one more INFO line per
+# remap per rank, right after it:
+#   "Remap peers: t0=<wall s> t1=<wall s> loops=N slow=[(peer,import_ms,map_ms,access_ms,start_offset_ms) x top 5 by
+#    import+map+access] sum_import=.. sum_map=.. sum_access=.. median_import=.. median_map=.. median_access=..
+#    median_peer_ms=.. max_peer_ms=.."
+#   Host perf_counter per call (cuMemImportFromShareableHandle / cuMemMap / cuMemSetAccess, per live row, own row
+#   included with no import); t0/t1 and start offsets are time.time() wall clock (node clocks, NTP-synced).
+# Rule (written before any REMAP-PEER data):
+# Per slow-arm remap: if one peer's import/map/set-access (summed) holds ~>= 0.4 s and the per-rank stalls end at about the same wall time (within ~50 ms) on every rank, the slow remap is a one-off teardown-type stall; if instead the per-call median times are >= ~2x online's with no single dominant peer, it is layout/state (every call slower). Otherwise: report the breakdown, no conclusion.
+#   (stall end = t0 + start_offset_ms + the peer's summed ms of the top slow entry.)
+# Observation arm, outside the rule: G8's last case is no EPLB rank5 x1 (victim 5) with the harness's existing
+# TLLM_TEST_DELAY_ABORT_S=3 (testhooks.py, DR-H2 hook: every survivor delays its reaction to the loss, i.e. the abort,
+# the watch's revoke and the recovery, by 3 s after first noticing it), so the remap starts ~3 s later after the kill.
+# If a teardown-type stall is behind the slow remap, this arm's import_map should look like online's; reported as an
+# observation only (the delay also holds the step's kernels 3 s; H23 resume_s <= 10 s still applies).
+# Readout: grep -h 'Remap phases ms\|Remap peers\|Remapped' $R/mvp/runs/KILL-FINAL-{OFF,OFF-A,OFF-B,ON}-<job>/rank5-*/rank-*.log
+# Arms (rank kills, KILL-FINAL knobs/victims of V5F-REC / V5F-REC-OFF / THIN-CELLS / REMAP-TIMER):
+#   G0: no EPLB (std-noeplb-ft.yaml) rank5 x2 (victims 5, 22), then offline EPLB (std-offline-ft-filled.yaml) rank5 x1
+#   G8: online (std-online.yaml) rank5 x2 (victims 13, 29), then no EPLB rank5 x1 delayed 3 s (KILL-FINAL-OFF-A, victim 5)
+# Time (measured case minutes, logs/bundle/{8269102,8285728,8283311}-*.log; a run_job's first case is cold):
+#   G0: noeplb rank5 13.3-13.9 cold + 10.2-10.4, offline rank5 14.6 cold = ~39 min
+#   G8: online rank5 16.8 cold + 13.2, noeplb rank5 13.9 cold = ~44 min. + ~4 min startup = ~48 min; --time 01:05,
+#   group limit 3600 s.
+# Mounts: claude dir rw + /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/common ro.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+grep -q "^$(hostname -s) " $R/mvp/EXCLUDE_NODES.txt && { echo "EXCLUDED_NODE $(hostname -s)"; exit 1; }
+bash $R/tools/check_excluded_nodes.sh || exit 1  # every allocated node, not just the batch host; no requeue rerun
+B=build-freeze-58caa0fde6
+FIX_OVERLAY=$R/overlays/remap-peer-0fb4b69496
+O="MVP_OVERLAY=$FIX_OVERLAY COST_DIAG_OVERLAY=1 KF_ALLOW_OVERLAY=1"
+# Import smoke of the overlay on the wheel in this container (py_compile alone is not enough): every node, before any
+# case; a failure ends the job here.
+if [[ -z ${WIDEEP_DRY_RUN:-} ]]; then
+    bash $R/tools/import_smoke.sh $R/$B/dist $FIX_OVERLAY > /tmp/import-smoke.log 2>&1; grep -q IMPORT_SMOKE_OK /tmp/import-smoke.log \
+        || { echo "IMPORT_SMOKE_FAIL node ${SLURM_NODEID:-0}"; tail -30 /tmp/import-smoke.log; exit 1; }
+    echo "IMPORT_SMOKE_OK node ${SLURM_NODEID:-0}"
+fi
+SMOKE=${SMOKE:-0}
+if [[ $SMOKE == 1 ]]; then
+    KI=4 KSTOP=4
+else
+    KI=4 KSTOP=8
+fi
+HD="TLLM_FAULT_TOLERANCE_HANG_DETECTION=1 TLLM_FAULT_TOLERANCE_HANG_CONFIRM_S=30"
+M="--mca btl_tcp_if_include eth0 --mca coll ^hcoll,ucc"
+K="$O MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_MPI_MCA='$M' $HD WIDEEP_FAILURE_DOMAIN=node KF_ITERATIONS=$KI WIDEEP_POLLUTION_CHECKS=1 KF_GRAPH_SIZES=136,148 WIDEEP_KILL_IN_DECODE_STEADY=1 KF_STOP_ITERATIONS=$KSTOP WIDEEP_DSTATE_SAMPLER=1 WIDEEP_DSTATE_SAMPLER_S=2"
+KNO="$K KF_BENCH_CONFIG=std-noeplb-ft.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+KON="$K KF_BENCH_CONFIG=std-online.yaml KF_VICTIM_RANKS='13 29' KF_VICTIM_NODES='3 7'"
+KOFF="$K KF_BENCH_CONFIG=std-offline-ft-filled.yaml KF_VICTIM_RANKS='5 22' KF_VICTIM_NODES='1 5'"
+run() { echo "bash $R/mvp/harness/run_job.sh $1"; }
+P0_1="$KNO KF_ROWS='rank5' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-OFF)"
+P0_2="$KOFF KF_ROWS='rank5' KF_REPEATS=1 $(run KILL-FINAL-OFF-B)"
+G0="{ $P0_1; $P0_2; }"
+P8_1="$KON KF_ROWS='rank5' KF_REPEATS=$((SMOKE ? 1 : 2)) $(run KILL-FINAL-ON)"
+P8_2="$KNO TLLM_TEST_DELAY_ABORT_S=3 KF_ROWS='rank5' KF_REPEATS=1 $(run KILL-FINAL-OFF-A)"
+G8="{ $P8_1; $P8_2; }"
+if [[ -n ${FIN_GROUP:-} ]]; then
+    v=G$FIN_GROUP; [[ -n ${!v:-} ]] || { echo "DRY_RUN_FAIL no $v in $0"; exit 1; }
+    bash -c "${!v}"; exit
+fi
+bash $R/bundle.sh "0:8:3600:$G0" "8:8:3600:$G8"

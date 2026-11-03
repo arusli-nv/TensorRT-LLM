@@ -1,0 +1,200 @@
+--- a/mvp/harness/testhooks.py
++++ b/mvp/harness/testhooks.py
+@@ -30,6 +30,19 @@
+   loop and the heartbeat thread run only in slices; the rank is slow, not hung.
+ - TLLM_TEST_TRIGGER_NEEDS_REQUESTS=1: the decode triggers above fire only in a step where rank r serves a real
+   (not attention-DP dummy) request, so a loss under load always takes requests with it.
++- TLLM_TEST_KILL_TRIGGER_FOR=r=path[,r=path...] (repeated failures): rank r kills itself at a decode replay once its
++  own path exists (as TLLM_TEST_KILL_IN_DECODE), so a second loss can follow the first one's recovery.
++- TLLM_TEST_KILL_RERUN_OWNER=prefix (rerun-once quarantine): at each recovery rank 0 writes the ids of the requests it
++  is about to run again to prefix.ids (and logs WIDEEP_RERUN / WIDEEP_QUARANTINE); the first non-0 rank that
++  prefills one of them claims prefix.claim and SIGKILLs itself in that forward, before the request delivers anything.
++- TLLM_TEST_LATE_WRITE_IN_DECODE=path (DR-H2, late writes of a lost rank): once path exists, rank r's GPU sleeps
++  TLLM_TEST_LATE_WRITE_DELAY_S (default 8) before one decode replay, then the process SIGSTOPs itself with that
++  replay queued: Open MPI's detector declares it lost while its CUDA context lives, and its GPU runs the replay's
++  all-to-all writes into the peers after the delay. A detached child SIGKILLs it TLLM_TEST_LATE_WRITE_KILL_S
++  (default 30) after the stop.
++- TLLM_TEST_DELAY_ABORT_S=s (DR-H2, survivors touching freed victim memory): every rank delays its reaction to a
++  peer failure (the MoE abort request, the watch's revoke and the recovery) by s seconds after it first notices
++  it, so kernels queued at the abort run after the victim's memory was freed.
+ Healthy-cost attribution: TLLM_TEST_EMPTY_EXTRA_SLOTS=1 empties the extra EPLB slots with FT off;
+ TLLM_TEST_POPULATE=off|timed skips or times the background page-table build of the EPLB host copies.
+ Diagnosis only: TLLM_TEST_WATCH_POLL_S=s sets the peer-failure watcher's poll interval;
+@@ -60,6 +73,13 @@
+ HOST_STALL_DECODE = os.environ.get("TLLM_TEST_HOST_STALL_IN_DECODE")
+ GIL_HOG_DECODE = os.environ.get("TLLM_TEST_GIL_HOG_IN_DECODE")
+ STICKY_DECODE = os.environ.get("TLLM_TEST_STICKY_IN_DECODE")
++# TLLM_TEST_KILL_TRIGGER_FOR: per-rank decode triggers; such a rank is a kill target with its own trigger.
++_TRIGGER_FOR = dict(item.split("=", 1) for item in os.environ.get("TLLM_TEST_KILL_TRIGGER_FOR", "").split(",") if item)
++if RANK in _TRIGGER_FOR:
++    KILL_HERE, KILL_DECODE, KILL_PREFILL = True, _TRIGGER_FOR[RANK], None
++RERUN_OWNER = os.environ.get("TLLM_TEST_KILL_RERUN_OWNER")
++LATE_WRITE_DECODE = os.environ.get("TLLM_TEST_LATE_WRITE_IN_DECODE")
++DELAY_ABORT_S = float(os.environ.get("TLLM_TEST_DELAY_ABORT_S", "0"))
+ 
+ 
+ def _say(event: str, extra: str = "") -> None:
+@@ -133,6 +153,31 @@
+             return replay(self, *args, **kwargs)
+ 
+         module.CUDAGraphRunner.replay = faulting_replay
++    if KILL_HERE and LATE_WRITE_DECODE:
++        replay = module.CUDAGraphRunner.replay
++        stopped = []
++
++        def late_writing_replay(self, *args, **kwargs):
++            if stopped or not _holds_requests() or not os.path.exists(LATE_WRITE_DECODE):
++                return replay(self, *args, **kwargs)
++            import subprocess
++
++            import torch
++
++            stopped.append(True)
++            delay = float(os.environ.get("TLLM_TEST_LATE_WRITE_DELAY_S", "8"))
++            kill_s = float(os.environ.get("TLLM_TEST_LATE_WRITE_KILL_S", "30"))
++            # WIDEEP_SELF_STALL: the drivers' marker that the victim acted on the trigger.
++            _say("WIDEEP_SELF_STALL", f"late_write delay_s={delay} kill_s={kill_s}")
++            torch.cuda._sleep(int(delay * 2e9))  # ~2 GHz SM clock, as the stall hook
++            output = replay(self, *args, **kwargs)  # queued behind the sleep; runs while the process is stopped
++            subprocess.Popen(["sh", "-c", f"sleep {kill_s}; kill -KILL {os.getpid()}"], start_new_session=True,
++                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            _say("WIDEEP_LATE_WRITE_STOP")
++            os.kill(os.getpid(), signal.SIGSTOP)
++            return output
++
++        module.CUDAGraphRunner.replay = late_writing_replay
+     if KILL_HERE and HOST_STALL_DECODE:
+         replay = module.CUDAGraphRunner.replay
+         host_stalled = []
+@@ -262,11 +307,100 @@
+         )
+         if KILL_PREFILL and getattr(batch, "num_context_requests", 0) > 0:
+             _kill_if_triggered(KILL_PREFILL)
++        if RERUN_OWNER and RANK != "0" and getattr(batch, "num_context_requests", 0) > 0:
++            _kill_if_rerun_owner(batch)
+         return forward(self, batch, *args, **kwargs)
+ 
+     module.PyTorchModelEngine.forward = killing_forward
+ 
+ 
++_RERUN_IDS = [None, frozenset()]  # (mtime of prefix.ids, ids)
++
++
++def _kill_if_rerun_owner(batch) -> None:
++    """SIGKILL this rank if it prefills a request rank 0 runs again, unless another rank claimed the kill."""
++    path = RERUN_OWNER + ".ids"
++    try:
++        mtime = os.stat(path).st_mtime_ns
++    except FileNotFoundError:
++        return
++    if mtime != _RERUN_IDS[0]:
++        with open(path) as ids:
++            _RERUN_IDS[:] = [mtime, frozenset(int(i) for i in ids.read().split())]
++    held = [r.py_request_id for r in batch.context_requests if r.py_request_id in _RERUN_IDS[1]]
++    if not held:
++        return
++    try:
++        claim = os.open(RERUN_OWNER + ".claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++    except FileExistsError:
++        return
++    os.write(claim, f"{RANK} {held[0]}\n".encode())
++    os.close(claim)
++    _say("WIDEEP_SELF_KILL", f"rerun_owner request={held[0]}")
++    os.kill(os.getpid(), signal.SIGKILL)
++
++
++def _patch_rerun_owner(module):
++    """Rank 0: publish the ids it runs again at each recovery (before readmitting them) and log quarantines."""
++    deliver = module.PeerLossRecovery._deliver_responses
++
++    def publishing_deliver(self, failed, buffered):
++        owners = self._request_owners or {}
++        lost = [rid for rid, (owner, _) in owners.items() if owner in failed and rid not in self._delivered]
++        rerun = sorted(rid for rid in lost if rid not in self._rerun)
++        quarantined = sorted(rid for rid in lost if rid in self._rerun)
++        _say("WIDEEP_RERUN", f"failed={sorted(failed)} count={len(rerun)} ids={rerun[:20]}")
++        _say("WIDEEP_QUARANTINE", f"failed={sorted(failed)} count={len(quarantined)} ids={quarantined[:20]}")
++        if rerun:
++            tmp = f"{RERUN_OWNER}.ids.tmp"
++            with open(tmp, "w") as ids:
++                ids.write(" ".join(map(str, rerun)) + "\n")
++            os.replace(tmp, RERUN_OWNER + ".ids")
++        return deliver(self, failed, buffered)
++
++    module.PeerLossRecovery._deliver_responses = publishing_deliver
++
++
++def _patch_delay_abort(module):
++    """Delay this rank's reaction to a peer failure by DELAY_ABORT_S after its first notice (watch or recovery)."""
++    cls = module.PeerLossRecovery
++    notice = []
++
++    def wait_out_delay(source: str) -> None:
++        if not notice:
++            notice.append(time.monotonic())
++            _say("WIDEEP_ABORT_DELAY", f"source={source} s={DELAY_ABORT_S}")
++        remaining = notice[0] + DELAY_ABORT_S - time.monotonic()
++        if remaining > 0:
++            time.sleep(remaining)
++
++    on_peer_failure = cls._on_peer_failure
++
++    def delayed_watch(self):
++        def on_failure():
++            # As the native watch does without a delay: the kernels' abort request first, then the host side.
++            wait_out_delay("watch")
++            self._executor.model_engine.moe_execution_state.request_abort()
++            _say("WIDEEP_ABORT_SET", "source=watch")
++            on_peer_failure(self)
++
++        # No abort word: the watch must not release the kernels before the delay.
++        self._watch = self._executor.dist.watch_peer_failures(on_failure, 0)
++
++    recover = cls._recover
++
++    def delayed_recover(self, error):
++        wait_out_delay("recover")
++        _say("WIDEEP_ABORT_SET", "source=recover")
++        try:
++            return recover(self, error)
++        finally:
++            notice.clear()
++
++    cls._watch_peer_failures = delayed_watch
++    cls._recover = delayed_recover
++
++
+ def _patch_watch(module):
+     module._WATCH_POLL_S = float(WATCH_POLL_S)
+ 
+@@ -310,7 +444,12 @@
+ def _patch_recovery(module):
+     # TLLM_TEST_BORROW_FROM_KV=1: the device reports no free memory, so borrowed slots always take theirs from the
+     # KV cache (the path a full device takes).
+-    module._free_device_bytes = lambda: 0
++    if os.environ.get("TLLM_TEST_BORROW_FROM_KV") == "1":
++        module._free_device_bytes = lambda: 0
++    if RERUN_OWNER and RANK == "0":
++        _patch_rerun_owner(module)
++    if DELAY_ABORT_S > 0:
++        _patch_delay_abort(module)
+ 
+ 
+ def _patch_alloc_stats(module):
+@@ -376,12 +515,13 @@
+     PATCHES["tensorrt_llm._torch.distributed.communicator"] = _patch_watch
+ if RANK is not None and RANK == os.environ.get("TLLM_TEST_KILL_AFTER_STOPPED"):
+     PATCHES["tensorrt_llm.executor.recovery.client"] = _patch_client
+-if os.environ.get("TLLM_TEST_BORROW_FROM_KV") == "1":
++if (os.environ.get("TLLM_TEST_BORROW_FROM_KV") == "1" or (RERUN_OWNER and RANK == "0")
++        or DELAY_ABORT_S > 0):
+     PATCHES["tensorrt_llm._torch.pyexecutor.peer_loss_recovery"] = _patch_recovery
+ if ALLOC_STATS_S is not None:
+     PATCHES["tensorrt_llm._torch.pyexecutor.py_executor"] = _patch_alloc_stats
+-if KILL_HERE and (KILL_PREFILL or KILL_DECODE or STALL_DECODE or STICKY_DECODE or HOST_STALL_DECODE
+-                  or GIL_HOG_DECODE):
++if (KILL_HERE and (KILL_PREFILL or KILL_DECODE or STALL_DECODE or STICKY_DECODE or HOST_STALL_DECODE
++                   or GIL_HOG_DECODE or LATE_WRITE_DECODE)) or RERUN_OWNER:
+     PATCHES["tensorrt_llm._torch.pyexecutor.model_engine"] = _patch_engine
+ 
+ 

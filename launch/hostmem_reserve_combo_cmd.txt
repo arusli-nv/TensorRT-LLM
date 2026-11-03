@@ -1,0 +1,7 @@
+# HOSTMEM-RESERVE-COMBO (1 node): the option-B early-reservation draft (uncommitted on ft-hostmem; overlay
+# scratch-v5pr/hostmem-reserve): its unit tests (launch/hostmem_reserve_unit_cmd.txt), then the warm-page-cache probe
+# (launch/warm_cache_probe_cmd.txt: late / evict / early HOST_NUMA allocation under a warm checkpoint cache).
+# Outputs in review/diag/. ~10 + ~30 min; --time 01:10.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/launch/hostmem_reserve_unit_cmd.txt
+bash $R/launch/warm_cache_probe_cmd.txt

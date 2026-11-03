@@ -1,0 +1,3 @@
+# Known unit-test failures that gates deselect: one pytest node-id suffix per line (FREEZE_CHECKLIST row in the comment).
+# Nothing else may fail a gate quietly; add an entry only with its checklist row.
+llmapi/test_mpi_session.py::test_remote_mpi_session[flashinfer_temporary_cleanup]  # C12: zmq ipc path > 107 chars under pytest TMPDIR

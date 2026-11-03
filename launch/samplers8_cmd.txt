@@ -1,0 +1,8 @@
+# SAMPLERS-8 (monitor: the "8/GPU sampler-on pair"): the w/o EPLB 8/GPU stall excess (stall rule HL +1.86 pt, CLAIMS 140)
+# with the gpumem/hostpressure samplers ON, so page migration, compaction and host pressure are visible per 20 s bin.
+# Two 8-node groups, std-noeplb and std-noeplb-ft at 8/GPU only, mirrored (G0 off->ft, G1 ft->off), finals settings
+# otherwise (seed2, burn-in 32x6, pollution checks). Readout: burst_counts_burnin.py / itl_stalls.py + hostpressure deltas.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v2-cef4670789
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_POLLUTION_CHECKS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=8 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json"
+bash $R/bundle.sh "0:8:3300:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD" \
+  "8:8:3300:$E FT_COST_E2E_ARMS='std-noeplb-ft std-noeplb' bash $R/mvp/harness/run_job.sh STD-G1"

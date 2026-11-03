@@ -1,0 +1,8 @@
+# NSYS-LB (8 nodes): where does the static load balancer's +2.4-3.0% step cost come from (CLAIMS 148, LAY32 8134758)?
+# std-noeplb (no LB) vs std-noeplb-lb (FT off, static LB 256) vs std-noeplb-ft at 32/GPU, one round, STD_NSYS=1: one
+# 50-step nsys window on ranks 0 and 5 per case (attribution only, never cost numbers), with Python sampling so host
+# work per step is visible (the cost metric is the host loop step). Readout: per-step kernel sums and the host gaps
+# between graph replays, lb vs off and ft vs lb.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude; B=build-v3-bcea8da496
+E="MVP_BUILD=$B FINAL_BUILD=$B WIDEEP_NO_SAMPLERS=1 FT_COST_E2E_ROUNDS=1 FT_COST_E2E_ROUND_MIN=40 WIDEEP_BURNIN=32:6 COST_LOADS=32 STD_PLACEMENT=$R/mvp/runs/STD-8109649/std-offline-placement.yaml FT_COST_E2E_SEED=$R/launch/std/std-seed2.json STD_NSYS=1 TLLM_TEST_NSYS_PYTHON=1 WIDEEP_LAUNCHER_GRACE_S=300"
+bash $R/bundle.sh "0:8:4200:$E FT_COST_E2E_ARMS='std-noeplb std-noeplb-lb std-noeplb-ft' bash $R/mvp/harness/run_job.sh STD"

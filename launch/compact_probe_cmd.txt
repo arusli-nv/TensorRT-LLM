@@ -1,0 +1,19 @@
+# COMPACT-PROBE (1 node, 4 GPUs; DIAGNOSTIC for the burst fix decision): do threads reading /dev/shm host copies stall
+# when the kernel compacts memory, and does page-locking (cudaHostRegister) the owner's segment stop it?
+# scratch-compact/compact_probe.py, modes lazy (fix-2-like: own mapping dropped), mapped, pinned; 4 readers x 60 GiB
+# segments, 4 copy threads each; a fragmenter forces compaction (checkerboard frees + MADV_HUGEPAGE faults) after 40 s
+# of quiet. Output: review/diag/compact-probe-<job>.txt. Devel image's torch only (no wheel). ~20 min; --time 00:40.
+R=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/arusli/src/TensorRT-LLM/.wideep-ft-runs/claude
+bash $R/tools/check_excluded_nodes.sh || exit 1
+out=$R/review/diag/compact-probe-${SLURM_JOB_ID:-x}.txt
+{
+    uname -r; cat /proc/sys/vm/compaction_proactiveness /proc/sys/vm/compact_unevictable_allowed 2>&1; ulimit -l
+    cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>&1
+    df -h /dev/shm; free -g
+    cd /tmp
+    for mode in lazy mapped pinned; do
+        echo "### $mode"; timeout 600 python3 $R/scratch-compact/compact_probe.py --mode $mode --seg-gb 60 --quiet-s 40 --frag-s 80
+        free -g | head -2
+    done
+    echo COMPACT_PROBE_DONE
+} > "$out" 2>&1

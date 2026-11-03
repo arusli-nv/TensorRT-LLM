@@ -1,0 +1,57 @@
+RT2 tests/docs fixes. Branch rt2-tests (worktree /tmp/claude-161238/work/wt-rt2d), on fix-final8 (90435f7b99). Not pushed.
+None of these were run: the login node has no torch or GPU. All commits passed pre-commit, carry Signed-off-by and have no AI lines.
+
+== 1. Tests that could not fail ==
+test_nothing_is_killed_before_a_shrink_when_no_failure_is_reported -> 3159d449ae
+  The test now records kill_rank calls in a list (no AssertionError on the daemon fence thread).
+  It asserts killed == [] and shrink.call_count == 1.
+  Run: pytest tests/unittest/_torch/executor/test_peer_loss_recovery.py -k "nothing_is_killed or shrink"   (cpu_only)
+test_hung_rank_fenced -> 7ba616d3fa
+  Removed the vacuous "survived its fence" check. Added a positive check on the worker output for either:
+  "asking the MPI runtime to end hung rank 2" (hang_evidence._obey, a live helper after the 1 s grace), or
+  "the MPI runtime ended failed rank 2" (peer_loss_recovery._end_ranks, when the shrink or rank 0's fence reached it first).
+  Run: tests/integration/defs/wide_ep_ft/test_peer_loss_recovery.py::test_hung_rank_fenced   (GB200 x4, ULFM)
+test_valid_counts_wait_for_a_source_that_arrives_late -> 83ee415210
+  The dispatch is launched first. The test sleeps 0.2 s, asserts done.query() is False, and only then has a side stream write the count and the flag.
+  It waits up to 10 s; on timeout it sets abort[0]=1 to release the kernel and fails instead of hanging.
+  Limit: this needs the side stream to run alongside the spinning kernel, so it fails, not hangs, under CUDA_DEVICE_MAX_CONNECTIONS=1. A comment says so.
+  Run: pytest tests/unittest/_torch/moe/test_moe_a2a_abort.py   (l0_b200, SM100/103)
+
+== 2. Skips that hide failures ==
+test_hang_evidence HeartbeatSender skip -> ec54b920be
+  Now a direct `from tensorrt_llm.bindings.internal.runtime import HeartbeatSender`; importorskip and the hasattr skip are removed.
+  Run: pytest tests/unittest/_torch/executor/test_hang_evidence.py -k native_heartbeat   (GPU stages: h100/b300)
+Ghost CPU-copy gtests (not changed, C++): cpp/tests/unit_tests/runtime/moeLoadBalancerTest.cpp
+  CpuWritesReachResidentAndBackedSlots (:1245-1251) and CpuCopiesLoadARestoredGhostSlotThroughEachMapping (:1365-1371)
+  GTEST_SKIP without host access (needs GDRCopy, and the GPU memory must not be a NUMA node).
+  No CI stage is confirmed to run them; say so in the PR.
+Missing DeepSeek-V3-Lite/nvfp4_moe_only under TLLM_REQUIRE_ULFM=1 still skips green (test_peer_loss_recovery.py:83-84). Left unchanged, per instructions.
+
+== 3. Docs ==
+Pinned request to a lost rank -> daeebd41bb (doc only)
+  PRODUCT ISSUE, not fixed: py_executor._fail_unservable_requests answers with peer_loss_retryable_message, which gives HTTP 503 with Retry-After: 1.
+  A lost rank never rejoins, so the same retry fails until the deployment restarts.
+  Suggested product fix: give it its own non-retryable code, with no Retry-After.
+  The doc now says retries fail until restart: drop attention_dp_rank, set attention_dp_relax, or send the request to another replica.
+Spec-dec moved out of "Not supported"; PP/CP refused -> 436ffc8719
+  Speculative decoding now has its own section. The refused list starts with "any layout but pure attention DP (tp_size == moe_ep_size == world_size; pipeline and context parallelism are refused)".
+  This matches communicator.enable_peer_loss_recovery.
+ghost + online EPLB without host access -> a8328ec17f
+  The doc now says it is accepted without a warning, and every online EPLB update copies on the GPU (moe_load_balancer.register_weight_slots_after_to_cuda calls set_use_gpu_memcpy(True)).
+  The behaviour is unchanged. Whether to warn is a product decision.
+mpi4py version -> 60de196cbf
+  The doc now says "mpi4py 4 or later (startup checks for MPI.Comm.Shrink; the container installs 4.1.2)".
+MOE_DEVELOPER_GUIDE MoeExecutionState path -> 54a00f151e
+  Added a paragraph: under recovery, the kernels read the shared MoeExecutionState's mask (install_mask) and pinned abort record (request_abort), in communication/execution_state.py.
+Feature-combination matrix -> c8e3ce182f
+  Added a WideEP FT constraint table, in the same style as the CSA2 table. It is not a matrix row, because a row would also need a new column in an 18-column triangle.
+  Docs check: build the docs (sphinx) or at least render the two .md files.
+
+== 4. Commit hygiene (not rewritten) ==
+2c3af30ce8 (in fix-final8-rc1) 'Revert "[None][perf] Compile the source-slot input remap out ..."' has no Signed-off-by (fails DCO) and no [None][type] prefix.
+It reverts 5663731764 from the same stack. At the PR restack, drop both commits, or re-sign it with -s and retitle it "[None][perf] Revert ...".
+
+== Tests to run ==
+CPU:       pytest -m cpu_only tests/unittest/_torch/executor/test_peer_loss_recovery.py
+GPU:       pytest tests/unittest/_torch/executor/test_hang_evidence.py tests/unittest/_torch/moe/test_moe_a2a_abort.py   (B200/GB200)
+GB200 x4:  tests/integration/defs/wide_ep_ft/test_peer_loss_recovery.py::test_hung_rank_fenced
