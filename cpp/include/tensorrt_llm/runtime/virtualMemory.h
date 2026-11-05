@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -255,7 +255,13 @@ struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
     void setup(CUmemGenericAllocationHandle handle) override
     {
         TLLM_CU_CHECK(cuMemMap(mAddress, mSize, 0, handle, 0));
-        TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        // A failed access grant leaves nothing mapped: teardown runs only after a successful setup.
+        CUresult const result = cuMemSetAccess(mAddress, mSize, &mDesc, 1);
+        if (result != CUDA_SUCCESS)
+        {
+            cuMemUnmap(mAddress, mSize);
+            TLLM_CU_CHECK(result);
+        }
     }
 
     void teardown(CUmemGenericAllocationHandle, bool) override
