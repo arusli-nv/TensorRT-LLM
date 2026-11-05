@@ -236,11 +236,11 @@ class MoEImplBase(
         self.layer_load_balancer = eplb.layer_load_balancer
 
     @property
-    def _num_extra_local_slots(self) -> int:
-        """Trailing local slots WideEP peer-loss recovery appends, without an expert while healthy."""
+    def _num_spare_local_slots(self) -> int:
+        """Trailing local spare slots WideEP fault tolerance adds, without an expert while healthy."""
         if self.layer_load_balancer is None:
             return 0
-        return self.layer_load_balancer.ghost_slot_count
+        return self.layer_load_balancer.spare_slot_count
 
     # ---- selection (pure; no GPU, no env, no import probe) ----------------
     @classmethod

@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm._utils import rank_failure_recovery_enabled
 
 from ...utils import Fp4QuantizedTensor
 from .impl_contract import MoEInputRequirement, MoEStaticCapability
@@ -289,7 +289,7 @@ def slot_rows(tensor: torch.Tensor) -> torch.Tensor:
     """``tensor`` ([slots, ...]) as ``[slots, elements]`` rows over the same storage, for EPLB slot copies.
 
     A slot of a repacked layout (e.g. DEEPGEMM's MN-major block scales) is not contiguous, but its elements fill
-    one dense block of the storage; EPLB copies that block as is, and the host copies share the layout.
+    one dense block of the storage; EPLB copies that block as is, and the host weights share the layout.
 
     Raises:
         ValueError: A slot's elements do not fill one dense block.
@@ -313,16 +313,16 @@ def slot_rows(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _eplb_slots(tensor: torch.Tensor) -> torch.Tensor:
-    """``tensor`` ([slots, ...]) indexed by slot for EPLB slot copies: ``slot_rows(tensor)`` with peer-loss
-    recovery, which also takes repacked layouts, else ``tensor`` itself."""
-    return slot_rows(tensor) if peer_loss_recovery_enabled() else tensor
+    """``tensor`` ([slots, ...]) indexed by slot for EPLB slot copies: ``slot_rows(tensor)`` with fault
+    tolerance, which also takes repacked layouts, else ``tensor`` itself."""
+    return slot_rows(tensor) if rank_failure_recovery_enabled() else tensor
 
 
 class MoEEplbWeightLayoutMixin:
     """The EPLB half that follows the weights, not the forward pass.
 
     "Weight" here means weight-side, not static-only: four of these members
-    return early unless ``_using_host_weight_copies()`` (dynamic routing, or
+    return early unless ``_using_host_weights()`` (dynamic routing, or
     static routing that restores slots), so the block serves the dynamic
     balancer at least as much as the static one. Naming it after
     static layout would send a reader looking for the dynamic path elsewhere.
@@ -342,7 +342,7 @@ class MoEEplbWeightLayoutMixin:
     """
 
     def _add_raw_shared_weights_for_unmap(self, weight_tensors: List[torch.Tensor]):
-        if self._using_host_weight_copies():
+        if self._using_host_weights():
             self.layer_load_balancer._add_raw_host_weight_for_unmap(weight_tensors)
 
     def _supports_load_balancer(self) -> bool:
@@ -362,8 +362,8 @@ class MoEEplbWeightLayoutMixin:
             return self.layer_load_balancer.is_dynamic_routing()
         return False
 
-    def _using_host_weight_copies(self) -> bool:
-        """Whether the load balancer keeps host copies of the experts and loadable slots (dynamic routing, or
+    def _using_host_weights(self) -> bool:
+        """Whether the load balancer keeps host weights of the experts and loadable slots (dynamic routing, or
         static routing with restores)."""
         return (
             bool(self.layer_load_balancer) and self.layer_load_balancer.need_load_shared_weights()
@@ -371,7 +371,7 @@ class MoEEplbWeightLayoutMixin:
 
     def register_parameter_weight_slot_fn(self, weight_name: str, local_slot_id: int):
         """Register parameter weight slot function for load balancer."""
-        if not self._using_host_weight_copies():
+        if not self._using_host_weights():
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
@@ -380,14 +380,14 @@ class MoEEplbWeightLayoutMixin:
 
     def register_to_fix_weight_fn(self, weight_name: str):
         """Register weight fixing function for load balancer."""
-        if not self._using_host_weight_copies():
+        if not self._using_host_weights():
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
         param = getattr(self, weight_name)
         weight_tensor = param.detach()
         assert isinstance(weight_tensor, torch.Tensor), f"weight {weight_name} should be a tensor"
-        if peer_loss_recovery_enabled():
+        if rank_failure_recovery_enabled():
             slot_rows(weight_tensor)  # Each slot must be one dense block of the storage.
         else:
             assert weight_tensor.is_contiguous(), (
@@ -410,7 +410,7 @@ class MoEEplbWeightLayoutMixin:
         self, weight_and_tensor_dict: Dict[str, torch.Tensor]
     ):
         """Register all parameter slot and weight fixing functions for load balancer."""
-        if not self._using_host_weight_copies():
+        if not self._using_host_weights():
             return
 
         # Register weight functions for each local slot

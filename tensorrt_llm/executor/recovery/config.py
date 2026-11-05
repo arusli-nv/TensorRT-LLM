@@ -42,7 +42,7 @@ COMMAND_FENCE_GRACE_S = 5.0
 # The exit code of a worker the authority told that the deployment hangs and no fence can recover it (EX_TEMPFAIL):
 # the deployment must restart.
 STALLED_EXIT_CODE = 75
-# A set of ranks lost together, as a sorted tuple: one rank or a whole node.
+# A set of ranks that fail together, as a sorted tuple: one rank or a whole node.
 FailureDomain = Tuple[int, ...]
 
 

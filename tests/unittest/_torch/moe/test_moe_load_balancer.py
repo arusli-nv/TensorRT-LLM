@@ -316,7 +316,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer.set_iter_info(True, True)
 
         with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage'), patch(
-                'tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.peer_loss_recovery_enabled',
+                'tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.rank_failure_recovery_enabled',
                 return_value=True):
             with self.assertRaises(ValueError):
                 with MoeLoadBalancerIterContext(balancer):
@@ -333,9 +333,9 @@ class TestMoeLoadBalancer(unittest.TestCase):
             1, interrupted=False)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
-    def test_without_peer_loss_recovery_a_raising_forward_ends_its_iteration_as_on_main(
+    def test_without_rank_failure_recovery_a_raising_forward_ends_its_iteration_unchanged(
             self, mock_load_balancer_impl):
-        """Without peer-loss recovery a forward that raises ends its iteration uninterrupted and keeps
+        """Without rank failure recovery a forward that raises ends its iteration uninterrupted and keeps
         the layer's stage counts."""
 
         torch.cuda.set_device(0)
@@ -670,8 +670,8 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
 
 
 @pytest.mark.parametrize("recovering", [True, False])
-def test_shutdown_tolerates_a_lost_node_peer_only_during_recovery(recovering):
-    """A dead node-mate fails the shutdown preflight and barriers: recovery shuts down without it."""
+def test_shutdown_tolerates_a_failed_node_peer_only_during_recovery(recovering):
+    """A failed node-mate fails the shutdown preflight and barriers: recovery shuts down without it."""
     from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer
 
     balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
@@ -683,7 +683,7 @@ def test_shutdown_tolerates_a_lost_node_peer_only_during_recovery(recovering):
     balancer.shared_mpi_comm.allgather.side_effect = MPI.Exception(
         MPI.ERR_OTHER)
     balancer.shared_mpi_comm.barrier.side_effect = MPI.Exception(MPI.ERR_OTHER)
-    with patch.object(moe_load_balancer, "peer_loss_recovery_enabled", return_value=recovering), \
+    with patch.object(moe_load_balancer, "rank_failure_recovery_enabled", return_value=recovering), \
             patch.object(moe_load_balancer, "is_mpi_peer_failure", return_value=True):
         if recovering:
             assert balancer.shutdown() is True
@@ -712,8 +712,8 @@ def test_slot_rows_copies_a_repacked_slot_as_its_dense_block():
 
 
 @pytest.mark.parametrize("recovery", [False, True])
-def test_eplb_slots_are_rows_only_with_peer_loss_recovery(recovery):
-    """Without peer-loss recovery EPLB registers each slot itself, contiguous only."""
+def test_eplb_slots_are_rows_only_with_rank_failure_recovery(recovery):
+    """Without rank failure recovery EPLB registers each slot itself, contiguous only."""
 
     class _Module(MoEEplbWeightLayoutMixin):
         pass
@@ -726,7 +726,7 @@ def test_eplb_slots_are_rows_only_with_peer_loss_recovery(recovery):
     module.scales = torch.nn.Parameter(torch.zeros(2, 3, 4).transpose(1, 2),
                                        requires_grad=False)
     with patch.object(impl_blocks,
-                      "peer_loss_recovery_enabled",
+                      "rank_failure_recovery_enabled",
                       return_value=recovery):
         module.register_parameter_weight_slot_fn("weight", 1)
         slot = module.layer_load_balancer.register_weight_slot.call_args.args[2]
@@ -755,8 +755,9 @@ def test_one_slot_table_keeps_a_none_result() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_ghost_slot_storage_copies_after_the_producer_on_its_stream():
-    """The weights may still be written by a kernel on a non-default stream when their slots become ghost slots."""
+def test_unbacked_slot_storage_copies_after_the_producer_on_its_stream():
+    """The weights may still be written by a kernel on a non-default stream when their slots become unbacked
+    slots."""
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
 
     stream = torch.cuda.Stream()
@@ -764,9 +765,9 @@ def test_ghost_slot_storage_copies_after_the_producer_on_its_stream():
         weights = torch.zeros(4, 1 << 20, device="cuda")
         torch.cuda._sleep(
             50_000_000
-        )  # the producer is still busy when the slots become ghost slots
+        )  # the producer is still busy when the slots become unbacked slots
         weights.fill_(3.0)
-        torch.ops.trtllm.moe_ghost_slot_storage(weights, [1])
+        torch.ops.trtllm.moe_unbacked_slot_storage(weights, [1])
     torch.cuda.synchronize()
     assert weights[0].eq(3.0).all() and weights[2:].eq(3.0).all()
 
