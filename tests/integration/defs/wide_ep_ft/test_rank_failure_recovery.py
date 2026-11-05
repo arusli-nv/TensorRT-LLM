@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""WideEP peer-loss recovery end to end: EP4 survives the loss of workers, and the loss of its authority."""
+"""WideEP rank failure recovery end to end: EP4 survives failed workers, and the loss of its authority."""
 
 import importlib.metadata
 import json
@@ -21,17 +21,17 @@ import pytest
 import yaml
 
 from ..conftest import llm_models_root
-from .peer_loss_driver import PROMPTS, RUN_TOKEN_ENV, SHORT_MAX_TOKENS, llm_kwargs
+from .rank_failure_driver import PROMPTS, RUN_TOKEN_ENV, SHORT_MAX_TOKENS, llm_kwargs
 
 VICTIM = 2
 WORLD_SIZE = 4
-DRIVER = Path(__file__).with_name("peer_loss_driver.py")
+DRIVER = Path(__file__).with_name("rank_failure_driver.py")
 WORKER_HOOKS = Path(__file__).with_name("worker_hooks")
-KILL_MARKER = "PEER_LOSS_DRIVER_KILL"
+KILL_MARKER = "RANK_FAILURE_DRIVER_KILL"
 SELF_KILL_MARKER = "WIDEEP_FT_TEST_SELF_KILL"
 # Model loading, CUDA graph capture and both request rounds.
 SERVE_TIMEOUT_S = 1800
-# Shutdown of a world that lost a rank ends in MPI_Abort after a 60 s worker grace period.
+# Shutdown of a world in which a rank failed ends in MPI_Abort after a 60 s worker grace period.
 TEARDOWN_TIMEOUT_S = 180
 # The server's view of the authority is at most 1 s old and a query waits 0.5 s.
 HEALTH_SETTLE_S = 30
@@ -256,9 +256,9 @@ def _run_driver(
     output = mpirun_log.read_text(errors="replace")
     assert result_path.exists(), f"The driver wrote no result:\n{output[-20000:]}"
     result = json.loads(result_path.read_text())
-    last_round = "healthy" if mode == "healthy" else "after_loss"
+    last_round = "healthy" if mode == "healthy" else "after_failure"
     assert last_round in result, f"The driver did not finish serving:\n{output[-20000:]}"
-    # The survivors of a recovered world finalize MPI on shutdown and exit 0.
+    # The live ranks of a recovered world finalize MPI on shutdown and exit 0.
     assert returncode == 0, f"mpirun exited with {returncode}:\n{output[-20000:]}"
     return result, output, authority_log.read_text()
 
@@ -266,7 +266,7 @@ def _run_driver(
 def _assert_answered(rows: list[dict]) -> None:
     """Each request answered with its expected word and exactly ``max_tokens`` tokens.
 
-    The requests ignore EOS, so a token that a discarded or re-run step duplicated or dropped changes the count.
+    The requests ignore EOS, so a token that a rolled-back or re-run step duplicated or dropped changes the count.
     """
     for row in rows:
         assert "error" not in row, row
@@ -299,11 +299,11 @@ def _assert_recovered(
     output: str,
     authority_text: str,
     mode: str,
-    lost: list[int],
+    failed: list[int],
     per_rank: int = 1,
     online_eplb: bool = False,
 ) -> str:
-    """Every request answered, the survivors resumed without ``lost`` and nothing was rebuilt.
+    """Every request answered, the live ranks resumed without ``failed`` and nothing was rebuilt.
 
     ``per_rank`` is the driver's in-flight requests per attention-DP rank; ``online_eplb`` whether
     online EPLB moves experts between rounds. Returns the mpirun log from the first fault on.
@@ -313,27 +313,28 @@ def _assert_recovered(
     before_kill, kill_marker, after_kill = output.partition(KILL_MARKER)
     assert kill_marker, "The driver did not fault a victim"
     if mode == "inflight":
-        # The lost ranks' requests streamed nothing, so the survivors ran them again from their prompts.
-        _assert_answered(result["during_loss"])
+        # The failed ranks' requests streamed nothing, so the live ranks ran them again from their prompts.
+        _assert_answered(result["during_failure"])
         if per_rank == 1 and not online_eplb:
-            # A survivor's request decoded its first tokens before the loss, alone on its rank as in
-            # the healthy round and on the same expert placement: the same greedy tokens. Online
+            # A live rank's request decoded its first tokens before the rank failure, alone on its rank
+            # as in the healthy round and on the same expert placement: the same greedy tokens. Online
             # EPLB may move experts between the rounds, which changes the reduction order.
-            for row in result["during_loss"]:
-                if row["rank"] not in lost:
+            for row in result["during_failure"]:
+                if row["rank"] not in failed:
                     assert row["token_ids"][:SHORT_MAX_TOKENS] == healthy_ids[row["rank"]], row
-        assert _rerun_counts(after_kill) == (len(lost) * per_rank, 0), after_kill[-20000:]
-    _assert_answered(result["after_loss"])
-    # Exact tokens are not asserted after the loss: the lost experts are served from other GPUs,
-    # which changes the reduction order and so may change greedy tokens. Each answer still holds its
-    # expected word and reads as text.
-    _assert_coherent(result["after_loss"])
+        assert _rerun_counts(after_kill) == (len(failed) * per_rank, 0), after_kill[-20000:]
+    _assert_answered(result["after_failure"])
+    # Exact tokens are not asserted after the rank failure: the lost experts are served from other
+    # GPUs, which changes the reduction order and so may change greedy tokens. Each answer still holds
+    # its expected word and reads as text.
+    _assert_coherent(result["after_failure"])
     for rank in range(WORLD_SIZE):
-        if rank not in lost:
-            assert f"Rank {rank}: resumed serving without ranks {lost}" in after_kill, rank
+        if rank not in failed:
+            assert f"Rank {rank}: resumed serving without ranks {failed}" in after_kill, rank
     assert "CUDA graph capture" in before_kill, "Decode CUDA graphs were not captured"
     assert "CUDA graph capture" not in after_kill, "Recovery captured CUDA graphs"
-    assert f"committed generation 1 without ranks {lost}" in authority_text, authority_text[-20000:]
+    committed = f"committed generation 1 without ranks {failed}"
+    assert committed in authority_text, authority_text[-20000:]
     return after_kill
 
 
@@ -341,7 +342,7 @@ def _assert_recovered(
 @pytest.mark.skip_device_not_contain(["GB200"])
 @pytest.mark.parametrize("overlap", [False, True], ids=["sync", "overlap"])
 @pytest.mark.parametrize("mode", ["idle", "inflight"])
-def test_peer_loss_recovery(mode: str, overlap: bool, tmp_path: Path):
+def test_rank_failure_recovery(mode: str, overlap: bool, tmp_path: Path):
     result, output, authority_text = _run_driver(tmp_path, mode, [VICTIM], overlap=overlap)
     _assert_recovered(result, output, authority_text, mode, [VICTIM])
 
@@ -357,7 +358,7 @@ def test_serving_without_fault_tolerance(overlap: bool, tmp_path: Path):
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
-def test_peer_loss_recovery_under_load(tmp_path: Path):
+def test_rank_failure_recovery_under_load(tmp_path: Path):
     """Rank 2 dies while 32 requests decode, a full batch of 8 on every attention-DP rank."""
     per_rank = 8
     result, output, authority_text = _run_driver(
@@ -368,7 +369,7 @@ def test_peer_loss_recovery_under_load(tmp_path: Path):
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
-def test_two_ranks_lost_together(tmp_path: Path):
+def test_two_ranks_fail_together(tmp_path: Path):
     """Ranks 2 and 3 die in one decode step and one recovery serves on without both.
 
     ``failure_domain: node`` needs ranks on more than one host; on one host each rank is its own domain, and
@@ -387,13 +388,13 @@ def test_two_ranks_lost_together(tmp_path: Path):
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
-def test_rank_lost_during_recovery(tmp_path: Path):
+def test_rank_fails_during_recovery(tmp_path: Path):
     """Rank 2 dies in decode and rank 3 right after reporting it: the authority plans the recovery again."""
     result, output, authority_text = _run_driver(
         tmp_path,
         "inflight",
         [2],
-        "--also-lost",
+        "--also-failed",
         "3",
         "--replica-offset",
         "2",
@@ -411,50 +412,50 @@ def test_rank_lost_during_recovery(tmp_path: Path):
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
 @pytest.mark.parametrize("eplb", ["static", "online"])
-def test_restore_into_ghost_slots(eplb: str, tmp_path: Path):
-    """The appended slots hold no memory until rank 2 dies in decode; the restore maps memory behind them.
+def test_restore_into_unbacked_slots(eplb: str, tmp_path: Path):
+    """The unbacked spare slots hold no memory until rank 2 dies in decode; the restore maps memory behind them.
 
     Three ranks cannot hold the 72 experts in 18 slots each (a static placement of one slot per expert) or in 20
-    (online EPLB over 80 slots): each rank gets 6 or 4 ghost slots after its EPLB slots, which the restore fills
-    once any replicas are used up. Online EPLB's updates then serve on.
+    (online EPLB over 80 slots): each rank gets 6 or 4 unbacked spare slots after its EPLB slots, which the restore
+    fills once any replicas are used up. Online EPLB's updates then serve on.
     """
     if eplb == "online":
-        args, appended = ["--online-slots", "80"], "4 ghost slots per rank to EPLB's 20"
+        args, spare = ["--online-slots", "80"], "4 unbacked spare slots per rank to EPLB's 20"
     else:
-        args, appended = ["--replica-offset", "0"], "6 ghost slots per rank to EPLB's 18"
+        args, spare = ["--replica-offset", "0"], "6 unbacked spare slots per rank to EPLB's 18"
     result, output, authority_text = _run_driver(
-        tmp_path, "inflight", [VICTIM], *args, ft_config=dict(extra_slots="ghost")
+        tmp_path, "inflight", [VICTIM], *args, ft_config=dict(spare_slots="unbacked")
     )
     before_kill = output.partition(KILL_MARKER)[0]
-    assert f"WideEP peer-loss recovery appends {appended}" in before_kill, output[-20000:]
+    assert f"WideEP fault tolerance adds {spare}" in before_kill, output[-20000:]
     after_kill = _assert_recovered(
         result, output, authority_text, "inflight", [VICTIM], online_eplb=eplb == "online"
     )
-    assert "behind ghost expert slots" in after_kill, output[-20000:]
+    assert "behind unbacked expert slots" in after_kill, output[-20000:]
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.skip_device_not_contain(["GB200"])
-def test_restore_into_appended_empty_slots(tmp_path: Path):
-    """Online EPLB's empty extra slots are held from startup and filled by a restore.
+def test_restore_into_backed_slots(tmp_path: Path):
+    """Online EPLB's backed spare slots are held from startup and filled by a restore.
 
-    They are the default where GDRCopy cannot map ghost slot memory. Each rank gets 4 after its 20 EPLB slots,
+    They are the default where GDRCopy cannot map unbacked slot memory. Each rank gets 4 after its 20 EPLB slots,
     holding memory from startup, and the restore after rank 2 dies in decode loads them without mapping any.
     """
     result, output, authority_text = _run_driver(
-        tmp_path, "inflight", [VICTIM], "--online-slots", "80", ft_config=dict(extra_slots="empty")
+        tmp_path, "inflight", [VICTIM], "--online-slots", "80", ft_config=dict(spare_slots="backed")
     )
     before_kill = output.partition(KILL_MARKER)[0]
-    assert "WideEP peer-loss recovery appends 4 empty slots per rank to EPLB's 20" in before_kill, (
-        output[-20000:]
-    )
+    assert (
+        "WideEP fault tolerance adds 4 backed spare slots per rank to EPLB's 20" in before_kill
+    ), output[-20000:]
     after_kill = _assert_recovered(
         result, output, authority_text, "inflight", [VICTIM], online_eplb=True
     )
     assert re.search(rf"Restored [1-9]\d* expert slots without ranks \[{VICTIM}\]", after_kill), (
         after_kill[-20000:]
     )
-    assert "behind ghost expert slots" not in after_kill, after_kill[-20000:]
+    assert "behind unbacked expert slots" not in after_kill, after_kill[-20000:]
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
@@ -573,7 +574,7 @@ def test_authority_lost_while_serving(tmp_path: Path):
                 time.sleep(1)
             # No details without an answer: nothing stale is reported.
             assert health == (200, {"state": "unprotected"}), health
-            # No rank was lost: the same greedy completions as before.
+            # No rank failed: the same greedy completions as before.
             assert _assert_completions(base_url, model) == healthy_texts
         finally:
             if mpirun is not None and mpirun.poll() is None:

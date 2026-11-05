@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""LLM API driver for the WideEP peer-loss recovery test.
+"""LLM API driver for the WideEP rank failure recovery test.
 
 Runs on MPI rank 0 under ``trtllm-llmapi-launch``: serves DeepSeek-V3-Lite on EP4 with
 attention DP, SIGKILLs (or SIGSTOPs) the worker processes of the victim ranks, keeps serving
@@ -19,7 +19,7 @@ import signal
 import time
 from pathlib import Path
 
-KILL_MARKER = "PEER_LOSS_DRIVER_KILL"
+KILL_MARKER = "RANK_FAILURE_DRIVER_KILL"
 # Environment variable whose value marks the processes of one test run.
 RUN_TOKEN_ENV = "WIDEEP_FT_TEST_RUN_TOKEN"
 WORLD_SIZE = 4
@@ -44,8 +44,8 @@ PROMPTS = {
 def placement(replica_offset: int = 1) -> list[int]:
     """Two replicas of every expert: rank r holds its own experts and those of rank r + offset.
 
-    Offset 1 survives the loss of any one rank; offset 2 also that of ranks 2 and 3 together. Offset 0: one slot
-    per expert, rank r holding its own.
+    Offset 1 survives the failure of any one rank; offset 2 also that of ranks 2 and 3 together. Offset 0: one
+    slot per expert, rank r holding its own.
     """
     per_rank = NUM_EXPERTS // WORLD_SIZE
     slots = []
@@ -169,7 +169,7 @@ def main() -> None:
     )
     parser.add_argument("--victims", type=int, nargs="*", default=[])
     parser.add_argument(
-        "--also-lost",
+        "--also-failed",
         type=int,
         nargs="*",
         default=[],
@@ -190,8 +190,8 @@ def main() -> None:
     from tensorrt_llm import LLM
 
     all_ranks = list(range(WORLD_SIZE))
-    lost = set(args.victims) | set(args.also_lost)
-    survivors = [rank for rank in all_ranks if rank not in lost]
+    failed = set(args.victims) | set(args.also_failed)
+    live_ranks = [rank for rank in all_ranks if rank not in failed]
     signum = signal.SIGKILL if args.fault == "kill" else signal.SIGSTOP
     result = {}
     llm = LLM(model=args.model, **llm_kwargs(args.overlap, args.replica_offset, args.online_slots))
@@ -204,16 +204,16 @@ def main() -> None:
             fault(args.victims, signum)
         else:
             ranks = [rank for rank in all_ranks for _ in range(args.per_rank)]
-            probe_index = ranks.index(survivors[0])
+            probe_index = ranks.index(live_ranks[0])
             pending = submit(llm, ranks, LONG_MAX_TOKENS, stream_index=probe_index)
             probe = pending[probe_index][2]
             while len(next(probe).outputs[0].token_ids) < TOKENS_BEFORE_KILL:
                 pass
             fault(args.victims, signum)
-            result["during_loss"] = collect(pending)
-        result["after_loss"] = collect(submit(llm, survivors, SHORT_MAX_TOKENS))
+            result["during_failure"] = collect(pending)
+        result["after_failure"] = collect(submit(llm, live_ranks, SHORT_MAX_TOKENS))
     finally:
-        # Written before shutdown: ending a world that lost a rank calls MPI_Abort.
+        # Written before shutdown: ending a world in which a rank failed calls MPI_Abort.
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         llm.shutdown()
 

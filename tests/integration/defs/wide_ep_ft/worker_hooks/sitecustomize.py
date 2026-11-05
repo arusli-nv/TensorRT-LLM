@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Test-only fault hook for the WideEP peer-loss recovery tests, loaded through ``PYTHONPATH``.
+"""Test-only fault hook for the WideEP rank failure recovery tests, loaded through ``PYTHONPATH``.
 
 ``WIDEEP_FT_TEST_KILL_AFTER_STOPPED=r``: the worker of MPI rank r SIGKILLs itself right after it
 sends its first ``Stopped`` to the recovery authority, so it fails while the survivors agree on a
