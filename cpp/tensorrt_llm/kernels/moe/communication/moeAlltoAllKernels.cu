@@ -719,7 +719,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // Signal completion to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
 #pragma unroll 1 // No unroll as one iter is typically enough
-            for (int target_rank = lane_id; target_rank < ep_size && !released; target_rank += warpSize)
+            for (int target_rank = lane_id; target_rank < ep_size && !incomplete; target_rank += warpSize)
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
@@ -1833,7 +1833,7 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
             // Signal readiness to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
 #pragma unroll 1 // No unroll
-            for (int peer_rank = lane_id; peer_rank < ep_size && !released; peer_rank += warpSize)
+            for (int peer_rank = lane_id; peer_rank < ep_size && !incomplete; peer_rank += warpSize)
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {

@@ -120,7 +120,7 @@ def test_cancel_and_exclusion_on_replay() -> None:
     with torch.cuda.graph(graph):
         received, output = _round(workspace, meta, experts, payload, controls)
 
-    # Peer 1 never signals: a pending request releases both waits instead of a timeout, and the released
+    # Peer 1 never signals: a pending request releases both waits instead of a timeout, and the incomplete
     # round combines nothing.
     abort[0] = 1
     graph.replay()
@@ -271,9 +271,9 @@ def test_dispatch_waits_for_a_source_that_arrives_late() -> None:
     assert _recv_count(workspace, meta, parity, 1) == 3
 
 
-def test_an_aborted_round_without_a_completion_flag_is_released() -> None:
+def test_an_aborted_round_without_a_completion_flag_is_incomplete() -> None:
     """Does an aborted round whose source's count arrived but whose completion flag did not return as
-    cancelled and mark the round released, so this rank publishes no further round flag?"""
+    cancelled and mark the round incomplete, so this rank publishes no further round flag?"""
     workspace, meta, experts, payload = _setup(2)
     controls, abort = _rank_mask_controls(3)
     _, parity = _next_parity(workspace, meta)
@@ -373,13 +373,13 @@ def test_replay_reads_the_slot_table_and_mask_written_before_it() -> None:
 
 @pytest.mark.parametrize("local", [0, 5])
 def test_each_source_s_receive_count_is_what_it_sent_and_0_when_masked(local: int) -> None:
-    """Is every source's receive count right: self, a peer with rows, a peer with none and a departed peer that
+    """Is every source's receive count right: self, a peer with rows, a peer with none and an absent peer that
     arrived?"""
     ep_size = 4
     workspace, meta, experts, payload = _setup(ep_size, tokens=local)
     controls, abort = _rank_mask_controls(0b0111)
-    # Stand in for peers 1-3: each publishes its count and completion flag for the next round. Peer 3 has
-    # departed (masked out), so its arrival must not count.
+    # Stand in for peers 1-3: each publishes its count and completion flag for the next round. Peer 3 is
+    # absent (masked out), so its arrival must not count.
     expected_flag, parity = _next_parity(workspace, meta)
     for peer, count in {1: 3, 2: 0, 3: 2}.items():
         _word(workspace, _offset(meta, "RECV_COUNTERS") + 4 * (parity * ep_size + peer)).fill_(

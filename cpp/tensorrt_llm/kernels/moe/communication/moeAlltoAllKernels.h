@@ -73,7 +73,7 @@ struct MoeA2AAbortState
 {
     static constexpr int32_t kCancelled = 1;
 
-    int32_t requested; // Set by the host to release kernels waiting on lost peers
+    int32_t requested; // Set by the host to release kernels waiting on failed peers
     int32_t status;    // kCancelled once a dispatch or combine returned without some active source's data
 };
 
