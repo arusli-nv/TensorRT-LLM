@@ -102,8 +102,8 @@ def _memory(monkeypatch, own_rank=1, size=4):
     return memory, driver
 
 
-def _gather_without(dead, size=4):
-    return lambda value: [None if rank in dead else value for rank in range(size)]
+def _gather_without(absent, size=4):
+    return lambda value: [None if rank in absent else value for rank in range(size)]
 
 
 def test_remap_maps_fresh_pages_at_same_addresses_for_live_rows_only(monkeypatch):
@@ -120,7 +120,7 @@ def test_remap_maps_fresh_pages_at_same_addresses_for_live_rows_only(monkeypatch
     assert all(handle[0] != "old" for handle in driver.mapped.values())
 
 
-def test_release_after_remap_skips_unmapped_departed_rows(monkeypatch):
+def test_release_after_remap_skips_unmapped_absent_rows(monkeypatch):
     memory, driver = _memory(monkeypatch)
     memory.release_backing()
     memory.remap(_gather_without({2}))
@@ -149,19 +149,19 @@ def test_remap_requires_released_backing(monkeypatch):
         memory.remap(_gather_without(set()))
 
 
-class _PeerLost(Exception):
+class _PeerFailure(Exception):
     pass
 
 
-def _gather_outcomes(outcomes, dead, size=4):
-    """The handle exchange without ``dead``, then the remap outcomes: a dict rank -> outcome for the other
+def _gather_outcomes(outcomes, absent, size=4):
+    """The handle exchange without ``absent``, then the remap outcomes: a dict rank -> outcome for the other
     ranks, or an exception the outcome exchange raises."""
     calls = []
 
     def gather(value):
         calls.append(value)
         if len(calls) == 1:
-            return [None if rank in dead else value for rank in range(size)]
+            return [None if rank in absent else value for rank in range(size)]
         if isinstance(outcomes, Exception):
             raise outcomes
         return [value if rank == 1 else outcomes.get(rank) for rank in range(size)]
@@ -175,7 +175,7 @@ def test_a_peer_s_failed_mapping_unmaps_this_rank_too(monkeypatch):
     memory.release_backing()
     driver.released.clear()
     with pytest.raises(RuntimeError, match="rank 3: RuntimeError"):
-        memory.remap(_gather_outcomes({3: "RuntimeError: import failed"}, dead={2}))
+        memory.remap(_gather_outcomes({3: "RuntimeError: import failed"}, absent={2}))
     assert driver.mapped == {} and not memory.mapped
     # The fresh local handle and the imported ones were released.
     assert len(driver.released) == 3
@@ -220,20 +220,20 @@ def test_a_failure_of_any_type_still_reaches_the_outcome_exchange(monkeypatch):
     assert driver.mapped == {} and not memory.mapped
 
 
-def test_a_peer_lost_during_the_outcome_exchange_leaves_the_allocation_unmapped(monkeypatch):
+def test_a_peer_failure_during_the_outcome_exchange_leaves_the_allocation_unmapped(monkeypatch):
     memory, driver = _memory(monkeypatch)
     memory.release_backing()
-    with pytest.raises(_PeerLost):
-        memory.remap(_gather_outcomes(_PeerLost(), dead={2}))
+    with pytest.raises(_PeerFailure):
+        memory.remap(_gather_outcomes(_PeerFailure(), absent={2}))
     assert driver.mapped == {} and not memory.mapped
     memory.remap(_gather_without({2}))
     assert memory.mapped
 
 
-def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_exchange(
+def test_a_peer_failure_during_the_handle_exchange_propagates_without_the_outcome_exchange(
     monkeypatch,
 ):
-    """The exchange that failed could not report an outcome either: the loss reaches the recovery at once."""
+    """The exchange that failed could not report an outcome either: the failure reaches the recovery at once."""
     memory, driver = _memory(monkeypatch)
     memory.release_backing()
     driver.released.clear()
@@ -241,9 +241,9 @@ def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_e
 
     def gather(value):
         calls.append(value)
-        raise _PeerLost()
+        raise _PeerFailure()
 
-    with pytest.raises(_PeerLost):
+    with pytest.raises(_PeerFailure):
         memory.remap(gather)
     assert len(calls) == 1
     assert driver.mapped == {} and not memory.mapped
@@ -253,7 +253,7 @@ def test_a_peer_lost_during_the_handle_exchange_propagates_without_the_outcome_e
 
 
 def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(monkeypatch):
-    """A peer lost during the outcome exchange stays the error the recovery sees, even if releasing the fresh
+    """A peer failure during the outcome exchange stays the error the recovery sees, even if releasing the fresh
     pages fails too; that failure is logged and the allocation is not remapped again."""
     memory, driver = _memory(monkeypatch)
     memory.release_backing()
@@ -261,8 +261,8 @@ def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(monk
     monkeypatch.setattr(mnnvl.logger, "error", errors.append)
     monkeypatch.setattr(driver, "cuMemUnmap", lambda address, size: 2)
 
-    with pytest.raises(_PeerLost):
-        memory.remap(_gather_outcomes(_PeerLost(), dead={2}))
+    with pytest.raises(_PeerFailure):
+        memory.remap(_gather_outcomes(_PeerFailure(), absent={2}))
 
     assert len(errors) == 1 and "failed MNNVL remap" in errors[0]
     assert _RemapMemory.allocated_map[_BASE].state is mnnvl._MnnvlAllocationState.BROKEN
@@ -270,8 +270,8 @@ def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(monk
         memory.remap(_gather_without({2}))
 
 
-def test_an_allocation_remapped_without_departed_ranks_refuses_a_checkpoint(monkeypatch):
-    """A checkpoint restore maps every rank's row: after a remap left a departed rank's row unmapped, a
+def test_an_allocation_remapped_without_absent_ranks_refuses_a_checkpoint(monkeypatch):
+    """A checkpoint restore maps every rank's row: after a remap left an absent rank's row unmapped, a
     checkpoint is refused instead of rebuilding that row."""
     memory, driver = _memory(monkeypatch)
     memory.release_backing()
@@ -281,7 +281,7 @@ def test_an_allocation_remapped_without_departed_ranks_refuses_a_checkpoint(monk
     mapped = dict(driver.mapped)
 
     try:
-        with pytest.raises(RuntimeError, match="remapped without departed ranks"):
+        with pytest.raises(RuntimeError, match="remapped without absent ranks"):
             memory.checkpoint_prepare()
     finally:
         # Pinned, the fake allocation is left alone when ``memory`` is collected.

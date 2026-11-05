@@ -267,7 +267,7 @@ class _MnnvlAllocationRecord:
 class _LiveRowsComm:
     """An allocation's communicator restricted to its live members, for :meth:`MnnvlMemory.remap`.
 
-    ``gather(value)`` returns one entry per global rank, None for a departed one; :meth:`allgather`
+    ``gather(value)`` returns one entry per global rank, None for an absent one; :meth:`allgather`
     orders them by the allocation's communicator ranks. ``gather_failed`` records that an exchange raised.
     """
 
@@ -891,7 +891,7 @@ class MnnvlMemory:
         first_error = None
         for rank in range(record.comm_size):
             if record.mem_handles[rank] is None:
-                # Not mapped: a departed rank's row after remap().
+                # Not mapped: an absent rank's row after remap().
                 continue
             rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
             try:
@@ -925,7 +925,7 @@ class MnnvlMemory:
             raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
         if any(handle is None for handle in record.mem_handles):
             raise RuntimeError(
-                "Cannot checkpoint an MNNVL allocation remapped without departed ranks: "
+                "Cannot checkpoint an MNNVL allocation remapped without absent ranks: "
                 "its restore would map their rows again"
             )
         if record.pin_count:
@@ -945,7 +945,7 @@ class MnnvlMemory:
 
         Unlike :meth:`checkpoint_prepare` this applies to a pinned allocation: captured graphs keep the
         addresses and replay only after :meth:`remap`. Pages stay allocated while any importer still maps
-        them, so a departed importer's late writes land in pages no live rank maps again. No collective;
+        them, so a failed importer's late writes land in pages no live rank maps again. No collective;
         the caller has joined the device work that may use the rows.
         """
         cls = type(self)
@@ -965,7 +965,7 @@ class MnnvlMemory:
     def remap(self, gather: Callable[[Any], Sequence[Any]]) -> None:
         """Map fresh pages at the addresses :meth:`release_backing` kept, shared only among the live ranks.
 
-        ``gather(value)`` collects ``value`` from every live rank: one entry per global rank, None for a departed
+        ``gather(value)`` collects ``value`` from every live rank: one entry per global rank, None for an absent
         one, whose row stays unmapped. Collective over the live ranks. The fresh pages are uninitialized.
 
         The live ranks exchange whether their mapping succeeded (it can fail on some ranks only), so every live
