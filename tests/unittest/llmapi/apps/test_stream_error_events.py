@@ -9,9 +9,9 @@ from http import HTTPStatus
 import pytest
 
 from tensorrt_llm.executor.utils import (
-    PEER_LOSS_RETRYABLE_CODE,
+    RANK_FAILURE_RETRYABLE_CODE,
     RequestError,
-    peer_loss_retryable_message,
+    rank_failure_retryable_message,
 )
 from tensorrt_llm.serve.openai_server import (
     OpenAIServer,
@@ -24,7 +24,7 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.fixture
 def recovery(monkeypatch):
-    """Fault-tolerance mode on; the server needs no authority address to answer a peer-loss failure."""
+    """Fault-tolerance mode on; the server needs no authority address to answer a rank-failure error."""
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
 
@@ -82,25 +82,25 @@ def test_a_stream_that_completes_passes_through_unchanged():
 
 
 @pytest.mark.usefixtures("recovery")
-def test_a_peer_loss_failure_streams_a_retryable_code():
-    message = peer_loss_retryable_message("Attention DP rank 2 failed; retry it")
+def test_a_rank_failure_error_streams_a_retryable_code():
+    message = rank_failure_retryable_message("Attention DP rank 2 failed; retry it")
 
     (event, _) = _stream_error_events(RequestError(message))
 
     error = json.loads(event[len("data: ") :])["error"]
-    assert error["code"] == PEER_LOSS_RETRYABLE_CODE and error["message"] == message
+    assert error["code"] == RANK_FAILURE_RETRYABLE_CODE and error["message"] == message
 
 
 @pytest.mark.usefixtures("recovery")
-def test_a_peer_loss_failure_is_a_503_with_retry_after():
-    message = peer_loss_retryable_message("Attention DP rank 2 is not serving")
+def test_a_rank_failure_error_is_a_503_with_retry_after():
+    message = rank_failure_retryable_message("Attention DP rank 2 is not serving")
 
     response = OpenAIServer.create_error_response(f"Request failed: {message}")
 
     assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
     assert response.headers["Retry-After"] == "1"
     body = json.loads(response.body)
-    assert body["code"] == PEER_LOSS_RETRYABLE_CODE
+    assert body["code"] == RANK_FAILURE_RETRYABLE_CODE
     assert body["type"] == "ServiceUnavailableError"
 
 
@@ -115,7 +115,7 @@ def test_without_fault_tolerance_a_tagged_message_is_an_ordinary_error(monkeypat
         monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
     else:
         monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", authority)
-    message = peer_loss_retryable_message("user text")
+    message = rank_failure_retryable_message("user text")
 
     response = OpenAIServer.create_error_response(message)
     (event, _) = _stream_error_events(RequestError(message))

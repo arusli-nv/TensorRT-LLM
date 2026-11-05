@@ -36,7 +36,7 @@ def test_health_reports_unprotected_when_only_detection_is_on(monkeypatch, mode,
     "phase,code",
     [
         ("SERVING", 200),
-        ("RECOVERED", 200),
+        ("DEGRADED", 200),
         ("STOPPING", 503),
         ("ABORTED", 503),
         ("A_NEWER_PHASE", 200),

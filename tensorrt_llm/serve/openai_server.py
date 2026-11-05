@@ -44,9 +44,9 @@ from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         PEER_LOSS_RETRYABLE_CODE,
+                                         RANK_FAILURE_RETRYABLE_CODE,
                                          is_context_length_exceeded_message,
-                                         is_peer_loss_retryable_message)
+                                         is_rank_failure_retryable_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
@@ -303,9 +303,9 @@ def _stream_error_events(error: Exception) -> List[str]:
     ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
     """
     message = str(error)
-    code = PEER_LOSS_RETRYABLE_CODE if (
+    code = RANK_FAILURE_RETRYABLE_CODE if (
         fault_tolerance_mode()
-        and is_peer_loss_retryable_message(message)) else None
+        and is_rank_failure_retryable_message(message)) else None
     error_data = json.dumps({
         "error": {
             "message": message,
@@ -689,7 +689,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
-        # WideEP peer-loss recovery: the recovery authority's state, for /health.
+        # WideEP rank-failure recovery: the recovery authority's state, for
+        # /health.
         self._recovery_status: Optional[RecoveryStatusProbe] = None
         self.tool_parser = tool_parser
         # Attached frontends serve the launcher's port: only it registers.
@@ -1197,17 +1198,18 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts and peer-loss failures are detected from the
+        # Over-length prompts and rank-failure errors are detected from the
         # message text because they cross the executor IPC boundary as plain
         # strings (RequestError), so no exception type survives to here.
         code: Union[int, str] = status_code.value
         headers = None
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
-        elif fault_tolerance_mode() and is_peer_loss_retryable_message(message):
+        elif fault_tolerance_mode() and is_rank_failure_retryable_message(
+                message):
             err_type = "ServiceUnavailableError"
             status_code = HTTPStatus.SERVICE_UNAVAILABLE
-            code, headers = PEER_LOSS_RETRYABLE_CODE, {"Retry-After": "1"}
+            code, headers = RANK_FAILURE_RETRYABLE_CODE, {"Retry-After": "1"}
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=code)
@@ -1774,7 +1776,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=200 if body["state"] in SERVING_STATES else 503,
                     content=body)
             if fault_tolerance_mode():
-                # Detection only: a peer loss is not recovered.
+                # Detection only: a rank failure is not recovered.
                 return JSONResponse(content=status_body(None))
             return Response(status_code=200)
         else:

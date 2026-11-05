@@ -1298,7 +1298,7 @@ def test_server_probe_drops_answers_that_do_not_unpickle_or_are_malformed(tmp_pa
         ("STOPPING", "recovering"),
         ("PREPARING", "recovering"),
         ("INSTALLING", "recovering"),
-        ("RECOVERED", "degraded"),
+        ("DEGRADED", "degraded"),
         ("ABORTED", "terminal"),
         ("A_PHASE_THIS_SERVER_DOES_NOT_KNOW", "unknown"),
     ],
@@ -1313,14 +1313,14 @@ def test_health_states_follow_the_authority_phase(phase, state):
 def test_status_body_reports_live_ranks_stages_and_failed_requests():
     from tensorrt_llm.serve.fault_tolerance_status import status_body
 
-    status = Status("RECOVERED", 1, (0, 1), NODE, 1, (40_000, 6_000, 18_000), 256, "")
+    status = Status("DEGRADED", 1, (0, 1), NODE, 1, (40_000, 6_000, 18_000), 256, "")
     assert status_body(status) == {
         "state": "degraded",
         "generation": 1,
         "live_ranks": [0, 1],
         "failed_ranks": [2, 3],
         "recoveries": 1,
-        "last_recovery_stage_ms": {"stop": 40.0, "agree": 6.0, "install": 18.0},
+        "last_recovery_stage_ms": {"stop": 40.0, "prepare": 6.0, "install": 18.0},
         "failed_requests": 256,
     }
     assert status_body(None) == {"state": "unprotected"}

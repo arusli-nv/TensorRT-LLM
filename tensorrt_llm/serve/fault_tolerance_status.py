@@ -4,7 +4,7 @@
 
 The recovery authority is the only holder of the committed state, so the server asks it rather than
 deriving the state itself. Asking changes nothing on the authority. If it does not answer, the state is
-``unprotected`` (serving, but a loss would not be recovered), never ``healthy``.
+``unprotected`` (serving, but a rank failure would not be recovered), never ``healthy``.
 """
 
 import os
@@ -15,7 +15,7 @@ from typing import Optional
 
 import zmq
 
-from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
+from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, rank_failure_recovery_enabled
 from tensorrt_llm.executor.recovery.client import MessageQueue, load_key, receive_message
 from tensorrt_llm.executor.recovery.protocol import (
     MAX_MESSAGE_BYTES,
@@ -30,21 +30,21 @@ __all__ = ["SERVING_STATES", "RecoveryStatusProbe", "health_state", "status_body
 
 # Authority phase -> state reported by the server. The server asks only after every worker registered, so an
 # authority still ``REGISTERING`` restarted and lost the committed state: workers register once per process, so
-# a loss would end the job. That is ``unprotected``, as when the authority does not answer.
+# a rank failure would end the job. That is ``unprotected``, as when the authority does not answer.
 _STATES = {
     "REGISTERING": "unprotected",
     "SERVING": "healthy",
     "STOPPING": "recovering",
     "PREPARING": "recovering",
     "INSTALLING": "recovering",
-    "RECOVERED": "degraded",
+    "DEGRADED": "degraded",
     "ABORTED": "terminal",
 }
 # States in which the server answers requests; /health returns 200 only in these. ``unprotected``: the
-# authority does not answer or restarted, so a loss would end the job, but the server itself serves.
+# authority does not answer or restarted, so a rank failure would end the job, but the server itself serves.
 # ``unknown``: the authority runs another version; the server still serves.
 SERVING_STATES = frozenset({"healthy", "degraded", "unprotected", "unknown"})
-_STAGES = ("stop", "agree", "install")
+_STAGES = ("stop", "prepare", "install")
 
 
 def health_state(status: Optional[Status]) -> str:
@@ -113,7 +113,7 @@ class RecoveryStatusProbe:
     @classmethod
     def from_env(cls) -> Optional["RecoveryStatusProbe"]:
         """A probe for the authority named by the environment; None when recovery is disabled."""
-        if not peer_loss_recovery_enabled():
+        if not rank_failure_recovery_enabled():
             return None
         return cls(os.environ[FAULT_TOLERANCE_AUTHORITY_ENV], load_key())
 
