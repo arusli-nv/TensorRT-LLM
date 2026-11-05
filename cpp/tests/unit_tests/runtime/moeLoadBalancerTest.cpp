@@ -422,24 +422,24 @@ TEST(MoeLoadBalancerUnusableSlotTest, PlacementNeverFillsAnUnusableSlot)
     constexpr int kExpertCount = 4;
     constexpr int kEpSize = 4;
     constexpr int kSlotCountPerRank = 3;
-    constexpr int kGhostSlot = 2;
-    constexpr int kDeadRank = 2;
+    constexpr int kSpareSlot = 2;
+    constexpr int kFailedRank = 2;
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo{
         kExpertCount, /*topK=*/2, /*epRank=*/0, kEpSize, kSlotCountPerRank};
-    // The last slot of every rank is unusable, except on rank 1 (a ghost slot a restore backed).
+    // The last slot of every rank is unusable, except on rank 1 (a spare slot a restore backed).
     std::vector<uint8_t> unusableSlotMask(kEpSize * kSlotCountPerRank, 0);
     for (int rank = 0; rank < kEpSize; ++rank)
     {
-        unusableSlotMask[rank * kSlotCountPerRank + kGhostSlot] = static_cast<uint8_t>(rank != 1);
+        unusableSlotMask[rank * kSlotCountPerRank + kSpareSlot] = static_cast<uint8_t>(rank != 1);
     }
     std::vector<uint8_t> const deadRankMask{0, 0, 1, 0};
 
-    for (auto const* dead : {static_cast<std::vector<uint8_t> const*>(nullptr), &deadRankMask})
+    for (auto const* failedRankMask : {static_cast<std::vector<uint8_t> const*>(nullptr), &deadRankMask})
     {
         for (auto const& load : {std::vector<float>{8.0F, 4.0F, 2.0F, 1.0F}, std::vector<float>(kExpertCount, 0.0F)})
         {
-            auto const placement = planPlacement(metaInfo, load, dead, &unusableSlotMask);
-            int const usableSlotCount = dead == nullptr ? 9 : 7;
+            auto const placement = planPlacement(metaInfo, load, failedRankMask, &unusableSlotMask);
+            int const usableSlotCount = failedRankMask == nullptr ? 9 : 7;
             int replicaSum = 0;
             for (int replicaCount : placement.expertReplicaCount)
             {
@@ -453,7 +453,7 @@ TEST(MoeLoadBalancerUnusableSlotTest, PlacementNeverFillsAnUnusableSlot)
                 for (int slot = 0; slot < kSlotCountPerRank; ++slot)
                 {
                     int const expertId = placement.rankExpertIds[rank][slot];
-                    bool const usable = !(dead != nullptr && rank == kDeadRank)
+                    bool const usable = !(failedRankMask != nullptr && rank == kFailedRank)
                         && unusableSlotMask[rank * kSlotCountPerRank + slot] == 0;
                     if (!usable)
                     {
@@ -505,12 +505,12 @@ TEST(MoeLoadBalancerUnusableSlotTest, AllUsableMaskPlacesExactlyAsNoMask)
         }
         loads.push_back(load);
     }
-    for (auto const* dead : {static_cast<std::vector<uint8_t> const*>(nullptr), &deadRankMask})
+    for (auto const* failedRankMask : {static_cast<std::vector<uint8_t> const*>(nullptr), &deadRankMask})
     {
         for (auto const& load : loads)
         {
-            auto const withoutMask = planPlacement(metaInfo, load, dead, nullptr);
-            auto const withMask = planPlacement(metaInfo, load, dead, &allUsable);
+            auto const withoutMask = planPlacement(metaInfo, load, failedRankMask, nullptr);
+            auto const withMask = planPlacement(metaInfo, load, failedRankMask, &allUsable);
             EXPECT_EQ(withMask.expertReplicaCount, withoutMask.expertReplicaCount);
             EXPECT_EQ(withMask.rankExpertIds, withoutMask.rankExpertIds);
         }
@@ -635,7 +635,7 @@ TEST(MoeLoadBalancerFaultToleranceOffTest, InitialAssignmentRejectsAnEmptySlot)
 
 // Adds weight slots but no host weights to one layer, then finalizes the model. GPU copies keep the slot pointers as
 // given, so finalization reaches the host-weight check.
-void finalizeLayerWithoutHostWeights(bool peerLossRecovery)
+void finalizeLayerWithoutHostWeights(bool rankFailureRecovery)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
     TLLM_CUDA_CHECK(cudaSetDevice(0));
@@ -644,7 +644,7 @@ void finalizeLayerWithoutHostWeights(bool peerLossRecovery)
     void* slotMemory = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&slotMemory, kSlotCountPerRank * kBytes));
     std::unique_ptr<void, decltype(&cudaFree)> const slotMemoryOwner(slotMemory, &cudaFree);
-    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/0, peerLossRecovery);
+    MoeLoadBalancer loadBalancer(/*epRank=*/0, /*epSize=*/4, /*layerUpdatesPerIter=*/0, rankFailureRecovery);
     loadBalancer.setUseGpuMemcpy(true);
     auto layer = loadBalancer.AddLayer(/*expertCount=*/4, /*topK=*/2, kSlotCountPerRank);
     for (int slotId = 0; slotId < kSlotCountPerRank; ++slotId)
@@ -662,17 +662,17 @@ void finalizeLayerWithoutHostWeights(bool peerLossRecovery)
 
 TEST(MoeLoadBalancerFaultToleranceOffTest, FinalizeRejectsWeightSlotsWithoutHostWeights)
 {
-    EXPECT_THROW(finalizeLayerWithoutHostWeights(/*peerLossRecovery=*/false), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(finalizeLayerWithoutHostWeights(/*rankFailureRecovery=*/false), tensorrt_llm::common::TllmException);
 }
 
 TEST(MoeLoadBalancerFaultToleranceOnTest, FinalizeAcceptsWeightSlotsWithoutHostWeights)
 {
-    EXPECT_NO_THROW(finalizeLayerWithoutHostWeights(/*peerLossRecovery=*/true));
+    EXPECT_NO_THROW(finalizeLayerWithoutHostWeights(/*rankFailureRecovery=*/true));
 }
 
 // One layer on EP rank 0 of 4 with 2 slots per rank; by default experts 2 and 3 live only on rank 2. With host weights,
 // every expert's is filled with expertId + 1; every local slot starts with its expert's values (0 in a -1 slot).
-// With ghostSlot1, the slots are one ghost range (GhostSlotMemory) whose slot 1 maps no memory, loaded by CPU copies
+// With unbackedSlot1, the slots are one range of UnbackedSlotMemory whose slot 1 is unbacked, loaded by CPU copies
 // where it can be host accessible.
 class RestorePlacementLayer
 {
@@ -680,19 +680,19 @@ public:
     static constexpr int kExpertCount = 4;
     static constexpr int kEpSize = 4;
     static constexpr int kSlotCountPerRank = 2;
-    static constexpr int kDeadRank = 2;
+    static constexpr int kFailedRank = 2;
     // The resident weight "r" holds expert e as e + 1 + kResidentOffset.
     static constexpr float kResidentOffset = 100.0F;
 
     // With residentWeight (CPU copies only), the layer also has weight "r" in host-accessible device memory outside
-    // ghost slot memory.
+    // unbacked slot memory.
     explicit RestorePlacementLayer(bool withHostWeights, int layerUpdatesPerIter = 1, size_t weightElems = 256,
-        bool ghostSlot1 = false, std::vector<int> const& initialAssignments = {0, 1, 0, 1, 2, 3, 0, 1},
+        bool unbackedSlot1 = false, std::vector<int> const& initialAssignments = {0, 1, 0, 1, 2, 3, 0, 1},
         bool residentWeight = false)
-        : mLoadBalancer(/*epRank=*/0, kEpSize, layerUpdatesPerIter, /*peerLossRecovery=*/true)
+        : mLoadBalancer(/*epRank=*/0, kEpSize, layerUpdatesPerIter, /*rankFailureRecovery=*/true)
         , mWeightElems(weightElems)
     {
-        bool const cpuCopies = ghostSlot1 && GhostSlotMemory::hostAccessibleSupported();
+        bool const cpuCopies = unbackedSlot1 && UnbackedSlotMemory::hostAccessibleSupported();
         mLoadBalancer.setUseGpuMemcpy(!cpuCopies);
         mLayer = mLoadBalancer.AddLayer(kExpertCount, /*topK=*/2, kSlotCountPerRank);
         size_t const bytes = mWeightElems * sizeof(float);
@@ -717,15 +717,15 @@ public:
             mResident
                 = static_cast<float*>(HostAccessibleDeviceAllocator::getInstance().allocate(bytes * kSlotCountPerRank));
         }
-        if (ghostSlot1)
+        if (unbackedSlot1)
         {
-            mGhost = static_cast<float*>(
-                GhostSlotMemory::getInstance().allocate(bytes, kSlotCountPerRank, {1}, cpuCopies));
+            mUnbacked = static_cast<float*>(
+                UnbackedSlotMemory::getInstance().allocate(bytes, kSlotCountPerRank, {1}, cpuCopies));
         }
         for (int slotId = 0; slotId < kSlotCountPerRank; ++slotId)
         {
-            float* slot = mGhost ? mGhost + slotId * mWeightElems : nullptr;
-            if (!mGhost)
+            float* slot = mUnbacked ? mUnbacked + slotId * mWeightElems : nullptr;
+            if (!mUnbacked)
             {
                 TLLM_CUDA_CHECK(cudaMalloc(&slot, bytes));
             }
@@ -760,9 +760,9 @@ public:
         {
             HostAccessibleDeviceAllocator::getInstance().free(mResident);
         }
-        if (mGhost)
+        if (mUnbacked)
         {
-            GhostSlotMemory::getInstance().free(mGhost);
+            UnbackedSlotMemory::getInstance().free(mUnbacked);
             return;
         }
         for (auto* slot : mSlots)
@@ -806,7 +806,7 @@ public:
         return value;
     }
 
-    // Empty (-1) slots and slots without host weights need peer-loss recovery.
+    // Empty (-1) slots and slots without host weights need rank-failure recovery.
     MoeLoadBalancer mLoadBalancer;
     std::shared_ptr<SingleLayerMoeLoadBalancer> mLayer;
 
@@ -824,22 +824,22 @@ private:
     size_t mWeightElems;
     std::vector<float*> mHostWeights;
     std::vector<float*> mSlots;
-    float* mGhost = nullptr;
+    float* mUnbacked = nullptr;
     float* mResident = nullptr;
 };
 
-// GhostSlotMemoryTest runs on the memory online EPLB gets: host accessible where it can be.
+// UnbackedSlotMemoryTest runs on the memory online EPLB gets: host accessible where it can be.
 bool hostAccessible()
 {
-    return GhostSlotMemory::hostAccessibleSupported();
+    return UnbackedSlotMemory::hostAccessibleSupported();
 }
 
-void* allocateGhost(size_t slotBytes, int slotCount, std::vector<int> const& emptySlots)
+void* allocateUnbacked(size_t slotBytes, int slotCount, std::vector<int> const& unbackedSlots)
 {
-    return GhostSlotMemory::getInstance().allocate(slotBytes, slotCount, emptySlots, hostAccessible());
+    return UnbackedSlotMemory::getInstance().allocate(slotBytes, slotCount, unbackedSlots, hostAccessible());
 }
 
-// What LocalCreator books for ghost slot memory: GPU bytes.
+// What LocalCreator books for unbacked slot memory: GPU bytes.
 size_t bookedBytes()
 {
     return MemoryCounters::getInstance().getGpu();
@@ -879,13 +879,13 @@ TEST(MoeLoadBalancerRestoreTest, OneSlotPerExpertRoutingKeepsOneReplicaPerExpert
     setup.mLoadBalancer.restorePlacement({}, {{{0, -1}, {1, -1}, {2, 3}, {-1, -1}}});
     setup.mLayer->commitOneSlotRouting();
 
-    // Losing rank 2 moves its experts into empty slots: still one replica each.
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {{{0, 2}, {1, 3}, {-1, -1}, {-1, -1}}});
+    // Rank 2 failing moves its experts into empty slots: still one replica each.
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {{{0, 2}, {1, 3}, {-1, -1}, {-1, -1}}});
     EXPECT_TRUE(setup.mLayer->routesEachExpertToOneSlot());
 
     // A second copy would need the replica-choosing kernel, which captured graphs do not launch.
-    EXPECT_THROW(
-        setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {{{0, 2}, {1, 3}, {-1, -1}, {0, -1}}}),
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement(
+                     {RestorePlacementLayer::kFailedRank}, {{{0, 2}, {1, 3}, {-1, -1}, {0, -1}}}),
         std::exception);
 }
 
@@ -908,17 +908,17 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementLoadsLostExpertsIntoSlots)
 
     // Rank 0 takes expert 2 over a replica of expert 0, rank 1 takes expert 3 over a replica of expert 1.
     std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement});
 
     auto* info = setup.mLayer->getPlacementCpuInfo();
     EXPECT_EQ(info->oldRankExpertIds[0], (std::vector<int>{2, 1}));
-    EXPECT_EQ(info->oldRankExpertIds[RestorePlacementLayer::kDeadRank], (std::vector<int>{-1, -1}));
+    EXPECT_EQ(info->oldRankExpertIds[RestorePlacementLayer::kFailedRank], (std::vector<int>{-1, -1}));
     std::vector<int> const expectedReplicaCounts{2, 2, 1, 1};
     for (int expertId = 0; expertId < RestorePlacementLayer::kExpertCount; ++expertId)
     {
         EXPECT_EQ(info->placementInfoForGPU.expertReplicaCount[expertId], expectedReplicaCounts[expertId]);
     }
-    EXPECT_EQ(setup.slotValue(0), 3.0f); // expert 2, loaded from the host copy
+    EXPECT_EQ(setup.slotValue(0), 3.0f); // expert 2, loaded from the host weights
     EXPECT_EQ(setup.slotValue(1), 2.0f); // expert 1, unchanged
 }
 
@@ -928,9 +928,9 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementRejectsPlacementMissingAnExpert
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     RestorePlacementLayer setup(/*withHostWeights=*/true);
 
-    // Expert 3 has no replica outside the dead rank: nothing may change.
+    // Expert 3 has no replica outside the failed rank: nothing may change.
     std::vector<std::vector<int>> const placement{{2, 1}, {0, 1}, {-1, -1}, {0, 1}};
-    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement}),
         tensorrt_llm::common::TllmException);
     EXPECT_EQ(setup.mLayer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{0, 1}));
     EXPECT_EQ(setup.slotValue(0), 1.0f);
@@ -949,8 +949,8 @@ TEST(MoeLoadBalancerRestoreTest, EmptySlotIsNotRoutedAndTakesALostExpert)
     EXPECT_EQ(info->placementInfoForGPU.expertReplicaCount[1], 2);
     EXPECT_EQ(setup.slotValue(1), 2.0f);
 
-    // Losing rank 2: expert 2 goes into the empty slot and is loaded from its host copy.
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {{{0, 2}, {3, 1}, {-1, -1}, {0, 1}}});
+    // Rank 2 fails: expert 2 goes into the empty slot and is loaded from its host weights.
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {{{0, 2}, {3, 1}, {-1, -1}, {0, 1}}});
     EXPECT_EQ(info->oldRankExpertIds[0], (std::vector<int>{0, 2}));
     std::vector<int> const expectedReplicaCounts{2, 2, 1, 1};
     for (int expertId = 0; expertId < RestorePlacementLayer::kExpertCount; ++expertId)
@@ -967,7 +967,7 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsHostWeights)
     RestorePlacementLayer setup(/*withHostWeights=*/false);
 
     std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
-    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement}),
         tensorrt_llm::common::TllmException);
 }
 
@@ -981,7 +981,7 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementPublishesSlotsTheCallerLoaded)
     std::vector<float> const loaded(256, 7.0f);
     setup.writeSlot(0, loaded);
     std::vector<std::vector<int>> const placement{{2, 1}, {0, 3}, {-1, -1}, {0, 1}};
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}, /*slotsLoaded=*/true);
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement}, /*slotsLoaded=*/true);
 
     auto* info = setup.mLayer->getPlacementCpuInfo();
     EXPECT_EQ(info->oldRankExpertIds[0], (std::vector<int>{2, 1}));
@@ -1002,14 +1002,14 @@ TEST(MoeLoadBalancerRestoreTest, RestorePlacementNeedsQuiesce)
     int statisticEnabled = 0;
     moeWaitSignalForGpuStageForTest(setup.mLayer->getSignal(), &statisticEnabled);
     setup.mLoadBalancer.endIter(0);
-    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement}),
+    EXPECT_THROW(setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement}),
         tensorrt_llm::common::TllmException);
     EXPECT_EQ(setup.mLayer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{0, 1}));
 
     // Once quiesced, the same placement installs.
     moeSetSignalForCpuStageForTest(setup.mLayer->getSignal());
     ASSERT_TRUE(setup.mLoadBalancer.quiesce(/*timeoutMs=*/10000));
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement});
     EXPECT_EQ(setup.mLayer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{2, 1}));
     EXPECT_EQ(setup.slotValue(0), 3.0f);
 }
@@ -1023,30 +1023,30 @@ TEST(MoeLoadBalancerFaultToleranceOffTest, RestorePlacementIsRejected)
     layer->setInitialWeightAssignments({0, 1, 0, 1, 2, 3, 0, 1});
     loadBalancer.finalizeModel();
 
-    // Without fault tolerance the updater cannot install the dead rank's empty (-1) slots: nothing may change.
+    // Without fault tolerance the updater cannot install the failed rank's empty (-1) slots: nothing may change.
     EXPECT_THROW(
         loadBalancer.restorePlacement({2}, {{{2, 1}, {0, 3}, {-1, -1}, {0, 1}}}), tensorrt_llm::common::TllmException);
     EXPECT_EQ(layer->getPlacementCpuInfo()->oldRankExpertIds[0], (std::vector<int>{0, 1}));
 }
 
-TEST(GhostSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
+TEST(UnbackedSlotMemoryTest, UnbackedSlotsShareScratchUntilBacked)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
     // Slots of 3.5 chunks: slot 1 owns chunks 4-6 whole (chunk 3 is shared with slot 0), slot 3 chunks 11-13.
     size_t const slotBytes = 3 * gran + gran / 2;
-    auto& memory = GhostSlotMemory::getInstance();
-    auto* base = static_cast<uint8_t*>(allocateGhost(slotBytes, 4, {1, 3}));
-    auto slot = [&](int i) { return GhostSlotMemory::Range{base + i * slotBytes, slotBytes}; };
+    auto& memory = UnbackedSlotMemory::getInstance();
+    auto* base = static_cast<uint8_t*>(allocateUnbacked(slotBytes, 4, {1, 3}));
+    auto slot = [&](int i) { return UnbackedSlotMemory::Range{base + i * slotBytes, slotBytes}; };
     // Two load balancers: each keeps or releases only the backing it asked for.
     int const owner = 0;
     int const other = 0;
     EXPECT_EQ(memory.unbackedBytes({slot(0)}), 0u);
     EXPECT_EQ(memory.unbackedBytes({slot(1)}), 3 * gran);
     EXPECT_EQ(memory.unbackedBytes({slot(1), slot(3), slot(1)}), 6 * gran);
-    EXPECT_EQ(memory.unbackedBytes({{&slotBytes, 1}}), 0u); // not ghost memory
+    EXPECT_EQ(memory.unbackedBytes({{&slotBytes, 1}}), 0u); // not unbacked slot memory
 
-    // Backed slots keep their bytes; the empty slots' whole chunks share scratch: chunks 4-6 and 11-13 each map a
+    // Backed slots keep their bytes; the unbacked slots' whole chunks share scratch: chunks 4-6 and 11-13 each map a
     // 2-chunk and a 1-chunk scratch allocation, so chunks 4 and 11 are the same memory.
     TLLM_CUDA_CHECK(cudaMemset(base, 1, 4 * slotBytes));
     TLLM_CUDA_CHECK(cudaMemset(base + 2 * slotBytes, 2, slotBytes));
@@ -1085,9 +1085,9 @@ TEST(GhostSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
     EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
     memory.free(base);
 
-    // Adjacent empty slots 1 and 2 are pieces of their own (chunks 4-6 and 7-9): backing slot 1 leaves slot 2's
+    // Adjacent unbacked slots 1 and 2 are pieces of their own (chunks 4-6 and 7-9): backing slot 1 leaves slot 2's
     // chunks unbacked.
-    base = static_cast<uint8_t*>(allocateGhost(slotBytes, 4, {1, 2}));
+    base = static_cast<uint8_t*>(allocateUnbacked(slotBytes, 4, {1, 2}));
     EXPECT_EQ(memory.unbackedBytes({slot(1), slot(2)}), 6 * gran);
     memory.back({slot(1)}, &owner);
     EXPECT_EQ(memory.unbackedBytes({slot(1)}), 0u);
@@ -1099,15 +1099,15 @@ TEST(GhostSlotMemoryTest, EmptySlotsShareScratchUntilBacked)
     memory.free(base);
 }
 
-TEST(GhostSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
+TEST(UnbackedSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
 {
-    // The design's core claim: a CUDA graph captured over a ghost slot keeps working while the memory behind
+    // The design's core claim: a CUDA graph captured over an unbacked slot keeps working while the memory behind
     // it changes (scratch, then backed, then scratch again), without recapture.
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = GhostSlotMemory::getInstance();
-    auto* base = static_cast<uint8_t*>(allocateGhost(2 * gran, 2, {1}));
-    GhostSlotMemory::Range const slot1{base + 2 * gran, 2 * gran};
+    auto& memory = UnbackedSlotMemory::getInstance();
+    auto* base = static_cast<uint8_t*>(allocateUnbacked(2 * gran, 2, {1}));
+    UnbackedSlotMemory::Range const slot1{base + 2 * gran, 2 * gran};
     uint8_t* out = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&out, 2 * gran));
     cudaStream_t stream = nullptr;
@@ -1146,23 +1146,23 @@ TEST(GhostSlotMemoryTest, CapturedGraphReadsWhateverIsMappedBehindASlot)
     memory.free(base);
 }
 
-TEST(GhostSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
+TEST(UnbackedSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = GhostSlotMemory::getInstance();
-    auto release = [](uint8_t* ptr) { GhostSlotMemory::getInstance().free(ptr); };
-    using Ghost = std::unique_ptr<uint8_t, decltype(release)>;
-    // Empty slots map only the shared scratch, so neither range below uses device memory however large it is. The
+    auto& memory = UnbackedSlotMemory::getInstance();
+    auto release = [](uint8_t* ptr) { UnbackedSlotMemory::getInstance().free(ptr); };
+    using Unbacked = std::unique_ptr<uint8_t, decltype(release)>;
+    // Unbacked slots map only the shared scratch, so neither range below uses device memory however large it is. The
     // second is larger than the whole device: no backing for it can be allocated, whatever else uses the GPU, so
     // backing both fails (after the first one's memory was allocated if the first range is processed first).
     size_t freeBytes = 0, totalBytes = 0;
     TLLM_CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
     size_t const hugeBytes = (totalBytes / gran + 1) * gran;
-    Ghost small(static_cast<uint8_t*>(allocateGhost(gran, 2, {1})), release);
-    Ghost huge(static_cast<uint8_t*>(allocateGhost(hugeBytes, 1, {0})), release);
-    GhostSlotMemory::Range const smallSlot{small.get() + gran, gran};
-    GhostSlotMemory::Range const hugeSlot{huge.get(), hugeBytes};
+    Unbacked small(static_cast<uint8_t*>(allocateUnbacked(gran, 2, {1})), release);
+    Unbacked huge(static_cast<uint8_t*>(allocateUnbacked(hugeBytes, 1, {0})), release);
+    UnbackedSlotMemory::Range const smallSlot{small.get() + gran, gran};
+    UnbackedSlotMemory::Range const hugeSlot{huge.get(), hugeBytes};
     auto const gpuBytes = bookedBytes();
     int const owner = 0;
     EXPECT_THROW(memory.back({smallSlot, hugeSlot}, &owner), tensorrt_llm::common::TllmException);
@@ -1176,11 +1176,11 @@ TEST(GhostSlotMemoryTest, BackingThatCannotBeAllocatedChangesNothing)
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-TEST(GhostSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
+TEST(UnbackedSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = GhostSlotMemory::getInstance();
+    auto& memory = UnbackedSlotMemory::getInstance();
     auto freeDeviceBytes = []
     {
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
@@ -1189,7 +1189,7 @@ TEST(GhostSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
         return freeBytes;
     };
     // A first range settles what the driver keeps for the process.
-    memory.free(allocateGhost(gran, 2, {1}));
+    memory.free(allocateUnbacked(gran, 2, {1}));
     size_t const freeBefore = freeDeviceBytes();
     auto const gpuBytes = bookedBytes();
     // Device bytes used since; under the 15 chunks of scratch, as the driver may keep some page tables.
@@ -1200,7 +1200,7 @@ TEST(GhostSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
     };
 
     // The scratch is freed with the last range: freeing it gives back every byte, scratch included.
-    void* range = allocateGhost(gran, 2, {1});
+    void* range = allocateUnbacked(gran, 2, {1});
     EXPECT_LT(freeDeviceBytes(), freeBefore);
     memory.free(range);
     EXPECT_LT(leaked(), 4 * gran);
@@ -1208,33 +1208,34 @@ TEST(GhostSlotMemoryTest, FreedAndFailedAllocationsLeaveNoMemoryBehind)
     // Slots of three quarters of the free memory: slot 0 maps its own memory and slot 1 maps scratch before the
     // memory of slot 2 fails to allocate. The failed allocation unmaps both and releases all the memory it made.
     size_t const slotBytes = freeBefore / 4 * 3 / gran * gran;
-    EXPECT_THROW(allocateGhost(slotBytes, 3, {1}), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(allocateUnbacked(slotBytes, 3, {1}), tensorrt_llm::common::TllmException);
     EXPECT_EQ(bookedBytes(), gpuBytes);
     EXPECT_LT(leaked(), 4 * gran);
-    // The same layout with slot 2 empty fits.
-    range = allocateGhost(slotBytes, 3, {1, 2});
+    // The same layout with slot 2 unbacked fits.
+    range = allocateUnbacked(slotBytes, 3, {1, 2});
     TLLM_CUDA_CHECK(cudaMemset(range, 1, 3 * slotBytes));
     memory.free(range);
     EXPECT_EQ(bookedBytes(), gpuBytes);
     EXPECT_LT(leaked(), 4 * gran);
 }
 
-TEST(GhostSlotMemoryTest, SleepTagsNeverTouchGhostEntries)
+TEST(UnbackedSlotMemoryTest, SleepTagsNeverTouchUnbackedSlotEntries)
 {
-    // Sleep and wakeup release and materialize entries of the process's CudaVirtualMemoryManager by tag. Ghost pieces
-    // have tags of their own: a backed slot keeps its memory and contents, an empty one stays on scratch.
+    // Sleep and wakeup release and materialize entries of the process's CudaVirtualMemoryManager by tag. The pieces of
+    // unbacked slots have tags of their own: a backed slot keeps its memory and contents, an unbacked one stays on
+    // scratch.
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = GhostSlotMemory::getInstance();
-    auto* base = static_cast<uint8_t*>(allocateGhost(gran, 3, {1, 2}));
-    GhostSlotMemory::Range const slot1{base + gran, gran};
-    GhostSlotMemory::Range const slot2{base + 2 * gran, gran};
+    auto& memory = UnbackedSlotMemory::getInstance();
+    auto* base = static_cast<uint8_t*>(allocateUnbacked(gran, 3, {1, 2}));
+    UnbackedSlotMemory::Range const slot1{base + gran, gran};
+    UnbackedSlotMemory::Range const slot2{base + 2 * gran, gran};
     int const owner = 0;
     memory.back({slot1}, &owner);
     memory.keepPending(&owner);
     TLLM_CUDA_CHECK(cudaMemset(base + gran, 7, gran));
     auto& manager = getVirtualMemoryManager();
-    for (char const* tag : {"model", "model_weights", "kv_cache", "ghost", "ghost/"})
+    for (char const* tag : {"model", "model_weights", "kv_cache", "unbacked", "unbacked/"})
     {
         EXPECT_EQ(manager.releaseWithTag(tag), 0u) << tag;
         EXPECT_EQ(manager.materializeWithTag(tag), 0u) << tag;
@@ -1249,13 +1250,13 @@ TEST(GhostSlotMemoryTest, SleepTagsNeverTouchGhostEntries)
     memory.free(base);
 }
 
-TEST(GhostSlotMemoryTest, FailedPieceIsDroppedAndEndsOnScratch)
+TEST(UnbackedSlotMemoryTest, FailedPieceIsDroppedAndEndsOnScratch)
 {
     // A piece whose memory cannot be allocated is dropped by the manager (a bad handle): its range stays on scratch,
     // the piece is added again (a later restore retries it), and freeing the range leaves no memory behind.
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
-    auto& memory = GhostSlotMemory::getInstance();
+    auto& memory = UnbackedSlotMemory::getInstance();
     auto& manager = getVirtualMemoryManager();
     auto freeDeviceBytes = []
     {
@@ -1265,13 +1266,13 @@ TEST(GhostSlotMemoryTest, FailedPieceIsDroppedAndEndsOnScratch)
         return std::make_pair(freeBytes, totalBytes);
     };
     // A first range settles what the driver keeps for the process.
-    memory.free(allocateGhost(gran, 2, {1}));
+    memory.free(allocateUnbacked(gran, 2, {1}));
     auto const [freeBefore, totalBytes] = freeDeviceBytes();
     auto const gpuBytes = bookedBytes();
     // Larger than the whole device: its memory can never be allocated.
     size_t const hugeBytes = (totalBytes / gran + 1) * gran;
-    auto* huge = static_cast<uint8_t*>(allocateGhost(hugeBytes, 1, {0}));
-    GhostSlotMemory::Range const slot{huge, hugeBytes};
+    auto* huge = static_cast<uint8_t*>(allocateUnbacked(hugeBytes, 1, {0}));
+    UnbackedSlotMemory::Range const slot{huge, hugeBytes};
     int const owner = 0;
     manager.retrieveBadHandles();
     for (int attempt = 0; attempt < 2; ++attempt)
@@ -1288,22 +1289,22 @@ TEST(GhostSlotMemoryTest, FailedPieceIsDroppedAndEndsOnScratch)
     EXPECT_LT(freeAfter >= freeBefore ? size_t{0} : freeBefore - freeAfter, 4 * gran);
 }
 
-TEST(GhostSlotMemoryTest, CpuWritesReachResidentAndBackedSlots)
+TEST(UnbackedSlotMemoryTest, CpuWritesReachResidentAndBackedSlots)
 {
     // GDRCopy maps each resident run and each backed piece. A backed slot spans several of them.
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     if (!hostAccessible())
     {
-        GTEST_SKIP() << "Ghost slot memory cannot be host accessible here";
+        GTEST_SKIP() << "Unbacked slot memory cannot be host accessible here";
     }
     size_t const gran = vmmGranularity();
-    // Slots of 2.25 chunks with slot 1 empty: chunks 0-2 and 4-8 are resident runs, chunk 3 is slot 1's piece.
+    // Slots of 2.25 chunks with slot 1 unbacked: chunks 0-2 and 4-8 are resident runs, chunk 3 is slot 1's piece.
     // Slot 1 spans the end of the first run, the piece and the start of the second run.
     size_t const slotBytes = 2 * gran + gran / 4;
-    auto& memory = GhostSlotMemory::getInstance();
+    auto& memory = UnbackedSlotMemory::getInstance();
     auto& allocator = HostAccessibleDeviceAllocator::getInstance();
-    auto* base = static_cast<uint8_t*>(allocateGhost(slotBytes, 4, {1}));
-    GhostSlotMemory::Range const slot1{base + slotBytes, slotBytes};
+    auto* base = static_cast<uint8_t*>(allocateUnbacked(slotBytes, 4, {1}));
+    UnbackedSlotMemory::Range const slot1{base + slotBytes, slotBytes};
     auto readBack = [](uint8_t const* ptr, size_t size)
     {
         std::vector<uint8_t> host(size);
@@ -1342,32 +1343,32 @@ TEST(GhostSlotMemoryTest, CpuWritesReachResidentAndBackedSlots)
     EXPECT_EQ(allocator.getHostPtr(base), nullptr);
 }
 
-TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindAGhostSlot)
+TEST(MoeLoadBalancerRestoreTest, RestoreMapsMemoryBehindAnUnbackedSlot)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
     TLLM_CUDA_CHECK(cudaSetDevice(0));
     size_t const gran = vmmGranularity();
     size_t const elems = 2 * gran / sizeof(float);
-    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*ghostSlot1=*/true);
+    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*unbackedSlot1=*/true);
     setup.mLoadBalancer.restorePlacement({}, {{{0, -1}, {0, 1}, {2, 3}, {0, 1}}});
 
-    // Losing rank 2: expert 2 goes into the ghost slot, which first gets its two chunks.
+    // Rank 2 fails: expert 2 goes into the unbacked slot, which first gets its two chunks.
     std::vector<std::vector<int>> const placement{{0, 2}, {3, 1}, {-1, -1}, {0, 1}};
     EXPECT_EQ(setup.mLoadBalancer.restoreBackingBytes({placement}), static_cast<int64_t>(2 * gran));
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement});
     EXPECT_EQ(setup.mLoadBalancer.restoreBackingBytes({placement}), 0);
     EXPECT_EQ(setup.slotValue(1), 3.0f);
     EXPECT_EQ(setup.slotValue(1, elems - 1), 3.0f);
     EXPECT_EQ(setup.slotValue(0, elems - 1), 1.0f);
 }
 
-TEST(MoeLoadBalancerRestoreTest, UpdatesFillAGhostSlotOnlyOnceARestoreLoadedIt)
+TEST(MoeLoadBalancerRestoreTest, UpdatesFillASpareSlotOnlyOnceARestoreLoadedIt)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
     TLLM_CUDA_CHECK(cudaSetDevice(0));
-    // Slot 1 of every rank is a ghost slot: -1 from the start, outside EPLB's updates.
+    // Slot 1 of every rank is a spare slot: -1 from the start, outside EPLB's updates.
     RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, /*weightElems=*/256,
-        /*ghostSlot1=*/false, {0, -1, 1, -1, 2, -1, 3, -1});
+        /*unbackedSlot1=*/false, {0, -1, 1, -1, 2, -1, 3, -1});
     auto* info = setup.mLayer->getPlacementCpuInfo();
     std::vector<float> const load{1.0F, 2.0F, 3.0F, 4.0F};
 
@@ -1381,20 +1382,20 @@ TEST(MoeLoadBalancerRestoreTest, UpdatesFillAGhostSlotOnlyOnceARestoreLoadedIt)
     EXPECT_EQ(setup.slotValue(0), static_cast<float>(info->oldRankExpertIds[0][0] + 1));
     EXPECT_EQ(setup.slotValue(1), 0.0F);
 
-    // Losing rank 2: its expert goes into rank 0's ghost slot, which then joins EPLB's updates.
+    // Rank 2 fails: its expert goes into rank 0's spare slot, which then joins EPLB's updates.
     auto placement = info->oldRankExpertIds;
-    int const lostExpert = placement[RestorePlacementLayer::kDeadRank][0];
-    placement[RestorePlacementLayer::kDeadRank] = {-1, -1};
+    int const lostExpert = placement[RestorePlacementLayer::kFailedRank][0];
+    placement[RestorePlacementLayer::kFailedRank] = {-1, -1};
     placement[0][1] = lostExpert;
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement});
     EXPECT_EQ(setup.slotValue(1), static_cast<float>(lostExpert + 1));
     setup.mLoadBalancer.resetUpdateSchedule();
 
-    // Rank 0's two slots and slot 0 of ranks 1 and 3 hold the four experts; the other ghost slots stay empty.
+    // Rank 0's two slots and slot 0 of ranks 1 and 3 hold the four experts; the other spare slots stay empty.
     setup.runUpdate(1, load);
     EXPECT_GE(info->oldRankExpertIds[0][0], 0);
     EXPECT_GE(info->oldRankExpertIds[0][1], 0);
-    EXPECT_EQ(info->oldRankExpertIds[RestorePlacementLayer::kDeadRank], (std::vector<int>{-1, -1}));
+    EXPECT_EQ(info->oldRankExpertIds[RestorePlacementLayer::kFailedRank], (std::vector<int>{-1, -1}));
     for (int rank : {1, 3})
     {
         EXPECT_GE(info->oldRankExpertIds[rank][0], 0) << "rank " << rank;
@@ -1408,21 +1409,22 @@ TEST(MoeLoadBalancerRestoreTest, UpdatesFillAGhostSlotOnlyOnceARestoreLoadedIt)
     EXPECT_EQ(setup.slotValue(1), static_cast<float>(info->oldRankExpertIds[0][1] + 1));
 }
 
-TEST(MoeLoadBalancerRestoreTest, CpuCopiesLoadARestoredGhostSlotThroughEachMapping)
+TEST(MoeLoadBalancerRestoreTest, CpuCopiesLoadARestoredUnbackedSlotThroughEachMapping)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);
     TLLM_CUDA_CHECK(cudaSetDevice(0));
-    if (!GhostSlotMemory::hostAccessibleSupported())
+    if (!UnbackedSlotMemory::hostAccessibleSupported())
     {
-        GTEST_SKIP() << "Ghost slot memory cannot be host accessible here";
+        GTEST_SKIP() << "Unbacked slot memory cannot be host accessible here";
     }
     size_t const gran = vmmGranularity();
-    // Slots of 2.25 chunks: ghost slot 1 spans the end of the resident run (chunk 2), its own piece (chunk 3) and the
-    // piece it shares with the space past the slots (chunk 4); each is a mapping of its own.
+    // Slots of 2.25 chunks: unbacked slot 1 spans the end of the resident run (chunk 2), its own piece (chunk 3) and
+    // the piece it shares with the space past the slots (chunk 4); each is a mapping of its own.
     size_t const slotBytes = 2 * gran + gran / 4;
     size_t const elems = slotBytes / sizeof(float);
-    // The layer's resident weight "r" is copied through its host address, the ghost weight "w" by device address.
-    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*ghostSlot1=*/true,
+    // The layer's resident weight "r" is copied through its host address, the weight "w" in unbacked slot memory by
+    // device address.
+    RestorePlacementLayer setup(/*withHostWeights=*/true, /*layerUpdatesPerIter=*/1, elems, /*unbackedSlot1=*/true,
         {0, -1, 1, -1, 2, -1, 3, -1}, /*residentWeight=*/true);
     auto* info = setup.mLayer->getPlacementCpuInfo();
     auto expectSlotHolds = [&](int slotId, float value)
@@ -1440,10 +1442,10 @@ TEST(MoeLoadBalancerRestoreTest, CpuCopiesLoadARestoredGhostSlotThroughEachMappi
         }
     };
 
-    // Losing rank 2: its expert 2 goes into rank 0's ghost slot, whose pieces the restore maps and pins.
+    // Rank 2 fails: its expert 2 goes into rank 0's unbacked slot, whose pieces the restore maps and pins.
     std::vector<std::vector<int>> const placement{{0, 2}, {1, -1}, {-1, -1}, {3, -1}};
     EXPECT_EQ(setup.mLoadBalancer.restoreBackingBytes({placement}), static_cast<int64_t>(2 * gran));
-    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kDeadRank}, {placement});
+    setup.mLoadBalancer.restorePlacement({RestorePlacementLayer::kFailedRank}, {placement});
     expectSlotHolds(1, 3.0F);
 
     // EPLB's updates then load both slots of rank 0 with CPU copies.
@@ -1487,7 +1489,7 @@ protected:
         auto param = GetParam();
         TLLM_CUDA_CHECK(cudaSetDevice(0));
         mLoadBalancer = std::make_unique<MoeLoadBalancer>(
-            param.epRank, param.epSize, param.layerUpdatesPerIter, peerLossRecovery());
+            param.epRank, param.epSize, param.layerUpdatesPerIter, rankFailureRecovery());
 
         mLoadBalancer->setUseGpuMemcpy(true);
 
@@ -1953,17 +1955,17 @@ protected:
     std::vector<std::vector<int>> mLayerUpdateSchedule;               // Layers to update in each iteration
     int64_t mLastIterId;                                              // Save last iteration ID for verification
 
-    virtual bool peerLossRecovery() const
+    virtual bool rankFailureRecovery() const
     {
         return false;
     }
 };
 
-// The same model under WideEP peer-loss recovery: quiesce needs the worker of fault tolerance.
+// The same model under WideEP rank-failure recovery: quiesce needs the worker of fault tolerance.
 class MoeLoadBalancerRecoveryTest : public MoeLoadBalancerTest
 {
 protected:
-    bool peerLossRecovery() const override
+    bool rankFailureRecovery() const override
     {
         return true;
     }

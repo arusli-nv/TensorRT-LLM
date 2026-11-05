@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "ghostSlotMemory.h"
+#include "unbackedSlotMemory.h"
 #include "hostAccessibleDeviceAllocator.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -51,7 +51,7 @@ struct HostAccessConfigurator : CUDAVirtualMemoryChunk::Configurator
     size_t mSize;
 };
 
-// The allocation of ghost slot memory: device memory, GPUDirect RDMA capable if host accessible (GDRCopy maps it).
+// The allocation of unbacked slot memory: device memory, GPUDirect RDMA capable if host accessible (GDRCopy maps it).
 CUmemAllocationProp slotMemoryProp(int device, bool hostAccessible)
 {
     CUmemAllocationProp prop{};
@@ -103,13 +103,13 @@ void releaseLogged(CUDAVirtualMemoryChunk& chunk) noexcept
     }
     catch (std::exception const& error)
     {
-        TLLM_LOG_ERROR("Releasing ghost slot memory failed: %s", error.what());
+        TLLM_LOG_ERROR("Releasing unbacked slot memory failed: %s", error.what());
     }
 }
 } // namespace
 
 // The scratch allocations of 1, 2, 4 and 8 chunks, shared by every piece and released with the last one.
-struct GhostSlotMemory::Scratch
+struct UnbackedSlotMemory::Scratch
 {
     Scratch(CUmemAllocationProp const& prop, size_t chunkBytes, CUmemAccessDesc accessDesc)
         : granularity(chunkBytes)
@@ -190,7 +190,7 @@ struct GhostSlotMemory::Scratch
 // The first configurator of a piece's manager entry: setup() unmaps the piece's scratch before the piece's own
 // memory is mapped, teardown() maps the scratch back after that memory is unmapped. Every release, rollback and
 // eviction of the entry thus ends with the piece on scratch.
-class GhostSlotMemory::ScratchSwap : public CUDAVirtualMemoryChunk::Configurator
+class UnbackedSlotMemory::ScratchSwap : public CUDAVirtualMemoryChunk::Configurator
 {
 public:
     ScratchSwap(std::shared_ptr<Scratch> scratch, CUdeviceptr address, size_t chunks)
@@ -235,7 +235,7 @@ public:
             }
             // A destructor must not throw.
             TLLM_LOG_ERROR(
-                "Ghost slot memory at %p left unmapped: %s", reinterpret_cast<void*>(mAddress), error.what());
+                "Unbacked slot memory at %p left unmapped: %s", reinterpret_cast<void*>(mAddress), error.what());
         }
     }
 
@@ -245,18 +245,18 @@ private:
     size_t mChunks;
 };
 
-GhostSlotMemory& GhostSlotMemory::getInstance()
+UnbackedSlotMemory& UnbackedSlotMemory::getInstance()
 {
     // Never destroyed: CUDA may be torn down before static destructors run.
-    static auto* instance = new GhostSlotMemory;
+    static auto* instance = new UnbackedSlotMemory;
     return *instance;
 }
 
-bool GhostSlotMemory::hostAccessibleSupported()
+bool UnbackedSlotMemory::hostAccessibleSupported()
 {
     // Tried once per process (one device): one chunk is mapped for the host through GDRCopy as allocate() would map
     // each of its allocations, and the host writes a pattern into it that the GPU reads back. A failure, or GPU memory
-    // that is a NUMA node, leaves ghost slot memory in device memory.
+    // that is a NUMA node, leaves unbacked slot memory in device memory.
     static bool const supported = []
     {
         auto& allocator = HostAccessibleDeviceAllocator::getInstance();
@@ -267,8 +267,8 @@ bool GhostSlotMemory::hostAccessibleSupported()
             if (HostAccessibleDeviceAllocator::gpuMemoryNumaId() >= 0)
             {
                 TLLM_LOG_INFO(
-                    "GPU memory is a NUMA node: ghost slot memory keeps device memory (host access on NUMA-mode GPUs "
-                    "is untested); online EPLB uses empty extra slots");
+                    "GPU memory is a NUMA node: unbacked slot memory keeps device memory (host access on NUMA-mode "
+                    "GPUs is untested); online EPLB uses backed spare slots");
                 return false;
             }
             if (!HostAccessibleDeviceAllocator::isSupportedWithoutManagedFallback())
@@ -313,7 +313,7 @@ bool GhostSlotMemory::hostAccessibleSupported()
         catch (std::exception const& error)
         {
             TLLM_LOG_WARNING(
-                "Ghost slot memory stays in device memory: GDRCopy cannot map it for the host: %s", error.what());
+                "Unbacked slot memory stays in device memory: GDRCopy cannot map it for the host: %s", error.what());
         }
         if (referenced)
         {
@@ -324,12 +324,12 @@ bool GhostSlotMemory::hostAccessibleSupported()
     return supported;
 }
 
-CUmemAllocationProp GhostSlotMemory::allocationProp() const
+CUmemAllocationProp UnbackedSlotMemory::allocationProp() const
 {
     return slotMemoryProp(mDevice, mHostAccessible);
 }
 
-void GhostSlotMemory::releaseScratch() noexcept
+void UnbackedSlotMemory::releaseScratch() noexcept
 {
     mScratch.reset();
     if (mHostAccessible)
@@ -338,7 +338,7 @@ void GhostSlotMemory::releaseScratch() noexcept
     }
 }
 
-CUDAVirtualMemoryChunk GhostSlotMemory::mapResident(CUdeviceptr address, size_t size) const
+CUDAVirtualMemoryChunk UnbackedSlotMemory::mapResident(CUdeviceptr address, size_t size) const
 {
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, size, mScratch->access));
@@ -359,7 +359,7 @@ CUDAVirtualMemoryChunk GhostSlotMemory::mapResident(CUdeviceptr address, size_t 
     return chunk;
 }
 
-void GhostSlotMemory::addPiece(Piece const& piece) const
+void UnbackedSlotMemory::addPiece(Piece const& piece) const
 {
     size_t const bytes = piece.count * mGranularity;
     CUDAVirtualMemoryChunk::Configurators configurators;
@@ -367,14 +367,14 @@ void GhostSlotMemory::addPiece(Piece const& piece) const
     configurators.push_back(std::make_unique<UnicastConfigurator>(piece.address, bytes, mScratch->access));
     if (mHostAccessible)
     {
-        // Pinned only while backed: no CPU copy writes a ghost slot on scratch.
+        // Pinned only while backed: no CPU copy writes an unbacked slot on scratch.
         configurators.push_back(std::make_unique<HostAccessConfigurator>(piece.address, bytes));
     }
     getVirtualMemoryManager().add(piece.address, piece.tag,
         CUDAVirtualMemoryChunk(std::make_unique<LocalCreator<>>(allocationProp(), bytes), std::move(configurators)));
 }
 
-void GhostSlotMemory::dropPiece(Piece const& piece) const noexcept
+void UnbackedSlotMemory::dropPiece(Piece const& piece) const noexcept
 {
     // A backed piece maps its scratch back as it is released.
     auto chunk = getVirtualMemoryManager().remove(piece.address);
@@ -385,21 +385,21 @@ void GhostSlotMemory::dropPiece(Piece const& piece) const noexcept
     }
     catch (std::exception const& error)
     {
-        TLLM_LOG_ERROR("Unmapping the scratch of ghost slot memory at %p failed: %s",
+        TLLM_LOG_ERROR("Unmapping the scratch of unbacked slot memory at %p failed: %s",
             reinterpret_cast<void*>(piece.address), error.what());
     }
 }
 
-void* GhostSlotMemory::allocate(
-    size_t slotBytes, int slotCount, std::vector<int> const& emptySlots, bool onHostAccessibleMemory)
+void* UnbackedSlotMemory::allocate(
+    size_t slotBytes, int slotCount, std::vector<int> const& unbackedSlots, bool onHostAccessibleMemory)
 {
     TLLM_CHECK_WITH_INFO(slotBytes > 0 && slotCount > 0, "No slots to allocate");
     TLLM_CHECK_WITH_INFO(
-        !onHostAccessibleMemory || hostAccessibleSupported(), "Ghost slot memory cannot be host accessible here");
+        !onHostAccessibleMemory || hostAccessibleSupported(), "Unbacked slot memory cannot be host accessible here");
     std::lock_guard<std::mutex> lock(mMutex);
     int device = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
-    TLLM_CHECK_WITH_INFO(mDevice < 0 || mDevice == device, "Ghost slot memory serves one device per process");
+    TLLM_CHECK_WITH_INFO(mDevice < 0 || mDevice == device, "Unbacked slot memory serves one device per process");
     if (!mScratch)
     {
         mDevice = device;
@@ -426,29 +426,29 @@ void* GhostSlotMemory::allocate(
         }
     }
     TLLM_CHECK_WITH_INFO(onHostAccessibleMemory == mHostAccessible,
-        "Ghost slot memory ranges that exist at once are all host accessible or all not");
+        "Unbacked slot memory ranges that exist at once are all host accessible or all not");
     size_t const slots = static_cast<size_t>(slotCount);
-    std::vector<bool> empty(slots, false);
-    for (int slot : emptySlots)
+    std::vector<bool> unbacked(slots, false);
+    for (int slot : unbackedSlots)
     {
-        TLLM_CHECK_WITH_INFO(slot >= 0 && slot < slotCount, "Empty slot %d is not in [0, %d)", slot, slotCount);
-        empty[slot] = true;
+        TLLM_CHECK_WITH_INFO(slot >= 0 && slot < slotCount, "Unbacked slot %d is not in [0, %d)", slot, slotCount);
+        unbacked[slot] = true;
     }
     size_t const bytes = slotBytes * slots;
     size_t const chunks = common::divUp(bytes, mGranularity);
-    // Per chunk: the empty slot holding all its bytes (slots past the last slot), -1 if a byte is in a backed slot,
-    // or a value of its own below -1 if it spans several empty slots. A run of one value is a piece.
+    // Per chunk: the unbacked slot holding all its bytes (slots past the last slot), -1 if a byte is in a backed slot,
+    // or a value of its own below -1 if it spans several unbacked slots. A run of one value is a piece.
     std::vector<int64_t> slotOf(chunks);
     for (size_t chunk = 0; chunk < chunks; ++chunk)
     {
         size_t const first = std::min(chunk * mGranularity / slotBytes, slots);
         size_t const last = std::min(((chunk + 1) * mGranularity - 1) / slotBytes, slots);
-        bool ghost = true;
-        for (size_t slot = first; slot <= last && ghost; ++slot)
+        bool inPiece = true;
+        for (size_t slot = first; slot <= last && inPiece; ++slot)
         {
-            ghost = slot == slots || empty[slot];
+            inPiece = slot == slots || unbacked[slot];
         }
-        slotOf[chunk] = !ghost ? -1 : first == last ? static_cast<int64_t>(first) : -2 - static_cast<int64_t>(chunk);
+        slotOf[chunk] = !inPiece ? -1 : first == last ? static_cast<int64_t>(first) : -2 - static_cast<int64_t>(chunk);
     }
 
     CUdeviceptr base = 0;
@@ -474,7 +474,7 @@ void* GhostSlotMemory::allocate(
             else
             {
                 auto const& piece = allocation.pieces.emplace_back(Piece{address, chunk, run - chunk,
-                    common::fmtstr("ghost/%llx/%zu", static_cast<unsigned long long>(base), chunk), false});
+                    common::fmtstr("unbacked/%llx/%zu", static_cast<unsigned long long>(base), chunk), false});
                 mScratch->map(piece.address, piece.count);
                 addPiece(piece);
             }
@@ -501,13 +501,13 @@ void* GhostSlotMemory::allocate(
     return reinterpret_cast<void*>(base);
 }
 
-void GhostSlotMemory::free(void* ptr) noexcept
+void UnbackedSlotMemory::free(void* ptr) noexcept
 {
     std::lock_guard<std::mutex> lock(mMutex);
     auto it = mAllocations.find(reinterpret_cast<CUdeviceptr>(ptr));
     if (it == mAllocations.end())
     {
-        TLLM_LOG_ERROR("%p is not ghost slot memory", ptr);
+        TLLM_LOG_ERROR("%p is not unbacked slot memory", ptr);
         return;
     }
     // Unlike cudaFree, cuMemUnmap does not wait for the work queued on the range: wait for it here.
@@ -536,7 +536,7 @@ void GhostSlotMemory::free(void* ptr) noexcept
     }
 }
 
-std::vector<GhostSlotMemory::Piece*> GhostSlotMemory::unbackedPieces(std::vector<Range> const& ranges)
+std::vector<UnbackedSlotMemory::Piece*> UnbackedSlotMemory::unbackedPieces(std::vector<Range> const& ranges)
 {
     std::vector<Piece*> pieces;
     for (auto const& [ptr, size] : ranges)
@@ -568,7 +568,7 @@ std::vector<GhostSlotMemory::Piece*> GhostSlotMemory::unbackedPieces(std::vector
     return pieces;
 }
 
-size_t GhostSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
+size_t UnbackedSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     size_t chunks = 0;
@@ -579,7 +579,7 @@ size_t GhostSlotMemory::unbackedBytes(std::vector<Range> const& ranges)
     return chunks * mGranularity;
 }
 
-void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
+void UnbackedSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
 {
     TLLM_CHECK_WITH_INFO(owner != nullptr, "Pending slot backing needs an owner");
     std::lock_guard<std::mutex> lock(mMutex);
@@ -591,7 +591,7 @@ void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
         for (; done < pieces.size(); ++done)
         {
             TLLM_CHECK_WITH_INFO(manager.materializeWithTag(pieces[done]->tag) == 1,
-                "Ghost slot memory %s has no released manager entry", pieces[done]->tag.c_str());
+                "Unbacked slot memory %s has no released manager entry", pieces[done]->tag.c_str());
         }
     }
     catch (...)
@@ -604,7 +604,8 @@ void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
         }
         catch (std::exception const& error)
         {
-            TLLM_LOG_ERROR("Ghost slot memory %s cannot be backed again: %s", pieces[done]->tag.c_str(), error.what());
+            TLLM_LOG_ERROR(
+                "Unbacked slot memory %s cannot be backed again: %s", pieces[done]->tag.c_str(), error.what());
         }
         while (done-- > 0)
         {
@@ -614,7 +615,7 @@ void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
             }
             catch (std::exception const& error)
             {
-                TLLM_LOG_ERROR("Releasing ghost slot memory %s failed: %s", pieces[done]->tag.c_str(), error.what());
+                TLLM_LOG_ERROR("Releasing unbacked slot memory %s failed: %s", pieces[done]->tag.c_str(), error.what());
             }
         }
         throw;
@@ -627,7 +628,7 @@ void GhostSlotMemory::back(std::vector<Range> const& ranges, Owner owner)
     }
 }
 
-size_t GhostSlotMemory::releasePending(Owner owner)
+size_t UnbackedSlotMemory::releasePending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     auto const it = mPending.find(owner);
@@ -660,13 +661,13 @@ size_t GhostSlotMemory::releasePending(Owner owner)
     return chunks * mGranularity;
 }
 
-void GhostSlotMemory::keepPending(Owner owner)
+void UnbackedSlotMemory::keepPending(Owner owner)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     mPending.erase(owner);
 }
 
-bool GhostSlotMemory::contains(void const* ptr)
+bool UnbackedSlotMemory::contains(void const* ptr)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     auto const address = reinterpret_cast<CUdeviceptr>(ptr);

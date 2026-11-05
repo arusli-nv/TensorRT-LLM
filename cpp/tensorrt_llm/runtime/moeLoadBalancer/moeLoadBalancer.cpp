@@ -495,9 +495,9 @@ SingleLayerMoeLoadBalancer::~SingleLayerMoeLoadBalancer()
 void SingleLayerMoeLoadBalancer::addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot)
 {
     bool const gpuAccess = mMoeLoadBalancer->mUseGpuMemcpy;
-    // CPU copies write ghost slot memory of WideEP fault tolerance through its device address.
-    weightSlot.mDeviceAddressed = !gpuAccess && mMoeLoadBalancer->mPeerLossRecovery
-        && GhostSlotMemory::getInstance().contains(weightSlot.mWeightPtr);
+    // CPU copies write unbacked slot memory of WideEP fault tolerance through its device address.
+    weightSlot.mDeviceAddressed = !gpuAccess && mMoeLoadBalancer->mRankFailureRecovery
+        && UnbackedSlotMemory::getInstance().contains(weightSlot.mWeightPtr);
     mWeightUpdater->addSingleWeightSlot(localSlotId, name, weightSlot, gpuAccess);
 }
 
@@ -510,8 +510,8 @@ void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> co
 {
     std::fill_n(mCpuPlacementInfo.expertReplicaCount.begin(), mMetaInfo.expertCount, 0);
     mUnusableSlots.clear();
-    // Empty (-1) slots are ghost slots of WideEP fault tolerance.
-    int const minExpertId = mMoeLoadBalancer->mPeerLossRecovery ? -1 : 0;
+    // Empty (-1) slots are spare slots of WideEP fault tolerance.
+    int const minExpertId = mMoeLoadBalancer->mRankFailureRecovery ? -1 : 0;
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
@@ -592,7 +592,7 @@ void SingleLayerMoeLoadBalancer::setGpuStage()
 
 void SingleLayerMoeLoadBalancer::waitCpuStage()
 {
-    if (!mMoeLoadBalancer->mPeerLossRecovery)
+    if (!mMoeLoadBalancer->mRankFailureRecovery)
     {
         tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal);
         return;
@@ -663,7 +663,8 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeReplicaCounts(
 bool SingleLayerMoeLoadBalancer::routesEachExpertToOneSlot() const
 {
     // Without fault tolerance, routing uses the replica-choosing kernel.
-    return mMoeLoadBalancer->mPeerLossRecovery && mOneReplicaPerExpert && mMoeLoadBalancer->mLayerUpdatesPerIter == 0;
+    return mMoeLoadBalancer->mRankFailureRecovery && mOneReplicaPerExpert
+        && mMoeLoadBalancer->mLayerUpdatesPerIter == 0;
 }
 
 void SingleLayerMoeLoadBalancer::commitOneSlotRouting()
@@ -747,7 +748,7 @@ void SingleLayerMoeLoadBalancer::installPlacement(
 }
 
 void SingleLayerMoeLoadBalancer::appendLoadedSlotRanges(
-    std::vector<std::vector<int>> const& rankExpertIds, std::vector<GhostSlotMemory::Range>& ranges) const
+    std::vector<std::vector<int>> const& rankExpertIds, std::vector<UnbackedSlotMemory::Range>& ranges) const
 {
     auto const& current = mCpuPlacementInfo.oldRankExpertIds[mMetaInfo.epRank];
     for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
@@ -877,7 +878,7 @@ void MoeWeightUpdaterBase::addSingleWeightSlot(
     mWeightSlots[name][localSlotId] = weightSlot;
 }
 
-void MoeWeightUpdaterBase::appendSlotRanges(int localSlotId, std::vector<GhostSlotMemory::Range>& ranges) const
+void MoeWeightUpdaterBase::appendSlotRanges(int localSlotId, std::vector<UnbackedSlotMemory::Range>& ranges) const
 {
     for (auto const& [name, slots] : mWeightSlots)
     {
@@ -984,7 +985,7 @@ void HostMemoryMoeWeightUpdater::finalizeWeights()
     finalizeWeightSlot();
     // Under WideEP fault tolerance a layer may have no host weights: then only restorePlacement with slotsLoaded
     // changes the slots.
-    if (!mHostWeights.empty() || !mLayerLoadBalancer->mMoeLoadBalancer->mPeerLossRecovery)
+    if (!mHostWeights.empty() || !mLayerLoadBalancer->mMoeLoadBalancer->mRankFailureRecovery)
     {
         finalizeHostWeight();
     }
@@ -1073,7 +1074,7 @@ void HostMemoryMoeWeightUpdater::updateWeights(
 {
     // PrintUpdateInfo(mMetaInfo, placementCpuInfo);
     bool useGpu = mLayerLoadBalancer->mMoeLoadBalancer->mUseGpuMemcpy;
-    int const minExpertId = mLayerLoadBalancer->mMoeLoadBalancer->mPeerLossRecovery ? -1 : 0;
+    int const minExpertId = mLayerLoadBalancer->mMoeLoadBalancer->mRankFailureRecovery ? -1 : 0;
     for (int slotId = 0; slotId < mMetaInfo.slotCountPerRank; ++slotId)
     {
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
@@ -1109,14 +1110,14 @@ void HostMemoryMoeWeightUpdater::updateWeights(
 // Moe Load Balancer
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter, bool peerLossRecovery)
+MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter, bool rankFailureRecovery)
     : mEpRank{epRank}
     , mEpSize{epSize}
     , mDeadRankMask(epSize, 0)
     , mLayerUpdatesPerIter{layerUpdatesPerIter}
 {
-    mPeerLossRecovery = peerLossRecovery;
-    if (mPeerLossRecovery)
+    mRankFailureRecovery = rankFailureRecovery;
+    if (mRankFailureRecovery)
     {
         HostAccessibleDeviceAllocator::retainForProcessLifetime();
     }
@@ -1319,7 +1320,7 @@ void MoeLoadBalancer::restorePlacement(std::vector<int> const& deadRanks,
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot restore placement.");
-    TLLM_CHECK_WITH_INFO(mPeerLossRecovery, "restorePlacement needs WideEP peer-loss recovery");
+    TLLM_CHECK_WITH_INFO(mRankFailureRecovery, "restorePlacement needs WideEP rank-failure recovery");
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot restore placement while an iteration is active.");
     TLLM_CHECK_WITH_INFO(mIterInfoQueue.empty(), "Cannot restore placement while iterations are queued.");
     // The worker walks the layers of a popped iteration without the lock: only quiesce makes it idle.
@@ -1336,7 +1337,7 @@ void MoeLoadBalancer::restorePlacement(std::vector<int> const& deadRanks,
     {
         mLayers[i]->validatePlacement(candidateDeadRankMask, layerRankExpertIds[i], slotsLoaded);
     }
-    GhostSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
+    UnbackedSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
     // Static placement never started the copy threads CPU copies need; start() is a no-op once they run.
     if (!mUseGpuMemcpy)
     {
@@ -1352,15 +1353,15 @@ void MoeLoadBalancer::restorePlacement(std::vector<int> const& deadRanks,
     }
     // The memory mapped for this placement serves it. If an install above throws, the recovery fails closed
     // and the process ends, so the pending memory is never released under installed experts.
-    GhostSlotMemory::getInstance().keepPending(this);
+    UnbackedSlotMemory::getInstance().keepPending(this);
 }
 
-std::vector<GhostSlotMemory::Range> MoeLoadBalancer::loadedSlotRanges(
+std::vector<UnbackedSlotMemory::Range> MoeLoadBalancer::loadedSlotRanges(
     std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds) const
 {
     TLLM_CHECK_WITH_INFO(layerRankExpertIds.size() == mLayers.size(), "Got placements for %ld layers, expected %ld",
         static_cast<long>(layerRankExpertIds.size()), static_cast<long>(mLayers.size()));
-    std::vector<GhostSlotMemory::Range> ranges;
+    std::vector<UnbackedSlotMemory::Range> ranges;
     for (size_t i = 0; i < mLayers.size(); ++i)
     {
         mLayers[i]->appendLoadedSlotRanges(layerRankExpertIds[i], ranges);
@@ -1372,28 +1373,28 @@ int64_t MoeLoadBalancer::restoreBackingBytes(std::vector<std::vector<std::vector
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot inspect slots while an iteration is active.");
-    return static_cast<int64_t>(GhostSlotMemory::getInstance().unbackedBytes(loadedSlotRanges(layerRankExpertIds)));
+    return static_cast<int64_t>(UnbackedSlotMemory::getInstance().unbackedBytes(loadedSlotRanges(layerRankExpertIds)));
 }
 
 void MoeLoadBalancer::backRestoredSlots(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds)
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot back slots while an iteration is active.");
-    GhostSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
+    UnbackedSlotMemory::getInstance().back(loadedSlotRanges(layerRankExpertIds), this);
 }
 
 int64_t MoeLoadBalancer::releaseUninstalledBacking()
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot release slot memory while an iteration is active.");
-    return static_cast<int64_t>(GhostSlotMemory::getInstance().releasePending(this));
+    return static_cast<int64_t>(UnbackedSlotMemory::getInstance().releasePending(this));
 }
 
 bool MoeLoadBalancer::quiesce(int64_t timeoutMs)
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
     TLLM_CHECK_WITH_INFO(mModelFinalized == true, "Model is not finalized, cannot quiesce.");
-    TLLM_CHECK_WITH_INFO(mPeerLossRecovery, "quiesce needs WideEP peer-loss recovery");
+    TLLM_CHECK_WITH_INFO(mRankFailureRecovery, "quiesce needs WideEP rank-failure recovery");
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot quiesce while an iteration is active.");
     if (mLayerUpdatesPerIter == 0)
     {
@@ -1422,7 +1423,7 @@ bool MoeLoadBalancer::quiesce(int64_t timeoutMs)
 void MoeLoadBalancer::resetUpdateSchedule()
 {
     std::unique_lock<std::mutex> workerLock(mWorkerThreadMutex);
-    TLLM_CHECK_WITH_INFO(mPeerLossRecovery, "resetUpdateSchedule needs WideEP peer-loss recovery");
+    TLLM_CHECK_WITH_INFO(mRankFailureRecovery, "resetUpdateSchedule needs WideEP rank-failure recovery");
     TLLM_CHECK_WITH_INFO(!mIterActive && mIterInfoQueue.empty() && mWorkerDoneIterId == mIterId,
         "The update schedule can only be reset while quiesced.");
     if (mLayerUpdatesPerIter > 0)
@@ -1470,7 +1471,7 @@ void MoeLoadBalancer::workerThread()
         }
         // Under fault tolerance, quiesce and resetUpdateSchedule read the schedule and the finished iteration.
         std::unique_lock<std::mutex> lock(mWorkerThreadMutex, std::defer_lock);
-        if (mPeerLossRecovery)
+        if (mRankFailureRecovery)
         {
             lock.lock();
         }
@@ -1480,7 +1481,7 @@ void MoeLoadBalancer::workerThread()
             mUpdateLayerQueue.pop_front();
             mUpdateLayerQueue.push_back(currentUpdatedLayers);
         }
-        if (mPeerLossRecovery)
+        if (mRankFailureRecovery)
         {
             mWorkerDoneIterId = iterId;
             mWorkerDoneCondition.notify_all();

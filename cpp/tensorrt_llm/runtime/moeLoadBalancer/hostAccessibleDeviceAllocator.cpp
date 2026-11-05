@@ -278,7 +278,7 @@ std::atomic<bool> gRetainForProcessLifetime{false};
 HostAccessibleDeviceAllocator* HostAccessibleDeviceAllocator::retainedInstance()
 {
     // Never destroyed: the process's CudaVirtualMemoryManager, destroyed after a static allocator, may still
-    // unregister backed ghost slot memory (WideEP fault tolerance) from its entries' teardown.
+    // unregister the memory a restore mapped behind unbacked slots (WideEP fault tolerance) from its entries' teardown.
     static HostAccessibleDeviceAllocator* const retained
         = gRetainForProcessLifetime.load() ? new HostAccessibleDeviceAllocator : nullptr;
     return retained;

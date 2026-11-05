@@ -17,9 +17,9 @@
 
 #include "moeBindings.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/unbackedSlotMemory.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -102,9 +102,9 @@ void initMoeBindings(nb::module_& m)
     // Bind MoeLoadBalancer class
     nb::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
         .def(nb::init<int, int, int, bool>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
-            nb::arg("peer_loss_recovery") = false,
+            nb::arg("rank_failure_recovery") = false,
             "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, update frequency and "
-            "whether WideEP peer-loss recovery is enabled",
+            "whether WideEP rank-failure recovery is enabled",
             nb::call_guard<nb::gil_scoped_release>())
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, nb::arg("use_gpu_memcpy"),
             "Set whether to use GPU memcpy for weight updates", nb::call_guard<nb::gil_scoped_release>())
@@ -127,7 +127,7 @@ void initMoeBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
             nb::arg("layer_rank_expert_ids"), nb::arg("slots_loaded") = false,
-            "Mark dead EP ranks and install a new placement per layer, loading changed local slots from host weights",
+            "Mark failed EP ranks and install a new placement per layer, loading changed local slots from host weights",
             nb::call_guard<nb::gil_scoped_release>())
         .def("quiesce", &tr::MoeLoadBalancer::quiesce, nb::arg("timeout_ms"),
             "Wait until started iterations and weight updates are done; false on timeout",
@@ -136,10 +136,10 @@ void initMoeBindings(nb::module_& m)
             "Restart the layer update rotation and clear the load factors (only while quiesced)",
             nb::call_guard<nb::gil_scoped_release>())
         .def("restore_backing_bytes", &tr::MoeLoadBalancer::restoreBackingBytes, nb::arg("layer_rank_expert_ids"),
-            "Device memory a restore of this placement maps behind ghost slots",
+            "Device memory a restore of this placement maps behind unbacked slots",
             nb::call_guard<nb::gil_scoped_release>())
         .def("back_restored_slots", &tr::MoeLoadBalancer::backRestoredSlots, nb::arg("layer_rank_expert_ids"),
-            "Map device memory behind the ghost slots a restore of this placement loads",
+            "Map device memory behind the unbacked slots a restore of this placement loads",
             nb::call_guard<nb::gil_scoped_release>())
         .def("release_uninstalled_backing", &tr::MoeLoadBalancer::releaseUninstalledBacking,
             "Return the memory mapped for a placement that was never installed; the bytes freed",
@@ -149,8 +149,8 @@ void initMoeBindings(nb::module_& m)
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
         "If current system support host accessible device memory");
-    m.def("is_ghost_slot_memory_host_accessible", &tr::GhostSlotMemory::hostAccessibleSupported,
-        "Whether ghost slot memory can be host accessible without the managed memory fallback, for CPU copies");
+    m.def("is_unbacked_slot_memory_host_accessible", &tr::UnbackedSlotMemory::hostAccessibleSupported,
+        "Whether unbacked slot memory can be host accessible without the managed memory fallback, for CPU copies");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, nb::arg("meta_info"), nb::arg("expert_load_factor"),

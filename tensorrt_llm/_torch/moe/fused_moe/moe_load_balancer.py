@@ -1203,7 +1203,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             ep_rank,
             ep_size,
             layer_updates_per_iter,
-            peer_loss_recovery=peer_loss_recovery_enabled())
+            rank_failure_recovery=rank_failure_recovery_enabled())
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self._setup_mpi_comm()

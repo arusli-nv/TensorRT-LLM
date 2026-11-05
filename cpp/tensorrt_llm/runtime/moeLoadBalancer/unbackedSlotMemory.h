@@ -19,38 +19,38 @@
 namespace tensorrt_llm::runtime
 {
 
-// Device storage for an EPLB slot tensor whose empty (ghost) slots hold no device memory until a restore fills them.
+// Device storage for an EPLB slot tensor whose unbacked slots hold no device memory until a restore fills them.
 // It is device memory that GPU copies load or, on request where hostAccessibleSupported(), GPUDirect RDMA capable
 // device memory that CPU copies load through HostAccessibleDeviceAllocator, which GDRCopy pins and maps for the host
 // while it is mapped. Where GPU memory is a NUMA node, it is device memory only.
 // The tensor is one virtual address range that stays fully mapped for the life of the process (CUDA graphs capture
-// its address). Chunks of the VMM granularity that lie wholly inside empty slots form ghost pieces, cut at slot
+// its address). Chunks of the VMM granularity that lie wholly inside unbacked slots form pieces, cut at slot
 // boundaries. While released, a piece maps scratch memory shared by every range of the process (one allocation each
-// of 1, 2, 4 and 8 chunks), so an access that strays into a ghost slot reads or writes scratch instead of faulting.
-// Each piece is an entry of the process's CudaVirtualMemoryManager under its own tag (ghost/<range>/<first chunk>),
+// of 1, 2, 4 and 8 chunks), so an access that strays into an unbacked slot reads or writes scratch instead of faulting.
+// Each piece is an entry of the process's CudaVirtualMemoryManager under its own tag (unbacked/<range>/<first chunk>),
 // added released; materializing it maps device memory in place of its scratch, releasing it maps scratch back. The
 // other chunks of the range are mapped to their own device memory at allocate(), one allocation per run of them. Each
-// such run and each backed piece is one host-accessible record; a backed ghost slot may span several (its own piece and
-// the runs or pieces it shares boundary chunks with), so CPU copies address it by device address.
+// such run and each backed piece is one host-accessible record; a slot whose piece is backed may span several (its own
+// piece and the runs or pieces it shares boundary chunks with), so CPU copies address it by device address.
 //
 // The instance is shared by every MoeLoadBalancer of the process, so the pieces that back() materializes are pending
 // for the owner that asked for them: keepPending() and releasePending() act on that owner's pieces only.
-class GhostSlotMemory
+class UnbackedSlotMemory
 {
 public:
     using Range = std::pair<void const*, size_t>;
     // Whose pending backing it is (the MoeLoadBalancer that restores the slots).
     using Owner = void const*;
 
-    static GhostSlotMemory& getInstance();
+    static UnbackedSlotMemory& getInstance();
 
     // Whether allocate() can place memory that CPU copies load through GDRCopy: false where GPU memory is a NUMA node.
     static bool hostAccessibleSupported();
 
-    // A range for slotCount slots of slotBytes each on the current device; the slots in emptySlots are not backed. The
-    // ranges that exist at once are all host accessible or all not.
+    // A range for slotCount slots of slotBytes each on the current device; the slots in unbackedSlots are not backed.
+    // The ranges that exist at once are all host accessible or all not.
     void* allocate(
-        size_t slotBytes, int slotCount, std::vector<int> const& emptySlots, bool onHostAccessibleMemory = false);
+        size_t slotBytes, int slotCount, std::vector<int> const& unbackedSlots, bool onHostAccessibleMemory = false);
     // Waits for the device's work, then unmaps and releases the range; errors are logged (a tensor deleter must not
     // throw).
     void free(void* ptr) noexcept;
@@ -58,7 +58,7 @@ public:
     // Device bytes that back(ranges) would allocate.
     size_t unbackedBytes(std::vector<Range> const& ranges);
 
-    // Materializes every released ghost piece that overlaps ranges (ranges outside these allocations are ignored).
+    // Materializes every released piece that overlaps ranges (ranges outside these allocations are ignored).
     // If one fails, the pieces materialized before it are released again and the manager's entry of the failed one
     // is added again: every piece is back on scratch. The new backing is pending until keepPending(owner). Only
     // while no kernel uses the slots.
@@ -75,7 +75,7 @@ private:
     struct Scratch;
     class ScratchSwap;
 
-    // Chunks [first, first + count) of an allocation, at address, all inside the same empty slots.
+    // Chunks [first, first + count) of an allocation, at address, all inside the same unbacked slots.
     struct Piece
     {
         CUdeviceptr address;
@@ -90,11 +90,11 @@ private:
         // Declared first so that it is freed after the chunks are unmapped.
         std::shared_ptr<void> reservation;
         size_t size;
-        std::vector<Piece> pieces;                    // the ghost pieces, by first chunk
+        std::vector<Piece> pieces;                    // the pieces of unbacked slots, by first chunk
         std::vector<CUDAVirtualMemoryChunk> resident; // the other chunks, mapped to their own device memory
     };
 
-    GhostSlotMemory() = default;
+    UnbackedSlotMemory() = default;
 
     CUmemAllocationProp allocationProp() const;
     // Releases the scratch, after the last range.

@@ -30,7 +30,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer/ghostSlotMemory.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/unbackedSlotMemory.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -42,7 +42,7 @@ struct MoeWeight
     size_t mHeight = 0;
     size_t mWidth = 0;
     size_t mPitch = 0;
-    // Set at registration on a CPU-copied slot in ghost slot memory, which keeps its device address.
+    // Set at registration on a CPU-copied slot in unbacked slot memory, which keeps its device address.
     bool mDeviceAddressed = false;
 
     int64_t getWeightPtr() const
@@ -88,13 +88,13 @@ public:
     virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) = 0;
     virtual bool hasHostWeights() const = 0;
     // The device bytes of every weight of localSlotId.
-    void appendSlotRanges(int localSlotId, std::vector<GhostSlotMemory::Range>& ranges) const;
+    void appendSlotRanges(int localSlotId, std::vector<UnbackedSlotMemory::Range>& ranges) const;
 
 protected:
     void finalizeWeightSlot();
     bool mWeightSlotsFinalized = false;
-    // With CPU copies, a slot holds its host-accessible address, except a slot in ghost slot memory: its host mapping
-    // changes as restores back it, so it keeps its device address (MoeWeight::mDeviceAddressed).
+    // With CPU copies, a slot holds its host-accessible address, except a slot in unbacked slot memory: its host
+    // mapping changes as restores back it, so it keeps its device address (MoeWeight::mDeviceAddressed).
     std::map<std::string, std::vector<MoeWeight>> mWeightSlots;
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo mMetaInfo;
     SingleLayerMoeLoadBalancer* mLayerLoadBalancer;
@@ -142,7 +142,7 @@ public:
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight);
 
     // set initial weight assignments for each slot
-    // index is the global slot id, value is the expert id; under WideEP peer-loss recovery
+    // index is the global slot id, value is the expert id; under WideEP rank-failure recovery
     // -1 leaves the slot empty and out of EPLB's updates until a restore loads an expert into it
     // should bind to python
     void setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments);
@@ -227,7 +227,7 @@ private:
         std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds, bool slotsLoaded);
     // The device bytes of the local slots that installing rankExpertIds loads.
     void appendLoadedSlotRanges(
-        std::vector<std::vector<int>> const& rankExpertIds, std::vector<GhostSlotMemory::Range>& ranges) const;
+        std::vector<std::vector<int>> const& rankExpertIds, std::vector<UnbackedSlotMemory::Range>& ranges) const;
     // Rejects replica counts the captured routing kernel cannot serve (see commitOneSlotRouting).
     void checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const;
     // Caches whether the replica counts of a placement set outside EPLB's updates are one per expert.
@@ -246,7 +246,7 @@ private:
 
     void copyPlacementInfoToGpu();
     void copyPlacementInfoToGpuByCpu();
-    // Loads the local slots whose expert changed in mCpuPlacementInfo from the host copies, by GPU memcpy or the
+    // Loads the local slots whose expert changed in mCpuPlacementInfo from the host weights, by GPU memcpy or the
     // copy threads, then publishes the placement to routing.
     void loadAndPublishPlacement();
     void updateWeightsRoutine();
@@ -312,7 +312,7 @@ private:
 class MoeLoadBalancer
 {
 public:
-    MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter, bool peerLossRecovery = false);
+    MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter, bool rankFailureRecovery = false);
     ~MoeLoadBalancer();
 
     // Add a new layer to the load balancer
@@ -340,8 +340,8 @@ public:
     void reconfigureMaskOnly(std::vector<int> const& deadRanks);
 
     // should bind to python
-    // Mark deadRanks dead and install a new placement per layer ([epSize][slotCountPerRank] expert ids, -1 = an
-    // empty slot that routing skips; dead ranks' rows are ignored), loading the local slots that get a new expert
+    // Mark deadRanks failed and install a new placement per layer ([epSize][slotCountPerRank] expert ids, -1 = an
+    // empty slot that routing skips; failed ranks' rows are ignored), loading the local slots that get a new expert
     // from EPLB's host weights (with slotsLoaded, the caller loaded them). Every layer is validated before any
     // changes; only under WideEP fault tolerance and while quiesced.
     void restorePlacement(std::vector<int> const& deadRanks,
@@ -352,12 +352,12 @@ public:
     // placement no longer changes. Returns false if that takes longer than timeoutMs (a forward that never reached
     // the GPU stage). Only while no iteration runs. After an interrupted iteration, only once the device work of
     // that iteration is done: the worker then sets the CPU stage of the layers the forward did not reach itself.
-    // Needs WideEP peer-loss recovery at finalizeModel.
+    // Needs WideEP rank-failure recovery at finalizeModel.
     bool quiesce(int64_t timeoutMs);
 
     // should bind to python
-    // Device memory that restorePlacement(layerRankExpertIds) must map behind the local slots it loads (ghost
-    // slot storage, see GhostSlotMemory). Only while no iteration runs.
+    // Device memory that restorePlacement(layerRankExpertIds) must map behind the local slots it loads (unbacked
+    // slot storage, see UnbackedSlotMemory). Only while no iteration runs.
     int64_t restoreBackingBytes(std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
 
     // should bind to python
@@ -373,7 +373,7 @@ public:
     // should bind to python
     // Restart the layer update rotation from the update plan's first entry and clear every layer's load factors,
     // so ranks that ran different numbers of iterations update the same layers from the same statistics again.
-    // Only while quiesced. Needs WideEP peer-loss recovery at finalizeModel.
+    // Only while quiesced. Needs WideEP rank-failure recovery at finalizeModel.
     void resetUpdateSchedule();
 
     // Test interface to use GPU to do memcpy test functionality
@@ -386,7 +386,7 @@ private:
     friend class SingleLayerMoeLoadBalancer;
     friend class HostMemoryMoeWeightUpdater;
 
-    std::vector<GhostSlotMemory::Range> loadedSlotRanges(
+    std::vector<UnbackedSlotMemory::Range> loadedSlotRanges(
         std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds) const;
 
     void startThreads();
@@ -403,9 +403,9 @@ private:
     int64_t mInterruptedIterId = -1;
     // The iteration whose pending CPU stages the worker sets itself, -1 if none (see quiesce).
     std::atomic<int64_t> mAbandonedIterId{-1};
-    // WideEP peer-loss recovery: only then does the worker publish mWorkerDoneIterId and release
+    // WideEP rank-failure recovery: only then does the worker publish mWorkerDoneIterId and release
     // abandoned CPU stages, so quiesce needs it.
-    bool mPeerLossRecovery = false;
+    bool mRankFailureRecovery = false;
     bool mWorkerThreadStopped = true;
     int64_t mWarmUpUntilIter = -1;
 

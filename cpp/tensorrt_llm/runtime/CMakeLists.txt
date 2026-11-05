@@ -28,9 +28,9 @@ set(SRCS
     ipcSocket.cpp
     mcastDeviceMemory.cpp
     moeLoadBalancer/gdrwrap.cpp
-    moeLoadBalancer/ghostSlotMemory.cpp
     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
+    moeLoadBalancer/unbackedSlotMemory.cpp
     ncclCommunicator.cpp
     workerPool.cpp)
 

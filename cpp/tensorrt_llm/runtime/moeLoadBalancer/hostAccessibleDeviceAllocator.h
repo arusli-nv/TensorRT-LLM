@@ -27,8 +27,8 @@
 namespace tensorrt_llm::runtime
 {
 
-class GhostSlotMemory;
 class MoeLoadBalancer;
+class UnbackedSlotMemory;
 
 namespace unit_tests
 {
@@ -51,7 +51,7 @@ public:
 
     /**
      * @brief Keep the instance for the whole process instead of destroying it at exit. Must precede the first
-     * getInstance(); WideEP fault tolerance needs it for ghost slot memory.
+     * getInstance(); WideEP fault tolerance needs it for unbacked slot memory.
      */
     static void retainForProcessLifetime();
 
@@ -116,7 +116,7 @@ public:
      * @brief Records device memory allocated and mapped elsewhere, so that getHostPtr() and the copies serve it. Where
      * GPU memory is a NUMA node, the host reaches it at its device address; otherwise GDRCopy pins and maps it, which
      * needs memory allocated GPUDirect RDMA capable, aligned to GPU pages, and one physical allocation per record.
-     * Needs an initialized allocator (a live MoeLoadBalancer or GhostSlotMemory's host-accessible memory).
+     * Needs an initialized allocator (a live MoeLoadBalancer or UnbackedSlotMemory's host-accessible memory).
      */
     void registerHostAccessible(void* devPtr, size_t size);
 
@@ -156,7 +156,7 @@ private:
     void shutdown();
 
     friend class tensorrt_llm::runtime::MoeLoadBalancer;
-    friend class tensorrt_llm::runtime::GhostSlotMemory;
+    friend class tensorrt_llm::runtime::UnbackedSlotMemory;
     friend class tensorrt_llm::runtime::unit_tests::HostAccessibleDeviceAllocatorTest;
 
     /**
