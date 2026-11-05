@@ -4981,9 +4981,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._has_cp_helix and not req.is_dummy_request and req.py_helix_decode_group_index > 0:
             # The forward pass for this step is skipped; give the step back.
             req.py_helix_decode_group_index -= 1
-        self._give_back_generation_step(request_id, kv_cache, draft_slots)
+        self._roll_back_generation_step(request_id, kv_cache, draft_slots)
 
-    def _give_back_generation_step(self, request_id: int, kv_cache, draft_slots: int) -> None:
+    def _roll_back_generation_step(self, request_id: int, kv_cache, draft_slots: int) -> None:
         """Shrink a generation request's cache by one step's allocation: its token and ``draft_slots``."""
         reverted_cap = kv_cache.capacity - 1 - draft_slots
         if reverted_cap < 0:
@@ -5817,15 +5817,15 @@ class KVCacheManagerV2(BaseResourceManager):
             req.py_request_id: req.py_ctx_pre_resize_cap for req in scheduled_batch.context_requests
         }
 
-    def revert_prepare_resources(
+    def roll_back_prepare_resources(
         self, scheduled_batch: ScheduledRequests, context_capacities: Dict[int, Optional[int]]
     ) -> None:
-        """Undo the scheduler's KV cache allocations for a step whose forward is discarded.
+        """Undo the scheduler's KV cache allocations for a step that is rolled back.
 
-        Steps are reverted newest first; ``context_capacities`` is the step's :meth:`context_capacities`.
+        Steps are rolled back newest first; ``context_capacities`` is the step's :meth:`context_capacities`.
         A request's first context chunk frees its cache; a later chunk shrinks back to its capacity before
-        the step and stays resident; a generation request gives back the step's newest allocation. A cache
-        that is no longer active is left alone. Connectors and SWA scratch reuse are not reverted.
+        the step and stays resident; a generation request drops the step's newest allocation. A cache
+        that is no longer active is left alone. Connectors and SWA scratch reuse are not rolled back.
 
         Raises:
             RuntimeError: A cache could not be resized back.
@@ -5843,7 +5843,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             if not kv_cache.resize(pre_cap):
                 raise RuntimeError(
-                    f"Failed to revert KV cache capacity for context request "
+                    f"Failed to roll back KV cache capacity for context request "
                     f"{req.py_request_id} to {pre_cap}"
                 )
             self._after_shrink(req.py_request_id, kv_cache)
@@ -5858,7 +5858,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._allocated_draft_lens.pop(request_id, None)
             kv_cache = self.kv_cache_map.get(request_id)
             if kv_cache is not None and kv_cache.is_active:
-                self._give_back_generation_step(request_id, kv_cache, draft_slots)
+                self._roll_back_generation_step(request_id, kv_cache, draft_slots)
 
     def _publish_sparse_metadata(self) -> None:
         """Refresh stable GPU rows on the execution stream before model work.
