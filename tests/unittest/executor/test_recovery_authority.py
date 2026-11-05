@@ -11,7 +11,7 @@ import time
 import pytest
 import zmq
 
-from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm._utils import rank_failure_recovery_enabled
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.executor.recovery import authority as authority_module
 from tensorrt_llm.executor.recovery import client as recovery_client
@@ -70,8 +70,8 @@ def _register_all(authority, recoverable=lambda rank: RECOVERABLE):
     return out
 
 
-def _registered(timeout: float = 10.0, fence_departed: bool = True) -> RecoveryAuthority:
-    authority = RecoveryAuthority(WORLD, recovery_timeout=timeout, fence_departed=fence_departed)
+def _registered(timeout: float = 10.0, fence_failed: bool = True) -> RecoveryAuthority:
+    authority = RecoveryAuthority(WORLD, recovery_timeout=timeout, fence_failed=fence_failed)
     out = _register_all(authority, lambda rank: ((1,), NODE, (FAILED,)))
     assert authority.phase is Phase.SERVING
     admitted = Registered(((1,), (FAILED,), NODE))
@@ -83,11 +83,11 @@ def _report(authority, message_type, ranks=SURVIVORS, now=1.0, **fields):
     out = []
     for rank in ranks:
         out = authority.handle(_route(rank), message_type(rank, **fields), now)
-    return _fence_departed(authority, out, now)
+    return _fence_failed(authority, out, now)
 
 
-def _fence_departed(authority, out, now):
-    """Rank 0 answers the authority's request to fence departed ranks: the runtime ended each."""
+def _fence_failed(authority, out, now):
+    """Rank 0 answers the authority's request to fence failed ranks: the runtime ended each."""
     fences = [message for _, message in out if isinstance(message, Fence)]
     if not fences:
         return out
@@ -118,7 +118,7 @@ def test_workers_reporting_different_recoverable_domains_abort(other):
     assert {route for route, _ in out} == {_route(rank) for rank in range(WORLD)}
 
 
-def test_idle_loss_recovers():
+def test_idle_rank_failure_recovers():
     authority = _registered()
     authority.handle(_route(0), Stopped(0, (FAILED,)), 1.0)
     assert authority.phase is Phase.STOPPING
@@ -130,18 +130,18 @@ def test_idle_loss_recovers():
     assert out == [(_route(rank), Install(1)) for rank in SURVIVORS]
     out = _report(authority, Installed, generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in SURVIVORS]
-    assert authority.phase is Phase.RECOVERED and authority.generation == 1
+    assert authority.phase is Phase.DEGRADED and authority.generation == 1
     assert authority.deadline is None and authority.expire(1e9) == []
 
 
-def test_node_loss_recovers_in_one_transaction():
+def test_node_failure_recovers_in_one_transaction():
     authority = _registered()
     out = _report(authority, Stopped, (0, 1), failed_ranks=NODE)
     assert out == [(_route(rank), Propose(1, NODE, (0, 1))) for rank in (0, 1)]
     _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
     out = _report(authority, Installed, (0, 1), generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
-    assert authority.failed_ranks == frozenset(NODE) and authority.phase is Phase.RECOVERED
+    assert authority.failed_ranks == frozenset(NODE) and authority.phase is Phase.DEGRADED
 
 
 def _status(authority) -> Status:
@@ -157,11 +157,11 @@ def test_status_reports_the_recovery_and_its_stage_durations():
     assert _status(authority).phase == "STOPPING"
     _report(authority, Stopped, (1,), now=1.5, failed_ranks=NODE)
     _report(authority, Ready, (0, 1), now=1.75, generation=1, placement_digest="digest")
-    # Rank 0 routes every request, so it reports how many the departed ranks were serving.
+    # Rank 0 routes every request, so it reports how many the failed ranks were serving.
     authority.handle(_route(0), Installed(0, 1, failed_requests=3), 2.0)
     _report(authority, Installed, (1,), now=2.0, generation=1)
     assert _status(authority) == Status(
-        "RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 3, ""
+        "DEGRADED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 3, ""
     )
 
 
@@ -176,7 +176,7 @@ def test_status_is_answered_after_an_abort_and_changes_nothing():
 
 
 @pytest.mark.parametrize("failed", [(0,), (0, 1), ()])
-def test_unadmitted_loss_aborts_every_worker(failed):
+def test_unadmitted_failure_aborts_every_worker(failed):
     authority = _registered()
     out = authority.handle(_route(1), Stopped(1, failed), 1.0)
     _assert_aborted(out, authority)
@@ -191,12 +191,12 @@ def test_a_stray_message_while_serving_is_refused_without_ending_the_deployment(
     # A frame that does not decode (e.g. version skew) likewise.
     assert [route for route, _ in authority.reject("bad frame", _route(1))] == [_route(1)]
     assert authority.phase is Phase.SERVING
-    # A loss report is real: one the deployment cannot recover from is terminal.
+    # A rank-failure report is real: one the deployment cannot recover from is terminal.
     _assert_aborted(authority.handle(_route(1), Stopped(1, (0,)), 1.0), authority)
 
 
 def _in_phase(phase: Phase) -> RecoveryAuthority:
-    """An authority in ``phase``, recovering from the loss of rank ``FAILED`` once registered."""
+    """An authority in ``phase``, recovering from the failure of rank ``FAILED`` once registered."""
     if phase is Phase.REGISTERING:
         authority = RecoveryAuthority(WORLD, recovery_timeout=10.0)
         authority.handle(_route(0), Register(0, RECOVERABLE, DIGEST), 0.0)
@@ -208,7 +208,7 @@ def _in_phase(phase: Phase) -> RecoveryAuthority:
         lambda: _report(authority, Ready, generation=1, placement_digest="d"),
         lambda: _report(authority, Installed, generation=1),
     ]
-    # Each step enters the next phase: STOPPING, PREPARING, INSTALLING, RECOVERED.
+    # Each step enters the next phase: STOPPING, PREPARING, INSTALLING, DEGRADED.
     for step in steps:
         if authority.phase is phase:
             break
@@ -225,7 +225,7 @@ def _in_phase(phase: Phase) -> RecoveryAuthority:
         Phase.STOPPING,
         Phase.PREPARING,
         Phase.INSTALLING,
-        Phase.RECOVERED,
+        Phase.DEGRADED,
     ],
     ids=lambda phase: phase.name.lower(),
 )
@@ -246,7 +246,7 @@ def test_a_recovery_completes_after_a_frame_that_does_not_decode():
     _report(authority, Stopped, SURVIVORS[1:], failed_ranks=(FAILED,))
     _report(authority, Ready, generation=1, placement_digest="digest")
     out = _report(authority, Installed, generation=1)
-    assert authority.phase is Phase.RECOVERED
+    assert authority.phase is Phase.DEGRADED
     assert out == [(_route(rank), Commit(1)) for rank in SURVIVORS]
 
 
@@ -255,7 +255,7 @@ def test_a_recovery_completes_after_a_frame_that_does_not_decode():
     [
         (_route(3), Stopped(3, (1,))),  # second distinct failure
         (_route(0), Stopped(0, (1, 3))),  # a different failed set (a larger one is a re-plan)
-        (_route(FAILED), Stopped(FAILED, (FAILED,))),  # departed rank still talking
+        (_route(FAILED), Stopped(FAILED, (FAILED,))),  # failed rank still talking
         (_route(1), Stopped(1, (FAILED,))),  # duplicate report
         (_route(1), Ready(1, 1, "digest")),  # Ready before Propose
         (_route(1), Commit(1)),  # authority-only message from a worker
@@ -272,7 +272,7 @@ def test_protocol_violations_abort(route, message):
 
 @pytest.mark.parametrize(
     "phase",
-    [Phase.SERVING, Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING, Phase.RECOVERED],
+    [Phase.SERVING, Phase.STOPPING, Phase.PREPARING, Phase.INSTALLING, Phase.DEGRADED],
     ids=lambda phase: phase.name.lower(),
 )
 @pytest.mark.parametrize(
@@ -388,7 +388,7 @@ def test_recovery_deadline_aborts_and_aborted_is_terminal(phase_reports):
     assert authority.expire(1e9) == []
 
 
-def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
+def test_a_rank_failure_during_the_recovery_plans_again_with_every_failed_rank():
     """Rank 3 fails while the survivors prepare to drop rank 2: the plan restarts without both."""
     authority = _registered()
     authority.handle(_route(1), Stopped(1, (FAILED,)), 1.0)
@@ -396,9 +396,9 @@ def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
     assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
     assert authority.handle(_route(0), Ready(0, 1, "digest"), 1.0) == []
 
-    lost = (FAILED, 3)
-    assert authority.handle(_route(0), Stopped(0, lost), 2.0) == []
-    assert authority.phase is Phase.STOPPING and authority.failed_ranks == frozenset(lost)
+    failed = (FAILED, 3)
+    assert authority.handle(_route(0), Stopped(0, failed), 2.0) == []
+    assert authority.phase is Phase.STOPPING and authority.failed_ranks == frozenset(failed)
     # Every round shares the first round's deadline.
     assert authority.deadline == pytest.approx(11.0)
     # Rank 3 sent this before it failed.
@@ -406,22 +406,22 @@ def test_a_loss_during_the_recovery_plans_again_with_every_lost_rank():
     # Rank 1 sent these before it saw rank 3 fail; its Stopped for the new plan follows.
     assert authority.handle(_route(1), Ready(1, 1, "digest"), 2.0) == []
     assert authority.handle(_route(1), Stopped(1, (FAILED,)), 2.0) == []
-    out = authority.handle(_route(1), Stopped(1, lost), 2.0)
+    out = authority.handle(_route(1), Stopped(1, failed), 2.0)
     # Rank 2 was fenced in the first round; only rank 3 is asked for.
     assert out == [(_route(0), Fence(3, 0))]
-    out = _fence_departed(authority, out, 2.0)
-    proposal = Propose(1, lost, (0, 1))
+    out = _fence_failed(authority, out, 2.0)
+    proposal = Propose(1, failed, (0, 1))
     assert out == [(_route(rank), proposal) for rank in (0, 1)]
     _report(authority, Ready, (0, 1), generation=1, placement_digest="digest")
     out = _report(authority, Installed, (0, 1), generation=1)
     assert out == [(_route(rank), Commit(1)) for rank in (0, 1)]
-    assert authority.phase is Phase.RECOVERED and authority.survivors == (0, 1)
+    assert authority.phase is Phase.DEGRADED and authority.survivors == (0, 1)
 
 
-def test_a_departed_rank_not_known_dead_is_fenced_before_the_proposal():
+def test_a_failed_rank_not_known_ended_is_fenced_before_the_proposal():
     """The survivors may agree on a failure detector's suspicion: rank 0 ends the rank before any plan."""
     authority = _registered()
-    authority.handle(b"evidence-2", Heartbeat(FAILED, 0, False, "node", 4242), 0.5)
+    authority.handle(b"reporter-2", Heartbeat(FAILED, 0, False, "node", 4242), 0.5)
     authority.handle(_route(1), Stopped(1, (FAILED,)), 1.0)
     out = authority.handle(_route(3), Stopped(3, (FAILED,)), 1.0)
     assert out == []
@@ -434,14 +434,14 @@ def test_a_departed_rank_not_known_dead_is_fenced_before_the_proposal():
 
 
 def test_without_hang_detection_the_proposal_follows_the_survivors_reports_without_a_fence():
-    authority = _registered(fence_departed=False)
+    authority = _registered(fence_failed=False)
     for rank in SURVIVORS:
         out = authority.handle(_route(rank), Stopped(rank, (FAILED,)), 1.0)
     assert out == [(_route(rank), Propose(1, (FAILED,), SURVIVORS)) for rank in SURVIVORS]
     assert authority.phase is Phase.PREPARING
 
 
-def test_a_departed_rank_that_cannot_be_fenced_aborts_the_recovery():
+def test_a_failed_rank_that_cannot_be_fenced_aborts_the_recovery():
     authority = _registered()
     for rank in SURVIVORS:
         authority.handle(_route(rank), Stopped(rank, (FAILED,)), 1.0)
@@ -463,13 +463,13 @@ def test_a_fence_answer_from_another_rank_or_for_a_live_rank_aborts(message):
     _assert_aborted(authority.handle(_route(message.rank), message, 1.25), authority)
 
 
-def test_a_loss_during_the_recovery_that_takes_rank0_aborts():
+def test_a_rank_failure_during_the_recovery_that_takes_rank0_aborts():
     authority = _registered()
     _report(authority, Stopped, (1, 3), failed_ranks=(FAILED,))
     _assert_aborted(authority.handle(_route(1), Stopped(1, (0, FAILED)), 2.0), authority)
 
 
-def test_a_loss_after_install_aborts():
+def test_a_rank_failure_after_install_aborts():
     authority = _registered()
     _report(authority, Stopped, failed_ranks=(FAILED,))
     _report(authority, Ready, generation=1, placement_digest="digest")
@@ -482,38 +482,38 @@ def _recovered_without_failed() -> RecoveryAuthority:
     _report(authority, Stopped, failed_ranks=(FAILED,))
     _report(authority, Ready, generation=1, placement_digest="digest")
     _report(authority, Installed, generation=1)
-    assert authority.phase is Phase.RECOVERED
+    assert authority.phase is Phase.DEGRADED
     return authority
 
 
-def test_a_further_loss_after_a_recovery_recovers_again():
-    """Rank 1 is lost after the recovery without rank 2: a second recovery commits generation 2.
+def test_a_further_rank_failure_after_a_recovery_recovers_again():
+    """Rank 1 fails after the recovery without rank 2: a second recovery commits generation 2.
 
     The survivors report both ranks; the recovery has its own deadline and stage durations.
     """
     authority = _recovered_without_failed()
-    lost = (1, FAILED)
-    authority.handle(_route(0), Stopped(0, lost), 50.0)
+    failed = (1, FAILED)
+    authority.handle(_route(0), Stopped(0, failed), 50.0)
     assert authority.phase is Phase.STOPPING and authority.deadline == pytest.approx(60.0)
-    out = authority.handle(_route(3), Stopped(3, lost), 50.5)
+    out = authority.handle(_route(3), Stopped(3, failed), 50.5)
     # Rank 2 was fenced in the first recovery; only rank 1 is asked for.
     assert out == [(_route(0), Fence(1, 0))]
-    out = _fence_departed(authority, out, 50.5)
-    assert out == [(_route(rank), Propose(2, lost, (0, 3))) for rank in (0, 3)]
+    out = _fence_failed(authority, out, 50.5)
+    assert out == [(_route(rank), Propose(2, failed, (0, 3))) for rank in (0, 3)]
     out = _report(authority, Ready, (0, 3), now=51.0, generation=2, placement_digest="digest2")
     assert out == [(_route(rank), Install(2)) for rank in (0, 3)]
     out = _report(authority, Installed, (0, 3), now=51.25, generation=2, failed_requests=1)
     assert out == [(_route(rank), Commit(2)) for rank in (0, 3)]
-    assert authority.phase is Phase.RECOVERED and authority.deadline is None
+    assert authority.phase is Phase.DEGRADED and authority.deadline is None
     assert authority.status() == Status(
-        "RECOVERED", 2, (0, 3), lost, 2, (500_000, 500_000, 250_000), 2, ""
+        "DEGRADED", 2, (0, 3), failed, 2, (500_000, 500_000, 250_000), 2, ""
     )
 
 
 @pytest.mark.parametrize(
-    "failed", [(1,), (FAILED,), (0, FAILED)], ids=["omits_departed", "no_new_rank", "rank0"]
+    "failed", [(1,), (FAILED,), (0, FAILED)], ids=["omits_absent", "no_new_rank", "rank0"]
 )
-def test_a_further_loss_report_that_is_not_a_superset_or_takes_rank0_aborts(failed):
+def test_a_further_failure_report_that_is_not_a_superset_or_takes_rank0_aborts(failed):
     authority = _recovered_without_failed()
     _assert_aborted(authority.handle(_route(1), Stopped(1, failed), 5.0), authority)
 
@@ -562,9 +562,9 @@ def test_wire_roundtrip_and_authentication(tmp_path):
             Propose(3, NODE, (0, 1)),
             Fence(2, 0),
             Fenced(0, 2, "PMIx refused"),
-            Abort("lost"),
+            Abort("aborted"),
             StatusQuery(),
-            Status("RECOVERED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),
+            Status("DEGRADED", 1, (0, 1), NODE, 1, (500_000, 250_000, 250_000), 2, ""),
             Status("SERVING", 0, (0, 1), (), 0, (), 0, ""),
         ):
             dealer.put(message)
@@ -681,18 +681,18 @@ def test_load_key_removes_the_key_from_the_environment(monkeypatch):
 def test_client_from_env(monkeypatch):
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY", raising=False)
-    peer_loss_recovery_enabled.cache_clear()
+    rank_failure_recovery_enabled.cache_clear()
     assert RecoveryClient.from_env(0) is None  # detection-only mode
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_AUTHORITY", "tcp://127.0.0.1:1")
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_AUTHORITY_KEY", raising=False)
-    peer_loss_recovery_enabled.cache_clear()
+    rank_failure_recovery_enabled.cache_clear()
     with pytest.raises(ValueError, match="KEY"):
         RecoveryClient.from_env(0)
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE")
-    peer_loss_recovery_enabled.cache_clear()
+    rank_failure_recovery_enabled.cache_clear()
     with pytest.raises(ValueError, match="TLLM_FAULT_TOLERANCE_MODE=1"):
         RecoveryClient.from_env(0)
-    peer_loss_recovery_enabled.cache_clear()
+    rank_failure_recovery_enabled.cache_clear()
 
 
 # End to end over ZeroMQ.
@@ -747,7 +747,7 @@ def _register_clients(clients):
 
 
 def _wait_for_proposal(client, rank, deadline) -> Propose:
-    """Wait for the plan; rank 0 first answers each request to fence a departed rank."""
+    """Wait for the plan; rank 0 first answers each request to fence a failed rank."""
     proposal = client.wait((Propose, Fence), deadline)
     while isinstance(proposal, Fence):
         client.send(Fenced(rank, proposal.rank, ""))
@@ -783,7 +783,7 @@ def test_end_to_end_over_zmq(served, clients):
         worker.join()
 
     assert results == {rank: Commit(1) for rank in SURVIVORS}
-    assert authority.phase is Phase.RECOVERED
+    assert authority.phase is Phase.DEGRADED
 
 
 def test_a_refusal_while_serving_does_not_abort_the_next_recovery(clients):
@@ -831,7 +831,7 @@ def test_a_message_that_cannot_be_sent_is_logged(tmp_path, monkeypatch):
     warnings = []
     monkeypatch.setattr(authority_module.logger, "warning", warnings.append)
     try:
-        authority_module._send(router, [(b"gone", Abort("lost"))], -1e9)
+        authority_module._send(router, [(b"gone", Abort("aborted"))], -1e9)
     finally:
         router.close()
     assert len(warnings) == 1 and "could not send" in warnings[0]
@@ -848,16 +848,16 @@ def test_abort_reaches_every_worker(clients):
 
 
 def test_an_interrupted_wait_takes_a_message_that_already_arrived(clients):
-    """E.g. an Install the other survivors act on: dropping it for a later loss would leave them waiting."""
+    """E.g. an Install the other survivors act on: dropping it for a later rank failure would leave them waiting."""
     _register_clients(clients)
-    further_loss = threading.Event()
-    further_loss.set()
+    further_failure = threading.Event()
+    further_failure.set()
     clients[1].send(Stopped(1, (3,)))
     assert clients[0]._queue.poll(5)
     with pytest.raises(RecoveryAborted):
-        clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_loss)
+        clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_failure)
     with pytest.raises(RecoveryInterrupted):
-        clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_loss)
+        clients[0].wait(Propose, time.monotonic() + 5.0, interrupt=further_failure)
 
 
 def test_stopping_during_a_recovery_aborts_it(tmp_path, make_client):
@@ -953,11 +953,11 @@ def test_a_replayed_report_does_not_abort_a_recovery(served, clients):
     _wait_for(authority, Phase.STOPPING)
     assert _replay(endpoint, captured).phase == "STOPPING"
     assert _finish_recovery(clients) == {rank: Commit(1) for rank in SURVIVORS}
-    assert authority.phase is Phase.RECOVERED
+    assert authority.phase is Phase.DEGRADED
 
 
-def test_a_departed_ranks_replayed_messages_are_dropped_on_its_own_route(served, clients):
-    """A rank departs; its captured messages come again on a connection with its routing id."""
+def test_a_failed_ranks_replayed_messages_are_dropped_on_its_own_route(served, clients):
+    """A rank fails; its captured messages come again on a connection with its routing id."""
     authority, endpoint = served
     captured = _captured(clients[FAILED])
     _register_clients(clients)
@@ -965,10 +965,10 @@ def test_a_departed_ranks_replayed_messages_are_dropped_on_its_own_route(served,
     clients[FAILED].close()
     clients[0].send(Stopped(0, (FAILED,)))
     _wait_for(authority, Phase.STOPPING)
-    # Accepted, its Register would abort: registration after it completed, from a departed rank.
+    # Accepted, its Register would abort: registration after it completed, from a failed rank.
     assert _replay(endpoint, captured, routing_id).phase == "STOPPING"
     assert _finish_recovery(clients) == {rank: Commit(1) for rank in SURVIVORS}
-    assert authority.phase is Phase.RECOVERED
+    assert authority.phase is Phase.DEGRADED
 
 
 def test_only_fresh_messages_of_a_ranks_session_are_applied():
@@ -991,8 +991,8 @@ def test_only_fresh_messages_of_a_ranks_session_are_applied():
     ):
         assert authority.receive(_route(1), sent, 1.0) == [], sent
         assert authority.phase is Phase.STOPPING
-    # Evidence is a stream of its own (another connection): a lower sequence number there is fresh.
-    authority.receive(b"evidence-1", Sent(1, "s1", 2, Heartbeat(1, 0, True, "node", 101)), 1.0)
+    # Hang reports are a stream of their own (another connection): a lower sequence number there is fresh.
+    authority.receive(b"reporter-1", Sent(1, "s1", 2, Heartbeat(1, 0, True, "node", 101)), 1.0)
     assert authority._sequences[(1, True)] == 2
     _assert_aborted(
         authority.receive(_route(1), Sent(1, "s1", 6, Ready(1, 1, "d")), 1.0), authority
@@ -1000,7 +1000,7 @@ def test_only_fresh_messages_of_a_ranks_session_are_applied():
 
 
 def test_a_fence_answer_is_applied_only_fresh_from_rank_0_s_protocol_stream():
-    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0, fence_departed=True)
+    authority = RecoveryAuthority(WORLD, recovery_timeout=10.0, fence_failed=True)
     domains = ((1,), NODE, (FAILED,))
     for rank in range(WORLD):
         authority.receive(
@@ -1017,7 +1017,7 @@ def test_a_fence_answer_is_applied_only_fresh_from_rank_0_s_protocol_stream():
         (_route(0), Sent(0, "other", 9, Fenced(0, FAILED, ""))),  # another session
         (_route(1), Sent(1, "s1", 9, Fenced(0, FAILED, ""))),  # rank 1's envelope
         (
-            b"evidence-0",
+            b"reporter-0",
             Sent(0, "s0", 1, Fenced(0, FAILED, "refused")),
         ),  # stale on the protocol stream
     ):

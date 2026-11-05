@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Recovery authority: coordinates the survivors of a lost failure domain (a rank or a node).
+"""Recovery authority: coordinates the survivors when a failure domain (a rank or a node) fails.
 
 Run as ``python -m tensorrt_llm.executor.recovery.authority --world-size N`` with
 ``TLLM_FAULT_TOLERANCE_AUTHORITY_KEY`` set to the hex HMAC key shared with the
@@ -53,11 +53,11 @@ from .protocol import (
     Ready,
     Register,
     Registered,
-    Restart,
     Sent,
     Status,
     StatusQuery,
     Stopped,
+    Terminate,
     Unauthenticated,
     datagram_address,
     decode_datagram,
@@ -87,7 +87,7 @@ class Phase(enum.Enum):
     STOPPING = enum.auto()
     PREPARING = enum.auto()
     INSTALLING = enum.auto()
-    RECOVERED = enum.auto()
+    DEGRADED = enum.auto()
     ABORTED = enum.auto()
 
 
@@ -101,12 +101,12 @@ class _Violation(Exception):
 
 
 class RecoveryAuthority:
-    """State machine for recovering from the loss of admitted failure domains, one recovery after another.
+    """State machine for recovering from failures of admitted failure domains, one recovery after another.
 
-    A failure domain is a set of worker ranks lost together: a single rank or a whole node. A loss recovers only if
-    every survivor reports the same failed set (every rank lost so far) and that set is a union of admitted domains.
-    The authority performs no I/O: ``handle`` and ``expire`` return ``(routing_id, message)`` pairs to send. A
-    protocol violation during registration or a recovery, an unrecoverable loss, or a recovery that does not commit
+    A failure domain is a set of worker ranks that fail together: a single rank or a whole node. A failure recovers
+    only if every survivor reports the same failed set (every rank failed so far) and that set is a union of admitted
+    domains. The authority performs no I/O: ``handle`` and ``expire`` return ``(routing_id, message)`` pairs to send.
+    A protocol violation during registration or a recovery, an unrecoverable failure, or a recovery that does not commit
     within ``recovery_timeout`` moves it to the terminal ``ABORTED`` phase and broadcasts ``Abort``. Its attributes
     are read-only for callers.
 
@@ -116,15 +116,15 @@ class RecoveryAuthority:
         recovery_timeout: Seconds from the first ``Stopped`` to ``Commit``. Keep it
             below the workers' recovery timeout so that workers observe ``Abort``.
         hang_monitor: Judges the workers' heartbeats and device waits; None ignores them. A stall of every
-            rank it reports, or a hung rank whose loss is not admitted (rank 0), aborts (terminal) and has
+            rank it reports, or a hung rank whose failure is not admitted (rank 0), aborts (terminal) and has
             every worker end with ``STALLED_EXIT_CODE``.
         fence: Last resort for a recoverable rank the monitor confirms hung (rank, reason, host and pid), called
-            if its loss has not started a recovery ``COMMAND_FENCE_GRACE_S`` after ``Fence`` went to the rank's own
-            evidence thread and to another rank's (which has the MPI runtime end it). It must end that process,
-            whose loss then recovers as any other. None relies on the workers alone.
+            if its failure has not started a recovery ``COMMAND_FENCE_GRACE_S`` after ``Fence`` went to the rank's
+            own reporter thread and to another rank's (which has the MPI runtime end it). It must end that process,
+            whose failure then recovers as any other. None relies on the workers alone.
         config_digest: The ``FaultToleranceConfig.digest()`` every worker must register with
             (default: that of the default settings).
-        fence_departed: Have rank 0 end every failed rank the authority has not fenced itself through the MPI
+        fence_failed: Have rank 0 end every failed rank the authority has not fenced itself through the MPI
             runtime before each proposal, so no process of a failed rank runs on beside the survivors; a rank
             that cannot be ended aborts.
     """
@@ -137,14 +137,14 @@ class RecoveryAuthority:
         fence: Callable[[HungRank], None] | None = None,
         config_digest: str | None = None,
         *,
-        fence_departed: bool = False,
+        fence_failed: bool = False,
     ) -> None:
         self.world_size = world_size
         self.config_digest = config_digest or FaultToleranceConfig().digest()
         self.recovery_timeout = recovery_timeout
         self.hang_monitor = hang_monitor
         self._fence = fence
-        self._fence_departed = fence_departed
+        self._fence_failed = fence_failed
         self.admitted_domains: frozenset[frozenset[int]] = frozenset()
         self.generation = 0
         self.phase = Phase.REGISTERING
@@ -159,8 +159,8 @@ class RecoveryAuthority:
         self._failed_during_recovery: frozenset[int] = frozenset()
         self._ready: dict[int, str] = {}
         self._installed: set[int] = set()
-        # Rank -> (route of its evidence connection, host, pid), from its heartbeats.
-        self._evidence: dict[int, tuple[bytes, str, int]] = {}
+        # Rank -> (route of its reporter connection, host, pid), from its heartbeats.
+        self._reporters: dict[int, tuple[bytes, str, int]] = {}
         # Rank -> the last native heartbeat accepted from its process.
         self._beats: dict[int, int] = {}
         # The fence command's deadline and target for each rank whose workers' fencing is under way.
@@ -173,15 +173,15 @@ class RecoveryAuthority:
         self._recovery_stage_us: tuple[int, ...] = ()
         self._failed_requests = 0
         self._last_drop_log = -_REJECTION_LOG_INTERVAL_S
-        # Rank -> its process's session, from its Register; kept after the rank departs.
+        # Rank -> its process's session, from its Register; kept after the rank fails.
         self._sessions: dict[int, str] = {}
-        # (rank, evidence?) -> the sequence number of the last message accepted on that stream. The
-        # protocol and the evidence travel on separate connections, ordered only within each.
+        # (rank, hang report?) -> the sequence number of the last message accepted on that stream. The
+        # protocol and the hang reports travel on separate connections, ordered only within each.
         self._sequences: dict[tuple[int, bool], int] = {}
 
     @property
     def survivors(self) -> tuple[int, ...]:
-        """Every rank except the departed ones, in rank order."""
+        """Every rank except the failed ones, in rank order."""
         return tuple(rank for rank in range(self.world_size) if rank not in self.failed_ranks)
 
     def handle(self, route: bytes, message: Message, now: float) -> Outbound:
@@ -189,9 +189,10 @@ class RecoveryAuthority:
         if isinstance(message, StatusQuery):
             return [(route, self.status())]
         if isinstance(message, (Heartbeat, NativeHeartbeat, DeviceWait)):
-            # Evidence, not protocol: a worker sends it from its own connection or its native thread, at any time.
+            # A hang report, not protocol: a worker sends it from its own connection or its native thread, at any
+            # time.
             if isinstance(message, Heartbeat):
-                self._evidence[message.rank] = (route, message.host, message.pid)
+                self._reporters[message.rank] = (route, message.host, message.pid)
             elif isinstance(message, NativeHeartbeat) and not self._accept(message):
                 return []
             self._observe(message, now)
@@ -203,9 +204,10 @@ class RecoveryAuthority:
         try:
             return self._dispatch(route, message, now)
         except _Violation as violation:
-            if self.phase in (Phase.SERVING, Phase.RECOVERED) and not isinstance(message, Stopped):
-                # No loss was reported: refuse the sender alone, so a stray or malformed message does not end
-                # a deployment that serves. A Stopped is a real loss, and an unrecoverable one is terminal.
+            if self.phase in (Phase.SERVING, Phase.DEGRADED) and not isinstance(message, Stopped):
+                # No rank failure was reported: refuse the sender alone, so a stray or malformed message does not
+                # end a deployment that serves. A Stopped is a real rank failure, and an unrecoverable one is
+                # terminal.
                 logger.error(f"Recovery authority: refusing {message} from {route!r}: {violation}")
                 return [(route, Abort(str(violation)))]
             # The message authenticated, so a worker (or a holder of its key) broke the protocol: the membership
@@ -218,7 +220,7 @@ class RecoveryAuthority:
 
         Fresh: it names the rank of the envelope, comes from the session that rank registered,
         and its sequence number is above the last accepted from that rank's protocol messages
-        or evidence (``Heartbeat``, ``DeviceWait``), whichever it is. A ``Register`` from
+        or hang reports (``Heartbeat``, ``DeviceWait``), whichever it is. A ``Register`` from
         another session is applied (a second process claiming a rank aborts as a duplicate);
         its session becomes the rank's once the registration is accepted.
         """
@@ -280,28 +282,28 @@ class RecoveryAuthority:
             # A recovery without the rank means the workers' fencing worked.
             if hung.rank not in self.failed_ranks and self.phase in (
                 Phase.SERVING,
-                Phase.RECOVERED,
+                Phase.DEGRADED,
             ):
                 logger.error(
                     f"Recovery authority: rank {hung.rank} survived its fence; running the fence command"
                 )
                 # The command may fail unseen: rank 0 still fences the rank before a recovery proposes.
                 self._fence(hung)
-        if self.hang_monitor is not None and self.phase in (Phase.SERVING, Phase.RECOVERED):
+        if self.hang_monitor is not None and self.phase in (Phase.SERVING, Phase.DEGRADED):
             hung = self.hang_monitor.check(now)
             if hung is not None:
                 return self._on_hung(hung, now)
             stalled = self.hang_monitor.all_stalled(now)
             if stalled is not None:
-                return self._restart(f"every rank stalled ({stalled})")
+                return self._terminate(f"every rank stalled ({stalled})")
         return []
 
     def _accept(self, message: NativeHeartbeat) -> bool:
-        """Whether a native heartbeat is new and from the process its rank's evidence connection announced.
+        """Whether a native heartbeat is new and from the process its rank's reporter connection announced.
 
         A replayed datagram repeats an old ``beat``; one from another process has another ``pid``.
         """
-        known = self._evidence.get(message.rank)
+        known = self._reporters.get(message.rank)
         if (
             known is None
             or known[2] != message.pid
@@ -312,8 +314,8 @@ class RecoveryAuthority:
         return True
 
     def _observe(self, message: Heartbeat | NativeHeartbeat | DeviceWait, now: float) -> None:
-        # During a recovery every rank waits by design; evidence counts only while serving.
-        if self.hang_monitor is None or self.phase not in (Phase.SERVING, Phase.RECOVERED):
+        # During a recovery every rank waits by design; hang reports count only while serving.
+        if self.hang_monitor is None or self.phase not in (Phase.SERVING, Phase.DEGRADED):
             return
         if isinstance(message, Heartbeat):
             self.hang_monitor.heartbeat(
@@ -327,33 +329,35 @@ class RecoveryAuthority:
             )
 
     def _on_hung(self, hung: HungRank, now: float) -> Outbound:
-        """Fence a recoverable hung rank; end the deployment for one whose loss is not admitted.
+        """Fence a recoverable hung rank; end the deployment for one whose failure is not admitted.
 
-        Its own evidence thread ends its process; another rank has the MPI runtime end it
+        Its own reporter thread ends its process; another rank has the MPI runtime end it
         if that thread cannot (the process is stopped); the fence command if neither
         starts a recovery.
         """
         where = f"rank {hung.rank} (pid {hung.pid} on {hung.host or 'unknown host'})"
-        # The monitor watches no departed rank, and rank 0's loss is never admitted.
+        # The monitor watches no failed rank, and rank 0's failure is never admitted.
         if frozenset({hung.rank}) not in self.admitted_domains:
-            return self._restart(f"{where} is hung ({hung.reason}) and its loss is not recoverable")
+            return self._terminate(
+                f"{where} is hung ({hung.reason}) and its failure is not recoverable"
+            )
         if not hung.pid:
             logger.error(f"Recovery authority: {where} is hung ({hung.reason}); not fencing it")
             return []
         logger.error(f"Recovery authority: {where} is hung ({hung.reason}); fencing it")
         fence = Fence(rank=hung.rank, pid=hung.pid)
-        # The hung rank's own evidence thread ends its process; two live, unsuspected ranks also ask the runtime,
-        # in case one of their evidence threads cannot.
+        # The hung rank's own reporter thread ends its process; two live, unsuspected ranks also ask the runtime,
+        # in case one of their reporter threads cannot.
         targets = [hung.rank] + self.hang_monitor.live_helpers(hung.rank, now)
         if self._fence is not None:
             self._command_fences.append((now + COMMAND_FENCE_GRACE_S, hung))
-        return [(self._evidence[rank][0], fence) for rank in targets if rank in self._evidence]
+        return [(self._reporters[rank][0], fence) for rank in targets if rank in self._reporters]
 
-    def _restart(self, why: str) -> Outbound:
+    def _terminate(self, why: str) -> Outbound:
         """End the deployment: terminal, and every worker exits for a restart."""
         reason = f"{why}; the deployment must restart"
         outbound = self.abort(reason)
-        return outbound + [(route, Restart(reason)) for route, _, _ in self._evidence.values()]
+        return outbound + [(route, Terminate(reason)) for route, _, _ in self._reporters.values()]
 
     def reject(self, reason: str, route: bytes) -> Outbound:
         """Refuse an object that is not a protocol message to its sender alone, in every phase.
@@ -391,7 +395,7 @@ class RecoveryAuthority:
             # Sent before the rank failed; it was already queued behind the survivors' reports.
             return []
         if message.rank in self.failed_ranks:
-            raise _Violation(f"departed rank sent {message}")
+            raise _Violation(f"failed rank sent {message}")
         if isinstance(message, Stopped):
             return self._on_stopped(message, now)
         if isinstance(message, Ready):
@@ -448,17 +452,17 @@ class RecoveryAuthority:
         else:
             logger.warning(
                 f"Recovery authority: {self.world_size} workers registered, but the expert "
-                "placement covers the loss of no rank or node"
+                "placement covers the failure of no rank or node"
             )
 
     def _on_stopped(self, message: Stopped, now: float) -> Outbound:
         failed = frozenset(message.failed_ranks)
         if message.rank in failed:
-            raise _Violation(f"rank {message.rank} reported its own loss")
+            raise _Violation(f"rank {message.rank} reported its own failure")
         if self.phase is Phase.SERVING or (
-            self.phase is Phase.RECOVERED and failed > self.failed_ranks
+            self.phase is Phase.DEGRADED and failed > self.failed_ranks
         ):
-            # A further loss after a recovery reports every rank lost so far.
+            # A further rank failure after a recovery reports every rank failed so far.
             self._admissible(failed)
             if self.hang_monitor is not None:
                 for rank in failed - self.failed_ranks:
@@ -475,40 +479,39 @@ class RecoveryAuthority:
         elif self.phase in (Phase.STOPPING, Phase.PREPARING) and failed > self.failed_ranks:
             self._replan(failed)
         elif self.phase is Phase.STOPPING and self._replans and failed < self.failed_ranks:
-            # Sent before its rank saw the further loss; the rank's next Stopped follows.
+            # Sent before its rank saw the further failure; the rank's next Stopped follows.
             return []
         elif self.phase is not Phase.STOPPING:
             raise _Violation(f"{message} in phase {self.phase.name}")
         if failed != self.failed_ranks:
-            raise _Violation(f"{message} conflicts with departed ranks {sorted(self.failed_ranks)}")
+            raise _Violation(f"{message} conflicts with failed ranks {sorted(self.failed_ranks)}")
         self._record(self._stopped, message)
         if len(self._stopped) < len(self.survivors):
             return []
-        self._fencing = set(self.failed_ranks - self._fenced) if self._fence_departed else set()
+        self._fencing = set(self.failed_ranks - self._fenced) if self._fence_failed else set()
         if self._fencing:
-            # Rank 0 is never lost. A pid only names the process in the log; the runtime ends the rank.
+            # Rank 0's failure is never admitted. A pid only names the process in the log; the runtime ends the
+            # rank.
             return [
-                (self._routes[0], Fence(rank=rank, pid=self._evidence.get(rank, (b"", "", 0))[2]))
+                (self._routes[0], Fence(rank=rank, pid=self._reporters.get(rank, (b"", "", 0))[2]))
                 for rank in sorted(self._fencing)
             ]
         return self._propose(now)
 
     def _on_fenced(self, message: Fenced, now: float) -> Outbound:
-        """Propose once rank 0 ended every failed rank not known to be dead; abort if one could not be ended."""
+        """Propose once rank 0 ended every failed rank not known to be ended; abort if one could not be ended."""
         if message.rank != 0 or message.target not in self.failed_ranks:
             raise _Violation(f"unexpected {message}: rank 0 fences failed ranks only")
         if message.error:
             # Its process may still run and write into the survivors' memory: recovering is not safe.
-            return self.abort(
-                f"departed rank {message.target} could not be fenced: {message.error}"
-            )
+            return self.abort(f"failed rank {message.target} could not be fenced: {message.error}")
         logger.info(
-            f"Recovery authority: departed rank {message.target} fenced "
+            f"Recovery authority: failed rank {message.target} fenced "
             f"{(now - self._stage_starts[0]) * 1e3:.1f} ms into the recovery"
         )
         self._fenced.add(message.target)
         if message.target not in self._fencing:
-            # A second answer: a further loss restarted the round after the first request.
+            # A second answer: a further rank failure restarted the round after the first request.
             return []
         self._fencing.discard(message.target)
         if self._fencing or len(self._stopped) < len(self.survivors):
@@ -524,12 +527,14 @@ class RecoveryAuthority:
     def _admissible(self, failed: frozenset[int]) -> None:
         """Raise unless ``failed`` is a union of admitted domains; the survivors check that their slots cover it."""
         if not failed or not failed <= frozenset().union(*self.admitted_domains):
-            raise _Violation(f"loss of ranks {sorted(failed)} is not a union of admitted domains")
+            raise _Violation(
+                f"failure of ranks {sorted(failed)} is not a union of admitted domains"
+            )
 
     def _replan(self, failed: frozenset[int]) -> None:
         """Start the recovery over without ``failed``: more ranks failed before any survivor installed.
 
-        The survivors that report it shrank again and checked that their slots cover the larger loss.
+        The survivors that report it shrank again and checked that their slots cover the larger failure.
         """
         self._admissible(failed)
         logger.warning(
@@ -551,7 +556,7 @@ class RecoveryAuthority:
 
     def _on_ready(self, message: Ready, now: float) -> Outbound:
         if self.phase is Phase.STOPPING and self._replans and message.rank not in self._stopped:
-            # Sent before its rank saw the further loss; its Stopped for the new plan follows.
+            # Sent before its rank saw the further failure; its Stopped for the new plan follows.
             return []
         self._expect(Phase.PREPARING, message)
         digests = set(self._ready.values())
@@ -578,16 +583,16 @@ class RecoveryAuthority:
         self._recovery_stage_us = tuple(
             round((end - start) * 1e6) for start, end in zip(self._stage_starts, ends)
         )
-        self._enter(Phase.RECOVERED)
+        self._enter(Phase.DEGRADED)
         if self.hang_monitor is not None:
-            # Evidence from before the recovery describes waits that no longer exist.
+            # Hang reports from before the recovery describe waits that no longer exist.
             self.hang_monitor.reset(now)
         logger.info(
             f"Recovery authority: committed generation {self.generation} "
             f"without ranks {sorted(self.failed_ranks)}; stage ms "
             + ", ".join(
                 f"{stage}={us / 1e3:.1f}"
-                for stage, us in zip(("stop", "agree", "install"), self._recovery_stage_us)
+                for stage, us in zip(("stop", "prepare", "install"), self._recovery_stage_us)
             )
         )
         return self._to_survivors(Commit(self.generation))
@@ -858,7 +863,7 @@ def main(argv: list[str] | None = None) -> None:
         "--fence-command",
         default="",
         help="last-resort command that kills a hung worker the workers could not fence (its own "
-        "evidence thread, then the MPI runtime), with {host} and {pid} placeholders and literal "
+        "reporter thread, then the MPI runtime), with {host} and {pid} placeholders and literal "
         "braces doubled, run without a shell, e.g. 'ssh {host} kill -KILL {pid}' or the "
         "deployment's node agent",
     )
@@ -885,7 +890,7 @@ def main(argv: list[str] | None = None) -> None:
         hang_monitor,
         fence,
         config.digest(),
-        fence_departed=True,
+        fence_failed=True,
     )
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):

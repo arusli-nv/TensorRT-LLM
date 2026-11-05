@@ -29,9 +29,9 @@ from tensorrt_llm.executor.recovery.protocol import (
     NativeHeartbeat,
     Propose,
     Register,
-    Restart,
     Sent,
     Stopped,
+    Terminate,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -223,7 +223,7 @@ def test_a_starved_rank_that_completes_no_step_for_the_window_is_fenced():
     assert hung is not None and hung.rank == 2 and now == CONFIRM + 1
 
 
-def test_every_rank_stalled_on_the_device_is_dead_and_fences_no_rank():
+def test_every_rank_stalled_on_the_device_is_a_stall_and_fences_no_rank():
     """A deadlock or desync every rank shares: each device waits on the next rank, no iteration advances."""
     monitor = _monitor()
     _beat(monitor, 0.0)
@@ -257,7 +257,7 @@ def test_progress_or_a_single_culprit_is_not_a_stall():
         assert monitor.all_stalled(float(now)) is None
 
 
-def test_an_all_rank_host_stall_is_neither_a_hang_nor_dead():
+def test_an_all_rank_host_stall_is_neither_a_hang_nor_a_failure():
     """Every serving loop sleeps at once: no progress, no waits on the host or the device."""
     monitor = _monitor()
     _, hung = _first_confirmation(
@@ -274,7 +274,7 @@ def test_waits_on_unknown_peers_are_ignored():
     assert hung is None
 
 
-def test_cleared_device_waits_drop_the_evidence():
+def test_cleared_device_waits_drop_the_hang_reports():
     monitor = _monitor()
     _beat(monitor, 0.0)
     _wait_on(monitor, PEERS, 2, 0.0)
@@ -289,7 +289,7 @@ def test_cleared_device_waits_drop_the_evidence():
 
 
 def test_a_rank_that_stops_before_its_first_heartbeat_after_a_reset_is_fenced():
-    """A recovery resets the evidence; a rank that stops right after it is still watched, with its process."""
+    """A recovery resets the hang reports; a rank that stops right after it is still watched, with its process."""
     monitor = _monitor()
     for rank in RANKS:
         monitor.heartbeat(rank, 0, False, -10.0, "node", 100 + rank)
@@ -308,7 +308,7 @@ def _serving_authority(fenced):
         len(RANKS),
         hang_monitor=_monitor(),
         fence=lambda hung: fenced.append((hung.rank, hung.reason, hung.host, hung.pid)),
-        fence_departed=True,
+        fence_failed=True,
     )
     for rank in RANKS:
         authority.handle(f"rank-{rank}".encode(), Register(rank, ((1,), (2,), (3,)), DIGEST), 0.0)
@@ -321,17 +321,17 @@ def _hang_rank_2(authority, until, stop_at=None):
     sent = {}
     for now in range(1, until):
         for rank in PEERS:
-            # Heartbeats come from each worker's own evidence connection, not its protocol route.
+            # Heartbeats come from each worker's own reporter connection, not its protocol route.
             assert (
                 authority.handle(
-                    f"evidence-{rank}".encode(),
+                    f"reporter-{rank}".encode(),
                     Heartbeat(rank, 0, True, "node", 100 + rank),
                     float(now),
                 )
                 == []
             )
         if now == 1:
-            authority.handle(b"evidence-2", Heartbeat(2, 0, False, "node", 102), 1.0)
+            authority.handle(b"reporter-2", Heartbeat(2, 0, False, "node", 102), 1.0)
         if now == stop_at:
             authority.handle(b"rank-0", Stopped(0, (2,)), float(now))
         outbound = authority.expire(float(now))
@@ -344,13 +344,13 @@ def test_authority_fences_a_hung_rank_through_itself_and_another_rank_then_the_c
     fenced = []
     authority = _serving_authority(fenced)
     sent = _hang_rank_2(authority, 60)
-    # Once, at confirmation: to the hung rank's evidence thread and to the two lowest live, unsuspected ranks
+    # Once, at confirmation: to the hung rank's reporter thread and to the two lowest live, unsuspected ranks
     # (either asks the runtime).
     ((_, outbound),) = sent.items()
     assert outbound == [
-        (b"evidence-2", Fence(2, 102)),
-        (b"evidence-0", Fence(2, 102)),
-        (b"evidence-1", Fence(2, 102)),
+        (b"reporter-2", Fence(2, 102)),
+        (b"reporter-0", Fence(2, 102)),
+        (b"reporter-1", Fence(2, 102)),
     ]
     # The workers could not end it (no recovery started): the fence command, once, after the grace.
     assert [(rank, host, pid) for rank, _, host, pid in fenced] == [(2, "node", 102)]
@@ -362,7 +362,7 @@ def test_the_fence_command_runs_for_each_rank_hung_within_the_grace():
     authority = _serving_authority(fenced)
     for rank in (2, 3):
         authority.handle(
-            f"evidence-{rank}".encode(), Heartbeat(rank, 0, False, "node", 100 + rank), 1.0
+            f"reporter-{rank}".encode(), Heartbeat(rank, 0, False, "node", 100 + rank), 1.0
         )
     authority._on_hung(HungRank(2, "stuck", "node", 102), 2.0)
     authority._on_hung(HungRank(3, "stuck", "node", 103), 3.0)
@@ -392,7 +392,7 @@ def test_a_rank_the_fence_command_ran_for_is_fenced_by_rank_0_before_the_proposa
     assert out == [(f"rank-{rank}".encode(), Propose(1, (2,), PEERS)) for rank in PEERS]
 
 
-def test_the_fence_command_is_skipped_once_the_hung_rank_s_loss_starts_a_recovery():
+def test_the_fence_command_is_skipped_once_the_hung_rank_s_failure_starts_a_recovery():
     fenced = []
     authority = _serving_authority(fenced)
     confirmed = next(iter(_hang_rank_2(_serving_authority([]), 60)))
@@ -403,13 +403,13 @@ def test_the_fence_command_is_skipped_once_the_hung_rank_s_loss_starts_a_recover
     assert fenced == []
 
 
-def test_authority_reports_a_stall_of_every_rank_as_terminal_and_restarts_every_worker():
+def test_authority_reports_a_stall_of_every_rank_as_terminal_and_terminates_every_worker():
     fenced = []
     authority = _serving_authority(fenced)
     sent = {}
     for now in range(0, 40):
         for rank in RANKS:
-            route = f"evidence-{rank}".encode()
+            route = f"reporter-{rank}".encode()
             authority.handle(route, Heartbeat(rank, 7, False, "node", 100 + rank), float(now))
             if now == 0:
                 authority.handle(route, DeviceWait(rank, (rank + 1) % len(RANKS), 2000), 0.0)
@@ -419,9 +419,9 @@ def test_authority_reports_a_stall_of_every_rank_as_terminal_and_restarts_every_
     ((_, outbound),) = sent.items()
     assert authority.phase is Phase.ABORTED and "every rank stalled" in authority.abort_reason
     aborts = [route for route, message in outbound if isinstance(message, Abort)]
-    restarts = [route for route, message in outbound if isinstance(message, Restart)]
+    terminates = [route for route, message in outbound if isinstance(message, Terminate)]
     assert sorted(aborts) == [f"rank-{rank}".encode() for rank in RANKS]
-    assert sorted(restarts) == [f"evidence-{rank}".encode() for rank in RANKS]
+    assert sorted(terminates) == [f"reporter-{rank}".encode() for rank in RANKS]
     assert fenced == [] and authority.status().phase == "ABORTED"
 
 
@@ -538,7 +538,7 @@ def test_the_authority_refuses_a_fence_command_it_cannot_fill_before_serving(mon
 
 
 def test_authority_ends_the_deployment_when_rank_zero_hangs():
-    """Rank 0's loss is never recovered: its confirmed hang is terminal and every worker exits for a restart."""
+    """Rank 0's failure is never recovered: its confirmed hang is terminal and every worker exits for a restart."""
     fenced = []
     authority = _serving_authority(fenced)
     authority.handle(b"heartbeat-0", Heartbeat(0, 0, False, "node", 100), 0.0)
@@ -557,13 +557,13 @@ def test_authority_ends_the_deployment_when_rank_zero_hangs():
     assert authority.phase is Phase.ABORTED and "rank 0" in authority.abort_reason
     assert authority.status().phase == "ABORTED"
     aborts = [route for route, message in outbound if isinstance(message, Abort)]
-    restarts = [route for route, message in outbound if isinstance(message, Restart)]
+    terminates = [route for route, message in outbound if isinstance(message, Terminate)]
     assert sorted(aborts) == [f"rank-{rank}".encode() for rank in RANKS]
-    assert sorted(restarts) == [f"heartbeat-{rank}".encode() for rank in RANKS]
+    assert sorted(terminates) == [f"heartbeat-{rank}".encode() for rank in RANKS]
     assert fenced == []
 
 
-def test_authority_ignores_evidence_during_recovery():
+def test_authority_ignores_hang_reports_during_recovery():
     fenced = []
     authority = _serving_authority(fenced)
     authority.handle(b"rank-0", Stopped(0, (2,)), 1.0)
@@ -574,23 +574,23 @@ def test_authority_ignores_evidence_during_recovery():
     assert fenced == []
 
 
-def test_after_a_recovery_a_hung_rank_that_has_not_departed_is_fenced():
-    """A further loss recovers too, so a hung admitted rank is fenced after a recovery as before it."""
+def test_after_a_recovery_a_hung_rank_that_has_not_failed_is_fenced():
+    """A further rank failure recovers too, so a hung admitted rank is fenced after a recovery as before it."""
     fenced = []
     authority = _serving_authority(fenced)
-    authority.phase = Phase.RECOVERED
+    authority.phase = Phase.DEGRADED
     fences = _hang_rank_2(authority, 60)
     assert [message for _, message in next(iter(fences.values()))] == [Fence(2, 102)] * 3
     assert [rank for rank, *_ in fenced] == [2]
 
 
-def test_the_fence_command_is_skipped_once_the_hung_rank_departed():
+def test_the_fence_command_is_skipped_once_the_hung_rank_failed():
     fenced = []
     authority = _serving_authority(fenced)
     confirmed = next(iter(_hang_rank_2(_serving_authority([]), 60)))
     _hang_rank_2(authority, confirmed + 1)
-    # The hung rank's loss recovered within the grace: the authority serves again, without it.
-    authority.phase, authority.failed_ranks = Phase.RECOVERED, frozenset({2})
+    # The hung rank's failure recovered within the grace: the authority serves again, without it.
+    authority.phase, authority.failed_ranks = Phase.DEGRADED, frozenset({2})
     for now in range(confirmed + 1, confirmed + 10):
         authority.expire(float(now))
     assert fenced == []
@@ -616,15 +616,15 @@ def _send_forgeries(sender, now):
 
 
 def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced():
-    """Rank 2's Python evidence thread goes silent; its native datagrams still report each step it finishes."""
+    """Rank 2's Python reporter thread goes silent; its native datagrams still report each step it finishes."""
     fenced = []
     authority = _serving_authority(fenced)
     receiver, sender = _datagrams()
     try:
-        authority.handle(b"evidence-2", Heartbeat(2, 0, False, "node", 102), 0.0)
+        authority.handle(b"reporter-2", Heartbeat(2, 0, False, "node", 102), 0.0)
         for now in range(1, 60):
             for rank in PEERS:
-                route = f"evidence-{rank}".encode()
+                route = f"reporter-{rank}".encode()
                 authority.handle(route, Heartbeat(rank, 0, True, "node", 100 + rank), float(now))
             # A step every 5 s, within the window.
             sender.send(_encode_datagram(NativeHeartbeat(2, 102, now, now // 5), KEY))
@@ -635,7 +635,7 @@ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced(
         sent = {}
         for now in range(60, 90):
             for rank in PEERS:
-                route = f"evidence-{rank}".encode()
+                route = f"reporter-{rank}".encode()
                 authority.handle(route, Heartbeat(rank, 0, True, "node", 100 + rank), float(now))
             sender.send(_encode_datagram(NativeHeartbeat(2, 102, now, 12), KEY))
             _send_forgeries(sender, now)
@@ -643,7 +643,7 @@ def test_native_heartbeats_keep_a_rank_whose_python_is_silent_from_being_fenced(
             if outbound := authority.expire(float(now)):
                 sent[now] = outbound
         assert list(sent) == [60 + int(CONFIRM)]
-        assert sent[60 + int(CONFIRM)][0] == (b"evidence-2", Fence(2, 102))
+        assert sent[60 + int(CONFIRM)][0] == (b"reporter-2", Fence(2, 102))
     finally:
         receiver.close()
         sender.close()
@@ -695,18 +695,18 @@ def test_the_native_heartbeat_wire_format():
     assert protocol.datagram_address("tcp://[::1]:5555") == ("::1", 5555)
 
 
-def test_evidence_messages_round_trip():
+def test_reporter_connection_messages_round_trip():
     for message in (
         Heartbeat(3, 1234, True, "node-3", 4321),
         DeviceWait(1, 2, 2500),
-        Restart("every rank stalled"),
+        Terminate("every rank stalled"),
     ):
         assert protocol.is_message(message)
         assert pickle.loads(pickle.dumps(message)) == message
 
 
 @pytest.mark.parametrize("replayed", [True, False], ids=["replayed", "sent_anew"])
-def test_a_replayed_device_wait_is_not_evidence(replayed):
+def test_a_replayed_device_wait_is_not_a_hang_report(replayed):
     """Every peer's device waits on rank 2 once, then clears it; rank 2 is healthy.
 
     Replaying the captured waits from another connection must not fence rank 2. The control
@@ -717,7 +717,7 @@ def test_a_replayed_device_wait_is_not_evidence(replayed):
         len(RANKS),
         hang_monitor=_monitor(),
         fence=lambda hung: fenced.append(hung.rank),
-        fence_departed=True,
+        fence_failed=True,
     )
     seq = dict.fromkeys(RANKS, 1)
     for rank in RANKS:
@@ -728,7 +728,7 @@ def test_a_replayed_device_wait_is_not_evidence(replayed):
     def send(rank, message, now):
         seq[rank] += 1
         sent = Sent(rank, f"s{rank}", seq[rank], message)
-        authority.receive(f"evidence-{rank}".encode(), sent, now)
+        authority.receive(f"reporter-{rank}".encode(), sent, now)
         return sent
 
     outbound = []
@@ -750,4 +750,4 @@ def test_a_replayed_device_wait_is_not_evidence(replayed):
     if replayed:
         assert (outbound, fenced) == ([], [])
     else:
-        assert (b"evidence-2", Fence(2, 102)) in outbound
+        assert (b"reporter-2", Fence(2, 102)) in outbound

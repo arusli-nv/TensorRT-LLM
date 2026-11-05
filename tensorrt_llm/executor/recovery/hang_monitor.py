@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Decide from worker evidence that one rank hangs, or that every rank does.
+"""Decide from the workers' hang reports that one rank hangs, or that every rank does.
 
 The recovery authority feeds the monitor the heartbeats and wait reports of the
 workers and asks it, at each deadline check, whether a rank is hung or the whole
@@ -15,7 +15,7 @@ __all__ = ["HangMonitor", "HungRank"]
 
 @dataclass(frozen=True)
 class HungRank:
-    """A rank the evidence shows hung, why, and the process to fence."""
+    """A rank the hang reports show hung, why, and the process to fence."""
 
     rank: int
     reason: str
@@ -24,7 +24,7 @@ class HungRank:
 
 
 @dataclass
-class _RankEvidence:
+class _RankState:
     """What the monitor knows about one rank."""
 
     # Monotonic time of the last heartbeat.
@@ -58,7 +58,7 @@ class HangMonitor:
 
     Args:
         ranks: The ranks that may be watched.
-        confirm_s: Seconds the evidence must hold; above the slowest legitimate step
+        confirm_s: Seconds the hang reports must show a hang; above the slowest legitimate step
             plus host stalls.
         heartbeat_timeout_s: Seconds without a heartbeat after which it counts as
             missing.
@@ -75,7 +75,7 @@ class HangMonitor:
         self.confirm_s = confirm_s
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self._ranks = frozenset(ranks)
-        self._evidence: dict[int, _RankEvidence] = {}
+        self._states: dict[int, _RankState] = {}
         # Rank -> time since which every peer has waited on it.
         self._suspected_since: dict[int, float] = {}
         self._confirmed: set[int] = set()
@@ -96,44 +96,44 @@ class HangMonitor:
         """
         if rank not in self._ranks:
             return
-        evidence = self._evidence.setdefault(rank, _RankEvidence(heartbeat=now, progressed=now))
-        evidence.heartbeat = now
+        state = self._states.setdefault(rank, _RankState(heartbeat=now, progressed=now))
+        state.heartbeat = now
         if pid:
-            evidence.host, evidence.pid = host, pid
+            state.host, state.pid = host, pid
         # Two heartbeat sources report the same counter at different times: only a rise is progress.
-        if iteration > evidence.iteration:
-            evidence.iteration = iteration
-            evidence.progressed = now
+        if iteration > state.iteration:
+            state.iteration = iteration
+            state.progressed = now
         if waiting is not None:
-            evidence.waiting = waiting
+            state.waiting = waiting
 
     def device_wait(self, rank: int, peer: int, waited_s: float, now: float) -> None:
         """Record that ``rank``'s device has waited ``waited_s`` on ``peer``; 0 clears it."""
-        evidence = self._evidence.get(rank)
-        if evidence is None or peer == rank or peer not in self._ranks:
+        state = self._states.get(rank)
+        if state is None or peer == rank or peer not in self._ranks:
             return
         if waited_s > 0:
-            evidence.device_waits.setdefault(peer, now - waited_s)
+            state.device_waits.setdefault(peer, now - waited_s)
         else:
-            evidence.device_waits.pop(peer, None)
+            state.device_waits.pop(peer, None)
 
     def remove(self, rank: int) -> None:
-        """Stop watching ``rank``, for example once it departed."""
+        """Stop watching ``rank``, for example once it failed."""
         self._ranks -= {rank}
-        self._evidence.pop(rank, None)
+        self._states.pop(rank, None)
         self._suspected_since.pop(rank, None)
-        for evidence in self._evidence.values():
-            evidence.device_waits.pop(rank, None)
+        for state in self._states.values():
+            state.device_waits.pop(rank, None)
 
     def reset(self, now: float) -> None:
-        """Forget all evidence at time ``now``, for example after a recovery changed what every rank waits on.
+        """Forget every hang report at time ``now``, for example after a recovery changed what every rank waits on.
 
         Every watched rank stays watched, as if it had sent a heartbeat and progressed at ``now``, so a rank
         that stops before its next heartbeat can still be confirmed hung.
         """
-        self._evidence = {
-            rank: _RankEvidence(heartbeat=now, progressed=now, host=evidence.host, pid=evidence.pid)
-            for rank, evidence in self._evidence.items()
+        self._states = {
+            rank: _RankState(heartbeat=now, progressed=now, host=state.host, pid=state.pid)
+            for rank, state in self._states.items()
         }
         self._suspected_since.clear()
 
@@ -142,32 +142,31 @@ class HangMonitor:
         if not self._has_view(now):
             self._suspected_since.clear()
             return None
-        for rank in sorted(self._evidence):
+        for rank in sorted(self._states):
             if not self._waited_on_by_every_peer(rank, now):
                 self._suspected_since.pop(rank, None)
                 continue
-            evidence = self._evidence[rank]
-            since = max(self._suspected_since.setdefault(rank, now), evidence.progressed)
+            state = self._states[rank]
+            since = max(self._suspected_since.setdefault(rank, now), state.progressed)
             if now - since >= self.confirm_s and rank not in self._confirmed:
                 self._confirmed.add(rank)
                 return HungRank(
                     rank,
                     f"every peer waits on it and it made no progress for {now - since:.1f}s",
-                    evidence.host,
-                    evidence.pid,
+                    state.host,
+                    state.pid,
                 )
         return None
 
     def all_stalled(self, now: float) -> str | None:
         """Why every rank is stuck with no rank to blame, or None."""
-        if len(self._evidence) < 2 or not self._has_view(now):
+        if len(self._states) < 2 or not self._has_view(now):
             return None
-        for rank, evidence in self._evidence.items():
-            if now - evidence.progressed < self.confirm_s:
+        for rank, state in self._states.items():
+            if now - state.progressed < self.confirm_s:
                 return None
-            if self._fresh(evidence, now) and (
-                not evidence.device_waits
-                or now - min(evidence.device_waits.values()) < self.confirm_s
+            if self._fresh(state, now) and (
+                not state.device_waits or now - min(state.device_waits.values()) < self.confirm_s
             ):
                 return None
             if self._waited_on_by_every_peer(rank, now):
@@ -180,29 +179,29 @@ class HangMonitor:
     def live_helpers(self, hung: int, now: float) -> list[int]:
         """Up to two ranks, lowest first, that can act for the deployment.
 
-        Their heartbeats are fresh and no evidence points at them.
+        Their heartbeats are fresh and no hang report points at them.
         """
         return [
             rank
-            for rank, evidence in sorted(self._evidence.items())
-            if rank != hung and rank not in self._suspected_since and self._fresh(evidence, now)
+            for rank, state in sorted(self._states.items())
+            if rank != hung and rank not in self._suspected_since and self._fresh(state, now)
         ][:2]
 
-    def _fresh(self, evidence: _RankEvidence, now: float) -> bool:
-        return now - evidence.heartbeat <= self.heartbeat_timeout_s
+    def _fresh(self, state: _RankState, now: float) -> bool:
+        return now - state.heartbeat <= self.heartbeat_timeout_s
 
     def _has_view(self, now: float) -> bool:
-        fresh = sum(self._fresh(evidence, now) for evidence in self._evidence.values())
-        return 2 * fresh >= len(self._evidence)
+        fresh = sum(self._fresh(state, now) for state in self._states.values())
+        return 2 * fresh >= len(self._states)
 
     def _waited_on_by_every_peer(self, rank: int, now: float) -> bool:
-        evidence = self._evidence[rank]
-        alive = self._fresh(evidence, now)
+        state = self._states[rank]
+        alive = self._fresh(state, now)
         # The device waits of a rank without a heartbeat are stale: its process stopped.
-        if alive and evidence.device_waits:
+        if alive and state.device_waits:
             return False
-        peers = [e for r, e in self._evidence.items() if r != rank and self._fresh(e, now)]
-        host_blocked = not (alive and evidence.waiting)
+        peers = [e for r, e in self._states.items() if r != rank and self._fresh(e, now)]
+        host_blocked = not (alive and state.waiting)
         return bool(peers) and all(
             rank in peer.device_waits or (peer.waiting and host_blocked) for peer in peers
         )
