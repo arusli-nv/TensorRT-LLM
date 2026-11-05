@@ -523,8 +523,9 @@ def fault_tolerance_mode() -> bool:
 
 
 @lru_cache(maxsize=None)
-def peer_loss_recovery_enabled() -> bool:
-    """Whether WideEP recovery from a peer loss is enabled; read once per process.
+def rank_failure_recovery_enabled() -> bool:
+    """Whether WideEP recovery from a rank failure is enabled; read once per
+    process.
 
     ``TLLM_FAULT_TOLERANCE_MODE=1`` alone enables detection only; adding the
     recovery authority's address (``TLLM_FAULT_TOLERANCE_AUTHORITY``) enables

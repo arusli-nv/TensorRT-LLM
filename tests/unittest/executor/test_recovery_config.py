@@ -29,31 +29,32 @@ def load(monkeypatch, tmp_path):
 def test_defaults_without_a_file(load):
     assert load() == FaultToleranceConfig()
     assert (
-        load().extra_slots is None and load().failure_domain == "node" and not load().hang_detection
+        load().spare_slots is None and load().failure_domain == "node" and not load().hang_detection
     )
 
 
 def test_file_fields_override_the_defaults(load):
     config = load(
-        "extra_slots: ghost\nhang_detection: true\nhang_confirm_s: 10\npeer_failure_poll_s: 0.05\n"
+        "spare_slots: unbacked\nhang_detection: true\nhang_confirm_s: 10\n"
+        "peer_failure_poll_s: 0.05\n"
     )
     assert (
-        config.extra_slots,
+        config.spare_slots,
         config.hang_detection,
         config.hang_confirm_s,
         config.peer_failure_poll_s,
-    ) == ("ghost", True, 10.0, 0.05)
+    ) == ("unbacked", True, 10.0, 0.05)
 
 
 @pytest.mark.parametrize(
     "text, match",
     [
-        ("extra_slots: replicas\n", "extra_slots"),
+        ("spare_slots: replicas\n", "spare_slots"),
         ("failure_domain: rack\n", "failure_domain"),
-        ("spare_slots: empty\n", "spare_slots"),
+        ("spare_slot: unbacked\n", "spare_slot"),
         ("recovery_timeout_s: 10\nauthority_timeout_s: 20\n", "authority_timeout_s"),
         ("heartbeat_s: 5\n", "heartbeat_s"),
-        # The runtime fence must end before the fence command starts.
+        # The runtime kill must end before the fence command starts.
         ("heartbeat_s: 3\n", "heartbeat_s"),
         ("hang_confirm_s: -1\n", "hang_confirm_s"),
         ("peer_failure_poll_s: 0\n", "peer_failure_poll_s"),
@@ -89,7 +90,7 @@ def test_digest_is_stable_and_changes_with_any_field():
     digest = FaultToleranceConfig().digest()
     assert digest == FaultToleranceConfig().digest() == FaultToleranceConfig(heartbeat_s=1).digest()
     changed = {
-        "extra_slots": "empty",
+        "spare_slots": "backed",
         "failure_domain": "rank",
         "recovery_timeout_s": 40.0,
         "authority_timeout_s": 10.0,

@@ -32,12 +32,12 @@ __all__ = [
 
 CONFIG_ENV = "TLLM_FAULT_TOLERANCE_CONFIG"
 # A worker asks the MPI runtime to kill a hung rank this long after it received the authority's Fence, unless the
-# hung rank's own evidence thread ended its process first.
-RUNTIME_FENCE_GRACE_S = 1.0
+# hung rank's own reporter thread ended its process first.
+RUNTIME_KILL_GRACE_S = 1.0
 # How long the MPI runtime may take to kill a rank before the authority's fence command takes over.
-RUNTIME_FENCE_CALL_S = 2.0
+RUNTIME_KILL_CALL_S = 2.0
 # How long the workers' own fencing gets before the authority's fence command runs: a heartbeat interval until
-# the workers receive the Fence, then the runtime fence's grace and call.
+# the workers receive the Fence, then the runtime kill's grace and call.
 COMMAND_FENCE_GRACE_S = 5.0
 # The exit code of a worker the authority told that the deployment hangs and no fence can recover it (EX_TEMPFAIL):
 # the deployment must restart.
@@ -51,18 +51,18 @@ class FaultToleranceConfig(StrictBaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    extra_slots: Optional[Literal["empty", "ghost"]] = Field(
+    spare_slots: Optional[Literal["backed", "unbacked"]] = Field(
         default=None,
-        description="The kind of EPLB slots fault tolerance appends to each rank where the survivors of a failure "
-        "domain's loss cannot hold every expert: ``ghost`` (no device memory until a restore maps it, so the KV cache "
-        "keeps that memory while healthy) or ``empty`` (memory held). Routing never uses them until a restore fills "
-        "them. Default: ``ghost``, except with online EPLB where GDRCopy cannot map ghost slot memory for the host "
-        "(it needs GPUDirect RDMA for virtual memory) or GPU memory is a NUMA node: ``empty`` there.",
+        description="The kind of spare EPLB slots fault tolerance adds to each rank where the survivors of a failed "
+        "domain cannot hold every expert: ``unbacked`` (no device memory until a restore backs it, so the KV cache "
+        "keeps that memory while healthy) or ``backed`` (memory held). Routing never uses them until a restore fills "
+        "them. Default: ``unbacked``, except with online EPLB where GDRCopy cannot map unbacked slot memory for the "
+        "host (it needs GPUDirect RDMA for virtual memory) or GPU memory is a NUMA node: ``backed`` there.",
     )
     failure_domain: Literal["rank", "node"] = Field(
         default="node",
-        description="The largest loss to recover from: every rank of one host (rank 0's excluded), or one rank. "
-        "Startup refuses an EPLB placement whose slots cannot serve every expert without such a loss.",
+        description="The largest failure to recover from: every rank of one host (rank 0's excluded), or one rank. "
+        "Startup refuses an EPLB placement whose slots cannot serve every expert after such a failure.",
     )
     recovery_timeout_s: PositiveFloat = Field(
         default=30.0,
@@ -89,13 +89,13 @@ class FaultToleranceConfig(StrictBaseModel):
     )
     hang_confirm_s: PositiveFloat = Field(
         default=30.0,
-        description="How long the evidence of a hang must hold before the authority confirms it; above the "
+        description="How long the hang reports must show a hang before the authority confirms it; above the "
         "slowest legitimate step plus host stalls.",
     )
     heartbeat_s: PositiveFloat = Field(
         default=1.0,
         description="Worker heartbeat interval, at most 2 s: a worker receives the authority's ``Fence`` within "
-        "one, and its runtime fence must end before the authority's fence command starts.",
+        "one, and its runtime kill must end before the authority's fence command starts.",
     )
     heartbeat_timeout_s: PositiveFloat = Field(
         default=5.0,
@@ -108,10 +108,10 @@ class FaultToleranceConfig(StrictBaseModel):
             raise ValueError("authority_timeout_s must be below recovery_timeout_s")
         if self.heartbeat_s >= self.heartbeat_timeout_s:
             raise ValueError("heartbeat_s must be below heartbeat_timeout_s")
-        if self.heartbeat_s + RUNTIME_FENCE_GRACE_S + RUNTIME_FENCE_CALL_S > COMMAND_FENCE_GRACE_S:
-            limit = COMMAND_FENCE_GRACE_S - RUNTIME_FENCE_GRACE_S - RUNTIME_FENCE_CALL_S
+        if self.heartbeat_s + RUNTIME_KILL_GRACE_S + RUNTIME_KILL_CALL_S > COMMAND_FENCE_GRACE_S:
+            limit = COMMAND_FENCE_GRACE_S - RUNTIME_KILL_GRACE_S - RUNTIME_KILL_CALL_S
             raise ValueError(
-                f"heartbeat_s must be at most {limit}s, so that the workers' runtime fence ends before the "
+                f"heartbeat_s must be at most {limit}s, so that the workers' runtime kill ends before the "
                 "authority's fence command starts"
             )
         return self
@@ -119,8 +119,8 @@ class FaultToleranceConfig(StrictBaseModel):
     def hang_resolution_s(self) -> float:
         """The longest a hang or a stall of every rank can take until it is acted on (before recovery starts).
 
-        Peers wait on a hung rank once their device wait is reported or its heartbeat is missing; the evidence
-        must then hold for ``hang_confirm_s``, and the fence command runs last.
+        Peers wait on a hung rank once their device wait is reported or its heartbeat is missing; the hang reports
+        must then show the hang for ``hang_confirm_s``, and the fence command runs last.
         """
         return (
             max(self.hang_suspect_s, self.heartbeat_timeout_s)
@@ -129,7 +129,7 @@ class FaultToleranceConfig(StrictBaseModel):
         )
 
     def shrink_timeout_s(self) -> float:
-        """The longest a survivor may wait from detecting a loss until the survivors agree on the failed ranks.
+        """The longest a survivor may wait from detecting a rank failure until the survivors agree on the failed ranks.
 
         The agreement needs every survivor. One can see a hung peer's failure before the others, which stay
         blocked on that peer until the authority confirms the hang and fences it.

@@ -15,7 +15,7 @@ from typing import TypeVar
 
 import zmq
 
-from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, peer_loss_recovery_enabled
+from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, rank_failure_recovery_enabled
 
 from ..ipc import ZeroMqQueue
 from ..utils import _scrub_process_env_value
@@ -210,7 +210,7 @@ class RecoveryClient:
     @classmethod
     def from_env(cls, rank: int) -> "RecoveryClient | None":
         """Connect to the authority named by the environment; None when recovery is disabled."""
-        if not peer_loss_recovery_enabled():
+        if not rank_failure_recovery_enabled():
             return None
         return cls(os.environ[FAULT_TOLERANCE_AUTHORITY_ENV], load_key(), rank)
 
@@ -221,11 +221,11 @@ class RecoveryClient:
 
         Args:
             recoverable_domains: Sorted rank sets (a single rank or a whole node) whose
-                combined loss this worker's expert placement covers.
+                combined failure this worker's expert placement covers.
             deadline: Absolute ``time.monotonic()`` value.
 
         Returns:
-            The failure domains whose loss the deployment recovers from.
+            The failure domains whose failure the deployment recovers from.
 
         Raises:
             RecoveryError: Registration was rejected or timed out.

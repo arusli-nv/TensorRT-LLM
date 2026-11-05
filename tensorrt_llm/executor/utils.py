@@ -169,25 +169,25 @@ def is_context_length_exceeded_message(message: str) -> bool:
     return bool(_CONTEXT_LENGTH_EXCEEDED_RE.search(message))
 
 
-# Machine-readable error code of a request that WideEP peer-loss recovery
-# failed, or that is pinned to a lost attention-DP rank. A retry can succeed,
+# Machine-readable error code of a request that WideEP rank-failure recovery
+# failed, or that is pinned to a failed attention-DP rank. A retry can succeed,
 # so the OpenAI-compatible server answers HTTP 503 with Retry-After.
-PEER_LOSS_RETRYABLE_CODE = "peer_loss_retryable"
-_PEER_LOSS_RETRYABLE_TAG = f"[{PEER_LOSS_RETRYABLE_CODE}]"
+RANK_FAILURE_RETRYABLE_CODE = "rank_failure_retryable"
+_RANK_FAILURE_RETRYABLE_TAG = f"[{RANK_FAILURE_RETRYABLE_CODE}]"
 
 
-def peer_loss_retryable_message(reason: str) -> str:
-    """Client-facing message for a request a peer loss failed.
+def rank_failure_retryable_message(reason: str) -> str:
+    """Client-facing message for a request a rank failure failed.
 
     Like ``context_length_exceeded_message``, it crosses the IPC boundary as a
-    plain string; ``is_peer_loss_retryable_message`` recognizes it.
+    plain string; ``is_rank_failure_retryable_message`` recognizes it.
     """
-    return f"{reason} {_PEER_LOSS_RETRYABLE_TAG}"
+    return f"{reason} {_RANK_FAILURE_RETRYABLE_TAG}"
 
 
-def is_peer_loss_retryable_message(message: str) -> bool:
-    """True if ``message`` contains a ``peer_loss_retryable_message``."""
-    return _PEER_LOSS_RETRYABLE_TAG in message
+def is_rank_failure_retryable_message(message: str) -> bool:
+    """True if ``message`` contains a ``rank_failure_retryable_message``."""
+    return _RANK_FAILURE_RETRYABLE_TAG in message
 
 
 class EngineDeadError(RuntimeError):

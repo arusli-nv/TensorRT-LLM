@@ -34,11 +34,11 @@ __all__ = [
     "Ready",
     "Register",
     "Registered",
-    "Restart",
     "Sent",
     "Status",
     "StatusQuery",
     "Stopped",
+    "Terminate",
     "datagram_address",
     "decode_datagram",
     "is_message",
@@ -49,15 +49,15 @@ __all__ = [
 # Upper bound on a message on either side; real messages are a few hundred bytes.
 MAX_MESSAGE_BYTES = 64 * 1024
 # Version of the messages below; raise it with any change to them that a peer cannot read.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 1
 
 
 @dataclass(frozen=True)
 class Register:
-    """Worker -> authority: announce a rank and the failure domains whose loss it can recover from.
+    """Worker -> authority: announce a rank and the failure domains whose failure it can recover from.
 
     ``recoverable_domains`` are sorted rank sets (a single rank or a whole node) whose
-    combined loss this worker's expert placement absorbs. ``config_digest`` is the worker's
+    combined failure this worker's expert placement absorbs. ``config_digest`` is the worker's
     ``FaultToleranceConfig.digest()``, and ``protocol_version`` the ``PROTOCOL_VERSION`` it speaks.
     """
 
@@ -69,14 +69,14 @@ class Register:
 
 @dataclass(frozen=True)
 class Registered:
-    """Authority -> workers: every rank registered; the loss of one admitted domain recovers."""
+    """Authority -> workers: every rank registered; the failure of one admitted domain recovers."""
 
     admitted_domains: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
 class Stopped:
-    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) depart."""
+    """Worker -> authority: local work joined after observing ``failed_ranks`` (sorted) fail."""
 
     rank: int
     failed_ranks: tuple[int, ...]
@@ -93,10 +93,10 @@ class Ready:
 
 @dataclass(frozen=True)
 class Installed:
-    """Worker -> authority: survivor membership for ``generation`` is installed.
+    """Worker -> authority: the live ranks of ``generation`` are installed.
 
-    ``failed_requests`` is how many requests the recovery fails: the departed ranks' requests that do
-    not run again, and the requests a loss interrupted a second time without progress. Only rank 0,
+    ``failed_requests`` is how many requests the recovery fails: the failed ranks' requests that do
+    not run again, and the requests a rank failure interrupted a second time without progress. Only rank 0,
     which routes every request, reports them (0 elsewhere).
     """
 
@@ -107,11 +107,11 @@ class Installed:
 
 @dataclass(frozen=True)
 class Propose:
-    """Authority -> survivors: prepare to continue without ``failed_ranks`` (sorted)."""
+    """Authority -> survivors: prepare to continue on ``live_ranks``, without ``failed_ranks`` (sorted)."""
 
     generation: int
     failed_ranks: tuple[int, ...]
-    survivors: tuple[int, ...]
+    live_ranks: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -177,11 +177,11 @@ class DeviceWait:
 
 @dataclass(frozen=True)
 class Fence:
-    """Authority -> a worker's evidence connection: end the worker process ``pid`` of the hung ``rank``.
+    """Authority -> a worker's reporter connection: end the worker process ``pid`` of the hung ``rank``.
 
-    Sent to the hung rank itself (its evidence thread kills its own process) and to another
+    Sent to the hung rank itself (its reporter thread kills its own process) and to another
     rank (which has the MPI runtime kill ``rank``'s process after a grace period). During a
-    recovery, sent to rank 0's recovery connection for a departed rank not known to be dead:
+    recovery, sent to rank 0's recovery connection for a failed rank not known to be ended:
     rank 0 has the MPI runtime kill it at once and answers ``Fenced``; ``pid`` is 0 if unknown.
     """
 
@@ -191,7 +191,7 @@ class Fence:
 
 @dataclass(frozen=True)
 class Fenced:
-    """Rank 0 -> authority: the MPI runtime ended departed rank ``target``, or ``error`` says why not."""
+    """Rank 0 -> authority: the MPI runtime ended failed rank ``target``, or ``error`` says why not."""
 
     rank: int
     target: int
@@ -199,8 +199,8 @@ class Fenced:
 
 
 @dataclass(frozen=True)
-class Restart:
-    """Authority -> each worker's evidence connection: the deployment hangs and no fence can recover it.
+class Terminate:
+    """Authority -> each worker's reporter connection: the deployment hangs and no fence can recover it.
 
     The worker ends its process with ``STALLED_EXIT_CODE`` so that the deployment is restarted.
     """
@@ -217,10 +217,10 @@ class StatusQuery:
 class Status:
     """Authority -> observer: the committed recovery state.
 
-    ``phase`` is the authority's phase name; ``live_ranks`` exclude the departed
+    ``phase`` is the authority's phase name; ``live_ranks`` exclude the
     ``failed_ranks`` (sorted) once they are known. ``recovery_stage_us`` holds the last
     committed recovery's durations in microseconds: stop (first ``Stopped`` to ``Propose``),
-    agree (to ``Install``) and install (to ``Commit``); empty before any recovery.
+    prepare (to ``Install``) and install (to ``Commit``); empty before any recovery.
     ``failed_requests`` counts the requests the recoveries failed (see ``Installed``).
     ``abort_reason`` is empty unless aborted.
     """
@@ -250,7 +250,7 @@ Message = (
     | DeviceWait
     | Fence
     | Fenced
-    | Restart
+    | Terminate
     | StatusQuery
     | Status
 )
@@ -263,7 +263,7 @@ class Sent:
     ``session`` is random and fixed for the life of the process, announced with its ``Register``;
     ``seq`` increases strictly over the process's messages. The authority drops a message whose
     session is not its rank's or whose ``seq`` is not above the last it accepted from that rank's
-    connection of the same kind (protocol or evidence), so a replayed message changes nothing,
+    connection of the same kind (protocol or hang reports), so a replayed message changes nothing,
     whatever connection carries it.
     """
 
