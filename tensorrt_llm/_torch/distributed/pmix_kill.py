@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""End one process of an MPI job through its runtime (PMIx job control), for fencing a hung rank.
+"""Kill one rank of an MPI job through PMIx job control (a PMIx kill), used to fence a hung rank.
 
 The runtime (PRRTE under ``mpirun``) kills the target's process group; the other processes keep running and
-ULFM survivors see the process fail like any other. Only ``PMIX_JOB_CTRL_KILL`` aimed at one process is used:
+see the process fail like any other. Only ``PMIX_JOB_CTRL_KILL`` aimed at one process is used:
 ``PMIX_JOB_CTRL_SIGNAL`` signals the whole job. The calls go through the libpmix that libmpi already loaded
 and initialized in this process.
 """

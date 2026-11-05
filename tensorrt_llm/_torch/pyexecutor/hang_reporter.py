@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Report evidence of a hung peer to the recovery authority.
+"""Report hangs to the recovery authority.
 
 Each worker's reporter thread sends the authority heartbeats (the executor iteration, and whether the executor
 waits on something outside its rank) and its device's all-to-all waits longer than a threshold. These come from the
 rank's all-to-all progress row (its round ``flag_val`` and its peers' completion flags), which a side stream copies
 to host memory, so eager and CUDA-graph steps are both read. A native ``HeartbeatSender`` also sends the iteration of
 the last finished step without the Python interpreter lock, so a rank with starved Python threads still counts as
-alive. Evidence never changes membership; the authority decides. The thread carries out the authority's ``Fence``:
-of its own rank (whose main thread is stuck) by killing its process; of another rank (whose whole process may be
-stopped) after a grace period, through the MPI runtime (``pmix_fence``) on a separate thread so heartbeats keep
-flowing. On ``Restart`` (a hang no fence can recover) it ends its process with ``STALLED_EXIT_CODE``.
+alive. Hang reports never change membership; the authority decides. The thread carries out the authority's
+``Fence``: of its own rank (whose main thread is stuck) by killing its process; of another rank (whose whole process
+may be stopped) after a grace period, through a PMIx kill (``pmix_kill``) on a separate thread so heartbeats keep
+flowing. On ``Terminate`` (a hang no fence can recover) it ends its process with ``STALLED_EXIT_CODE``.
 """
 
 from __future__ import annotations
@@ -27,21 +27,21 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._torch.alltoall_watchdog import _COMPLETION_FLAG_MASK
-from tensorrt_llm._torch.distributed.pmix_fence import PmixUnavailable, kill_rank
+from tensorrt_llm._torch.distributed.pmix_kill import PmixUnavailable, kill_rank
 from tensorrt_llm._utils import FAULT_TOLERANCE_AUTHORITY_ENV, prefer_pinned
 from tensorrt_llm.executor.recovery.client import load_key
-from tensorrt_llm.executor.recovery.config import RUNTIME_FENCE_GRACE_S, STALLED_EXIT_CODE
+from tensorrt_llm.executor.recovery.config import RUNTIME_KILL_GRACE_S, STALLED_EXIT_CODE
 from tensorrt_llm.executor.recovery.protocol import (
     DeviceWait,
     Fence,
     Heartbeat,
-    Restart,
+    Terminate,
     datagram_address,
 )
 from tensorrt_llm.logger import logger
 
 __all__ = [
-    "HangEvidenceReporter",
+    "HangReporter",
     "ProgressRow",
     "ProgressRowReader",
     "lagging_peers",
@@ -171,7 +171,7 @@ def start_native_heartbeat(rank: int, interval_s: float):
         return None
 
 
-class HangEvidenceReporter:
+class HangReporter:
     """Background thread sending heartbeats and long device waits to the authority.
 
     Args:
@@ -185,7 +185,7 @@ class HangEvidenceReporter:
         heartbeat_s: Interval between heartbeats; also the polling interval.
         receive: Returns the authority's next message for this connection, or None; called from the
             reporter thread only.
-        pmix_ranks: Each rank's rank in the MPI runtime (``pmix_fence.pmix_ranks`` of the session
+        pmix_ranks: Each rank's rank in the MPI runtime (``pmix_kill.pmix_ranks`` of the session
             communicator), for fencing another rank.
     """
 
@@ -206,10 +206,10 @@ class HangEvidenceReporter:
         self._send = send
         self._receive = receive
         self._pmix_ranks = tuple(pmix_ranks)
-        # Runtime fences due: (monotonic deadline, Fence).
+        # Runtime kills due: (monotonic deadline, Fence).
         self._fences: list[tuple[float, Fence]] = []
-        # The runtime fence under way; at most one, since a call the runtime never answers blocks its thread.
-        self._runtime_fence: threading.Thread | None = None
+        # The runtime kill under way; at most one, since a call the runtime never answers blocks its thread.
+        self._runtime_kill: threading.Thread | None = None
         self._read_row = read_row
         self._active_ranks = active_ranks
         self._iteration = iteration
@@ -231,7 +231,7 @@ class HangEvidenceReporter:
         before it serves. Every message goes out from the reporter thread."""
         sent = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, args=(sent,), name="hang_evidence", daemon=True
+            target=self._run, args=(sent,), name="hang_reporter", daemon=True
         )
         self._thread.start()
         sent.wait()
@@ -244,14 +244,14 @@ class HangEvidenceReporter:
         self._thread.join(_STOP_TIMEOUT_S)
         if self._thread.is_alive():
             logger.warning(
-                f"Rank {self._rank}: the hang evidence reporter did not stop within {_STOP_TIMEOUT_S}s"
+                f"Rank {self._rank}: the hang reporter did not stop within {_STOP_TIMEOUT_S}s"
             )
             return False
         return True
 
     def _obey(self, now: float) -> None:
         while (message := self._receive()) is not None:
-            if isinstance(message, Restart):
+            if isinstance(message, Terminate):
                 logger.error(
                     f"Rank {self._rank}: {message.reason}; ending the process with exit code "
                     f"{STALLED_EXIT_CODE}"
@@ -271,21 +271,21 @@ class HangEvidenceReporter:
                 )
                 # Self-fence: SIGKILL, so that no handler or atexit code of a stuck process runs.
                 os.kill(os.getpid(), signal.SIGKILL)
-            self._fences.append((now + RUNTIME_FENCE_GRACE_S, message))
+            self._fences.append((now + RUNTIME_KILL_GRACE_S, message))
         due = [fence for deadline, fence in self._fences if deadline <= now]
         self._fences = [(deadline, fence) for deadline, fence in self._fences if deadline > now]
         for fence in due:
-            if self._runtime_fence is not None and self._runtime_fence.is_alive():
+            if self._runtime_kill is not None and self._runtime_kill.is_alive():
                 logger.warning(
                     f"Rank {self._rank}: not fencing rank {fence.rank} through the MPI runtime; it has "
-                    "not answered an earlier fence"
+                    "not answered an earlier kill"
                 )
                 continue
             logger.error(f"Rank {self._rank}: asking the MPI runtime to end hung rank {fence.rank}")
-            self._runtime_fence = threading.Thread(
-                target=self._kill_rank, args=(fence.rank,), name="runtime_fence", daemon=True
+            self._runtime_kill = threading.Thread(
+                target=self._kill_rank, args=(fence.rank,), name="runtime_kill", daemon=True
             )
-            self._runtime_fence.start()
+            self._runtime_kill.start()
 
     def _heartbeat(self) -> None:
         self._send(
@@ -308,20 +308,20 @@ class HangEvidenceReporter:
             kill_rank(self._pmix_ranks[rank])
         except (PmixUnavailable, RuntimeError) as error:
             # The rank may have ended itself already; else the authority's fence command remains.
-            logger.warning(f"Rank {self._rank}: runtime fence of rank {rank} failed: {error}")
+            logger.warning(f"Rank {self._rank}: PMIx kill of rank {rank} failed: {error}")
 
     def _run(self, sent: threading.Event) -> None:
         try:
             self._heartbeat()
-        except Exception as error:  # noqa: BLE001 - evidence is best effort; never kill the worker
-            logger.warning(f"Rank {self._rank}: hang evidence reporting failed: {error}")
+        except Exception as error:  # noqa: BLE001 - hang reports are best effort; never kill the worker
+            logger.warning(f"Rank {self._rank}: hang reporting failed: {error}")
         finally:
             sent.set()
         while not self._stop.wait(self._heartbeat_s):
             try:
                 self.poll(time.monotonic())
-            except Exception as error:  # noqa: BLE001 - evidence is best effort; never kill the worker
-                logger.warning(f"Rank {self._rank}: hang evidence reporting failed: {error}")
+            except Exception as error:  # noqa: BLE001 - hang reports are best effort; never kill the worker
+                logger.warning(f"Rank {self._rank}: hang reporting failed: {error}")
 
     def poll(self, now: float) -> None:
         """Carry out the authority's commands, then send a heartbeat and the device-wait changes worth reporting."""
@@ -330,7 +330,7 @@ class HangEvidenceReporter:
         row = self._read_row()
         if row is not None:
             self._last_row, self._row_time = row, now
-        # A copy that does not land (its own device is stuck) leaves no current evidence about peers, and
+        # A copy that does not land (its own device is stuck) leaves no current progress row of peers, and
         # waits reported earlier must not keep this rank looking like a victim.
         if self._last_row is None or now - self._row_time > self._heartbeat_s:
             lagging = set()

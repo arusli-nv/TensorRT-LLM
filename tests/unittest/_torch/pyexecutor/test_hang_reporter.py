@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Worker-side hang evidence: lagging peers from the all-to-all progress row, and the reporter."""
+"""Worker-side hang reports: lagging peers from the all-to-all progress row, and the reporter."""
 
 import os
 import signal
@@ -11,9 +11,9 @@ import time
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor import hang_evidence
-from tensorrt_llm._torch.pyexecutor.hang_evidence import (
-    HangEvidenceReporter,
+from tensorrt_llm._torch.pyexecutor import hang_reporter
+from tensorrt_llm._torch.pyexecutor.hang_reporter import (
+    HangReporter,
     ProgressRow,
     ProgressRowReader,
     lagging_peers,
@@ -25,7 +25,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Fence,
     Heartbeat,
     NativeHeartbeat,
-    Restart,
+    Terminate,
 )
 
 RANKS = (0, 1, 2, 3)
@@ -52,7 +52,7 @@ class _Reporter:
     def __init__(self, rows, suspect_s=2.0, heartbeat_s=1.0):
         self.sent = []
         self.rows = list(rows)
-        self.reporter = HangEvidenceReporter(
+        self.reporter = HangReporter(
             rank=0,
             send=self.sent.append,
             read_row=lambda: self.rows.pop(0) if self.rows else None,
@@ -85,7 +85,7 @@ def test_short_waits_and_stale_rows_report_nothing():
     for now in (0.0, 1.0, 2.0):
         r.reporter.poll(now)
     assert r.waits() == []
-    # The copy stops landing (this rank's own device is stuck): no evidence about peers.
+    # The copy stops landing (this rank's own device is stuck): nothing to report about peers.
     r = _Reporter([stuck])
     for now in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
         r.reporter.poll(now)
@@ -97,22 +97,22 @@ def test_a_reported_wait_is_cleared_once_rows_stop_landing():
     r = _Reporter([stuck, stuck, stuck])
     for now in (0.0, 1.0, 2.0, 3.0, 4.0):
         r.reporter.poll(now)
-    # Reported at 2 s; at 4 s this rank's own copy has not landed for two polls: no current evidence.
+    # Reported at 2 s; at 4 s this rank's own copy has not landed for two polls: no current progress row.
     assert r.waits() == [DeviceWait(0, 2, 2000), DeviceWait(0, 2, 0)]
 
 
 def _fence_reporter(monkeypatch, messages, runtime_kill=None, pmix_ranks=RANKS):
     killed = []
-    monkeypatch.setattr(hang_evidence.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(hang_reporter.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     if runtime_kill is not False:
         monkeypatch.setattr(
-            hang_evidence,
+            hang_reporter,
             "kill_rank",
             runtime_kill or (lambda rank: killed.append(("runtime", rank))),
         )
     inbox = list(messages)
     sent = []
-    reporter = HangEvidenceReporter(
+    reporter = HangReporter(
         rank=0,
         send=sent.append,
         read_row=lambda: None,
@@ -126,9 +126,9 @@ def _fence_reporter(monkeypatch, messages, runtime_kill=None, pmix_ranks=RANKS):
     return reporter, killed, inbox
 
 
-def _join_runtime_fence(reporter):
-    reporter._runtime_fence.join(5)
-    assert not reporter._runtime_fence.is_alive()
+def _join_runtime_kill(reporter):
+    reporter._runtime_kill.join(5)
+    assert not reporter._runtime_kill.is_alive()
 
 
 def test_a_fenced_rank_ends_its_own_process(monkeypatch):
@@ -143,10 +143,10 @@ def test_a_fence_of_another_process_of_this_rank_is_ignored(monkeypatch):
     assert killed == []
 
 
-def test_a_restart_ends_the_process_with_the_stalled_exit_code(monkeypatch):
+def test_a_terminate_ends_the_process_with_the_stalled_exit_code(monkeypatch):
     exits = []
-    monkeypatch.setattr(hang_evidence.os, "_exit", exits.append)
-    reporter, killed, _ = _fence_reporter(monkeypatch, [Restart("every rank stalled")])
+    monkeypatch.setattr(hang_reporter.os, "_exit", exits.append)
+    reporter, killed, _ = _fence_reporter(monkeypatch, [Terminate("every rank stalled")])
     reporter.poll(0.0)
     assert exits == [STALLED_EXIT_CODE] and killed == []
 
@@ -169,7 +169,7 @@ def test_the_first_heartbeat_is_sent_before_the_rank_serves():
 
 
 def test_stop_gives_up_on_a_blocked_reporter_thread(monkeypatch):
-    monkeypatch.setattr(hang_evidence, "_STOP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hang_reporter, "_STOP_TIMEOUT_S", 0.05)
     blocked, release = threading.Event(), threading.Event()
     r = _Reporter([], heartbeat_s=0.01)
 
@@ -225,35 +225,35 @@ def test_another_rank_has_the_runtime_end_a_hung_rank_after_the_grace(monkeypatc
     reporter.poll(0.0)
     assert killed == []  # the hung rank's own thread gets the first chance
     reporter.poll(2.0)
-    _join_runtime_fence(reporter)
+    _join_runtime_kill(reporter)
     # Through the runtime, by rank: never a signal to a pid this rank cannot vouch for.
     assert killed == [("runtime", 2)]
 
 
-def test_the_runtime_fence_needs_a_pmix_runtime(monkeypatch):
-    from tensorrt_llm._torch.distributed import pmix_fence
+def test_the_runtime_kill_needs_a_pmix_runtime(monkeypatch):
+    from tensorrt_llm._torch.distributed import pmix_kill
 
     monkeypatch.delenv("PMIX_NAMESPACE", raising=False)
-    with pytest.raises(pmix_fence.PmixUnavailable):
-        pmix_fence.kill_rank(2)
+    with pytest.raises(pmix_kill.PmixUnavailable):
+        pmix_kill.kill_rank(2)
 
 
 def test_pmix_ranks_translate_a_communicator_to_the_job():
     from mpi4py import MPI
 
-    from tensorrt_llm._torch.distributed.pmix_fence import pmix_ranks
+    from tensorrt_llm._torch.distributed.pmix_kill import pmix_ranks
 
     assert pmix_ranks(MPI.COMM_SELF) == (MPI.COMM_WORLD.Get_rank(),)
 
 
-def test_a_failed_runtime_fence_leaves_the_worker_running(monkeypatch):
+def test_a_failed_runtime_kill_leaves_the_worker_running(monkeypatch):
     def refuse(rank):
-        raise hang_evidence.PmixUnavailable("not launched by PMIx")
+        raise hang_reporter.PmixUnavailable("not launched by PMIx")
 
     reporter, killed, _ = _fence_reporter(monkeypatch, [Fence(2, 4242)], refuse)
     reporter.poll(0.0)
     reporter.poll(2.0)
-    _join_runtime_fence(reporter)
+    _join_runtime_kill(reporter)
     assert killed == []
 
 
@@ -261,7 +261,7 @@ def test_a_fence_of_a_rank_outside_the_session_is_not_run(monkeypatch):
     reporter, killed, _ = _fence_reporter(monkeypatch, [Fence(len(RANKS), 4242)])
     reporter.poll(0.0)
     reporter.poll(2.0)
-    _join_runtime_fence(reporter)
+    _join_runtime_kill(reporter)
     assert killed == []
 
 
@@ -289,15 +289,15 @@ class _FakeLibpmix:
         return 0
 
 
-def test_the_runtime_fence_kills_the_job_rank_off_the_heartbeat_thread(monkeypatch):
+def test_the_runtime_kill_targets_the_job_rank_off_the_heartbeat_thread(monkeypatch):
     import threading
 
-    from tensorrt_llm._torch.distributed import pmix_fence
+    from tensorrt_llm._torch.distributed import pmix_kill
 
     answered = threading.Event()
     lib = _FakeLibpmix(answered)
     monkeypatch.setenv("PMIX_NAMESPACE", "prterun-test@1")
-    monkeypatch.setattr(pmix_fence, "_loaded_libpmix", lambda: lib)
+    monkeypatch.setattr(pmix_kill, "_loaded_libpmix", lambda: lib)
     # Session rank 2 is job rank 6.
     reporter, killed, inbox = _fence_reporter(
         monkeypatch, [Fence(2, 4242)], runtime_kill=False, pmix_ranks=(4, 5, 6, 7)
@@ -310,7 +310,7 @@ def test_the_runtime_fence_kills_the_job_rank_off_the_heartbeat_thread(monkeypat
     reporter.poll(5.0)
     assert sum(isinstance(m, Heartbeat) for m in reporter.sent) == 4
     answered.set()
-    _join_runtime_fence(reporter)
+    _join_runtime_kill(reporter)
     assert lib.targets == [(b"prterun-test@1", 6)]
     assert killed == []
 
