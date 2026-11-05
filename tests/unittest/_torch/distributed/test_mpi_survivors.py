@@ -222,19 +222,19 @@ def world(fake_mpi, monkeypatch):
 def dist(world):
     dist = MPIDist(_mapping())
     dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
-    dist.enable_peer_loss_recovery()
+    dist.enable_rank_failure_recovery()
     return dist
 
 
 def test_recovery_revokes_a_private_world_not_the_session_world(world, monkeypatch):
-    """The MPI session keeps using the world communicator after a peer loss."""
+    """The MPI session keeps using the world communicator after a rank failure."""
     private = FakeComm(range(WORLD), ME)
     monkeypatch.setattr(world, "Dup", lambda: private, raising=False)
     dist = MPIDist(_mapping())
     dist._tp_comm = FakeComm(range(WORLD), ME, failed=(FAILED,))
     with pytest.raises(RuntimeError):
         dist.revoke()
-    dist.enable_peer_loss_recovery()
+    dist.enable_rank_failure_recovery()
     dist.broadcast_int64([1], root=0)
     dist.revoke()
     assert private.bcast_roots == [0] and world.bcast_roots == []
@@ -247,7 +247,7 @@ def test_recovery_refuses_an_mpi_library_without_ulfm(world, monkeypatch):
 
     monkeypatch.setattr(world, "Get_failed", get_failed)
     with pytest.raises(RuntimeError, match="ULFM calls"):
-        MPIDist(_mapping()).enable_peer_loss_recovery()
+        MPIDist(_mapping()).enable_rank_failure_recovery()
 
 
 def test_failed_ranks_need_mpi4py_4():
@@ -409,25 +409,25 @@ def test_install_survivors_keeps_logical_ranks(dist, world):
 
     assert dist.live_ranks == (0, 1, 3)
     assert (dist.tp_rank, dist.tp_size) == (ME, WORLD)
-    assert dist.tp_allgather("me", small_payload=True, departed=None) == [
+    assert dist.tp_allgather("me", small_payload=True, absent=None) == [
         "rank0",
         "me",
         None,
         "rank3",
     ]
-    assert dist.allgather("me", departed=0) == ["rank0", "me", 0, "rank3"]
+    assert dist.allgather("me", absent=0) == ["rank0", "me", 0, "rank3"]
 
-    # A caller that does not say what a departed rank contributes fails stop.
+    # A caller that does not say what an absent rank contributes fails stop.
     for gather in (
         lambda: dist.tp_allgather("me", small_payload=True),
         lambda: dist.allgather("me"),
         lambda: dist.tp_cp_allgather("me", small_payload=True),
     ):
-        with pytest.raises(RuntimeError, match="departed="):
+        with pytest.raises(RuntimeError, match="absent="):
             gather()
-    with pytest.raises(RuntimeError, match="departed"):
+    with pytest.raises(RuntimeError, match="absent="):
         dist.tp_allgather_int64([5, 6])
-    rows = dist.tp_allgather_int64([5, 6], departed=[-1, 1])
+    rows = dist.tp_allgather_int64([5, 6], absent=[-1, 1])
     np.testing.assert_array_equal(rows, [[5, 6], [105, 106], [-1, 1], [305, 306]])
 
     survivor = dist.tp_comm
@@ -450,10 +450,10 @@ def test_install_survivors_tp_gather_returns_logical_list(dist, monkeypatch):
         return [f"rank{m}" for m in comm.members]
 
     monkeypatch.setattr(communicator, "safe_gather", fake_safe_gather)
-    assert dist.tp_gather("x", root=0, departed=None) == ["rank0", "rank1", None, "rank3"]
-    with pytest.raises(RuntimeError, match="departed="):
+    assert dist.tp_gather("x", root=0, absent=None) == ["rank0", "rank1", None, "rank3"]
+    with pytest.raises(RuntimeError, match="absent="):
         dist.tp_gather("x", root=0)
-    dist.tp_gather("x", root=3, departed=None)
+    dist.tp_gather("x", root=3, absent=None)
     assert roots == [0, 0, 2]
 
 
@@ -478,7 +478,7 @@ def test_interruption_after_install_reports_logical_ranks(dist):
 )
 def test_recovery_rejects_unsupported_layouts(world, overrides):
     with pytest.raises(ValueError):
-        MPIDist(_mapping(**overrides)).enable_peer_loss_recovery()
+        MPIDist(_mapping(**overrides)).enable_rank_failure_recovery()
 
 
 def test_install_survivors_requires_shrink(dist):
@@ -486,7 +486,7 @@ def test_install_survivors_requires_shrink(dist):
         dist.install_survivors()
 
 
-def test_a_loss_after_a_recovery_shrinks_the_installed_survivors(dist):
+def test_a_rank_failure_after_a_recovery_shrinks_the_installed_survivors(dist):
     dist.revoke()
     _install(dist)
     installed = dist._survivor_comm
@@ -496,10 +496,10 @@ def test_a_loss_after_a_recovery_shrinks_the_installed_survivors(dist):
     assert installed.Is_revoked()
     assert _install(dist) == frozenset({FAILED, 3})
     assert dist.live_ranks == (0, 1)
-    assert dist.allgather("me", departed=None) == ["rank0", "me", None, None]
+    assert dist.allgather("me", absent=None) == ["rank0", "me", None, None]
 
 
-def test_shrink_again_before_install_drops_a_peer_lost_during_recovery(dist):
+def test_shrink_again_before_install_drops_a_rank_that_failed_during_recovery(dist):
     with pytest.raises(RuntimeError, match="prior shrink"):
         dist.watch_survivor_failures(lambda: None)
     dist.revoke()
@@ -568,7 +568,7 @@ def test_a_watch_stopped_from_its_own_callback_is_released_by_the_next_stop(
 
 
 def test_survivor_calls_refuse_to_run_before_their_setup(world, dist):
-    with pytest.raises(RuntimeError, match="enable_peer_loss_recovery"):
+    with pytest.raises(RuntimeError, match="enable_rank_failure_recovery"):
         MPIDist(_mapping()).watch_peer_failures(lambda: None)
     with pytest.raises(RuntimeError, match="prior shrink"):
         dist.barrier_among_survivors()
@@ -597,26 +597,26 @@ def test_recovery_requires_hcoll_off(variable, value, world, fake_mpi, monkeypat
         if selection:
             monkeypatch.setenv("OMPI_MCA_coll", selection)
         with pytest.raises(RuntimeError, match="hcoll"):
-            MPIDist(_mapping()).enable_peer_loss_recovery()
+            MPIDist(_mapping()).enable_rank_failure_recovery()
     monkeypatch.delenv("OMPI_MCA_coll")
     monkeypatch.setenv(variable, value)
     dist = MPIDist(_mapping())
     dist._tp_comm = FakeComm(range(WORLD), ME)
-    dist.enable_peer_loss_recovery()
+    dist.enable_rank_failure_recovery()
 
 
 def test_recovery_requires_mpi4py_ulfm_launch_and_thread_multiple(world, fake_mpi, monkeypatch):
     dist = MPIDist(_mapping())
     monkeypatch.setenv("OMPI_MCA_pml", "ucx")
     with pytest.raises(RuntimeError, match="ob1"):
-        dist.enable_peer_loss_recovery()
+        dist.enable_rank_failure_recovery()
     monkeypatch.setenv("OMPI_MCA_pml", "ob1")
     monkeypatch.setattr(fake_mpi, "Query_thread", lambda: 1)
     with pytest.raises(RuntimeError, match="THREAD_MULTIPLE"):
-        dist.enable_peer_loss_recovery()
+        dist.enable_rank_failure_recovery()
     monkeypatch.delenv("OMPI_MCA_mpi_ft_enable")
     with pytest.raises(RuntimeError, match="--with-ft ulfm"):
-        dist.enable_peer_loss_recovery()
+        dist.enable_rank_failure_recovery()
     monkeypatch.setattr(fake_mpi, "Comm", SimpleNamespace())
     with pytest.raises(RuntimeError, match="mpi4py>=4"):
-        dist.enable_peer_loss_recovery()
+        dist.enable_rank_failure_recovery()

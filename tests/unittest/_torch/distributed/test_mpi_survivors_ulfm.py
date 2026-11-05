@@ -3,7 +3,7 @@
 """MPIDist survivor recovery against a real ULFM MPI library.
 
 The test launches this file under ``mpirun --with-ft ulfm``; one rank exits (or
-freezes and is fenced through the runtime) and the others detect, interrupt,
+freezes and is fenced by a PMIx kill) and the others detect, interrupt,
 shrink and keep running host collectives.
 """
 
@@ -51,7 +51,7 @@ def ulfm() -> None:
     [(None, False), (3, False), (None, True)],
     ids=["exit", "replan", "fenced"],
 )
-def test_survivors_recover_from_departed_ranks(second_victim, frozen):
+def test_survivors_recover_from_failed_ranks(second_victim, frozen):
     """One rank exits; with ``second_victim``, another exits during the recovery, before install.
 
     ``frozen``: the victim stops itself (SIGSTOP) instead, and rank 0 fences it through the runtime
@@ -104,7 +104,7 @@ def _run_rank() -> None:
         enable_attention_dp=True,
     )
     dist = MPIDist(mapping)
-    dist.enable_peer_loss_recovery()
+    dist.enable_rank_failure_recovery()
     assert dist.tp_allgather(rank) == list(range(WORLD_SIZE))
 
     failure_seen = threading.Event()
@@ -116,11 +116,11 @@ def _run_rank() -> None:
             os.kill(os.getpid(), signal.SIGSTOP)
         os._exit(0)
     if rank == 0 and os.environ.get("ULFM_FROZEN_VICTIM") == "1":
-        from tensorrt_llm._torch.distributed.pmix_fence import kill_rank
+        from tensorrt_llm._torch.distributed.pmix_kill import kill_rank
 
         kill_rank(VICTIM)
 
-    assert failure_seen.wait(60), "the watch did not observe the departed rank"
+    assert failure_seen.wait(60), "the watch did not observe the failed rank"
     assert watch.failed and abort[0] == 1
     with pytest.raises(HostCollectiveInterrupted):
         dist.tp_allgather(rank)
@@ -133,7 +133,7 @@ def _run_rank() -> None:
     placement = {"slots": list(range(WORLD_SIZE))}
     sent = dist.broadcast_among_survivors(placement if rank == 0 else None, root=0)
     assert sent == placement, sent
-    departed = {VICTIM}
+    absent = {VICTIM}
     second = int(os.environ.get("ULFM_SECOND_VICTIM", "-1"))
     if second >= 0:
         # Another rank fails during the recovery: the survivors shrink again. The callback drops the
@@ -148,25 +148,25 @@ def _run_rank() -> None:
         watches.append(dist.watch_survivor_failures(on_second_failure))
         if rank == second:
             os._exit(0)
-        assert replan.wait(60), "the survivor watch did not observe the second departed rank"
+        assert replan.wait(60), "the survivor watch did not observe the second failed rank"
         dist.revoke()
         failed = dist.shrink()
-        departed.add(second)
-        assert failed == frozenset(departed), failed
+        absent.add(second)
+        assert failed == frozenset(absent), failed
     # Roots name logical ranks, which the survivor communicator renumbers densely.
-    last = max(r for r in range(WORLD_SIZE) if r not in departed)
+    last = max(r for r in range(WORLD_SIZE) if r not in absent)
     assert dist.broadcast_among_survivors(rank if rank == last else None, root=last) == last
     dist.install_survivors()
     with pytest.raises(RuntimeError, match="prior shrink"):
         dist.broadcast_among_survivors(None)
 
-    survivors = [r for r in range(WORLD_SIZE) if r not in departed]
-    assert dist.live_ranks == tuple(survivors)
-    expected = [None if r in departed else r for r in range(WORLD_SIZE)]
-    assert dist.tp_allgather(rank, departed=None) == expected
-    assert dist.allgather(rank, departed=None) == expected
-    gathered = dist.tp_allgather_int64([rank], departed=-1)[:, 0].tolist()
-    assert gathered == [-1 if r in departed else r for r in range(WORLD_SIZE)]
+    live_ranks = [r for r in range(WORLD_SIZE) if r not in absent]
+    assert dist.live_ranks == tuple(live_ranks)
+    expected = [None if r in absent else r for r in range(WORLD_SIZE)]
+    assert dist.tp_allgather(rank, absent=None) == expected
+    assert dist.allgather(rank, absent=None) == expected
+    gathered = dist.tp_allgather_int64([rank], absent=-1)[:, 0].tolist()
+    assert gathered == [-1 if r in absent else r for r in range(WORLD_SIZE)]
     assert dist.broadcast(rank * 10) == 0
 
     # Survivors can watch again after recovery; a clean stop never fires.
