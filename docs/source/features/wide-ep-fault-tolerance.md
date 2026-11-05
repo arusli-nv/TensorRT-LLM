@@ -1,12 +1,12 @@
 # Wide-EP Fault Tolerance (experimental)
 
-Wide expert parallelism spreads a model's experts over many GPUs, so without fault tolerance the loss of
-one GPU's process ends the whole job. With fault tolerance on, the surviving ranks detect the loss, stop
-the step in flight, agree on who survived, route the lost rank's experts to their copies on other GPUs and
-keep serving on the same CUDA graphs. Requests the lost rank was serving run again on a survivor if they
+Wide expert parallelism spreads a model's experts over many GPUs, so without fault tolerance the failure of
+one GPU's process ends the whole job. With fault tolerance on, the surviving ranks detect the rank failure, stop
+the step in flight, agree on who survived, route the failed rank's experts to their copies on other GPUs and
+keep serving on the same CUDA graphs. Requests the failed rank was serving run again on a live rank if they
 had delivered nothing yet, else end with a retryable error; every other request continues. A request that a
-second loss interrupts before it completed a step since the first ends with a retryable error, whichever ranks
-were lost.
+second rank failure interrupts before it completed a step since the first ends with a retryable error, whichever
+ranks failed.
 
 ## Requirements
 
@@ -15,28 +15,29 @@ were lost.
   is accepted, so an interrupted step publishes none), the default attention-DP router, and a generation sampler
   (not a non-generation model or a multimodal encoder-only executor).
 - NVLinkOneSided all-to-all on its fence path. Where CFT counted writes are available (a build against CUDA 13.4 or
-  later, driver 615 or later, SM100 or newer), NVLinkOneSided selects them by default. With peer-loss recovery
+  later, driver 615 or later, SM100 or newer), NVLinkOneSided selects them by default. With fault tolerance
   enabled it falls back to the fence path by itself and logs a warning. Setting
   `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=1` forces CFT on, and recovery then refuses to start. A deployment
   without fault tolerance that you compare with selects CFT by default: set
   `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0` there, so that both run the same all-to-all. CFT is not measured with
   fault tolerance.
 - The standard EPLB load balancer (`moe_config.load_balancer` with `num_slots` at least the number of experts),
-  static (`layer_updates_per_iter: 0`) or online; per-layer dynamic EPLB is refused. Fault tolerance appends slots to each rank where the survivors of a
-  failure domain's loss cannot hold every expert (`extra_slots` below), and host copies of the experts in
-  `/dev/shm` restore the experts of a lost rank into them; rank 0 is never recoverable. A placement with replicas
+  static (`layer_updates_per_iter: 0`) or online; per-layer dynamic EPLB is refused. Fault tolerance adds spare slots to each rank where the other ranks
+  cannot hold every expert after a failure domain fails (`spare_slots` below), and host weights of the experts in
+  `/dev/shm` restore the experts of a failed rank into them; rank 0 is never recoverable. A placement with replicas
   (online EPLB, or a static placement with more slots than experts, for example offline EPLB's
   `initial_global_assignments` from `examples/wide_ep/ep_load_balancer/generate_eplb_config.py`) keeps them
-  routed: a loss reroutes to the surviving replicas or restores into appended slots or a replica's slot, and every
-  node keeps every expert's copy; with online EPLB the survivors adopt rank 0's placement during the recovery and
-  restart the update rotation together. A static placement without replicas (`num_slots` equal to the number of
-  experts) restores only into the appended slots, and each node keeps only the home experts of the next node
-  (nodes in order of their first rank, the last node keeping the first's; a single node keeps its own), about
-  `1/N` of the copies with `N` nodes. A restore there copies each expert from a GPU of that node into the
-  restoring rank's NVLinkOneSided workspace and from there into its slot, in chunks of half the workspace; losing
-  a node together with the node that keeps its copies is not recoverable. Size `/dev/shm` (host memory) for these
-  copies: with replicas, every node needs the expert weights of all MoE layers; without, about `1/N` of them.
-  Startup fails with the sizes if a rank's copies do not fit.
+  routed: a rank failure reroutes to the surviving replicas or restores into spare slots or a replica's slot, and
+  every node keeps every expert's host weights; with online EPLB the survivors adopt rank 0's placement during the
+  recovery and restart the update rotation together. A static placement without replicas (`num_slots` equal to
+  the number of experts) restores only into the spare slots and keeps ring host weights: each node keeps only the
+  host weights of the next node's home experts (nodes in order of their first rank, the last node keeping the
+  first's; a single node keeps its own), about `1/N` of the host weights with `N` nodes. A restore there copies
+  each expert from a GPU of that node into the restoring rank's NVLinkOneSided workspace and from there into its
+  slot, in chunks of half the workspace; the failure of a node together with the node that keeps its host weights
+  is not recoverable. Size `/dev/shm` (host memory) for the host weights: with replicas, every node needs the
+  expert weights of all MoE layers; without, about `1/N` of them. Startup fails with the sizes if a rank's host
+  weights do not fit.
 - Open MPI built with ULFM fault tolerance (`ompi_info | grep ftmpi` lists it) and mpi4py 4 or later (startup checks for `MPI.Comm.Shrink`; the container installs 4.1.2).
 
 ## Running
@@ -69,15 +70,15 @@ were lost.
 
 | Variable | Meaning |
 |---|---|
-| `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance; alone it turns on the rank mask (and its cost) but only detects a loss: rank 0 warns at startup, `/health` reports `unprotected`, and CUDA graph capture fails, so disable CUDA graphs in this mode |
+| `TLLM_FAULT_TOLERANCE_MODE=1` | Enables fault tolerance; alone it turns on the rank mask (and its cost) but only detects a rank failure: rank 0 warns at startup, `/health` reports `unprotected`, and CUDA graph capture fails, so disable CUDA graphs in this mode |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY` | The authority's address; required to recover |
 | `TLLM_FAULT_TOLERANCE_AUTHORITY_KEY` | Shared HMAC key for authority messages: a hex string of at least 16 bytes (32 hex characters) |
 | `TLLM_FAULT_TOLERANCE_CONFIG` | Optional YAML file with the settings below; set the same file on the workers and the authority, which refuses a worker's registration with different settings (it logs its settings' digest at startup) |
 
 | Setting | Meaning |
 |---|---|
-| `failure_domain` | `node` (default): one rank's loss, or every rank of one host but rank 0's; `rank`: one rank's loss only, for placements with fewer spare slots |
-| `extra_slots` | The kind of slots fault tolerance appends to each rank where the survivors of a failure domain's loss cannot hold every expert (none if they can): `ghost` (default) or `empty`; details below |
+| `failure_domain` | `node` (default): the failure of one rank, or of every rank of one host but rank 0's; `rank`: the failure of one rank only, for placements with fewer spare slots |
+| `spare_slots` | The kind of spare slots fault tolerance adds to each rank where the other ranks cannot hold every expert after a failure domain fails (none if they can): `unbacked` (default) or `backed`; details below |
 | `recovery_timeout_s` | How long each of a worker's two recovery phases may take before the job stops: from the survivors' agreement on the failed ranks until it reports itself stopped (including finishing a long step first), and from that report until it resumes; up to about twice this in all (default 30 s) |
 | `authority_timeout_s` | How long the authority waits from the first report to the commit (default 20 s; must be below `recovery_timeout_s`) |
 | `peer_failure_poll_s` | How often a worker tests whether MPI reported a peer failure; detection lags MPI's report by at most this (default 0.02 s, at most 1 s) |
@@ -87,30 +88,30 @@ were lost.
 | `heartbeat_s` | Worker heartbeat interval (default 1 s, at most 2 s, below `heartbeat_timeout_s`) |
 | `heartbeat_timeout_s` | A worker without a heartbeat this long counts as missing (default 5 s) |
 
-`extra_slots` in detail:
+`spare_slots` in detail:
 
-- Default: `ghost`. With online EPLB the default is `empty` where GDRCopy cannot map ghost slot memory for the
-  host (that takes a GPU with GPUDirect RDMA for virtual memory), because online EPLB's weight updates would
-  otherwise load ghost slots with GPU copies every iteration. GPUs whose memory is a NUMA node use `empty` with
-  online EPLB: host access to ghost slot memory there is untested and deferred.
-- `ghost` slots are empty slots whose device memory, in chunks of the VMM granularity that lie wholly inside
+- Default: `unbacked`. With online EPLB the default is `backed` where GDRCopy cannot map unbacked slot memory for
+  the host (that takes a GPU with GPUDirect RDMA for virtual memory), because online EPLB's weight updates would
+  otherwise load unbacked slots with GPU copies every iteration. GPUs whose memory is a NUMA node use `backed` with
+  online EPLB: host access to unbacked slot memory there is untested and deferred.
+- Unbacked slots are empty slots whose device memory, in chunks of the VMM granularity that lie wholly inside
   them, is not backed while healthy (the KV cache keeps it). A chunk shared with a neighbouring slot stays
   backed, and each process maps unbacked chunks to one scratch allocation each of 1, 2, 4 and 8 chunks. They get
-  memory only when a recovery restores a lost rank's experts into them. That memory is taken from the KV cache
+  memory only when a recovery restores a failed rank's experts into them. That memory is taken from the KV cache
   when the device lacks it: that rank's KV cache stays smaller until the deployment restarts, and if it cannot
   shrink, the recovery fails and the job ends.
-- `empty` slots hold their memory and are not routed to while healthy, so there is no mapping at recovery and the
+- Backed slots hold their memory and are not routed to while healthy, so there is no mapping at recovery and the
   recovery resumes faster. The cost is about one slot per rank per MoE layer of device memory; it is not measured
   for DeepSeek-R1 NVFP4.
-- With online EPLB, its updates use an appended slot once a restore filled it.
-- An explicit `ghost` with online EPLB where ghost slot memory is not host accessible (no GDRCopy mapping, or GPU
-  memory is a NUMA node) is accepted, and rank 0 warns at startup: every online EPLB weight update then copies on
+- With online EPLB, its updates use a spare slot once a restore filled it.
+- An explicit `unbacked` with online EPLB where unbacked slot memory is not host accessible (no GDRCopy mapping, or
+  GPU memory is a NUMA node) is accepted, and rank 0 warns at startup: every online EPLB weight update then copies on
   the GPU instead of the host, which is slower.
 
-A confirmed hung rank is fenced by its own evidence thread (its process ends itself), else, 1 s later, by
-another rank asking the MPI runtime to kill it (PMIx job control of that one process; under `mpirun` PRRTE
+A confirmed hung rank is fenced by its own hang reporter thread (its process ends itself), else, 1 s later, by
+another rank asking the MPI runtime to kill it (a PMIx kill of that one process; under `mpirun` PRRTE
 ends its process group and the job keeps running), else by the authority's `--fence-command` (a
-`{host}`/`{pid}` template, run without a shell, 5 s later); its loss then recovers as any other.
+`{host}`/`{pid}` template, run without a shell, 5 s later); its failure then recovers as any other.
 
 A rank declared failed can still hold its GPU and its mappings of the survivors' memory, and the survivors'
 agreement on the failed ranks does not complete until that process ends. So failed ranks are
@@ -122,58 +123,58 @@ above; without it, such a rank holds the agreement until it ends.
 
 A failed rank's kernels can still write the all-to-all workspace pages it mapped. Each recovery therefore releases
 the survivors' workspace pages and maps fresh ones at the same addresses, shared only among the survivors: the
-failed rank's late writes land in pages no survivor maps, and the CUDA graphs keep their addresses. Ring host
-copies stage restored experts through the fresh pages only after every survivor remapped them. The old pages are
-freed only when the failed process ends; until then the fresh ones are taken from the KV cache if the device lacks
+failed rank's late writes land in pages no survivor maps, and the CUDA graphs keep their addresses. Restores
+from ring host weights stage experts through the fresh pages only after every survivor remapped them. The old
+pages are freed only when the failed process ends; until then the fresh ones are taken from the KV cache if the device lacks
 the memory, and returned to it later (see below).
 
 Fault tolerance ends a worker process in exactly these places, with SIGKILL so that no handler, atexit
 code or MPI finalization of a broken process runs, except the last, which exits with code 75:
 - a rank whose serving loop fails with an error that leaves it unusable (for example a sticky CUDA error)
-  kills itself, so that the survivors recover from its loss (`PyExecutor` event loop);
-- a rank the authority confirmed hung kills itself from its evidence thread (`hang_evidence`);
-- another rank has the MPI runtime kill a hung rank that could not (`pmix_fence`, PMIx job control);
+  kills itself, so that the survivors recover from its failure (`PyExecutor` event loop);
+- a rank the authority confirmed hung kills itself from its hang reporter thread (`hang_reporter`);
+- another rank has the MPI runtime kill a hung rank that could not (`pmix_kill`, a PMIx kill);
 - rank 0 has the MPI runtime kill each failed rank before a recovery plan, and, with `hang_detection`, each
-  survivor the ranks its MPI view reports failed before agreeing on them (`peer_loss_recovery`);
+  survivor the ranks its MPI view reports failed before agreeing on them (`rank_failure_recovery`);
 - the authority's `--fence-command`, if configured;
-- every rank, when the authority found every rank stalled with no rank to blame, or rank 0 hung (`hang_evidence`).
+- every rank, when the authority found every rank stalled with no rank to blame, or rank 0 hung (`hang_reporter`).
 
-At startup the workers register with the authority (it must be running), check that the survivors of each failure
-domain's loss can still serve every expert, and rank 0 logs which ranks' and nodes' loss the job can recover from.
-Startup fails closed: a configuration that recovery does not support, or slots that do not cover a failure domain,
-is refused with the requirement it misses, and the loss of a rank before serving starts (model loading, warmup, CUDA
-graph capture, KV cache estimation) ends the job (`MPI_Abort`).
+At startup the workers register with the authority (it must be running), check that the other ranks can still
+serve every expert after any one failure domain fails, and rank 0 logs which ranks' and nodes' failure the job can
+recover from. Startup fails closed: a configuration that recovery does not support, or slots that do not cover a
+failure domain, is refused with the requirement it misses, and a rank failure before serving starts (model loading,
+warmup, CUDA graph capture, KV cache estimation) ends the job (`MPI_Abort`).
 
 ## What is covered
 
-The loss, with the NVLink fabric healthy, of either:
+The failure, with the NVLink fabric healthy, of either:
 
 - a recoverable rank's process (killed, for example by the out-of-memory killer, or failed with an error
   that corrupts its CUDA context, such as an illegal memory access, after which it ends itself), or
 - with `failure_domain: node` (the default), every rank on one host other than rank 0's (the ranks that report the same
-  host name). The survivors must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and
-  `K` ranks per host, `s * (N - K)` must be at least the number of experts, with `s` including the slots fault
-  tolerance appends. For DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, the 28 survivors of one node's
-  loss need 10 slots each. A static placement of 256 slots gets two ghost slots per rank: 320 in all, which cover
-  one node and up to 6 lost GPUs in total over repeated losses (26 survivors hold 260 slots). Online EPLB or
-  offline EPLB with `num_slots: 288` gets one ghost slot per rank after EPLB's own (with online EPLB, an empty one
-  where ghost slot memory cannot be host accessible): 320 in all.
+  host name). The remaining ranks must be able to hold every expert: with `s` EPLB slots per rank, `N` ranks and
+  `K` ranks per host, `s * (N - K)` must be at least the number of experts, with `s` including the spare slots
+  fault tolerance adds. For DeepSeek-R1 (256 experts) at DEP32 with 4 GPUs per node, the 28 ranks left after one
+  node fails need 10 slots each. A static placement of 256 slots gets two unbacked spare slots per rank: 320 in
+  all, which cover one node and up to 6 failed GPUs in total over repeated rank failures (26 live ranks hold 260
+  slots). Online EPLB or offline EPLB with `num_slots: 288` gets one unbacked spare slot per rank after EPLB's own
+  (with online EPLB, a backed one where unbacked slot memory cannot be host accessible): 320 in all.
 
-Several such ranks lost together, or one more during a recovery (before the survivors install the new
-communicator, including while they remap the all-to-all workspaces), are recovered as one loss if the survivors'
-slots still hold every expert. A further loss after a
-recovery is recovered the same way: the survivors recover again as long as their slots still hold every expert
-without every rank lost so far (startup checks only one failure domain, so how many further losses a deployment
-survives depends on its spare slots).
+Several such ranks failing together, or one more during a recovery (before the survivors install the new
+communicator, including while they remap the all-to-all workspaces), are recovered as one rank failure if the
+survivors' slots still hold every expert. A further rank failure after a
+recovery is recovered the same way: the live ranks recover again as long as their slots still hold every expert
+without every rank failed so far (startup checks only one failure domain, so how many further rank failures a
+deployment survives depends on its spare slots).
 
 Not covered (these fail closed: the job ends as without fault tolerance):
 - rank 0, which runs the server's coordination;
 - the death of a host itself (power loss, kernel panic, or its Open MPI daemon ending): whether and how fast it
-  ends the job depends on Open MPI's runtime (PRRTE). `failure_domain: node` covers the loss of every rank
+  ends the job depends on Open MPI's runtime (PRRTE). `failure_domain: node` covers the failure of every rank
   process of a host that stays up;
 - a fault that takes down a GPU device, the NVLink fabric, several hosts or a rack;
-- a further loss after the survivors installed a recovery and before it committed (another loss before the
-  install re-plans the recovery, see above), and a further loss the remaining slots cannot cover;
+- a further rank failure after the survivors installed a recovery and before it committed (another rank failure
+  before the install re-plans the recovery, see above), and a further rank failure the remaining slots cannot cover;
 - a rank that hangs without dying, unless hang detection is on and the hang is in the MoE all-to-alls, and a
   stall that every rank shares (a deadlock or desync with no single culprit: with hang detection on it is
   reported, see below). These end the job only through the executor's hang detector (a fixed 300 s without a
@@ -182,29 +183,29 @@ Not covered (these fail closed: the job ends as without fault tolerance):
 - other errors in the serving loop.
 
 The authority is not a single point of failure for serving: if it stops, the deployment keeps serving but
-unprotected (`/health` reports `unprotected`), and a rank loss then ends the job. A job that recovered
-from a loss still stops: stopping `trtllm-serve` finalizes MPI on each process, which waits at most 30 s for
+unprotected (`/health` reports `unprotected`), and a rank failure then ends the job. A job that recovered
+from a rank failure still stops: stopping `trtllm-serve` finalizes MPI on each process, which waits at most 30 s for
 `MPI_Finalize` and then exits with its status.
 
-After a recovery the deployment serves `degraded` and a lost rank never rejoins: each loss lowers capacity
-and may take KV cache: for restored experts until the deployment restarts, and for the remapped all-to-all
+After a recovery the deployment serves `degraded` and a failed rank never rejoins: each rank failure lowers
+capacity and may take KV cache: for restored experts until the deployment restarts, and for the remapped all-to-all
 workspaces only until the failed processes have ended (returned at the recovery's commit, else at an idle
-iteration or a later recovery's commit). A request re-run after its rank's loss (see below) runs
-on any survivor, even if it was pinned to the lost rank with `attention_dp_relax=False`; a new request pinned to a
-lost rank fails with "Attention DP rank N is not serving" (HTTP 400, not retryable: the rank does not come back
+iteration or a later recovery's commit). A request re-run after its rank failed (see below) runs
+on any live rank, even if it was pinned to the failed rank with `attention_dp_relax=False`; a new request pinned to
+a failed rank fails with "Attention DP rank N is not serving" (HTTP 400, not retryable: the rank does not come back
 until the deployment restarts; send the request without `attention_dp_rank` or with `attention_dp_relax`). If a re-run or retried request
-that crashes every rank it runs on lands on rank 0, or on a rank whose loss the remaining slots cannot cover, its
+that crashes every rank it runs on lands on rank 0, or on a rank whose failure the remaining slots cannot cover, its
 crash ends the deployment; the server does not recognize a client's retry of a failed request.
 
 Failure model: a failing rank stops (it dies, or it hangs and is fenced). A rank that keeps running but
-computes wrong results (for example silent memory corruption) is not detected: the survivors keep its
+computes wrong results (for example silent memory corruption) is not detected: the other ranks keep its
 results until it fails, and any tokens they streamed meanwhile stay delivered.
 
 Timeouts (see the settings above):
 
 | What | How long |
 |---|---|
-| A dead process | detected when its TCP connections close, in milliseconds |
+| A process that ends | detected when its TCP connections close, in milliseconds |
 | A hung rank | `hang_suspect_s` (2 s) until a device wait is reported, or `heartbeat_timeout_s` (5 s) until a stopped rank's heartbeat counts as missing, plus `hang_confirm_s` (30 s) until the authority confirms it, plus 1 s before another rank has the runtime end it (5 s before the fence command). Measured at DEP32 with DeepSeek-R1 NVFP4, 64 requests per GPU, one rank frozen with SIGSTOP and `hang_confirm_s` 30 s: the rank was fenced 29.5-34.1 s after the freeze, and the first step after the recovery came 32.9-37.4 s after the freeze (3 runs for each of no EPLB, offline EPLB and online EPLB) |
 | A stall of every rank, or a hung rank 0 | `hang_confirm_s` (30 s) from its start until the deployment is reported terminal and every worker exits with code 75 |
 | A recovery | `recovery_timeout_s` (30 s) at the workers from the survivors' agreement on the failed ranks until each reports itself stopped, and again from then until it resumes (up to about 60 s in all), `authority_timeout_s` (20 s) at the authority. Measured at DEP32 with DeepSeek-R1 NVFP4, 128 requests per GPU, from the kill to the first step after the recovery: 0.8-1.6 s for a rank kill and 1.4-2.8 s for a node kill (see "What happens during a recovery"). The agreement waits for every survivor: up to the hang's resolution time (with hang detection) plus `recovery_timeout_s`, since a survivor can detect a stopped peer before the others, which stay blocked on it until it is fenced |
@@ -229,7 +230,7 @@ process): its native heartbeat keeps it known to be alive, but if it finishes no
 its peers wait for it, it is fenced like a hung rank. Without the native heartbeat (the UDP datagrams cannot
 reach the authority) the Python heartbeat alone is used, and a starved rank whose heartbeat stops looks stopped.
 
-A process that ends (it exits or is killed) is reported failed by the MPI runtime, and the survivors see it
+A process that ends (it exits or is killed) is reported failed by the MPI runtime, and the other ranks see it
 within tens of milliseconds. A process that does not end but makes no progress, frozen as a whole (a stopped process,
 a host that stops scheduling it) or alive but stuck (a device hang, a deadlock), is detected only with
 `hang_detection`: the authority confirms it after about `heartbeat_timeout_s` plus `hang_confirm_s` (35 s with
@@ -244,36 +245,37 @@ the defaults) and fences it through the MPI runtime.
   through the executor's hang detection or the MoE communication timeout.
 - A fenced process stuck in the GPU driver may not exit when killed, which can stall the job's shutdown.
 - Nothing restarts the authority, and the workers register only at startup: under an authority started again,
-  `/health` reports `unprotected` and a loss ends the job until the deployment restarts. Restart the authority
-  only together with the job, with a new key, never under a running job.
+  `/health` reports `unprotected` and a rank failure ends the job until the deployment restarts. Restart the
+  authority only together with the job, with a new key, never under a running job.
 - Under ULFM, `MPI_Finalize` can hang, so a stop can take up to about 30 s longer than without fault
   tolerance. Give the orchestrator's grace period room for it (Kubernetes' default is 30 s).
 - Stopping the job (`scancel`, deleting its pods) signals every rank; a rank signaled a moment after another may
   log a recovery attempt before it exits. The job ends anyway, with the status of the signal.
-- With ring host copies (online EPLB off), losing a node (or only its copy node) leaves the next node's
-  experts without host copies, so a later loss there is unrecoverable and ends the job.
-- During ring-restore staging, hang evidence may read all-to-all workspace rows that restores are being staged
-  through; this affects only the evidence, not correctness.
+- With ring host weights (online EPLB off), the failure of a node (or only of the node that keeps its host
+  weights) leaves the next node's experts without host weights, so a later rank failure there is unrecoverable
+  and ends the job.
+- During ring-restore staging, the hang reporter may read all-to-all workspace rows that restores are being
+  staged through; this affects only the hang reports, not correctness.
 - With hang detection on, a network partition between the authority and a node's ranks (while the MPI network
   between the ranks stays healthy) looks like a stopped process: their heartbeats stop, so they can be fenced
   as hung, and if rank 0 is among them, the deployment restarts.
-- A loss after the authority's commit, before every survivor resumed, ends the job instead of starting
+- A rank failure after the authority's commit, before every survivor resumed, ends the job instead of starting
   another recovery. So does a commit message lost on the way to a survivor (the authority sends it once): the
   survivors wait up to the recovery timeout, then exit.
-- A further loss just as the authority installs the new membership can leave survivors on different
+- A further rank failure just as the authority installs the new membership can leave survivors on different
   memberships; the executor's hang detection ends the job.
 - A survivor that cannot release or map its all-to-all workspaces during a remap (for example for lack of
-  memory) ends the job (it fails closed); a further loss during the remap re-plans the recovery.
+  memory) ends the job (it fails closed); a further rank failure during the remap re-plans the recovery.
 - KV cache lent to a remap is returned once the failed processes have ended: at the recovery's commit if they
   have by then, else at an idle iteration (checked at most once a second) or a later recovery's commit. Under the
   overlap scheduler with steady load no iteration is idle, so if the failed processes end after the commit, that
   KV cache stays lent until a later recovery commits.
-- With speculative decoding under the overlap scheduler, a loss in the step after a committed one can skip
+- With speculative decoding under the overlap scheduler, a rank failure in the step after a committed one can skip
   the committed step's KV cache update for its rejected draft tokens (KV cache manager V2).
 
 ## Speculative decoding
 
-Every speculative decoding method is accepted. A recovery discards the interrupted steps' draft tokens
+Every speculative decoding method is accepted. A recovery rolls back the interrupted steps' draft tokens
 and draft KV, and target verification keeps the output exact. Only one-model MTP with a linear draft is
 tested; other methods log a warning at startup, because per-slot draft state kept inside the CUDA graphs
 (the relaxed-acceptance delta, the suffix automaton, dynamic-tree state) is not reset: acceptance can drop
@@ -290,39 +292,40 @@ models, sleep/wake-up, per-layer dynamic EPLB, DSpark confidence scheduling, a n
 `recovery_timeout_s`, plus the hang's resolution time when hang detection is on (see the timeouts above).
 
 Rejected per request: repetition, presence and frequency penalties (their token counts cannot be rolled back
-when a step is discarded), logits post-processors (they may keep state and would run again on a re-run step),
+with the rest of a step), logits post-processors (they may keep state and would run again on a re-run step),
 and multimodal requests under the overlap scheduler.
 
 ## What happens during a recovery
 
-- Survivors detect the loss within milliseconds (about 0.02 s at the median). Measured at DEP32 with DeepSeek-R1
-  NVFP4 and 128 requests per GPU, the first step after the recovery came, counted from the kill, at 1.5 s for a rank
+- Survivors detect the rank failure within milliseconds (about 0.02 s at the median). Measured at DEP32 with
+  DeepSeek-R1 NVFP4 and 128 requests per GPU, the first step after the recovery came, counted from the kill, at 1.5 s for a rank
   kill without EPLB and 0.88 s with online EPLB (means of 4 runs, and of 8 runs for the online rank kill, 4 of them
   during an EPLB update), and at 2.6 s and 1.55 s for a node kill. Over all runs of the final design the range is 0.8-1.6 s for a rank kill
   (1.7-2.7 s when the rank is killed during prefill, 2-3 runs per mode) and 1.4-2.8 s for a node kill. A step
   that was running finishes first, so under heavy prefill a recovery takes up to the length of one step
   (`max_num_tokens` bounds it).
-- The requests the lost ranks were serving that had delivered nothing yet (every non-streaming request, and a
-  streaming one before its first token) run again from their prompt on a survivor. A request is interrupted
-  once at most without progress: one that an earlier loss interrupted (it ran again, or a survivor was running
-  it) and that completed no step since may be what crashes the ranks, so it is quarantined, not continued. A
-  lost rank's steps count once it reported them with its responses, so a step it completed just before the loss
-  may not count. Quarantined requests, and streaming requests of the
-  lost ranks that had already delivered tokens (they are not continued on a survivor), end with a retryable
-  error. Non-streaming requests get HTTP 503 with `Retry-After: 1` and the error code `peer_loss_retryable`.
+- The requests the failed ranks were serving that had delivered nothing yet (every non-streaming request, and a
+  streaming one before its first token) run again from their prompt on a live rank. A request is interrupted
+  once at most without progress: one that an earlier rank failure interrupted (it ran again, or a live rank was
+  running it) and that completed no step since may be what crashes the ranks, so it fails instead of continuing.
+  A failed rank's steps count once it reported them with its responses, so a step it completed just before it
+  failed may not count. Those requests, and streaming requests of the
+  failed ranks that had already delivered tokens (they are not continued on a live rank), end with a retryable
+  error. Non-streaming requests get HTTP 503 with `Retry-After: 1` and the error code `rank_failure_retryable`.
   Streaming `/v1/completions`, `/v1/chat/completions` and `/v1/responses` responses end with an SSE `error`
   event with that code followed by `[DONE]`, so OpenAI clients raise an `APIError`. Clients should retry those
   requests.
-- A request of the lost ranks whose cancellation they had not answered yet ends cancelled.
-- All other requests continue with their full output. In the DEP32 runs with 128 requests per GPU, the survivors'
-  requests all completed, and the lost rank's 128 in-flight requests (512 for a node loss) ended with a retryable
+- A request of the failed ranks whose cancellation they had not answered yet ends cancelled.
+- All other requests continue with their full output. In the DEP32 runs with 128 requests per GPU, the live ranks'
+  requests all completed, and the failed rank's 128 in-flight requests (512 for a node failure) ended with a retryable
   error. GSM8K accuracy (strict match, DeepSeek-R1 NVFP4, DEP32, 1319 questions) after rank 5 was killed before the
   evaluation was 0.9477 against 0.9469 on a server with fault tolerance off (standard error about 0.006 each); four
   such runs on three builds are all within two standard errors. Token-by-token equality was checked only in a
   small-batch DEP32 configuration (batch at most 8, MTP with overlap scheduler, one rank killed mid-generation): in
-  6 of 6 kills, the three surviving requests and the re-run request produced 400-token outputs identical to a run
-  without a loss. The standard configuration's reference is not deterministic, so token equality is undefined there.
-- No CUDA graphs are recaptured, so serving resumes without the lost GPUs at once.
+  6 of 6 kills, the three requests on live ranks and the re-run request produced 400-token outputs identical to a
+  run without a rank failure. The standard configuration's reference is not deterministic, so token equality is
+  undefined there.
+- No CUDA graphs are recaptured, so serving resumes without the failed GPUs at once.
 - Throughput after a recovery, measured at the client at DEP32 with 128 requests per GPU (first full decode wave
   after the resume against the waves before the kill): median 0.945 of the earlier throughput after a rank kill
   (31 of 32 ranks live; 13 kills, range 0.900-0.967; proportional to live ranks would be 0.969) and 0.860 after a
@@ -331,36 +334,35 @@ and multimodal requests under the overlap scheduler.
   2.6-15.8% below the offered load (mean 10.3%) and 30.4% below after the node kill; from 10 s to 60 s it was
   4.9% below to 1.8% above for the rank kills.
 - Each rank logs one line when it resumes: "resumed serving without ranks [...] at membership generation N",
-  the time since the interruption, the discarded steps, the remaining ranks and the KV cache bytes given to
+  the time since the interruption, the rolled-back steps, the remaining ranks and the KV cache bytes given to
   restored experts; on rank 0 also how many requests ran again and how many failed. Each rank also logs the bytes
   of the remapped all-to-all workspaces and how many came from the KV cache, and later each return of them
   ("Returned N bytes the all-to-all workspace remap took to the KV cache").
-- Expected in the logs: on rank 0, an `mpi4py.futures` manager thread exits with `MPI_ERR_PROC_FAILED`,
-  followed by "a rank departed; only shutdown is accepted from now on". This is the MPI session noticing the
-  loss; serving is not affected.
+- Expected in the logs: on rank 0, a one-line report that an `mpi4py.futures` manager thread ended with
+  `MPI_ERR_PROC_FAILED`. This is the MPI session noticing the rank failure; serving is not affected.
 
 ## Monitoring
 
 `trtllm-serve` asks the recovery authority for its state and caches the answer for at most 0.1 s. `GET /health`
 returns 200 with the state while the
-server serves: `healthy` (no loss), `degraded` (serving after a recovery), `unprotected` (the authority did not
-answer, or restarted and lost the deployment's state, so a loss would end the job: alert, but keep serving; restart
-the deployment to protect it again) or `unknown` (the authority reported a state this server does not know, for
+server serves: `healthy` (no rank failure), `degraded` (serving after a recovery), `unprotected` (the authority
+did not answer, or restarted and lost the deployment's state, so a rank failure would end the job: alert, but keep
+serving; restart the deployment to protect it again) or `unknown` (the authority reported a state this server does not know, for
 example from a different version: alert, but keep serving). It returns 503 with the state while `recovering` or
 `terminal` (a recovery aborted: restart the deployment). The JSON body always has `state`. While
 the authority answers it also has `generation` (the membership generation), `live_ranks` and `failed_ranks`
-(sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `agree` and `install` durations),
-`failed_requests` (requests the recoveries failed: those of the lost ranks that did not run again, and those a
-second loss interrupted without progress). The reason a recovery aborted is only in the authority's log:
+(sorted), `recoveries`, `last_recovery_stage_ms` (the last recovery's `stop`, `prepare` and `install` durations),
+`failed_requests` (requests the recoveries failed: those of the failed ranks that did not run again, and those a
+second rank failure interrupted without progress). The reason a recovery aborted is only in the authority's log:
 `/health` is not authenticated. An `unprotected` body has only `state`. If the engine itself failed, `/health`
 returns 503 as without fault tolerance.
 
 What an orchestrator should do with these signals:
-- `degraded`: the deployment serves with fewer GPUs and survives a further loss only while its remaining slots
+- `degraded`: the deployment serves with fewer GPUs and survives a further rank failure only while its remaining slots
   hold every expert without it. Restart it (or replace it with a fresh replica) when convenient to get the
   capacity and the full protection back.
-- `terminal`, a `/health` that stops answering, or a server process that exits: the loss was not recoverable
-  (rank 0, more than one failure domain at once, a further loss the remaining slots cannot cover, a failed
+- `terminal`, a `/health` that stops answering, or a server process that exits: the rank failure was not recoverable
+  (rank 0, more than one failure domain at once, a further rank failure the remaining slots cannot cover, a failed
   recovery), or every rank stalled (the workers then exit with code 75). Move traffic to another replica,
   have clients retry their failed requests there, and restart the deployment.
 - `unprotected`: keep serving, alert, and check the authority.
@@ -378,9 +380,9 @@ Exit status of `mpirun` (and of the workers):
 |---|---|
 | 0 | Stopped cleanly, also after recoveries |
 | 75 | Every rank stalled, or rank 0 hung: restart the deployment |
-| Any other | The loss or error was not recoverable: restart the deployment |
+| Any other | The rank failure or error was not recoverable: restart the deployment |
 
-`/health` only reports. There is no control action: no drain, no retry of a lost rank on the same
+`/health` only reports. There is no control action: no drain, no retry of a failed rank on the same
 GPUs and no scale-down request; drain a deployment by stopping traffic to it at the load balancer.
 
 ## How well each part is tested
@@ -388,20 +390,22 @@ GPUs and no scale-down request; drain a deployment by stopping traffic to it at 
 The whole feature is experimental.
 
 DEP32 runs (DeepSeek-R1 NVFP4 on 32 GB200 GPUs, 8 nodes) of the final design: 52 of 52 recovery runs passed. They
-cover rank kills and node kills (the loss of every rank of one host with `failure_domain: node`) with no EPLB,
-offline EPLB and online EPLB, kills during prefill and during an online EPLB update, two losses in a row, and a
-frozen rank fenced by hang detection (2-5 runs per case). Under realistic traffic at about 80% of capacity (mixed
-lengths, 62 minutes per run), 8 losses (7 rank kills and 1 node kill) all recovered, and the requests that failed
-were the lost ranks' in-flight requests. Two losses 15 minutes apart both recovered in each of 2 runs. The
+cover rank kills and node kills (the failure of every rank of one host with `failure_domain: node`) with no EPLB,
+offline EPLB and online EPLB, kills during prefill and during an online EPLB update, two rank failures in a row,
+and a frozen rank fenced by hang detection (2-5 runs per case). Under realistic traffic at about 80% of capacity
+(mixed lengths, 62 minutes per run), 8 rank failures (7 rank kills and 1 node kill) all recovered, and the
+requests that failed were the failed ranks' in-flight requests. Two rank failures 15 minutes apart both recovered
+in each of 2 runs. The
 late-write and workspace-remap tests pass on one node with 4 GPUs. A recovery shows `recovering` for about
 0.7-0.9 s, so a health probe interval longer than that can miss it.
 
-What CI covers: the multi-GPU integration tests run on one 4-GPU GB200 node with `failure_domain: rank`. The loss
+What CI covers: the multi-GPU integration tests run on one 4-GPU GB200 node with `failure_domain: rank`. The failure
 of a whole host and `failure_domain: node` are covered only by the DEP32 runs, not by CI.
 
 Not tested: two frozen ranks at once, CFT with fault tolerance, the death of a host, and NVLink faults. KV block
 reuse and speculative decoding methods other than one-model MTP with a linear draft are tested only at small scale
-or not at all. A request that a second loss interrupts without progress (quarantine) is tested only by unit tests.
+or not at all. A request that a second rank failure interrupts without progress (and that therefore fails) is tested only by
+unit tests.
 
 ## Cost
 

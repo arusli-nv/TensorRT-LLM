@@ -153,7 +153,7 @@ Normally, these shared memory segments will be cleaned up automatically at proce
 
 If you experience an abnormal exit and are concerned about the shared memory usage before the next run, you need to manually check the `/dev/shm` directory and delete any `/dev/shm/moe_shared_*` files if present.
 
-With [WideEP peer-loss recovery](../../docs/source/features/wide-ep-fault-tolerance.md) enabled, each job appends a random token to the base name (`moe_shared_<token>_l0_lr0_all`), so instances on one node never share segments, and fails rather than replace a segment of that name it did not create. Once every rank of a node has mapped the segments, at the end of model loading, their names are removed from `/dev/shm`: the memory is freed when the last rank exits, however it exits.
+With [Wide-EP fault tolerance](../../docs/source/features/wide-ep-fault-tolerance.md) enabled, each job appends a random token to the base name (`moe_shared_<token>_l0_lr0_all`), so instances on one node never share segments, and fails rather than replace a segment of that name it did not create. Once every rank of a node has mapped the segments, at the end of model loading, their names are removed from `/dev/shm`: the memory is freed when the last rank exits, however it exits.
 
 #### Manual Cleanup Commands
 
