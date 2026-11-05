@@ -32,7 +32,7 @@ from tensorrt_llm.logger import logger
 
 from .. import _utils
 from .._utils import (global_mpi_rank, is_mpi_peer_failure, mpi_failed_ranks,
-                      mpi_rank, peer_loss_recovery_enabled)
+                      mpi_rank, rank_failure_recovery_enabled)
 from .utils import logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
@@ -86,7 +86,7 @@ def _num_failed_ranks() -> int:
 
     Zero when recovery is disabled or the MPI library cannot report failures.
     """
-    if not (ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled()):
+    if not (ENABLE_MULTI_DEVICE and rank_failure_recovery_enabled()):
         return 0
     try:
         return len(mpi_failed_ranks(mpi4py.MPI.COMM_WORLD))
@@ -100,15 +100,15 @@ def _num_failed_ranks() -> int:
 _FAILED_RANK_EVIDENCE_S = 1.0
 
 
-def _is_departed_peer_failure(exc: BaseException) -> bool:
-    """Whether *exc* only reports a departed MPI peer while recovery is on.
+def _is_failed_peer_error(exc: BaseException) -> bool:
+    """Whether *exc* only reports a failed MPI peer while recovery is on.
 
-    Such failures are left to the surviving ranks' recovery path instead of
+    Such errors are left to the surviving ranks' recovery path instead of
     tearing down the session: a ULFM peer-failure error, or a
     ``BrokenExecutor`` from the mpi4py futures manager once ULFM reports a
     failed rank.
     """
-    if not peer_loss_recovery_enabled():
+    if not rank_failure_recovery_enabled():
         return False
     if isinstance(exc, BrokenExecutor):
         deadline = time.monotonic() + _FAILED_RANK_EVIDENCE_S
@@ -121,10 +121,10 @@ def _is_departed_peer_failure(exc: BaseException) -> bool:
 
 
 @functools.cache
-def _quiet_departed_peer_manager_failures() -> None:
-    """Log in one line, not as a traceback, an mpi4py futures manager thread a departed peer ended.
+def _quiet_failed_peer_manager_errors() -> None:
+    """Log in one line, not as a traceback, an mpi4py futures manager thread a failed peer ended.
 
-    The manager probes for results from every rank, so a peer's loss ends it;
+    The manager probes for results from every rank, so a peer's failure ends it;
     the survivors recover without it (see ``RemoteMpiCommSessionServer.serve``).
     """
     previous = threading.excepthook
@@ -134,9 +134,9 @@ def _quiet_departed_peer_manager_failures() -> None:
         while tb is not None and not tb.tb_frame.f_globals.get(
                 "__name__", "").startswith("mpi4py.futures"):
             tb = tb.tb_next
-        if tb is not None and _is_departed_peer_failure(args.exc_value):
+        if tb is not None and _is_failed_peer_error(args.exc_value):
             logger.info(
-                f"mpi4py futures manager thread ended after a peer departed: "
+                f"mpi4py futures manager thread ended after a peer failed: "
                 f"{args.exc_value}")
         else:
             previous(args)
@@ -170,7 +170,7 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
     the peer-failure watch they would stop is stopped first.
     """
     recovery = sys.modules.get(
-        "tensorrt_llm._torch.pyexecutor.peer_loss_recovery")
+        "tensorrt_llm._torch.pyexecutor.rank_failure_recovery")
     if recovery is not None:
         recovery.stop_startup_watch()
     logging.shutdown()
@@ -211,23 +211,23 @@ def _finalize_and_exit(status: int, where: str) -> NoReturn:
 
 
 def exit_fault_tolerant_process() -> None:
-    """End this process through a bounded MPI_Finalize under peer-loss recovery.
+    """End this process through a bounded MPI_Finalize under rank-failure recovery.
 
     With recovery enabled, exits with status 0 (see ``_finalize_and_exit``);
     otherwise returns.
     """
-    if ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled():
+    if ENABLE_MULTI_DEVICE and rank_failure_recovery_enabled():
         _finalize_and_exit(0, "process end")
 
 
-# Set by ``run_worker_rank`` under peer-loss recovery (see ``_exit``).
+# Set by ``run_worker_rank`` under rank-failure recovery (see ``_exit``).
 _worker_rank_cleanup: Optional[Callable[[], None]] = None
 
 
 def _exit(status: int) -> NoReturn:
     """``os._exit(status)``, without exit handlers.
 
-    In a worker rank that ``run_worker_rank`` serves under peer-loss recovery, first runs the rank's cleanup,
+    In a worker rank that ``run_worker_rank`` serves under rank-failure recovery, first runs the rank's cleanup,
     and ends any non-zero *status* by SIGKILL instead: the MPI runtime survives a killed process, but a second
     non-zero exit status ends the whole job. The stalled exit (``STALLED_EXIT_CODE``), meant to end the job,
     calls ``os._exit`` directly. Exits that never reach Python (a native ``exit(1)``, a failure before
@@ -246,14 +246,14 @@ def run_worker_rank(serve: Callable[[], None],
                     lock_fd: Optional[int] = None) -> None:
     """Run *serve*, the loop of an MGMN worker rank, then end this process.
 
-    Under peer-loss recovery trtllm-llmapi-launch execs this process, so the MPI runtime sees its end directly,
+    Under rank-failure recovery trtllm-llmapi-launch execs this process, so the MPI runtime sees its end directly,
     and passes the launcher's duties on: this process keeps the FlashInfer workspace lock on *lock_fd* (made
-    non-inheritable, so no exec'd descendant keeps a dead rank's slot locked), removes the temporary FlashInfer
+    non-inheritable, so no exec'd descendant keeps a failed rank's slot locked), removes the temporary FlashInfer
     workspace *temporary_workspace* on every exit that runs Python, and ends any failure by SIGKILL (see
     ``_exit``); a clean end finalizes MPI (see ``exit_fault_tolerant_process``). Without recovery, runs *serve*
     and returns.
     """
-    if not (ENABLE_MULTI_DEVICE and peer_loss_recovery_enabled()):
+    if not (ENABLE_MULTI_DEVICE and rank_failure_recovery_enabled()):
         serve()
         return
     global _worker_rank_cleanup
@@ -292,21 +292,21 @@ def _remove_temporary_workspace(workspace: Optional[str]) -> None:
 
 
 def _leave_degraded_world(clean: bool) -> NoReturn:
-    """End this process of an MPI world that lost a rank, once its task ended.
+    """End this process of an MPI world in which a rank failed, once its task ended.
 
     mpi4py.futures cannot release such a world: task results and its stop
-    message travel on communicators that include the lost rank, so each
+    message travel on communicators that include the failed rank, so each
     process leaves on its own. After a clean task end it finalizes MPI with
-    the other survivors (ULFM's MPI_Finalize first agrees on the lost ranks)
+    the other survivors (ULFM's MPI_Finalize first agrees on the failed ranks)
     and exits with status 0 (see ``_finalize_and_exit``). After an error it
     ends the world with MPI_Abort.
     """
     if clean:
         logger.warning(f"Rank {global_mpi_rank()}: finalizing the MPI world, "
-                       "which lost a rank")
+                       "in which a rank failed")
         _finalize_and_exit(0, "degraded world")
-    logger.error(f"Rank {global_mpi_rank()}: ending the MPI world, which "
-                 "lost a rank, after its task failed")
+    logger.error(f"Rank {global_mpi_rank()}: ending the MPI world, in which "
+                 "a rank failed, after its task failed")
     logging.shutdown()
     sys.stdout.flush()
     sys.stderr.flush()
@@ -1085,8 +1085,8 @@ class MpiCommSession(MpiSession):
             logger_debug(
                 f"_start_mpi_pool: Checking if self.comm == mpi4py.MPI.COMM_WORLD: {self.comm == mpi4py.MPI.COMM_WORLD}\n",
                 "grey")
-        if peer_loss_recovery_enabled():
-            _quiet_departed_peer_manager_failures()
+        if rank_failure_recovery_enabled():
+            _quiet_failed_peer_manager_errors()
         if ENABLE_MULTI_DEVICE and self.comm == mpi4py.MPI.COMM_WORLD:
             if MPINodeState._global_comm_executor is None:
                 logger_debug("Creating global MPICommExecutor for COMM_WORLD\n",
@@ -1469,15 +1469,16 @@ class RemoteMpiCommSessionServer():
                                                      abort=self.session.abort)
 
     def _drop_task(self, message: RemoteTask) -> None:
-        """Refuse a task in a world that lost a rank: it only stops."""
-        error = RuntimeError("An MPI world that lost a rank cannot run tasks")
+        """Refuse a task in a world in which a rank failed: it only stops."""
+        error = RuntimeError(
+            "An MPI world in which a rank failed cannot run tasks")
         logger.error(f"Remote MPI server dropped a task: {error}")
         if message.sync:
             self.queue.put(error)
 
     def _stop_degraded_world(self, rank0_future: Optional[Future],
                              grace: float) -> NoReturn:
-        """Stop rank 0's session and end this process of a world that lost a rank.
+        """Stop rank 0's session and end this process of a world in which a rank failed.
 
         mpi4py.futures cannot release such a world (see ``_leave_degraded_world``).
         """
@@ -1520,11 +1521,11 @@ class RemoteMpiCommSessionServer():
                     if error is None:
                         results.append(future.result())
                     elif (future is not rank0_future
-                          and _is_departed_peer_failure(error)):
+                          and _is_failed_peer_error(error)):
                         # Rank 0 cannot recover, so only its failure always
                         # reaches the client.
                         logger.warning(
-                            "Remote MPI worker departed; leaving recovery to "
+                            "Remote MPI worker failed; leaving recovery to "
                             f"the survivors: {error!r}")
                     else:
                         logger.error(f"Remote MPI worker failed: {error!r}")

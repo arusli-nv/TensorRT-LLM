@@ -261,8 +261,8 @@ function configure_flashinfer_workspace {
     done
 }
 
-# WideEP peer-loss recovery: fault-tolerance mode with a recovery authority.
-function peer_loss_recovery_enabled {
+# WideEP rank-failure recovery: fault-tolerance mode with a recovery authority.
+function rank_failure_recovery_enabled {
     [ "$TLLM_FAULT_TOLERANCE_MODE" = "1" ] && [ -n "$TLLM_FAULT_TOLERANCE_AUTHORITY" ]
 }
 
@@ -291,10 +291,10 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 tllm_mpi_size=$(mpi_world_size)
 export tllm_mpi_size
 
-# Peer-loss recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too, without the hcoll and ucc
-# collectives. Each worker's MPI_Init reads these, so a user's own `--mca pml` / `--mca btl` / `--mca coll` choice
-# (exported the same way) wins.
-if peer_loss_recovery_enabled; then
+# Rank-failure recovery runs on Open MPI's ob1 messaging layer, over TCP within nodes too, without the hcoll and
+# ucc collectives. Each worker's MPI_Init reads these, so a user's own `--mca pml` / `--mca btl` / `--mca coll`
+# choice (exported the same way) wins.
+if rank_failure_recovery_enabled; then
     export OMPI_MCA_pml=${OMPI_MCA_pml:-ob1} OMPI_MCA_btl=${OMPI_MCA_btl:-self,tcp} OMPI_MCA_coll=${OMPI_MCA_coll:-^hcoll,ucc}
 fi
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
@@ -512,12 +512,12 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
-    # Under peer-loss recovery the worker replaces this launcher, so that the
-    # MPI runtime sees the worker's own end: peers that reach a rank through
+    # Under rank-failure recovery the worker replaces this launcher, so that
+    # the MPI runtime sees the worker's own end: peers that reach a rank through
     # shared memory do not learn of a worker that dies under a launcher shell.
     # The worker keeps the workspace lock and takes over this launcher's exit
     # duties (see run_worker_rank in mpi_session.py).
-    if peer_loss_recovery_enabled; then
+    if rank_failure_recovery_enabled; then
         worker_args=()
         if [ -n "$flashinfer_temporary_workspace" ]; then
             worker_args+=(--flashinfer-temporary-workspace "$flashinfer_temporary_workspace")
