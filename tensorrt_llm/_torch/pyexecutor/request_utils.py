@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-from tensorrt_llm._utils import nvtx_range, peer_loss_recovery_enabled
+from tensorrt_llm._utils import nvtx_range, rank_failure_recovery_enabled
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -123,11 +123,11 @@ def can_process_attention_dp_request(
         max_num_active_requests: Maximum number of active requests per rank.
 
     Returns:
-        True if the request can be processed, False otherwise. With peer-loss
-        recovery, a request pinned to a rank that is not serving is returned as
-        processable so the ADP router fails it. Without it, every rank serves
-        and the target indexes the ranks in order (a negative one counts from
-        the last).
+        True if the request can be processed, False otherwise. With rank
+        failure recovery, a request pinned to a rank that is not serving is
+        returned as processable so the ADP router fails it. Without it, every
+        rank serves and the target indexes the ranks in order (a negative one
+        counts from the last).
     """
     scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None:
@@ -138,7 +138,7 @@ def can_process_attention_dp_request(
         return True
 
     if target_dp_rank not in all_ranks_num_active_requests:
-        if peer_loss_recovery_enabled():
+        if rank_failure_recovery_enabled():
             return True
         target_dp_rank = list(all_ranks_num_active_requests)[target_dp_rank]
 

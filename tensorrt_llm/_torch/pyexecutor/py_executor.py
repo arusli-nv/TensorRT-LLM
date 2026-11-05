@@ -1886,8 +1886,8 @@ class PyExecutor:
             return
         local_dict = self._pending_iter_stats_dict
         self._pending_iter_stats_dict = None
-        # A departed rank reports no stats, like a rank with nothing to send.
-        gathered = self.dist.tp_allgather(local_dict, departed=None)
+        # An absent rank reports no stats, like a rank with nothing to send.
+        gathered = self.dist.tp_allgather(local_dict, absent=None)
         if self.dist.tp_rank != 0:
             return
         rank_dicts = [d for d in gathered if d is not None]
@@ -5092,7 +5092,7 @@ class PyExecutor:
             # cp_size == 1 this is the TP gather. A rank that left the group
             # must not veto the forward.
             batch_sizes = self.dist.tp_cp_allgather_int64(
-                [scheduled_batch.batch_size], departed=1)[:, 0]
+                [scheduled_batch.batch_size], absent=1)[:, 0]
             can_queue = bool(batch_sizes.all())
             # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
             # together whether to defer the previous batch.
@@ -6588,7 +6588,7 @@ class PyExecutor:
                 # the retire below issues attention-DP gathers that every rank
                 # must join in the same iteration, so fire only once all ranks
                 # are drained. A rank that left the group counts as drained.
-                drained = all(self.dist.tp_allgather(int(drained), departed=1))
+                drained = all(self.dist.tp_allgather(int(drained), absent=1))
             if not drained:
                 # drain=True: keep the sentinel parked until the engine drains.
                 return
@@ -8599,10 +8599,9 @@ class PyExecutor:
             num_scheduled_tokens, num_real_generation_requests
         ]
         # Balance over the serving ranks only: a rank that left the group
-        # after a recovered peer loss schedules nothing.
+        # after a recovered rank failure schedules nothing.
         responses_list = live_rows(
-            self.dist, self.dist.tp_allgather_int64(counts,
-                                                    departed=0)).tolist()
+            self.dist, self.dist.tp_allgather_int64(counts, absent=0)).tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]

@@ -4553,12 +4553,12 @@ class TestAdpBalanceExcludesPadDummies:
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
 
-    def test_balancing_continues_over_the_serving_ranks_after_a_loss(self):
-        """After a recovered peer loss the departed rank's row is filled with zeros.
+    def test_balancing_continues_over_the_serving_ranks_after_a_rank_failure(self):
+        """After a recovered rank failure the absent rank's row is filled with zeros.
 
         Balancing compares the serving ranks only. Every serving rank holds
         context and decode work, so the context batch is held for the batching
-        wait as usual; counting the departed rank's empty row would release it
+        wait as usual; counting the absent rank's empty row would release it
         at once and switch balancing off for the rest of the job.
         """
         executor = self._make_executor(
@@ -4572,8 +4572,8 @@ class TestAdpBalanceExcludesPadDummies:
 
         assert balanced == []
         assert executor.adp_ctx_batching_wait_iters_count == 1
-        # A departed rank's row reads as an idle rank.
-        assert executor.dist.tp_allgather_int64.call_args.kwargs == {"departed": 0}
+        # An absent rank's row reads as an idle rank.
+        assert executor.dist.tp_allgather_int64.call_args.kwargs == {"absent": 0}
 
 
 def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:

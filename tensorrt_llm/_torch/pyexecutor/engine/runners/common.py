@@ -44,8 +44,8 @@ def get_all_rank_num_tokens(
             counts = [math.ceil(count / mapping.cp_size) for count in counts]
             gathered = dist.tp_cp_allgather_int64(counts)
         else:
-            # A departed rank contributes no tokens.
-            gathered = dist.tp_allgather_int64(counts, departed=0)
+            # An absent rank contributes no tokens.
+            gathered = dist.tp_allgather_int64(counts, absent=0)
         return attn_metadata.set_adp_token_counts(gathered.T.tolist())
     return None
 
@@ -58,8 +58,8 @@ def get_all_rank_ctx_requests(
 ) -> list[int] | None:
     if enable_attention_dp:
         assert dist is not None, "attention DP requires a distributed communicator"
-        # A departed rank has no context requests.
-        return dist.tp_allgather_int64([num_ctx_requests], departed=0)[:, 0].tolist()
+        # An absent rank has no context requests.
+        return dist.tp_allgather_int64([num_ctx_requests], absent=0)[:, 0].tolist()
     return None
 
 

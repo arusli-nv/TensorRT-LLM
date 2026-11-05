@@ -61,7 +61,7 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range, peer_loss_recovery_enabled
+from tensorrt_llm._utils import nvtx_range, rank_failure_recovery_enabled
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
     MiniMaxM3SparseAttentionConfig,
@@ -288,7 +288,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._initialize_moe_workspace_reclaimer()
         # Checked at startup: a misconfigured recovery environment fails here, not in the serving loop.
         self.moe_execution_state = (
-            MoeExecutionState.for_model(model) if peer_loss_recovery_enabled() else None
+            MoeExecutionState.for_model(model) if rank_failure_recovery_enabled() else None
         )
         self._warmup = DecoderWarmup(
             config=self._config,

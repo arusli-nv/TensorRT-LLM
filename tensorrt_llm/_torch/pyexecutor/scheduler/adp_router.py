@@ -42,7 +42,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Set, Tuple
 
-from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm._utils import rank_failure_recovery_enabled
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.logger import logger
 
@@ -384,7 +384,7 @@ class ADPRouter(ABC):
         if self.dist.has_cp_helix:
             self._use_max_load_across_cp(local_state)
         responses = self.dist.tp_allgather(
-            local_state.serialize(include_kv_cache_load), departed=None
+            local_state.serialize(include_kv_cache_load), absent=None
         )
         return [RankState.deserialize(data=resp) for resp in responses if resp is not None]
 
@@ -451,8 +451,8 @@ class ADPRouter(ABC):
         """Place requests carrying an explicit ``attention_dp_rank`` on that rank
         (while it is under ``max_num_active_requests``) and return the rest for
         load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
-        place. With peer-loss recovery, a relaxed request targeting a rank that
-        is not serving is load balanced; :meth:`split_unservable_requests`
+        place. With rank failure recovery, a relaxed request targeting a rank
+        that is not serving is load balanced; :meth:`split_unservable_requests`
         removes strict ones first. Without it, every rank serves and the
         target's count is looked up by position.
         """
@@ -464,7 +464,7 @@ class ADPRouter(ABC):
             )
             count_rank = target_dp_rank
             if target_dp_rank is not None and target_dp_rank not in all_ranks_num_active_requests:
-                if peer_loss_recovery_enabled():
+                if rank_failure_recovery_enabled():
                     remaining.append(req_item)
                     continue
                 count_rank = list(all_ranks_num_active_requests)[target_dp_rank]

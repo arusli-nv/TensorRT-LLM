@@ -360,7 +360,7 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     runner.enable_in_graph_sampling = True
     exchanges = []
 
-    def allgather(payload, departed=None):
+    def allgather(payload, absent=None):
         exchanges.append(payload)
         peer = list(payload)
         peer[-1] = SampleType.FULL.value
@@ -419,7 +419,7 @@ def test_stale_replay_vote_rejoins_the_shape_collective():
     runner.enable_in_graph_sampling = False
     exchanges = []
 
-    def exchange(payload, *, departed=None):
+    def exchange(payload, *, absent=None):
         exchanges.append(payload)
         return np.array([payload, payload], dtype=np.int64)
 

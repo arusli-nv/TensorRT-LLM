@@ -30,7 +30,7 @@ _GATED_MODULES = (
 
 WORLD_SIZE = 4
 FAILED_RANK = 2
-SURVIVORS = (0, 1, 3)
+LIVE_RANKS = (0, 1, 3)
 
 
 def _router(tp_rank=0, tp_size=WORLD_SIZE):
@@ -50,26 +50,26 @@ def _item(req_id, target=None, relax=True, num_tokens=4):
     return item
 
 
-def _survivor_states(active=None):
+def _live_rank_states(active=None):
     active = active or {}
     return [
         RankState(rank=rank, num_active_requests=active.get(rank, 0), num_active_tokens=0)
-        for rank in SURVIVORS
+        for rank in LIVE_RANKS
     ]
 
 
 @pytest.fixture
 def recovery(monkeypatch):
-    """Peer-loss recovery is enabled."""
+    """Rank failure recovery is enabled."""
     for module in _GATED_MODULES:
-        monkeypatch.setattr(f"{module}.peer_loss_recovery_enabled", lambda: True)
+        monkeypatch.setattr(f"{module}.rank_failure_recovery_enabled", lambda: True)
 
 
 @pytest.fixture
 def no_recovery(monkeypatch):
-    """Fault tolerance is off, so no rank departs and every rank counts."""
+    """Fault tolerance is off, so no rank is absent and every rank counts."""
     for module in _GATED_MODULES:
-        monkeypatch.setattr(f"{module}.peer_loss_recovery_enabled", lambda: False)
+        monkeypatch.setattr(f"{module}.rank_failure_recovery_enabled", lambda: False)
 
 
 def test_gather_all_rank_states_omits_failed_ranks():
@@ -81,18 +81,18 @@ def test_gather_all_rank_states_omits_failed_ranks():
         RankState(rank=3, num_active_requests=2).serialize(),
     ]
     states = router.gather_all_rank_states([])
-    # After a loss the gather raises unless told what a departed rank counts as.
-    assert router.dist.tp_allgather.call_args.kwargs == {"departed": None}
-    assert [state.rank for state in states] == list(SURVIVORS)
+    # After a rank failure the gather raises unless told what an absent rank counts as.
+    assert router.dist.tp_allgather.call_args.kwargs == {"absent": None}
+    assert [state.rank for state in states] == list(LIVE_RANKS)
     assert [state.num_active_requests for state in states] == [1, 0, 2]
 
 
-def test_default_router_balances_over_survivors_by_logical_rank():
+def test_default_router_balances_over_live_ranks_by_logical_rank():
     router = _router()
     requests = [_item(i) for i in range(6)]
-    routed, expected = router.route_requests(_survivor_states({3: 1}), requests, 8)
+    routed, expected = router.route_requests(_live_rank_states({3: 1}), requests, 8)
 
-    assert set(routed) == set(SURVIVORS)
+    assert set(routed) == set(LIVE_RANKS)
     assert sum(len(reqs) for reqs in routed.values()) == 6
     assert len(routed[3]) <= expected
 
@@ -102,12 +102,12 @@ def test_only_strict_pins_to_failed_rank_are_unservable():
     relaxed = _item(1, target=FAILED_RANK, relax=True)
     live = _item(2, target=3, relax=False)
     routable, unservable = DefaultADPRouter.split_unservable_requests(
-        [pinned, relaxed, live], _survivor_states()
+        [pinned, relaxed, live], _live_rank_states()
     )
     assert routable == [relaxed, live] and unservable == [pinned]
 
 
-def test_strict_pin_outside_the_group_is_unservable_without_a_loss():
+def test_strict_pin_outside_the_group_is_unservable_without_a_rank_failure():
     states = [RankState(rank=rank) for rank in range(WORLD_SIZE)]
     pinned = _item(0, target=WORLD_SIZE, relax=False)
     assert DefaultADPRouter.split_unservable_requests([pinned], states) == ([], [pinned])
@@ -116,14 +116,14 @@ def test_strict_pin_outside_the_group_is_unservable_without_a_loss():
 def test_relaxed_pin_to_failed_rank_is_rebalanced(recovery):
     router = _router()
     relaxed = _item(0, target=FAILED_RANK, relax=True)
-    routed, _ = router.route_requests(_survivor_states(), [relaxed], 8)
-    assert set(routed) == set(SURVIVORS)
+    routed, _ = router.route_requests(_live_rank_states(), [relaxed], 8)
+    assert set(routed) == set(LIVE_RANKS)
     assert [req for reqs in routed.values() for req in reqs] == [relaxed]
 
 
 def test_cuda_graph_vote_ignores_failed_rank():
     gathered = np.array([[1, 2, 0], [1, 4, 0], [0, 0, 0], [1, 1, 0]], dtype=np.int64)
-    dist = Mock(live_ranks=SURVIVORS)
+    dist = Mock(live_ranks=LIVE_RANKS)
     dist.tp_allgather_int64.return_value = gathered
     runner = SimpleNamespace(config=SimpleNamespace(dist=dist))
     votes = CUDAGraphRunner._gather_adp_graph_batch_info(
@@ -132,10 +132,10 @@ def test_cuda_graph_vote_ignores_failed_rank():
     assert votes == [(True, 2, 0), (True, 4, 0), (True, 1, 0)]
 
 
-class _DepartedRankDist:
-    """The int64 all-gather of MPIDist after FAILED_RANK left: every survivor sends ``peer_values``."""
+class _AbsentRankDist:
+    """The int64 all-gather of MPIDist after FAILED_RANK left: every live rank sends ``peer_values``."""
 
-    live_ranks = SURVIVORS
+    live_ranks = LIVE_RANKS
     tp_size = WORLD_SIZE
     tp_rank = 0
     cp_size = 1
@@ -143,36 +143,36 @@ class _DepartedRankDist:
     def __init__(self, peer_values):
         self._peer_values = peer_values
 
-    def tp_allgather_int64(self, values, *, departed=None):
-        if departed is None:
-            raise RuntimeError("tp_allgather_int64 needs a departed")
+    def tp_allgather_int64(self, values, *, absent=None):
+        if absent is None:
+            raise RuntimeError("tp_allgather_int64 needs an absent value")
         rows = np.empty((WORLD_SIZE, len(values)), dtype=np.int64)
-        rows[:] = departed
-        rows[list(SURVIVORS)] = self._peer_values
+        rows[:] = absent
+        rows[list(LIVE_RANKS)] = self._peer_values
         return rows
 
-    def tp_cp_allgather_int64(self, values, *, departed=None):
-        return self.tp_allgather_int64(values, departed=departed)
+    def tp_cp_allgather_int64(self, values, *, absent=None):
+        return self.tp_allgather_int64(values, absent=absent)
 
 
-def test_every_per_step_vote_survives_a_departed_rank(recovery):
-    """Each per-step int64 vote treats the departed rank as neutral instead of failing or vetoing."""
-    # Admission: survivors have work, so the group can queue.
+def test_every_per_step_vote_survives_an_absent_rank(recovery):
+    """Each per-step int64 vote treats the absent rank as neutral instead of failing or vetoing."""
+    # Admission: live ranks have work, so the group can queue.
     executor = PyExecutor.__new__(PyExecutor)
     executor.model_engine = SimpleNamespace()
     executor.enable_attention_dp = True
-    executor.dist = _DepartedRankDist([2])
+    executor.dist = _AbsentRankDist([2])
     assert executor._can_queue(SimpleNamespace(batch_size=2)) == (True, True)
 
-    # Token and context-request counts: the departed rank contributes nothing.
+    # Token and context-request counts: the absent rank contributes nothing.
     metadata = SimpleNamespace(
         get_adp_token_counts=lambda: [7], set_adp_token_counts=lambda counts: counts[0]
     )
     mapping = SimpleNamespace(has_cp_helix=lambda: False)
     assert get_all_rank_num_tokens(
-        metadata, enable_attention_dp=True, mapping=mapping, dist=_DepartedRankDist([7])
+        metadata, enable_attention_dp=True, mapping=mapping, dist=_AbsentRankDist([7])
     ) == [7, 7, 0, 7]
-    assert get_all_rank_ctx_requests(1, enable_attention_dp=True, dist=_DepartedRankDist([1])) == [
+    assert get_all_rank_ctx_requests(1, enable_attention_dp=True, dist=_AbsentRankDist([1])) == [
         1,
         1,
         0,
@@ -182,7 +182,7 @@ def test_every_per_step_vote_survives_a_departed_rank(recovery):
     runner = SimpleNamespace(
         _config=SimpleNamespace(enable_attention_dp=True),
         mapping=SimpleNamespace(cp_size=1, has_cp_helix=lambda: False),
-        dist=_DepartedRankDist([7, 8, 2, 2]),
+        dist=_AbsentRankDist([7, 8, 2, 2]),
     )
     spec = SimpleNamespace(dp_num_tokens=lambda: 8, seq_lens=[4, 4], num_generations=2)
     assert DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(
@@ -192,21 +192,21 @@ def test_every_per_step_vote_survives_a_departed_rank(recovery):
         [[8, 8, 0, 8], [2, 2, 0, 2], [2, 2, 0, 2]],
     )
 
-    # CUDA graph agreement: the departed rank does not vote.
-    runner = SimpleNamespace(config=SimpleNamespace(dist=_DepartedRankDist([1, 2, 0])))
+    # CUDA graph agreement: the absent rank does not vote.
+    runner = SimpleNamespace(config=SimpleNamespace(dist=_AbsentRankDist([1, 2, 0])))
     votes = CUDAGraphRunner._gather_adp_graph_batch_info(
         runner, SimpleNamespace(batch_size=2), True, SampleType.FULL
     )
-    assert votes == [(True, 2, 0)] * len(SURVIVORS)
+    assert votes == [(True, 2, 0)] * len(LIVE_RANKS)
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])
-def test_without_peer_loss_recovery_token_and_spec_counts_gather_as_on_main(no_recovery, tp_size):
+def test_without_rank_failure_recovery_token_and_spec_counts_gather_unchanged(no_recovery, tp_size):
     """Without recovery the counts go through tp_cp_allgather_int64: no collective at tp_size 1.
 
-    With recovery they take the same call; its ``departed`` fills the rows of ranks that left."""
+    With recovery they take the same call; its ``absent`` fills the rows of ranks that left."""
     dist = Mock(spec=["tp_cp_allgather_int64", "tp_allgather_int64"])
-    dist.tp_cp_allgather_int64.side_effect = lambda values, departed: np.tile(
+    dist.tp_cp_allgather_int64.side_effect = lambda values, absent: np.tile(
         np.asarray(values, dtype=np.int64), (tp_size, 1)
     )
     runner = SimpleNamespace(
@@ -221,7 +221,7 @@ def test_without_peer_loss_recovery_token_and_spec_counts_gather_as_on_main(no_r
     assert DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(
         runner, metadata, spec
     ) == ([7] * tp_size, [[8] * tp_size, [2] * tp_size, [2] * tp_size])
-    dist.tp_cp_allgather_int64.assert_called_once_with([7, 8, 2, 2], departed=0)
+    dist.tp_cp_allgather_int64.assert_called_once_with([7, 8, 2, 2], absent=0)
     dist.tp_allgather_int64.assert_not_called()
 
 
@@ -230,7 +230,7 @@ def test_waiting_queue_releases_strict_pin_to_failed_rank(recovery):
     pinned = _item(0, target=FAILED_RANK, relax=False)
     full = _item(1, target=1, relax=False)
     waiting_queue.add_requests([pinned, full])
-    counts = {rank: 0 for rank in SURVIVORS}
+    counts = {rank: 0 for rank in LIVE_RANKS}
     counts[1] = 8
 
     popped = get_from_waiting_queue(
@@ -260,8 +260,8 @@ def _pop_pinned(target, full_rank=None):
     return popped
 
 
-def test_without_peer_loss_recovery_a_pin_past_the_last_rank_raises_as_on_main(no_recovery):
-    """Main indexes per-rank lists: IndexError at admission and in the router."""
+def test_without_rank_failure_recovery_a_pin_past_the_last_rank_raises_unchanged(no_recovery):
+    """Per-rank lists are indexed: IndexError at admission and in the router."""
     with pytest.raises(IndexError):
         _pop_pinned(WORLD_SIZE)
     states = [RankState(rank=rank) for rank in range(WORLD_SIZE)]
@@ -270,8 +270,8 @@ def test_without_peer_loss_recovery_a_pin_past_the_last_rank_raises_as_on_main(n
             _router().route_requests(states, [_item(0, target=WORLD_SIZE, relax=relax)], 8)
 
 
-def test_without_peer_loss_recovery_a_negative_pin_behaves_as_on_main(no_recovery):
-    """Main admits it against the last rank's count, then the router raises placing it (KeyError)."""
+def test_without_rank_failure_recovery_a_negative_pin_is_handled_unchanged(no_recovery):
+    """It is admitted against the last rank's count, then the router raises placing it (KeyError)."""
     assert len(_pop_pinned(-1)) == 1
     assert len(_pop_pinned(-1, full_rank=0)) == 1
     assert _pop_pinned(-1, full_rank=WORLD_SIZE - 1) == []

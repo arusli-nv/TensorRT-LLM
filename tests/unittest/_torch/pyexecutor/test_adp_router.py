@@ -545,7 +545,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -559,7 +559,7 @@ class TestDefaultADPRouter:
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [_retiring_request(), _retiring_request()]
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -576,7 +576,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -680,7 +680,7 @@ class TestDefaultADPRouter:
         assert states[1] == RankState(rank=1, num_active_requests=2, num_active_tokens=20)
         dist.tp_allgather.assert_called_once_with(
             RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize(),
-            departed=None,
+            absent=None,
         )
 
     @pytest.mark.parametrize("include_kv_cache_load", [False, True])
@@ -732,7 +732,7 @@ class TestDefaultADPRouter:
         assert states[0] == expected_local
         assert states[1] == rank1
         dist.tp_allgather.assert_called_once_with(
-            expected_local.serialize(include_kv_cache_load), departed=None
+            expected_local.serialize(include_kv_cache_load), absent=None
         )
 
     @pytest.mark.parametrize(
@@ -746,7 +746,7 @@ class TestDefaultADPRouter:
         # DP rank. The peer CP rank still holds a 20-token request that this CP
         # rank already retired.
         dist.cp_allgather_int64.return_value = np.array([[1, 10], [2, 30]])
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
         router = DefaultADPRouter(dist=dist)
 
         [state] = router.gather_all_rank_states(
@@ -808,7 +808,7 @@ class TestDefaultADPRouter:
                     for cp in cp_ranks
                 ]
             )
-            dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+            dist.tp_allgather.side_effect = lambda payload, absent: [payload]
             requests = [Mock(total_input_len_cp=t) for t in active_tokens[(cp_rank, dp_rank)]]
             [state] = DefaultADPRouter(dist=dist).gather_all_rank_states(requests)
             return state
@@ -1881,7 +1881,7 @@ class TestConversationAwareADPRouter:
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
             _retiring_request(prompt_len=50),
         ]
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
 
         states = router.gather_all_rank_states(active_requests=active)
 

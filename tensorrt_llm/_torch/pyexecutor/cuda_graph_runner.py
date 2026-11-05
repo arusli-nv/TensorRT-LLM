@@ -408,15 +408,15 @@ class CUDAGraphRunner:
         One fixed-size exchange, entered by every rank unconditionally. The
         sampling tier rides along because it is part of the graph key: ranks
         that resolved different tiers would otherwise replay different graphs.
-        Ranks that left the group after a recovered peer loss do not vote.
+        Ranks that left the group after a recovered rank failure do not vote.
         """
         dist = self.config.dist
-        # Departed ranks' rows are dropped; the departed value is unused.
+        # Absent ranks' rows are dropped; the absent value is unused.
         gathered = live_rows(
             dist,
             dist.tp_allgather_int64(
                 [bool(can_run_cuda_graph), batch.batch_size, sample_type.value],
-                departed=0))
+                absent=0))
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
@@ -1696,8 +1696,8 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         local_bucket = self._ragged_verify_bucket(
             batch) if can_run_cuda_graph else None
         dist = self.config.dist
-        # Ranks that left the group after a recovered peer loss do not vote;
-        # their rows are dropped, so the departed value is unused.
+        # Ranks that left the group after a recovered rank failure do not
+        # vote; their rows are dropped, so the absent value is unused.
         peer_shapes = live_rows(
             dist,
             dist.tp_allgather_int64([
@@ -1707,7 +1707,7 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
                 self._local_draft_len(batch) if can_run_cuda_graph else -1,
                 local_sample_type.value,
             ],
-                                    departed=0)).tolist()
+                                    absent=0)).tolist()
         if (not all(peer[0] for peer in peer_shapes)
                 or not all(peer[1:4] == peer_shapes[0][1:4]
                            for peer in peer_shapes)):

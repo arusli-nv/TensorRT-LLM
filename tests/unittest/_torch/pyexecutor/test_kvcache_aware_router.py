@@ -133,7 +133,7 @@ class TestKVCacheAwareADPRouter:
             cached_tokens=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
 
         states = router.gather_all_rank_states([req1, req2])
 
@@ -165,7 +165,7 @@ class TestKVCacheAwareADPRouter:
             cached_tokens=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
-        dist.tp_allgather.side_effect = lambda payload, departed: [payload]
+        dist.tp_allgather.side_effect = lambda payload, absent: [payload]
 
         states = router.gather_all_rank_states([req1, req2])
 
