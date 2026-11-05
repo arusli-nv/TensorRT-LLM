@@ -974,7 +974,7 @@ def test_cft_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
 
 
 # ============================================================================
-# Dispatch routed through a one-slot-per-expert table
+# Dispatch routed through an expert-to-slot table
 # ============================================================================
 
 

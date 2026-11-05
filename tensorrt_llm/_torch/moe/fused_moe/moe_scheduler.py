@@ -51,7 +51,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
-from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm._utils import rank_failure_recovery_enabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
@@ -167,8 +167,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
     def __init__(self, moe: "ConfigurableMoE") -> None:
         super().__init__(moe)
-        # Only peer-loss recovery looks the slots up in a table inside the NVLinkOneSided dispatch.
-        self._peer_loss_recovery = peer_loss_recovery_enabled()
+        # Only rank failure recovery looks the slots up in a table inside the NVLinkOneSided dispatch.
+        self._rank_failure_recovery = rank_failure_recovery_enabled()
 
     def forward(
         self,
@@ -297,8 +297,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
 
-    def _dispatch_slot_table(self) -> Optional[torch.Tensor]:
-        """The expert -> slot table (see ``one_slot_table``) NVLinkOneSided dispatch reads instead of route(), or None.
+    def _dispatch_expert_to_slot_table(self) -> Optional[torch.Tensor]:
+        """The expert-to-slot table (see ``expert_to_slot_table``) NVLinkOneSided dispatch reads instead of route(),
+        or None.
 
         ExpertStatistic and the calibrator read the slot ids route() returns, so they keep route().
         """
@@ -308,7 +309,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             and get_calibrator().mode == CalibratorMode.NONE
         ):
             return None
-        return self.moe.layer_load_balancer.one_slot_table()
+        return self.moe.layer_load_balancer.expert_to_slot_table()
 
     # ------------------------------------------------------------------
     # Async input quantization
@@ -629,8 +630,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 ignore_allreduce=ignore_allreduce,
             )
 
-            if self._peer_loss_recovery:
-                expert_to_slot = self._dispatch_slot_table()
+            if self._rank_failure_recovery:
+                expert_to_slot = self._dispatch_expert_to_slot_table()
             if expert_to_slot is None:
                 token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             else:

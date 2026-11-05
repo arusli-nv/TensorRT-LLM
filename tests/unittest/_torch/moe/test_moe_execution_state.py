@@ -327,22 +327,23 @@ def test_for_model_binds_a_layer_with_an_unfinalized_combine(monkeypatch) -> Non
 
 
 @pytest.mark.parametrize("recovery", [True, False])
-def test_scheduler_records_peer_loss_recovery_and_finds_the_one_slot_table(
+def test_scheduler_records_rank_failure_recovery_and_finds_the_expert_to_slot_table(
     monkeypatch, recovery: bool
 ) -> None:
-    """The scheduler records whether peer-loss recovery is on; its slot table is the one-slot table either way."""
-    monkeypatch.setattr(moe_scheduler, "peer_loss_recovery_enabled", lambda: recovery)
+    """The scheduler records whether rank failure recovery is on; its slot table is the expert-to-slot table either
+    way."""
+    monkeypatch.setattr(moe_scheduler, "rank_failure_recovery_enabled", lambda: recovery)
     table = torch.zeros(2, dtype=torch.int32)
     comm = _frontend(EPGroupHealth(2))
     scheduler = ExternalCommMoEScheduler(
         SimpleNamespace(
             comm=comm,
             enable_alltoall=True,
-            layer_load_balancer=Mock(one_slot_table=Mock(return_value=table)),
+            layer_load_balancer=Mock(expert_to_slot_table=Mock(return_value=table)),
         )
     )
-    assert scheduler._peer_loss_recovery is recovery
-    assert scheduler._dispatch_slot_table() is table
+    assert scheduler._rank_failure_recovery is recovery
+    assert scheduler._dispatch_expert_to_slot_table() is table
 
 
 class _Dispatched(Exception):
@@ -350,12 +351,12 @@ class _Dispatched(Exception):
 
 
 @pytest.mark.parametrize("recovery", [True, False])
-def test_only_peer_loss_recovery_dispatches_by_the_expert_to_slot_table(
+def test_only_rank_failure_recovery_dispatches_by_the_expert_to_slot_table(
     monkeypatch, recovery: bool
 ) -> None:
-    """Without peer-loss recovery the scheduler routes the slots itself and never passes a slot table, so the
+    """Without rank failure recovery the scheduler routes the slots itself and never passes a slot table, so the
     dispatch never takes the kernel's expert-to-slot (USE_EXPERT_TO_SLOT) path."""
-    monkeypatch.setattr(moe_scheduler, "peer_loss_recovery_enabled", lambda: recovery)
+    monkeypatch.setattr(moe_scheduler, "rank_failure_recovery_enabled", lambda: recovery)
     table = torch.zeros(4, dtype=torch.int32)
     experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     comm = Mock(spec=NVLinkOneSided)
@@ -372,7 +373,7 @@ def test_only_peer_loss_recovery_dispatches_by_the_expert_to_slot_table(
     moe.backend.input_requirement.routing_scales_dtype = None
     moe.backend.input_requirement.requires_sanitized_expert_ids = False
     moe.backend.quantize_input.side_effect = lambda x: (x, None)
-    moe.layer_load_balancer.one_slot_table.return_value = table
+    moe.layer_load_balancer.expert_to_slot_table.return_value = table
     scheduler = ExternalCommMoEScheduler(moe)
 
     with pytest.raises(_Dispatched) as dispatched:
@@ -393,5 +394,5 @@ def test_only_peer_loss_recovery_dispatches_by_the_expert_to_slot_table(
         assert kwargs["token_selected_slots"] is experts
     else:
         assert "expert_to_slot" not in kwargs
-        moe.layer_load_balancer.one_slot_table.assert_not_called()
+        moe.layer_load_balancer.expert_to_slot_table.assert_not_called()
         assert kwargs["token_selected_slots"] is moe._load_balancer_route.return_value

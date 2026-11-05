@@ -947,7 +947,8 @@ def _register_fake():
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
 
-    @torch.library.register_fake("trtllm::moe_load_balance_one_slot_table")
+    @torch.library.register_fake(
+        "trtllm::moe_load_balance_expert_to_slot_table")
     def _(single_layer_load_balancer_ptr: int):
         # Empty means "no table": traced code keeps the routing kernel.
         return torch.empty((0, ),

@@ -509,9 +509,10 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Clean up
             balancer.shutdown()
 
-    def test_one_slot_table_is_what_routing_reads(self):
-        """Under fault tolerance a static one-slot placement exposes route()'s device table at a fixed address;
-        dynamic routing has none, and without fault tolerance routing uses the routing kernel (no table)."""
+    def test_expert_to_slot_table_is_what_routing_reads(self):
+        """Under fault tolerance a static placement of one slot per expert exposes route()'s device table at a
+        fixed address; dynamic routing has none, and without fault tolerance routing uses the routing kernel (no
+        table)."""
         torch.cuda.set_device(0)
         ep_size, expert_count, top_k, slots_per_rank = 2, 4, 2, 2
         num_slots = ep_size * slots_per_rank
@@ -522,7 +523,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Only the native balancer recovers: this single process is not a WideEP job.
             def native(*args, fault_tolerance=fault_tolerance, **kwargs):
                 return native_balancer(*args,
-                                       peer_loss_recovery=fault_tolerance)
+                                       rank_failure_recovery=fault_tolerance)
 
             with self.subTest(fault_tolerance=fault_tolerance, layer_updates_per_iter=layer_updates_per_iter), \
                     patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer', native):
@@ -533,7 +534,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
                 layer.set_initial_weight_assignments([2, 0, 3, 1])
                 balancer.finalize_model()
                 try:
-                    table = layer.one_slot_table()
+                    table = layer.expert_to_slot_table()
                     if layer_updates_per_iter or not fault_tolerance:
                         self.assertIsNone(table)
                         continue
@@ -553,7 +554,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
                                                expected,
                                                rtol=0,
                                                atol=0)
-                    self.assertEqual(layer.one_slot_table().data_ptr(),
+                    self.assertEqual(layer.expert_to_slot_table().data_ptr(),
                                      table.data_ptr())
                 finally:
                     balancer.shutdown()
@@ -740,17 +741,17 @@ def test_eplb_slots_are_rows_only_with_rank_failure_recovery(recovery):
 
 
 @pytest.mark.cpu_only
-def test_one_slot_table_keeps_a_none_result() -> None:
+def test_expert_to_slot_table_keeps_a_none_result() -> None:
     """A placement with replicas queries the op once, not on every forward."""
     layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
     layer.updates_enabled = False
-    layer._one_slot_table = None
-    layer._one_slot_table_queried = False
+    layer._expert_to_slot_table = None
+    layer._expert_to_slot_table_queried = False
     with patch.object(SingleLayerMoeLoadBalancer,
-                      "_query_one_slot_table",
+                      "_query_expert_to_slot_table",
                       return_value=None) as query:
-        assert layer.one_slot_table() is None
-        assert layer.one_slot_table() is None
+        assert layer.expert_to_slot_table() is None
+        assert layer.expert_to_slot_table() is None
     query.assert_called_once_with()
 
 

@@ -505,9 +505,9 @@ class SingleLayerMoeLoadBalancer:
         self.to_migrate_weight_fns = []
         # Local slots whose storage maps no memory until a restore (unbacked spare slots), or None.
         self.unbacked_slots: Optional[List[int]] = None
-        # one_slot_table's first eager result: the device expert -> slot table, or None.
-        self._one_slot_table: Optional[torch.Tensor] = None
-        self._one_slot_table_queried = False
+        # expert_to_slot_table's first eager result: the device expert -> slot table, or None.
+        self._expert_to_slot_table: Optional[torch.Tensor] = None
+        self._expert_to_slot_table_queried = False
 
         if self.updates_enabled:
             self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
@@ -958,7 +958,7 @@ class SingleLayerMoeLoadBalancer:
             token_selected_experts, offset_by_ep_rank,
             self.single_layer_load_balancer_ptr)
 
-    def one_slot_table(self) -> Optional[torch.Tensor]:
+    def expert_to_slot_table(self) -> Optional[torch.Tensor]:
         """The device expert -> slot table [num_experts] while every expert has exactly one slot, else None.
 
         ``route`` then reduces to this lookup. Its address is fixed and placement updates rewrite it in place, so
@@ -970,14 +970,14 @@ class SingleLayerMoeLoadBalancer:
             return None
         if torch.compiler.is_compiling():
             # Traced code gets the op's empty fake, so it keeps the routing kernel.
-            return self._query_one_slot_table()
-        if not self._one_slot_table_queried:
-            self._one_slot_table = self._query_one_slot_table()
-            self._one_slot_table_queried = True
-        return self._one_slot_table
+            return self._query_expert_to_slot_table()
+        if not self._expert_to_slot_table_queried:
+            self._expert_to_slot_table = self._query_expert_to_slot_table()
+            self._expert_to_slot_table_queried = True
+        return self._expert_to_slot_table
 
-    def _query_one_slot_table(self) -> Optional[torch.Tensor]:
-        table = torch.ops.trtllm.moe_load_balance_one_slot_table(
+    def _query_expert_to_slot_table(self) -> Optional[torch.Tensor]:
+        table = torch.ops.trtllm.moe_load_balance_expert_to_slot_table(
             self.single_layer_load_balancer_ptr)
         return table if table.numel() > 0 else None
 

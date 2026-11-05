@@ -173,10 +173,10 @@ torch::Tensor moeLoadBalanceRouting(
     return tokenRoutedSlotIds;
 }
 
-// The device expert -> slot table [expertCount] (a view, read at execution time and rewritten in place by placement
+// The device expert-to-slot table [expertCount] (a view, read at execution time and rewritten in place by placement
 // updates) while routesEachExpertToOneSlot(), else an empty tensor. The view does not own its memory: it is valid
 // while the layer's balancer exists.
-torch::Tensor moeLoadBalanceOneSlotTable(int64_t singleLayerLoadBalancerPtr)
+torch::Tensor moeLoadBalanceExpertToSlotTable(int64_t singleLayerLoadBalancerPtr)
 {
     TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
     auto* loadBalancer
@@ -327,12 +327,12 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("moe_load_balance_one_slot_table(int single_layer_load_balancer_ptr) -> Tensor");
+    m.def("moe_load_balance_expert_to_slot_table(int single_layer_load_balancer_ptr) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("moe_load_balance_one_slot_table", &tensorrt_llm::torch_ext::moeLoadBalanceOneSlotTable);
+    m.impl("moe_load_balance_expert_to_slot_table", &tensorrt_llm::torch_ext::moeLoadBalanceExpertToSlotTable);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
