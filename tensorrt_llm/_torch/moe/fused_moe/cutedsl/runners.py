@@ -143,7 +143,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_locality_domain: bool = False,
         workload_identity: tuple | None = None,
         prime_inner_tactics: bool = False,
-        num_extra_local_experts: int = 0,
+        num_spare_local_experts: int = 0,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -155,9 +155,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
         self.use_locality_domain = use_locality_domain
-        self.num_extra_local_experts = num_extra_local_experts
+        self.num_spare_local_experts = num_spare_local_experts
         self.tuning_layout = loaded_slot_layout(
-            num_experts, num_local_experts, local_expert_offset, num_extra_local_experts
+            num_experts, num_local_experts, local_expert_offset, num_spare_local_experts
         )
 
         assert output_dtype == torch.bfloat16
@@ -206,7 +206,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return [128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
-        key = (self.unique_id(), self.num_extra_local_experts)
+        key = (self.unique_id(), self.num_spare_local_experts)
         if key not in self.__class__.tuning_config_cache:
             num_experts, num_local_experts, local_expert_offset = self.tuning_layout
             if self.use_direct_expert_metadata:

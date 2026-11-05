@@ -342,8 +342,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
             # Direct metadata lays rows out by every local slot.
-            num_extra_local_experts=(
-                0 if use_direct_expert_metadata else self._num_extra_local_slots
+            num_spare_local_experts=(
+                0 if use_direct_expert_metadata else self._num_spare_local_slots
             ),
         )
 
@@ -488,14 +488,14 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             gather_act_kwargs["expert_counts"] = recv_expert_count
             gather_act_kwargs["expert_capacity"] = deep_ep_expert_capacity
         # Count-native metadata lays rows out by every local slot.
-        num_extra_local_experts = (
-            0 if use_count_native_expert_metadata else self._num_extra_local_slots
+        num_spare_local_experts = (
+            0 if use_count_native_expert_metadata else self._num_spare_local_slots
         )
         if use_rubin:
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
         else:
-            gather_act_kwargs["num_extra_local_experts"] = num_extra_local_experts
+            gather_act_kwargs["num_spare_local_experts"] = num_spare_local_experts
         gather_act_kwargs["activation_type"] = self.activation_type
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
@@ -585,7 +585,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 finalize_inplace_kwargs["expert_capacity"] = (
                     deep_ep_expert_capacity if use_count_native_expert_metadata else 0
                 )
-                finalize_inplace_kwargs["num_extra_local_experts"] = num_extra_local_experts
+                finalize_inplace_kwargs["num_spare_local_experts"] = num_spare_local_experts
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:

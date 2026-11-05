@@ -230,15 +230,15 @@ class MoERunner(TunableRunner):
 
 def loaded_slot_moe_tuner_inputs(
         inputs: List[Optional[torch.Tensor]],
-        num_extra_local_experts: int) -> List[Optional[torch.Tensor]]:
+        num_spare_local_experts: int) -> List[Optional[torch.Tensor]]:
     """``MoERunner`` inputs ``[x, fc1 weights, fc1 biases, fc2 weights, fc2 biases]`` of the loaded slots only.
 
     The kernel derives the expert count from the weights, so profiling the loaded slots' weights tunes and keys
     the tactics on the loaded slots (see ``loaded_slot_layout``).
     """
-    if not num_extra_local_experts:
+    if not num_spare_local_experts:
         return inputs
-    num_loaded = inputs[3].shape[0] - num_extra_local_experts
+    num_loaded = inputs[3].shape[0] - num_spare_local_experts
     return [
         t[:num_loaded] if i > 0 and t is not None else t
         for i, t in enumerate(inputs)
@@ -306,7 +306,7 @@ def fused_moe(
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
     swiglu_clamp_after_silu: bool = False,
-    num_extra_local_experts: int = 0,
+    num_spare_local_experts: int = 0,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -349,7 +349,7 @@ def fused_moe(
     tuner_inputs = loaded_slot_moe_tuner_inputs([
         tuner_input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
         fc2_expert_biases
-    ], num_extra_local_experts)
+    ], num_spare_local_experts)
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
@@ -483,7 +483,7 @@ def _(input: torch.Tensor,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       token_to_slot: Optional[torch.Tensor] = None,
       swiglu_clamp_after_silu: bool = False,
-      num_extra_local_experts: int = 0):
+      num_spare_local_experts: int = 0):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,

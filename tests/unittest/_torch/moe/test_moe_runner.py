@@ -77,13 +77,13 @@ def test_sm107_bf16_moe_preserves_tuned_tactic(monkeypatch: pytest.MonkeyPatch) 
     runner.fused_moe_runner.get_tactic_num.assert_not_called()
 
 
-@pytest.mark.parametrize("num_extra,num_loaded", [(2, 8), (1, 9)])
+@pytest.mark.parametrize("num_spare,num_loaded", [(2, 8), (1, 9)])
 @pytest.mark.parametrize("num_tokens", [1, 64, 3072])
-def test_moe_runner_keys_extra_slots_as_loaded_slots(
-    num_extra: int, num_loaded: int, num_tokens: int
+def test_moe_runner_keys_spare_slots_as_loaded_slots(
+    num_spare: int, num_loaded: int, num_tokens: int
 ) -> None:
-    """Weights of 10 local slots, ``num_extra`` of them empty, look tactics up under the key of
-    the loaded slots alone: the key of the same deployment without peer-loss recovery."""
+    """Weights of 10 local slots, ``num_spare`` of them empty, look tactics up under the key of
+    the loaded slots alone: the key of the same deployment without fault tolerance."""
     runner = _make_runner(torch.bfloat16, torch.bfloat16)
     for name, value in dict(
         output_dtype=torch.bfloat16,
@@ -105,7 +105,7 @@ def test_moe_runner_keys_extra_slots_as_loaded_slots(
         setattr(runner, name, value)
     hidden_size, inter_size = 7168, 2048
 
-    def key(num_local: int, num_extra_local: int, with_bias: bool):
+    def key(num_local: int, num_spare_local: int, with_bias: bool):
         def tensor(*shape):
             return torch.empty(*shape, device="meta")
 
@@ -116,7 +116,7 @@ def test_moe_runner_keys_extra_slots_as_loaded_slots(
             tensor(num_local, hidden_size, inter_size),
             tensor(num_local, hidden_size) if with_bias else None,
         ]
-        tuner_inputs = torch_custom_ops.loaded_slot_moe_tuner_inputs(inputs, num_extra_local)
+        tuner_inputs = torch_custom_ops.loaded_slot_moe_tuner_inputs(inputs, num_spare_local)
         tuner = AutoTuner.get()
         return tuner.profiling_cache.get_cache_key(
             "trtllm::fused_moe::gemm1",
@@ -126,13 +126,13 @@ def test_moe_runner_keys_extra_slots_as_loaded_slots(
         )
 
     for with_bias in (False, True):
-        assert key(10, num_extra, with_bias) == key(num_loaded, 0, with_bias)
+        assert key(10, num_spare, with_bias) == key(num_loaded, 0, with_bias)
         assert key(10, 0, with_bias) != key(num_loaded, 0, with_bias)
 
 
-@pytest.mark.parametrize("num_extra", [0, 2])
+@pytest.mark.parametrize("num_spare", [0, 2])
 def test_fused_moe_profiles_the_weights_of_the_loaded_slots(
-    monkeypatch: pytest.MonkeyPatch, num_extra: int
+    monkeypatch: pytest.MonkeyPatch, num_spare: int
 ) -> None:
     """trtllm::fused_moe hands both GEMM choices the weights and biases of the loaded slots, and runs the
     kernel over every local slot."""
@@ -171,10 +171,10 @@ def test_fused_moe_profiles_the_weights_of_the_loaded_slots(
         [],
         ep_size=32,
         ep_rank=5,
-        num_extra_local_experts=num_extra,
+        num_spare_local_experts=num_spare,
     )
 
-    loaded = num_local - num_extra
+    loaded = num_local - num_spare
     expected = [
         (num_tokens, hidden_size),
         (loaded, 2 * inter_size, hidden_size),
