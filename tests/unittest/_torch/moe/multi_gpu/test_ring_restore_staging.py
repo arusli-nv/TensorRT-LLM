@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Ring host copies restore through real MNNVL NVLinkOneSided workspaces, bit-exactly.
+"""Ring host weights restore through real MNNVL NVLinkOneSided workspaces, bit-exactly.
 
 Four processes, one GPU each, map a real MoE All-to-All workspace. The ring
 treats ranks 0 and 2 as one node and ranks 1 and 3 as the other; ranks 1 and 3
-are lost. The survivors copy the lost experts from host memory into the
+fail. The survivors copy the lost experts from host memory into the
 target's workspace (their own or the peer's, over NVLink) and from there into
 the target's slots, in chunks of half of the workspace row, as a WideEP restore does after it remapped the
 workspace.
@@ -30,17 +30,17 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     SingleLayerMoeLoadBalancer,
     restore_lost_experts,
-    ring_copy_nodes,
+    ring_host_weight_nodes,
 )
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
 _EP_SIZE = 4
 _HOSTS = ["a", "b", "a", "b"]
-_DEAD = [1, 3]
+_FAILED = [1, 3]
 _SURVIVORS = [0, 2]
 _EXPERTS = 8
-# Two slots per rank hold one expert each; two ghost slots per rank take restores.
+# Two slots per rank hold one expert each; two spare slots per rank take restores.
 _PLACEMENT = [[0, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1]]
 # Per slot: w1 3 MiB of bytes, w2 1.5 MiB of bfloat16 (sizes of real expert weights' order of magnitude).
 _WEIGHTS = {"w1": (3 << 20, torch.uint8), "w2": (768 << 10, torch.bfloat16)}
@@ -63,7 +63,7 @@ class _StoreComm(StoreComm):
         self.store.wait([f"survivors/{self.survivor_calls}/{r}" for r in _SURVIVORS])
 
 
-def _host_copy(layer_idx: int, expert: int, name: str) -> torch.Tensor:
+def _host_weight(layer_idx: int, expert: int, name: str) -> torch.Tensor:
     count, dtype = _WEIGHTS[name]
     generator = torch.Generator().manual_seed(layer_idx * 1000 + expert * 10 + len(name))
     data = torch.randint(0, 256, (count * dtype.itemsize,), dtype=torch.uint8, generator=generator)
@@ -71,8 +71,8 @@ def _host_copy(layer_idx: int, expert: int, name: str) -> torch.Tensor:
 
 
 def _load_balancer(rank: int) -> MoeLoadBalancer:
-    """One layer over _PLACEMENT, with this rank's ring host copies and slots."""
-    copy_nodes = ring_copy_nodes(_HOSTS)
+    """One layer over _PLACEMENT, with this rank's ring host weights and slots."""
+    host_weight_nodes = ring_host_weight_nodes(_HOSTS)
     layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
     layer.single_layer_load_balancer_impl = Mock(
         get_layer_id=Mock(return_value=0), get_old_rank_expert_ids=Mock(return_value=_PLACEMENT)
@@ -84,14 +84,14 @@ def _load_balancer(rank: int) -> MoeLoadBalancer:
         for name, (count, dtype) in _WEIGHTS.items()
     }
     layer.ring_host_weights = {
-        (expert, name): _host_copy(0, expert, name)
+        (expert, name): _host_weight(0, expert, name)
         for expert in range(_EXPERTS)
-        if rank in copy_nodes[layer.home_ranks[expert]]
+        if rank in host_weight_nodes[layer.home_ranks[expert]]
         for name in _WEIGHTS
     }
     load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
     load_balancer.ep_rank, load_balancer.ep_size = rank, _EP_SIZE
-    load_balancer.copy_nodes = copy_nodes
+    load_balancer.host_weight_nodes = host_weight_nodes
     load_balancer.single_layer_load_balancers = [layer]
     return load_balancer
 
@@ -99,9 +99,9 @@ def _load_balancer(rank: int) -> MoeLoadBalancer:
 def _survivor(comm: _StoreComm, workspace: torch.Tensor) -> None:
     load_balancer = _load_balancer(comm.rank)
     placement = np.array(_PLACEMENT, dtype=np.int32)
-    placement[_DEAD] = -1
-    assert restore_lost_experts(placement, [2, 3, 6, 7], _DEAD) == []
-    plan = load_balancer.restore_copy_plan(_DEAD, [placement], workspace.size(1))
+    placement[_FAILED] = -1
+    assert restore_lost_experts(placement, [2, 3, 6, 7], _FAILED) == []
+    plan = load_balancer.restore_copy_plan(_FAILED, [placement], workspace.size(1))
     # Both survivors copy into the other's workspace as well as their own.
     assert {(source, target) for source, target in plan[:, [6, 2]].tolist()} == {
         (0, 0),
@@ -118,7 +118,7 @@ def _survivor(comm: _StoreComm, workspace: torch.Tensor) -> None:
             continue
         for name in _WEIGHTS:
             loaded = layer.weight_slots[(slot, name)].cpu().view(torch.uint8)
-            expected = _host_copy(0, expert, name).view(torch.uint8)
+            expected = _host_weight(0, expert, name).view(torch.uint8)
             assert torch.equal(loaded, expected), f"rank {comm.rank} slot {slot} {name}"
 
 
@@ -137,7 +137,7 @@ def _worker(rank: int, port: int) -> None:
     workspace = memory.as_torch_strided_tensor(torch.uint8)
     if rank in _SURVIVORS:
         _survivor(comm, workspace)
-    # The lost ranks keep their workspaces mapped until the survivors are done.
+    # The failed ranks keep their workspaces mapped until the survivors are done.
     comm.barrier()
 
 
