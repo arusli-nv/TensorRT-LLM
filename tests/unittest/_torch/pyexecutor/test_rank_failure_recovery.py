@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Scheduler-side WideEP peer-loss recovery with fake distributed, model, and authority."""
+"""Scheduler-side WideEP rank failure recovery with fake distributed, model, and authority."""
 
 import functools
 import pickle
@@ -16,19 +16,19 @@ import torch
 from tensorrt_llm._torch.distributed.communicator import HostCollectiveInterrupted, MPIDist
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
-from tensorrt_llm._torch.pyexecutor import llm_request, peer_loss_recovery, py_executor
+from tensorrt_llm._torch.pyexecutor import llm_request, py_executor, rank_failure_recovery
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     CONTROL_REQUEST_ID,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
-from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import (
-    PeerLossRecovery,
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
     PreparedStep,
+    RankFailureRecovery,
     RecoveryHook,
 )
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, adp_router
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode as SpecMode
@@ -50,7 +50,7 @@ from tensorrt_llm.executor.recovery.protocol import (
     Ready,
     Stopped,
 )
-from tensorrt_llm.executor.utils import is_peer_loss_retryable_message
+from tensorrt_llm.executor.utils import is_rank_failure_retryable_message
 from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -58,7 +58,7 @@ pytestmark = pytest.mark.cpu_only
 
 WORLD_SIZE = 4
 FAILED_RANK = 2
-SURVIVORS = (0, 1, 3)
+LIVE_RANKS = (0, 1, 3)
 ADMITTED = frozenset({frozenset({1}), frozenset({FAILED_RANK}), frozenset({3})})
 
 
@@ -80,7 +80,7 @@ class _FakeClient:
         reply = self.replies.pop(0)
         while skip is not None and skip(reply):
             reply = self.replies.pop(0)
-        if reply is _FURTHER_LOSS:
+        if reply is _FURTHER_FAILURE:
             assert interrupt is not None
             raise RecoveryInterrupted("another peer failed")
         if isinstance(reply, Abort):
@@ -90,12 +90,12 @@ class _FakeClient:
 
 
 # A scripted reply: the survivor watch fires while the worker waits for the authority.
-_FURTHER_LOSS = object()
+_FURTHER_FAILURE = object()
 
 
-def _happy_replies(generation=1, failed=(FAILED_RANK,), survivors=SURVIVORS):
+def _happy_replies(generation=1, failed=(FAILED_RANK,), live_ranks=LIVE_RANKS):
     return [
-        Propose(generation=generation, failed_ranks=failed, survivors=survivors),
+        Propose(generation=generation, failed_ranks=failed, live_ranks=live_ranks),
         Install(generation=generation),
         Commit(generation=generation),
     ]
@@ -119,8 +119,8 @@ def _executor(rank=1, failed=frozenset({FAILED_RANK}), world_size=WORLD_SIZE):
         "watch"
     ) or Mock(failed=False)
     dist.broadcast.side_effect = lambda value, root: value
-    dist.allgather.side_effect = lambda value, departed: [
-        departed if r in failed else value for r in range(world_size)
+    dist.allgather.side_effect = lambda value, absent: [
+        absent if r in failed else value for r in range(world_size)
     ]
     engine = Mock()
     engine.moe_load_balancer.is_static_routing.return_value = True
@@ -162,12 +162,12 @@ def _recovery(
     executor = _executor(rank, failed, world_size)
     # A static recovery stages its ring copies: by default the plan copies nothing.
     executor.model_engine.moe_load_balancer.restore_copy_plan.return_value = []
-    recovery = PeerLossRecovery(executor, client, admitted)
+    recovery = RankFailureRecovery(executor, client, admitted)
     recovery._join_device_work = Mock()
     recovery._remap_workspaces = Mock()
     recovery._watch = Mock(failed=False)
-    executor.discard_interrupted_steps = Mock()
-    executor._peer_loss_recovery = recovery
+    executor.roll_back_interrupted_steps = Mock()
+    executor._rank_failure_recovery = recovery
     return recovery
 
 
@@ -209,11 +209,11 @@ def test_recovery_runs_protocol_and_installs_in_order():
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
-def test_static_placement_with_replicas_restores_from_full_host_copies():
-    """Its replicas stay routed and every node keeps every host copy: the install loads, nothing is staged."""
+def test_static_placement_with_replicas_restores_from_full_host_weights():
+    """Its replicas stay routed and every node keeps all host weights: the install loads, nothing is staged."""
     recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
-    load_balancer.copy_nodes = None
+    load_balancer.host_weight_nodes = None
     recovery._peer_failed.set()
 
     recovery._recover(_interrupted())
@@ -227,8 +227,8 @@ def test_static_placement_with_replicas_restores_from_full_host_copies():
     load_balancer.install_recovery_placement.assert_called_once_with([FAILED_RANK], ["placement"])
 
 
-def test_ghost_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypatch):
-    """Ghost slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
+def test_unbacked_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypatch):
+    """Unbacked slots get their memory before Ready; the KV cache gives up only what free memory lacks."""
     recovery = _recovery(_FakeClient([]))
     executor = recovery._executor
     executor.resize_kv_cache_quota = Mock(return_value=True)
@@ -237,18 +237,18 @@ def test_ghost_slots_take_kv_cache_memory_only_when_the_device_is_short(monkeypa
     load_balancer.restore_backing_bytes.return_value = need
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: 4 << 30)
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: 4 << 30)
     recovery._back_restored_slots(load_balancer, ["placement"])
     executor.resize_kv_cache_quota.assert_not_called()
     load_balancer.back_restored_slots.assert_called_once_with(["placement"])
 
     free = 512 << 20
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: free)
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: free)
     recovery._back_restored_slots(load_balancer, ["placement"])
-    lent = need + peer_loss_recovery._GHOST_MARGIN_BYTES - free
+    lent = need + rank_failure_recovery._UNBACKED_MARGIN_BYTES - free
     executor.resize_kv_cache_quota.assert_called_once_with(-lent)
 
-    # A plan abandoned for a further loss returns its slots' memory and the KV cache's share.
+    # A plan abandoned for a further failure returns its slots' memory and the KV cache's share.
     load_balancer_of_engine = executor.model_engine.moe_load_balancer
     load_balancer_of_engine.release_uninstalled_backing.return_value = need
     recovery._release_uninstalled_backing()
@@ -279,11 +279,11 @@ def test_remap_releases_on_every_survivor_before_taking_room_and_remapping(monke
     dist, state = executor.dist, executor.model_engine.moe_execution_state
     order = []
     need, free = 1 << 30, 512 << 20
-    state.release_workspaces.side_effect = lambda departed: order.append("release") or need
+    state.release_workspaces.side_effect = lambda failed: order.append("release") or need
     dist.barrier_among_survivors.side_effect = lambda: order.append("barrier")
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        peer_loss_recovery, "_free_device_bytes", lambda: order.append("room") or free
+        rank_failure_recovery, "_free_device_bytes", lambda: order.append("room") or free
     )
     state.remap_workspaces.side_effect = lambda gather: order.append(("remap", gather))
 
@@ -294,10 +294,10 @@ def test_remap_releases_on_every_survivor_before_taking_room_and_remapping(monke
     assert "room" in order[2:-2]
     assert order[-2:] == [("remap", dist.allgather_among_survivors), "barrier"]
     executor.resize_kv_cache_quota.assert_called_once_with(
-        -(need + peer_loss_recovery._GHOST_MARGIN_BYTES - free)
+        -(need + rank_failure_recovery._UNBACKED_MARGIN_BYTES - free)
     )
     assert recovery._kv_lent == 0
-    assert recovery._remap_lent == need + peer_loss_recovery._GHOST_MARGIN_BYTES - free
+    assert recovery._remap_lent == need + rank_failure_recovery._UNBACKED_MARGIN_BYTES - free
 
     # A rank short of room still joins the remap, whose exchange then fails on every survivor.
     executor.resize_kv_cache_quota.return_value = False
@@ -315,9 +315,9 @@ def test_the_remap_checks_the_recovery_deadline_before_and_after_its_exchanges(m
     executor.resize_kv_cache_quota = Mock(return_value=True)
     state = executor.model_engine.moe_execution_state
     state.release_workspaces.return_value = 0
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: 1 << 40)
     now = [100.0]
-    monkeypatch.setattr(peer_loss_recovery.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(rank_failure_recovery.time, "monotonic", lambda: now[0])
 
     with pytest.raises(RecoveryTimeout, match="before remapping"):
         recovery._remap_workspaces(frozenset({FAILED_RANK}), 100.0)
@@ -337,21 +337,21 @@ def test_a_commit_returns_the_remap_s_kv_cache_share_as_far_as_memory_is_free(mo
     recovery = _recovery(_FakeClient([]))
     executor = recovery._executor
     executor.resize_kv_cache_quota = Mock(return_value=True)
-    margin = peer_loss_recovery._GHOST_MARGIN_BYTES
+    margin = rank_failure_recovery._UNBACKED_MARGIN_BYTES
     recovery._remap_lent = lent = 1 << 30
 
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: margin)
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: margin)
     recovery._return_remap_room()
     executor.resize_kv_cache_quota.assert_not_called()
 
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: margin + (256 << 20))
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: margin + (256 << 20))
     recovery._return_remap_room()
     executor.resize_kv_cache_quota.assert_called_once_with(256 << 20)
     assert recovery._remap_lent == lent - (256 << 20)
 
     # A KV cache that cannot grow keeps the share lent.
     executor.resize_kv_cache_quota.return_value = False
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: margin + (4 << 30))
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: margin + (4 << 30))
     recovery._return_remap_room()
     assert recovery._remap_lent == lent - (256 << 20)
 
@@ -367,13 +367,13 @@ def test_an_idle_executor_returns_the_remap_s_share_once_memory_is_free(monkeypa
     recovery = _recovery(_FakeClient([]))
     executor = recovery._executor
     executor.resize_kv_cache_quota = Mock(return_value=True)
-    margin = peer_loss_recovery._GHOST_MARGIN_BYTES
-    interval = peer_loss_recovery._REMAP_RETURN_INTERVAL_S
+    margin = rank_failure_recovery._UNBACKED_MARGIN_BYTES
+    interval = rank_failure_recovery._REMAP_RETURN_INTERVAL_S
     now = [100.0]
     free = [margin]
-    monkeypatch.setattr(peer_loss_recovery.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(rank_failure_recovery.time, "monotonic", lambda: now[0])
     free_device_bytes = Mock(side_effect=lambda: free[0])
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", free_device_bytes)
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", free_device_bytes)
     recovery._remap_lent = lent = 1 << 30
 
     recovery.serving_idle()
@@ -402,7 +402,7 @@ def test_the_executor_reports_idle_only_without_a_step_in_flight(monkeypatch, in
     """The overlap loop has a step in flight while ``previous_batch`` is set; only without one may the KV cache
     resize."""
     executor = PyExecutor.__new__(PyExecutor)
-    executor._peer_loss_recovery = Mock(enabled=True)
+    executor._rank_failure_recovery = Mock(enabled=True)
     executor.previous_batch = Mock() if in_flight else None
     executor.hang_detector = MagicMock()
     executor._profiler = MagicMock()
@@ -423,7 +423,7 @@ def test_the_executor_reports_idle_only_without_a_step_in_flight(monkeypatch, in
 
     PyExecutor._executor_loop_overlap(executor)
 
-    assert executor._peer_loss_recovery.serving_idle.call_count == (0 if in_flight else 1)
+    assert executor._rank_failure_recovery.serving_idle.call_count == (0 if in_flight else 1)
 
 
 def test_every_survivor_resets_its_remapped_rows_before_any_stages_into_them(monkeypatch):
@@ -433,11 +433,11 @@ def test_every_survivor_resets_its_remapped_rows_before_any_stages_into_them(mon
 
     recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
     del recovery._remap_workspaces
-    monkeypatch.setattr(peer_loss_recovery, "_free_device_bytes", lambda: 4 << 30)
+    monkeypatch.setattr(rank_failure_recovery, "_free_device_bytes", lambda: 4 << 30)
     engine, dist = recovery._executor.model_engine, recovery._executor.dist
     events = []
     engine.moe_execution_state.release_workspaces.side_effect = (
-        lambda departed: events.append("release") or 0
+        lambda failed: events.append("release") or 0
     )
     engine.moe_execution_state.remap_workspaces.side_effect = lambda gather: events.append("reset")
     dist.barrier_among_survivors.side_effect = lambda: events.append("barrier")
@@ -479,10 +479,10 @@ def test_kv_cache_quota_cut_suspends_the_active_caches_around_the_resize():
     assert mgr.resume_request.call_count == mgr.suspend_request.call_count == 3
 
 
-def test_a_node_loss_recovers_every_rank_in_one_transaction():
-    """Losing node 1 (ranks 4-7) masks all four ranks and runs the requests each one served again."""
+def test_a_node_failure_recovers_every_rank_in_one_transaction():
+    """A failure of node 1 (ranks 4-7) masks all four ranks and runs the requests each one served again."""
     node = frozenset({4, 5, 6, 7})
-    client = _FakeClient(_happy_replies(failed=(4, 5, 6, 7), survivors=(0, 1, 2, 3)))
+    client = _FakeClient(_happy_replies(failed=(4, 5, 6, 7), live_ranks=(0, 1, 2, 3)))
     recovery = _recovery(client, rank=0, failed=node, world_size=8, admitted=ADMITTED | {node})
     recovery._request_owners = {
         request_id: (owner, Mock(id=request_id, request=Mock(client_id=None), child_req_ids=None))
@@ -507,52 +507,52 @@ def test_a_node_loss_recovers_every_rank_in_one_transaction():
     assert list(recovery._request_owners) == [13]
 
 
-def test_a_loss_during_the_recovery_plans_again_without_every_lost_rank():
+def test_a_failure_during_the_recovery_plans_again_without_every_failed_rank():
     """Rank 3 fails while rank 1 waits for the plan without rank 2: rank 1 shrinks again, checks that the
     survivors' slots serve every expert without both, and recovers without both; the first plan's
     leftovers are dropped."""
-    lost = (FAILED_RANK, 3)
+    failed = (FAILED_RANK, 3)
     client = _FakeClient(
         [
-            _FURTHER_LOSS,
-            Propose(1, (FAILED_RANK,), SURVIVORS),
-            Propose(1, lost, (0, 1)),
+            _FURTHER_FAILURE,
+            Propose(1, (FAILED_RANK,), LIVE_RANKS),
+            Propose(1, failed, (0, 1)),
             Install(1),
             Commit(1),
         ]
     )
-    recovery = _recovery(client, failed=frozenset(lost))
+    recovery = _recovery(client, failed=frozenset(failed))
     dist = recovery._executor.dist
-    shrinks = iter([frozenset({FAILED_RANK}), frozenset(lost)])
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset(failed)])
     dist.shrink.side_effect = lambda: next(shrinks)
     load_balancer = recovery._executor.model_engine.moe_load_balancer
-    load_balancer.covers_loss_of.return_value = True
+    load_balancer.covers_failure_of.return_value = True
 
     recovery._recover(_interrupted())
 
     assert client.sent == [
         Stopped(rank=1, failed_ranks=(FAILED_RANK,)),
-        Stopped(rank=1, failed_ranks=lost),
+        Stopped(rank=1, failed_ranks=failed),
         Ready(rank=1, generation=1, placement_digest="digest"),
         Installed(rank=1, generation=1),
     ]
     assert dist.watch_survivor_failures.call_count == 2
-    load_balancer.covers_loss_of.assert_called_once_with(frozenset(lost))
-    load_balancer.install_recovery_placement.assert_called_once_with(list(lost), ["placement"])
+    load_balancer.covers_failure_of.assert_called_once_with(frozenset(failed))
+    load_balancer.install_recovery_placement.assert_called_once_with(list(failed), ["placement"])
 
 
 def test_a_shrink_again_restarts_the_hang_detection_bound():
     """The executor's hang detector bounds one shrink and the recovery deadline; a second shrink, after up to
     that much time, gets a bound of its own."""
-    lost = (FAILED_RANK, 3)
-    client = _FakeClient([_FURTHER_LOSS, Propose(1, lost, (0, 1)), Install(1), Commit(1)])
-    recovery = _recovery(client, failed=frozenset(lost))
+    failed = (FAILED_RANK, 3)
+    client = _FakeClient([_FURTHER_FAILURE, Propose(1, failed, (0, 1)), Install(1), Commit(1)])
+    recovery = _recovery(client, failed=frozenset(failed))
     executor = recovery._executor
     events = executor._events
-    shrinks = iter([frozenset({FAILED_RANK}), frozenset(lost)])
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset(failed)])
     executor.dist.shrink.side_effect = lambda: events.append("shrink") or next(shrinks)
     executor.hang_detector.checkpoint.side_effect = lambda: events.append("checkpoint")
-    executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
+    executor.model_engine.moe_load_balancer.covers_failure_of.return_value = True
 
     recovery._recover(_interrupted())
 
@@ -563,61 +563,61 @@ def test_a_shrink_again_restarts_the_hang_detection_bound():
     ]
 
 
-def test_a_survivor_lost_during_the_recovery_releases_the_survivor_collectives():
+def test_a_survivor_failing_during_the_recovery_releases_the_survivor_collectives():
     """A survivor blocked in a survivor collective is released by the revocation, not only the event."""
     recovery = _recovery(_FakeClient([]))
     dist = recovery._executor.dist
-    further_loss = threading.Event()
-    recovery._watch_survivors(further_loss)
+    further_failure = threading.Event()
+    recovery._watch_survivors(further_failure)
     ((on_failure,), _) = dist.watch_survivor_failures.call_args
     dist.revoke.assert_not_called()
     on_failure()
-    assert further_loss.is_set()
+    assert further_failure.is_set()
     dist.revoke.assert_called_once_with()
 
 
-def test_a_loss_during_the_recovery_the_slots_cannot_serve_fails_closed():
-    client = _FakeClient([_FURTHER_LOSS])
+def test_a_failure_during_the_recovery_the_slots_cannot_serve_fails_closed():
+    client = _FakeClient([_FURTHER_FAILURE])
     recovery = _recovery(client)
     shrinks = iter([frozenset({FAILED_RANK}), frozenset({FAILED_RANK, 3})])
     recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
-    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = False
+    recovery._executor.model_engine.moe_load_balancer.covers_failure_of.return_value = False
     with pytest.raises(RuntimeError, match="not recoverable"):
         recovery._recover(_interrupted())
 
 
 @pytest.mark.parametrize("covered", [True, False])
-def test_a_loss_after_a_recovery_recovers_only_while_the_slots_cover_every_lost_rank(covered):
-    """After the recovery without rank 2 committed, rank 3 is lost: the survivors shrink the installed communicator
+def test_a_failure_after_a_recovery_recovers_only_while_the_slots_cover_every_failed_rank(covered):
+    """After the recovery without rank 2 committed, rank 3 fails: the survivors shrink the installed communicator
     and recover without both at generation 2 if their slots still serve every expert, else fail closed."""
-    lost = frozenset({FAILED_RANK, 3})
+    failed = frozenset({FAILED_RANK, 3})
     client = _FakeClient(
         [
             *_happy_replies(),
-            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+            *_happy_replies(generation=2, failed=tuple(sorted(failed)), live_ranks=(0, 1)),
         ]
     )
-    recovery = _recovery(client, failed=lost)
-    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery = _recovery(client, failed=failed)
+    shrinks = iter([frozenset({FAILED_RANK}), failed])
     recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
     load_balancer = recovery._executor.model_engine.moe_load_balancer
-    load_balancer.covers_loss_of.return_value = covered
+    load_balancer.covers_failure_of.return_value = covered
     recovery._recover(_interrupted())
 
     if not covered:
         with pytest.raises(RuntimeError, match="not recoverable"):
-            recovery._recover(_interrupted(lost))
-        load_balancer.covers_loss_of.assert_called_with(lost)
+            recovery._recover(_interrupted(failed))
+        load_balancer.covers_failure_of.assert_called_with(failed)
         return
-    recovery._recover(_interrupted(lost))
+    recovery._recover(_interrupted(failed))
     assert client.sent[3:] == [
         Stopped(rank=1, failed_ranks=(FAILED_RANK, 3)),
         Ready(rank=1, generation=2, placement_digest="digest"),
         Installed(rank=1, generation=2),
     ]
-    load_balancer.recovery_placements.assert_called_with(lost, None)
+    load_balancer.recovery_placements.assert_called_with(failed, None)
     load_balancer.install_recovery_placement.assert_called_with([FAILED_RANK, 3], ["placement"])
-    assert recovery._executor.model_engine.moe_execution_state.health.get_failed_ranks() == lost
+    assert recovery._executor.model_engine.moe_execution_state.health.get_failed_ranks() == failed
     # The watch is armed again after each recovery.
     assert recovery._executor._events.count("watch") == 2
 
@@ -659,12 +659,12 @@ def test_a_shrink_beyond_its_timeout_fails_closed():
     assert "survivors" not in recovery._executor._events
 
 
-def test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan():
+def test_rank0_ends_each_failed_rank_the_authority_asks_for_before_the_plan():
     client = _FakeClient([Fence(FAILED_RANK, 0), *_happy_replies()])
     recovery = _recovery(client, rank=0)
     recovery._end_ranks = Mock(return_value={FAILED_RANK: ""})
     recovery._recover(_interrupted())
-    # The fence's call comes first; the shrink ends the departed ranks again.
+    # The fence's call comes first; the shrink ends the failed ranks again.
     assert recovery._end_ranks.call_args_list[0] == call([FAILED_RANK])
     assert client.sent[:3] == [
         Stopped(rank=0, failed_ranks=(FAILED_RANK,)),
@@ -673,8 +673,8 @@ def test_rank0_ends_each_departed_rank_the_authority_asks_for_before_the_plan():
     ]
 
 
-def test_a_departed_rank_the_runtime_cannot_end_is_reported_and_the_recovery_ends():
-    client = _FakeClient([Fence(FAILED_RANK, 0), Abort("departed rank 2 could not be fenced")])
+def test_a_failed_rank_the_runtime_cannot_end_is_reported_and_the_recovery_ends():
+    client = _FakeClient([Fence(FAILED_RANK, 0), Abort("failed rank 2 could not be fenced")])
     recovery = _recovery(client, rank=0)
     recovery._end_ranks = Mock(return_value={FAILED_RANK: "PMIx refused to kill rank 2"})
     with pytest.raises(RecoveryAborted, match="could not be fenced"):
@@ -686,9 +686,9 @@ def test_a_departed_rank_the_runtime_cannot_end_is_reported_and_the_recovery_end
 
 
 @pytest.mark.parametrize("outcome", ["ended", "refused", "no answer"])
-def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch, outcome):
+def test_the_pmix_kill_of_a_failed_rank_reports_why_it_failed(monkeypatch, outcome):
     from tensorrt_llm import _utils
-    from tensorrt_llm._torch.distributed import pmix_fence
+    from tensorrt_llm._torch.distributed import pmix_kill
     from tensorrt_llm.executor.recovery import config
 
     killed, release = [], threading.Event()
@@ -702,16 +702,16 @@ def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch,
 
     monkeypatch.setattr(_utils, "mpi_comm", lambda: None)
     # The rank in the MPI runtime differs from the rank in the session communicator.
-    monkeypatch.setattr(pmix_fence, "pmix_ranks", lambda comm: (10, 11, 12, 13))
-    monkeypatch.setattr(pmix_fence, "kill_rank", kill_rank)
-    monkeypatch.setattr(config, "RUNTIME_FENCE_CALL_S", 0.1)
+    monkeypatch.setattr(pmix_kill, "pmix_ranks", lambda comm: (10, 11, 12, 13))
+    monkeypatch.setattr(pmix_kill, "kill_rank", kill_rank)
+    monkeypatch.setattr(config, "RUNTIME_KILL_CALL_S", 0.1)
     recovery = _recovery(_FakeClient([]), rank=0)
     try:
         (error,) = recovery._end_ranks([FAILED_RANK]).values()
     finally:
         release.set()
         for thread in threading.enumerate():
-            if thread.name == "rank_fence":
+            if thread.name == "pmix_kill":
                 thread.join(timeout=5)
     assert killed == [12]
     assert (
@@ -727,26 +727,26 @@ def test_the_runtime_fence_of_a_departed_rank_reports_why_it_failed(monkeypatch,
 def _runtime(monkeypatch, kill_rank, hang_detection=True):
     """The MPI runtime: session rank r is runtime rank 10 + r; ``kill_rank`` ends a runtime rank."""
     from tensorrt_llm import _utils
-    from tensorrt_llm._torch.distributed import pmix_fence
+    from tensorrt_llm._torch.distributed import pmix_kill
 
     monkeypatch.setattr(_utils, "mpi_comm", lambda: None)
-    monkeypatch.setattr(pmix_fence, "pmix_ranks", lambda comm: (10, 11, 12, 13))
-    monkeypatch.setattr(pmix_fence, "kill_rank", kill_rank)
+    monkeypatch.setattr(pmix_kill, "pmix_ranks", lambda comm: (10, 11, 12, 13))
+    monkeypatch.setattr(pmix_kill, "kill_rank", kill_rank)
     monkeypatch.setattr(
-        peer_loss_recovery,
+        rank_failure_recovery,
         "fault_tolerance_config",
         lambda: FaultToleranceConfig(hang_detection=hang_detection),
     )
 
 
 def test_a_shrink_waiting_on_a_detector_reported_live_rank_completes_once_it_is_killed(monkeypatch):
-    """The failure detector declared rank 2 failed while its process is stopped: the agreement needs it dead."""
-    dead = threading.Event()
+    """The failure detector declared rank 2 failed while its process is stopped: the agreement needs it ended."""
+    ended = threading.Event()
     killed = []
 
     def kill_rank(rank):
         killed.append(rank)
-        dead.set()
+        ended.set()
 
     _runtime(monkeypatch, kill_rank)
     recovery = _recovery(_FakeClient(_happy_replies()))
@@ -755,7 +755,7 @@ def test_a_shrink_waiting_on_a_detector_reported_live_rank_completes_once_it_is_
 
     def shrink():
         # The real agreement blocks until the reported rank's process has ended.
-        assert dead.wait(5.0), "the shrink waited on a live failed rank"
+        assert ended.wait(5.0), "the shrink waited on a live failed rank"
         return frozenset({FAILED_RANK})
 
     dist.shrink.side_effect = shrink
@@ -780,7 +780,7 @@ def test_ranks_that_cannot_be_ended_before_the_shrink_are_left_to_the_authority_
 
 
 def test_nothing_is_killed_before_a_shrink_when_no_failure_is_reported(monkeypatch):
-    # Kills run on fence threads, where a raised assertion would not fail the test: record them instead.
+    # Kills run on PMIx kill threads, where a raised assertion would not fail the test: record them instead.
     killed = []
     _runtime(monkeypatch, killed.append)
     recovery = _recovery(_FakeClient(_happy_replies()))
@@ -799,9 +799,9 @@ def test_without_hang_detection_no_reported_rank_is_killed_before_a_shrink(monke
     assert recovery._executor.dist.shrink.call_count == 1
 
 
-def test_a_loss_after_the_recovery_deadline_does_not_shrink_again():
+def test_a_failure_after_the_recovery_deadline_does_not_shrink_again():
     """A started shrink cannot be interrupted, so none starts once the deadline passed."""
-    recovery = _recovery(_FakeClient([_FURTHER_LOSS]))
+    recovery = _recovery(_FakeClient([_FURTHER_FAILURE]))
     recovery._timeout_s = 0.2
     dist = recovery._executor.dist
     # Stopping the survivor watch outlasts the deadline.
@@ -816,23 +816,23 @@ def test_a_round_after_a_late_shrink_does_not_start_survivor_collectives():
     """A shrink that returns after the deadline ends the recovery before the next round's watch and broadcast."""
     import numpy as np
 
-    recovery = _recovery(_FakeClient([_FURTHER_LOSS]))
+    recovery = _recovery(_FakeClient([_FURTHER_FAILURE]))
     recovery._timeout_s = 0.2
     dist = recovery._executor.dist
     shrinks = iter([frozenset({FAILED_RANK}), frozenset({FAILED_RANK, 3})])
 
     def shrink():
-        lost = next(shrinks)
-        if len(lost) > 1:
+        failed = next(shrinks)
+        if len(failed) > 1:
             time.sleep(0.3)  # the second shrink returns after the deadline
-        return lost
+        return failed
 
     dist.shrink.side_effect = shrink
     load_balancer = recovery._executor.model_engine.moe_load_balancer
-    load_balancer.covers_loss_of.return_value = True
+    load_balancer.covers_failure_of.return_value = True
     # Online EPLB: every round broadcasts rank 0's placement among the survivors.
     load_balancer.is_static_routing.return_value = False
-    load_balancer.copy_nodes = None
+    load_balancer.host_weight_nodes = None
     load_balancer.quiesce.return_value = True
     load_balancer.current_placements.return_value = [np.zeros((WORLD_SIZE, 2))]
     dist.broadcast_among_survivors = Mock(return_value=[np.zeros((WORLD_SIZE, 2))])
@@ -878,7 +878,7 @@ def test_recovery_does_not_rebroadcast_a_request_a_survivor_started():
     executor = recovery._executor
     _broadcast(recovery, [_queued(3), _queued(4)], interrupted=True)
     served = [(set(), 0, set(), set()), ({3}, 0, set(), set()), None, (set(), 0, set(), set())]
-    executor.dist.allgather.side_effect = lambda value, departed: served
+    executor.dist.allgather.side_effect = lambda value, absent: served
 
     recovery._recover(_interrupted())
 
@@ -887,15 +887,15 @@ def test_recovery_does_not_rebroadcast_a_request_a_survivor_started():
         assert recovery._request_owners[3][0] == 1
 
 
-def test_rank0_marks_interrupted_a_started_request_whose_routing_the_loss_cut_off():
-    """Rank 1 started request 3 in the discarded step while rank 0 saw its broadcast interrupted: rank 0 learns
-    its owner before the quarantine, so the request is marked interrupted and a second loss without progress
-    fails it."""
+def test_rank0_marks_interrupted_a_started_request_whose_routing_the_failure_cut_off():
+    """Rank 1 started request 3 in the rolled-back step while rank 0 saw its broadcast interrupted: rank 0 learns
+    its owner before it chooses the requests to fail, so the request is marked interrupted and a second failure
+    without progress fails it."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     executor = recovery._executor
     _broadcast(recovery, [_queued(3)], interrupted=True)
     gathered = [(set(), 0, set(), set()), ({3}, 0, {3}, set()), None, (set(), 0, set(), set())]
-    executor.dist.allgather.side_effect = lambda value, departed: gathered
+    executor.dist.allgather.side_effect = lambda value, absent: gathered
 
     recovery._recover(_interrupted())
 
@@ -904,11 +904,11 @@ def test_rank0_marks_interrupted_a_started_request_whose_routing_the_loss_cut_of
 
 
 def test_survivors_resume_from_the_same_iteration():
-    """A loss can stop survivors one iteration apart; they resume from the furthest one."""
+    """A failure can stop survivors one iteration apart; they resume from the furthest one."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     executor = recovery._executor
     executor.iter_counter = 7
-    executor.dist.allgather.side_effect = lambda value, departed: [
+    executor.dist.allgather.side_effect = lambda value, absent: [
         (set(), 8, set(), set()),
         value,
         None,
@@ -928,7 +928,7 @@ def test_recovery_reports_requests_it_already_answered_as_held():
     executor._pending_transfer_responses = [(3, rejected)]
     reported = []
     executor.dist.allgather.side_effect = (
-        lambda value, departed: reported.append(value) or [value] * WORLD_SIZE
+        lambda value, absent: reported.append(value) or [value] * WORLD_SIZE
     )
 
     recovery._recover(_interrupted())
@@ -1012,7 +1012,7 @@ def test_multimodal_requests_are_rejected_only_under_the_overlap_scheduler(overl
 def test_recovery_requires_a_covered_union_of_admitted_domains(failed, covered):
     client = _FakeClient(_happy_replies())
     recovery = _recovery(client, rank=3, failed=failed)
-    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = covered
+    recovery._executor.model_engine.moe_load_balancer.covers_failure_of.return_value = covered
     with pytest.raises(RuntimeError, match="is not recoverable"):
         recovery._recover(_interrupted())
     assert client.sent == []
@@ -1021,13 +1021,13 @@ def test_recovery_requires_a_covered_union_of_admitted_domains(failed, covered):
 @pytest.mark.parametrize(
     "replies, match",
     [
-        ([Propose(generation=1, failed_ranks=(3,), survivors=(0, 1, 2))], "authority proposed"),
-        ([Propose(generation=1, failed_ranks=(2, 3), survivors=(0, 1))], "authority proposed"),
-        ([Propose(generation=1, failed_ranks=(2,), survivors=(0, 3))], "authority proposed"),
+        ([Propose(generation=1, failed_ranks=(3,), live_ranks=(0, 1, 2))], "authority proposed"),
+        ([Propose(generation=1, failed_ranks=(2, 3), live_ranks=(0, 1))], "authority proposed"),
+        ([Propose(generation=1, failed_ranks=(2,), live_ranks=(0, 3))], "authority proposed"),
         (_happy_replies()[:1] + [Install(generation=2)], "Expected recovery generation 1"),
         (_happy_replies()[:2] + [Commit(generation=2)], "Expected recovery generation 1"),
     ],
-    ids=["wrong_failed_rank", "wrong_failed_set", "not_a_survivor", "install_gen", "commit_gen"],
+    ids=["wrong_failed_rank", "wrong_failed_set", "not_a_live_rank", "install_gen", "commit_gen"],
 )
 def test_recovery_fails_closed_on_protocol_mismatch(replies, match):
     recovery = _recovery(_FakeClient(replies))
@@ -1095,7 +1095,7 @@ def test_run_surfaces_a_failed_recovery_after_stopping_the_watch():
     watch.stop.assert_called()
 
 
-def test_recovery_discards_the_steps_newest_first_after_joining_their_device_work():
+def test_recovery_rolls_back_the_steps_newest_first_after_joining_their_device_work():
     recovery = _recovery(_FakeClient(_happy_replies()))
     calls = []
     older, newer = (
@@ -1105,13 +1105,13 @@ def test_recovery_discards_the_steps_newest_first_after_joining_their_device_wor
     recovery.step_prepared(older)
     recovery.step_prepared(newer)
     recovery._join_device_work = lambda deadline: calls.append("join")
-    recovery._executor.discard_interrupted_steps = lambda steps: calls.append(
-        ("discard", [step.batch for step in steps])
+    recovery._executor.roll_back_interrupted_steps = lambda steps: calls.append(
+        ("roll back", [step.batch for step in steps])
     )
 
     recovery._recover(_interrupted())
 
-    assert calls == ["join", ("discard", [newer, older])]
+    assert calls == ["join", ("roll back", [newer, older])]
     assert not recovery._uncommitted_steps
 
 
@@ -1128,7 +1128,7 @@ def test_steps_commit_oldest_first_and_release_the_newest():
 
 
 def test_a_failed_forward_forgets_its_steps_so_the_next_step_commits():
-    """A forward error that is no peer loss fails the steps' requests; the next step commits as usual."""
+    """A forward error that is no rank failure fails the steps' requests; the next step commits as usual."""
     recovery = _recovery(_FakeClient([]))
     previous, failed, nxt = (
         Mock(name=name, context_requests=[]) for name in ("previous", "failed", "next")
@@ -1143,7 +1143,7 @@ def test_a_failed_forward_forgets_its_steps_so_the_next_step_commits():
 
 def test_rank0_logs_each_recovery_phase_once_in_order(monkeypatch):
     logged = []
-    monkeypatch.setattr(peer_loss_recovery.logger, "info", logged.append)
+    monkeypatch.setattr(rank_failure_recovery.logger, "info", logged.append)
     recovery = _recovery(_FakeClient(_happy_replies(generation=1)), rank=0)
     recovery._recover(_interrupted())
     step = Mock(context_requests=[])
@@ -1155,11 +1155,11 @@ def test_rank0_logs_each_recovery_phase_once_in_order(monkeypatch):
     assert phases == [
         ["gen=1", f"phase={name}"]
         for name in (
-            "detect",
+            "detected",
             "stopped",
             "proposed",
             "ready",
-            "install",
+            "installing",
             "installed",
             "committed",
             "resumed",
@@ -1172,11 +1172,11 @@ def test_rank0_logs_each_recovery_phase_once_in_order(monkeypatch):
 def test_run_logs_a_recovery_after_it_ends(monkeypatch, fails):
     # A log write can stall, and every survivor waits for the slowest at each collective.
     events = []
-    monkeypatch.setattr(peer_loss_recovery.logger, "warning", lambda line: events.append(line))
+    monkeypatch.setattr(rank_failure_recovery.logger, "warning", lambda line: events.append(line))
     recovery = _recovery(_FakeClient([]))
 
     def recover(error):
-        recovery._log(peer_loss_recovery.logger.warning, "interrupted")
+        recovery._log(rank_failure_recovery.logger.warning, "interrupted")
         events.append("sent Stopped")
         if fails:
             raise RuntimeError("not recoverable")
@@ -1190,7 +1190,7 @@ def test_run_logs_a_recovery_after_it_ends(monkeypatch, fails):
         recovery.run(event_loop)
 
     assert events == ["sent Stopped", "interrupted"]
-    recovery._log(peer_loss_recovery.logger.warning, "serving")
+    recovery._log(rank_failure_recovery.logger.warning, "serving")
     assert events[-1] == "serving"
 
 
@@ -1212,21 +1212,19 @@ def test_run_recovers_and_resumes():
     hang_detector.__exit__.assert_called_once()
 
 
-def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor import hang_evidence
+def test_run_sends_hang_reports_only_when_enabled(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import hang_reporter
     from tensorrt_llm.executor.recovery import client as client_module
 
     started, stopped, closed = [], [], []
-    monkeypatch.setattr(hang_evidence, "ProgressRowReader", lambda *args: Mock(read=lambda: None))
+    monkeypatch.setattr(hang_reporter, "ProgressRowReader", lambda *args: Mock(read=lambda: None))
+    monkeypatch.setattr(hang_reporter.HangReporter, "start", lambda self: started.append(self))
     monkeypatch.setattr(
-        hang_evidence.HangEvidenceReporter, "start", lambda self: started.append(self)
-    )
-    monkeypatch.setattr(
-        hang_evidence.HangEvidenceReporter, "stop", lambda self: stopped.append(self) or True
+        hang_reporter.HangReporter, "stop", lambda self: stopped.append(self) or True
     )
     heartbeats = []
     monkeypatch.setattr(
-        hang_evidence,
+        hang_reporter,
         "start_native_heartbeat",
         lambda rank, interval_s: heartbeats.append(Mock()) or heartbeats[-1],
     )
@@ -1247,7 +1245,7 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
     assert started == []
 
     monkeypatch.setattr(
-        peer_loss_recovery,
+        rank_failure_recovery,
         "fault_tolerance_config",
         lambda: FaultToleranceConfig(hang_detection=True),
     )
@@ -1267,32 +1265,32 @@ def test_run_reports_hang_evidence_only_when_enabled(monkeypatch):
 def test_only_an_admitted_serving_rank_outside_recovery_exits_alone():
     unadmitted = _recovery(_FakeClient([]), rank=0)
     unadmitted.run(Mock(return_value=None))
-    assert not unadmitted.survives_own_loss
+    assert not unadmitted.survives_own_failure
 
     recovery = _recovery(_FakeClient([]))
     # Not before the serving loop watches its peers.
-    assert not recovery.survives_own_loss
+    assert not recovery.survives_own_failure
     seen = []
-    recovery.run(Mock(side_effect=lambda: seen.append(recovery.survives_own_loss)))
+    recovery.run(Mock(side_effect=lambda: seen.append(recovery.survives_own_failure)))
     assert seen == [True]
 
-    # After a recovery, only while the survivors' slots also cover this rank's loss.
+    # After a recovery, only while the live ranks' slots also cover this rank's failure.
     for covered in (True, False):
         recovery = _recovery(_FakeClient([]))
         recovery._recover = Mock()
         load_balancer = recovery._executor.model_engine.moe_load_balancer
-        load_balancer.covers_loss_of.return_value = covered
+        load_balancer.covers_failure_of.return_value = covered
         loops = iter([_interrupted(), None])
 
         def event_loop():
             error = next(loops)
             if error is not None:
                 raise error
-            seen.append(recovery.survives_own_loss)
+            seen.append(recovery.survives_own_failure)
 
         seen = []
         recovery.run(event_loop)
-        load_balancer.covers_loss_of.assert_called_once_with(frozenset({FAILED_RANK, 1}))
+        load_balancer.covers_failure_of.assert_called_once_with(frozenset({FAILED_RANK, 1}))
         assert seen == [covered]
 
 
@@ -1309,9 +1307,9 @@ def test_crashed_loop_exits_only_this_rank_when_peers_can_recover(monkeypatch, m
     from tensorrt_llm._torch.pyexecutor import py_executor
 
     recovery = _recovery(_FakeClient([]))
-    recovery.survives_own_loss = True
+    recovery.survives_own_failure = True
     executor = _executor()
-    executor._peer_loss_recovery = recovery
+    executor._rank_failure_recovery = recovery
     recovery.run = Mock(side_effect=RuntimeError(message))
     executor._is_warmup = True
     executor._event_loop_error_delivered = Mock()
@@ -1336,7 +1334,7 @@ def test_run_does_not_recover_during_kv_cache_estimation():
 
 
 @pytest.mark.parametrize("peer_failed", [False, True])
-def test_commit_step_waits_then_accepts_or_discards(peer_failed):
+def test_commit_step_waits_then_accepts_or_rolls_back(peer_failed):
     recovery = _recovery(_FakeClient([]))
     batch = Mock(name="batch", context_requests=[])
     recovery.step_prepared(batch)
@@ -1377,7 +1375,7 @@ def test_commit_step_waits_on_the_sampler_event_or_without_one_the_stream(monkey
     assert not recovery._uncommitted_steps
 
 
-def test_commit_step_discards_a_step_whose_peer_failed_while_it_ran():
+def test_commit_step_rolls_back_a_step_whose_peer_failed_while_it_ran():
     """The flag is read after waiting for the step's device work, not before."""
     recovery = _recovery(_FakeClient([]))
     batch = Mock(name="batch", context_requests=[])
@@ -1388,8 +1386,8 @@ def test_commit_step_discards_a_step_whose_peer_failed_while_it_ran():
         recovery.commit_step(batch, sample_state)
 
 
-def test_commit_step_discards_a_step_whose_collective_was_released_before_the_failure_is_seen():
-    """A released collective is recorded on the device, so the step is discarded before the watch fires."""
+def test_commit_step_rolls_back_a_step_whose_collective_was_aborted_before_the_failure_is_seen():
+    """An aborted collective is recorded on the device, so the step is rolled back before the watch fires."""
     recovery = _recovery(_FakeClient([]))
     batch = Mock(name="batch", context_requests=[])
     recovery.step_prepared(batch)
@@ -1457,25 +1455,25 @@ def test_a_failure_seen_only_by_the_watch_counts():
 
 
 def test_a_peer_failure_before_serving_ends_the_job(monkeypatch):
-    """Nothing recovers a loss during startup, and under ULFM the runtime does not end the job."""
+    """Nothing recovers a rank failure during startup, and under ULFM the runtime does not end the job."""
     import tensorrt_llm._utils
     from tensorrt_llm._torch.pyexecutor import hang_detector
 
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(peer_loss_recovery, "_startup_watch", None)
-    monkeypatch.setattr(peer_loss_recovery, "atexit", Mock())
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
+    monkeypatch.setattr(rank_failure_recovery, "_startup_watch", None)
+    monkeypatch.setattr(rank_failure_recovery, "atexit", Mock())
     # The executor thread's communicator, not the watch thread's default.
     executor_comm = Mock()
     monkeypatch.setattr(tensorrt_llm._utils, "mpi_comm", lambda: executor_comm)
     kills = []
     monkeypatch.setattr(hang_detector, "propagate_hard_kill", lambda **kwargs: kills.append(kwargs))
     dist = Mock(spec=MPIDist)
-    peer_loss_recovery.watch_startup_peer_failures(dist)
+    rank_failure_recovery.watch_startup_peer_failures(dist)
     # Once per process: the final executor's creation does not watch again.
-    peer_loss_recovery.watch_startup_peer_failures(dist)
-    dist.enable_peer_loss_recovery.assert_called_once_with()
-    peer_loss_recovery.atexit.register.assert_called_once_with(
-        peer_loss_recovery.stop_startup_watch
+    rank_failure_recovery.watch_startup_peer_failures(dist)
+    dist.enable_rank_failure_recovery.assert_called_once_with()
+    rank_failure_recovery.atexit.register.assert_called_once_with(
+        rank_failure_recovery.stop_startup_watch
     )
     ((on_failure,), _) = dist.watch_peer_failures.call_args
     assert dist.watch_peer_failures.call_count == 1 and kills == []
@@ -1488,29 +1486,29 @@ def test_a_failed_executor_creation_stops_the_startup_watch(monkeypatch):
     from tensorrt_llm._torch.pyexecutor import py_executor_creator
 
     startup = Mock()
-    monkeypatch.setattr(peer_loss_recovery, "_startup_watch", startup)
+    monkeypatch.setattr(rank_failure_recovery, "_startup_watch", startup)
     monkeypatch.setattr(
         py_executor_creator, "_create_py_executor_impl", Mock(side_effect=RuntimeError("load"))
     )
     with pytest.raises(RuntimeError, match="load"):
         py_executor_creator.create_py_executor(Mock())
     startup.stop.assert_called_once_with()
-    assert peer_loss_recovery._startup_watch is None
+    assert rank_failure_recovery._startup_watch is None
 
 
 def test_serving_takes_over_from_the_startup_watch(monkeypatch):
     startup = Mock()
-    monkeypatch.setattr(peer_loss_recovery, "_startup_watch", startup)
+    monkeypatch.setattr(rank_failure_recovery, "_startup_watch", startup)
     recovery = _recovery(_FakeClient([]))
     recovery._executor.dist.watch_peer_failures.side_effect = (
         lambda callback, abort_word: startup.stop.assert_not_called() or Mock(failed=False)
     )
     recovery.run(Mock())
     startup.stop.assert_called_once_with()
-    assert peer_loss_recovery._startup_watch is None
+    assert rank_failure_recovery._startup_watch is None
 
 
-def test_discard_returns_step_resources_and_padding_request():
+def test_rollback_returns_step_resources_and_padding_request():
     executor = _executor()
     executor.kv_cache_manager = Mock()
     executor.draft_kv_cache_manager = Mock()
@@ -1521,16 +1519,20 @@ def test_discard_returns_step_resources_and_padding_request():
     dummy = Mock(is_attention_dp_dummy=True, py_request_id=99)
     executor.active_requests.extend([request, dummy])
 
-    executor.discard_interrupted_steps([step])
+    executor.roll_back_interrupted_steps([step])
 
-    executor.kv_cache_manager.revert_prepare_resources.assert_called_once_with(step.batch, {7: 64})
-    executor.draft_kv_cache_manager.revert_prepare_resources.assert_called_once_with(step.batch, {})
+    executor.kv_cache_manager.roll_back_prepare_resources.assert_called_once_with(
+        step.batch, {7: 64}
+    )
+    executor.draft_kv_cache_manager.roll_back_prepare_resources.assert_called_once_with(
+        step.batch, {}
+    )
     executor._terminate_request.assert_called_once_with(dummy)
     assert executor.active_requests == [request]
     assert executor.previous_batch is None and request.py_batch_idx is None
 
 
-def test_discard_undoes_each_step_s_request_changes_newest_first():
+def test_rollback_undoes_each_step_s_request_changes_newest_first():
     """Under the overlap scheduler two steps can be uncommitted; each one's changes are undone in reverse."""
     executor = _executor()
     executor.inflight_req_ids = Mock()
@@ -1545,13 +1547,13 @@ def test_discard_undoes_each_step_s_request_changes_newest_first():
         executor._note_step_change(request)
         request.context_current_position, request.state = position, state
 
-    executor.discard_interrupted_steps([newer, older])
+    executor.roll_back_interrupted_steps([newer, older])
 
     assert (request.context_current_position, request.state) == (0, "CONTEXT_INIT")
     assert executor._step_changes is None
 
 
-def test_discard_pauses_a_recompute_victim_after_restoring_its_step():
+def test_rollback_pauses_a_recompute_victim_after_restoring_its_step():
     """A request of the uncommitted step can be the next step's recompute victim, whose KV cache is freed."""
     executor = _executor()
     executor.inflight_req_ids = Mock()
@@ -1567,13 +1569,13 @@ def test_discard_pauses_a_recompute_victim_after_restoring_its_step():
         request.context_current_position
     )
 
-    executor.discard_interrupted_steps([step])
+    executor.roll_back_interrupted_steps([step])
 
     assert paused_at == [64]
     assert executor._recompute_unpaused is None
 
 
-def test_discard_restores_the_draft_tokens_sampling_set():
+def test_rollback_restores_the_draft_tokens_sampling_set():
     """Sampling sets a finishing context request's draft tokens before its step is accepted."""
     recovery = _recovery(_FakeClient([]))
     executor = recovery._executor
@@ -1591,14 +1593,14 @@ def test_discard_restores_the_draft_tokens_sampling_set():
     executor._note_step_change(request)
     request.context_current_position, request.state = 96, "GENERATION_IN_PROGRESS"
 
-    PyExecutor.discard_interrupted_steps(executor, reversed(recovery._uncommitted_steps))
+    PyExecutor.roll_back_interrupted_steps(executor, reversed(recovery._uncommitted_steps))
 
     assert request.py_draft_tokens is drafts
     assert (request.context_current_position, request.state) == (64, "CONTEXT_INIT")
 
 
-def test_discard_restores_the_exclusion_of_the_last_generation_logits():
-    """A step that completes its request next iteration stops excluding the last generation logits; a discard
+def test_rollback_restores_the_exclusion_of_the_last_generation_logits():
+    """A step that completes its request next iteration stops excluding the last generation logits; a rollback
     restores the exclusion, and the rerun decides again."""
     executor = _executor()
     executor.inflight_req_ids = Mock()
@@ -1616,7 +1618,7 @@ def test_discard_restores_the_exclusion_of_the_last_generation_logits():
     executor._update_generation_requests_that_will_complete_next_iteration([request])
     assert request.py_result.exclude_last_generation_logits is False
 
-    executor.discard_interrupted_steps([step])
+    executor.roll_back_interrupted_steps([step])
 
     assert request.py_result.exclude_last_generation_logits is True
     assert request.state == "GENERATION_IN_PROGRESS"
@@ -1636,7 +1638,7 @@ def test_fault_tolerance_off_marks_requests_completing_next_iteration_without_re
     assert executor._step_changes is None
 
 
-def test_discard_drops_the_logits_and_additional_outputs_its_steps_appended(monkeypatch):
+def test_rollback_drops_the_logits_and_additional_outputs_its_steps_appended(monkeypatch):
     """Sampling appends a step's logits and additional outputs before the step is accepted; its rerun appends
     them again."""
     monkeypatch.setattr(llm_request, "prefer_pinned", lambda: False)
@@ -1681,7 +1683,7 @@ def test_discard_drops_the_logits_and_additional_outputs_its_steps_appended(monk
         recovery.step_outputs_appending(batch)
         append(value)
 
-    PyExecutor.discard_interrupted_steps(executor, reversed(recovery._uncommitted_steps))
+    PyExecutor.roll_back_interrupted_steps(executor, reversed(recovery._uncommitted_steps))
 
     assert torch.equal(result.context_logits, torch.ones(2, 8))
     assert torch.equal(result.generation_logits, torch.ones(1, 1, 8))
@@ -1692,8 +1694,8 @@ def test_discard_drops_the_logits_and_additional_outputs_its_steps_appended(monk
     assert torch.equal(result.generation_logits[0, :, 0], torch.tensor([1.0, 2.0]))
 
 
-def test_discard_before_prepare_releases_the_tentative_padding_request():
-    """A loss in the can-queue exchange precedes prepare_resources."""
+def test_rollback_before_prepare_releases_the_tentative_padding_request():
+    """A rank failure in the can-queue exchange precedes prepare_resources."""
     executor = _executor()
     executor.kv_cache_manager = Mock()
     executor.inflight_req_ids = Mock()
@@ -1704,10 +1706,10 @@ def test_discard_before_prepare_releases_the_tentative_padding_request():
     executor.active_requests.extend([request, dummy])
     executor._pending_adp_dummy_request = dummy
 
-    executor.discard_interrupted_steps([])
+    executor.roll_back_interrupted_steps([])
 
     executor.kv_cache_manager.free_resources.assert_called_once_with(dummy)
-    executor.kv_cache_manager.revert_prepare_resources.assert_not_called()
+    executor.kv_cache_manager.roll_back_prepare_resources.assert_not_called()
     executor._terminate_request.assert_not_called()
     assert executor.active_requests == [request]
 
@@ -1766,11 +1768,11 @@ def test_an_error_of_any_sequence_ends_the_request(sequence_id):
     assert recovery._request_owners == {} and recovery._parent_ids == {}
 
 
-def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
-    """Nothing reached the client: a survivor runs it again, once, after the loss of its rank alone too."""
+def test_recovery_reruns_a_failed_rank_request_that_delivered_nothing():
+    """Nothing reached the client: a live rank runs it again, once, after the failure of its rank alone too."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
-    lost, kept = Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)
-    recovery._request_owners = {11: (FAILED_RANK, lost), 12: (3, kept)}
+    stranded, kept = Mock(id=11, child_req_ids=None), Mock(id=12, child_req_ids=None)
+    recovery._request_owners = {11: (FAILED_RANK, stranded), 12: (3, kept)}
     recovery._executor.active_requests.append(
         Mock(is_child=False, py_request_id=12, is_attention_dp_dummy=False)
     )
@@ -1779,57 +1781,57 @@ def test_recovery_reruns_a_departed_rank_request_that_delivered_nothing():
     recovery._recover(_interrupted())
 
     assert sent[-1] == []
-    assert recovery._executor.request_accumulated[:1] == [lost]
+    assert recovery._executor.request_accumulated[:1] == [stranded]
     assert recovery._request_owners == {12: (3, kept)}
     # Marked as interrupted until it ends.
     assert recovery._interrupted == {11}
-    recovery.requests_routed({1: [lost]})
+    recovery.requests_routed({1: [stranded]})
     recovery.responses_gathered([(11, LlmResponse(request_id=11, result=Mock(is_final=True)))])
     assert recovery._interrupted == set() and recovery._request_owners == {12: (3, kept)}
 
 
-def test_a_request_pinned_to_a_departed_rank_runs_again_on_a_survivor(monkeypatch):
-    """The request was accepted while its rank served: it runs again on a survivor. A new request pinned to the
-    departed rank still fails."""
+def test_a_request_pinned_to_a_failed_rank_runs_again_on_a_live_rank(monkeypatch):
+    """The request was accepted while its rank served: it runs again on a live rank. A new request pinned to the
+    failed rank still fails."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     warnings = []
-    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warnings.append)
+    monkeypatch.setattr(rank_failure_recovery.logger, "warning", warnings.append)
 
     def pinned(request_id):
         params = SchedulingParams(attention_dp_rank=FAILED_RANK, attention_dp_relax=False)
         request = Mock(py_scheduling_params=params, num_input_tokens=4)
         return Mock(id=request_id, request=request, child_req_ids=None)
 
-    lost, new = pinned(11), pinned(12)
-    recovery._request_owners = {11: (FAILED_RANK, lost)}
+    stranded, new = pinned(11), pinned(12)
+    recovery._request_owners = {11: (FAILED_RANK, stranded)}
     _sent_responses(recovery)
 
     recovery._recover(_interrupted())
 
-    assert recovery._executor.request_accumulated[:1] == [lost]
+    assert recovery._executor.request_accumulated[:1] == [stranded]
     assert "re-ran 1 requests and failed 0; lent 0 bytes of the KV cache" in warnings[-1]
-    assert lost.request.py_scheduling_params == SchedulingParams(
+    assert stranded.request.py_scheduling_params == SchedulingParams(
         attention_dp_rank=FAILED_RANK, attention_dp_relax=True
     )
-    states = [RankState(rank=rank) for rank in SURVIVORS]
-    routable, unservable = DefaultADPRouter.split_unservable_requests([lost, new], states)
-    assert routable == [lost] and unservable == [new]
-    monkeypatch.setattr(adp_router, "peer_loss_recovery_enabled", lambda: True)
+    states = [RankState(rank=rank) for rank in LIVE_RANKS]
+    routable, unservable = DefaultADPRouter.split_unservable_requests([stranded, new], states)
+    assert routable == [stranded] and unservable == [new]
+    monkeypatch.setattr(adp_router, "rank_failure_recovery_enabled", lambda: True)
     router = DefaultADPRouter(dist=Mock(tp_rank=0, tp_size=WORLD_SIZE, has_cp_helix=False))
     routed, _ = router.route_requests(states, routable, 8)
-    assert set(routed) == set(SURVIVORS)
-    assert [req for reqs in routed.values() for req in reqs] == [lost]
+    assert set(routed) == set(LIVE_RANKS)
+    assert [req for reqs in routed.values() for req in reqs] == [stranded]
 
 
 @pytest.mark.parametrize("streamed", [True, False])
-def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_again(
+def test_recovery_fails_a_failed_rank_request_that_streamed_or_already_ran_again(
     monkeypatch, streamed
 ):
-    """Streamed tokens cannot be taken back; a request that already ran again after its rank failed, and lost its
-    new rank too, may be what crashes them: it is quarantined."""
+    """Streamed tokens cannot be taken back; a request that already ran again after its rank failed, and whose
+    new rank failed too, may be what crashes them: it fails."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     warnings = []
-    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warnings.append)
+    monkeypatch.setattr(rank_failure_recovery.logger, "warning", warnings.append)
     item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
     recovery._request_owners = {11: (FAILED_RANK, item)}
     if streamed:
@@ -1843,7 +1845,7 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_aga
     ((request_id, response),) = sent[-1]
     assert request_id == 11 and response.client_id == "c11"
     assert f"rank {FAILED_RANK} failed" in response.error_msg
-    assert is_peer_loss_retryable_message(response.error_msg)
+    assert is_rank_failure_retryable_message(response.error_msg)
     assert ("streamed" in response.error_msg) == streamed
     assert ("already interrupted" in response.error_msg) != streamed
     assert "re-ran 0 requests and failed 1;" in warnings[-1]
@@ -1851,19 +1853,19 @@ def test_recovery_fails_a_departed_rank_request_that_streamed_or_already_ran_aga
     assert recovery._executor.request_accumulated == []
 
 
-def test_a_request_run_again_fails_when_it_loses_its_rank_again():
-    """Rank 2's request runs again on rank 3 after the first recovery; rank 3 is lost next: the request fails, and
+def test_a_request_run_again_fails_when_its_rank_fails_again():
+    """Rank 2's request runs again on rank 3 after the first recovery; rank 3 fails next: the request fails, and
     the deployment recovers a second time without both ranks."""
-    lost = frozenset({FAILED_RANK, 3})
+    failed = frozenset({FAILED_RANK, 3})
     client = _FakeClient(
         [
             *_happy_replies(),
-            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+            *_happy_replies(generation=2, failed=tuple(sorted(failed)), live_ranks=(0, 1)),
         ]
     )
-    recovery = _recovery(client, rank=0, failed=lost)
-    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
-    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery = _recovery(client, rank=0, failed=failed)
+    recovery._executor.model_engine.moe_load_balancer.covers_failure_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), failed])
     recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
     item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
     recovery._request_owners = {11: (FAILED_RANK, item)}
@@ -1874,7 +1876,7 @@ def test_a_request_run_again_fails_when_it_loses_its_rank_again():
     recovery._executor.request_accumulated.clear()
     recovery.requests_routed({3: [item]})
 
-    recovery._recover(_interrupted(lost))
+    recovery._recover(_interrupted(failed))
 
     ((request_id, response),) = sent[-1]
     assert request_id == 11 and "already interrupted" in response.error_msg
@@ -1882,19 +1884,19 @@ def test_a_request_run_again_fails_when_it_loses_its_rank_again():
     assert [m.generation for m in client.sent if isinstance(m, Installed)] == [1, 2]
 
 
-def test_a_request_run_again_that_reported_progress_runs_again_when_it_loses_its_rank_again():
-    """As above, but rank 3 reported a committed step of the request in a response gather before it was lost: the
+def test_a_request_run_again_that_reported_progress_runs_again_when_its_rank_fails_again():
+    """As above, but rank 3 reported a committed step of the request in a response gather before it failed: the
     request delivered nothing and is not what crashed the ranks, so it runs again."""
-    lost = frozenset({FAILED_RANK, 3})
+    failed = frozenset({FAILED_RANK, 3})
     client = _FakeClient(
         [
             *_happy_replies(),
-            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+            *_happy_replies(generation=2, failed=tuple(sorted(failed)), live_ranks=(0, 1)),
         ]
     )
-    recovery = _recovery(client, rank=0, failed=lost)
-    recovery._executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
-    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    recovery = _recovery(client, rank=0, failed=failed)
+    recovery._executor.model_engine.moe_load_balancer.covers_failure_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), failed])
     recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
     item = Mock(id=11, request=Mock(client_id="c11"), child_req_ids=None)
     recovery._request_owners = {11: (FAILED_RANK, item)}
@@ -1907,16 +1909,16 @@ def test_a_request_run_again_that_reported_progress_runs_again_when_it_loses_its
     recovery.responses_gathered(object(), [(), (), None, ([], [], [], [11])])
     assert recovery._interrupted == set()
 
-    recovery._recover(_interrupted(lost))
+    recovery._recover(_interrupted(failed))
 
     assert recovery._executor.request_accumulated == [item]
     assert not any(request_id == 11 for part in sent for request_id, _ in part)
 
 
 def _interrupting(recovery, failed, interrupted, progressed=frozenset()):
-    """Report ``interrupted`` as the requests the loss interrupted on rank 1, which serves requests 11 and 12,
-    and ``progressed`` as those of them that committed a step since an earlier loss interrupted them."""
-    recovery._executor.dist.allgather.side_effect = lambda value, departed: [
+    """Report ``interrupted`` as the requests the failure interrupted on rank 1, which serves requests 11 and 12,
+    and ``progressed`` as those of them that committed a step since an earlier failure interrupted them."""
+    recovery._executor.dist.allgather.side_effect = lambda value, absent: [
         None
         if r in failed
         else ({11, 12}, 0, interrupted, set(progressed))
@@ -1926,20 +1928,20 @@ def _interrupting(recovery, failed, interrupted, progressed=frozenset()):
     ]
 
 
-def test_a_request_two_losses_interrupt_fails_whatever_ranks_were_lost():
-    """A survivor's request runs on after a loss interrupts its step, but a second interruption fails it: it may
-    be what crashes the ranks. A request interrupted once runs on."""
-    lost = frozenset({FAILED_RANK, 3})
+def test_a_request_two_failures_interrupt_fails_whatever_ranks_failed():
+    """A survivor's request runs on after a failure interrupts its step, but a second interruption fails it: it
+    may be what crashes the ranks. A request interrupted once runs on."""
+    failed = frozenset({FAILED_RANK, 3})
     client = _FakeClient(
         [
             *_happy_replies(),
-            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+            *_happy_replies(generation=2, failed=tuple(sorted(failed)), live_ranks=(0, 1)),
         ]
     )
-    recovery = _recovery(client, rank=0, failed=lost)
+    recovery = _recovery(client, rank=0, failed=failed)
     executor = recovery._executor
-    executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
-    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    executor.model_engine.moe_load_balancer.covers_failure_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), failed])
     executor.dist.shrink.side_effect = lambda: next(shrinks)
     recovery.requests_routed(
         {1: [Mock(id=request_id, child_req_ids=None) for request_id in (11, 12)]}
@@ -1952,26 +1954,26 @@ def test_a_request_two_losses_interrupt_fails_whatever_ranks_were_lost():
     recovery._recover(_interrupted())
     assert failures == [set()] and recovery._interrupted == {11}
 
-    _interrupting(recovery, lost, {11, 12})
-    recovery._recover(_interrupted(lost))
+    _interrupting(recovery, failed, {11, 12})
+    recovery._recover(_interrupted(failed))
     assert failures[-1] == {11} and recovery._interrupted == {11, 12}
     assert executor.request_accumulated == []
 
 
 def test_a_request_that_progressed_after_an_interruption_runs_on_after_another():
-    """Under the overlap scheduler most requests sit in a discarded step: one that committed a step since an
-    earlier loss interrupted it is not failed by an unrelated second loss."""
-    lost = frozenset({FAILED_RANK, 3})
+    """Under the overlap scheduler most requests sit in a rolled-back step: one that committed a step since an
+    earlier failure interrupted it is not failed by an unrelated second failure."""
+    failed = frozenset({FAILED_RANK, 3})
     client = _FakeClient(
         [
             *_happy_replies(),
-            *_happy_replies(generation=2, failed=tuple(sorted(lost)), survivors=(0, 1)),
+            *_happy_replies(generation=2, failed=tuple(sorted(failed)), live_ranks=(0, 1)),
         ]
     )
-    recovery = _recovery(client, rank=0, failed=lost)
+    recovery = _recovery(client, rank=0, failed=failed)
     executor = recovery._executor
-    executor.model_engine.moe_load_balancer.covers_loss_of.return_value = True
-    shrinks = iter([frozenset({FAILED_RANK}), lost])
+    executor.model_engine.moe_load_balancer.covers_failure_of.return_value = True
+    shrinks = iter([frozenset({FAILED_RANK}), failed])
     executor.dist.shrink.side_effect = lambda: next(shrinks)
     recovery.requests_routed(
         {1: [Mock(id=request_id, child_req_ids=None) for request_id in (11, 12)]}
@@ -1982,13 +1984,13 @@ def test_a_request_that_progressed_after_an_interruption_runs_on_after_another()
 
     _interrupting(recovery, {FAILED_RANK}, {11, 12})
     recovery._recover(_interrupted())
-    _interrupting(recovery, lost, {11, 12}, progressed={12})
-    recovery._recover(_interrupted(lost))
+    _interrupting(recovery, failed, {11, 12}, progressed={12})
+    recovery._recover(_interrupted(failed))
 
     assert failures[-1] == {11} and recovery._interrupted == {11, 12}
 
 
-def test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once():
+def test_a_live_rank_reports_the_interrupted_requests_whose_step_committed_once():
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     executor = recovery._executor
     requests = {
@@ -2002,7 +2004,7 @@ def test_a_survivor_reports_the_interrupted_requests_whose_step_committed_once()
     recovery.step_prepared(interrupted)
     reported = []
     executor.dist.allgather.side_effect = (
-        lambda value, departed: reported.append(value) or [value] * WORLD_SIZE
+        lambda value, absent: reported.append(value) or [value] * WORLD_SIZE
     )
     recovery._recover(_interrupted())
     assert recovery._unprogressed == {11, 12}
@@ -2052,7 +2054,7 @@ def test_rank0_keeps_an_earlier_unrouted_rerun_request_across_a_recovery():
     assert recovery._rerouting == {7}
 
 
-def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
+def test_live_ranks_fail_the_sequences_of_the_requests_rank0_chooses_to_fail():
     recovery = _recovery(_FakeClient([]), rank=1)
     executor = recovery._executor
     executor.dist.broadcast.side_effect = (
@@ -2070,7 +2072,7 @@ def test_survivors_fail_the_sequences_of_the_requests_rank0_quarantines():
     (call,) = executor._handle_errors.call_args_list
     assert call.kwargs["requests"] == [parent, child] and not call.kwargs["charge_budget"]
     assert "interrupted this request a second time" in call.args[0]
-    assert is_peer_loss_retryable_message(call.args[0])
+    assert is_rank_failure_retryable_message(call.args[0])
 
 
 def test_rank0_tracks_requests_that_delivered_a_response():
@@ -2165,7 +2167,7 @@ def test_fetch_splits_and_records_routing_only_with_new_requests(monkeypatch, nu
     executor.adp_router.split_unservable_requests.side_effect = lambda requests, _: (requests, [])
     executor.adp_router.route_requests.return_value = (routed, 1)
     executor._pop_from_waiting_queue.return_value = (list(new_requests), {})
-    executor._peer_loss_recovery.enabled = True
+    executor._rank_failure_recovery.enabled = True
 
     assert PyExecutor._fetch_new_requests(executor, Mock(), []) == new_requests
 
@@ -2174,10 +2176,10 @@ def test_fetch_splits_and_records_routing_only_with_new_requests(monkeypatch, nu
     )
     if num_new:
         executor.adp_router.split_unservable_requests.assert_called_once_with(new_requests, states)
-        executor._peer_loss_recovery.requests_routed.assert_called_once_with(routed)
+        executor._rank_failure_recovery.requests_routed.assert_called_once_with(routed)
     else:
         executor.adp_router.split_unservable_requests.assert_not_called()
-        executor._peer_loss_recovery.requests_routed.assert_not_called()
+        executor._rank_failure_recovery.requests_routed.assert_not_called()
     executor._fail_unservable_requests.assert_not_called()
 
 
@@ -2193,15 +2195,19 @@ def test_rank0_enqueues_the_responses_of_each_gathered_part():
     executor.dist = Mock(rank=0, world_size=4)
     executor.dist.mapping.tp_group = [0, 1, 2, 3]
     executor.dist.tp_gather.return_value = parts
-    executor._peer_loss_recovery = Mock()
-    executor._peer_loss_recovery.contribution_responses.side_effect = owner.contribution_responses
+    executor._rank_failure_recovery = Mock()
+    executor._rank_failure_recovery.contribution_responses.side_effect = (
+        owner.contribution_responses
+    )
     executor.response_cv = threading.Condition()
     executor.responses, executor.result_wait_queues = {}, {}
 
     PyExecutor._enqueue_responses(executor, [])
 
     assert executor.responses == {11: [first[0][1]], 12: [second[0][1]]}
-    executor._peer_loss_recovery.responses_gathered.assert_called_once_with(first + second, parts)
+    executor._rank_failure_recovery.responses_gathered.assert_called_once_with(
+        first + second, parts
+    )
     executor.dist.tp_gather.return_value = [(), 3]
     with pytest.raises(RuntimeError, match="collective desync"):
         PyExecutor._enqueue_responses(executor, [])
@@ -2216,18 +2222,18 @@ def test_rank0_gathers_responses_without_hook_calls_when_recovery_is_off():
     executor.dist.mapping.tp_group = [0, 1]
     response = _response(11)
     executor.dist.tp_gather.return_value = [[(11, response)], []]
-    executor._peer_loss_recovery = Mock(enabled=False)
+    executor._rank_failure_recovery = Mock(enabled=False)
     executor.response_cv = threading.Condition()
     executor.responses, executor.result_wait_queues = {}, {}
 
     PyExecutor._enqueue_responses(executor, [])
 
     assert executor.responses == {11: [response]}
-    assert executor._peer_loss_recovery.mock_calls == []
+    assert executor._rank_failure_recovery.mock_calls == []
 
 
 def test_a_resent_part_notes_the_requests_it_answered_again():
-    """Rank 0 never read the notes of a gather a loss interrupted, so the resent part carries them again."""
+    """Rank 0 never read the notes of a gather a failure interrupted, so the resent part carries them again."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     recovery.gathering_responses([(11, _response(11))])
     recovery._executor.dist.broadcast.side_effect = (
@@ -2244,9 +2250,9 @@ def test_a_resent_part_notes_the_requests_it_answered_again():
 
 
 @pytest.mark.parametrize("ran_again, failed_requests", [(False, 1), (True, 2)])
-def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(ran_again, failed_requests):
-    """The authority's status counts the requests a loss failed: those that had streamed, and those that had
-    already run again once."""
+def test_rank0_reports_how_many_requests_the_failed_rank_was_serving(ran_again, failed_requests):
+    """The authority's status counts the failed rank's requests that fail: those that had streamed, and those
+    that had already run again once."""
     client = _FakeClient(_happy_replies())
     recovery = _recovery(client, rank=0)
     if ran_again:
@@ -2265,9 +2271,9 @@ def test_rank0_reports_how_many_requests_the_departed_rank_was_serving(ran_again
     assert installed.failed_requests == failed_requests
 
 
-def test_rank0_reports_the_requests_it_quarantines_as_failed():
-    """A survivor's request a second loss interrupts without progress fails, and the authority's status counts it
-    with the departed rank's request that had streamed."""
+def test_rank0_reports_the_requests_it_chooses_to_fail_as_failed():
+    """A survivor's request a second failure interrupts without progress fails, and the authority's status counts
+    it with the failed rank's request that had streamed."""
     client = _FakeClient(_happy_replies())
     recovery = _recovery(client, rank=0)
     executor = recovery._executor
@@ -2292,7 +2298,7 @@ def test_recovery_readmits_requests_that_never_reached_their_rank():
     torn, delivered = Mock(id=21, child_req_ids=None), Mock(id=22, child_req_ids=None)
     recovery._request_owners = {21: (3, torn), 22: (1, delivered)}
     held = {1: ({22}, 0, set(), set()), 3: (set(), 0, set(), set())}
-    recovery._executor.dist.allgather.side_effect = lambda value, departed: [
+    recovery._executor.dist.allgather.side_effect = lambda value, absent: [
         held.get(rank, value) for rank in range(WORLD_SIZE)
     ]
     _sent_responses(recovery)
@@ -2312,8 +2318,8 @@ def test_a_cancelled_request_is_tracked_until_its_rank_answers_it():
     assert recovery._request_owners == {} and recovery._cancelled == set()
 
 
-def test_a_cancelled_request_of_a_departed_rank_ends_cancelled_not_run_again():
-    """Its rank was lost before it answered the cancellation; a caller waiting after abort() needs a final
+def test_a_cancelled_request_of_a_failed_rank_ends_cancelled_not_run_again():
+    """Its rank failed before it answered the cancellation; a caller waiting after abort() needs a final
     response."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=0)
     request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=4)
@@ -2332,7 +2338,7 @@ def test_a_cancelled_request_of_a_departed_rank_ends_cancelled_not_run_again():
     assert all(item.is_canceled_request for item in recovery._executor.request_accumulated)
 
 
-def test_survivors_join_departed_request_responses():
+def test_live_ranks_join_failed_rank_request_responses():
     """Ranks without the owner table still take part in the response collective."""
     recovery = _recovery(_FakeClient(_happy_replies()), rank=1)
     assert recovery._request_owners is None
@@ -2410,7 +2416,7 @@ def test_recovery_fails_closed_if_gather_numbers_diverged():
         recovery._recover(_interrupted())
 
 
-def test_an_unrecoverable_loss_fails_before_waiting_on_the_device():
+def test_an_unrecoverable_failure_fails_before_waiting_on_the_device():
     recovery = _recovery(_FakeClient(_happy_replies()), failed=frozenset({0}))
     with pytest.raises(RuntimeError, match=r"ranks \[0\] is not recoverable"):
         recovery._recover(_interrupted(frozenset({0})))
@@ -2426,7 +2432,7 @@ def test_joining_device_work_reports_a_device_error(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "synchronize", fail)
     with pytest.raises(RuntimeError, match="illegal memory access"):
-        PeerLossRecovery._join_device_work(recovery, time.monotonic() + 5)
+        RankFailureRecovery._join_device_work(recovery, time.monotonic() + 5)
 
 
 def test_joining_device_work_is_bounded(monkeypatch):
@@ -2436,11 +2442,11 @@ def test_joining_device_work_is_bounded(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: release.wait())
     try:
         with pytest.raises(RecoveryTimeout, match="device work"):
-            PeerLossRecovery._join_device_work(recovery, time.monotonic() + 0.05)
+            RankFailureRecovery._join_device_work(recovery, time.monotonic() + 0.05)
     finally:
         release.set()
         for thread in threading.enumerate():
-            if thread.name == "peer_loss_device_join":
+            if thread.name == "rank_failure_device_join":
                 thread.join(timeout=5)
 
 
@@ -2466,7 +2472,7 @@ def _supported_executor():
     load_balancer = Mock()
     load_balancer.__class__ = MoeLoadBalancer
     load_balancer.is_static_routing.return_value = True
-    load_balancer.covers_loss_of.return_value = True
+    load_balancer.covers_failure_of.return_value = True
     kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     return SimpleNamespace(
         model_engine=SimpleNamespace(
@@ -2512,7 +2518,7 @@ def _supported_executor():
             lambda ex: setattr(ex, "kv_cache_manager", Mock()),
             "KV Cache Manager V2",
         ),
-        # A model without a KV cache (its runner's gathers expect no departed rank).
+        # A model without a KV cache (its runner's gathers expect no absent rank).
         (lambda ex: setattr(ex, "kv_cache_manager", None), "KV Cache Manager V2"),
         (lambda ex: setattr(ex, "draft_kv_cache_manager", Mock()), "KV Cache Manager V2"),
         (
@@ -2552,21 +2558,21 @@ def _supported_executor():
         ),
     ],
 )
-def test_create_rejects_configurations_a_discarded_step_cannot_rerun(
+def test_create_rejects_configurations_a_rolled_back_step_cannot_rerun(
     monkeypatch, unsupported, requirement
 ):
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
     executor = _supported_executor()
     unsupported(executor)
     with pytest.raises(ValueError, match=requirement):
-        PeerLossRecovery.create(executor)
-    executor.dist.enable_peer_loss_recovery.assert_not_called()
+        RankFailureRecovery.create(executor)
+    executor.dist.enable_rank_failure_recovery.assert_not_called()
 
 
 def test_create_requires_the_hang_detector_to_outlast_a_shrink_waiting_for_a_fence(monkeypatch):
     config = FaultToleranceConfig(hang_detection=True)
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
-    monkeypatch.setattr(peer_loss_recovery, "fault_tolerance_config", lambda: config)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
+    monkeypatch.setattr(rank_failure_recovery, "fault_tolerance_config", lambda: config)
     executor = _supported_executor()
     # Above the hang's resolution plus a recovery, but not above the shrink plus a recovery's two waits.
     executor.hang_detector.timeout = timeout = config.shrink_timeout_s() + config.recovery_timeout_s
@@ -2574,30 +2580,30 @@ def test_create_requires_the_hang_detector_to_outlast_a_shrink_waiting_for_a_fen
     with pytest.raises(
         ValueError, match=rf"hang_detection_timeout \({timeout} s\) above {minimum:g} s"
     ):
-        PeerLossRecovery.create(executor)
+        RankFailureRecovery.create(executor)
 
 
 @pytest.mark.parametrize("mode,rank,warns", [("1", 0, True), ("1", 1, False), (None, 0, False)])
 def test_create_warns_on_rank0_when_only_detection_is_on(monkeypatch, mode, rank, warns):
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: False)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: False)
     if mode is None:
         monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
     else:
         monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", mode)
     warning = Mock()
-    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warning)
+    monkeypatch.setattr(rank_failure_recovery.logger, "warning", warning)
     executor = _supported_executor()
     executor.dist.rank = rank
-    assert type(PeerLossRecovery.create(executor)) is RecoveryHook
+    assert type(RankFailureRecovery.create(executor)) is RecoveryHook
     assert warning.called == warns
     if warns:
         assert "TLLM_FAULT_TOLERANCE_AUTHORITY" in warning.call_args.args[0]
 
 
 def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: False)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: False)
     executor = _supported_executor()
-    recovery = PeerLossRecovery.create(executor)
+    recovery = RankFailureRecovery.create(executor)
     assert type(recovery) is RecoveryHook
     assert not (recovery.peer_failed or recovery.exits_alone(RuntimeError("illegal memory access")))
     responses = [(1, Mock())]
@@ -2605,52 +2611,52 @@ def test_create_returns_a_pass_through_hook_when_disabled(monkeypatch):
     event_loop = Mock()
     recovery.run(event_loop)
     event_loop.assert_called_once_with()
-    executor.dist.enable_peer_loss_recovery.assert_not_called()
+    executor.dist.enable_rank_failure_recovery.assert_not_called()
 
 
 @pytest.mark.parametrize("failure_domain, refused", [("rank", False), ("node", True)])
 def test_create_refuses_a_failure_domain_the_slots_cannot_cover(
     monkeypatch, failure_domain, refused
 ):
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
     monkeypatch.setattr(
-        peer_loss_recovery,
+        rank_failure_recovery,
         "fault_tolerance_config",
         lambda: FaultToleranceConfig(failure_domain=failure_domain),
     )
     monkeypatch.setattr(
-        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+        rank_failure_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )
     executor = _supported_executor()
-    executor.model_engine.moe_load_balancer.covers_loss_of.side_effect = lambda dead: len(dead) == 1
+    executor.model_engine.moe_load_balancer.covers_failure_of.side_effect = lambda r: len(r) == 1
     if refused:
         with pytest.raises(ValueError, match=r"failure_domain=node .* \(2, 3\)"):
-            PeerLossRecovery.create(executor)
+            RankFailureRecovery.create(executor)
     else:
-        assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+        assert isinstance(RankFailureRecovery.create(executor), RankFailureRecovery)
 
 
 def test_create_accepts_the_dsa_kv_cache_manager(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
 
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
     monkeypatch.setattr(
-        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+        rank_failure_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )
     executor = _supported_executor()
     executor.kv_cache_manager = DSACacheManagerV2.__new__(DSACacheManagerV2)
-    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    assert isinstance(RankFailureRecovery.create(executor), RankFailureRecovery)
 
 
 def test_create_accepts_kv_block_reuse(monkeypatch):
-    # A step commits its context blocks for reuse only once accepted, so a discarded step published none.
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    # A step commits its context blocks for reuse only once accepted, so a rolled-back step published none.
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
     monkeypatch.setattr(
-        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+        rank_failure_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )
     executor = _supported_executor()
     executor.kv_cache_manager.enable_block_reuse = True
-    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    assert isinstance(RankFailureRecovery.create(executor), RankFailureRecovery)
 
 
 def _spec_config(mode: "SpecMode", **options) -> SimpleNamespace:
@@ -2718,16 +2724,16 @@ def _spec_config(mode: "SpecMode", **options) -> SimpleNamespace:
 def test_create_accepts_any_speculative_decoding_and_warns_when_untested(
     monkeypatch, configure, warns
 ):
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
     monkeypatch.setattr(
-        peer_loss_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
+        rank_failure_recovery, "_register", lambda rank, recoverable: (Mock(), frozenset())
     )
     warning = Mock()
-    monkeypatch.setattr(peer_loss_recovery.logger, "warning", warning)
+    monkeypatch.setattr(rank_failure_recovery.logger, "warning", warning)
     executor = _supported_executor()
     configure(executor)
-    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
-    executor.dist.enable_peer_loss_recovery.assert_called_once()
+    assert isinstance(RankFailureRecovery.create(executor), RankFailureRecovery)
+    executor.dist.enable_rank_failure_recovery.assert_called_once()
     if warns:
         warning.assert_called_once()
         assert "in-graph draft state" in warning.call_args.args[0]
@@ -2735,35 +2741,35 @@ def test_create_accepts_any_speculative_decoding_and_warns_when_untested(
         warning.assert_not_called()
 
 
-def test_create_registers_the_domains_whose_loss_the_placement_covers(monkeypatch):
-    monkeypatch.setattr(peer_loss_recovery, "peer_loss_recovery_enabled", lambda: True)
+def test_create_registers_the_domains_whose_failure_the_placement_covers(monkeypatch):
+    monkeypatch.setattr(rank_failure_recovery, "rank_failure_recovery_enabled", lambda: True)
     registered = []
     monkeypatch.setattr(
-        peer_loss_recovery,
+        rank_failure_recovery,
         "_register",
         lambda rank, recoverable: registered.append((rank, recoverable)) or (Mock(), frozenset()),
     )
     monkeypatch.setattr(
-        peer_loss_recovery,
+        rank_failure_recovery,
         "fault_tolerance_config",
         lambda: FaultToleranceConfig(failure_domain="node"),
     )
     executor = _supported_executor()
-    assert isinstance(PeerLossRecovery.create(executor), PeerLossRecovery)
+    assert isinstance(RankFailureRecovery.create(executor), RankFailureRecovery)
     assert registered == [(0, ((1,), (2,), (3,), (2, 3)))]
-    executor.dist.enable_peer_loss_recovery.assert_called_once()
+    executor.dist.enable_rank_failure_recovery.assert_called_once()
 
 
 def test_install_recovery_placement_reroutes_before_masking():
     events = []
     load_balancer = Mock()
-    load_balancer.install_recovery_placement.side_effect = lambda dead, placements: events.append(
-        ("routed", dead)
+    load_balancer.install_recovery_placement.side_effect = lambda failed, placements: events.append(
+        ("routed", failed)
     )
     health = EPGroupHealth(WORLD_SIZE)
     state = Mock(health=health)
     state.install_mask.side_effect = lambda: events.append(("mask", health.get_mask_words()))
-    install = functools.partial(peer_loss_recovery.install_recovery_placement, placements=[])
+    install = functools.partial(rank_failure_recovery.install_recovery_placement, placements=[])
 
     install(state, load_balancer, {FAILED_RANK}, own_rank=0)
 
@@ -2780,7 +2786,7 @@ def test_install_recovery_placement_reroutes_before_masking():
         install(state, load_balancer, {0, 3}, own_rank=0)
     assert events == [] and health.get_failed_ranks() == frozenset({FAILED_RANK})
 
-    # A loss after a recovery installs every rank lost so far.
+    # A failure after a recovery installs every rank failed so far.
     install(state, load_balancer, {FAILED_RANK, 3}, own_rank=0)
     assert health.get_failed_ranks() == frozenset({FAILED_RANK, 3})
     assert events == [("routed", [FAILED_RANK, 3]), ("mask", (0b0011, 0, 0, 0))]
@@ -2793,7 +2799,7 @@ def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():
     recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.is_static_routing.return_value = False
-    load_balancer.copy_nodes = None
+    load_balancer.host_weight_nodes = None
     load_balancer.quiesce.return_value = True
     own, rank0 = [np.zeros((WORLD_SIZE, 2))], [np.ones((WORLD_SIZE, 2))]
     load_balancer.current_placements.return_value = own
@@ -2803,7 +2809,7 @@ def test_online_eplb_starts_from_rank_0s_placement_sent_among_the_survivors():
 
     broadcast.assert_called_once_with(None, root=0)
     load_balancer.recovery_placements.assert_called_once_with(frozenset({FAILED_RANK}), rank0)
-    # Online EPLB restores from its full host copies: nothing to stage.
+    # Online EPLB restores from its full host weights: nothing to stage.
     load_balancer.stage_restored_slots.assert_not_called()
     load_balancer.placement_digest.assert_called_once_with(
         frozenset({FAILED_RANK}), ["placement"], None
@@ -2818,7 +2824,7 @@ def test_online_eplb_only_gathers_statistics_for_a_while_after_a_recovery(online
     recovery = _recovery(_FakeClient(_happy_replies(generation=1)))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.is_static_routing.return_value = not online
-    load_balancer.copy_nodes = None
+    load_balancer.host_weight_nodes = None
     load_balancer.quiesce.return_value = True
     load_balancer.current_placements.return_value = [np.zeros((WORLD_SIZE, 2))]
     recovery._executor.dist.broadcast_among_survivors = Mock(
@@ -2830,7 +2836,7 @@ def test_online_eplb_only_gathers_statistics_for_a_while_after_a_recovery(online
     if online:
         load_balancer.reset_update_schedule.assert_called_once_with()
         load_balancer.set_warm_up_iter_count.assert_called_once_with(
-            peer_loss_recovery._EPLB_WARM_UP_ITERS_AFTER_RECOVERY
+            rank_failure_recovery._EPLB_WARM_UP_ITERS_AFTER_RECOVERY
         )
     else:
         load_balancer.reset_update_schedule.assert_not_called()
@@ -2839,18 +2845,18 @@ def test_online_eplb_only_gathers_statistics_for_a_while_after_a_recovery(online
 
 @pytest.mark.parametrize("covered", [True, False])
 def test_online_eplb_decides_recoverability_from_rank_0s_placement(covered):
-    """Under online EPLB a survivor's own placement may not cover a loss that rank 0's does (or the reverse):
+    """Under online EPLB a survivor's own placement may not cover a failure that rank 0's does (or the reverse):
     every survivor decides from rank 0's placement, so they all recover or all fail closed."""
     import numpy as np
 
-    lost = frozenset({FAILED_RANK, 3})
-    client = _FakeClient(_happy_replies(failed=tuple(sorted(lost)), survivors=(0, 1)))
-    recovery = _recovery(client, failed=lost)
+    failed = frozenset({FAILED_RANK, 3})
+    client = _FakeClient(_happy_replies(failed=tuple(sorted(failed)), live_ranks=(0, 1)))
+    recovery = _recovery(client, failed=failed)
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.is_static_routing.return_value = False
-    load_balancer.copy_nodes = None
+    load_balancer.host_weight_nodes = None
     load_balancer.quiesce.return_value = True
-    load_balancer.covers_loss_of.return_value = not covered
+    load_balancer.covers_failure_of.return_value = not covered
     rank0 = [np.ones((WORLD_SIZE, 2))]
     load_balancer.current_placements.return_value = [np.zeros((WORLD_SIZE, 2))]
     recovery._executor.dist.broadcast_among_survivors = Mock(return_value=rank0)
@@ -2858,18 +2864,18 @@ def test_online_eplb_decides_recoverability_from_rank_0s_placement(covered):
         load_balancer.recovery_placements.side_effect = ValueError("No surviving replica")
 
     if covered:
-        recovery._recover(_interrupted(lost))
+        recovery._recover(_interrupted(failed))
         load_balancer.install_recovery_placement.assert_called_once_with(
-            sorted(lost), ["placement"]
+            sorted(failed), ["placement"]
         )
     else:
         with pytest.raises(RuntimeError, match="not recoverable"):
-            recovery._recover(_interrupted(lost))
-    load_balancer.covers_loss_of.assert_not_called()
-    load_balancer.recovery_placements.assert_called_once_with(lost, rank0)
+            recovery._recover(_interrupted(failed))
+    load_balancer.covers_failure_of.assert_not_called()
+    load_balancer.recovery_placements.assert_called_once_with(failed, rank0)
 
 
-def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(monkeypatch):
+def test_a_survivor_failing_while_rank_0_sends_its_placement_interrupts_the_round(monkeypatch):
     from mpi4py import MPI
 
     recovery = _recovery(_FakeClient([]))
@@ -2877,15 +2883,15 @@ def test_a_survivor_lost_while_rank_0_sends_its_placement_interrupts_the_round(m
     recovery._executor.dist.broadcast_among_survivors = Mock(
         side_effect=MPI.Exception(MPI.ERR_OTHER)
     )
-    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
+    monkeypatch.setattr(rank_failure_recovery, "is_mpi_peer_failure", lambda error: True)
     with pytest.raises(RecoveryInterrupted):
         recovery._rank0_placements(load_balancer)
-    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
+    monkeypatch.setattr(rank_failure_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
         recovery._rank0_placements(load_balancer)
 
 
-def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_plan(monkeypatch):
+def test_ring_host_weights_stage_the_restore_after_propose_and_digest_the_copy_plan(monkeypatch):
     """The copies run once the failed ranks are fenced (Propose) and before Ready, whose digest covers them."""
     import numpy as np
 
@@ -2918,58 +2924,58 @@ def test_ring_host_copies_stage_the_restore_after_propose_and_digest_the_copy_pl
     load_balancer.placement_digest.assert_called_once_with(failed, ["placement"], plan)
 
 
-def test_a_survivor_lost_while_restored_experts_are_copied_interrupts_the_round(monkeypatch):
+def test_a_survivor_failing_while_restored_experts_are_copied_interrupts_the_round(monkeypatch):
     from mpi4py import MPI
 
     recovery = _recovery(_FakeClient([]))
     load_balancer = recovery._executor.model_engine.moe_load_balancer
     load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
     failed = frozenset({FAILED_RANK})
-    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: True)
+    monkeypatch.setattr(rank_failure_recovery, "is_mpi_peer_failure", lambda error: True)
     with pytest.raises(RecoveryInterrupted):
         recovery._stage_ring_restore(load_balancer, failed, ["placement"])
-    # So does a loss a staging barrier observes.
+    # So does a failure a staging barrier observes.
     load_balancer.stage_restored_slots.side_effect = lambda plan, workspace, barrier: barrier()
     recovery._executor.dist.barrier_among_survivors.side_effect = MPI.Exception(MPI.ERR_OTHER)
     with pytest.raises(RecoveryInterrupted):
         recovery._stage_ring_restore(load_balancer, failed, ["placement"])
     load_balancer.stage_restored_slots.side_effect = MPI.Exception(MPI.ERR_OTHER)
-    monkeypatch.setattr(peer_loss_recovery, "is_mpi_peer_failure", lambda error: False)
+    monkeypatch.setattr(rank_failure_recovery, "is_mpi_peer_failure", lambda error: False)
     with pytest.raises(MPI.Exception):
         recovery._stage_ring_restore(load_balancer, failed, ["placement"])
 
 
 @pytest.mark.parametrize("staged_first_plan", [True, False])
-def test_every_survivor_remaps_and_stages_again_without_every_lost_rank_whether_it_staged_or_not(
+def test_every_survivor_remaps_and_stages_again_without_every_failed_rank_whether_it_staged_or_not(
     staged_first_plan,
 ):
     """Rank 3 fails during the recovery without rank 2. A survivor that staged the first plan and one
     interrupted before it got the plan both remap the workspaces again and stage the plan without both."""
     import numpy as np
 
-    lost = (FAILED_RANK, 3)
-    first = Propose(1, (FAILED_RANK,), SURVIVORS)
+    failed = (FAILED_RANK, 3)
+    first = Propose(1, (FAILED_RANK,), LIVE_RANKS)
     if staged_first_plan:
-        replies = [first, _FURTHER_LOSS]
+        replies = [first, _FURTHER_FAILURE]
     else:
-        replies = [_FURTHER_LOSS, first]
-    client = _FakeClient([*replies, Propose(1, lost, (0, 1)), Install(1), Commit(1)])
-    recovery = _recovery(client, failed=frozenset(lost))
-    shrinks = iter([frozenset({FAILED_RANK}), frozenset(lost)])
+        replies = [_FURTHER_FAILURE, first]
+    client = _FakeClient([*replies, Propose(1, failed, (0, 1)), Install(1), Commit(1)])
+    recovery = _recovery(client, failed=frozenset(failed))
+    shrinks = iter([frozenset({FAILED_RANK}), frozenset(failed)])
     recovery._executor.dist.shrink.side_effect = lambda: next(shrinks)
     load_balancer = recovery._executor.model_engine.moe_load_balancer
-    load_balancer.covers_loss_of.return_value = True
-    load_balancer.recovery_placements.side_effect = lambda dead, base=None: [sorted(dead)]
+    load_balancer.covers_failure_of.return_value = True
+    load_balancer.recovery_placements.side_effect = lambda ranks, base=None: [sorted(ranks)]
     plans = []
 
-    def restore_copy_plan(dead, placements, size):
-        plans.append((sorted(dead), placements))
-        return np.full((1, 10), len(dead), dtype=np.int64)
+    def restore_copy_plan(ranks, placements, size):
+        plans.append((sorted(ranks), placements))
+        return np.full((1, 10), len(ranks), dtype=np.int64)
 
     load_balancer.restore_copy_plan.side_effect = restore_copy_plan
 
     def stage_restored_slots(copy_plan, workspace, barrier):
-        # The first plan (dead ranks: 1) stages two chunks.
+        # The first plan (failed ranks: 1) stages two chunks.
         for _ in range(3 - int(copy_plan[0, 0])):
             barrier()
 
@@ -2977,15 +2983,15 @@ def test_every_survivor_remaps_and_stages_again_without_every_lost_rank_whether_
 
     recovery._recover(_interrupted())
 
-    assert plans[-1] == (list(lost), [list(lost)])
+    assert plans[-1] == (list(failed), [list(failed)])
     assert len(plans) == (2 if staged_first_plan else 1)
     remapped = [call.args[0] for call in recovery._remap_workspaces.call_args_list]
-    assert remapped[-1] == frozenset(lost)
+    assert remapped[-1] == frozenset(failed)
     assert len(remapped) == len(plans)
     stopped = [message for message in client.sent if isinstance(message, Stopped)]
     assert stopped == [
         Stopped(rank=1, failed_ranks=(FAILED_RANK,)),
-        Stopped(rank=1, failed_ranks=lost),
+        Stopped(rank=1, failed_ranks=failed),
     ]
 
 
@@ -2998,8 +3004,8 @@ def test_a_control_action_commits_the_in_flight_step_before_applying_it():
     batch = Mock()
     batch.scheduled_requests.context_requests = [Mock()]
     executor.previous_batch = batch
-    executor._peer_loss_recovery = Mock(enabled=True)
-    executor._peer_loss_recovery.commit_step.side_effect = lambda *args: calls.append("commit")
+    executor._rank_failure_recovery = Mock(enabled=True)
+    executor._rank_failure_recovery.commit_step.side_effect = lambda *args: calls.append("commit")
     executor._wait_for_model_engine_input_copy = lambda: calls.append("wait for input copy")
     executor._update_v2_context_resources = lambda requests: calls.append("commit context blocks")
     executor._update_requests = lambda state: calls.append("apply results")

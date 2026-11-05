@@ -61,8 +61,9 @@ from .hang_diagnostics import monitor_executor_initialization
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .peer_loss_recovery import stop_startup_watch, watch_startup_peer_failures
 from .py_executor import PyExecutor
+from .rank_failure_recovery import (stop_startup_watch,
+                                    watch_startup_peer_failures)
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)

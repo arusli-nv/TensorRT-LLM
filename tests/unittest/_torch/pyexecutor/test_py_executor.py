@@ -48,13 +48,13 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     SamplingConfig,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
-from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import RecoveryHook
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     EncoderStepResult,
     PyExecutor,
     _ADPForwardIntent,
 )
+from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import RecoveryHook
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
@@ -97,7 +97,7 @@ def _forward_step_executor(
         _handle_errors=Mock(),
         _finish_inforward_snapshots=False,
         kv_cache_manager=Mock(),
-        _peer_loss_recovery=RecoveryHook(),
+        _rank_failure_recovery=RecoveryHook(),
         _raise_if_peer_failed=lambda operation, error: None,
     )
 
@@ -671,7 +671,7 @@ def _make_admission_executor(model, requests):
         _validate_token_id_range=Mock(),
         _validate_request_budget=Mock(),
         _handle_errors=Mock(),
-        _peer_loss_recovery=RecoveryHook(),
+        _rank_failure_recovery=RecoveryHook(),
     )
     executor._validate_request = types.MethodType(PyExecutor._validate_request, executor)
     return executor

@@ -2,20 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Recovery of the MNNVL MoE All-to-All among survivors, on four GPUs sharing a real fabric workspace.
 
-``test_remap_orphans_late_writer``: a lost rank whose kernels keep writing the survivors' rows reaches only the
+``test_remap_orphans_late_writer``: a failed rank whose kernels keep writing the survivors' rows reaches only the
 released pages; MoeExecutionState.remap_workspaces backs the survivors' rows with fresh pages at the same
-addresses, and their masked round trips never touch the lost rank's unmapped row. The survivors run
-PeerLossRecovery._remap_workspaces, which takes room from a stand-in KV cache, then install_recovery_placement's
-sequence; PeerLossRecovery._return_remap_room gives the room back once the victim's death frees its pages.
+addresses, and their masked round trips never touch the failed rank's unmapped row. The survivors run
+RankFailureRecovery._remap_workspaces, which takes room from a stand-in KV cache, then install_recovery_placement's
+sequence; RankFailureRecovery._return_remap_room returns the room once the victim's death frees its pages.
 
-``test_second_loss_orphans_importer_of_remapped_pages``: a rank that imported a remap's fresh pages and is lost
-next keeps writing them; the second remap, without both lost ranks, keeps its writes off the survivors' live
+``test_second_failure_orphans_importer_of_remapped_pages``: a rank that imported a remap's fresh pages and fails
+next keeps writing them; the second remap, without both failed ranks, keeps its writes off the survivors' live
 rows, and their masked round trips stay exact.
 
-``test_aborted_round_with_runahead_rank``: on packed rows, a rank released by an abort that runs rounds ahead
-makes its peers' round abort on request, neither trapping, hanging nor completing, and a rearm restores exact
-round trips. Its ``graph-mask`` case installs a mask between two replays of a captured graph; the next replay
-must read it.
+``test_aborted_round_with_runahead_rank``: on packed rows, a rank whose round an abort left incomplete runs
+rounds ahead and makes its peers' round abort on request, neither trapping, hanging nor completing, and a rearm
+restores exact round trips. Its ``graph-mask`` case installs a mask between two replays of a captured graph; the
+next replay must read it.
 
 Workers are separate processes over a TCPStore, as in test_moe_a2a_late_writes.py, since one may be SIGKILLed.
 Each layer is a fake NVLinkOneSided on the real workspace lifecycle, with its watchdog, bound to a
@@ -43,18 +43,19 @@ from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspace
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.pyexecutor import peer_loss_recovery
-from tensorrt_llm._torch.pyexecutor.peer_loss_recovery import PeerLossRecovery
+from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
+from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import RankFailureRecovery
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
 _EP_SIZE = 4
 _EVERYONE = list(range(_EP_SIZE))
 _CAPACITY, _HIDDEN = 256, 7168
-# The lost rank of the remap test, the rank released ahead, and the rank that leaves between graph replays.
-_VICTIM, _RUNAHEAD, _DEPARTED = 2, 1, 3
-# The two ranks the re-plan test loses in turn: the second imports the first remap's pages.
-_FIRST_LOST, _SECOND_LOST = 3, 2
+# The failed rank of the remap test, the rank whose incomplete round runs ahead, and the rank that fails between
+# graph replays.
+_VICTIM, _RUNAHEAD, _FAILED = 2, 1, 3
+# The two ranks that fail in turn in the re-plan test: the second imports the first remap's pages.
+_FIRST_FAILED, _SECOND_FAILED = 3, 2
 _AHEAD_ROUNDS = 4
 _PATTERN = 0xA5
 _WRITE_S = 1.0
@@ -241,13 +242,13 @@ class _Rank:
         _check_round(self.rank, seed, live, received, combined)
 
     def round_flags(self) -> list[int]:
-        """This rank's round counter and released-round word."""
+        """This rank's round counter and incomplete-round word."""
         row = self.workspace[self.rank]
         return [
             int(row[offset : offset + 4].view(torch.int32).item())
             for offset in (
                 workspace_offset(self.meta, "FLAG_VAL"),
-                workspace_offset(self.meta, "RELEASED_ROUND"),
+                workspace_offset(self.meta, "INCOMPLETE_ROUND"),
             )
         ]
 
@@ -275,7 +276,7 @@ def _survivor(ctx: _Rank, mode: str) -> None:
     state, row = ctx.state, ctx.workspace[ctx.rank]
     ctx.store.wait(["progress"])  # the victim's writes are in flight
 
-    # PeerLossRecovery._remap_workspaces among the survivors, then install_recovery_placement's mask commit.
+    # RankFailureRecovery._remap_workspaces among the survivors, then install_recovery_placement's mask commit.
     survivors = _Survivors(ctx.comm, live)
     live_mask = [sum(1 << r for r in live), 0, 0, 0]
     held = _held_bytes()
@@ -320,12 +321,12 @@ def _survivor(ctx: _Rank, mode: str) -> None:
 
     if mode == "kill":
         # The victim's death drops the last mappings of the released pages. Recovery returns the KV cache share
-        # it lent to the remap only once cudaMemGetInfo shows them free (PeerLossRecovery._return_remap_room).
+        # it lent to the remap only once cudaMemGetInfo shows them free (RankFailureRecovery._return_remap_room).
         deadline = time.monotonic() + 60
         while _held_bytes() > remapped - need + slack:
             assert time.monotonic() < deadline, (
                 f"cudaMemGetInfo still counts the {need} released bytes 60 s after the victim's SIGKILL: "
-                "the driver keeps a dead importer's pages, so recovery would keep the KV cache share it lent"
+                "the driver keeps a killed importer's pages, so recovery would keep the KV cache share it lent"
             )
             time.sleep(0.1)
         recovery._return_remap_room()
@@ -344,14 +345,14 @@ def _survivor(ctx: _Rank, mode: str) -> None:
 
 def _remap_recovery(
     ctx: _Rank, survivors: _Survivors, need: int, live_mask: list[int]
-) -> tuple[PeerLossRecovery, list[int]]:
-    """A PeerLossRecovery that runs only _remap_workspaces and _return_remap_room for this survivor; returns it
+) -> tuple[RankFailureRecovery, list[int]]:
+    """A RankFailureRecovery that runs only _remap_workspaces and _return_remap_room for this survivor; returns it
     and the KV cache quota changes it makes.
 
     The device reports, outside PyTorch's caching allocator, ``need // 2`` bytes less than the remap needs
     beyond the margin, so the remap takes them from the KV cache, as on a device the KV cache fills.
     """
-    recovery = PeerLossRecovery.__new__(PeerLossRecovery)
+    recovery = RankFailureRecovery.__new__(RankFailureRecovery)
     quota, barriers = [], []
 
     def resize_kv_cache_quota(delta: int) -> bool:
@@ -361,7 +362,7 @@ def _remap_recovery(
     def barrier_among_survivors() -> None:
         barriers.append(None)
         if len(barriers) == 1:
-            # The first barrier follows the release: the departed rank left the device mask with its row,
+            # The first barrier follows the release: the failed rank left the device mask with its row,
             # before the committed membership does, and the watchdog stopped reading the unmapped rows.
             assert ctx.state.active_rank_mask.cpu().tolist() == live_mask
             assert not ctx.watchdog_running(), (
@@ -385,9 +386,9 @@ def _remap_recovery(
     def untracked_free() -> int:
         return torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
 
-    reported = need + peer_loss_recovery._GHOST_MARGIN_BYTES - need // 2
+    reported = need + rank_failure_recovery._UNBACKED_MARGIN_BYTES - need // 2
     hidden = untracked_free() - reported
-    peer_loss_recovery._free_device_bytes = lambda: untracked_free() - hidden
+    rank_failure_recovery._free_device_bytes = lambda: untracked_free() - hidden
     return recovery, quota
 
 
@@ -400,26 +401,26 @@ def _remap_worker(ctx: _Rank, mode: str) -> None:
         _survivor(ctx, mode)
 
 
-# ---- test_second_loss_orphans_importer_of_remapped_pages ----
+# ---- test_second_failure_orphans_importer_of_remapped_pages ----
 
 
-def _replan(ctx: _Rank, lost: list[int]) -> list[int]:
-    """Recovery without ``lost`` among the other ranks: PeerLossRecovery._remap_workspaces, then
+def _replan(ctx: _Rank, failed: list[int]) -> list[int]:
+    """Recovery without ``failed`` among the other ranks: RankFailureRecovery._remap_workspaces, then
     install_recovery_placement's mask commit. Returns the live ranks."""
-    live = [r for r in _EVERYONE if r not in lost]
+    live = [r for r in _EVERYONE if r not in failed]
     live_mask = [sum(1 << r for r in live), 0, 0, 0]
     need = MnnvlMemory.allocated_map[ctx.memory.ptr].aligned_size
     recovery, _ = _remap_recovery(ctx, _Survivors(ctx.comm, live), need, live_mask)
-    recovery._remap_workspaces(frozenset(lost), time.monotonic() + 60)
+    recovery._remap_workspaces(frozenset(failed), time.monotonic() + 60)
     assert ctx.watchdog_running(), "the remap did not restart the watchdog"
-    for rank in lost:
+    for rank in failed:
         ctx.state.health.mark_failed(rank)
     ctx.state.rearm()
     ctx.state.install_mask()
     assert ctx.state.active_rank_mask.cpu().tolist() == live_mask
     handles = MnnvlMemory.allocated_map[ctx.memory.ptr].mem_handles
-    assert [handle is None for handle in handles] == [r in lost for r in _EVERYONE], (
-        "only the lost ranks' rows may stay unmapped"
+    assert [handle is None for handle in handles] == [r in failed for r in _EVERYONE], (
+        "only the failed ranks' rows may stay unmapped"
     )
     return live
 
@@ -427,19 +428,19 @@ def _replan(ctx: _Rank, lost: list[int]) -> list[int]:
 def _replan_worker(ctx: _Rank) -> None:
     ctx.round_trip(0, _EVERYONE)
     ctx.comm.barrier()
-    if ctx.rank == _FIRST_LOST:
-        # Lost but alive: it keeps the original pages mapped and runs nothing more.
+    if ctx.rank == _FIRST_FAILED:
+        # Failed but alive: it keeps the original pages mapped and runs nothing more.
         ctx.store.wait(["stopped"])
         return
 
-    # Round 1: the others remap without the first lost rank; the second imports the fresh pages.
-    live = _replan(ctx, [_FIRST_LOST])
+    # Round 1: the others remap without the first failed rank; the second imports the fresh pages.
+    live = _replan(ctx, [_FIRST_FAILED])
     for seed in (1, 2):
         ctx.round_trip(seed, live)
-    # Every round trip has read its rows before the second lost rank writes them.
+    # Every round trip has read its rows before the second failed rank writes them.
     _Survivors(ctx.comm, live).barrier_among_survivors()
-    survivors = [r for r in live if r != _SECOND_LOST]
-    if ctx.rank == _SECOND_LOST:
+    survivors = [r for r in live if r != _SECOND_FAILED]
+    if ctx.rank == _SECOND_FAILED:
         _late_writer(ctx, survivors)
         return
 
@@ -450,12 +451,12 @@ def _replan_worker(ctx: _Rank) -> None:
     deadline = time.monotonic() + 10
     while not bool((row == _PATTERN).all()):
         assert time.monotonic() < deadline, (
-            "the second lost rank's writes never reached round 1's pages"
+            "the second failed rank's writes never reached round 1's pages"
         )
         time.sleep(_POLL_S)
 
-    # Round 2: the survivors remap without both lost ranks while the second keeps writing.
-    assert _replan(ctx, [_FIRST_LOST, _SECOND_LOST]) == survivors
+    # Round 2: the survivors remap without both failed ranks while the second keeps writing.
+    assert _replan(ctx, [_FIRST_FAILED, _SECOND_FAILED]) == survivors
     reset = _reset_row(ctx).cuda()
     progress = int(ctx.store.get("progress"))
     deadline = time.monotonic() + _WRITE_S
@@ -465,7 +466,7 @@ def _replan_worker(ctx: _Rank) -> None:
         if time.monotonic() >= deadline:
             break
         time.sleep(_POLL_S)
-    assert int(ctx.store.get("progress")) > progress, "the second lost rank stopped writing"
+    assert int(ctx.store.get("progress")) > progress, "the second failed rank stopped writing"
     # A peer's round trip writes this row: none starts before every survivor checked its own.
     survivor_group = _Survivors(ctx.comm, survivors)
     survivor_group.barrier_among_survivors()
@@ -484,7 +485,8 @@ def _replan_worker(ctx: _Rank) -> None:
 
 
 def _run_ahead(ctx: _Rank) -> None:
-    """Released by its own abort request, run _AHEAD_ROUNDS rounds the peers have not started."""
+    """With its rounds left incomplete by its own abort request, run _AHEAD_ROUNDS rounds the peers have not
+    started."""
     ctx.state.request_abort()
     for k in range(_AHEAD_ROUNDS):
         # Each round routes differently, so its receive counts differ from those of the peers' round.
@@ -492,18 +494,19 @@ def _run_ahead(ctx: _Rank) -> None:
         ctx.launch(x.cuda(), targets.cuda())
     done = torch.cuda.Event()
     done.record()
-    _await(done, ctx.state, "a released rank kept waiting for its peers")
+    _await(done, ctx.state, "a rank with an incomplete round kept waiting for its peers")
     assert ctx.state.abort.tolist() == [1, 1]
-    counter, released = ctx.round_flags()
-    assert released == 1, "the released rank does not record its released round"
+    counter, incomplete = ctx.round_flags()
+    assert incomplete == 1, "the run-ahead rank does not record its incomplete round"
     ctx.store.set("ahead", str(counter))
 
 
 def _fall_behind(ctx: _Rank) -> None:
-    """Run the round the released rank already left: wait for it, then return aborted on request.
+    """Run the round the run-ahead rank already left: wait for it, then return aborted on request.
 
-    The dispatch may complete: the released rank published this round's dispatch flag before its wait was
-    released. The combine waits, since a released rank publishes no flag until its workspace is reset.
+    The dispatch may complete: the run-ahead rank published this round's dispatch flag before its wait was
+    released. The combine waits, since a rank with an incomplete round publishes no flag until its workspace is
+    reset.
     """
     ahead = int(ctx.store.get("ahead"))
     x, targets = _tokens(1, ctx.rank, _EVERYONE)
@@ -511,17 +514,17 @@ def _fall_behind(ctx: _Rank) -> None:
     done = torch.cuda.Event()
     done.record()
     time.sleep(0.3)
-    assert not done.query(), "the round completed without the released rank's flags"
+    assert not done.query(), "the round completed without the run-ahead rank's flags"
     ctx.state.request_abort()
     _await(done, ctx.state, "the round kept waiting after the abort request")
     assert ctx.state.abort.tolist() == [1, 1], "the round did not report itself aborted"
-    # The dispatch and combine prepare kernels advance flag_val[0] on every launch, released or not.
-    assert ctx.round_flags()[0] < ahead, "the released rank's round counter is not ahead"
+    # The dispatch and combine prepare kernels advance flag_val[0] on every launch, aborted or not.
+    assert ctx.round_flags()[0] < ahead, "the run-ahead rank's round counter is not ahead"
 
 
 def _replay_across_mask(ctx: _Rank) -> None:
-    """Replay a graph captured with every rank; between two replays the departed rank leaves and the others
-    install a mask without it. The next replays must read it: waiting for the departed rank never ends."""
+    """Replay a graph captured with every rank; between two replays the failed rank leaves and the others
+    install a mask without it. The next replays must read it: waiting for the failed rank never ends."""
     x = torch.empty((_CAPACITY, _HIDDEN), dtype=torch.bfloat16, device="cuda")
     targets = torch.empty((_CAPACITY, 1), dtype=torch.int32, device="cuda")
 
@@ -539,20 +542,20 @@ def _replay_across_mask(ctx: _Rank) -> None:
     torch.cuda.synchronize()
     _check_round(ctx.rank, 4, _EVERYONE, received, combined)
     ctx.comm.barrier()
-    if ctx.rank == _DEPARTED:
+    if ctx.rank == _FAILED:
         ctx.store.wait(["done"])
         return
 
-    live = [r for r in _EVERYONE if r != _DEPARTED]
-    # No remap: the departed rank stays mapped, so only the mask keeps the replays off it.
-    ctx.state.health.mark_failed(_DEPARTED)
+    live = [r for r in _EVERYONE if r != _FAILED]
+    # No remap: the failed rank stays mapped, so only the mask keeps the replays off it.
+    ctx.state.health.mark_failed(_FAILED)
     ctx.state.install_mask()
     for seed in (5, 6):
         load(seed, live)
         graph.replay()
         done = torch.cuda.Event()
         done.record()
-        _await(done, ctx.state, "a replay after install_mask waited for the departed rank")
+        _await(done, ctx.state, "a replay after install_mask waited for the failed rank")
         _check_round(ctx.rank, seed, live, received, combined)
         assert ctx.state.abort.tolist() == [0, 0]
     _Survivors(ctx.comm, live).barrier_among_survivors()
@@ -653,8 +656,8 @@ def test_remap_orphans_late_writer(mode: str) -> None:
         _reap(workers)
 
 
-def test_second_loss_orphans_importer_of_remapped_pages() -> None:
-    """Rank 3 is lost and ranks 0-2 remap without it. Rank 2, which imported those fresh pages, then keeps
+def test_second_failure_orphans_importer_of_remapped_pages() -> None:
+    """Rank 3 fails and ranks 0-2 remap without it. Rank 2, which imported those fresh pages, then keeps
     writing a pattern into rows 0 and 1, which their polls see; ranks 0 and 1 remap without ranks 2 and 3. Their
     rows then hold exactly the reset state, polled over _WRITE_S of rank 2's writes, and their masked round trips
     are exact."""
@@ -670,9 +673,10 @@ def test_second_loss_orphans_importer_of_remapped_pages() -> None:
 
 @pytest.mark.parametrize("mode", ["runahead", "graph-mask"])
 def test_aborted_round_with_runahead_rank(mode: str) -> None:
-    """``runahead``: rank 1, released by an abort, runs _AHEAD_ROUNDS rounds; its peers' next round waits, returns
-    aborted on request without trapping, and after a rearm every round trip is exact. ``graph-mask``: a graph
-    captured with every rank replays exactly among ranks 0-2 after they install a mask without rank 3."""
+    """``runahead``: rank 1, its round left incomplete by an abort, runs _AHEAD_ROUNDS rounds; its peers' next round
+    waits, returns aborted on request without trapping, and after a rearm every round trip is exact.
+    ``graph-mask``: a graph captured with every rank replays exactly among ranks 0-2 after they install a mask
+    without rank 3."""
     reason = mnnvl_skip_reason(_EP_SIZE)
     if reason:
         pytest.skip(reason)
