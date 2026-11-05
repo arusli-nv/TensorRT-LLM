@@ -23,7 +23,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
 )
-from tensorrt_llm._utils import fault_tolerance_mode, peer_loss_recovery_enabled
+from tensorrt_llm._utils import fault_tolerance_mode, rank_failure_recovery_enabled
 
 from .ep_group_health import EPGroupHealth
 
@@ -58,7 +58,7 @@ def get_wide_ep_ft_options(
     reports suspects through its ``on_timeout`` seam; it never mutates the
     committed membership directly. The kernels read the mask at execution
     time, so rank-mask mode works with CUDA graphs once each communicator is
-    bound to an execution state, which peer-loss recovery does; without
+    bound to an execution state, which rank failure recovery does; without
     recovery, a model that uses CUDA graphs is refused here.
     """
 
@@ -68,11 +68,11 @@ def get_wide_ep_ft_options(
     if (
         rank_mask_enabled
         and getattr(model_config, "use_cuda_graph", False)
-        and not peer_loss_recovery_enabled()
+        and not rank_failure_recovery_enabled()
     ):
-        # Only peer-loss recovery binds the communicators to an execution state.
+        # Only rank failure recovery binds the communicators to an execution state.
         raise ValueError(
-            "WideEP rank-mask mode without peer-loss recovery does not support CUDA graphs; "
+            "WideEP rank-mask mode without rank failure recovery does not support CUDA graphs; "
             "disable CUDA graphs or enable recovery"
         )
     if health is None and rank_mask_enabled:

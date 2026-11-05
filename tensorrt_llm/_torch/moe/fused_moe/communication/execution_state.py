@@ -108,20 +108,20 @@ class MoeExecutionState:
         )
         return memory.as_torch_strided_tensor(torch.uint8)
 
-    def release_workspaces(self, departed: Iterable[int]) -> int:
+    def release_workspaces(self, failed: Iterable[int]) -> int:
         """Release every bound workspace's backing, keeping its addresses; return the bytes :meth:`remap_workspaces`
         allocates again. Only while the model is idle; collectives and staging wait for the remap.
 
-        First clears the ``departed`` EP ranks from the device mask, whose rows stay unmapped from here on, so no
+        First clears the ``failed`` EP ranks from the device mask, whose rows stay unmapped from here on, so no
         collective reaches them even before :meth:`install_mask` publishes the committed membership.
         """
         words = list(self.health.get_mask_words())
-        departed = set(departed)
-        if any(ep_rank in departed for ep_rank, _ in self._layers):
+        failed = set(failed)
+        if any(ep_rank in failed for ep_rank, _ in self._layers):
             raise RuntimeError(
-                f"This rank cannot release its own workspaces as departed: {sorted(departed)}"
+                f"This rank cannot release its own workspaces as failed: {sorted(failed)}"
             )
-        for rank in departed:
+        for rank in failed:
             words[rank >> 6] &= ~(1 << (rank & 63))
         torch.cuda.synchronize(self.active_rank_mask.device)
         self.active_rank_mask.copy_(torch.tensor(words, dtype=torch.uint64))
@@ -131,7 +131,7 @@ class MoeExecutionState:
         """Back every bound workspace with fresh pages at the same addresses, shared only among the ranks ``gather``
         reaches, and reset this rank's rows as at startup.
 
-        A departed rank keeps mappings only to the released pages, so its late writes cannot reach the fresh ones.
+        A failed rank keeps mappings only to the released pages, so its late writes cannot reach the fresh ones.
         Its rows stay unmapped; the installed mask keeps every collective off them. Collective over the live ranks,
         each after its :meth:`release_workspaces`; layers bind in the same order on every rank, so the workspaces
         remap in the same order too.
@@ -163,7 +163,7 @@ class MoeExecutionState:
     def request_abort(self) -> None:
         """Make running and future collectives of this state return without peers.
 
-        Kernels poll the request while they wait, so collectives stuck on a lost
+        Kernels poll the request while they wait, so collectives stuck on a failed
         peer finish and record a cancelled status; their outputs are invalid.
         A plain host store: it never waits for the GPU.
         """

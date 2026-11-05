@@ -124,8 +124,8 @@ def test_records_and_install_mask() -> None:
     assert state.active_rank_mask.cpu().tolist() == [1, 0, 0, 0]
 
 
-def test_abort_rearm_and_exclusion_resume_after_peer_lost_mid_collective() -> None:
-    """Can a dispatch stuck on a lost peer be aborted from another thread, and the next round
+def test_abort_rearm_and_exclusion_resume_after_peer_failure_mid_collective() -> None:
+    """Can a dispatch stuck on a failed peer be aborted from another thread, and the next round
     run on the same workspace after rearming and excluding that peer?"""
     # The dispatch waits for logical rank 1's completion flag until the abort arrives.
     workspace, meta, experts, payload = _collective_inputs()
@@ -162,13 +162,13 @@ def test_abort_rearm_and_exclusion_resume_after_peer_lost_mid_collective() -> No
         time.sleep(0.01)
     assert state.abort.cpu().tolist() == [1, 1]
     assert state.aborted()
-    # This rank's own rows arrived before it waited for the lost peer: every token goes to expert 0 on
+    # This rank's own rows arrived before it waited for the failed peer: every token goes to expert 0 on
     # rank 0, so they are the payload's rows in an order the dispatch assigns.
     own_rows = received[0].float()
     torch.testing.assert_close(own_rows[own_rows[:, 0].argsort()], payload.float(), rtol=0, atol=0)
     assert torch.count_nonzero(output) == 0
-    # The released dispatch marks the round, so the combine published no readiness: a peer that
-    # did not abort cannot combine outputs computed without the lost peer's rows.
+    # The aborted dispatch marks the round incomplete, so the combine published no readiness: a peer that
+    # did not abort cannot combine outputs computed without the failed peer's rows.
     assert _workspace_word(workspace, meta, 0, "FLAG_VAL", 1) == 1
     assert _workspace_word(workspace, meta, 1, "COMBINE_COMPLETION_FLAGS", 0) == 0
 
@@ -207,7 +207,7 @@ def test_bind_execution_state_pins_workspace_once() -> None:
 
 
 def test_workspaces_release_and_remap_in_binding_order_then_reset() -> None:
-    """Every retained workspace releases its backing, once the departed ranks are off the device mask, then
+    """Every retained workspace releases its backing, once the failed ranks are off the device mask, then
     remaps through the survivors' gather and resets."""
     state = MoeExecutionState(EPGroupHealth(66), torch.device("cuda"))
     calls = []
@@ -240,7 +240,7 @@ def test_workspaces_release_and_remap_in_binding_order_then_reset() -> None:
     state.close()
 
 
-def test_a_rank_does_not_release_its_own_workspaces_as_departed() -> None:
+def test_a_rank_does_not_release_its_own_workspaces_as_failed() -> None:
     state = MoeExecutionState(EPGroupHealth(4), torch.device("cuda"))
     state.track_layer(2, lambda: None)
     try:

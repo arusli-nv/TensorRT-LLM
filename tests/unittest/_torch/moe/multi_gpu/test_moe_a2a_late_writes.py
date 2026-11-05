@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""A lost EP peer's late writes land only on pages the survivors no longer map.
+"""A failed EP peer's late writes land only on pages the survivors no longer map.
 
 Two processes share a real MNNVL MoE All-to-All workspace under bound execution. The victim, rank 1,
 keeps pushing dispatches into the survivor's workspace row. Its token count differs from the survivor's,
 so its rows of the packed layout (source s's rows at [s * T, (s + 1) * T) for runtime token count T)
 fall on the survivor's own rows. The survivor, rank 0, aborts the dispatch that waits on the victim,
 releases the workspace's backing and remaps fresh pages at the same addresses shared only with itself,
-as peer-loss recovery does, then rearms and installs a membership without the victim. Its CUDA graph
-captured before the loss then returns exact results while the victim, killed or still writing, reaches
+as rank failure recovery does, then rearms and installs a membership without the victim. Its CUDA graph
+captured before the failure then returns exact results while the victim, killed or still writing, reaches
 none of its bytes.
 
 ``no-remap`` is the negative control: without the remap the victim's writes reach the survivor's live
@@ -135,7 +135,7 @@ def _survivor(
     experts = torch.zeros((_CAPACITY, 1), dtype=torch.int32, device="cuda")
     payload = torch.empty((_CAPACITY, _HIDDEN), dtype=torch.bfloat16, device="cuda")
 
-    # Captured with full membership; replayed only after the victim is lost.
+    # Captured with full membership; replayed only after the victim failed.
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -159,8 +159,8 @@ def _survivor(
     store.wait(["proceed"])
 
     # The victim's first dispatch published its round-1 flag, with its complete rows, before its pending abort
-    # released it, so the survivor's next dispatch completes on that flag. The combine after it waits for the
-    # lost victim, which publishes no further flag, until recovery aborts it.
+    # left the round incomplete, so the survivor's next dispatch completes on that flag. The combine after it
+    # waits for the failed victim, which publishes no further flag, until recovery aborts it.
     done = torch.cuda.Event()
     eager, eager_offset, _ = _dispatch(
         workspace, meta, _SURVIVOR, experts, [payload], _CAPACITY, mask, abort
@@ -171,7 +171,7 @@ def _survivor(
     torch.ops.trtllm.moe_a2a_combine(*eager_args, eager_offset, False, **_controls(mask, abort))
     done.record()
     time.sleep(0.2)
-    assert not done.query(), "combine completed without the lost victim"
+    assert not done.query(), "combine completed without the failed victim"
     state.request_abort()
     deadline = time.monotonic() + 10
     while not done.query():
@@ -229,7 +229,7 @@ def _survivor(
         assert torch.equal(tokens.sort().values, torch.arange(_CAPACITY, device="cuda"))
         assert torch.equal(rows, payload[tokens]), "a received row differs from its token's row"
         assert torch.all(received[1][_SURVIVOR] == 0)
-        # Nothing writes the lost victim's rows: they keep the reset's zeros.
+        # Nothing writes the failed victim's rows: they keep the reset's zeros.
         assert torch.count_nonzero(received[0][_VICTIM]) == 0
         assert torch.count_nonzero(received[1][_VICTIM]) == 0
         assert abort.tolist() == [0, 0]
@@ -270,7 +270,7 @@ def _worker(rank: int, port: int, mode: str) -> None:
         ("no-remap", None),
     ],
 )
-def test_lost_peer_late_writes_land_only_on_orphaned_pages(
+def test_failed_peer_late_writes_land_only_on_orphaned_pages(
     mode: str, kill_delay_s: float | None
 ) -> None:
     """After the remap the survivor's results stay exact and none of its bytes change, whether the victim was

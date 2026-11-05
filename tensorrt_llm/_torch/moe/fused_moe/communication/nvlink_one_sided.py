@@ -48,7 +48,7 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (
     cuda,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
-from tensorrt_llm._utils import peer_loss_recovery_enabled
+from tensorrt_llm._utils import rank_failure_recovery_enabled
 from tensorrt_llm.bindings import BuildInfo
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
@@ -140,10 +140,10 @@ def _cft_device_support_reason() -> str | None:
 
 def select_cft_counted_writes(force_cft: bool | None) -> bool:
     """Resolve CFT availability identically for workspace sizing and construction."""
-    if force_cft is not True and peer_loss_recovery_enabled():
+    if force_cft is not True and rank_failure_recovery_enabled():
         tllm_logger.warning_once(
-            "CFT counted writes disabled: WideEP peer-loss recovery runs on the fence path.",
-            key="moe_a2a_cft_peer_loss_recovery",
+            "CFT counted writes disabled: WideEP rank failure recovery runs on the fence path.",
+            key="moe_a2a_cft_rank_failure_recovery",
         )
         return False
     if not BuildInfo.CFT_COUNTED_WRITES:
@@ -452,7 +452,7 @@ class NVLinkOneSided(Communication):
                 The watchdog observes the eager launches of an unbound layer. A layer bound to a
                 ``MoeExecutionState`` reads the state's mask and abort records instead, so CUDA graphs captured after
                 the bind follow every later membership change; its launches, eager or replayed, rely on the abort
-                record, set by peer-loss detection, and on the device timeout instead of the watchdog.
+                record, set by rank failure detection, and on the device timeout instead of the watchdog.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -1120,8 +1120,8 @@ class NVLinkOneSided(Communication):
             )
         )
         # The host watchdog tracks each eager call, but replayed CUDA graphs skip
-        # this code: bound execution relies on the abort record, set by peer-loss
-        # detection, and on the device timeout instead.
+        # this code: bound execution relies on the abort record, set by rank
+        # failure detection, and on the device timeout instead.
         if state is None:
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "dispatch", active_rank_mask

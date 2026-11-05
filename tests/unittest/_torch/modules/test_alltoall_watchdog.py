@@ -208,7 +208,7 @@ def test_wide_ep_ft_options_allow_cuda_graphs_only_with_recovery(
     import tensorrt_llm._torch.moe.fused_moe.wide_ep_ft as wide_ep_ft
 
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
-    monkeypatch.setattr(wide_ep_ft, "peer_loss_recovery_enabled", lambda: recovery)
+    monkeypatch.setattr(wide_ep_ft, "rank_failure_recovery_enabled", lambda: recovery)
     model_config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(moe_ep_size=4),

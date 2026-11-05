@@ -1150,11 +1150,11 @@ def test_dispatch_through_slot_table(mode: str) -> None:
 # ============================================================================
 
 
-def _run_bind_layers_worker(dead_rank: int | None) -> dict:
+def _run_bind_layers_worker(failed_rank: int | None) -> dict:
     """Bind an NVFP4-shaped and a BF16-shaped layer sharing one workspace to an execution state, and
     round-trip each through the dispatch region, before and after a rearm.
 
-    With ``dead_rank``, that rank then stops taking part in the all-to-all, and the others mark it failed,
+    With ``failed_rank``, that rank then stops taking part in the all-to-all, and the others mark it failed,
     rearm, install the membership without it, and round-trip among themselves."""
     # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
     import os
@@ -1239,7 +1239,7 @@ def _run_bind_layers_worker(dead_rank: int | None) -> dict:
             for s, source in enumerate(sources):
                 if s not in live:
                     # Its rows from earlier rounds are stale: the masked source routes none of them.
-                    check(bool((ids[s] == -1).all()), f"{name} rows of the dead rank {s} routed")
+                    check(bool((ids[s] == -1).all()), f"{name} rows of the failed rank {s} routed")
                     continue
                 sent = source[0][:, 0] // slots_per_rank == rank
                 n = int(sent.sum())
@@ -1286,10 +1286,10 @@ def _run_bind_layers_worker(dead_rank: int | None) -> dict:
         round_trips(short, 3, everyone)
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        if dead_rank is not None:
-            # The dead rank's rows of the earlier rounds stay in the survivors' receive buffers.
-            live = [r for r in everyone if r != dead_rank]
-            health.mark_failed(dead_rank)
+        if failed_rank is not None:
+            # The failed rank's rows of the earlier rounds stay in the live ranks' receive buffers.
+            live = [r for r in everyone if r != failed_rank]
+            health.mark_failed(failed_rank)
             if rank in live:
                 state.rearm()
             MPI.COMM_WORLD.Barrier()
@@ -1307,20 +1307,20 @@ def _run_bind_layers_worker(dead_rank: int | None) -> dict:
             comm.destroy()
 
 
-@pytest.mark.parametrize("ep_size,dead_rank", [(2, None), (4, 1)])
+@pytest.mark.parametrize("ep_size,failed_rank", [(2, None), (4, 1)])
 def test_bound_layers_of_two_signatures_round_trip_on_one_workspace(
-    ep_size: int, dead_rank: int | None
+    ep_size: int, failed_rank: int | None
 ) -> None:
     """Bound layers with an NVFP4 and a BF16 payload signature share one workspace, and bound dispatch + combine
     of both return exact results, before and after a rearm.
 
-    With a dead middle rank, the survivors' rows land at s * rows + i with exact values, the dead rank's rows
+    With a failed middle rank, the live ranks' rows land at s * rows + i with exact values, the failed rank's rows
     carry expert -1, and combine returns exact results without it."""
     if torch.cuda.device_count() < ep_size:
         pytest.skip(f"requires {ep_size} GPUs")
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
     try:
-        results = list(executor.map(_run_bind_layers_worker, [dead_rank] * ep_size))
+        results = list(executor.map(_run_bind_layers_worker, [failed_rank] * ep_size))
         skipped = [r["skip"] for r in results if "skip" in r]
         if skipped:
             pytest.skip(skipped[0])
