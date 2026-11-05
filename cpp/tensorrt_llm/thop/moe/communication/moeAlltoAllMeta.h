@@ -98,7 +98,7 @@ enum MoeA2AMetaInfoIndex : int64_t
     WORKSPACE_SIZE_INDEX = 24,
     // uint32_t scalar after the flag value, only in rank-mask layouts (0 otherwise): nonzero once a dispatch on
     // this rank returned without some active source's data (see MoeA2AAbortState); reset with the workspace.
-    RELEASED_ROUND_OFFSET_INDEX = 25,
+    INCOMPLETE_ROUND_OFFSET_INDEX = 25,
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
     NUM_METAINFO_FIELDS = 26
 };
@@ -135,7 +135,7 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
         {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
         {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
-        {"MOE_A2A_RELEASED_ROUND_OFFSET_INDEX", RELEASED_ROUND_OFFSET_INDEX},
+        {"MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX", INCOMPLETE_ROUND_OFFSET_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},

@@ -738,8 +738,8 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
 
 
 @pytest.mark.parametrize("cft", [False, True])
-def test_only_rank_mask_layouts_reserve_the_released_round(cft: bool) -> None:
-    """Only rank-mask layouts reserve the released-round word, a control word next to the flag value."""
+def test_only_rank_mask_layouts_reserve_the_incomplete_round(cft: bool) -> None:
+    """Only rank-mask layouts reserve the incomplete-round word, a control word next to the flag value."""
     from tensorrt_llm.bindings import internal as _tllm_internal
 
     thop = _tllm_internal.thop
@@ -750,10 +750,10 @@ def test_only_rank_mask_layouts_reserve_the_released_round(cft: bool) -> None:
     args = (8, 6, 128, 7168, torch.bfloat16, None, 0, cft, False)
     plain = NVLinkOneSided._make_workspace_layout(*args)
     masked = NVLinkOneSided._make_workspace_layout(*args, rank_mask=True)
-    assert field(plain, "RELEASED_ROUND_OFFSET_INDEX") == 0
-    released = field(masked, "RELEASED_ROUND_OFFSET_INDEX")
-    assert released == field(masked, "FLAG_VAL_OFFSET_INDEX") + 4
-    assert released + 4 <= field(masked, "LOCAL_TOKEN_COUNTER_OFFSET_INDEX")
+    assert field(plain, "INCOMPLETE_ROUND_OFFSET_INDEX") == 0
+    incomplete = field(masked, "INCOMPLETE_ROUND_OFFSET_INDEX")
+    assert incomplete == field(masked, "FLAG_VAL_OFFSET_INDEX") + 4
+    assert incomplete + 4 <= field(masked, "LOCAL_TOKEN_COUNTER_OFFSET_INDEX")
     assert field(masked, "WORKSPACE_SIZE_INDEX") % 256 == 0
     for size in (
         "DISPATCH_PAYLOAD_SIZE_INDEX",

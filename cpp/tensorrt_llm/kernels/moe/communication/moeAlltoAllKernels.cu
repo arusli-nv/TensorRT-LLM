@@ -708,7 +708,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             uint32_t const expected_value = *ptrs.flag_val;
             // Whether a dispatch on this rank returned without some active source's data since the workspace reset
             // (it then publishes no round flag, see MoeA2AAbortState). Written and read in stream-ordered kernels.
-            bool const released = ENABLE_RANK_MASK && *ptrs.released_round != 0;
+            bool const incomplete = ENABLE_RANK_MASK && *ptrs.incomplete_round != 0;
 
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
@@ -753,7 +753,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 {
                     if constexpr (ENABLE_RANK_MASK)
                     {
-                        *ptrs.released_round = 1;
+                        *ptrs.incomplete_round = 1;
                     }
                     return;
                 }
@@ -1279,7 +1279,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
-    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.released_round != nullptr,
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.incomplete_round != nullptr,
         "rank-mask mode needs a workspace laid out with rank_mask");
 
     // Prepare kernel pointers struct
@@ -1312,7 +1312,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.le_dispatch_counters[i] = params.le_dispatch_counters[i];
     }
     kernel_ptrs.flag_val = params.flag_val;
-    kernel_ptrs.released_round = params.released_round;
+    kernel_ptrs.incomplete_round = params.incomplete_round;
 
     // Copy communication tracking pointers
     kernel_ptrs.send_counters = params.send_counters;
@@ -1826,7 +1826,7 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         int lane_id = threadIdx.x % warpSize;
         uint32_t const expected_value = *ptrs.flag_val;
         // See the dispatch kernel.
-        bool const released = ENABLE_RANK_MASK && *ptrs.released_round != 0;
+        bool const incomplete = ENABLE_RANK_MASK && *ptrs.incomplete_round != 0;
 
         if (blockIdx.x == 0)
         {
@@ -2236,7 +2236,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
-    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.released_round != nullptr,
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.incomplete_round != nullptr,
         "rank-mask mode needs a workspace laid out with rank_mask");
 
     // ---- CFT combine path (one block per token). ----
@@ -2258,7 +2258,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             kp.completion_flags[i] = params.completion_flags[i];
         }
         kp.flag_val = params.flag_val;
-        kp.released_round = params.released_round;
+        kp.incomplete_round = params.incomplete_round;
         kp.topk_target_ranks = params.topk_target_ranks;
         kp.topk_target_indices = params.topk_target_indices;
 
@@ -2319,7 +2319,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kernel_ptrs.completion_flags[i] = params.completion_flags[i];
     }
     kernel_ptrs.flag_val = params.flag_val;
-    kernel_ptrs.released_round = params.released_round;
+    kernel_ptrs.incomplete_round = params.incomplete_round;
 
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
