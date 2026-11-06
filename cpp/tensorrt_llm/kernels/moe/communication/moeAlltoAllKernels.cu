@@ -708,7 +708,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             uint32_t const expected_value = *ptrs.flag_val;
             // Whether a dispatch on this rank returned without some active source's data since the workspace reset
             // (it then publishes no round flag, see MoeA2AAbortState). Written and read in stream-ordered kernels.
-            bool const incomplete = ENABLE_RANK_MASK && *ptrs.incomplete_round != 0;
+            // Only a workspace laid out with rank_mask has the word; without it no dispatch can return early.
+            bool const incomplete = ENABLE_RANK_MASK && ptrs.incomplete_round != nullptr && *ptrs.incomplete_round != 0;
 
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
@@ -1279,8 +1280,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
-    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.incomplete_round != nullptr,
-        "rank-mask mode needs a workspace laid out with rank_mask");
+    TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
+        "an abort record needs a workspace laid out with rank_mask");
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -1826,7 +1827,7 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         int lane_id = threadIdx.x % warpSize;
         uint32_t const expected_value = *ptrs.flag_val;
         // See the dispatch kernel.
-        bool const incomplete = ENABLE_RANK_MASK && *ptrs.incomplete_round != 0;
+        bool const incomplete = ENABLE_RANK_MASK && ptrs.incomplete_round != nullptr && *ptrs.incomplete_round != 0;
 
         if (blockIdx.x == 0)
         {
@@ -2236,8 +2237,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
-    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.incomplete_round != nullptr,
-        "rank-mask mode needs a workspace laid out with rank_mask");
+    TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
+        "an abort record needs a workspace laid out with rank_mask");
 
     // ---- CFT combine path (one block per token). ----
     // Bypasses the base fence combine below entirely. The CFT push is launched separately by
