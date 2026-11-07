@@ -38,15 +38,21 @@ nodes of one NVLink domain. Without either, ``create`` returns None and callers 
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+import time
+from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
 from ..modules.fla.op import gdc_wait_with_memory_clobber
+
+if TYPE_CHECKING:
+    from .mnnvl_memory import MnnvlRows
 
 # Fewest rows (keys) per rank and launch a TPKeyExchange is built for.
 _MIN_MAX_ROWS = 512
@@ -1324,6 +1330,165 @@ def get_tp_group_exchange(
             f"{'LL exchange over ' + ex.transport if ex is not None else 'unavailable'}"
         )
     return _GROUP_EXCHANGES[key]
+
+
+class TPHostExchange:
+    """All-to-all of byte strings between the host processes of a TP group, over one row of MNNVL memory per rank.
+
+    The same LL protocol as the kernels above, driven by the host through the GPU's copy engines: a payload travels
+    as 8-byte packets ``(epoch << 32) | word`` that the sender copies into its receive slot in every rank's buffer;
+    a receiver copies its own buffer to pinned host memory until every packet of every sender carries the current
+    epoch. Each exchange advances the epoch and uses one of two slot sets chosen by its parity, so, as for the
+    kernels, a rank never overwrites a slot a slower rank still reads: every exchange waits for every rank.
+
+    A sender's first packet holds its payload's length. Payloads longer than one slot take several rounds; the first
+    round's lengths tell every rank how many rounds follow. Every rank calls :meth:`exchange` in step, like any
+    collective. No kernel runs, so the exchange never competes with the model for SMs.
+    """
+
+    # Bytes of payload per slot and round; larger payloads take more rounds.
+    DEFAULT_SLOT_PAYLOAD_BYTES = 8192
+    # Polls that spin before the wait starts sleeping (an idle rank parks here until the next request).
+    _SPIN_POLLS = 64
+    _MAX_SLEEP_S = 1e-3
+
+    def __init__(self, rank: int, nranks: int, rows: MnnvlRows, slot_payload_bytes: int):
+        from .mnnvl_memory import _check_cu_result, cuda
+
+        self._cuda = cuda
+        self._check_cu = _check_cu_result
+        self.rank = rank
+        self.nranks = nranks
+        self.rows = rows
+        self._words = slot_payload_bytes // 4
+        self._slot_bytes = 8 * (1 + self._words)
+        self._parity_bytes = nranks * self._slot_bytes
+        self._epoch = 0  # epoch 0 is never sent: the buffers start zeroed
+        self._stream = torch.cuda.Stream()
+        # One copy of the outgoing slot per peer: a 2D copy needs a source pitch of at least its width.
+        self._send = self._pinned((nranks, 1 + self._words))
+        self._recv = self._pinned((nranks, 1 + self._words))
+
+    @staticmethod
+    def _pinned(shape: Tuple[int, int]) -> np.ndarray:
+        """A host array of uint64 packets, pinned unless pinning does not help (Confidential Compute)."""
+        return (
+            torch.empty(shape, dtype=torch.int64, pin_memory=prefer_pinned())
+            .numpy()
+            .view(np.uint64)
+        )
+
+    @staticmethod
+    def buffer_bytes(nranks: int, slot_payload_bytes: int) -> int:
+        return 2 * nranks * 8 * (1 + slot_payload_bytes // 4)
+
+    @classmethod
+    def create(
+        cls, mapping, slot_payload_bytes: int = DEFAULT_SLOT_PAYLOAD_BYTES
+    ) -> "TPHostExchange":
+        """Collective over the TP group, which must have MNNVL memory."""
+        from .mnnvl_memory import MnnvlRows, TpMnnvlMemory
+
+        if slot_payload_bytes % 4:
+            raise ValueError(
+                f"slot_payload_bytes must be a multiple of 4, got {slot_payload_bytes}"
+            )
+        comm = TpMnnvlMemory.get_comm(mapping)
+        rows = MnnvlRows(
+            mapping.tp_rank,
+            mapping.tp_size,
+            cls.buffer_bytes(mapping.tp_size, slot_payload_bytes),
+            comm.allgather,
+        )
+        comm.barrier()  # every row is zeroed before any rank writes into it
+        return cls(mapping.tp_rank, mapping.tp_size, rows, slot_payload_bytes)
+
+    def close(self) -> None:
+        self.rows.close()
+
+    def exchange(
+        self, payload: bytes, readers: Optional[Sequence[int]] = None
+    ) -> list[Optional[bytes]]:
+        """Send ``payload`` to every rank and return every rank's payload, in rank order.
+
+        ``readers``: the ranks whose payloads this rank needs (default all); the others come back as None, and their
+        data is not copied to the host.
+        """
+        readers = range(self.nranks) if readers is None else readers
+        lengths, first = self._round(payload[: 4 * self._words], len(payload), readers)
+        received = {r: [first[r]] for r in readers}
+        rounds = max(-(-n // (4 * self._words)) for n in lengths)
+        for k in range(1, rounds):
+            chunk = payload[4 * self._words * k : 4 * self._words * (k + 1)]
+            _, parts = self._round(chunk, len(chunk), readers)
+            for r in readers:
+                received[r].append(parts[r])
+        return [
+            b"".join(received[r])[: lengths[r]] if r in received else None
+            for r in range(self.nranks)
+        ]
+
+    def _round(self, chunk: bytes, length: int, readers) -> Tuple[list, dict]:
+        """One exchange of up to one slot per rank: returns every rank's header word and the readers' chunks."""
+        cuda = self._cuda
+        self._epoch = (
+            self._epoch % 0xFFFFFFFE + 1
+        )  # wraps from an even epoch to 1, keeping the parity alternating
+        tag = np.uint64(self._epoch) << np.uint64(32)
+        parity_offset = (self._epoch & 1) * self._parity_bytes
+        mine = parity_offset + self.rank * self._slot_bytes
+        words = np.frombuffer(chunk + b"\0" * (-len(chunk) % 4), dtype=np.uint32)
+        packets = self._send[:, : 1 + words.size]
+        packets[:, 0] = tag | np.uint64(length)
+        packets[:, 1:] = tag | words.astype(np.uint64)
+        copy = cuda.CUDA_MEMCPY2D()
+        copy.srcMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_HOST
+        copy.srcHost, copy.srcPitch = self._send.ctypes.data, self._slot_bytes
+        copy.dstMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_DEVICE
+        copy.dstDevice, copy.dstPitch = self.rows.ptr + mine, self.rows.stride
+        copy.WidthInBytes, copy.Height = 8 * (1 + words.size), self.nranks
+        self._check_cu(cuda.cuMemcpy2DAsync(copy, self._stream.cuda_stream))
+        local = self.rows.row(self.rank) + parity_offset
+        headers = self._wait(local, [1] * self.nranks)
+        lengths = [int(h & np.uint64(0xFFFFFFFF)) for h in headers[:, 0]]
+        # A header holds the sender's total length in the first round and its chunk's length in later ones.
+        packets_per_rank = [0] * self.nranks
+        for r in readers:
+            packets_per_rank[r] = 1 + min(self._words, -(-lengths[r] // 4))
+        if max(packets_per_rank) <= 1:
+            return lengths, {r: b"" for r in readers}
+        rows = self._wait(local, packets_per_rank)
+        parts = {
+            r: (rows[r, 1 : packets_per_rank[r]] & np.uint64(0xFFFFFFFF))
+            .astype(np.uint32)
+            .tobytes()
+            for r in readers
+        }
+        return lengths, parts
+
+    def _wait(self, local: int, packets_per_rank: Sequence[int]) -> np.ndarray:
+        """Copy the slots to the host until the first ``packets_per_rank[r]`` packets of each rank r carry the
+        current epoch (0: rank r is not waited for)."""
+        cuda = self._cuda
+        width = max(packets_per_rank)
+        copy = cuda.CUDA_MEMCPY2D()
+        copy.srcMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_DEVICE
+        copy.srcDevice, copy.srcPitch = local, self._slot_bytes
+        copy.dstMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_HOST
+        copy.dstHost, copy.dstPitch = self._recv.ctypes.data, self._slot_bytes
+        copy.WidthInBytes, copy.Height = 8 * width, self.nranks
+        rows = self._recv[:, :width]
+        wanted = np.arange(width) < np.asarray(packets_per_rank)[:, None]
+        polls, sleep_s = 0, 1e-6
+        while True:
+            self._check_cu(cuda.cuMemcpy2DAsync(copy, self._stream.cuda_stream))
+            self._stream.synchronize()
+            if ((rows >> np.uint64(32)) == self._epoch)[wanted].all():
+                return rows
+            polls += 1
+            if polls > self._SPIN_POLLS:
+                time.sleep(sleep_s)
+                sleep_s = min(2 * sleep_s, self._MAX_SLEEP_S)
 
 
 _EXCHANGES: Dict[tuple, Optional[TPKeyExchange]] = {}

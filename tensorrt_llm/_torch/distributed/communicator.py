@@ -34,12 +34,14 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
-from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
-                                 mpi_comm, mpi_disabled, mpi_isend,
-                                 mpi_isend_object, mpi_recv, mpi_recv_object,
-                                 mpi_send, mpi_send_object, mpi_world_size,
-                                 prefer_pinned, torch_pybind11_abi)
+from tensorrt_llm._torch.distributed.mnnvl_memory import (MnnvlMemory,
+                                                          init_helix_cp_comm)
+from tensorrt_llm._utils import (fault_tolerance_mode, local_mpi_size,
+                                 mpi_allgather, mpi_barrier, mpi_comm,
+                                 mpi_disabled, mpi_isend, mpi_isend_object,
+                                 mpi_recv, mpi_recv_object, mpi_send,
+                                 mpi_send_object, mpi_world_size, prefer_pinned,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -112,8 +114,9 @@ class Distributed(ABC):
     def get(mapping: Mapping) -> "Distributed":
         if mpi_disabled():
             return TorchDist(mapping)
-        else:
-            return MPIDist(mapping)
+        if fault_tolerance_mode() and MnnvlDist.supports(mapping):
+            return MnnvlDist(mapping)
+        return MPIDist(mapping)
 
     @property
     def rank(self):
@@ -949,6 +952,125 @@ class MPIDist(Distributed):
         if self.cp_size > 1:
             buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
         return buf
+
+
+class MnnvlDist(MPIDist):
+    """``MPIDist`` whose host collectives go through MNNVL memory instead of MPI.
+
+    Used with WideEP fault tolerance on pure attention-DP layouts, where the TP
+    group spans the world. The collectives run as rounds of a
+    ``TPHostExchange``: every rank copies its payload into every rank's receive
+    buffer and reads its own, with no MPI call. The host exchange buffers are
+    allocated on the first collective, which every rank reaches in step.
+    Methods not overridden here, such as point-to-point calls and the PP/CP
+    groups, stay on MPI.
+    """
+
+    _REDUCE = {
+        ReduceOp.SUM: lambda a, b: a + b,
+        ReduceOp.PRODUCT: lambda a, b: a * b,
+        ReduceOp.MIN: min,
+        ReduceOp.MAX: max,
+        ReduceOp.BAND: lambda a, b: a & b,
+        ReduceOp.BOR: lambda a, b: a | b,
+        ReduceOp.BXOR: lambda a, b: a ^ b,
+    }
+
+    def __init__(self, mapping: Mapping):
+        super().__init__(mapping)
+        self._host_exchange = None
+
+    @staticmethod
+    def supports(mapping: Mapping) -> bool:
+        """Whether the layout is pure attention DP (one TP group over the world)
+        on GPUs with MNNVL memory."""
+        return (mapping.enable_attention_dp and mapping.pp_size == 1
+                and mapping.cp_size == 1
+                and mapping.tp_size == mapping.world_size
+                and MnnvlMemory.supports_mnnvl())
+
+    def _exchange(self, obj, readers=None) -> list:
+        """Every rank's pickled ``obj`` (only ``readers``' are unpickled)."""
+        if self._host_exchange is None:
+            from .ll_exchange import TPHostExchange
+            self._host_exchange = TPHostExchange.create(self.mapping)
+        payloads = self._host_exchange.exchange(pickle.dumps(obj), readers)
+        return [
+            None if payload is None else pickle.loads(payload)  # nosec B301
+            for payload in payloads
+        ]
+
+    def broadcast(self,
+                  obj,
+                  root=0,
+                  chunk_size: int = 4 * 1024 * 1024,
+                  prefer_cpu=False):
+        if self.mapping.tp_rank == root:
+            self._exchange(obj, readers=())
+            return obj
+        return self._exchange(None, readers=(root, ))[root]
+
+    def broadcast_or_none(self, obj, root=0):
+        return self.broadcast(obj, root)
+
+    def allgather(self, obj):
+        return self._exchange(obj)
+
+    def barrier(self):
+        self._exchange(None, readers=())
+
+    def tp_barrier(self):
+        self.barrier()
+
+    def tp_allgather(self,
+                     obj,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     *,
+                     small_payload: bool = False):
+        return self._exchange(obj)
+
+    def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+        if self.mapping.tp_rank != root:
+            self._exchange(obj, readers=())
+            return None
+        return self._exchange(obj)
+
+    def tp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
+        return self.broadcast(obj, root)
+
+    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        _check_reduce_op(op)
+        values = self._exchange(obj)
+        result = values[0]
+        for value in values[1:]:
+            result = self._REDUCE[op](result, value)
+        return result
+
+    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        return self.allreduce(obj, op)
+
+    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        row = np.ascontiguousarray(
+            np.asarray(values, dtype=np.int64).reshape(-1))
+        return np.stack(self._exchange(row))
+
+    def broadcast_int64(self,
+                        values: ArrayLike,
+                        root: int = 0,
+                        *,
+                        prefer_cpu: bool = False) -> np.ndarray:
+        row = np.ascontiguousarray(
+            np.asarray(values, dtype=np.int64).reshape(-1))
+        return self.broadcast(row, root)
+
+    def tp_cp_broadcast_int64(self,
+                              values: ArrayLike,
+                              root: int = 0) -> np.ndarray:
+        return self.broadcast_int64(values, root)
 
 
 class MultiHandleWrapper:

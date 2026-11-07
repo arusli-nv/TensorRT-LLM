@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol
 
 import pynvml
 import torch
@@ -1150,6 +1150,69 @@ class TpMnnvlMemory(MnnvlMemory):
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.tp_rank,
         )
+
+
+class MnnvlRows:
+    """One row of MNNVL memory per rank, every row mapped in every process at ``ptr + r * stride``.
+
+    Each process allocates its own row and maps the others from their exported handles, back to back with no
+    unmapped gap, so one strided copy can reach every row. A row whose process is gone stays mapped (its memory
+    lives while any process maps it), and :meth:`replace_row` maps a new process's row in its place.
+    """
+
+    def __init__(
+        self, rank: int, nranks: int, nbytes: int, allgather: Callable[[bytes], List[bytes]]
+    ):
+        """Collective: ``allgather`` exchanges the rows' handles in rank order."""
+        dev_id = torch.cuda.current_device()
+        self._prop = MnnvlMemory.get_allocation_prop(dev_id)
+        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
+        self.rank = rank
+        self.stride = granularity * -(-nbytes // granularity)
+        own = _check_cu_result(cuda.cuMemCreate(self.stride, self._prop, 0))
+        exported = _check_cu_result(
+            cuda.cuMemExportToShareableHandle(own, self._prop.requestedHandleTypes, 0)
+        )
+        self.handle_bytes = bytes(exported.data)
+        self.ptr = int(
+            _check_cu_result(cuda.cuMemAddressReserve(nranks * self.stride, granularity, 0, 0))
+        )
+        self._handles = [None] * nranks
+        for r, handle in enumerate(allgather(self.handle_bytes)):
+            self._map(r, own if r == rank else self._import(handle))
+        _check_cu_result(cuda.cuMemsetD8(self.row(rank), 0, self.stride))
+        torch.cuda.synchronize()
+
+    def row(self, rank: int) -> int:
+        return self.ptr + rank * self.stride
+
+    def replace_row(self, rank: int, handle_bytes: bytes) -> None:
+        """Map the row a new process for ``rank`` exported, in place of its old row."""
+        self._unmap(rank)
+        self._map(rank, self._import(handle_bytes))
+
+    def close(self) -> None:
+        for r in range(len(self._handles)):
+            self._unmap(r)
+        _check_cu_result(cuda.cuMemAddressFree(self.ptr, len(self._handles) * self.stride))
+
+    def _import(self, handle_bytes: bytes):
+        return _check_cu_result(
+            cuda.cuMemImportFromShareableHandle(handle_bytes, self._prop.requestedHandleTypes)
+        )
+
+    def _map(self, rank: int, handle) -> None:
+        _check_cu_result(cuda.cuMemMap(self.row(rank), self.stride, 0, handle, 0))
+        access = cuda.CUmemAccessDesc()
+        access.location = self._prop.location
+        access.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        _check_cu_result(cuda.cuMemSetAccess(self.row(rank), self.stride, [access], 1))
+        self._handles[rank] = handle
+
+    def _unmap(self, rank: int) -> None:
+        _check_cu_result(cuda.cuMemUnmap(self.row(rank), self.stride))
+        _check_cu_result(cuda.cuMemRelease(self._handles[rank]))
+        self._handles[rank] = None
 
 
 def init_helix_cp_comm(mapping: Mapping) -> None:

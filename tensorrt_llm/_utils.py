@@ -513,6 +513,11 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
+def fault_tolerance_mode() -> bool:
+    """True if WideEP fault tolerance is on (TLLM_FAULT_TOLERANCE_MODE is "1")."""
+    return os.environ.get("TLLM_FAULT_TOLERANCE_MODE") == "1"
+
+
 def mpi_rank():
     if mpi_disabled():
         try:
