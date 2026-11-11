@@ -23,12 +23,14 @@ import os
 import pickle
 import queue
 import re
+import runpy
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from concurrent.futures import Future
 from datetime import timedelta
 from functools import partial
@@ -41,6 +43,7 @@ import pytest
 import torch
 
 from tensorrt_llm import _utils
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import membership, mnnvl_memory
 from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
 from tensorrt_llm._torch.distributed.membership import (
@@ -87,7 +90,7 @@ from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
     RankFailureRecovery,
     StartupMemory,
     check_supported,
-    check_supported_model,
+    prepare_model,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
@@ -546,19 +549,37 @@ def test_the_host_weights_already_in_dev_shm_need_no_more_room(shm_free):
         segment.unlink()
 
 
-def test_the_model_check_checks_the_room_for_the_host_weights(monkeypatch):
+def _supported_model(monkeypatch, state=None):
+    """A model the model check accepts, whose MoE layers it binds to ``state``; returns the model and the binding."""
     from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 
-    monkeypatch.setattr(MoeExecutionState, "model_comms", Mock())
-    fit = Mock(side_effect=ValueError("/dev/shm"))
-    monkeypatch.setattr(recovery_module, "_check_host_weights_fit", fit)
-    model = SimpleNamespace(model_config=SimpleNamespace(pretrained_config=SimpleNamespace()))
+    for_model = Mock(return_value=state)
+    monkeypatch.setattr(MoeExecutionState, "for_model", for_model)
+    monkeypatch.setattr(recovery_module, "_moe_execution_state", None)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.config_utils.is_hybrid_linear", lambda config: False
     )
+    model = SimpleNamespace(model_config=SimpleNamespace(pretrained_config=SimpleNamespace()))
+    return model, for_model
+
+
+def test_the_model_check_checks_the_room_for_the_host_weights(monkeypatch):
+    model, _ = _supported_model(monkeypatch)
+    fit = Mock(side_effect=ValueError("/dev/shm"))
+    monkeypatch.setattr(recovery_module, "_check_host_weights_fit", fit)
     with pytest.raises(ValueError, match="/dev/shm"):
-        check_supported_model(model)
+        prepare_model(model)
     fit.assert_called_once_with(model)
+
+
+def test_the_model_check_binds_the_moe_layers(monkeypatch):
+    """Before warmup captures the CUDA graphs that read the state's records; recovery drives that state."""
+    state = Mock()
+    model, for_model = _supported_model(monkeypatch, state)
+    monkeypatch.setattr(recovery_module, "_check_host_weights_fit", Mock())
+    prepare_model(model)
+    for_model.assert_called_once_with(model)
+    assert recovery_module._moe_execution_state is state
 
 
 # The flag reaches every process, and requests it does not support are rejected.
@@ -3043,7 +3064,8 @@ def test_a_replacement_takes_the_startup_values_rank_0_recorded(agreed_startup, 
     # Rank 0 runs each collective once.
     assert gathers == [["a", "a", "b", "b"], [[0, 0]] * WORLD, [[1, 0]] * WORLD]
     tuned = FakeProfilingCache({("gemm", 8): (0, 3, 0.1)})
-    recovery_module.adopt_tuned_tactics(tuned)  # rank 0 records its tactics and keeps them
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(profiling_cache=tuned))
+    startup_record.adopt_tuned_tactics()  # rank 0 records its tactics and keeps them
     assert tuned.cache == {("gemm", 8): (0, 3, 0.1)}
     startup_record.close()
     _replacement_of(monkeypatch, recovery_module._agreed_startup_record())
@@ -3057,7 +3079,8 @@ def test_a_replacement_takes_the_startup_values_rank_0_recorded(agreed_startup, 
     assert exited.value.code == membership.REPLACEMENT_CANNOT_START
     assert startup_record.agree("startup_group_split", gather(None)) == [[1, 0]] * WORLD
     own = FakeProfilingCache({("gemm", 8): (0, 5, 0.2), ("gemm", 16): (0, 1, 0.3)})
-    recovery_module.adopt_tuned_tactics(own)
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(profiling_cache=own))
+    startup_record.adopt_tuned_tactics()
     assert own.cache == {("gemm", 8): (0, 3, 0.1), ("gemm", 16): (0, 1, 0.3)}
     assert gathers == []
     startup_record.close()
@@ -3147,6 +3170,17 @@ def test_a_rank_turns_fault_tolerance_on_before_it_imports_the_executor(
     # The import machinery also looks up module attributes such as __path__; worker_main is what matters.
     assert ("worker_main", True) in seen
     assert ("worker_main", False) not in seen
+
+
+def test_module_entry_runs_the_imported_module(monkeypatch):
+    """``python -m`` runs the module as ``__main__``: the rank joins in the module the executor imports."""
+    worker_node_main = Mock()
+    monkeypatch.setattr(recovery_module, "worker_node_main", worker_node_main)
+    with warnings.catch_warnings():
+        # runpy warns that the module it runs is imported already.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        runpy.run_module(recovery_module.__name__, run_name="__main__")
+    worker_node_main.assert_called_once_with()
 
 
 @pytest.mark.parametrize("identity", ["2,4,4,0", "2,4,4,1"])
@@ -3298,8 +3332,9 @@ def test_an_original_rank_takes_over_its_membership_once_every_rank_has_started(
 
     executor._kv_pools_suspended = kv_pools_suspended
     executor.dist.allgather.side_effect = lambda value: [value] * WORLD
-    executor.model_engine.moe_execution_state = MagicMock()
-    executor.model_engine.moe_execution_state.workspace_bytes.return_value = 4 * MIB
+    monkeypatch.setattr(
+        recovery_module, "_moe_execution_state", Mock(workspace_bytes=Mock(return_value=4 * MIB))
+    )
     executor.model_engine.moe_load_balancer = MagicMock(spec=MoeLoadBalancer)
     expert_restore = MagicMock(spec=EplbExpertRestore)
     executor.model_engine.moe_load_balancer.expert_restore = expert_restore
@@ -3412,11 +3447,11 @@ def test_the_startup_rejects_a_largest_failure_no_kv_cache_pool_can_restore(
         suspended.append(True)
         yield device
 
+    monkeypatch.setattr(
+        recovery_module, "_moe_execution_state", Mock(workspace_bytes=Mock(return_value=4 * MIB))
+    )
     executor = SimpleNamespace(
         dist=Mock(rank=0, allgather=lambda fits: [fits, peer_fits, True, True]),
-        model_engine=SimpleNamespace(
-            moe_execution_state=Mock(workspace_bytes=Mock(return_value=4 * MIB))
-        ),
         _kv_pools_suspended=kv_pools_suspended,
     )
     balancer = Mock(

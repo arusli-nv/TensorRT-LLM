@@ -521,7 +521,7 @@ else
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
     if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
         # The worker must be a direct child of the node supervisor to exit with it.
-        exec python3 -m tensorrt_llm.llmapi.mgmn_worker_node
+        exec python3 -m tensorrt_llm._torch.pyexecutor.rank_failure_recovery
     fi
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?

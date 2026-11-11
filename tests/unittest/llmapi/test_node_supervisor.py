@@ -286,7 +286,9 @@ def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deplo
         started = _read(tmp_path, rank, 0)
         assert started["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == f"{rank},4,2,0"  # on GPU rank % 2
         assert not any(
-            key.startswith(("OMPI_", "PMIX_")) for key in started["environ"] if key != "OMPI_MCA_btl"
+            key.startswith(("OMPI_", "PMIX_"))
+            for key in started["environ"]
+            if key != "OMPI_MCA_btl"
         )
         assert started["environ"]["OMPI_MCA_btl"] == "^sm"  # no /dev/shm segment to leave behind
         assert started["environ"][JOIN_SECRET_ENV] == os.environ[JOIN_SECRET_ENV]
@@ -920,7 +922,7 @@ def test_a_rank_the_node_supervisor_starts_takes_its_rank_from_its_identity(tmp_
     assert "mpi_rank: 3" in result.stderr
     assert "with mpi_world_size: 4" in result.stderr
     args = (tmp_path / "python3-args").read_text().split()
-    assert args == ["-m", "tensorrt_llm.llmapi.mgmn_worker_node"]
+    assert args == ["-m", "tensorrt_llm._torch.pyexecutor.rank_failure_recovery"]
     assert "MGMN worker node exit code" not in result.stderr  # exec'd
 
 

@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
     from ..distributed import Distributed
+    from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from .llm_request import LlmRequest
     from .py_executor import PyExecutor
     from .scheduler.adp_router import RankState
@@ -106,6 +107,7 @@ class _MembershipRestarted(Exception):
 _rendezvous_ports: List[socket.socket] = []
 _agent: Optional[MembershipAgent] = None
 _authority: Optional[subprocess.Popen] = None
+_moe_execution_state: Optional[MoeExecutionState] = None
 
 
 def ensure_rendezvous() -> None:
@@ -226,8 +228,8 @@ def _rank_identity() -> RankIdentity:
     return identity
 
 
-def check_supported_model(model: torch.nn.Module) -> None:
-    """Check, before any weight loads, that the built model supports fault tolerance.
+def prepare_model(model: torch.nn.Module) -> None:
+    """Check, before any weight loads, that the built model supports fault tolerance, and bind its MoE layers.
 
     Raises:
         ValueError: The model is not supported with fault tolerance.
@@ -235,6 +237,7 @@ def check_supported_model(model: torch.nn.Module) -> None:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from .config_utils import is_hybrid_linear
 
+    global _moe_execution_state
     if is_hybrid_linear(model.model_config.pretrained_config):
         raise ValueError(
             "WideEP fault tolerance does not support hybrid linear-attention models: their KV cache manager "
@@ -242,7 +245,7 @@ def check_supported_model(model: torch.nn.Module) -> None:
             "request is freed, so it cannot hold a step's reuse commits until the step is accepted; turn it off "
             "(enable_wide_ep_fault_tolerance=False)"
         )
-    MoeExecutionState.model_comms(model)
+    _moe_execution_state = MoeExecutionState.for_model(model)
     _check_host_weights_fit(model)
 
 
@@ -280,18 +283,6 @@ WORKER_ARGS_KEY = "worker_args"
 _startup_fingerprint: Optional[str] = None
 _worker_main_args: Optional[dict] = None
 _published_record: Optional[dict] = None
-
-
-def adopt_tuned_tactics(profiling_cache) -> None:
-    """Share rank 0's tuned tactics with a replacement, which skips the KV cache estimation warmup."""
-    tactics = startup_record.agree(
-        "tuned_tactics",
-        lambda: profiling_cache._serialize_cache_data(
-            profiling_cache._partition_cache_by_strategy()[0]
-        ),
-    )
-    if startup_record.replaying:
-        profiling_cache.cache.update(profiling_cache._deserialize_cache_data(tactics))
 
 
 _deployment_nonce: Optional[str] = None
@@ -346,7 +337,7 @@ def start_worker(worker_main_args: dict) -> None:
     elif _agent is None:
         raise ValueError(
             f"WideEP fault tolerance starts rank {identity.rank} as its own process, which takes rank 0's worker "
-            "arguments from the rendezvous store: run `python -m tensorrt_llm.llmapi.mgmn_worker_node`"
+            "arguments from the rendezvous store: run `python -m tensorrt_llm._torch.pyexecutor.rank_failure_recovery`"
         )
 
 
@@ -365,7 +356,7 @@ def _worker_args_for_other_ranks() -> bytes:
 
 
 def worker_node_main() -> None:
-    """Run a rank other than 0 with fault tolerance (``python -m tensorrt_llm.llmapi.mgmn_worker_node``).
+    """Run a rank other than 0 with fault tolerance (this module's ``python -m`` entry).
 
     Raises:
         ReplacementCannotStart: A replacement does not match the deployment, or its startup failed in a way that a
@@ -555,7 +546,7 @@ def _check_largest_failure_fits(
     """Check on every original rank that the KV cache pool can give up the memory to restore the largest failure."""
     needed = (
         balancer.expert_restore.largest_failure_restore_bytes()
-        + executor.model_engine.moe_execution_state.workspace_bytes()
+        + _moe_execution_state.workspace_bytes()
     )
     fits = True
     with executor._kv_pools_suspended() as kv_cache_manager:
@@ -758,7 +749,7 @@ class RankFailureRecovery:
         recovery = cls(
             executor,
             dist.host_exchange,
-            executor.model_engine.moe_execution_state,
+            _moe_execution_state,
             store,
             os.environ[RENDEZVOUS_ENV],
             startup_memory,
@@ -1523,3 +1514,10 @@ class FaultToleranceHealth:
                 incarnations=list(record.incarnations),
             )
         return status
+
+
+if __name__ == "__main__":
+    # Run in the imported module, whose state the executor shares.
+    from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
+
+    rank_failure_recovery.worker_node_main()

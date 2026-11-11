@@ -1234,27 +1234,18 @@ class DecoderWarmup:
                 token_num_upper_bound=token_num_upper_bound,
                 max_num_draft_tokens=self._config.original_max_draft_len,
             )
+        startup_record.adopt_tuned_tactics()
 
         # The warmup runs again after the KV cache is rebuilt; when the token
         # shape is unchanged and no MXFP8 tuning is pending, the profiling
         # cache already holds every tactic this pass would tune. The token
         # shape comes from this rank's free KV capacity, so the whole forward
         # group must agree before any rank skips the collective-bearing pass.
-        def agree_skip() -> bool:
-            return self._agreement.agree_flag(
-                self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
-                and not enable_flashinfer_mxfp8_autotuner
-                and not enable_native_mxfp8_autotuner
-            )
-
-        if startup_record.active:
-            # A replacement rank adopts rank 0's tactics so that it tunes what the original ranks do.
-            from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import adopt_tuned_tactics
-
-            adopt_tuned_tactics(AutoTuner.get().profiling_cache)
-            skip_completed_warmup = startup_record.agree("autotuner_warmup_skip", agree_skip)
-        else:
-            skip_completed_warmup = agree_skip()
+        skip_completed_warmup = self._agreement.agree_flag(
+            self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
+            and not enable_flashinfer_mxfp8_autotuner
+            and not enable_native_mxfp8_autotuner
+        )
         if skip_completed_warmup:
             logger.info(
                 "Skipping duplicate autotuner warmup for already completed "

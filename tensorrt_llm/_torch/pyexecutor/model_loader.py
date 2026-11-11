@@ -1344,8 +1344,8 @@ class ModelLoader:
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
             if fault_tolerance_mode():
-                from .rank_failure_recovery import check_supported_model
-                check_supported_model(model)
+                from .rank_failure_recovery import prepare_model
+                prepare_model(model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

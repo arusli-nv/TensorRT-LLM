@@ -29,11 +29,13 @@ _COLLECTIVE_MODULES = frozenset(
     }
 )
 
-# Callers whose payload is a per-rank measurement, so a replacement's payload may differ from its predecessor's.
+# Callers whose payload is a per-rank measurement, or a warmup vote that a replacement casts without the KV cache
+# estimation's warmup, so a replacement's payload may differ from its predecessor's.
 RANK_VARYING_CALLERS = frozenset(
     {
         ("autotuner.py", "_merge_cache_data"),
         ("autotuner.py", "post_tune_merge_tactics"),
+        ("warmup.py", "agree_flag"),
     }
 )
 
@@ -153,6 +155,22 @@ class StartupRecord:
             self.resume()
         self.values.setdefault(name, []).append(value)
         return value
+
+    def adopt_tuned_tactics(self) -> None:
+        """Share rank 0's tuned tactics with a replacement, which skips the KV cache estimation warmup."""
+        if not self.active:
+            return
+        from ..autotuner import AutoTuner
+
+        profiling_cache = AutoTuner.get().profiling_cache
+        tactics = self.agree(
+            "tuned_tactics",
+            lambda: profiling_cache._serialize_cache_data(
+                profiling_cache._partition_cache_by_strategy()[0]
+            ),
+        )
+        if self.replaying:
+            profiling_cache.cache.update(profiling_cache._deserialize_cache_data(tactics))
 
     def exchange(
         self,
