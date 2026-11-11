@@ -27,10 +27,9 @@ import argparse
 import enum
 import hashlib
 import hmac
-import itertools
+import json
 import os
 import pickle  # nosec B403
-import secrets
 import select
 import selectors
 import signal
@@ -39,7 +38,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -100,7 +99,7 @@ class MembershipRecord(_Message):
     state: MembershipState
     live_mask: int
     resume: ResumeState = ResumeState()
-    # The process each rank currently stands for (0 = original, n = n-th replacement).
+    # The process each rank currently stands for (0 = original, n = n-th replacement), assigned at its hello.
     incarnations: Tuple[int, ...] = ()
     # The live ranks whose replacement joins in this transaction: they enter the host exchange only at the iteration
     # the live ranks resume after.
@@ -151,7 +150,7 @@ class RankReport(_Message):
     # With READY: what the live ranks' restore needs from this rank (None from most ranks); kept small, as the INSTALL
     # record carries it to every rank.
     ready_payload: Optional[str] = None
-    incarnation: int = 0
+    incarnation: int = 0  # of the process that sent it: set by the authority, which assigned it
     # Advanced with every report: a rank whose reports stop advancing is frozen or gone.
     sequence: int = 0
     # Of the ranks in waiting_for, those an all-to-all kernel waits for, with the round flag it waits for.
@@ -606,36 +605,11 @@ class SignedStore:
 LIVENESS_KEY = "liveness"  # host:port of the authority's liveness listener
 RECORD_KEY = "record"
 TRANSACTION_KEY = "last_transaction"  # the authority's last TransactionSummary
+# Per rank, the newest incarnation whose liveness connection closed, as did those of every older one (-1 if none): a
+# process's connection closes when it ends. A JSON list, unset while no process has left.
+DISCONNECTED_KEY = "disconnected"
 # The name prefix of every node's shared-memory segments of host weights, which the node supervisors unlink at the end.
 HOST_WEIGHTS_PREFIX_KEY = "host_weights_prefix"
-
-
-def incarnation_key(rank: int) -> str:
-    """The last incarnation claimed for ``rank``: ``<incarnation> <nonce>``, unset before its first replacement."""
-    return f"incarnation/{rank}"
-
-
-def _last_claim(store: SignedStore, rank: int) -> bytes:
-    key = incarnation_key(rank)
-    return store.store.get(key) if store.store.check([key]) else b""
-
-
-def claimed_incarnation(store: SignedStore, rank: int) -> int:
-    """The last incarnation claimed for ``rank``; 0 before its first replacement."""
-    claim = _last_claim(store, rank)
-    return int(claim.split()[0]) if claim else 0
-
-
-def claim_incarnation(store: SignedStore, rank: int, failed: int) -> Optional[int]:
-    """Claim ``failed + 1`` for a replacement of the process ``failed`` of ``rank`` by one compare-and-set; of the
-    claims that replace one process one wins, None for the others."""
-    last = _last_claim(store, rank)
-    if (int(last.split()[0]) if last else 0) != failed:
-        return None
-    # The nonce tells this claim from another of the same incarnation.
-    claim = f"{failed + 1} {secrets.token_hex(8)}"
-    won = store.store.compare_set(incarnation_key(rank), last.decode(), claim) == claim.encode()
-    return failed + 1 if won else None
 
 
 # Ranks per store counter of an arrival mask: the store's counters are signed 64-bit integers.
@@ -694,7 +668,9 @@ def rendezvous_store(timeout_s: float = 60.0) -> SignedStore:
     )
 
 
-# The first poll of a wait for values in the store (wait_for_keys), and the longest poll of a gather's wait.
+# Ranks per store counter of an arrival mask: the store's counters are signed 64-bit integers.
+_RANKS_PER_COUNTER = 63
+# The first poll of a wait for values in the store (wait_for_keys), and the longest poll of a group's wait.
 _FIRST_POLL_S = 0.001
 STORE_POLL_S = 0.1
 
@@ -721,94 +697,189 @@ def wait_for_keys(
         backoff_s = min(2 * backoff_s, poll_s)
 
 
-def store_gather(
-    store: SignedStore,
-    name: str,
-    rank: int,
-    ranks: Sequence[int],
-    size: int,
-    on_wait: Callable[[int], None],
-) -> Callable[[object], List[object]]:
-    """An allgather among ``ranks`` through ``store``: every call returns the values of ranks ``0 .. size - 1``, None
-    for a rank outside ``ranks``. While a call waits, ``on_wait`` gets after every poll the mask of the ranks whose
-    values are missing (the arrival mask, read once per report interval) and raises to stop waiting; it gets 0 once
-    the call's wait ends. Only the last call's keys stay in the store."""
-    ranks = list(ranks)
-    mask = sum(1 << r for r in ranks)
-    calls = itertools.count()
+class StoreGroup:
+    """A communicator of the global ranks ``ranks`` (communicator rank ``i`` is ``ranks[i]``) over the rendezvous
+    store, on the pattern of main's ``StoreDwdpGroup``: call ``n`` of every member sets its value under
+    ``<name>/<n>/<rank>`` and waits for the other members'. Only the members in ``live`` (every member by default)
+    take part: the others' values are None, and a group whose only live member is this rank exchanges nothing.
 
-    def gather(value: object) -> List[object]:
-        call = next(calls)
-        prefix = f"{name}/{call}"
-        keys = [f"{prefix}/{r}" for r in ranks]
-        store.set(f"{prefix}/{rank}", pickle.dumps(value))
-        mark_arrived(store, prefix, rank)
+    While a call waits, ``on_wait`` gets after every poll the mask (by global rank) of the live members whose values
+    are missing, read from their arrival counters once per report interval, and may raise to stop waiting; it gets 0
+    once the call ends. A call deletes this rank's value of the call before (every member has read it): only the
+    last call's values stay in the store. The splits by node take the node of rank ``r`` as ``r // gpus_per_node``, as
+    ``Mapping.get_node_rank`` does. ``exchange_failed`` records that an exchange raised.
+
+    Given ``gather``, the group exchanges through it instead of the store, as an MNNVL remap does through the
+    exchange of a membership change: ``gather(value)`` returns the values by global rank, None for an absent one.
+    """
+
+    def __init__(
+        self,
+        store: Optional[SignedStore],
+        name: str,
+        rank: int,
+        ranks: Sequence[int],
+        on_wait: Callable[[int], None] = lambda waiting: None,
+        live: Optional[Sequence[int]] = None,
+        gpus_per_node: int = 1,
+        gather: Optional[Callable[[Any], Sequence[Any]]] = None,
+    ):
+        self.membership = tuple(ranks)
+        self.rank = rank
+        self.exchange_failed = False
+        self._store = store
+        self._name = name
+        self._on_wait = on_wait
+        self._live = tuple(r for r in self.membership if live is None or r in live)
+        self._gpus_per_node = gpus_per_node
+        self._gather = gather
+        self._calls = 0
+        self._subgroups = 0
+
+    def Get_rank(self) -> int:
+        return self.membership.index(self.rank)
+
+    def Get_size(self) -> int:
+        return len(self.membership)
+
+    def allgather(self, value: Any) -> List[Any]:
+        """Every member's value, by communicator rank; None for a member that is not live.
+
+        Raises:
+            RuntimeError: The store, which the authority's process hosts, is lost.
+        """
+        try:
+            by_rank = self._exchange(value)
+        except BaseException:
+            self.exchange_failed = True
+            raise
+        return [by_rank.get(r) for r in self.membership]
+
+    def barrier(self) -> None:
+        self.allgather(None)
+
+    Barrier = barrier
+
+    def bcast(self, obj: Any, root: int = 0) -> Any:
+        """The ``obj`` of communicator rank ``root`` (None if it is not live)."""
+        return self.allgather(obj)[root]
+
+    def allreduce(self, obj: Any, op: Any = None) -> Any:
+        """The live members' ``obj`` reduced by ``op``: ``MPI.SUM`` (the default), ``MPI.MIN`` or ``MPI.MAX``."""
+        from mpi4py import MPI
+
+        op = MPI.SUM if op is None else op
+        values = [value for value in self.allgather(obj) if value is not None]
+        for mpi_op, reduce in ((MPI.SUM, sum), (MPI.MIN, min), (MPI.MAX, max)):
+            if op == mpi_op:
+                return reduce(values)
+        raise NotImplementedError(f"StoreGroup reduces by MPI.SUM, MPI.MIN or MPI.MAX, not {op}")
+
+    def Free(self) -> None:
+        """A group holds nothing to free: its exchanges share this process's store client."""
+
+    def subgroup(self, ranks: Sequence[int]) -> "StoreGroup":
+        """The group of ``ranks``, members of this group with this rank among them, in that order."""
+        ranks = tuple(ranks)
+        digest = hashlib.sha256(repr(ranks).encode()).hexdigest()[:16]
+        self._subgroups += 1
+        return StoreGroup(
+            self._store,
+            f"{self._name}/{self._subgroups}-{digest}",
+            self.rank,
+            ranks,
+            self._on_wait,
+            self._live,
+            self._gpus_per_node,
+        )
+
+    def Split(self, color: int = 0, key: int = 0) -> "StoreGroup":
+        """The members that give the same ``color``, ordered by ``key``, then by their communicator rank; a
+        replacement takes the original ranks' colors from the startup record."""
+        from .startup_record import startup_record
+
+        splits = startup_record.agree("startup_group_split", lambda: self.allgather((color, key)))
+        ranks = sorted(
+            (split[1], index, rank)
+            for index, (rank, split) in enumerate(zip(self.membership, splits))
+            if split[0] == color
+        )
+        return self.subgroup(rank for _, _, rank in ranks)
+
+    def Split_type(self, split_type: int, key: int = 0, info: Any = None) -> "StoreGroup":
+        """The members on this rank's node, for the node split types (``MPI.COMM_TYPE_SHARED``, Open MPI's
+        ``COMM_TYPE_HOST``)."""
+        from mpi4py import MPI
+
+        from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
+
+        if split_type not in (MPI.COMM_TYPE_SHARED, OMPI_COMM_TYPE_HOST):
+            raise NotImplementedError(
+                f"StoreGroup splits by node only, not by split type {split_type}"
+            )
+        node = self.rank // self._gpus_per_node
+        return self.subgroup(r for r in self.membership if r // self._gpus_per_node == node)
+
+    def _exchange(self, value: Any) -> Dict[int, Any]:
+        if self._gather is not None:
+            values = self._gather(value)
+            return {r: values[r] for r in self.membership}
+        if self._live == (self.rank,):
+            self._on_wait(0)  # a call that ends: a replacement's startup progress
+            return {self.rank: value}
+        from torch.distributed import DistError
+
+        prefix = f"{self._name}/{self._calls}"
+        self._calls += 1
+        try:
+            self._store.set(f"{prefix}/{self.rank}", pickle.dumps(value))
+            self._store.store.add(
+                self._counter(prefix, self.rank), 1 << self.rank % _RANKS_PER_COUNTER
+            )
+            try:
+                values = self._wait(prefix)
+            finally:
+                self._on_wait(0)
+            if self._calls > 1:
+                previous = f"{self._name}/{self._calls - 2}"
+                self._store.store.delete_key(f"{previous}/{self.rank}")
+                if self.rank == min(self._live):
+                    for key in self._counters(previous):
+                        self._store.store.delete_key(key)
+        except DistError as error:
+            raise RuntimeError(
+                f"Rank {self.rank} lost the rendezvous store, which the membership authority hosts"
+            ) from error
+        # Only processes with the join secret write the store's values (SignedStore).
+        return {r: pickle.loads(v) for r, v in zip(self._live, values)}  # nosec B301
+
+    def _wait(self, prefix: str) -> List[bytes]:
+        keys = [f"{prefix}/{r}" for r in self._live]
+        live_mask = sum(1 << r for r in self._live)
         read_s, missing = None, 0
 
         def check(unsigned: Set[str]) -> None:
             nonlocal read_s, missing
             if read_s is None or time.monotonic() - read_s >= REPORT_INTERVAL_S:
                 read_s = time.monotonic()
-                missing = mask & ~arrived_ranks(store, prefix, size)
-            on_wait(missing | sum(1 << r for r, key in zip(ranks, keys) if key in unsigned))
+                arrived = sum(
+                    self._store.store.add(key, 0) << int(key.rsplit("/", 1)[1]) * _RANKS_PER_COUNTER
+                    for key in self._counters(prefix)
+                )
+                missing = live_mask & ~arrived
+            self._on_wait(
+                missing | sum(1 << r for r, key in zip(self._live, keys) if key in unsigned)
+            )
 
-        try:
-            values = wait_for_keys(store, keys, STORE_POLL_S, check)
-        finally:
-            on_wait(0)
-        if call:
-            # Every rank set its value of this call, so each has read the values of the call before.
-            previous = f"{name}/{call - 1}"
-            store.store.delete_key(f"{previous}/{rank}")
-            if rank == min(ranks):
-                for counter in _arrival_counters(previous, size):
-                    store.store.delete_key(counter)
-        by_rank = dict(zip(ranks, values))
-        return [
-            pickle.loads(by_rank[r]) if r in by_rank else None  # nosec B301
-            for r in range(size)
-        ]
+        return wait_for_keys(self._store, keys, STORE_POLL_S, check)
 
-    return gather
+    def _counters(self, prefix: str) -> List[str]:
+        return sorted({self._counter(prefix, r) for r in self._live})
 
-
-def startup_gather(
-    store: SignedStore,
-    name: str,
-    rank: int,
-    ranks: Sequence[int],
-    size: int,
-    on_wait: Callable[[int], None],
-) -> Callable[[object], List[object]]:
-    """A :func:`store_gather` among the ranks that start together, under ``startup/<name>``; ``on_wait`` gets each
-    change of the peers it waits for, then 0. Its waits end only when the membership agent ends the process or the
-    store is lost.
-
-    Raises:
-        RuntimeError: The store, which the authority's process hosts, is lost.
-    """
-    from torch.distributed import DistError
-
-    reported = 0
-
-    def report_changes(waiting: int) -> None:
-        nonlocal reported
-        if waiting != reported or not waiting:
-            reported = waiting
-            on_wait(waiting)
-
-    gather = store_gather(store, f"startup/{name}", rank, ranks, size, report_changes)
-
-    def startup(value: object) -> List[object]:
-        try:
-            return gather(value)
-        except DistError as error:
-            raise RuntimeError(
-                f"Rank {rank} lost the rendezvous store, which the membership authority hosts, while it waited for "
-                "ranks to start"
-            ) from error
-
-    return startup
+    @staticmethod
+    def _counter(prefix: str, rank: int) -> str:
+        # The counters only say whose value to wait for, so they are not signed.
+        return f"{prefix}/arrived/{rank // _RANKS_PER_COUNTER}"
 
 
 def join_secret_digest() -> str:
@@ -914,11 +985,11 @@ def _open_connection(store: SignedStore, announcement: str, timeout_s: float) ->
 
 
 def open_liveness_connection(
-    store: SignedStore, rank: int, incarnation: int, timeout_s: float = HELLO_TIMEOUT_S
+    store: SignedStore, rank: int, replacement: bool = False, timeout_s: float = HELLO_TIMEOUT_S
 ) -> LivenessConnection:
-    """This process's liveness connection to the authority for ``rank`` and ``incarnation``; a newer incarnation
-    asks to join."""
-    connection = _open_connection(store, f"{rank} {incarnation}", timeout_s)
+    """This process's liveness connection to the authority for ``rank``; a ``replacement`` asks to join. The first
+    record the authority sends over it gives the process its incarnation (``MembershipRecord.incarnations``)."""
+    connection = _open_connection(store, f"{rank} {int(replacement)}", timeout_s)
     # A forked child must not keep the connection open.
     os.register_at_fork(after_in_child=connection.sock.close)
     return connection
@@ -936,14 +1007,15 @@ class MembershipAgent:
     """A rank's side of membership: a thread that keeps the liveness connection, calls ``on_record`` with every
     record and sends the rank's report every ``REPORT_INTERVAL_S`` (after ``on_tick``) and at once when
     :meth:`report` changes it. It stops once a record no longer lists this process after one did, or on an error,
-    which closes the connection and is passed to ``on_error``."""
+    which closes the connection and is passed to ``on_error``. A ``replacement`` asks to join; :attr:`incarnation`
+    is the one the authority assigned this process."""
 
     def __init__(
         self,
         rank: int,
         store: SignedStore,
         on_record: Callable[[MembershipRecord], None],
-        incarnation: int = 0,
+        replacement: bool = False,
         on_tick: Optional[Callable[[], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
     ):
@@ -952,8 +1024,10 @@ class MembershipAgent:
         self._on_record = on_record
         self._on_tick = on_tick
         self._on_error = on_error
-        self._report = RankReport(incarnation=incarnation)
+        self._replacement = replacement
+        self._report = RankReport()
         self.record: Optional[MembershipRecord] = None
+        self.incarnation: Optional[int] = None  # from the first record, once started
         # Whether the liveness connection is open: the authority closes it only when it ends or fails this rank.
         self.connected = False
         self._lock = threading.Lock()
@@ -968,10 +1042,29 @@ class MembershipAgent:
         )
         self._sock: Optional[socket.socket] = None
         self._lines: Optional[_Lines] = None
+        self._received: List[bytes] = []  # the lines start() read, which the thread delivers first
 
     def start(self) -> None:
-        connection = open_liveness_connection(self._store, self.rank, self._report.incarnation)
+        """Connect, take this process's incarnation from the authority's first record and start the thread.
+
+        Raises:
+            ConnectionError: The authority refused this process.
+        """
+        connection = open_liveness_connection(self._store, self.rank, self._replacement)
         self._sock, self._lines = connection.sock, connection.lines
+        self._sock.settimeout(HELLO_TIMEOUT_S)
+        while not self._received:
+            data = self._sock.recv(1 << 16)
+            if not data:
+                self._sock.close()
+                raise ConnectionError(
+                    f"the membership authority refused this process of rank {self.rank}"
+                )
+            self._received = self._lines.decode(data)
+        self._sock.settimeout(None)
+        self.incarnation = MembershipRecord.model_validate_json(self._received[0]).incarnations[
+            self.rank
+        ]
         self.connected = True
         self._send_report()  # the authority has it as soon as it admits the connection
         self._thread.start()
@@ -1022,29 +1115,31 @@ class MembershipAgent:
         self._sock.sendall(_line(report))
 
     def _run(self) -> None:
-        incarnation = self._report.incarnation
         listed = False  # a record listed this process as a live member
         tick_s = time.monotonic()  # when the next periodic report is due
+        lines, self._received = self._received, []
         try:
             while not self._stop.is_set():
+                for line in lines:
+                    record = MembershipRecord.model_validate_json(line)
+                    with self._delivery:
+                        self.record = record
+                        self._on_record(record)
+                    member = record.is_member(self.rank, self.incarnation)
+                    if listed and not member:
+                        return  # excluded, left out or replaced
+                    listed = member
                 readable, _, _ = select.select(
                     [self._sock, self._wake_read], [], [], max(0.0, tick_s - time.monotonic())
                 )
+                lines = []
                 if self._sock in readable:
                     data = self._sock.recv(1 << 16)
                     if not data:
                         raise ConnectionError(
                             "the membership authority closed the liveness connection"
                         )
-                    for line in self._lines.decode(data):
-                        record = MembershipRecord.model_validate_json(line)
-                        with self._delivery:
-                            self.record = record
-                            self._on_record(record)
-                        member = record.is_member(self.rank, incarnation)
-                        if listed and not member:
-                            return  # excluded, left out or replaced
-                        listed = member
+                    lines = self._lines.decode(data)
                 due = time.monotonic() >= tick_s
                 if due:
                     tick_s = time.monotonic() + REPORT_INTERVAL_S
@@ -1083,11 +1178,11 @@ class AuthorityProcess:
     """The authority as a process: publishes every record in the store and over every connection, and decides with
     :class:`Authority` from the reports.
 
-    A replacement joins by connecting with a newer incarnation of its rank: never for rank 0, before the deployment
-    has started, or while the rank's current process is connected, so only the authority's verdict removes a live
-    process. Once ``parent`` (readable only at its end of file: rank 0's process ended) ends, the deployment aborts. A
-    node supervisor's connection receives :class:`NodeView` lines; once it closes while the deployment serves, the
-    connections of its ranks are closed too.
+    A replacement joins by connecting as one, and gets the rank's next incarnation: never for rank 0, before the
+    deployment has started, or while the rank's current process is connected, so only the authority's verdict removes
+    a live process. Once ``parent`` (readable only at its end of file: rank 0's process ended) ends, the deployment
+    aborts. A node supervisor's connection receives :class:`NodeView` lines; once it closes while the deployment
+    serves, the connections of its ranks are closed too.
     """
 
     def __init__(
@@ -1105,6 +1200,7 @@ class AuthorityProcess:
         # Something the authority decides on at once changed since its last decision (see _serve).
         self._changed = False
         self._incarnation = [0] * world_size
+        self._disconnected = [-1] * world_size  # as last written to DISCONNECTED_KEY
         self._connections: Dict[socket.socket, _Connection] = {}
         self._selector = selectors.DefaultSelector()
         self._record: Optional[MembershipRecord] = None  # the last one published
@@ -1278,7 +1374,9 @@ class AuthorityProcess:
             for line in connection.lines.decode(data) if data else ():
                 if connection.node is not None:
                     raise ValueError(f"the supervisor of node {connection.node} sent a report")
-                report = RankReport.model_validate_json(line)
+                report = RankReport.model_validate_json(line).model_copy(
+                    update={"incarnation": connection.member[1]}
+                )
                 if connection.report is None or _decided_at_once(
                     connection.report
                 ) != _decided_at_once(report):
@@ -1319,16 +1417,19 @@ class AuthorityProcess:
             )
             self._send_record(ranks=False)
             return rest
-        rank, incarnation = (int(field) for field in announcement)
-        refusal = self._refusal(rank, incarnation)
+        rank, replacement = (int(field) for field in announcement)
+        refusal = self._refusal(rank, replacement)
         if refusal is not None:
             raise ValueError(refusal)
-        if incarnation > self._incarnation[rank]:  # a replacement asks to join
-            self._incarnation[rank] = incarnation
+        if replacement:
+            self._incarnation[rank] += 1
             self._authority.request_join(rank)
-        connection.member, connection.lines = (rank, incarnation), _Lines()
+        connection.member, connection.lines = (rank, self._incarnation[rank]), _Lines()
         self._changed = True
-        connection.unsent += _line(self._record)
+        # The first record a process receives gives it its incarnation.
+        connection.unsent += _line(
+            self._record.model_copy(update={"incarnations": tuple(self._incarnation)})
+        )
         self._flush(sock, connection)
         return rest
 
@@ -1341,21 +1442,23 @@ class AuthorityProcess:
                 return f"node {node} or one of its ranks {list(ranks)} has a supervisor already"
         return None
 
-    def _refusal(self, rank: int, incarnation: int) -> Optional[str]:
-        """Why a valid hello of the process ``incarnation`` of ``rank`` opens no connection; None if it does."""
+    def _refusal(self, rank: int, replacement: int) -> Optional[str]:
+        """Why a valid hello for ``rank``, of a ``replacement`` or of the rank's first process, opens no connection;
+        None if it does."""
         if not 0 <= rank < self.world_size:
             return f"rank {rank} is not in the deployment"
-        if incarnation < self._incarnation[rank]:
-            return f"rank {rank}'s incarnation {incarnation} was replaced"
-        if any(c.member == (rank, incarnation) for c in self._connections.values()):
-            return f"rank {rank}'s incarnation {incarnation} is connected already"
-        if incarnation > self._incarnation[rank]:
-            if rank == 0:
-                return "rank 0 is never replaced"
-            if self._authority.record.state == MembershipState.STARTING:
-                return "no replacement joins before the deployment has started"
-            if self._authority.record.is_live(rank) and self._connected() >> rank & 1:
-                return f"rank {rank} is live: no replacement joins for it"
+        if not replacement:
+            if self._incarnation[rank]:
+                return f"rank {rank}'s first process was replaced"
+            if any(c.member == (rank, 0) for c in self._connections.values()):
+                return f"rank {rank}'s first process is connected already"
+            return None
+        if rank == 0:
+            return "rank 0 is never replaced"
+        if self._authority.record.state == MembershipState.STARTING:
+            return "no replacement joins before the deployment has started"
+        if self._authority.record.is_live(rank) and self._connected() >> rank & 1:
+            return f"rank {rank} is live: no replacement joins for it"
         return None
 
     def _drop(self, sock: socket.socket) -> None:
@@ -1363,6 +1466,8 @@ class AuthorityProcess:
         connection = self._connections.pop(sock)
         sock.close()
         self._changed = True
+        if connection.member is not None:
+            self._publish_disconnected(connection.member[0])
         if connection.node is None:
             return
         if self._record.state not in (MembershipState.ABORT, MembershipState.SHUTDOWN):
@@ -1374,6 +1479,16 @@ class AuthorityProcess:
                 if peer.member is not None and peer.member[0] in connection.node_ranks:
                     self._drop(other)
         self._send_record(ranks=False)
+
+    def _publish_disconnected(self, rank: int) -> None:
+        """Write :data:`DISCONNECTED_KEY` once a connection of ``rank``'s processes closed, if that advanced it."""
+        connected = [
+            c.member[1] for c in self._connections.values() if c.member and c.member[0] == rank
+        ]
+        newest = min(connected) - 1 if connected else self._incarnation[rank]
+        if newest > self._disconnected[rank]:
+            self._disconnected[rank] = newest
+            self._store.set(DISCONNECTED_KEY, json.dumps(self._disconnected).encode())
 
     def _connected(self) -> int:
         return sum(

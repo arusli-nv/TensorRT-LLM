@@ -131,7 +131,7 @@ def _absent(tp):
     if rank == leaver:
         _skip_rebuild(gather_handles)
     else:
-        exchange.rebuild(gather_handles, survivors, epoch)
+        _rebuild(exchange, gather_handles, survivors, epoch)
     mpi.barrier()
     if rank != leaver:
         # Fresh pages at the same addresses: the copies built for them are kept.
@@ -165,7 +165,7 @@ def _absent(tp):
         mnnvl.barrier()
 
     epoch = max(mpi.allgather(exchange.epoch)) + 1
-    exchange.rebuild(gather_handles, (1 << tp) - 1, epoch)
+    _rebuild(exchange, gather_handles, (1 << tp) - 1, epoch)
     mpi.barrier()
     gathered = mnnvl.tp_allgather_int64([rank + 1])
     assert np.array_equal(mnnvl.tp_live_rows(gathered), [[r + 1] for r in range(tp)])
@@ -233,7 +233,12 @@ def _membership(tp):
 
         def change():
             stopped = [e for e in mpi.allgather(exchange.stopped_epoch) if e is not None]
-            exchange.install(gather_handles, survivors, next_epoch(latest_epoch(stopped)))
+            exchange.install(
+                gather_handles,
+                survivors,
+                next_epoch(latest_epoch(stopped)),
+                exchange.rows.stale_rows(gather_handles),
+            )
             exchange.interrupted = lambda: False
             mpi.barrier()  # the commit
 
@@ -249,11 +254,18 @@ def _membership(tp):
     # they resume.
     all_ranks = (1 << tp) - 1
     epoch = next_epoch(max(mpi.allgather(exchange.epoch)))
-    exchange.rebuild(gather_handles, survivors, epoch)
+    _rebuild(exchange, gather_handles, survivors, epoch)
     if rank != leaver:
         assert mnnvl.allgather(rank) == [r if survivors >> r & 1 else None for r in range(tp)]
     exchange.admit(all_ranks, next_epoch(mpi.broadcast(exchange.epoch, root=0)))
     assert mnnvl.allgather(rank) == list(range(tp))
+
+
+def _rebuild(exchange, gather, live_mask, epoch):
+    """Map the host exchange's rows among the ranks ``gather`` reaches, as an INSTALL does, then continue with the
+    ranks in ``live_mask`` from ``epoch``, outside any round."""
+    exchange.rows.remap(gather, exchange.rows.stale_rows(gather))
+    exchange.admit(live_mask, epoch)
 
 
 def _skip_rebuild(gather_handles):
@@ -268,7 +280,7 @@ def _admission(tp):
     an isolated startup. No process that maps the survivors' rows is gone, so every rank keeps the pages it maps and
     imports only the rows it does not map yet; then every rank exchanges with every other. MPI stands in for the
     membership transaction."""
-    from tensorrt_llm._torch.distributed.mnnvl_live_group import isolated_gather
+    from tensorrt_llm._torch.distributed.membership import StoreGroup
 
     mnnvl, mpi, rank = _dists(tp)
     leaver = tp - 1
@@ -280,24 +292,24 @@ def _admission(tp):
         _skip_rebuild(mpi.allgather)
         exchange.rows.close()
         slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
-        rows = MnnvlRows(rank, tp, TPHostExchange.buffer_bytes(tp, slot), isolated_gather(rank, tp))
-        assert rows.holders == {rank}
+        isolated = StoreGroup(None, "rows", rank, range(tp), live=[rank])
+        rows = MnnvlRows(rank, tp, TPHostExchange.buffer_bytes(tp, slot), isolated.allgather)
         exchange = mnnvl._host_exchange = TPHostExchange(rank, tp, rows, slot)
     else:
-        exchange.rebuild(mpi.allgather, survivors, epoch)
+        _rebuild(exchange, mpi.allgather, survivors, epoch)
         assert mnnvl.allgather(rank) == [r if survivors >> r & 1 else None for r in range(tp)]
     mpi.barrier()
 
     own = np.zeros((2 * tp, 1 + exchange._words), dtype=np.uint64)
     exchange._copy_to_host(exchange.rows.row(rank), own)
     epoch = next_epoch(max(mpi.allgather(exchange.epoch)))
-    exchange.rebuild(mpi.allgather, (1 << tp) - 1, epoch)
+    _rebuild(exchange, mpi.allgather, (1 << tp) - 1, epoch)
     kept = np.zeros_like(own)
     exchange._copy_to_host(exchange.rows.row(rank), kept)
     mpi.barrier()  # no rank writes into a row before its owner has read it
     # The admission kept every row's pages: the packets of the survivors' last exchanges are still there.
     assert np.array_equal(kept, own) and (rank == leaver or own.any())
-    assert exchange.rows.holders == set(range(tp))
+    assert exchange.rows.stale_rows(mpi.allgather) == frozenset()
     assert mnnvl.allgather(rank) == list(range(tp))
     assert mnnvl.allreduce(rank + 1, ReduceOp.SUM) == sum(r + 1 for r in range(tp))
 
@@ -368,7 +380,7 @@ def _membership_change(tp):
     def change():
         stopped = [epoch for epoch in mpi.allgather(exchange.stopped_epoch) if epoch is not None]
         epoch = next_epoch(latest_epoch(stopped))  # the INSTALL record's epoch
-        exchange.install(gather_handles, survivors, epoch)
+        exchange.install(gather_handles, survivors, epoch, exchange.rows.stale_rows(gather_handles))
         exchange.interrupted = lambda: False
         changes.append((exchange.stopped_epoch, epoch))
         mpi.barrier()
@@ -399,7 +411,12 @@ def _change_without_loss(tp):
     def change():
         stopped = mpi.allgather(exchange.stopped_epoch)
         stops.append(stopped)
-        exchange.install(mpi.allgather, every, next_epoch(latest_epoch(stopped)))
+        exchange.install(
+            mpi.allgather,
+            every,
+            next_epoch(latest_epoch(stopped)),
+            exchange.rows.stale_rows(mpi.allgather),
+        )
         exchange.interrupted = lambda: False
         mpi.barrier()  # the commit
 

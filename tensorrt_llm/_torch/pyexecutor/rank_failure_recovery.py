@@ -15,7 +15,7 @@
 """Keep a WideEP deployment serving when one of its ranks fails, and let a replacement rank rejoin.
 
 Every rank is its own process, which joins the membership at the entry of its worker (:func:`start_worker`,
-:func:`worker_node_main`); the startup collectives go through the rendezvous store (:class:`StartupGroup`). Once
+:func:`worker_node_main`); the startup collectives go through the rendezvous store (``StoreGroup``). Once
 serving, :class:`RankFailureRecovery` takes part in every membership change the authority proposes: it stops the
 all-to-all and the host exchange, replies READY, moves the host exchange to the live ranks at INSTALL, and at the
 resume point restores the lost experts and the all-to-all workspaces, then replies INSTALLED. See
@@ -39,27 +39,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
-from mpi4py import MPI
 
 from tensorrt_llm._utils import (
     FAULT_TOLERANCE_RANK_ENV,
-    OMPI_COMM_TYPE_HOST,
     RankIdentity,
     check_fault_tolerance_requirements,
     fault_tolerance_mode,
@@ -76,6 +62,7 @@ from tensorrt_llm.logger import logger
 
 from ..distributed.host_exchange_epoch import next_epoch
 from ..distributed.membership import (
+    DISCONNECTED_KEY,
     HOST_WEIGHTS_PREFIX_KEY,
     JOIN_SECRET_ENV,
     LAUNCHER_ENV_PREFIXES,
@@ -92,20 +79,13 @@ from ..distributed.membership import (
     Reply,
     ResumeState,
     SignedStore,
+    StoreGroup,
     TransactionSummary,
-    claimed_incarnation,
     open_store,
     rendezvous_store,
-    startup_gather,
-    store_gather,
     wait_for_keys,
 )
-from ..distributed.mnnvl_live_group import (
-    LiveGroupComm,
-    MnnvlMappingError,
-    MnnvlPeerHandleError,
-    isolated_gather,
-)
+from ..distributed.mnnvl_live_group import MnnvlMappingError, MnnvlPeerHandleError
 from ..distributed.startup_record import startup_record
 
 if TYPE_CHECKING:
@@ -268,7 +248,7 @@ def _rank_identity() -> RankIdentity:
     if identity is None:
         raise ValueError(
             "WideEP fault tolerance starts every rank as its own process, with "
-            f"'<rank>,<world size>,<GPUs per node>,<incarnation>' in {FAULT_TOLERANCE_RANK_ENV}: launch the ranks "
+            f"'<rank>,<world size>,<GPUs per node>,<replacement>' in {FAULT_TOLERANCE_RANK_ENV}: launch the ranks "
             "with trtllm-llmapi-launch, whose node supervisor sets it, or let the server start them on one node"
         )
     return identity
@@ -465,7 +445,7 @@ def worker_node_main() -> None:
     try:
         # Only processes with the join secret can write the store's values (SignedStore).
         worker_main_args = pickle.loads(store.get(WORKER_ARGS_KEY))  # nosec B301
-        if identity.incarnation > 0:
+        if identity.replacement:
             if startup_fingerprint(worker_main_args) != _agreed_startup()["fingerprint"]:
                 raise ReplacementCannotStart(
                     "The replacement rank does not match the deployment it replaces a rank of (TensorRT-LLM "
@@ -486,107 +466,32 @@ def _startup_store() -> SignedStore:
 
 # The startup collectives this rank completed: its progress while the deployment starts (RankReport.progress).
 _startup_steps = 0
+# The peers the startup collective in progress waits for, as last reported.
+_startup_waiting_for = 0
 
 
 def _report_startup_wait(waiting_for: int) -> None:
-    """Report the peers a startup collective of this rank waits for; 0 completes a collective, a step of progress."""
-    global _startup_steps
+    """Report each change of the peers a startup collective of this rank waits for; 0 completes a collective, a step
+    of progress."""
+    global _startup_steps, _startup_waiting_for
+    if waiting_for and waiting_for == _startup_waiting_for:
+        return
+    _startup_waiting_for = waiting_for
     if not waiting_for:
         _startup_steps += 1
     _agent.report(waiting_for=waiting_for, progress=_startup_steps)
 
 
-# The deployment's mapping, which gives the node of each rank to a split by node (join_startup_group).
-_mapping: Optional[Mapping] = None
-
-
-class StartupGroup(LiveGroupComm):
-    """``mpi_comm()`` with fault tolerance, and its subgroups: a group of ``ranks`` (global ranks, in group-rank order)
-    exchanges through :func:`startup_gather`. A replacement's groups have only itself live: their exchanges answer at
-    once, and its splits come from the startup record. It has the mpi4py methods the startup calls.
-    """
-
-    def __init__(self, identity: RankIdentity, ranks: Sequence[int], key: str = "world"):
-        ranks = tuple(ranks)
-        if identity.incarnation:
-            isolated = isolated_gather(identity.rank, identity.world_size)
-
-            def gather(value: Any) -> List[Any]:
-                values = isolated(value)
-                # A replacement's startup progress: the authority stops holding other joins for one that has none.
-                _report_startup_wait(0)
-                return values
-
-        else:
-            gather = startup_gather(
-                _startup_store(),
-                key,
-                identity.rank,
-                ranks,
-                identity.world_size,
-                _report_startup_wait,
-            )
-        super().__init__(ranks, ranks.index(identity.rank), gather)
-        self._identity = identity
-        self._key = key
-        self._subgroups = 0
-
-    def subgroup(self, ranks: Sequence[int]) -> StartupGroup:
-        """The group of ``ranks``, members of this group with this rank among them, in that order."""
-        ranks = tuple(ranks)
-        digest = hashlib.sha256(repr(ranks).encode()).hexdigest()[:16]
-        self._subgroups += 1
-        return StartupGroup(self._identity, ranks, f"{self._key}/{self._subgroups}-{digest}")
-
-    def Split(self, color: int = 0, key: int = 0) -> StartupGroup:
-        """The members that give the same ``color``, ordered by ``key``, then by their rank in this group."""
-        splits = startup_record.agree("startup_group_split", lambda: self.allgather((color, key)))
-        ranks = sorted(
-            (split[1], group_rank, rank)
-            for group_rank, (rank, split) in enumerate(zip(self.membership, splits))
-            if split[0] == color
-        )
-        return self.subgroup(rank for _, _, rank in ranks)
-
-    def Split_type(self, split_type: int, key: int = 0, info: Any = None) -> StartupGroup:
-        """The members on this rank's node (``Mapping.get_node_rank``), for the node split types
-        (``MPI.COMM_TYPE_SHARED``, Open MPI's ``COMM_TYPE_HOST``)."""
-        if split_type not in (MPI.COMM_TYPE_SHARED, OMPI_COMM_TYPE_HOST):
-            raise NotImplementedError(
-                f"StartupGroup splits by node only, not by split type {split_type}"
-            )
-        node = _mapping.get_node_rank(self._identity.rank)
-        return self.subgroup(r for r in self.membership if _mapping.get_node_rank(r) == node)
-
-    def Barrier(self) -> None:
-        self.barrier()
-
-    def bcast(self, obj: Any, root: int = 0) -> Any:
-        """The ``obj`` of group rank ``root`` (None in a replacement rank's group, but for its own)."""
-        return self.allgather(obj)[root]
-
-    def Free(self) -> None:
-        """A group holds nothing to free: its exchanges share this process's store client."""
-
-    def allreduce(self, obj: Any, op: Any = MPI.SUM) -> Any:
-        """The live members' ``obj`` reduced by ``op``: ``MPI.SUM``, ``MPI.MIN`` or ``MPI.MAX``."""
-        values = [value for value in self.allgather(obj) if value is not None]
-        for mpi_op, reduce in ((MPI.SUM, sum), (MPI.MIN, min), (MPI.MAX, max)):
-            if op == mpi_op:
-                return reduce(values)
-        raise NotImplementedError(f"StartupGroup reduces by MPI.SUM, MPI.MIN or MPI.MAX, not {op}")
-
-
 def join_startup_group(mapping: Mapping) -> None:
-    """Called in ``worker_main`` after :func:`start_worker`: makes the startup group of every rank this rank's
-    ``mpi_comm()``, whose splits by node take each rank's node from ``mapping``, and sets ``TLLM_RANK``.
+    """Called in ``worker_main`` after :func:`start_worker`: makes the startup group of every rank (a ``StoreGroup``
+    with only this rank live in a replacement, whose splits come from the startup record) this rank's ``mpi_comm()``,
+    and sets ``TLLM_RANK``.
 
     Raises:
         ValueError: The process has no rank identity, or ``mapping`` places the ranks on other nodes than the node
             supervisor runs them on.
         RuntimeError: The node's communicator was split from MPI before.
     """
-    global _mapping
     identity = _rank_identity()
     one_node = identity.world_size <= min(identity.gpus_per_node, mapping.gpus_per_node)
     check_fault_tolerance_requirements(
@@ -599,9 +504,18 @@ def join_startup_group(mapping: Mapping) -> None:
         ]
     )
     os.environ["TLLM_RANK"] = str(identity.rank)
-    _mapping = mapping
-    set_mpi_comm(StartupGroup(identity, range(identity.world_size)))
-    if not isinstance(local_mpi_comm(), StartupGroup):
+    set_mpi_comm(
+        StoreGroup(
+            _startup_store(),
+            "startup/world",
+            identity.rank,
+            range(identity.world_size),
+            _report_startup_wait,
+            live=[identity.rank] if identity.replacement else None,
+            gpus_per_node=identity.gpus_per_node,
+        )
+    )
+    if not isinstance(local_mpi_comm(), StoreGroup):
         raise RuntimeError(
             "The node's communicator was split from MPI before the startup group was set"
         )
@@ -615,7 +529,7 @@ def _join_at_entry(store: SignedStore, identity: RankIdentity) -> None:
         identity.rank,
         store,
         _on_record_at_startup,
-        incarnation=identity.incarnation,
+        replacement=identity.replacement,
         on_error=_on_error_at_startup,
     )
     _agent.start()
@@ -965,7 +879,7 @@ class RankFailureRecovery:
             os.environ[RENDEZVOUS_ENV],
             startup_memory,
             _authority,
-            incarnation=0 if replacement is None else replacement.incarnation,
+            incarnation=_agent.incarnation,
         )
         if replacement is None:
             wait_for_every_rank()
@@ -1212,14 +1126,13 @@ class RankFailureRecovery:
         return {"ready_payload": ready_payload(record, self.rank, view)}
 
     def _install(self, record: MembershipRecord) -> None:
-        """Move the host exchange to fresh rows of every live rank; the joining ranks enter it only at the resume
-        point."""
-        members = record.live_mask & ~record.joining_mask
-        gather = self._gather_through_store(record, "host_exchange_rows")
-        if members >> self.rank & 1:
-            self._exchange.install(gather, members, record.resume.epoch)
-        else:
-            self._exchange.rebuild(gather, members, record.resume.epoch)
+        """Map the host exchange's rows among every live rank, on fresh pages if a process that maps them may not be
+        live; the joining ranks enter the exchange only at the resume point."""
+        gather = self._live_group(record, "host_exchange_rows").allgather
+        fresh_rows = self._exchange.rows.stale_rows(gather)
+        self._exchange.install(
+            gather, record.live_mask & ~record.joining_mask, record.resume.epoch, fresh_rows
+        )
         with self._record_changed:
             self._installed = record
             self._pending = self._change_pending(self._record)
@@ -1231,24 +1144,22 @@ class RankFailureRecovery:
         self._install_steps += 1
         self._agent.report(install_steps=self._install_steps)
 
-    def _gather_through_store(
-        self, record: MembershipRecord, name: str
-    ) -> Callable[[Any], List[Any]]:
-        """An allgather over the record's live ranks through the store (:func:`store_gather`), which reports the ranks
-        it waits for and raises :class:`_MembershipRestarted` once the record is no longer ``record``."""
+    def _live_group(self, record: MembershipRecord, name: str) -> StoreGroup:
+        """The group of every rank whose exchanges reach the record's live ranks through the store; it reports the
+        ranks it waits for and raises :class:`_MembershipRestarted` once the record is no longer ``record``."""
 
         def on_wait(waiting: int) -> None:
             self._waiting_in_store = waiting
             if waiting and self._record != record:
                 raise _MembershipRestarted
 
-        return store_gather(
+        return StoreGroup(
             self._store,
             f"{name}/{record.generation}",
             self.rank,
-            [r for r in range(self.world_size) if record.is_live(r)],
-            self.world_size,
+            range(self.world_size),
             on_wait,
+            live=[r for r in range(self.world_size) if record.is_live(r)],
         )
 
     def _fail_install(self, record: MembershipRecord, error: Exception) -> None:
@@ -1414,16 +1325,18 @@ class RankFailureRecovery:
 
     def _give_back_retry_due(self) -> bool:
         """Whether to retry the give-back that fell short (:meth:`_retry_give_back`): checked at most once a second,
-        when device memory was freed since the last give-back. Once every excluded process ended (its replacement's
-        incarnation is claimed), that retry is the last; without memory freed, the retries end at once."""
+        when device memory was freed since the last give-back. Once every excluded process ended (the authority saw
+        its liveness connection close, ``DISCONNECTED_KEY``), that retry is the last; without memory freed, the
+        retries end at once."""
         retry = self._give_back_retry
         now_s = time.monotonic()
         if now_s < retry.check_after_s:
             return False
         retry.check_after_s = now_s + _GIVE_BACK_RETRY_S
         if not retry.ended:
+            disconnected = json.loads(self._store.get_if_set(DISCONNECTED_KEY) or "[]")
             retry.ended = all(
-                claimed_incarnation(self._store, rank) > incarnation
+                rank < len(disconnected) and disconnected[rank] >= incarnation
                 for rank, incarnation in retry.excluded.items()
             )
         freed = torch.cuda.mem_get_info()[0] > retry.free_seen
@@ -1458,8 +1371,8 @@ class RankFailureRecovery:
 
     def _restore(self, record: MembershipRecord, times: Optional[Dict[str, float]] = None) -> str:
         """This rank's part of installing ``record``, collective over its live ranks: restore the experts from the
-        agreed placement, remap the all-to-all workspaces (or only map the joining ranks' rows), with the KV cache pool
-        giving up the memory they need, then reset the all-to-all and install the live mask.
+        agreed placement, remap the all-to-all workspaces (on fresh pages if a process that maps them may not be live),
+        with the KV cache pool giving up the memory they need, then reset the all-to-all and install the live mask.
 
         Args:
             record: The INSTALL record.
@@ -1496,20 +1409,17 @@ class RankFailureRecovery:
                 self._moe.health.mark_active(r)
             else:
                 self._moe.health.mark_failed(r)
-        gather = self._gather_through_store(record, "moe_a2a_workspaces")
-        fresh_pages = self._moe.workspaces_need_fresh_pages(gather)
-        # The remap allocates the workspaces' fresh pages before the pages they replace are freed; an admission
-        # that keeps them allocates nothing.
-        workspace_bytes = self._moe.workspace_bytes() if fresh_pages else 0
+        gather = self._live_group(record, "moe_a2a_workspaces").allgather
+        fresh_rows = self._moe.stale_workspace_rows(gather)
+        # The remap allocates fresh pages for this rank's rows before the pages they replace are freed; an admission
+        # keeps them and allocates nothing.
+        workspace_bytes = self._moe.workspace_bytes() if self.rank in fresh_rows else 0
         needed = workspace_bytes + (0 if plan is None else plan.device_bytes)
 
         def remap() -> None:
             start_s = time.perf_counter()
-            if fresh_pages:
-                self._moe.remap_workspaces(gather)
-            else:
-                self._moe.admit_to_workspaces(gather)
-            times["remap" if fresh_pages else "admission"] = (time.perf_counter() - start_s) * 1e3
+            self._moe.remap_workspaces(gather, fresh_rows)
+            times["remap"] = (time.perf_counter() - start_s) * 1e3
             self._install_step_done()
 
         kv_cache_quota = "unchanged"

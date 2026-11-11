@@ -39,8 +39,8 @@ from tensorrt_llm._utils import fault_tolerance_mode, is_sm_120f, mpi_comm, mpi_
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from .membership import StoreGroup
 from .mnnvl_live_group import (
-    LiveGroupComm,
     MnnvlMappingError,
     MnnvlPeerHandleError,
     _mapping_outcome,
@@ -283,7 +283,7 @@ class MnnvlMemory:
     # Whether :meth:`remap` maps the rows of absent ranks on one local scratch allocation instead of leaving them
     # unmapped.
     absent_rows_on_scratch: bool = False
-    # The communicator ranks whose rows map scratch since the last :meth:`remap` or :meth:`admit`.
+    # The communicator ranks whose rows map scratch since the last :meth:`remap`.
     _scratch_rows: frozenset[int] = frozenset()
 
     # Per-class state attributes. These will be auto-initialized for each subclass
@@ -468,7 +468,7 @@ class MnnvlMemory:
             cls.comm = ProcessGroupComm(pg)
         elif fault_tolerance_mode():
             # Under WideEP fault tolerance, too, each rank is its own MPI world: mpi_comm() is the group of every
-            # rank over the rendezvous store (StartupGroup), whose subgroup has only the live ranks of the group.
+            # rank over the rendezvous store (StoreGroup), whose subgroup has only the live ranks of the group.
             cls.comm = mpi_comm().subgroup(cls.comm_split_ranks(mapping))
         else:
             color, key = cls.comm_split_color_key(mapping)
@@ -590,9 +590,9 @@ class MnnvlMemory:
 
         A rank ``comm`` returns None for is absent: its row stays unmapped, or, with ``absent_rows_on_scratch``,
         maps one local scratch allocation shared by every absent row. ``mapped_handles``, if given, are the handles
-        of the rows this rank maps already, its own among them, each of a live rank: this rank keeps them, exports
-        its own handle again instead of creating one, and maps only the other rows. On any failure nothing else
-        stays mapped or allocated.
+        of the rows this rank keeps (None for the others), each of a live rank: this rank maps only the other rows,
+        and exports its own handle again instead of creating one if it keeps it. On any failure nothing else stays
+        mapped or allocated.
 
         Raises:
             MnnvlPeerHandleError: A live peer's handle could not be imported.
@@ -727,7 +727,7 @@ class MnnvlMemory:
                 if kept[rank] is not None:
                     if exported_by_rank[rank] is None:
                         raise RuntimeError(
-                            f"Rank {rank} left while this rank maps its pages: remap the allocation instead"
+                            f"Rank {rank} left while this rank maps its pages: its row needs fresh pages"
                         )
                     mem_handles[rank] = kept[rank]
                     continue
@@ -810,7 +810,7 @@ class MnnvlMemory:
 
     @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
-        """Collective over the class's communicator for ``mapping``; the rows of the members a LiveGroupComm reports
+        """Collective over the class's communicator for ``mapping``; the rows of the members a ``StoreGroup`` reports
         absent stay unmapped."""
         dev_id = cls._init_device()
         comm = cls.get_comm(mapping)
@@ -950,109 +950,93 @@ class MnnvlMemory:
         if first_error is not None:
             raise first_error
 
-    def remap(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Map fresh pages at the addresses :meth:`checkpoint_prepare` kept, shared only among the live ranks.
+    def stale_rows(self, gather: Callable[[Any], Sequence[Any]]) -> frozenset[int]:
+        """The global ranks whose rows a membership change among the ranks ``gather`` reaches must back with fresh
+        pages (:meth:`remap`): every row if a process that maps this allocation's pages may not be among those ranks,
+        since it may still write into them; else none.
+
+        Each rank posts the ranks it last mapped the allocation with, its own included (none while unmapped). The
+        pages are kept only if every rank a posted set names is live and names the poster too: a rank whose process
+        was replaced fails this, as its new process did not map the allocation with the ranks its old one did.
+        Collective over those ranks, which all return the same rows.
+        """
+        record = type(self).allocated_map[self.ptr]
+        mapped_with = frozenset()
+        if record.state is _MnnvlAllocationState.MAPPED:
+            mapped_with = frozenset(
+                rank
+                for index, (rank, handle) in enumerate(
+                    zip(record.comm_membership, record.mem_handles)
+                )
+                if handle is not None and index not in self._scratch_rows
+            )
+        views = gather(mapped_with)
+        stale = any(
+            not view or any(views[peer] is None or rank not in views[peer] for peer in view)
+            for rank, view in enumerate(views)
+            if view is not None
+        )
+        return frozenset(record.comm_membership) if stale else frozenset()
+
+    def remap(self, gather: Callable[[Any], Sequence[Any]], fresh_rows: frozenset[int]) -> None:
+        """Map the allocation among the live ranks at the addresses it keeps: the rows of the global ranks in
+        ``fresh_rows`` (:meth:`stale_rows`) on fresh pages, which an excluded process never maps, so its late writes
+        land in pages no live rank maps; this rank keeps every other row it maps and imports the live rows it does not
+        map yet, such as a joining rank's.
 
         ``gather(value)`` collects ``value`` from every live rank (one entry per global rank, None for an absent
         one, whose row stays unmapped or maps scratch, see ``absent_rows_on_scratch``); it reaches exactly the ranks
-        of a membership record that lists this rank, so an excluded process never maps the fresh pages and its late
-        writes land in pages no live rank maps. Collective over the live ranks; the fresh pages are uninitialized
-        but for this rank's row, which :meth:`_reset_own_row` initializes before the live ranks learn the outcome.
-        Every live rank either maps or raises the same error type, leaving the allocation unmapped for a later
-        attempt by every live rank together (broken if releasing the fresh pages fails too).
+        of a membership record that lists this rank. Collective over the live ranks, which pass the same
+        ``fresh_rows``; fresh pages are uninitialized but for this rank's row, which :meth:`_reset_own_row`
+        initializes before the live ranks learn the outcome. Every live rank either maps or raises the same error
+        type, releasing every page it maps (a peer may map this rank's), so a later remap maps fresh pages (broken if
+        that release fails).
 
         Raises:
             MnnvlPeerHandleError: Some live rank could not import a peer's handle; ``ranks`` are global ranks.
             MnnvlMappingError: Mapping failed on some live ranks for another reason; ``ranks`` are those global
                 ranks.
+            RuntimeError: This rank's row is unmapped but not in ``fresh_rows``, or a rank whose row this rank keeps
+                is not live.
         """
-        record = type(self).allocated_map[self.ptr]
-        if record.state is not _MnnvlAllocationState.UNMAPPED:
-            raise RuntimeError(f"Cannot remap MNNVL allocation in {record.state.value} state")
-        self._map_live_rows("MNNVL remap", gather, None)
-
-    def admit(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Map the rows of the live ranks that this rank does not map yet, keeping the pages of its
-        :attr:`holders`: the membership change :meth:`remap` makes when no process outside the live ranks maps
-        them (:meth:`needs_fresh_pages`), without fresh pages. This rank exports its own handle again and imports
-        only the new rows; the rows on scratch are mapped anew.
-
-        ``gather`` is as for :meth:`remap`. Collective over the live ranks. Every live rank either maps or raises
-        the same error type; since a peer may then hold this rank's pages, every live rank also releases the pages
-        it kept, leaving the allocation unmapped for a later :meth:`remap` by every live rank together (broken if
-        that release fails).
-
-        Raises:
-            MnnvlPeerHandleError: As for :meth:`remap`.
-            MnnvlMappingError: As for :meth:`remap`.
-            RuntimeError: A rank whose row this rank maps is not live.
-        """
-        cls = type(self)
-        record = cls.allocated_map[self.ptr]
-        if record.state is not _MnnvlAllocationState.MAPPED:
-            raise RuntimeError(
-                f"Cannot admit ranks to MNNVL allocation in {record.state.value} state"
-            )
-        if self._scratch_rows:
-            # A joining rank's row is mapped where scratch is; the rows of the ranks still absent map scratch again.
-            scratch = [index in self._scratch_rows for index in range(record.comm_size)]
-            try:
-                cls._unmap_and_release_handles(
-                    replace(
-                        record,
-                        mem_handles=[h if s else None for h, s in zip(record.mem_handles, scratch)],
-                    )
-                )
-            except RuntimeError:
-                record.state = _MnnvlAllocationState.BROKEN
-                raise
-            record.mem_handles = [None if s else h for h, s in zip(record.mem_handles, scratch)]
-            self._scratch_rows = frozenset()
-        self._map_live_rows("MNNVL admission", gather, record.mem_handles)
-
-    @property
-    def holders(self) -> Optional[frozenset[int]]:
-        """The global ranks whose processes map this allocation's pages: the live ranks this rank last mapped it with
-        (:meth:`remap`, :meth:`admit` or the allocation itself), its own included, since every live rank maps the
-        rows of every live rank. None while the allocation is not mapped."""
-        record = type(self).allocated_map[self.ptr]
-        if record.state is not _MnnvlAllocationState.MAPPED:
-            return None
-        return frozenset(
-            rank
-            for index, (rank, handle) in enumerate(zip(record.comm_membership, record.mem_handles))
-            if handle is not None and index not in self._scratch_rows
-        )
-
-    def needs_fresh_pages(self, gather: Callable[[Any], Sequence[Any]]) -> bool:
-        """Whether a membership change among the ranks ``gather`` reaches (see :meth:`remap`) must map the allocation
-        on fresh pages (:meth:`remap`) rather than keep the pages it maps (:meth:`admit`): when one of those ranks
-        does not map it, or a process that maps the pages one of them keeps may not be among them, since such a
-        process may still write into them.
-
-        A live rank's pages are kept only if each of its :attr:`holders` is live and lists it among its own holders
-        too. A holder whose process was replaced fails this: its new process did not map the allocation with the
-        ranks its old one mapped it with. Collective over those ranks, which all return the same answer.
-        """
-        views = gather(self.holders or frozenset())
-        return any(
-            not view or any(views[holder] is None or rank not in views[holder] for holder in view)
-            for rank, view in enumerate(views)
-            if view is not None
-        )
-
-    def _map_live_rows(
-        self,
-        what: str,
-        gather: Callable[[Any], Sequence[Any]],
-        mapped_handles: Optional[Sequence[Any]],
-    ) -> None:
-        """:meth:`remap` (``mapped_handles`` None) or :meth:`admit` (the handles of this rank's holders' rows); logs
-        how long it took."""
         start_s = time.perf_counter()
         cls = type(self)
         record = cls.allocated_map[self.ptr]
-        comm = LiveGroupComm(record.comm_membership, record.comm_rank, gather)
+        own_row_fresh = record.comm_membership[record.comm_rank] in fresh_rows
+        if record.state is _MnnvlAllocationState.MAPPED:
+            # Mapped anew: the fresh rows, and the rows on scratch (a joining rank's row is imported where scratch was;
+            # the rows of the ranks still absent map scratch again).
+            drop = [
+                rank in fresh_rows or index in self._scratch_rows
+                for index, rank in enumerate(record.comm_membership)
+            ]
+            if any(drop):
+                torch.cuda.synchronize()
+                try:
+                    cls._unmap_and_release_handles(
+                        replace(
+                            record,
+                            mem_handles=[
+                                h if d else None for h, d in zip(record.mem_handles, drop)
+                            ],
+                        )
+                    )
+                except RuntimeError:
+                    record.state = _MnnvlAllocationState.BROKEN
+                    raise
+                record.mem_handles = [None if d else h for h, d in zip(record.mem_handles, drop)]
+        elif record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot remap MNNVL allocation in {record.state.value} state")
+        elif not own_row_fresh:
+            raise RuntimeError("This rank's row of an unmapped MNNVL allocation needs fresh pages")
+        kept = list(record.mem_handles)
+        comm = StoreGroup(
+            None,
+            "MNNVL remap",
+            record.comm_membership[record.comm_rank],
+            record.comm_membership,
+            gather=gather,
+        )
         # A live rank's outcome: () if it mapped, or what _mapping_outcome reports; None stands for an absent rank.
         handles, outcome, local_failure = None, (), None
 
@@ -1063,7 +1047,9 @@ class MnnvlMemory:
                 cls._unmap_and_release_handles(record)
             except RuntimeError as cleanup_error:
                 # The original error decides how the recovery goes on; this allocation is not mapped again.
-                logger.error(f"Failed to release the pages of a failed {what}: {cleanup_error}")
+                logger.error(
+                    f"Failed to release the pages of a failed MNNVL remap: {cleanup_error}"
+                )
                 record.state = _MnnvlAllocationState.BROKEN
                 return
             record.state = _MnnvlAllocationState.UNMAPPED
@@ -1076,9 +1062,9 @@ class MnnvlMemory:
                 record.rank_stride,
                 record.address_offset,
                 absent_rows_on_scratch=cls.absent_rows_on_scratch,
-                mapped_handles=mapped_handles,
+                mapped_handles=kept,
             )
-            if mapped_handles is None:
+            if own_row_fresh:
                 self._reset_own_row()
         except Exception as failure:
             if comm.exchange_failed:
@@ -1088,7 +1074,7 @@ class MnnvlMemory:
             outcome = _mapping_outcome(failure, record.comm_rank, record.comm_membership)
         try:
             outcomes = gather(outcome)
-            _raise_reported_failures(what, outcomes, local_failure)
+            _raise_reported_failures("MNNVL remap", outcomes, local_failure)
         except BaseException:
             release()
             raise
@@ -1100,10 +1086,11 @@ class MnnvlMemory:
             if handle is not None and outcomes[rank] is None
         )
         live = sum(reported is not None for reported in outcomes)
-        kept = 1 if mapped_handles is None else sum(handle is not None for handle in mapped_handles)
+        imported = live - sum(handle is not None for handle in kept) - own_row_fresh
         logger.info(
-            f"{what} of {cls.__name__} at {self.ptr:#x} among {live} live ranks: imported {live - kept} rows in "
-            f"{(time.perf_counter() - start_s) * 1e3:.1f} ms"
+            f"MNNVL remap of {cls.__name__} at {self.ptr:#x} among {live} live ranks: "
+            f"{sum(outcomes[rank] is not None for rank in fresh_rows)} rows on fresh pages, imported "
+            f"{imported} rows in {(time.perf_counter() - start_s) * 1e3:.1f} ms"
         )
 
     def _reset_own_row(self) -> None:

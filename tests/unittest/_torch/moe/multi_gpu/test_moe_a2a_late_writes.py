@@ -25,8 +25,8 @@ writing, reaches none of their bytes.
 
 With two ranks, the survivor first aborts the combine that waits on the victim. With four, three survivors
 import each other's fresh pages and exchange tokens among themselves after the remap; ``admitted`` then
-admits the victim's replacement, which keeps the survivors' pages (``MoeExecutionState.admit_to_workspaces``),
-and every rank exchanges tokens with every other.
+admits the victim's replacement, which keeps the survivors' pages (``MoeExecutionState.remap_workspaces`` without
+fresh rows), and every rank exchanges tokens with every other.
 
 ``no-remap`` is the negative control: without the remap the victim's writes reach the survivors' live
 rows.
@@ -46,12 +46,13 @@ import torch
 from torch.distributed import TCPStore
 
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch.distributed.mnnvl_live_group import LiveGroupComm, isolated_gather
+from tensorrt_llm._torch.distributed.membership import StoreGroup
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._utils import set_fault_tolerance_mode
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
@@ -306,7 +307,7 @@ def _survivor(
     # Recovery: fresh pages at the same addresses among the survivors, then the new membership.
     state.health.mark_failed(victim)
     if mode != "no-remap":
-        state.remap_workspaces(_survivors_gather(store, rank, ep_size))
+        state.remap_workspaces(_survivors_gather(store, rank, ep_size), frozenset(range(ep_size)))
         assert memory.mapped
     state.rearm()
     state.install_mask()
@@ -391,7 +392,7 @@ def _survivor_with_peers(
     gather = _survivors_gather(store, rank, ep_size)
     state.health.mark_failed(victim)
     if mode != "no-remap":
-        state.remap_workspaces(gather)
+        state.remap_workspaces(gather, frozenset(range(ep_size)))
         # The handle exchange and the exchange of every survivor's mapping outcome; each survivor resets its row
         # when it rearms.
         assert memory.mapped and gather.calls == 2
@@ -455,10 +456,10 @@ def _admit(
     kept = list(record.mem_handles)
     for peer in range(ep_size):
         state.health.mark_active(peer)
-    assert not state.workspaces_need_fresh_pages(gather)
-    state.admit_to_workspaces(gather)
+    assert state.stale_workspace_rows(gather) == frozenset()
+    state.remap_workspaces(gather, frozenset())
     assert all(handle is None or record.mem_handles[r] is handle for r, handle in enumerate(kept))
-    assert memory.holders == set(range(ep_size))
+    assert all(handle is not None for handle in record.mem_handles)
     state.rearm()
     state.install_mask()
     assert state.active_rank_mask.cpu().tolist() == [(1 << ep_size) - 1, 0, 0, 0]
@@ -500,13 +501,14 @@ def _replacement(store: TCPStore, rank: int, ep_size: int) -> None:
     mapping = Mapping(ep_size, rank, ep_size, tp_size=ep_size, moe_ep_size=ep_size)
     MnnvlMemory.initialize()
     # The class's group at an isolated startup: the deployment's layout with only this rank live.
-    MnnvlMemory.comm = LiveGroupComm(tuple(range(ep_size)), rank, isolated_gather(rank, ep_size))
+    MnnvlMemory.comm = StoreGroup(None, "workspace", rank, range(ep_size), live=[rank])
     MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
     meta = _workspace_layout(ep_size)
     memory = MnnvlMemory(mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)]))
     workspace = memory.as_torch_strided_tensor(torch.uint8)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size)
-    assert memory.holders == {rank}
+    handles = MnnvlMemory.allocated_map[memory.ptr].mem_handles
+    assert [handle is not None for handle in handles] == [r == rank for r in range(ep_size)]
     state = _bound_state(memory, workspace, meta, rank, ep_size)
     admission = _admit(store, state, memory, rank, ep_size)
     experts = _to_every_rank(ep_size)
@@ -524,6 +526,8 @@ def _replacement(store: TCPStore, rank: int, ep_size: int) -> None:
 
 def _worker(rank: int, port: int, mode: str, ep_size: int) -> None:
     store = TCPStore("127.0.0.1", port, is_master=False, timeout=_TIMEOUT)
+    # Every rank of a deployment that survives a lost rank runs with WideEP fault tolerance on.
+    set_fault_tolerance_mode(True)
     if mode == "replacement":
         _replacement(store, rank, ep_size)
         return

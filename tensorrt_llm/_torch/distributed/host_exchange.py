@@ -39,9 +39,9 @@ class MnnvlRows(MnnvlMemory):
     Unlike other :class:`MnnvlMemory` allocations, whose rows lie a fabric page apart with unmapped address space
     between them, the rows sit back to back, so one strided copy reaches every row. The row of an absent rank maps
     local scratch memory. A membership change maps the rows at the same addresses, on fresh pages if a process that
-    is no longer a member may still write into the current ones (:meth:`needs_fresh_pages`): it can then only write
-    into pages nobody maps anymore. :meth:`remap` zeroes this rank's row, so on return every live rank may write
-    into any row. Per-class state is separate from MnnvlMemory's.
+    is no longer a member may still write into the current ones (:meth:`stale_rows`): it can then only write into
+    pages nobody maps anymore. :meth:`remap` zeroes this rank's row when it gets fresh pages, so on return every live
+    rank may write into any row. Per-class state is separate from MnnvlMemory's.
     """
 
     absent_rows_on_scratch = True
@@ -92,7 +92,7 @@ class MnnvlRows(MnnvlMemory):
         self.segment_size = nbytes
         self.ptr, self.rank_stride = ptr, stride
         try:
-            self.remap(gather)
+            self.remap(gather, frozenset(range(nranks)))
         except BaseException:
             self.close()
             raise
@@ -154,9 +154,10 @@ class TPHostExchange:
     DEFAULT_SLOT_PAYLOAD_BYTES = 64 * 1024
     # Payload packets per rank that a header poll also copies: payloads up to 1 KB arrive with their headers.
     _POLL_PACKETS = 256
-    # A wait polls without sleeping, but in an idle exchange (a peer may park until the next request) it sleeps
-    # between polls, with a doubling backoff up to this long.
-    _MAX_SLEEP_S = 1e-3
+    # A wait polls without sleeping. In an idle exchange, where a peer may park until the next request, it polls
+    # for _IDLE_SPIN_S, then sleeps _IDLE_SLEEP_S between polls: about one poll's cost, so a late peer adds little.
+    _IDLE_SPIN_S = 20e-6
+    _IDLE_SLEEP_S = 20e-6
 
     def __init__(self, rank: int, nranks: int, rows: MnnvlRows, slot_payload_bytes: int):
         from .mnnvl_memory import _check_cu_result, cuda
@@ -242,40 +243,35 @@ class TPHostExchange:
         """The epoch of the last exchange round."""
         return self._epoch
 
-    def rebuild(self, gather: Callable[[Any], Sequence[Any]], live_mask: int, epoch: int) -> None:
-        """Continue with the ranks in ``live_mask`` on the rows of the ranks ``gather`` reaches, at the same addresses,
-        from ``epoch`` (above every epoch any rank used): on fresh rows if a process that maps the current ones may not
-        be among those ranks (:meth:`MnnvlMemory.needs_fresh_pages`), else on the current rows, mapping those of the
-        ranks that join.
-
-        Collective over the ranks ``gather`` reaches, whose rows are mapped: a superset of ``live_mask`` maps the rows
-        of ranks that enter later (:meth:`admit`). No rank may exchange until every one has rebuilt.
-        """
-        if self.rows.needs_fresh_pages(gather):
-            self.rows.checkpoint_prepare()
-            self.rows.remap(gather)
-        else:
-            self.rows.admit(gather)
-        self.admit(live_mask, epoch)
-
     def admit(self, live_mask: int, epoch: int) -> None:
-        """Continue with the ranks in ``live_mask``, whose rows the last :meth:`rebuild` mapped, from ``epoch``
+        """Continue with the ranks in ``live_mask``, whose rows the last :meth:`install` mapped, from ``epoch``
         (above every epoch any rank used). Called by every rank in ``live_mask`` between the same two rounds."""
         self.live_mask = live_mask
         self._epoch = epoch - 1
 
-    def install(self, gather: Callable[[Any], Sequence[Any]], live_mask: int, epoch: int) -> None:
+    def install(
+        self,
+        gather: Callable[[Any], Sequence[Any]],
+        live_mask: int,
+        epoch: int,
+        fresh_rows: frozenset[int],
+    ) -> None:
         """Switch to the ranks in ``live_mask`` while stopped; called by ``on_interrupt`` on every live rank.
 
         ``epoch`` is the epoch after the latest :attr:`stopped_epoch` among the live ranks; the round stopped in last
         runs again from it. A rank stopped in the round before finishes that round with the packets its live peers
-        received (a peer that went on to the next round received them all). Then :meth:`rebuild`, collective over the
-        ranks ``gather`` reaches.
+        received (a peer that went on to the next round received them all). Then the rows are mapped among the ranks
+        ``gather`` reaches, at the same addresses, the rows of ``fresh_rows`` (:meth:`MnnvlMemory.stale_rows`) on
+        fresh pages (:meth:`MnnvlMemory.remap`). Collective over those ranks: a joining rank, outside ``live_mask``,
+        maps the rows too and enters the exchange later (:meth:`admit`). No rank may exchange until every one has
+        installed.
 
         Raises:
             RuntimeError: This rank stopped more than one round before the latest live rank.
         """
-        if next_epoch(self.stopped_epoch) == epoch:
+        if not live_mask >> self.rank & 1:
+            pass  # a joining rank stopped in no round
+        elif next_epoch(self.stopped_epoch) == epoch:
             # Every live rank runs this round again, also after an earlier attempt of the change finished it here
             # with the packets of a rank that has failed since.
             self._finished_round = self._epoch_after_round = None
@@ -288,10 +284,11 @@ class TPHostExchange:
                     f"host exchange stopped at epoch {self.stopped_epoch}, more than one round before the "
                     f"latest live rank (epoch {epoch} is next)"
                 )
-            # Read before rebuild: the peers' rows stay mapped here until this rank's checkpoint_prepare.
+            # Read before the remap, which may release the peers' rows here.
             self._finished_round = self._finish_from_peers(live_mask)
         round_epoch = self._epoch
-        self.rebuild(gather, live_mask, epoch)
+        self.rows.remap(gather, fresh_rows)
+        self.admit(live_mask, epoch)
         if self._finished_round is not None:
             self._epoch_after_round, self._epoch = self._epoch, round_epoch
 
@@ -456,7 +453,7 @@ class TPHostExchange:
         is not copied to the host. ``recipients``: the ranks that need this rank's payload (default all), which must
         include every rank that names this rank among its ``readers``; only their rows get the payload, every row its
         length. ``idle``: this rank may wait long here, as when the executor has no work and a peer parks until the
-        next request: the wait sleeps between polls (see ``_MAX_SLEEP_S``).
+        next request: the wait sleeps between polls (see ``_IDLE_SLEEP_S``).
         """
         reader_mask = self.live_mask
         if readers is not None:
@@ -649,7 +646,8 @@ class TPHostExchange:
         """Copy the slots of the ``waited`` ranks (those with packets to wait for, in increasing order) in the slot set
         at ``parity_offset`` to the host until every ``wanted`` packet (``[nranks, packets]``, each rank's first ones)
         carries the current epoch. Each poll copies at least ``width`` packets per rank, of the ranks from the first
-        to the last waited one, and stops for a pending membership change. ``idle``: sleep between polls."""
+        to the last waited one, and stops for a pending membership change. ``idle``: sleep between polls once the
+        wait has polled for ``_IDLE_SPIN_S``."""
         if self._finished_round is not None:
             return self._take_finished_round(wanted)
         cuda = self._cuda
@@ -659,7 +657,7 @@ class TPHostExchange:
         poll.WidthInBytes = 8 * width
         rows = self._recv[:, :width]
         epochs = self._recv_epochs[:, : wanted.shape[1]]
-        sleep_s = 1e-6
+        spin_end = time.monotonic() + self._IDLE_SPIN_S if idle else 0.0
         while True:
             self._check_cu(cuda.cuMemcpy2DAsync(poll, self._stream.cuda_stream))
             self._stream.synchronize()
@@ -674,9 +672,8 @@ class TPHostExchange:
                 if self._finished_round is not None:
                     return self._take_finished_round(wanted)
                 raise _RoundRestarted
-            if idle:
-                time.sleep(sleep_s)
-                sleep_s = min(2 * sleep_s, self._MAX_SLEEP_S)
+            if idle and time.monotonic() >= spin_end:
+                time.sleep(self._IDLE_SLEEP_S)
 
 
 class MnnvlDist(MPIDist):

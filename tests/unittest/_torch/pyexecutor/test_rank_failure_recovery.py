@@ -44,6 +44,7 @@ from tensorrt_llm import _utils
 from tensorrt_llm._torch.distributed import membership, mnnvl_memory
 from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
 from tensorrt_llm._torch.distributed.membership import (
+    DISCONNECTED_KEY,
     HOST_WEIGHTS_PREFIX_KEY,
     JOIN_SECRET_ENV,
     PROGRESS_TIMEOUT_S,
@@ -55,8 +56,8 @@ from tensorrt_llm._torch.distributed.membership import (
     Reply,
     ResumeState,
     SignedStore,
+    StoreGroup,
     TransactionSummary,
-    incarnation_key,
 )
 from tensorrt_llm._torch.distributed.mnnvl_live_group import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
@@ -288,11 +289,11 @@ def test_a_rank_needs_the_rendezvous_address(join_secret, monkeypatch, rendezvou
 
 
 def test_a_rank_needs_its_identity_from_its_node_supervisor(join_secret, monkeypatch):
-    """Only a node supervisor starts a rank, with its incarnation: a lost rank or node comes back by its node's
-    launch, never by a rank started on its own."""
+    """Only a node supervisor starts a rank, saying whether it is a replacement: a lost rank or node comes back by its
+    node's launch, never by a rank started on its own."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    with pytest.raises(ValueError, match="'<rank>,<world size>,<GPUs per node>,<incarnation>'"):
+    with pytest.raises(ValueError, match="'<rank>,<world size>,<GPUs per node>,<replacement>'"):
         recovery_module._launched_rank()
 
 
@@ -626,15 +627,13 @@ class FakeExchange:
         self.waiting_for = 0
         self.stopped_epoch = 6
         self.epoch = 40
+        self.rows = SimpleNamespace(stale_rows=lambda gather: frozenset(range(WORLD)))
         self.installs = []
-        self.rebuilds = []
         self.admits = []
 
-    def install(self, gather, live_mask, epoch):
-        self.installs.append((gather(b"rows-0"), live_mask, epoch))
-
-    def rebuild(self, gather, live_mask, epoch):
-        self.rebuilds.append((gather(b"row-mine"), live_mask, epoch))
+    def install(self, gather, live_mask, epoch, fresh_rows):
+        assert fresh_rows == frozenset(range(WORLD))
+        self.installs.append((gather(b"row-mine"), live_mask, epoch))
 
     def admit(self, live_mask, epoch):
         self.admits.append((live_mask, epoch))
@@ -708,6 +707,7 @@ def _recovery(rank=0):
     moe.aborted.return_value = False
     moe.waited_rounds.return_value = {}
     moe.workspace_bytes.return_value = 0
+    moe.stale_workspace_rows.return_value = frozenset(range(WORLD))
     recovery = RankFailureRecovery(
         _executor(rank), FakeExchange(), moe, FakeStore(), "host:1", STARTUP_MEMORY
     )
@@ -862,7 +862,9 @@ def test_membership_change_replies_and_returns_once_the_host_exchange_is_install
         {"install_steps": 1},
     ]
     # The record's epoch, which the authority took from the READY replies.
-    assert recovery._exchange.installs == [([b"rows-0", b"rows-0", None, b"rows-3"], SURVIVORS, 8)]
+    assert recovery._exchange.installs == [
+        ([b"rows-0", b"row-mine", None, b"rows-3"], SURVIVORS, 8)
+    ]
     assert recovery._resume_after == 9 and recovery.holds_steps()
     # The installed change no longer stops the host exchange.
     assert not recovery._membership_changing()
@@ -1002,15 +1004,20 @@ def test_main_s_hang_detector_is_paused_while_a_rank_takes_part_in_a_membership_
         detector.stop()
 
 
+def _mark_arrived(store, prefix, rank):
+    """Mark ``rank``'s value of the call under ``prefix`` set, as its StoreGroup does."""
+    store.store.add(StoreGroup._counter(prefix, rank), 1 << rank % 63)
+
+
 @pytest.mark.timeout(60)
 def test_a_gather_through_the_store_reports_the_ranks_whose_values_it_waits_for():
     """The authority then takes only those ranks for the end of the wait-for chain, not the ranks waiting for them."""
     recovery = _recovery(rank=1)
     record = _record(MembershipState.INSTALL)
     recovery._record = record
-    gather = recovery._gather_through_store(record, "rows")
+    gather = recovery._live_group(record, "rows").allgather
     recovery._store.set("rows/1/0/0", pickle.dumps("rows-0"))
-    membership.mark_arrived(recovery._store, "rows/1/0", 0)
+    _mark_arrived(recovery._store, "rows/1/0", 0)
     gathered = []
     gathering = threading.Thread(target=lambda: gathered.append(gather("rows-1")), daemon=True)
     gathering.start()
@@ -1032,9 +1039,9 @@ def test_a_value_not_signed_with_the_join_secret_counts_as_not_set():
     recovery = _recovery(rank=1)
     recovery._store = store
     record = recovery._record = _record(MembershipState.INSTALL)
-    gather = recovery._gather_through_store(record, "rows")
+    gather = recovery._live_group(record, "rows").allgather
     store.set("rows/1/0/0", pickle.dumps("rows-0"))
-    membership.mark_arrived(store, "rows/1/0", 0)
+    _mark_arrived(store, "rows/1/0", 0)
     raw.set("rows/1/0/3", bytes(32) + pickle.dumps("forged"))
     gathered = []
     gathering = threading.Thread(target=lambda: gathered.append(gather("rows-1")), daemon=True)
@@ -1064,11 +1071,11 @@ def test_a_gather_reads_the_ranks_it_waits_for_from_arrival_counters_once_per_re
     add, check = store.add, store.check
     monkeypatch.setattr(store, "add", lambda *args: (adds.append(args), add(*args))[1])
     monkeypatch.setattr(store, "check", lambda keys: (checked.append(len(keys)), check(keys))[1])
-    gather = recovery._gather_through_store(record, "rows")
+    gather = recovery._live_group(record, "rows").allgather
     for r in range(world):
         if r not in (1, 200):
             store.set(f"rows/1/0/{r}", pickle.dumps(r))
-            membership.mark_arrived(store, "rows/1/0", r)
+            _mark_arrived(store, "rows/1/0", r)
     adds.clear()
     checked.clear()
     gathered = []
@@ -1086,7 +1093,7 @@ def test_a_gather_reads_the_ranks_it_waits_for_from_arrival_counters_once_per_re
         assert len(adds) <= 1 + 5 * (waited_s / membership.REPORT_INTERVAL_S + 1)
     finally:
         store.set("rows/1/0/200", pickle.dumps(200))
-        membership.mark_arrived(store, "rows/1/0", 200)
+        _mark_arrived(store, "rows/1/0", 200)
         gathering.join(10)
     assert gathered == [list(range(world))]
 
@@ -1148,10 +1155,13 @@ def _store_chunk(request, size, logits):
 
 
 @pytest.mark.parametrize("reused", [0, 4], ids=["no_reuse", "reused_accepted_chunk"])
-def test_a_discarded_step_drops_its_context_rows_and_the_recompute_stores_them_again(reused):
+def test_a_discarded_step_drops_its_context_rows_and_the_recompute_stores_them_again(
+    monkeypatch, reused
+):
     """Context logits and prompt logprobs are stored during the forward, before the step is accepted. The steps an
     abort discards drop their rows (invalid MoE outputs), and the recompute stores them again, once, whether its
     prefill starts at the beginning or after the accepted chunk it reuses: the result is that of a clean run."""
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
     generator = torch.Generator().manual_seed(5)
     logits = torch.randn(_PROMPT_LEN, _VOCAB, generator=generator)
     clean = _context_rows_request()
@@ -1320,7 +1330,7 @@ def test_the_workspace_remap_gathers_among_the_survivors_through_the_store(monke
                 f"moe_a2a_workspaces/1/{call}/{r}", pickle.dumps(("handle", r, call))
             )
     gathered = []
-    recovery._moe.remap_workspaces.side_effect = lambda gather: gathered.extend(
+    recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: gathered.extend(
         [gather(("handle", 0, 0)), gather(None)]
     )
     recovery.before_iteration()
@@ -1340,7 +1350,9 @@ def test_a_newer_change_stops_the_install_without_resetting_the_all_to_all(
     recovery.outstanding_requests = lambda: {11: 111}
     newer = _record(MembershipState.PROPOSE, generation=2, live_mask=0b0011)
     if change_after_remap:
-        recovery._moe.remap_workspaces.side_effect = lambda gather: recovery._on_record(newer)
+        recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: recovery._on_record(
+            newer
+        )
     else:
         recovery._on_record(newer)
     recovery.before_iteration()
@@ -1535,7 +1547,7 @@ def _eplb(monkeypatch, recovery, restored=6 * MIB, workspace=4 * MIB, device=Non
     recovery._executor.model_engine.moe_load_balancer = balancer
     recovery._executor._kv_pools_suspended = kv_pools_suspended
     recovery._moe.workspace_bytes.return_value = workspace
-    recovery._moe.remap_workspaces.side_effect = lambda gather: calls.append("remap")
+    recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: calls.append("remap")
     return calls, plan, device
 
 
@@ -1652,7 +1664,7 @@ def test_the_kv_cache_pool_leaves_out_the_pages_a_process_that_is_ending_maps(mo
     device = _Device()
     loss = _resuming_recovery(placement=_PLACEMENT)
     _eplb(monkeypatch, loss, device=device)
-    loss._moe.remap_workspaces.side_effect = lambda gather: device.take(4 * MIB)
+    loss._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: device.take(4 * MIB)
     loss._restore(loss._installed)
     loss._give_back_kv_cache()  # once committed
     assert device.gpu_quota == 54 * MIB and device.free == FREE_BYTES
@@ -1673,7 +1685,7 @@ def _short_give_back(monkeypatch):
     monkeypatch.setattr(recovery_module.torch.cuda, "synchronize", lambda: None)
     recovery = _resuming_recovery(placement=_PLACEMENT)
     _, _, device = _eplb(monkeypatch, recovery)
-    recovery._moe.remap_workspaces.side_effect = lambda gather: device.take(4 * MIB)
+    recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: device.take(4 * MIB)
     recovery.before_iteration()  # the install, then the commit
     assert device.gpu_quota == 54 * MIB and device.free == FREE_BYTES
     recovery._give_back_retry.check_after_s = 0.0
@@ -1714,10 +1726,12 @@ def test_a_retried_give_back_takes_back_the_memory_freed_since_the_commit(monkey
 
 
 def test_the_give_back_retries_end_once_the_excluded_process_ended(monkeypatch):
-    """Once the replacement of rank 2 claimed its incarnation, its excluded process has ended: with no memory freed
-    since the last give-back, the retries end without another one."""
+    """Once the authority saw the liveness connection of rank 2's excluded process close, the process has ended: with
+    no memory freed since the last give-back, the retries end without another one."""
     recovery, device = _short_give_back(monkeypatch)
-    recovery._store.set(incarnation_key(FAILED), b"1 claim")
+    recovery._store.set(
+        DISCONNECTED_KEY, json.dumps([0 if r == FAILED else -1 for r in range(WORLD)]).encode()
+    )
     assert _vote(recovery)[0] == [4, 0, 0]
     assert recovery._give_back_retry is None and device.gpu_quota == 54 * MIB
 
@@ -1801,11 +1815,10 @@ def test_an_admission_that_needs_no_memory_leaves_the_kv_cache_pool_alone(monkey
         released=released,
         device=_Device(gpu_quota=58 * MIB, backed=released),
     )
-    recovery._moe.workspaces_need_fresh_pages.return_value = False
-    recovery._moe.admit_to_workspaces.side_effect = lambda gather: calls.append("admit")
+    recovery._moe.stale_workspace_rows.return_value = frozenset()
+    recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: calls.append(fresh_rows)
     recovery._restore(recovery._installed)
-    assert calls[1:] == [("restore", plan), "admit"]
-    recovery._moe.remap_workspaces.assert_not_called()
+    assert calls[1:] == [("restore", plan), frozenset()]
     given_back = recovery._give_back_kv_cache()  # once committed
     if released:
         assert calls[3:] == [
@@ -1826,7 +1839,7 @@ def test_repeated_failures_do_not_ratchet_the_kv_cache_pool_down(monkeypatch):
     device = _Device()
     loss = _resuming_recovery(placement=_PLACEMENT)
     _eplb(monkeypatch, loss, device=device)
-    loss._moe.remap_workspaces.side_effect = lambda gather: device.take(4 * MIB)
+    loss._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: device.take(4 * MIB)
     loss._restore(loss._installed)
     assert device.gpu_quota == 54 * MIB
     device.take(-4 * MIB)  # the excluded process ended
@@ -3258,6 +3271,7 @@ def test_an_original_rank_takes_over_its_membership_once_every_rank_has_started(
     agent = Mock(
         record=MembershipRecord(generation=0, state=MembershipState.STARTING, live_mask=0b1111),
         bind=Mock(side_effect=lambda *args, **kwargs: events.append("bind")),
+        incarnation=0,
     )
 
     def report(**changes):
@@ -3472,8 +3486,7 @@ def test_a_replacement_waits_for_its_admission_and_starts_where_the_live_ranks_r
     assert not joined.is_alive() and not errors
     # Its fresh row is mapped by every live rank at INSTALL; it enters the host exchange at the resume point,
     # where it also restores and replies INSTALLED.
-    assert recovery._exchange.installs == []
-    assert recovery._exchange.rebuilds == [
+    assert recovery._exchange.installs == [
         ([b"rows-0", b"rows-1", b"row-mine", b"rows-3"], SURVIVORS, 40)
     ]
     assert all(report.get("reply") != Reply.INSTALLED for report in recovery._agent.reports)
@@ -3531,7 +3544,7 @@ def test_the_live_ranks_keep_the_host_exchange_to_themselves_while_a_rank_joins(
     changed.join(5)
     assert not changed.is_alive()
     assert recovery._exchange.installs == [
-        ([b"rows-0", b"rows-0", b"rows-2", b"rows-3"], SURVIVORS, 40)
+        ([b"rows-0", b"row-mine", b"rows-2", b"rows-3"], SURVIVORS, 40)
     ]
 
 
@@ -3567,7 +3580,7 @@ def test_rank_0_admits_the_joining_rank_into_the_host_exchange(monkeypatch):
     recovery.before_iteration()
     epoch = membership.next_epoch(40)
     assert handed["host_exchange_epoch/2"] == str(epoch).encode()
-    assert recovery._exchange.admits == [(0b1111, epoch)] and recovery._exchange.rebuilds == []
+    assert recovery._exchange.admits == [(0b1111, epoch)] and recovery._exchange.installs == []
     # The joining ranks take the waiting queue from the store: no collective with the live ranks.
     queued = pickle.loads(handed["waiting_queue/2"])
     assert [item.id for item in queued] == [7]
@@ -3595,7 +3608,7 @@ def test_a_joining_rank_enters_the_host_exchange_and_takes_rank_0_s_waiting_queu
     recovery._store.set("waiting_queue/2", pickle.dumps([RequestQueueItem(7)]))
     executor = recovery._executor
     recovery.before_iteration()
-    assert recovery._exchange.admits == [(0b1111, 41)] and recovery._exchange.rebuilds == []
+    assert recovery._exchange.admits == [(0b1111, 41)] and recovery._exchange.installs == []
     assert [item.id for item in executor.waiting_queue] == [7]
     executor.dist.broadcast.assert_not_called()
     # It ran no step, and enters the host exchange only at its admission.
@@ -3767,8 +3780,9 @@ def test_only_the_rank_whose_mapping_failed_replies_failed(monkeypatch, rank):
             recovery.before_iteration()
         assert exited.value.code == 1
     else:
+        installed = recovery._installed
         recovery.before_iteration()
-        recovery._next_record.assert_not_called()
+        recovery._next_record.assert_called_once_with(installed)
     assert _replies(recovery) == ([Reply.FAILED] if rank == FAILED else [])
     recovery._moe.rearm.assert_not_called()
     assert recovery.holds_steps()
@@ -3827,7 +3841,7 @@ def test_a_joining_rank_follows_a_newer_change_that_still_adds_it(monkeypatch, r
     replies = [(r["reply"], r["reply_generation"]) for r in recovery._agent.reports if "reply" in r]
     assert replies[-2:] == [(Reply.READY, 3), (Reply.INSTALLED, 3)]
     # Mapped as it joined: the rows of the newer change's live ranks, rank 3 left out.
-    assert recovery._exchange.rebuilds[-1] == (
+    assert recovery._exchange.installs[-1] == (
         [b"rows-0", b"rows-1", b"row-mine", None],
         0b0011,
         50,
@@ -3867,13 +3881,13 @@ def test_a_joining_rank_leaves_the_collective_a_newer_change_interrupts(monkeypa
     assert recovery._installed is _NEWER_INSTALL
 
 
-@pytest.mark.parametrize("incarnation", [0, 1], ids=["original", "replacement"])
-def test_every_rank_takes_its_identity_from_its_node_supervisor(monkeypatch, incarnation):
+@pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
+def test_every_rank_takes_its_identity_from_its_node_supervisor(monkeypatch, replacement):
     """Its MPI world is only itself; the rank and the world size come from the node supervisor."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,4,4,{incarnation}")
-    assert _utils.wide_ep_fault_tolerance_rank() == (2, 4, 4, incarnation)
-    assert _utils.fault_tolerance_replacement() == ((2, 4, 4, 1) if incarnation else None)
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,4,4,{int(replacement)}")
+    assert _utils.wide_ep_fault_tolerance_rank() == (2, 4, 4, replacement)
+    assert _utils.fault_tolerance_replacement() == ((2, 4, 4, True) if replacement else None)
     assert (_utils.mpi_rank(), _utils.global_mpi_rank()) == (2, 2)
     assert (_utils.mpi_world_size(), _utils.global_mpi_size()) == (4, 4)
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)

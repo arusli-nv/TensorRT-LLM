@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
+import tensorrt_llm._torch.moe.fused_moe.communication.execution_state as execution_state_module
 import tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
@@ -106,15 +107,15 @@ def _register_without_watchdog(
     )
 
 
-def test_remap_releases_the_pages_then_maps_fresh_ones_among_the_live_ranks() -> None:
+def test_remap_maps_the_workspace_among_the_live_ranks_with_the_rows_asked_on_fresh_pages() -> None:
     """The remap keeps the workspace's addresses; this rank's part is reset later, by the execution state's rearm."""
     lifecycle, memory, _ = _make_lifecycle()
     memory.reset_mock()
     gather = Mock()
 
-    lifecycle.remap(gather)
+    lifecycle.remap(gather, frozenset({1}))
 
-    assert memory.mock_calls == [call.checkpoint_prepare(), call.remap(gather)]
+    assert memory.mock_calls == [call.remap(gather, frozenset({1}))]
 
 
 def test_checkpoint_prepare_rejects_any_active_shared_client() -> None:
@@ -846,12 +847,13 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     lifecycle.unregister.assert_not_called()
 
 
-@pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
+@pytest.mark.parametrize("rank_mask", [True, False], ids=["rank_mask", "off"])
 def test_one_sided_workspace_ranks_meet_over_the_allocation_group(
-    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+    monkeypatch: pytest.MonkeyPatch, rank_mask: bool
 ) -> None:
-    """The barrier after the workspace's initialization runs over the allocation's group, not over C++'s MPI session,
-    of which each rank is the only member under WideEP fault tolerance."""
+    """In rank-mask mode the ranks meet after the workspace's initialization over the allocation's group, not over C++'s
+    MPI session, of which each rank is the only member under WideEP fault tolerance; without a rank mask the
+    initialization op synchronizes the ranks itself."""
     group = _FakeComm()
 
     class _Memory:
@@ -882,7 +884,7 @@ def test_one_sided_workspace_ranks_meet_over_the_allocation_group(
     monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
     monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
-    monkeypatch.setattr(one_sided_module, "fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.setattr(one_sided_module, "fault_tolerance_mode", lambda: rank_mask)
     monkeypatch.setattr(
         _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
     )
@@ -891,10 +893,21 @@ def test_one_sided_workspace_ranks_meet_over_the_allocation_group(
         world_size=2, moe_ep_size=2, moe_ep_rank=0, has_cp_helix=Mock(return_value=False)
     )
 
-    NVLinkOneSided(mapping=mapping, num_slots=2, top_k=1, max_num_tokens_per_rank=1)
+    health = None
+    if rank_mask:
+        health = SimpleNamespace(snapshot=lambda: SimpleNamespace(generation=0))
+        monkeypatch.setattr(execution_state_module.MoeExecutionState, "for_health", Mock())
+
+    NVLinkOneSided(
+        mapping=mapping,
+        num_slots=2,
+        top_k=1,
+        max_num_tokens_per_rank=1,
+        ep_group_health=health,
+    )
 
     assert initialize.call_args.kwargs == {}
-    assert group.barrier_count == 1
+    assert group.barrier_count == int(rank_mask)
 
 
 def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) -> None:

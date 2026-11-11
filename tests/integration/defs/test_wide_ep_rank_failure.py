@@ -1644,28 +1644,28 @@ class Run:
         return lambda ok, message: pending.append({"check": message, "ok": bool(ok)})
 
     @contextlib.contextmanager
-    def connect(self, rank: int, incarnation: int):
-        """Connect to the authority as ``incarnation`` of ``rank``, and nothing more; yields the time.
+    def connect(self, rank: int, replacement: bool):
+        """Connect to the authority for ``rank`` and nothing more; yields the time.
 
-        That is how a replacement asks to join once it has started (its signed liveness connection). The connection
-        stays open until the context ends.
+        As a ``replacement`` or as the rank's first process. That is how a replacement asks to join once it has
+        started (its signed liveness connection). The connection stays open until the context ends.
         """
         d = self.deployment
         store = open_store(_rendezvous(d.secret), bytes.fromhex(d.secret), timeout_s=60.0)
-        t = self.event(f"liveness connection: rank {rank} incarnation {incarnation}")
-        with open_liveness_connection(store, rank, incarnation):
+        t = self.event(f"liveness connection: rank {rank}, replacement {replacement}")
+        with open_liveness_connection(store, rank, replacement):
             yield t
 
     @contextlib.contextmanager
-    def refused(self, rank: int, incarnation: int, reason: str):
+    def refused(self, rank: int, replacement: bool, reason: str):
         """:meth:`connect`, which the authority must refuse with ``reason``: it logs the refusal."""
         line = REFUSAL_LOG + reason
         logged = _log_count(self.deployment.logs, line)
-        with self.connect(rank, incarnation) as t:
+        with self.connect(rank, replacement) as t:
             yield t
         self.check(
             _log_count(self.deployment.logs, line) > logged,
-            f"the authority logged no refusal of incarnation {incarnation} of rank {rank}: {line!r}",
+            f"the authority logged no refusal of a hello for rank {rank} (replacement {replacement}): {line!r}",
         )
 
     def _phase_report(
@@ -1910,11 +1910,11 @@ def _sign_test_p(lost: int, gained: int) -> float:
 
 
 def _join_record(
-    kind: str, incarnation: int, before: dict, after: dict, workers, after_workers
+    kind: str, replacement: bool, before: dict, after: dict, workers, after_workers
 ) -> dict:
     return {
         "join": kind,
-        "incarnation": incarnation,
+        "replacement": replacement,
         "status_before": before,
         "status_after": after,
         "worker_pids": {
@@ -2029,23 +2029,23 @@ def test_repeated_rank_reuse(deployment: Deployment, tmp_path: Path):
                 )
 
 
-def _refused_join(run: Run, kind: str, incarnation: int, reason: str) -> None:
-    """A join as ``incarnation`` of the victim's rank, which the authority refuses with ``reason``.
+def _refused_join(run: Run, kind: str, replacement: bool, reason: str) -> None:
+    """A join for the victim's rank, which the authority refuses with ``reason``.
 
-    Watched INVALID_JOIN_WATCH_S with the connection open: the membership does not change and no process restarts.
+    As a ``replacement`` or as the rank's first process. Watched INVALID_JOIN_WATCH_S with the connection open: the
+    membership does not change and no process restarts.
     """
     d = run.deployment
     workers, before = _rank_workers(d.secret), _status(d.base)
-    with run.refused(d.victim, incarnation, reason) as t_join:
+    with run.refused(d.victim, replacement, reason) as t_join:
         time.sleep(INVALID_JOIN_WATCH_S)
     run.phases.append(Phase(f"{kind}_join", len(run.cycles), t_join, time.monotonic()))
     after, after_workers = _status(d.base), _rank_workers(d.secret)
-    run.joins.append(_join_record(kind, incarnation, before, after, workers, after_workers))
+    run.joins.append(_join_record(kind, replacement, before, after, workers, after_workers))
     run.check(
         after["generation"] == before["generation"]
         and after["live_ranks"] == list(range(d.world_size)),
-        f"a {kind} join as incarnation {incarnation} of rank {d.victim} changed the membership: {before} -> "
-        f"{after}",
+        f"a {kind} join for rank {d.victim} changed the membership: {before} -> {after}",
     )
     run.check(
         {r: p.pid for r, p in after_workers.items()} == {r: p.pid for r, p in workers.items()},
@@ -2058,25 +2058,19 @@ def _refused_join(run: Run, kind: str, incarnation: int, reason: str) -> None:
 def test_invalid_joins(deployment: Deployment, tmp_path: Path):
     """Joins the authority refuses, and a replacement that fails during its admission, under load in one deployment.
 
-    - A second connection of a live process's incarnation: the process's crash is still failed over at once.
-    - A stale incarnation, and a newer incarnation of a live rank (as a second supervisor would send).
+    - A second connection of a live first process: the process's crash is still failed over at once.
+    - A replaced first process, and a replacement of a live rank (as a second supervisor would send).
     - A replacement killed during its admission: the survivors go on without it, and the next replacement rejoins.
 
     The authority logs each refusal; the deployment keeps serving, and no survivor restarts.
     """
     d = deployment
     with Run(d, tmp_path, "invalid_joins") as run:
-        live = _status(d.base)["incarnations"][d.victim]
-        with run.refused(
-            d.victim, live, f"rank {d.victim}'s incarnation {live} is connected already"
-        ):
+        with run.refused(d.victim, False, f"rank {d.victim}'s first process is connected already"):
             run.cycle("crash")
-        live = _status(d.base)["incarnations"][d.victim]  # the victim's replacement
+        _refused_join(run, "stale", False, f"rank {d.victim}'s first process was replaced")
         _refused_join(
-            run, "stale", live - 1, f"rank {d.victim}'s incarnation {live - 1} was replaced"
-        )
-        _refused_join(
-            run, "duplicate", live + 1, f"rank {d.victim} is live: no replacement joins for it"
+            run, "duplicate", True, f"rank {d.victim} is live: no replacement joins for it"
         )
 
         victim_pid = _rank_workers(d.secret)[d.victim].pid
@@ -2104,18 +2098,15 @@ def test_silent_joiner_does_not_hold_survivors(deployment: Deployment, tmp_path:
             RECOVERY_TIMEOUT_S,
         )[0]
         time.sleep(SETTLE_S)
-        incarnation = _status(d.base)["incarnations"][d.victim] + 1
         # It never reports that it is ready to join, so the authority never stops the survivors for it.
-        with run.connect(d.victim, incarnation) as t_join:
+        with run.connect(d.victim, True) as t_join:
             time.sleep(T_HUNG_S + SETTLE_S)
         run.phases.append(Phase("failover", 0, t_fail, t_degraded, event=t_fail))
         run.phases.append(Phase("silent_joiner", 0, t_join, time.monotonic()))
         pause_s = _largest_gap(
             run.clients.stream_arrivals(), t_join - 1.0, t_join + T_HUNG_S + SETTLE_S
         )[0]
-        run.joins.append(
-            {"join": "silent", "incarnation": incarnation, "pause_s": round(pause_s, 3)}
-        )
+        run.joins.append({"join": "silent", "pause_s": round(pause_s, 3)})
         run.check(
             pause_s < ADMISSION_PAUSE_TARGET_S,
             f"a joiner that never replied paused the survivors {pause_s:.2f} s, target < "
@@ -2199,8 +2190,8 @@ def test_every_rank_serves_as_its_own_process(launch: str, request, tmp_path: Pa
     assert sorted(workers) == list(range(deployment.world_size))
     for rank, process in workers.items():
         environ = process.environ()
-        given_rank, world_size, _, incarnation = environ[FAULT_TOLERANCE_RANK_ENV].split(",")
-        assert (given_rank, world_size, incarnation) == (str(rank), str(deployment.world_size), "0")
+        given_rank, world_size, _, replacement = environ[FAULT_TOLERANCE_RANK_ENV].split(",")
+        assert (given_rank, world_size, replacement) == (str(rank), str(deployment.world_size), "0")
         if rank != 0:
             assert not any(name in environ for name in RANK_ENV)
     with Run(deployment, tmp_path, f"independent_ranks_{launch}"):

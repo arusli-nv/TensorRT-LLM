@@ -136,15 +136,10 @@ class _HostRows:
     def row(self, rank):
         return self.ptr + rank * self.stride
 
-    def needs_fresh_pages(self, gather):
-        return True
-
-    def checkpoint_prepare(self):
-        pass
-
-    def remap(self, gather):
-        """Fresh pages, of which this rank zeroes its own row (``gather`` is unused: the memory is shared)."""
-        self._memory[self.rank * self.stride : (self.rank + 1) * self.stride] = 0
+    def remap(self, gather, fresh_rows):
+        """This rank zeroes its own row if it gets fresh pages (``gather`` is unused: the memory is shared)."""
+        if self.rank in fresh_rows:
+            self._memory[self.rank * self.stride : (self.rank + 1) * self.stride] = 0
 
     def close(self):
         pass
@@ -156,7 +151,8 @@ _LONG_SLOT_BYTES = 4 * 1024
 
 
 def _host_exchange_group(monkeypatch, nranks, slot_bytes):
-    """``nranks`` ranks' TPHostExchange over shared host rows; a change's ``install`` zeroes this rank's row."""
+    """``nranks`` ranks' TPHostExchange over shared host rows; a change's ``install`` zeroes this rank's row when it
+    gets fresh pages."""
     monkeypatch.setattr(mnnvl_memory, "cuda", _HostCopies())
     monkeypatch.setattr(host_exchange, "prefer_pinned", lambda: False)
     monkeypatch.setattr(
@@ -224,6 +220,38 @@ def test_only_an_idle_wait_sleeps(host_exchanges, monkeypatch, idle):
     assert results == {0: [b"r0", b"r1"], 1: [b"r0", b"r1"]}
     assert reported == [1 << 0]
     assert bool(sleeps) == idle, sleeps
+
+
+@pytest.mark.timeout(60)
+def test_idle_wait_sleeps_briefly(host_exchanges, monkeypatch):
+    """An idle wait polls for ``_IDLE_SPIN_S`` first, then sleeps ``_IDLE_SLEEP_S`` between polls however long its
+    peer takes, so a request that ends the wait is seen about one poll later."""
+    clock = [0.0]
+    sleeps = []  # (clock at the sleep, its length)
+    waited_long = threading.Event()
+
+    def monotonic():
+        clock[0] += 1e-6  # each poll takes time
+        return clock[0]
+
+    def sleep(seconds):
+        sleeps.append((clock[0], seconds))
+        clock[0] += seconds
+        if len(sleeps) == 1000:
+            waited_long.set()
+
+    monkeypatch.setattr(host_exchange, "time", SimpleNamespace(monotonic=monotonic, sleep=sleep))
+
+    def late(exchange):  # rank 0 sends once rank 1 has waited 1000 sleeps
+        waited_long.wait(30)
+        return exchange.exchange(b"r0", idle=True)
+
+    results = _run_ranks(
+        host_exchanges, [late, lambda exchange: exchange.exchange(b"r1", idle=True)]
+    )
+    assert results == {0: [b"r0", b"r1"], 1: [b"r0", b"r1"]}
+    assert sleeps[0][0] >= TPHostExchange._IDLE_SPIN_S
+    assert max(seconds for _, seconds in sleeps) == TPHostExchange._IDLE_SLEEP_S
 
 
 def test_mnnvl_dist_marks_only_the_idle_request_probe_idle():
@@ -331,7 +359,8 @@ def test_a_change_that_loses_no_process_gives_every_rank_the_same_results(host_e
     def change(rank, exchange):  # the membership change, from READY to the commit
         stopped[rank] = exchange.stopped_epoch
         transaction.wait()
-        exchange.install(None, 0b11, next_epoch(latest_epoch(list(stopped.values()))))
+        # Every process that maps the rows is live: they keep their pages.
+        exchange.install(None, 0b11, next_epoch(latest_epoch(list(stopped.values()))), frozenset())
         seen[rank] = False
         transaction.wait()
 
@@ -378,7 +407,9 @@ def test_a_wait_for_a_lost_rank_stops_for_the_change(monkeypatch):
     def change(exchange):  # the membership change, from READY to the commit
         stopped[exchange.rank] = exchange.stopped_epoch
         transaction.wait()
-        exchange.install(None, survivors, next_epoch(latest_epoch(list(stopped.values()))))
+        exchange.install(
+            None, survivors, next_epoch(latest_epoch(list(stopped.values()))), frozenset(range(3))
+        )
         exchange.interrupted = lambda: False
         transaction.wait()
 
@@ -395,6 +426,17 @@ def test_a_wait_for_a_lost_rank_stops_for_the_change(monkeypatch):
     assert stopped == {0: 1, 1: 1}  # in the round rank 2 never sent into
 
 
+def test_a_joining_rank_installs_the_rows_without_entering_the_exchange(monkeypatch):
+    """A joining rank, in no round, maps the rows at INSTALL with the live ranks and continues with them from the
+    record's epoch; it enters the exchange only when admitted."""
+    joining = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)[2]
+    joining.rows._memory[:] = 1
+    joining.install(None, 0b011, 7, frozenset(range(3)))
+    assert joining.live_mask == 0b011 and joining.epoch == 6
+    row = joining.rows._memory[2 * joining.rows.stride : 3 * joining.rows.stride]
+    assert not row.any()
+
+
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("absent", [1, 3])
 def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
@@ -407,7 +449,7 @@ def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
     live_ranks = [r for r in range(nranks) if live >> r & 1]
     for exchange in exchanges:
         if exchange.rank != absent:
-            exchange.rebuild(None, live, next_epoch(exchange.epoch))
+            exchange.admit(live, next_epoch(exchange.epoch))
     payloads = (
         lambda r: {"rank": r},
         lambda r: bytes([r]) * (2 * _LONG_SLOT_BYTES + 100 * r),
@@ -441,7 +483,7 @@ def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
     _run_ranks([exchanges[r] for r in live_ranks], [collectives] * len(live_ranks))
     epoch = next_epoch(max(exchange.epoch for exchange in exchanges))
     for exchange in exchanges:
-        exchange.rebuild(None, (1 << nranks) - 1, epoch)
+        exchange.admit((1 << nranks) - 1, epoch)
     results = _run_ranks(
         exchanges, [lambda exchange: dist_of(exchange).allgather(exchange.rank)] * nranks
     )

@@ -45,8 +45,13 @@ modules:
                                        note: MegaMoE backends (validate_backend and MoeExecutionState.model_comms)}
     ensure_deepgemm_torch_distributed: {collectives: [Split_type, bcast, bcast], reason: rejected,
                                         note: MegaMoE backends (validate_backend and MoeExecutionState.model_comms)}
-  tensorrt_llm/_torch/distributed/mnnvl_live_group.py:
-    LiveGroupComm.barrier: {collectives: [allgather], reason: transport}
+  tensorrt_llm/_torch/distributed/membership.py:
+    StoreGroup.barrier: {collectives: [allgather], reason: transport}
+    StoreGroup.bcast: {collectives: [allgather], reason: transport}
+    StoreGroup.allreduce: {collectives: [allgather], reason: transport}
+    StoreGroup.Split: {collectives: [subgroup], reason: transport,
+                       note: every member's color and key come from startup_record.agree}
+    StoreGroup.Split_type: {collectives: [subgroup], reason: transport}
   tensorrt_llm/_torch/distributed/mnnvl_memory.py:
     ProcessGroupComm.barrier: {collectives: [barrier], reason: transport}
     MnnvlMemory.get_comm: {collectives: [Split, subgroup], reason: transport}
@@ -60,7 +65,7 @@ modules:
   tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py:
     SingleLayerMoeLoadBalancer.update_statistic_with_local_ids._update_statistic: {collectives: [allreduce],
                                                                                    reason: device}
-    MoeLoadBalancer._setup_mpi_comm: {collectives: [Split_type], reason: transport, note: StartupGroup.Split_type}
+    MoeLoadBalancer._setup_mpi_comm: {collectives: [Split_type], reason: transport, note: StoreGroup.Split_type}
     MoeLoadBalancer.finalize_model: {collectives: [barrier], reason: barrier,
                                      note: a replacement rank then waits for its node's host weights}
     MoeLoadBalancer.shutdown: {collectives: [allgather, barrier, barrier], reason: shutdown}
@@ -70,8 +75,14 @@ modules:
     KVCacheManager.calculate_max_num_blocks: {collectives: [allreduce], reason: rejected,
                                               note: KV cache manager V1 (check_supported)}
   tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py:
-    KVCacheManagerV2.__init__: {collectives: [allreduce], reason: replayed,
-                                note: the minimum must bound a replacement rank's own token capacity}
+    KVCacheManagerV2.__init__: {collectives: [allreduce, allreduce], reason: replayed,
+                                note: the minimums must bound a replacement rank's own host history budget and token
+                                  capacity}
+    KVCacheManagerV2._grow_host_tier_into_unpinned_history: {collectives: [allreduce], reason: replayed,
+                                                             note: the original ranks' outcome must match a replacement
+                                                               rank's own host tier resize}
+    KVCacheManagerV2._setup_sparse_kv_offload: {collectives: [allreduce], reason: replayed,
+                                                note: the minimum must bound a replacement rank's own history pools}
     _sync_host_tier_quota: {collectives: [allreduce], reason: replayed,
                             note: the minimum must bound a replacement rank's own host quota}
     _sync_kv_cache_manager_init_status: {collectives: [allreduce], reason: replayed,
@@ -87,12 +98,6 @@ modules:
                               note: pipeline parallelism and sleep mode}
     PyExecutor._enqueue_responses: {collectives: [allgather], reason: serving}
   tensorrt_llm/_torch/pyexecutor/rank_failure_recovery.py:
-    StartupGroup.Split: {collectives: [subgroup], reason: transport,
-                         note: every member's color and key come from startup_record.agree}
-    StartupGroup.Split_type: {collectives: [subgroup], reason: transport}
-    StartupGroup.Barrier: {collectives: [barrier], reason: transport}
-    StartupGroup.bcast: {collectives: [allgather], reason: transport}
-    StartupGroup.allreduce: {collectives: [allgather], reason: transport}
     _check_largest_failure_fits: {collectives: [allgather], reason: agreed_elsewhere,
                                   note: a check of the original ranks; a replacement rank skips it}
     RankFailureRecovery._finish_install: {collectives: [allgather], reason: serving}

@@ -55,17 +55,17 @@ def _store(port, secret=SECRET):
 
 
 class _ReportingAuthorityProcess(AuthorityProcess):
-    """The authority process, which also puts ("refused", rank, incarnation, reason) on ``results`` for each valid
+    """The authority process, which also puts ("refused", rank, replacement, reason) on ``results`` for each valid
     hello it refuses."""
 
     def __init__(self, results, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._results = results
 
-    def _refusal(self, rank, incarnation):
-        reason = super()._refusal(rank, incarnation)
+    def _refusal(self, rank, replacement):
+        reason = super()._refusal(rank, replacement)
         if reason is not None:
-            self._results.put(("refused", rank, incarnation, reason))
+            self._results.put(("refused", rank, replacement, reason))
         return reason
 
 
@@ -79,9 +79,9 @@ def _authority(port, results):
 _STOP_KEY = "test_stop"
 
 
-def _rank(port, rank, incarnation, results):
-    """Follow the records and answer them like an executor would, until shut down or no longer a member. A rank with
-    ``incarnation`` > 0 is a replacement: connecting asks to join, and it then reports that it is ready to join."""
+def _rank(port, rank, replacement, results):
+    """Follow the records and answer them like an executor would, until shut down or no longer a member. A
+    ``replacement`` asks to join by connecting, and then reports that it is ready to join."""
     agent = None
 
     def on_record(record):
@@ -92,16 +92,23 @@ def _rank(port, rank, incarnation, results):
         elif record.state == MembershipState.INSTALL:
             agent.report(reply=Reply.INSTALLED, reply_generation=record.generation)
         results.put(
-            (rank, incarnation, record.generation, record.state.name, record.live_mask, time.time())
+            (
+                rank,
+                agent.incarnation,
+                record.generation,
+                record.state.name,
+                record.live_mask,
+                time.time(),
+            )
         )
 
     store = _store(port)
-    agent = MembershipAgent(rank, store, on_record, incarnation=incarnation)
+    agent = MembershipAgent(rank, store, on_record, replacement=replacement)
     agent.start()
-    if not incarnation:
-        agent.report(started=True)
-    if incarnation:
+    if replacement:
         agent.report(joining_ready=True, ready_payload=f"rank {rank}")
+    else:
+        agent.report(started=True)
     progress = 0
     while agent._thread.is_alive():
         progress += 1
@@ -159,7 +166,7 @@ def cluster():
 
     def start_cluster():
         start("authority", _authority)
-        ranks = [start(r, _rank, r, 0) for r in range(WORLD)]
+        ranks = [start(r, _rank, r, False) for r in range(WORLD)]
         _until_all(
             results,
             *(lambda item, r=r: item[0] == r and item[3] == "COMMITTED" for r in range(WORLD)),
@@ -194,7 +201,7 @@ def test_a_killed_rank_is_removed_quickly_and_its_replacement_joins(cluster):
     _, results, start, start_cluster = cluster
     ranks = start_cluster()
     _kill_and_expect_removal(results, ranks[3], 3, 1, 0b0111)
-    start("replacement-3", _rank, 3, 1)
+    start("replacement-3", _rank, 3, True)
     _until(results, _committed(0, 2, 0b1111), timeout_s=STARTUP_S)
 
 
@@ -218,17 +225,18 @@ def test_a_replacement_joins_once_the_process_it_replaces_is_gone(cluster):
     process."""
     _, results, start, start_cluster = cluster
     ranks = start_cluster()
-    start("refused-replacement-2", _rank, 2, 1)
+    start("refused-replacement-2", _rank, 2, True)
     with pytest.raises(AssertionError):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=STARTUP_S / 6)
     _kill_and_expect_removal(results, ranks[2], 2, 1, 0b1011)
-    start("replacement-2", _rank, 2, 1)
+    start("replacement-2", _rank, 2, True)
     _until(results, _committed(0, 2, 0b1111), timeout_s=STARTUP_S)
 
 
-def _refused(store, rank, incarnation):
-    """Open a liveness connection for ``rank`` and ``incarnation``; returns whether the authority closed it unread."""
-    with open_liveness_connection(store, rank, incarnation) as connection:
+def _refused(store, rank, replacement):
+    """Open a liveness connection for ``rank``, of a ``replacement`` or of its first process; returns whether the
+    authority closed it unread."""
+    with open_liveness_connection(store, rank, replacement) as connection:
         connection.sock.settimeout(10)
         return connection.sock.recv(1) == b""
 
@@ -238,7 +246,7 @@ def test_a_join_for_a_live_rank_is_refused(cluster):
     membership does not change."""
     store, results, _, start_cluster = cluster
     start_cluster()
-    assert _refused(store, 2, 1)
+    assert _refused(store, 2, True)
     _until(
         results,
         lambda item: item == ("refused", 2, 1, "rank 2 is live: no replacement joins for it"),
@@ -247,15 +255,15 @@ def test_a_join_for_a_live_rank_is_refused(cluster):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=2)
 
 
-def test_a_second_connection_of_an_incarnation_is_refused(cluster):
-    """A second hello of rank 1's connected process is refused, with the reason; the process's own connection still
-    tells when it ends."""
+def test_a_second_connection_of_a_first_process_is_refused(cluster):
+    """A second hello of rank 1's connected first process is refused, with the reason; the process's own connection
+    still tells when it ends."""
     store, results, _, start_cluster = cluster
     ranks = start_cluster()
-    assert _refused(store, 1, 0)
+    assert _refused(store, 1, False)
     _until(
         results,
-        lambda item: item == ("refused", 1, 0, "rank 1's incarnation 0 is connected already"),
+        lambda item: item == ("refused", 1, 0, "rank 1's first process is connected already"),
     )
     with pytest.raises(AssertionError):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=2)

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Communicators of a group whose exchanges reach only its live members, and the failures of MNNVL memory
-mapped through them."""
+"""The failures of MNNVL memory mapped among the live members of a group (``membership.StoreGroup``), as every live
+member reports them."""
 
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 
 class MnnvlPeerHandleError(RuntimeError):
@@ -60,43 +60,3 @@ def _raise_reported_failures(
     if lost:
         raise MnnvlPeerHandleError(lost, message) from local_failure
     raise MnnvlMappingError([rank for rank, _ in failures], message) from local_failure
-
-
-class LiveGroupComm:
-    """A communicator of a group whose exchanges reach only its live members.
-
-    ``gather(value)`` exchanges ``value`` among the live members and returns every member's value, indexed by
-    rank in the numbering ``membership`` uses, None for an absent member; communicator rank ``i`` is
-    ``membership[i]``. An MNNVL allocation mapped through it skips the rows of absent members (see
-    :meth:`MnnvlMemory._create_and_map_handles`). ``exchange_failed`` records that an exchange raised.
-    """
-
-    def __init__(
-        self, membership: tuple[int, ...], rank: int, gather: Callable[[Any], Sequence[Any]]
-    ) -> None:
-        self.membership = membership
-        self._rank = rank
-        self._gather = gather
-        self.exchange_failed = False
-
-    def Get_rank(self) -> int:
-        return self._rank
-
-    def Get_size(self) -> int:
-        return len(self.membership)
-
-    def allgather(self, value: Any) -> list[Any]:
-        try:
-            by_rank = self._gather(value)
-        except BaseException:
-            self.exchange_failed = True
-            raise
-        return [by_rank[member] for member in self.membership]
-
-    def barrier(self) -> None:
-        self.allgather(None)
-
-
-def isolated_gather(rank: int, size: int) -> Callable[[Any], list[Any]]:
-    """A gather over ``size`` ranks that only ``rank`` takes part in: every other rank is absent."""
-    return lambda value: [value if r == rank else None for r in range(size)]

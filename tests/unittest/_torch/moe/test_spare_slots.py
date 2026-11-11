@@ -797,13 +797,12 @@ def _replacement(monkeypatch, rank):
 
 
 def test_a_replacement_keeps_its_node_layout_without_mpi(monkeypatch):
-    """Its startup group (mpi_comm()) splits by the mapping's gpus_per_node, with only itself live."""
-    from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import StartupGroup
+    """Its startup group (mpi_comm()) splits by its node supervisor's GPUs per node, with only itself live."""
+    from tensorrt_llm._torch.distributed.membership import StoreGroup
 
     _replacement(monkeypatch, 5)
     mapping = Mapping(world_size=8, rank=5, tp_size=8, gpus_per_node=4)
-    monkeypatch.setattr(rank_failure_recovery, "_mapping", mapping)
-    world = StartupGroup(_utils.wide_ep_fault_tolerance_rank(), range(8))
+    world = StoreGroup(None, "startup/world", 5, range(8), live=[5], gpus_per_node=4)
     monkeypatch.setattr("tensorrt_llm.mpi_comm", lambda: world)
     monkeypatch.setattr("tensorrt_llm.local_mpi_size", lambda: 4)
     load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)

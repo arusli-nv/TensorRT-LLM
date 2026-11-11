@@ -59,8 +59,10 @@ class _Process:
     """The process of one of the supervisor's ranks."""
 
     child: subprocess.Popen
-    incarnation: int
+    replacement: bool
     pidfd: Optional[int]  # readable once the process ended; None once it was reaped
+    # The incarnation the authority assigned it, once a record listed it (an original rank's is 0).
+    incarnation: Optional[int] = None
     listed: bool = False  # a record listed it as a live member
     admitted: bool = False  # a COMMITTED record listed it as a live member
     killed: bool = False
@@ -205,7 +207,7 @@ class NodeSupervisor:
                 if not self._served:
                     for rank in self._ranks:
                         if rank != 0 or not self._rank_0_in_session:
-                            self._start(rank, 0)
+                            self._start(rank, replacement=False)
                 while True:
                     status = self._step(time.monotonic())
                     if status is not None:
@@ -314,10 +316,11 @@ class NodeSupervisor:
         if self._connection is None:
             return None
         if process is not None and not ended:
-            member = record.is_member(rank, process.incarnation)
-            if member:
+            # Its process is the rank's only one: the authority lists no other process of the rank while it runs.
+            if record.is_live(rank):
                 process.listed = True
-                process.admitted |= record.admits(rank, process.incarnation)
+                process.incarnation = record.incarnations[rank]
+                process.admitted |= record.state == self._membership.MembershipState.COMMITTED
             elif process.listed and not process.killed:
                 self._logger.warning(
                     f"the record no longer lists rank {rank} (incarnation {process.incarnation}): killing it"
@@ -330,7 +333,7 @@ class NodeSupervisor:
         if now_s < self._replacements.due_s(rank):
             self._wake_at_s.append(self._replacements.due_s(rank))
             return None
-        self._replace(rank, process, now_s)
+        self._replace(rank, now_s)
         return None
 
     def _end_job(self, reason: str) -> None:
@@ -344,8 +347,8 @@ class NodeSupervisor:
         except (OSError, subprocess.SubprocessError) as error:
             self._logger.error(f"cannot end the job: {error!r}")
 
-    def _start(self, rank: int, incarnation: int) -> None:
-        identity = f"{rank},{self._world_size},{self._gpus_per_node},{incarnation}"
+    def _start(self, rank: int, replacement: bool) -> None:
+        identity = f"{rank},{self._world_size},{self._gpus_per_node},{int(replacement)}"
         environ = {**self._environ, self._rank_env: identity}
         child = subprocess.Popen(  # nosec B603
             self._command,
@@ -356,29 +359,15 @@ class NodeSupervisor:
         )
         pidfd = os.pidfd_open(child.pid)
         self._selector.register(pidfd, selectors.EVENT_READ, rank)
-        self._processes[rank] = _Process(child, incarnation, pidfd)
+        self._processes[rank] = _Process(child, replacement, pidfd, None if replacement else 0)
 
-    def _replace(self, rank: int, process: Optional[_Process], now_s: float) -> None:
-        """Start a replacement of ``rank``, whose ``process`` ended (None: a supervisor started again after its node
-        was lost replaces the rank's last claimed incarnation)."""
-        membership = self._membership
+    def _replace(self, rank: int, now_s: float) -> None:
+        """Start a replacement of ``rank``, whose process ended or, after this node was lost, ran under the supervisor
+        this one replaces; the authority assigns its incarnation."""
         try:
-            failed = (
-                membership.claimed_incarnation(self._store, rank)
-                if process is None
-                else process.incarnation
-            )
-            incarnation = membership.claim_incarnation(self._store, rank, failed)
-            if incarnation is None:
-                self._logger.error(
-                    f"another claim replaced incarnation {failed} of rank {rank}: this supervisor no longer "
-                    "replaces it"
-                )
-                self._given_up.add(rank)
-                return
-            self._logger.warning(f"starting replacement {incarnation} of rank {rank}")
-            self._start(rank, incarnation)
-        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            self._logger.warning(f"starting a replacement of rank {rank}")
+            self._start(rank, replacement=True)
+        except (OSError, subprocess.SubprocessError) as error:
             self._logger.error(f"cannot start a replacement of rank {rank}: {error!r}")
             self._replacements.delay(rank, now_s)
             self._wake_at_s.append(self._replacements.due_s(rank))
@@ -391,16 +380,17 @@ class NodeSupervisor:
         process.pidfd = None
         process.status = process.child.wait()
         self._logger.warning(
-            f"rank {rank} (incarnation {process.incarnation}) ended with status {process.status}"
+            f"rank {rank} ({'replacement' if process.replacement else 'first process'}, incarnation "
+            f"{process.incarnation}) ended with status {process.status}"
         )
         if process.status != 0 and self._first_failure is None:
             self._first_failure = _exit_status(process.status)
-        if process.incarnation == 0 or process.admitted:
+        if not process.replacement or process.admitted:
             self._replacements.reset(rank)
             return
         if process.status == self._membership.REPLACEMENT_CANNOT_START:
             self._logger.error(
-                f"replacement {process.incarnation} of rank {rank} cannot start, nor could another one"
+                f"the replacement of rank {rank} cannot start, nor could another one"
             )
             self._given_up.add(rank)
             return

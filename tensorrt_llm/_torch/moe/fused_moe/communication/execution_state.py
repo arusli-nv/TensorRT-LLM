@@ -34,16 +34,13 @@ class MembershipWorkspace(Protocol):
 
     @property
     def device_bytes(self) -> int:
-        """The device memory :meth:`remap` allocates on this rank."""
+        """The device memory :meth:`remap` allocates on this rank to back its row with fresh pages."""
 
-    def needs_fresh_pages(self, gather: Callable[[Any], Sequence[Any]]) -> bool:
-        """Whether the change must map fresh pages (:meth:`remap`) rather than keep this rank's (:meth:`admit`)."""
+    def stale_rows(self, gather: Callable[[Any], Sequence[Any]]) -> frozenset[int]:
+        """The global ranks whose rows the change must back with fresh pages, the same on every rank."""
 
-    def admit(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Map the rows of the ranks that join, keeping this rank's pages."""
-
-    def remap(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Map fresh pages, shared only among the live ranks."""
+    def remap(self, gather: Callable[[Any], Sequence[Any]], fresh_rows: frozenset[int]) -> None:
+        """Map the workspace among the live ranks, the rows of ``fresh_rows`` on fresh pages."""
 
 
 class BindableCommunication(Protocol):
@@ -177,32 +174,23 @@ class MoeExecutionState:
         self._workspaces.setdefault(id(workspace), (workspace, reset_workspace))
 
     def workspace_bytes(self) -> int:
-        """The device memory :meth:`remap_workspaces` allocates on this rank, on top of the pages it replaces until it
-        returns."""
+        """The device memory :meth:`remap_workspaces` allocates on this rank to back its rows with fresh pages, on top
+        of the pages they replace until it returns."""
         return sum(workspace.device_bytes for workspace, _ in self._workspaces.values())
 
-    def workspaces_need_fresh_pages(self, gather: Callable[[Any], Sequence[Any]]) -> bool:
-        """Whether a change among the ranks ``gather`` reaches must back the bound workspaces with fresh pages
-        (:meth:`remap_workspaces`) rather than map only the joining ranks' rows (:meth:`admit_to_workspaces`).
-        Collective over those ranks."""
-        return any(
-            workspace.needs_fresh_pages(gather) for workspace, _ in self._workspaces.values()
+    def stale_workspace_rows(self, gather: Callable[[Any], Sequence[Any]]) -> frozenset[int]:
+        """The global ranks whose rows a change among the ranks ``gather`` reaches must back with fresh pages in the
+        bound workspaces (:meth:`remap_workspaces`): those of any workspace. Collective over those ranks."""
+        return frozenset().union(
+            *(workspace.stale_rows(gather) for workspace, _ in self._workspaces.values())
         )
 
-    def admit_to_workspaces(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Map the joining ranks' rows into every bound workspace, keeping this rank's pages. Only while no rank is in a
-        collective; collective over the ranks ``gather`` reaches.
-
-        Raises:
-            MnnvlPeerHandleError: As for :meth:`remap_workspaces`.
-            RuntimeError: Mapping failed on some rank; the workspace whose admission failed is unmapped.
-        """
-        for workspace, _ in self._workspaces.values():
-            workspace.admit(gather)
-
-    def remap_workspaces(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Back every bound workspace with fresh pages at the same addresses, shared only among the ranks ``gather``
-        reaches. Only while no rank is in a collective; every rank must :meth:`rearm` before the next one.
+    def remap_workspaces(
+        self, gather: Callable[[Any], Sequence[Any]], fresh_rows: frozenset[int]
+    ) -> None:
+        """Map every bound workspace at the same addresses among the ranks ``gather`` reaches, the rows of
+        ``fresh_rows`` (:meth:`stale_workspace_rows`) on fresh pages and every other row this rank maps kept. Only
+        while no rank is in a collective; every rank must :meth:`rearm` before the next one.
 
         Raises:
             MnnvlPeerHandleError: A rank ``gather`` reached could not import a peer's handle, as when the
@@ -210,7 +198,7 @@ class MoeExecutionState:
             RuntimeError: Mapping failed on some rank; the workspace whose remap failed is unmapped.
         """
         for workspace, _ in self._workspaces.values():
-            workspace.remap(gather)
+            workspace.remap(gather, fresh_rows)
 
     def track_layer(self, ep_rank: int, reset_state: Callable[[], None]) -> None:
         """Record a bound layer's EP rank and the reset of its dispatch/combine state machine.

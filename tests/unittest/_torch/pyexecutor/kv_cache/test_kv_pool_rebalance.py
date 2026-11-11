@@ -132,6 +132,10 @@ def _make_executor(
         PyExecutor._resume_after_rebalance(exe, mgr, paused, dummies)
     )
     exe._pp_ring_is_quiescent = lambda: PyExecutor._pp_ring_is_quiescent(exe)
+    # And the previous-batch accessor, which returns previous_batch without
+    # rank failure recovery.
+    exe.rank_failure_recovery = None
+    exe._accepted_previous_batch = lambda: PyExecutor._accepted_previous_batch(exe)
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()

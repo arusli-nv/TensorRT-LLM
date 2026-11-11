@@ -20,7 +20,6 @@ own rank live. Run directly, this file is one such rank."""
 import json
 import os
 import secrets
-import socket
 import subprocess  # nosec B404
 import sys
 from unittest.mock import Mock
@@ -54,13 +53,8 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     # Stands for the membership agent the worker's entry starts, which takes the startup collectives' reports.
     recovery._agent = Mock()
     if incarnation:
-        # The startup record rank 0 published: every rank on this host.
-        startup_record.replay(
-            {"values": {"rank_hosts": [[socket.gethostname()] * world_size]}, "exchanges": []}
-        )
-    recovery.join_startup_group()
-    # Past the startup record (a replacement's host collectives reach only itself).
-    startup_record.close()
+        # The startup record rank 0 published: its ranks agreed on nothing before this point.
+        startup_record.replay({"values": {}, "exchanges": []})
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
@@ -69,6 +63,9 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
         enable_attention_dp=True,
         gpus_per_node=WORLD,
     )
+    recovery.join_startup_group(mapping)
+    # Past the startup record (a replacement's host collectives reach only itself).
+    startup_record.close()
     live = [rank] if incarnation else list(range(world_size))
     dist = MnnvlDist(mapping)
     check(

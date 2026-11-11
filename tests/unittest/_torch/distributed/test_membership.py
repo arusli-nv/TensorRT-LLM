@@ -16,6 +16,7 @@
 
 import contextlib
 import itertools
+import json
 import os
 import socket
 import threading
@@ -37,8 +38,6 @@ from tensorrt_llm._torch.distributed.membership import (
     ResumeState,
     SignedStore,
     TransactionSummary,
-    claim_incarnation,
-    claimed_incarnation,
     open_liveness_connection,
 )
 
@@ -1159,7 +1158,7 @@ def test_the_authority_listens_at_the_port_after_the_rendezvous_port():
     thread.start()
     _until(lambda: store.store.check([membership.LIVENESS_KEY]))
     assert store.get(membership.LIVENESS_KEY) == f"127.0.0.1:{port}".encode()
-    with open_liveness_connection(store, 0, 0) as rank_0:
+    with open_liveness_connection(store, 0) as rank_0:
         rank_0.sock.sendall(membership._line(RankReport(shutdown=True)))
         rank_0.sock.settimeout(10)
         membership._read_line(rank_0.sock)  # the record, at the hello
@@ -1182,7 +1181,7 @@ def test_the_authority_aborts_once_the_process_that_started_it_has_ended():
     try:
         thread.start()
         _until(lambda: store.store.check([membership.LIVENESS_KEY]))
-        with open_liveness_connection(store, 0, 0):  # a rank that never leaves
+        with open_liveness_connection(store, 0):  # a rank that never leaves
             thread.join(0.3)
             assert thread.is_alive()
             os.close(write_fd)
@@ -1342,7 +1341,7 @@ def _until(condition, timeout_s=10.0):
         time.sleep(0.01)
 
 
-def _member(store, rank, world, incarnation=0):
+def _member(store, rank, world, replacement=False):
     """A rank's agent that replies to every record like an executor. A replacement reports that it is ready to join
     once it started, as its executor does."""
     agent = None
@@ -1355,18 +1354,19 @@ def _member(store, rank, world, incarnation=0):
         elif record.state == MembershipState.INSTALL:
             agent.report(reply=Reply.INSTALLED, reply_generation=record.generation)
 
-    agent = MembershipAgent(rank, store, on_record, incarnation=incarnation)
+    agent = MembershipAgent(rank, store, on_record, replacement=replacement)
     agent.start()
-    if not incarnation:
-        agent.report(started=True)
-    if incarnation:
+    if replacement:
         agent.report(joining_ready=True, ready_payload=f"rank {rank}")
+    else:
+        agent.report(started=True)
     return agent
 
 
-def _refused(store, rank, incarnation):
-    """Whether the authority closes the connection a hello for ``rank`` and ``incarnation`` opens."""
-    with open_liveness_connection(store, rank, incarnation) as connection:
+def _refused(store, rank, replacement):
+    """Whether the authority closes the connection a hello for ``rank``, of a ``replacement`` or of its first process,
+    opens."""
+    with open_liveness_connection(store, rank, replacement) as connection:
         connection.sock.settimeout(10)
         return connection.sock.recv(1 << 16) == b""
 
@@ -1384,13 +1384,14 @@ def test_a_stopped_agent_releases_every_file_descriptor_it_opened():
         agents[1].stop()
         open_fds = len(os.listdir("/proc/self/fd"))
         for incarnation in range(1, 21):
-            agent = _member(store, 1, 2, incarnation=incarnation)
+            agent = _member(store, 1, 2, replacement=True)
+            assert agent.incarnation == incarnation
             _until(lambda: agent.record is not None and agent.record.is_member(1, incarnation))
             agent.stop()
         # The authority's thread closes its end of an agent's connection once it sees the connection end, and the
         # count above may include the end of agents[1]'s that it had not closed yet.
         _until(lambda: len(os.listdir("/proc/self/fd")) <= open_fds)
-        agents[1] = _member(store, 1, 2, incarnation=21)
+        agents[1] = _member(store, 1, 2, replacement=True)
         _until(lambda: agents[1].record is not None and agents[1].record.is_member(1, 21))
 
 
@@ -1426,12 +1427,14 @@ def test_only_a_valid_hello_of_a_process_not_connected_yet_opens_a_connection(mo
                 membership._read_line(forged)
                 forged.sendall(tag + hello + b"\n")
                 assert forged.recv(1) == b""
-        assert _refused(store, 0, 0)
+        assert _refused(store, 0, False)
         with socket.create_connection((host, int(port)), timeout=10) as silent:
             membership._read_line(silent)
             assert silent.recv(1) == b""  # after HELLO_TIMEOUT_S
         assert agents[0].record.live_mask == 0b01
-        agents[1] = _member(store, 1, 2, incarnation=1)  # the same hello, signed for its connection
+        agents[1] = _member(
+            store, 1, 2, replacement=True
+        )  # the same hello, signed for its connection
         _until(lambda: agents[0].record.live_mask == 0b11)
 
 
@@ -1450,7 +1453,7 @@ def test_a_deployment_at_rest_sends_and_writes_nothing():
         writes = Mock(wraps=store.store.set)
         store.store.set = writes
         # A replacement that has not reported that it is ready to join: no transaction starts for it.
-        with open_liveness_connection(store, 1, 1) as connection:
+        with open_liveness_connection(store, 1, replacement=True) as connection:
             connection.sock.settimeout(1.5)
             received = b""
             with contextlib.suppress(socket.timeout):
@@ -1458,24 +1461,48 @@ def test_a_deployment_at_rest_sends_and_writes_nothing():
                     data = connection.sock.recv(1 << 16)
                     assert data, "the authority closed the connection"
                     received += data
-        assert len(connection.lines.decode(received)) == 1  # the record, with the hello's answer
-        writes.assert_not_called()
+            assert (
+                len(connection.lines.decode(received)) == 1
+            )  # the record that gives it its incarnation
+            writes.assert_not_called()  # until the connection closes
 
 
 def test_a_replacement_joins_only_once_the_process_it_replaces_is_gone():
-    """Never for rank 0; a join for a rank whose process still serves would evict it."""
+    """Never for rank 0; a join for a rank whose process still serves would evict it. The authority assigns the
+    replacement the rank's next incarnation at its hello, and no longer admits the process it replaced."""
     with _deployment(3) as (store, agents):
-        assert _refused(store, 2, 1)
-        assert _refused(store, 0, 1)
+        assert _refused(store, 2, True)
+        assert _refused(store, 0, True)
         assert agents[0].record.live_mask == 0b111 and agents[2]._thread.is_alive()
         agents[2]._sock.shutdown(socket.SHUT_RDWR)
         _until(lambda: agents[0].record.live_mask == 0b011)
-        agents.append(_member(store, 2, 3, incarnation=1))
+        agents.append(_member(store, 2, 3, replacement=True))
+        assert agents[-1].incarnation == 1
         _until(
             lambda: agents[0].record.live_mask == 0b111
             and agents[0].record.state == MembershipState.COMMITTED
         )
         assert agents[0].record.incarnations == (0, 0, 1)
+        assert _refused(store, 2, False)
+
+
+def test_the_authority_publishes_the_incarnations_whose_connections_closed():
+    """Per rank, the newest incarnation that ended with every older one: a replacement that ends while the process
+    it replaces is still connected does not advance it."""
+    with _deployment(2) as (store, agents):
+        assert store.get_if_set(membership.DISCONNECTED_KEY) is None
+        agents[1].stop()
+        _until(lambda: _committed_without_rank_1(agents[0]))
+        assert json.loads(store.get(membership.DISCONNECTED_KEY)) == [-1, 0]
+        held = open_liveness_connection(store, 1, replacement=True)  # incarnation 1, held open
+        agents[1] = _member(store, 1, 2, replacement=True)  # incarnation 2
+        assert agents[1].incarnation == 2
+        _until(lambda: agents[0].record.live_mask == 0b11)
+        agents[1].stop()
+        _until(lambda: _committed_without_rank_1(agents[0]))
+        assert json.loads(store.get(membership.DISCONNECTED_KEY)) == [-1, 0]
+        held.sock.close()
+        _until(lambda: json.loads(store.get(membership.DISCONNECTED_KEY)) == [-1, 2])
 
 
 class FailingAuthority(Authority):
@@ -1593,24 +1620,13 @@ def test_transaction_summary_round_trip():
     assert TransactionSummary.model_validate_json(summary.model_dump_json()) == summary
 
 
-def test_of_the_claims_that_replace_one_process_one_wins():
-    """Two supervisors that saw incarnation 1 of rank 2 fail cannot both start a replacement for it; a claim from an
-    incarnation that is no longer the last claimed one loses, and each rank has its own claims."""
-    store = SignedStore(DictStore(), b"join-secret")
-    assert claimed_incarnation(store, 2) == 0
-    assert claim_incarnation(store, 2, 0) == 1
-    assert claim_incarnation(store, 2, 0) is None
-    assert [claim_incarnation(store, 2, 1), claim_incarnation(store, 2, 1)] == [2, None]
-    assert claimed_incarnation(store, 2) == 2 and claimed_incarnation(store, 3) == 0
-    assert claim_incarnation(store, 3, 0) == 1
-
-
 def test_an_agent_stops_once_a_record_no_longer_lists_its_process_after_one_did(monkeypatch):
     """A replacement is listed by the PROPOSE that adds it; the change that restarts without it ends its membership,
     before any COMMITTED record admitted it."""
     monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 60.0)
     records = []
-    agent = MembershipAgent(1, SignedStore(None, b"secret"), records.append, incarnation=1)
+    agent = MembershipAgent(1, SignedStore(None, b"secret"), records.append, replacement=True)
+    agent.incarnation = 1
     agent._sock, authority_side = _socket_pair()
     agent._lines = membership._Lines()
     agent._thread.start()
@@ -1701,7 +1717,7 @@ def test_connections_that_send_no_hello_are_capped(monkeypatch):
         silent[1].settimeout(0.5)
         with pytest.raises(socket.timeout):
             silent[1].recv(1)
-        with open_liveness_connection(store, 0, 0) as rank_0:  # a valid hello still opens one
+        with open_liveness_connection(store, 0) as rank_0:  # a valid hello still opens one
             rank_0.sock.sendall(membership._line(RankReport(shutdown=True)))
             rank_0.sock.settimeout(10)
             assert membership._read_line(rank_0.sock)  # the record, at the hello

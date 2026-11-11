@@ -415,10 +415,15 @@ class TestMoeLoadBalancer(unittest.TestCase):
                        single_layer_load_balancer_ptr):
             summed.copy_(global_statistic_info)
 
+        # The executor's own stream: the legacy default stream would wait for
+        # the load balancer's stream implicitly and hide the race.
+        main_stream = torch.cuda.Stream()
+        main_stream.wait_stream(torch.cuda.current_stream())
         try:
             with patch.object(torch.ops.trtllm,
                               "moe_hierarchical_statistic_update",
-                              record_sum), with_multi_stream(True):
+                              record_sum), with_multi_stream(True), \
+                    torch.cuda.stream(main_stream):
                 with MoeLoadBalancerIterContext(balancer):
                     layer.start_wait_gpu_stage()
                     layer.done_wait_gpu_stage()

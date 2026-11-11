@@ -301,29 +301,23 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
 
     @property
     def device_bytes(self) -> int:
-        """The device memory this rank's part of the workspace takes, which :meth:`remap` allocates again."""
+        """The device memory this rank's part of the workspace takes, which :meth:`remap` allocates again on fresh
+        pages."""
         return self._memory.local_device_bytes
 
-    def needs_fresh_pages(self, gather: Callable[[object], Sequence[object]]) -> bool:
-        """Whether a membership change must back the workspace with fresh pages
-        (:meth:`MnnvlMemory.needs_fresh_pages`)."""
-        return self._memory.needs_fresh_pages(gather)
+    def stale_rows(self, gather: Callable[[object], Sequence[object]]) -> frozenset[int]:
+        """The rows a membership change must back with fresh pages (:meth:`MnnvlMemory.stale_rows`)."""
+        return self._memory.stale_rows(gather)
 
-    def admit(self, gather: Callable[[object], Sequence[object]]) -> None:
-        """Map the rows of the ranks that join, keeping this rank's pages (:meth:`MnnvlMemory.admit`). The watchdog
-        stops meanwhile: a failure releases the pages whose flags it reads."""
-        self._stop_watchdog()
-        self._memory.admit(gather)
-        self._start_watchdog()
-
-    def remap(self, gather: Callable[[object], Sequence[object]]) -> None:
-        """Back the workspace with fresh pages at the same addresses, shared among the live ranks
-        (:meth:`MnnvlMemory.remap`). The watchdog stops meanwhile, as its flag reads would fault. This rank's part of
-        the fresh pages is uninitialized until its owner resets it; the watchdog reads it only for a collective it
+    def remap(
+        self, gather: Callable[[object], Sequence[object]], fresh_rows: frozenset[int]
+    ) -> None:
+        """Map the workspace among the live ranks at the same addresses, ``fresh_rows`` on fresh pages
+        (:meth:`MnnvlMemory.remap`). The watchdog stops meanwhile, as its flag reads would fault on a released page.
+        A fresh row is uninitialized until its owner resets it; the watchdog reads it only for a collective it
         watches."""
         self._stop_watchdog()
-        self._memory.checkpoint_prepare()
-        self._memory.remap(gather)
+        self._memory.remap(gather, fresh_rows)
         self._start_watchdog()
 
     def _create_coordinator(self) -> AlltoAllWatchdogCoordinator:

@@ -549,8 +549,8 @@ def check_fault_tolerance_requirements(
 # Set in the process of every rank under WideEP fault tolerance, by the node
 # supervisor (``_llmapi_node_supervisor.py``) that starts it, or by
 # ``MpiPoolSession`` for rank 0:
-# "<rank>,<world size>,<GPUs per node>,<incarnation>". The rank runs on GPU
-# rank % GPUs per node.
+# "<rank>,<world size>,<GPUs per node>,<replacement>" (1 for a replacement of
+# a lost process, else 0). The rank runs on GPU rank % GPUs per node.
 FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 
 
@@ -562,7 +562,7 @@ class RankIdentity(NamedTuple):
     world_size: int
     # The ranks the node supervisor runs on each node, one per GPU.
     gpus_per_node: int
-    incarnation: int  # 0 for an original rank, n for its n-th replacement
+    replacement: bool  # a replacement of a lost process of the rank
 
 
 def wide_ep_fault_tolerance_rank() -> Optional[RankIdentity]:
@@ -576,14 +576,16 @@ def fault_tolerance_replacement() -> Optional[RankIdentity]:
     """With WideEP fault tolerance, the rank this process replaces (None for
     an original rank)."""
     identity = wide_ep_fault_tolerance_rank()
-    return identity if identity is not None and identity.incarnation else None
+    return identity if identity is not None and identity.replacement else None
 
 
 @lru_cache(maxsize=1)
 def _parse_rank_identity(value: Optional[str]) -> Optional[RankIdentity]:
     if value is None:
         return None
-    return RankIdentity(*(int(field) for field in value.split(",")))
+    rank, world_size, gpus_per_node, replacement = (
+        int(field) for field in value.split(","))
+    return RankIdentity(rank, world_size, gpus_per_node, bool(replacement))
 
 
 def mpi_rank():

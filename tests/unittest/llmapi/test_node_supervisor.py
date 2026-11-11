@@ -33,8 +33,6 @@ from tensorrt_llm._torch.distributed.membership import (
     MembershipState,
     NodeView,
     SignedStore,
-    claim_incarnation,
-    claimed_incarnation,
 )
 
 # The tests run supervisors, ranks and launchers as processes: one that hangs fails its test, not the job.
@@ -58,14 +56,17 @@ def _timings(monkeypatch):
         monkeypatch.setattr(supervisor_module, name, value)
 
 
-# A rank: records itself in SUPERVISOR_TEST_ROOT, then behaves as SUPERVISOR_TEST_MODES says for its rank and
-# incarnation ("serves" by default; "records-signals": records the first SIGINT or SIGTERM it gets, and exits).
+# A rank: records itself in SUPERVISOR_TEST_ROOT as the rank's n-th process (0 for its first, then its replacements
+# in turn), then behaves as SUPERVISOR_TEST_MODES says for "<rank>:<n>" ("serves" by default; "records-signals":
+# records the first SIGINT or SIGTERM it gets, and exits).
 _RANK = r"""
 import json, os, signal, sys, time
 from pathlib import Path
 
-rank, world_size, _, incarnation = os.environ["TLLM_FAULT_TOLERANCE_RANK"].split(",")
+rank, world_size, _, replacement = os.environ["TLLM_FAULT_TOLERANCE_RANK"].split(",")
 root = Path(os.environ["SUPERVISOR_TEST_ROOT"])
+started = [int(path.stem.rsplit("-", 1)[1]) for path in root.glob(f"rank-{rank}-*.json")]
+incarnation = max(started, default=0) + 1 if replacement == "1" else 0
 modes = dict(item.split("=") for item in os.environ.get("SUPERVISOR_TEST_MODES", "").split())
 mode = modes.get(f"{rank}:{incarnation}", "serves")
 if mode == "records-signals":
@@ -306,7 +307,6 @@ def test_a_crashed_rank_is_replaced_on_its_gpu_once_the_record_lists_it_as_faile
     _until(lambda: _read(tmp_path, 3, 1))
     replacement = _read(tmp_path, 3, 1)
     assert replacement["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == "3,4,2,1"
-    assert claimed_incarnation(authority.store, 3) == 1  # claimed in the store
     assert _alive(_read(tmp_path, 2, 0)["pid"])
     authority.push(_record(MembershipState.SHUTDOWN, incarnations=(0, 0, 0, 1)))
     assert running.wait() == 0
@@ -360,23 +360,12 @@ def test_a_replacement_the_change_that_would_add_it_leaves_out_is_killed_and_sta
     joined = (0, 0, 0, 1)
     authority.push(_record(MembershipState.PROPOSE, 0b1111, incarnations=joined, generation=2))
     _until(lambda: running.supervisor._processes[3].listed)
+    assert running.supervisor._processes[3].incarnation == 1  # the one the authority assigned it
     authority.push(_record(MembershipState.PROPOSE, 0b0111, incarnations=joined, generation=3))
     _until(lambda: not _alive(joining))
     _until(lambda: _read(tmp_path, 3, 2))
-    assert claimed_incarnation(authority.store, 3) == 2
     authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0111, generation=3))
     assert running.wait() == 0
-
-
-def test_of_two_claims_that_replace_one_process_one_wins(deployment):
-    """Compare-and-set from the failed incarnation (fails with a plain counter, which gives both a number)."""
-    authority, _ = deployment
-    authority.start()
-    assert claimed_incarnation(authority.store, 3) == 0
-    assert claim_incarnation(authority.store, 3, 0) == 1
-    assert claim_incarnation(authority.store, 3, 0) is None
-    assert claimed_incarnation(authority.store, 3) == 1
-    assert claim_incarnation(authority.store, 3, 1) == 2
 
 
 def test_each_rank_runs_in_its_own_session(tmp_path, deployment):

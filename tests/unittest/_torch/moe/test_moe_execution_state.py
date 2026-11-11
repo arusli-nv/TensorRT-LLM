@@ -205,11 +205,11 @@ def test_remap_workspaces_remaps_each_workspace_in_binding_order_without_a_reset
         comm.bind_execution_state(state)
     gather = Mock()
 
-    state.remap_workspaces(gather)
+    state.remap_workspaces(gather, frozenset({1}))
 
     assert [name for name, _, _ in calls.mock_calls] == ["workspace0.remap", "workspace1.remap"]
     for comm in comms:
-        comm._workspace_lifecycle.remap.assert_called_once_with(gather)
+        comm._workspace_lifecycle.remap.assert_called_once_with(gather, frozenset({1}))
     gather.assert_not_called()
 
 
@@ -226,36 +226,20 @@ def test_workspace_bytes_count_each_bound_workspace_once() -> None:
     assert state.workspace_bytes() == 8 << 20
 
 
-@pytest.mark.parametrize("needs", [(False, False), (False, True)])
-def test_the_workspaces_need_fresh_pages_when_one_of_them_does(needs) -> None:
-    """Each workspace answers alike on every rank of the change (``MnnvlMemory.needs_fresh_pages``)."""
+@pytest.mark.parametrize("stale", [(set(), set()), (set(), {0, 1, 2, 3})])
+def test_the_workspaces_need_fresh_pages_for_the_stale_rows_of_any_of_them(stale) -> None:
+    """Each workspace answers alike on every rank of the change (``MnnvlMemory.stale_rows``)."""
     health = EPGroupHealth(4)
     state = MoeExecutionState(health, torch.device("cuda"))
     comms = [_frontend(health), _frontend(health)]
-    for comm, need in zip(comms, needs):
-        comm._workspace_lifecycle = Mock(needs_fresh_pages=Mock(return_value=need))
+    for comm, rows in zip(comms, stale):
+        comm._workspace_lifecycle = Mock(stale_rows=Mock(return_value=frozenset(rows)))
         comm._reset_local_workspace = Mock()
         comm.bind_execution_state(state)
     gather = Mock()
-    assert state.workspaces_need_fresh_pages(gather) is any(needs)
-    comms[0]._workspace_lifecycle.needs_fresh_pages.assert_called_once_with(gather)
-
-
-def test_an_admission_maps_the_joining_rows_of_every_workspace_without_releasing_any() -> None:
-    health = EPGroupHealth(2)
-    state = MoeExecutionState(health, torch.device("cuda"))
-    calls = Mock()
-    comms = [_frontend(health), _frontend(health)]
-    for index, comm in enumerate(comms):
-        comm._workspace_lifecycle = getattr(calls, f"workspace{index}")
-        comm._reset_local_workspace = getattr(calls, f"reset{index}")
-        comm.bind_execution_state(state)
-    gather = Mock()
-    state.admit_to_workspaces(gather)
-    assert [name for name, _, _ in calls.mock_calls] == ["workspace0.admit", "workspace1.admit"]
+    assert state.stale_workspace_rows(gather) == frozenset().union(*stale)
     for comm in comms:
-        comm._workspace_lifecycle.admit.assert_called_once_with(gather)
-    gather.assert_not_called()
+        comm._workspace_lifecycle.stale_rows.assert_called_once_with(gather)
 
 
 def test_waited_rounds_name_each_peer_waited_for_with_its_round() -> None:

@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MnnvlMemory.remap and MnnvlRows against a fake CUDA driver: same addresses, live rows only."""
+"""MnnvlMemory.remap and MnnvlRows against a fake CUDA driver: same addresses, live rows only, fresh pages for the
+rows asked."""
 
 import gc
 import itertools
@@ -24,12 +25,8 @@ import torch
 
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 from tensorrt_llm._torch.distributed.host_exchange import MnnvlRows
-from tensorrt_llm._torch.distributed.mnnvl_live_group import (
-    LiveGroupComm,
-    MnnvlMappingError,
-    MnnvlPeerHandleError,
-    isolated_gather,
-)
+from tensorrt_llm._torch.distributed.membership import StoreGroup
+from tensorrt_llm._torch.distributed.mnnvl_live_group import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -161,13 +158,13 @@ def _rows(*ranks, base=_BASE):
     return [base + rank * _STRIDE for rank in ranks]
 
 
+_ALL, _SURVIVORS, _REPLACEMENT = frozenset(range(4)), frozenset({0, 1, 3}), frozenset({2})
+
+
 def test_remap_maps_fresh_pages_at_same_addresses_for_live_rows_only(memory, driver):
-    memory.checkpoint_prepare()
-    assert driver.mapped == {}
+    memory.remap(_gather_without({2}), _ALL)
+
     assert sorted(driver.released) == sorted(("old", rank) for rank in range(4))
-
-    memory.remap(_gather_without({2}))
-
     assert memory.mapped
     assert sorted(driver.mapped) == _rows(0, 1, 3)
     assert driver.mapped[_BASE + _STRIDE][0] == "local"
@@ -181,10 +178,11 @@ def test_a_replacement_maps_only_its_own_row_until_its_admission_maps_every_live
     """Isolated startup: the class's group has the deployment's layout with only the replacement live, so only its
     row is mapped; the admission maps every live row in place, keeping the replacement's pages unless the live ranks
     need fresh ones."""
+    monkeypatch.setattr(mnnvl, "fault_tolerance_mode", lambda: True)
     monkeypatch.setattr(
         _RemapMemory, "get_allocation_granularity", classmethod(lambda cls, dev_id: _SIZE)
     )
-    group = LiveGroupComm((0, 1, 2, 3), 2, isolated_gather(2, 4))
+    group = StoreGroup(None, "workspace", 2, range(4), live=[2])
     monkeypatch.setattr(_RemapMemory, "get_comm", classmethod(lambda cls, mapping: group))
     memory = _RemapMemory(Mapping(world_size=4, rank=2, tp_size=4, moe_ep_size=4), _SIZE)
     try:
@@ -192,15 +190,10 @@ def test_a_replacement_maps_only_its_own_row_until_its_admission_maps_every_live
         assert list(driver.mapped) == [rows[2]]
         record = _RemapMemory.allocated_map[memory.ptr]
         assert (record.comm_size, record.comm_rank, record.comm_membership) == (4, 2, (0, 1, 2, 3))
-        assert memory.holders == {2}
         own = driver.mapped[rows[2]]
-        if fresh_pages:
-            memory.checkpoint_prepare()
-            memory.remap(_gather_without(set()))
-        else:
-            memory.admit(_gather_without(set()))
-            assert driver.mapped[rows[2]] is own
-        assert sorted(driver.mapped) == rows and memory.holders == {0, 1, 2, 3}
+        memory.remap(_gather_without(set()), _ALL if fresh_pages else frozenset())
+        assert (driver.mapped[rows[2]] is own) is not fresh_pages
+        assert sorted(driver.mapped) == rows
     finally:
         memory.checkpoint_prepare()
         _RemapMemory.allocated_map.clear()
@@ -209,11 +202,8 @@ def test_a_replacement_maps_only_its_own_row_until_its_admission_maps_every_live
 
 
 def test_release_after_remap_skips_unmapped_absent_rows(memory, driver):
-    memory.checkpoint_prepare()
-    memory.remap(_gather_without({2}))
-    memory.checkpoint_prepare()
-    assert driver.mapped == {}
-    memory.remap(_gather_without({0, 2}))
+    memory.remap(_gather_without({2}), _ALL)
+    memory.remap(_gather_without({0, 2}), _ALL)
     assert sorted(driver.mapped) == _rows(1, 3)
 
 
@@ -222,75 +212,64 @@ def test_a_membership_change_logs_one_line_with_its_time(memory, driver, monkeyp
     monkeypatch.setattr(mnnvl, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
     info = Mock()
     monkeypatch.setattr(mnnvl.logger, "info", info)
-    memory.checkpoint_prepare()
-    memory.remap(_gather_without({2}))
+    memory.remap(_gather_without({2}), _ALL)
     info.assert_called_once_with(
-        f"MNNVL remap of _RemapMemory at {_BASE:#x} among 3 live ranks: imported 2 rows in 250.0 ms"
+        f"MNNVL remap of _RemapMemory at {_BASE:#x} among 3 live ranks: 3 rows on fresh pages, imported 2 rows "
+        "in 250.0 ms"
     )
 
 
 def test_failed_remap_leaves_allocation_unmapped_and_retryable(memory, driver):
-    memory.checkpoint_prepare()
     driver.fail_create = True
     with pytest.raises(RuntimeError, match="handle export failed"):
-        memory.remap(_gather_without({2}))
+        memory.remap(_gather_without({2}), _ALL)
     assert driver.mapped == {}
     assert not memory.mapped
     driver.fail_create = False
-    memory.remap(_gather_without({2}))
+    memory.remap(_gather_without({2}), _ALL)
     assert memory.mapped
-
-
-def test_remap_requires_released_backing(memory):
-    with pytest.raises(RuntimeError, match="Cannot remap"):
-        memory.remap(_gather_without(set()))
 
 
 def test_an_admission_keeps_every_mapped_row_and_maps_only_the_joining_rank_s_row(memory, driver):
     """Rank 1 maps the rows of ranks 0, 1 and 3 after rank 2 failed; rank 2's replacement joins. Rank 1 creates and
     releases nothing: it exports its own handle again, keeps every row it maps with the same handle, and imports
     and maps rank 2's row only."""
-    memory.checkpoint_prepare()
-    memory.remap(_gather_without({2}))
-    assert memory.holders == {0, 1, 3}
+    memory.remap(_gather_without({2}), _ALL)
     kept = dict(driver.mapped)
     driver.released.clear()
     driver.fail_create = True
-    memory.admit(_gather_without(set()))
+    memory.remap(_gather_without(set()), frozenset())
     assert sorted(driver.mapped) == _rows(0, 1, 2, 3)
     assert all(driver.mapped[address] is handle for address, handle in kept.items())
     (own,) = _rows(1)
     assert driver.mapped[_BASE + 2 * _STRIDE] == ("import", ("export", kept[own]))
     assert driver.released == []
-    assert memory.mapped and memory.holders == {0, 1, 2, 3}
+    assert memory.mapped
 
 
 def test_an_admission_refuses_a_row_whose_rank_left(memory, driver):
     """Rank 3, whose pages rank 1 maps, is not live: only fresh pages keep its late writes out. Every row is
     released, for the remap."""
     with pytest.raises(RuntimeError, match="Rank 3 left while this rank maps its pages"):
-        memory.admit(_gather_without({3}))
-    assert driver.mapped == {} and not memory.mapped and memory.holders is None
-    memory.remap(_gather_without({3}))
+        memory.remap(_gather_without({3}), frozenset())
+    assert driver.mapped == {} and not memory.mapped
+    memory.remap(_gather_without({3}), _ALL)
     assert sorted(driver.mapped) == _rows(0, 1, 2)
 
 
 def test_a_failed_admission_releases_the_kept_pages_too(memory, driver):
     """A peer may have imported rank 1's pages before the admission failed elsewhere: rank 1 releases every page
-    it mapped, its own included, so that the next change remaps."""
+    it mapped, its own included, so that the next change maps it on fresh pages."""
     with pytest.raises(MnnvlMappingError, match="rank 3: RuntimeError"):
-        memory.admit(_gather_outcomes({3: ("RuntimeError: map failed", [])}, absent=set()))
-    assert driver.mapped == {} and not memory.mapped and memory.holders is None
+        memory.remap(
+            _gather_outcomes({3: ("RuntimeError: map failed", [])}, absent=set()), frozenset()
+        )
+    assert driver.mapped == {} and not memory.mapped
     assert sorted(driver.released) == sorted(("old", rank) for rank in range(4))
-    with pytest.raises(
-        RuntimeError, match="Cannot admit ranks to MNNVL allocation in unmapped state"
-    ):
-        memory.admit(_gather_without(set()))
-    memory.remap(_gather_without(set()))
+    with pytest.raises(RuntimeError, match="row of an unmapped MNNVL allocation needs fresh pages"):
+        memory.remap(_gather_without(set()), frozenset())
+    memory.remap(_gather_without(set()), _ALL)
     assert memory.mapped
-
-
-_ALL, _SURVIVORS, _REPLACEMENT = frozenset(range(4)), frozenset({0, 1, 3}), frozenset({2})
 
 
 @pytest.mark.parametrize(
@@ -314,23 +293,22 @@ def test_fresh_pages_are_needed_only_when_a_process_that_maps_them_may_not_be_li
     memory, driver, absent, peers, fresh_pages
 ):
     """Rank 1 maps the rows of every rank but ``absent`` (since a remap without them); the ranks of the change post
-    their holders, and every rank answers alike from all of them."""
+    the ranks they mapped the allocation with, and every rank answers alike from all of them."""
     if absent:
-        memory.checkpoint_prepare()
-        memory.remap(_gather_without(absent))
+        memory.remap(_gather_without(absent), _ALL)
     posted = []
 
     def gather(value):
         posted.append(value)
         return [value if rank == 1 else peers.get(rank) for rank in range(4)]
 
-    assert memory.needs_fresh_pages(gather) is fresh_pages
-    assert posted == [memory.holders]
+    assert memory.stale_rows(gather) == (_ALL if fresh_pages else frozenset())
+    assert posted == [_ALL - absent]
 
 
 def test_an_unmapped_allocation_needs_fresh_pages(memory, driver):
     memory.checkpoint_prepare()
-    assert memory.needs_fresh_pages(lambda value: [value] * 4)
+    assert memory.stale_rows(lambda value: [value] * 4) == _ALL
 
 
 def test_an_admission_maps_a_joining_rank_s_row_where_scratch_was(rows_driver):
@@ -338,17 +316,16 @@ def test_an_admission_maps_a_joining_rank_s_row_where_scratch_was(rows_driver):
     joins: rank 1 keeps its own and rank 0's rows, imports rank 2's in place of scratch, and maps rank 3's, still
     absent, on scratch again."""
     rows = MnnvlRows(1, 4, _SIZE, _gather_without({2, 3}))
-    assert rows.holders == {0, 1}
     kept = [rows_driver.mapped[rows.row(rank)] for rank in (0, 1)]
     scratch = rows_driver.mapped[rows.row(2)]
 
-    rows.admit(_gather_without({3}))
+    rows.remap(_gather_without({3}), frozenset())
 
     assert [rows_driver.mapped[rows.row(rank)] for rank in (0, 1)] == kept
     assert rows_driver.mapped[rows.row(2)][0] == "import"
     assert rows_driver.mapped[rows.row(3)][0] == "local"
     assert rows_driver.mapped[rows.row(3)] not in (scratch, kept[1])
-    assert rows_driver.released == [scratch] and rows.holders == {0, 1, 2}
+    assert rows_driver.released == [scratch]
     rows.close()
 
 
@@ -377,13 +354,13 @@ def test_a_peer_s_failed_mapping_unmaps_this_rank_too(memory, driver):
     memory.checkpoint_prepare()
     driver.released.clear()
     with pytest.raises(RuntimeError, match="rank 3: RuntimeError") as raised:
-        memory.remap(_gather_outcomes({3: ("RuntimeError: map failed", [])}, absent={2}))
+        memory.remap(_gather_outcomes({3: ("RuntimeError: map failed", [])}, absent={2}), _ALL)
     # It names the rank that failed, which alone reports the failure in a membership change.
     assert isinstance(raised.value, MnnvlMappingError) and raised.value.ranks == (3,)
     assert driver.mapped == {} and not memory.mapped
     # The fresh local handle and the imported ones were released.
     assert len(driver.released) == 3
-    memory.remap(_gather_without({2}))
+    memory.remap(_gather_without({2}), _ALL)
     assert sorted(driver.mapped) == _rows(0, 1, 3)
 
 
@@ -397,7 +374,7 @@ def test_this_rank_s_failed_import_is_reported_to_the_others(memory, driver):
         return [None if rank == 2 else value for rank in range(4)]
 
     with pytest.raises(MnnvlPeerHandleError, match="rank 1: MnnvlPeerHandleError") as raised:
-        memory.remap(gather)
+        memory.remap(gather, _ALL)
     # Rank 1 failed on the first peer it imports, global rank 0; the CUDA result reaches every live rank.
     assert reported[-1][1] == [0] and raised.value.ranks == (0,)
     assert "cuMemImportFromShareableHandle: 2" in reported[-1][0]
@@ -419,7 +396,7 @@ def test_only_the_rank_whose_export_failed_is_named(memory, driver):
         return [None if rank == 2 else theirs if rank == 3 else value for rank in range(4)]
 
     with pytest.raises(MnnvlMappingError, match="rank 3: MnnvlMappingError") as raised:
-        memory.remap(gather)
+        memory.remap(gather, _ALL)
     assert raised.value.ranks == (3,) and reported[-1] == ()
     assert driver.mapped == {} and not memory.mapped
 
@@ -439,7 +416,7 @@ def test_a_failure_of_any_type_still_reaches_the_outcome_exchange(memory, driver
         return [None if rank == 2 else value for rank in range(4)]
 
     with pytest.raises(RuntimeError, match="rank 1: ValueError: bad mapping"):
-        memory.remap(gather)
+        memory.remap(gather, _ALL)
     assert len(reported) == 2 and reported[-1] == ("ValueError: bad mapping", [])
     assert driver.mapped == {} and not memory.mapped
 
@@ -459,7 +436,7 @@ def test_a_peer_s_failed_import_raises_the_lost_global_rank_on_every_live_rank(m
         return [{4: failure, 5: value}.get(rank) for rank in range(8)]
 
     with pytest.raises(MnnvlPeerHandleError, match="rank 4: MnnvlPeerHandleError") as raised:
-        memory.remap(gather)
+        memory.remap(gather, frozenset(range(4, 8)))
     assert calls[-1] == () and raised.value.ranks == (7,)
     assert driver.mapped == {} and not memory.mapped
 
@@ -467,9 +444,9 @@ def test_a_peer_s_failed_import_raises_the_lost_global_rank_on_every_live_rank(m
 def test_a_peer_failure_during_the_outcome_exchange_leaves_the_allocation_unmapped(memory, driver):
     memory.checkpoint_prepare()
     with pytest.raises(_PeerFailure):
-        memory.remap(_gather_outcomes(_PeerFailure(), absent={2}))
+        memory.remap(_gather_outcomes(_PeerFailure(), absent={2}), _ALL)
     assert driver.mapped == {} and not memory.mapped
-    memory.remap(_gather_without({2}))
+    memory.remap(_gather_without({2}), _ALL)
     assert memory.mapped
 
 
@@ -486,11 +463,11 @@ def test_a_peer_failure_during_the_handle_exchange_propagates_without_the_outcom
         raise _PeerFailure()
 
     with pytest.raises(_PeerFailure):
-        memory.remap(gather)
+        memory.remap(gather, _ALL)
     assert len(calls) == 1
     assert driver.mapped == {} and not memory.mapped
     assert len(driver.released) == 1
-    memory.remap(_gather_without({2}))
+    memory.remap(_gather_without({2}), _ALL)
     assert memory.mapped
 
 
@@ -505,12 +482,12 @@ def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(
     monkeypatch.setattr(driver, "cuMemUnmap", lambda address, size: 2)
 
     with pytest.raises(_PeerFailure):
-        memory.remap(_gather_outcomes(_PeerFailure(), absent={2}))
+        memory.remap(_gather_outcomes(_PeerFailure(), absent={2}), _ALL)
 
     assert len(errors) == 1 and "failed MNNVL remap" in errors[0]
     assert _RemapMemory.allocated_map[_BASE].state is mnnvl._MnnvlAllocationState.BROKEN
     with pytest.raises(RuntimeError, match="Cannot remap MNNVL allocation in broken state"):
-        memory.remap(_gather_without({2}))
+        memory.remap(_gather_without({2}), _ALL)
 
 
 @pytest.fixture
@@ -575,8 +552,7 @@ def test_a_membership_change_remaps_mnnvl_rows_at_the_same_addresses(rows_driver
     for live in ({0, 1, 2}, {0, 1, 2, 3}):
         before = [rows_driver.mapped[rows.row(rank)] for rank in range(4)]
         events.clear()
-        rows.checkpoint_prepare()
-        rows.remap(gather_among(live))
+        rows.remap(gather_among(live), _ALL)
         after = [rows_driver.mapped[rows.row(rank)] for rank in range(4)]
 
         assert rows.ptr == ptr and rows_driver.reserved == [(ptr, 4 * _SIZE)]

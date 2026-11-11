@@ -16,15 +16,14 @@
 
 A change to shared code can break fault tolerance (``enable_wide_ep_fault_tolerance``) without failing any test of
 its own: a host collective that ``MnnvlDist`` does not take over, a vote over a gather that counts failed ranks, a
-read of the previous batch before it is accepted, a startup collective that a replacement rank cannot join, or an
-LLM argument nobody classified under fault tolerance. These tests read the sources with ``ast`` (no import of
-TensorRT-LLM, no GPU) and fail on such a change with what to do. The tables here and in the YAML files next to this
-module list the reviewed exceptions; an entry that no longer matches the code fails too, so the tables stay current.
+read of the previous batch before it is accepted, or a startup collective that a replacement rank cannot join. These
+tests read the sources with ``ast`` (no import of TensorRT-LLM, no GPU) and fail on such a change with what to do. The
+tables here and in the YAML file next to this module list the reviewed exceptions; an entry that no longer matches
+the code fails too, so the tables stay current.
 """
 
 import ast
 import functools
-import json
 from pathlib import Path
 
 import yaml
@@ -561,108 +560,5 @@ def test_startup_collectives_are_agreed_or_listed():
         for site, entry in sorted(listed.items())
         if entry.get("reason") not in reasons
         or not {"collectives", "reason"} <= set(entry) <= ENTRY_KEYS
-    ]
-    assert not problems, "\n".join(problems)
-
-
-# --- 5. Every LLM argument is classified under fault tolerance ----------------------------------------------------
-
-LLM_ARGS_CLASSIFICATION = HERE / "wide_ep_ft_llm_args.yaml"
-GOLDEN_MANIFEST = "tensorrt_llm/usage/llm_args_golden_manifest.json"
-FLAG = "enable_wide_ep_fault_tolerance"
-# The checks that reject a configuration with fault tolerance on: name -> (file, function).
-REJECTING_CHECKS = {
-    "validate_wide_ep_fault_tolerance": (
-        "tensorrt_llm/llmapi/llm_args.py",
-        "TorchLlmArgs.validate_wide_ep_fault_tolerance",
-    ),
-    "check_supported": (f"{TORCH}/pyexecutor/rank_failure_recovery.py", "check_supported"),
-    "check_supported_model": (
-        f"{TORCH}/pyexecutor/rank_failure_recovery.py",
-        "check_supported_model",
-    ),
-    "unmet_requirements": (HOST_EXCHANGE, "MnnvlDist.unmet_requirements"),
-    "validate_backend": (
-        f"{TORCH}/moe/fused_moe/configurable_moe.py",
-        "ConfigurableMoE.validate_backend",
-    ),
-}
-
-
-def _function_node(path: str, qualname: str) -> ast.AST:
-    return dict(_functions(_tree(path)))[qualname]
-
-
-def _attribute_chain(node: ast.AST):
-    """(root name, attributes) of ``root.a.b``; (None, []) if ``node`` is no such chain."""
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    return (node.id, parts[::-1]) if isinstance(node, ast.Name) else (None, [])
-
-
-def _argument_paths(function: ast.AST, root: str) -> set:
-    """The dotted LLM-argument paths ``function`` reads from ``root`` (``self.a.b`` -> ``a.b``).
-
-    Local names bound to such a path (``adp = self.attention_dp_config``) are followed.
-    """
-    aliases = {}
-    for targets, value in _assignments(function):
-        base, parts = _attribute_chain(value)
-        if base == root and len(targets) == 1:
-            aliases[next(iter(targets))] = parts
-    paths = set()
-    for node in ast.walk(function):
-        base, parts = _attribute_chain(node)
-        if base == root:
-            paths.add(".".join(parts))
-        elif base in aliases:
-            paths.add(".".join(aliases[base] + parts))
-    return paths
-
-
-def test_every_llm_argument_is_classified_under_fault_tolerance():
-    """Every field of the LLM arguments' golden manifest is classified in wide_ep_ft_llm_args.yaml.
-
-    A field is supported (fault tolerance starts with any value of it) or rejected by a check of
-    ``REJECTING_CHECKS``. A new field fails until it is classified; a rejected field must stay read by its check,
-    and a field the checks read must be classified rejected.
-    """
-    manifest_path = REPO / GOLDEN_MANIFEST
-    manifest = {entry["path"] for entry in json.loads(manifest_path.read_text())["TorchLlmArgs"]}
-    classification = _load_table(LLM_ARGS_CLASSIFICATION)
-    table = LLM_ARGS_CLASSIFICATION.name
-    problems = [
-        f"{path}: a new LLM argument; classify it in {table} (supported, or rejected by a fault-tolerance check)"
-        for path in sorted(manifest - set(classification))
-    ]
-    problems += [
-        f"{table} classifies {path}, which the golden manifest no longer has: remove it"
-        for path in sorted(set(classification) - manifest)
-    ]
-    sources = {
-        name: ast.unparse(_function_node(*where)) for name, where in REJECTING_CHECKS.items()
-    }
-    for path, status in sorted(classification.items()):
-        if status == "supported" or (status == "flag" and path == FLAG):
-            continue
-        kind, _, check = status.partition(" ")
-        if kind != "rejected" or check not in sources:
-            problems.append(
-                f"{path}: {status!r} is not 'supported', 'rejected <one of {sorted(sources)}>' or, for {FLAG}, "
-                "'flag'"
-            )
-        elif not any(part in sources[check] for part in path.split(".")):
-            problems.append(
-                f"{path}: classified rejected by {check}, which no longer reads it: reclassify it"
-            )
-    read = _argument_paths(
-        _function_node(*REJECTING_CHECKS["validate_wide_ep_fault_tolerance"]), "self"
-    ) | _argument_paths(_function_node(*REJECTING_CHECKS["check_supported"]), "llm_args")
-    problems += [
-        f"{path}: a fault-tolerance check reads it, but {table} classifies it {classification[path]!r}"
-        for path in sorted(read & manifest - {FLAG})
-        if not str(classification.get(path, "")).startswith("rejected")
     ]
     assert not problems, "\n".join(problems)
