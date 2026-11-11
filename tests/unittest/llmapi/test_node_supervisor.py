@@ -789,7 +789,10 @@ def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
     assert secret not in " ".join(args)
     relaunched_environ = json.loads((tmp_path / "prun-0.stdin").read_text())
     assert relaunched_environ[JOIN_SECRET_ENV] == secret
-    assert not any(key.startswith(("OMPI_", "PMIX_")) for key in relaunched_environ)
+    assert not any(
+        key.startswith(("OMPI_", "PMIX_")) for key in relaunched_environ if key != "OMPI_MCA_btl"
+    )
+    assert relaunched_environ["OMPI_MCA_btl"] == "^sm"
     authority.push(_record(MembershipState.COMMITTED, live_mask=0b0011), nodes)  # it connected
     time.sleep(0.5)
     assert len(_pruns(tmp_path)) == 1
