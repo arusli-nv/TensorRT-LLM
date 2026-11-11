@@ -786,6 +786,7 @@ class MnnvlMemory:
     @staticmethod
     def _init_device() -> int:
         """Initialize MnnvlMemory and return the current device's id."""
+        # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
         MnnvlMemory.initialize()
 
         dev = _check_cu_result(cuda.cuCtxGetDevice())

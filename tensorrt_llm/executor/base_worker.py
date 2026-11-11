@@ -111,6 +111,7 @@ class BaseWorker(GenerationExecutor):
     ) -> None:
         set_wide_ep_fault_tolerance_enabled(
             getattr(llm_args, "enable_wide_ep_fault_tolerance", False))
+        # Direct worker construction also bypasses BaseLLM/worker_main.
         launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
         if llm_args is not None and llm_args.env_overrides:
             os.environ.update(llm_args.env_overrides)

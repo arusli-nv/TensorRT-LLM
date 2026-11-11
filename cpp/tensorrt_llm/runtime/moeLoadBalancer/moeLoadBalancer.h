@@ -319,6 +319,7 @@ public:
     // update plan so that every survivor updates the same layers. Every launched kernel must be able to finish.
     void abandonIterations();
 
+    // Test interface to use GPU to do memcpy test functionality
     void setUseGpuMemcpy(bool useGpuMemcpy = false)
     {
         mUseGpuMemcpy = useGpuMemcpy;
