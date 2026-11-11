@@ -225,6 +225,45 @@ __device__ __forceinline__ bool is_rank_active(uint64_t const* mask, int rank)
     return (mask[rank >> 6] >> (rank & 63)) & 1ULL;
 }
 
+// Register copy of the active-rank bitmask, for kernels that read it before their grid dependency wait.
+__device__ __forceinline__ void load_rank_mask_words(uint64_t const* mask, uint64_t (&words)[kRankMaskWords])
+{
+#pragma unroll
+    for (int w = 0; w < kRankMaskWords; ++w)
+    {
+        words[w] = mask[w];
+    }
+}
+
+// is_rank_active on a register copy; selects the word without dynamic indexing so `words` stays in registers.
+__device__ __forceinline__ bool is_rank_active_in_words(uint64_t const (&words)[kRankMaskWords], int rank)
+{
+    uint64_t word = words[0];
+#pragma unroll
+    for (int w = 1; w < kRankMaskWords; ++w)
+    {
+        word = (rank >> 6) == w ? words[w] : word;
+    }
+    return (word >> (rank & 63)) & 1ULL;
+}
+
+// Clears every rank but `rank` in a register copy of the mask.
+__device__ __forceinline__ void keep_only_rank_in_words(uint64_t (&words)[kRankMaskWords], int rank)
+{
+#pragma unroll
+    for (int w = 0; w < kRankMaskWords; ++w)
+    {
+        words[w] = (rank >> 6) == w ? words[w] & (1ULL << (rank & 63)) : 0;
+    }
+}
+
+// The value a collective of round flag value `flag_value` that returned early stores in the incomplete-round word
+// (see MoeA2AAbortState): the flag value with bit 0 set, so that it is never 0, the value of a complete history.
+__device__ __forceinline__ uint32_t incomplete_round_value(uint32_t flag_value)
+{
+    return flag_value | 1U;
+}
+
 // Each A2A round uses two consecutive flag values: 2N + 1 for dispatch and
 // 2N + 2 for combine. Subtracting one and dividing by two maps both values
 // to round N; the low bit selects the alternating counter bank.
@@ -240,10 +279,87 @@ __device__ __forceinline__ void publish_round_flag(uint32_t* address, uint32_t v
     asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
 }
 
-__device__ __forceinline__ bool wait_round_flag(
-    uint32_t const* address, uint32_t expected, int64_t timeout_cycles, int rank_id, int peer_rank, char const* phase)
+__device__ __forceinline__ void record_cancelled(MoeA2AAbortState* abort)
+{
+    asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(&abort->status), "r"(MoeA2AAbortState::kCancelled));
+}
+
+// Returns whether the host requested an abort and, if so, records that this kernel cancelled.
+__device__ __forceinline__ bool observe_abort(MoeA2AAbortState* abort)
+{
+    int32_t requested;
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(requested) : "l"(&abort->requested));
+    if (requested != 0)
+    {
+        record_cancelled(abort);
+    }
+    return requested != 0;
+}
+
+// Publishes (value != 0) or withdraws (0) this rank's wait evidence on peer_rank; see MoeA2AAbortState.
+__device__ __forceinline__ void record_wait_evidence(MoeA2AAbortState* abort, int peer_rank, uint32_t value)
+{
+    asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(&abort->waited_round[peer_rank]), "r"(value) : "memory");
+}
+
+// Abort polling shared, in shared memory, by the threads of a block that wait on peers: one waiting thread per
+// kAbortPollCycles period reads the host abort record and publishes what it saw here, where the other waiting
+// threads read it. Concurrent host reads from every waiting thread would slow down healthy waits.
+struct AbortPoll
+{
+    unsigned long long next_poll; // clock64() value from which the next read of the host record is due
+    int requested;                // Nonzero once a read of the host record saw an abort request
+};
+
+// The block's AbortPoll, set up by lane 0 of the one warp of the block that waits on peers before it starts waiting:
+// the first read of the host record is due once the waits have lasted kAbortPollCycles. nullptr without
+// ENABLE_RANK_MASK, whose waits do not honour an abort.
+template <bool ENABLE_RANK_MASK>
+__device__ __forceinline__ AbortPoll* start_abort_poll(int lane_id)
+{
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        __shared__ AbortPoll poll;
+        if (lane_id == 0)
+        {
+            poll.next_poll = static_cast<unsigned long long>(clock64()) + kAbortPollCycles;
+            poll.requested = 0;
+        }
+        __syncwarp();
+        return &poll;
+    }
+    else
+    {
+        return nullptr;
+    }
+}
+
+// Returns whether the host requested an abort: as already seen by the block, or by reading the host record when a
+// read is due and this thread claims it (clock64() is per SM, so all threads of the block compare the same clock).
+__device__ __forceinline__ bool abort_requested(MoeA2AAbortState* abort, AbortPoll* poll)
+{
+    if (*reinterpret_cast<int volatile*>(&poll->requested) != 0)
+    {
+        return true;
+    }
+    auto const now = static_cast<unsigned long long>(clock64());
+    auto const due = *reinterpret_cast<unsigned long long volatile*>(&poll->next_poll);
+    if (now < due || atomicCAS(&poll->next_poll, due, now + kAbortPollCycles) != due || !observe_abort(abort))
+    {
+        return false;
+    }
+    *reinterpret_cast<int volatile*>(&poll->requested) = 1;
+    return true;
+}
+
+// Wait until a peer's round flag reaches `expected`. Returns false if the host requested an abort through `abort`,
+// which the waiting threads of a block poll through `poll` (see AbortPoll); traps on timeout. With `abort`, a wait
+// that lasts kWaitEvidenceCycles is published as wait evidence until it ends.
+__device__ __forceinline__ bool wait_round_flag(uint32_t const* address, uint32_t expected, int64_t timeout_cycles,
+    MoeA2AAbortState* abort, AbortPoll* poll, int rank_id, int peer_rank, char const* phase)
 {
     auto const start = clock64();
+    bool evidence = false;
     uint32_t observed;
     do
     {
@@ -254,7 +370,27 @@ __device__ __forceinline__ bool wait_round_flag(
 #endif
         if (observed == expected)
         {
+            if (evidence)
+            {
+                record_wait_evidence(abort, peer_rank, 0);
+            }
             return true;
+        }
+        if (abort != nullptr)
+        {
+            if (!evidence && clock64() - start >= kWaitEvidenceCycles)
+            {
+                record_wait_evidence(abort, peer_rank, expected);
+                evidence = true;
+            }
+            if (abort_requested(abort, poll))
+            {
+                if (evidence)
+                {
+                    record_wait_evidence(abort, peer_rank, 0);
+                }
+                return false;
+            }
         }
     } while (!check_timeout(start, timeout_cycles));
 
@@ -272,10 +408,11 @@ __host__ __device__ constexpr uint32_t make_warp_lane_mask()
     return (NUM_LANES == 32) ? ~0U : ((1U << NUM_LANES) - 1U);
 }
 
+// rank_mask is the register copy of the active-rank mask (load_rank_mask_words), read only with ENABLE_RANK_MASK.
 template <int TOP_K, bool ENABLE_RANK_MASK, bool USE_RANK_COMPACT_ROUTING>
 __device__ __forceinline__ void route_dispatch_token(int32_t const* token_selected_experts,
-    DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
-    int* topk_target_indices, uint32_t lane_mask)
+    DispatchKernelPointers const& ptrs, uint64_t const (&rank_mask)[kRankMaskWords], int local_token_idx, int ep_size,
+    int num_experts, int* topk_target_ranks, int* topk_target_indices, uint32_t lane_mask)
 {
     static_assert(TOP_K <= 32, "warp-parallel routing requires TOP_K <= warpSize");
     int const k = threadIdx.x;
@@ -300,7 +437,7 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     bool should_send = valid_expert && ((__ffs(same_target) - 1) == k);
     if constexpr (ENABLE_RANK_MASK)
     {
-        should_send = should_send && is_rank_active(ptrs.active_rank_mask, target_rank);
+        should_send = should_send && is_rank_active_in_words(rank_mask, target_rank);
     }
 
     int const target_rank_to_store = should_send ? target_rank : -1;
@@ -464,6 +601,26 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int thread_idx = threadIdx.x;
     int local_token_idx = blockIdx.x;
 
+    // Read by the first warp, which routes and signals. Reading the mask and the incomplete-round word before the grid
+    // dependency wait is safe: this kernel launches only after moeA2APrepareDispatchKernel passed its own grid
+    // dependency wait, so all earlier work on the stream is complete, and the mask's writer rewrites it only in stream
+    // order or while no collective runs. Only the last block of this kernel writes the incomplete-round word, after
+    // every block has read it.
+    uint64_t rank_mask[kRankMaskWords] = {};
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        if (thread_idx < warpSize)
+        {
+            load_rank_mask_words(ptrs.active_rank_mask, rank_mask);
+            // After a collective of this rank returned early (see MoeA2AAbortState), live peers may still read the
+            // rows this rank would write: until the workspace reset it routes to, signals and waits for itself only.
+            if (ptrs.incomplete_round != nullptr && *ptrs.incomplete_round != 0)
+            {
+                keep_only_rank_in_words(rank_mask, rank_id);
+            }
+        }
+    }
+
     if (local_num_tokens == 0)
     {
         // Special case: If local_num_tokens == 0,
@@ -496,7 +653,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         if (thread_idx < TOP_K)
         {
             route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts, ptrs,
-                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
+                rank_mask, local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
                 kRoutingLaneMask);
             // Compact routing slots may be written by a different lane.
             __syncwarp(kRoutingLaneMask);
@@ -566,7 +723,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    if (!is_rank_active_in_words(rank_mask, target_rank))
                         continue;
                 }
                 int send_count = ptrs.send_counters[target_rank];
@@ -582,7 +739,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 {
                     if constexpr (ENABLE_RANK_MASK)
                     {
-                        if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        if (!is_rank_active_in_words(rank_mask, target_rank))
                             continue;
                     }
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
@@ -599,9 +756,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
-            asm volatile("fence.release.sys;");
+            asm volatile("fence.release.sys;" ::: "memory");
 #else
-            asm volatile("fence.acq_rel.sys;");
+            asm volatile("fence.acq_rel.sys;" ::: "memory");
 #endif
             // Signal completion to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
@@ -610,7 +767,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    if (!is_rank_active_in_words(rank_mask, target_rank))
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
@@ -622,6 +779,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
             }
 
+            AbortPoll* abort_poll = start_abort_poll<ENABLE_RANK_MASK>(lane_id);
+
             // Wait for all active peers to signal; skip dead ranks (otherwise we would
             // spin forever — this is the bug the rank-mask is here to prevent).
 #pragma unroll 1 // No unroll
@@ -629,15 +788,20 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!is_rank_active_in_words(rank_mask, peer_rank))
                     {
                         round_recv_counters[peer_rank] = 0;
                         continue;
                     }
                 }
                 if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
-                        rank_id, peer_rank, "dispatch"))
+                        ENABLE_RANK_MASK ? ptrs.abort : nullptr, abort_poll, rank_id, peer_rank, "dispatch"))
                 {
+                    if constexpr (ENABLE_RANK_MASK)
+                    {
+                        // The first incomplete collective since the workspace reset keeps its value.
+                        atomicCAS(ptrs.incomplete_round, 0U, incomplete_round_value(expected_value));
+                    }
                     return;
                 }
             }
@@ -878,8 +1042,13 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
         constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
         if (threadIdx.x < TOP_K)
         {
+            uint64_t rank_mask[kRankMaskWords] = {};
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                load_rank_mask_words(ptrs.active_rank_mask, rank_mask);
+            }
             route_dispatch_token<TOP_K, ENABLE_RANK_MASK, USE_RANK_COMPACT_ROUTING>(token_selected_experts, ptrs,
-                local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
+                rank_mask, local_token_idx, ep_size, num_experts, smem_topk_target_ranks, smem_topk_target_indices,
                 kRoutingLaneMask);
         }
         __syncthreads();
@@ -1152,13 +1321,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
-    if (params.enable_rank_mask)
-    {
-        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
-    }
+    // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
+        "rank-mask mode needs the device address of active_rank_mask");
+    TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
+        "an abort record needs a workspace laid out with rank_mask");
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -1190,6 +1357,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.le_dispatch_counters[i] = params.le_dispatch_counters[i];
     }
     kernel_ptrs.flag_val = params.flag_val;
+    kernel_ptrs.incomplete_round = params.incomplete_round;
 
     // Copy communication tracking pointers
     kernel_ptrs.send_counters = params.send_counters;
@@ -1216,11 +1384,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.invalid_expert_id = params.invalid_expert_id;
     }
 
-    // Copy active-rank bitmask into the kernel pointers struct
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
-    }
+    kernel_ptrs.active_rank_mask = params.active_rank_mask;
+    TLLM_CHECK_WITH_INFO(params.abort == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes),
+        "the abort record needs the rank-mask fence path");
+    kernel_ptrs.abort = params.abort;
 
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)
@@ -1425,9 +1592,10 @@ __device__ void vectorized_combine_impl(
 
 // Pack valid source pointers in routing order and count the contributing ranks.
 // stride_per_token can exceed the wire size for in-place low-precision combine.
-template <int TOP_K, typename OutputT, typename InputT>
+// With ENABLE_RANK_MASK and only_rank >= 0 (read by the first TOP_K threads), only routes to only_rank contribute.
+template <int TOP_K, typename OutputT, typename InputT, bool ENABLE_RANK_MASK = false>
 __device__ void vectorized_combine(
-    OutputT* output, int size_per_token, int stride_per_token, CombineKernelPointers const& ptrs)
+    OutputT* output, int size_per_token, int stride_per_token, CombineKernelPointers const& ptrs, int only_rank = -1)
 {
     static_assert(TOP_K > 0 && TOP_K <= 32, "combine routing requires TOP_K <= warpSize");
     constexpr uint32_t kRoutingLaneMask = make_warp_lane_mask<TOP_K>();
@@ -1437,7 +1605,14 @@ __device__ void vectorized_combine(
     {
         int const k = threadIdx.x;
         int const index = blockIdx.x * TOP_K + k;
-        int const target_index = ptrs.topk_target_indices[index];
+        int target_index = ptrs.topk_target_indices[index];
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            if (only_rank >= 0 && ptrs.topk_target_ranks[index] != only_rank)
+            {
+                target_index = -1;
+            }
+        }
         uint32_t const valid = __ballot_sync(kRoutingLaneMask, target_index >= 0);
         if (k == 0)
         {
@@ -1637,6 +1812,10 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
 
     int local_token_idx = blockIdx.x;
     int const size_per_token = elements_per_token * static_cast<int>(sizeof(InputT));
+    // Set (rank-mask kernels only) when an abort request released this block's wait on a peer.
+    bool aborted = false;
+    // Rank-mask kernels after an incomplete collective (read by the first warp): the only rank combined from.
+    int only_rank = -1;
 
     if (local_num_tokens == 0)
     {
@@ -1653,6 +1832,17 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
             return;
     }
 
+    // Read by the first warp, before the grid dependency wait as in the dispatch kernel: this kernel launches only
+    // after moeA2APrepareCombineKernel passed its own grid dependency wait.
+    uint64_t rank_mask[kRankMaskWords] = {};
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        if (threadIdx.x < warpSize)
+        {
+            load_rank_mask_words(ptrs.active_rank_mask, rank_mask);
+        }
+    }
+
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
 #endif
@@ -1666,6 +1856,20 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
     {
         int lane_id = threadIdx.x % warpSize;
         uint32_t expected_value = *ptrs.flag_val;
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            // See the dispatch kernel; written by earlier kernels, so read after the grid dependency wait. The word
+            // keeps the first incomplete collective's value, which may be this kernel's own once a block of it
+            // returned early: that value is ignored here, so that every block of this kernel signals, waits for and
+            // combines from the same peers. After an earlier incomplete collective the saved routes may name peers
+            // whose rows were never completed, so only this rank's rows are combined.
+            uint32_t const incomplete = ptrs.incomplete_round != nullptr ? *ptrs.incomplete_round : 0;
+            if (incomplete != 0 && incomplete != incomplete_round_value(expected_value))
+            {
+                keep_only_rank_in_words(rank_mask, rank_id);
+                only_rank = rank_id;
+            }
+        }
 
         if (blockIdx.x == 0)
         {
@@ -1676,7 +1880,7 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
-                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    if (!is_rank_active_in_words(rank_mask, peer_rank))
                         continue;
                 }
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
@@ -1688,6 +1892,8 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
             }
         }
 
+        AbortPoll* abort_poll = start_abort_poll<ENABLE_RANK_MASK>(lane_id);
+
         // Wait for all active peers to signal; skip dead ranks (otherwise we would spin
         // forever — this is the bug the rank-mask is here to prevent).
 #pragma unroll 1 // No unroll
@@ -1695,30 +1901,61 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         {
             if constexpr (ENABLE_RANK_MASK)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                if (!is_rank_active_in_words(rank_mask, peer_rank))
                     continue;
             }
             if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
-                    rank_id, peer_rank, "combine"))
+                    ENABLE_RANK_MASK ? ptrs.abort : nullptr, abort_poll, rank_id, peer_rank, "combine"))
             {
-                return;
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    aborted = true;
+                    break;
+                }
+                else
+                {
+                    return;
+                }
             }
         }
 #if TLLM_MOE_A2A_COMPILE_SM90
         // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
-        asm volatile("fence.acquire.sys;");
+        asm volatile("fence.acquire.sys;" ::: "memory");
 #else
-        asm volatile("fence.acq_rel.sys;");
+        asm volatile("fence.acq_rel.sys;" ::: "memory");
 #endif
     }
-    __syncthreads();
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        aborted = __syncthreads_or(aborted);
+        if (aborted && threadIdx.x == 0 && ptrs.incomplete_round != nullptr)
+        {
+            // As after an incomplete dispatch; an earlier incomplete collective's value stays.
+            atomicCAS(ptrs.incomplete_round, 0U, incomplete_round_value(*ptrs.flag_val));
+        }
+    }
+    else
+    {
+        __syncthreads();
+    }
 #endif
 
     if (local_num_tokens == 0)
         return;
 
     T* token_output = static_cast<T*>(ptrs.output) + local_token_idx * elements_per_token;
-    vectorized_combine<TOP_K, T, InputT>(token_output, size_per_token, stride_per_token, ptrs);
+    if (ENABLE_RANK_MASK && aborted)
+    {
+        // Peer contributions may be missing; leave a finite output for the invalidated collective.
+        uint8_t* const output_bytes = reinterpret_cast<uint8_t*>(token_output);
+        for (int i = threadIdx.x; i < elements_per_token * static_cast<int>(sizeof(T)); i += blockDim.x)
+        {
+            output_bytes[i] = 0;
+        }
+        return;
+    }
+    vectorized_combine<TOP_K, T, InputT, ENABLE_RANK_MASK>(
+        token_output, size_per_token, stride_per_token, ptrs, only_rank);
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -1929,7 +2166,7 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
                     continue;
             }
             if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
-                    rank_id, peer_rank, "combine(cft)"))
+                    nullptr, nullptr, rank_id, peer_rank, "combine(cft)"))
             {
                 return;
             }
@@ -1958,8 +2195,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         peer_info.ids[i] = params.cft_peer_le_ids[i];
         peer_info.completion_flags[i] = params.completion_flags[i];
     }
-    for (int w = 0; w < kRankMaskWords; ++w)
-        peer_info.active_rank_mask[w] = params.active_rank_mask[w];
+    peer_info.active_rank_mask = params.active_rank_mask;
 
     // Push parallelism is env-overridable for tuning:
     //   TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_WARPS           : warps per block (default kCombinePushWarpsPerBlock)
@@ -2048,13 +2284,13 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
-    if (params.enable_rank_mask)
-    {
-        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
-    }
+    // The mask is read on the device; whoever publishes it checks that it marks the local rank active.
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
+        "rank-mask mode needs the device address of active_rank_mask");
+    TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
+        "an abort record needs a workspace laid out with rank_mask");
+    TLLM_CHECK_WITH_INFO(params.abort == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine),
+        "the abort record needs the rank-mask fence path");
 
     // ---- CFT combine path (one block per token). ----
     // Bypasses the base fence combine below entirely. The CFT push is launched separately by
@@ -2075,6 +2311,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             kp.completion_flags[i] = params.completion_flags[i];
         }
         kp.flag_val = params.flag_val;
+        kp.incomplete_round = params.incomplete_round;
         kp.topk_target_ranks = params.topk_target_ranks;
         kp.topk_target_indices = params.topk_target_indices;
 
@@ -2083,10 +2320,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kp.combine_counter_baseline = params.cft_combine_counter_baseline;
         kp.combine_counter_ep_stride = params.combine_counter_ep_stride;
         kp.timeout_cycles = params.timeout_cycles;
-        for (int w = 0; w < kRankMaskWords; ++w)
-        {
-            kp.active_rank_mask[w] = params.active_rank_mask[w];
-        }
+        kp.active_rank_mask = params.active_rank_mask;
 
         // A source rank's pushed tokens occupy one runtime-packed slice in the local inbox.
         int64_t const peer_stride = static_cast<int64_t>(params.max_tokens_per_rank) * params.wire_bytes_per_token;
@@ -2138,16 +2372,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kernel_ptrs.completion_flags[i] = params.completion_flags[i];
     }
     kernel_ptrs.flag_val = params.flag_val;
+    kernel_ptrs.incomplete_round = params.incomplete_round;
 
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_target_indices = params.topk_target_indices;
 
-    // Copy active-rank bitmask into the kernel pointers struct
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
-    }
+    kernel_ptrs.active_rank_mask = params.active_rank_mask;
+    kernel_ptrs.abort = params.abort;
 
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
         SWITCH_DTYPE(params.dtype, T, {

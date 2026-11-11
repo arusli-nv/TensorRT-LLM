@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
 
+#include <atomic>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -110,8 +112,11 @@ void moeHierarchicalStatisticUpdate(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBala
 // @param tokenCount: the token count to compute the route
 // @param offsetByEpRank: whether to offset the round robin position by epRank
 // @param stream: the CUDA stream to be used
+// @param oneSlotPerExpert: every expert has exactly one replica (more slots than experts, the rest empty), so no
+// replica needs choosing
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream);
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream,
+    bool oneSlotPerExpert = false);
 
 // @brief wait for the signal from gpu to cpu on host
 //
@@ -120,7 +125,9 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
 // After this function is called, functions for weight update can be called.
 //
 // @param signal: the signal
-void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal);
+// @param stop: optional; once it is set, stops waiting
+// @return: whether the signal was set for cpu stage (false: stopped)
+bool moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, std::atomic<bool> const* stop = nullptr);
 
 // @brief set the signal for gpu stage on host
 //

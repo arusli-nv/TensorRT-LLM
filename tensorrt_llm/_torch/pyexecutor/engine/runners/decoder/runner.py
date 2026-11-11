@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -62,7 +63,7 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import fault_tolerance_mode, nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
     MiniMaxM3SparseAttentionConfig,
@@ -164,6 +165,8 @@ class DecoderRunner(ScheduledModelRunner):
     _steady_gen_cache_supported = True
     _eager_workspace_reclaim_supported = True
     _deferred_decode_outputs_supported = True
+    # Bound to every NVLinkOneSided layer in fault tolerance mode; None otherwise.
+    moe_execution_state: MoeExecutionState | None = None
 
     def __init__(
         self,
@@ -289,6 +292,10 @@ class DecoderRunner(ScheduledModelRunner):
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
         self._initialize_moe_workspace_reclaimer()
+        # Bound before warmup captures CUDA graphs, which then read the state's rank-mask and abort records.
+        self.moe_execution_state = (
+            MoeExecutionState.for_model(model) if fault_tolerance_mode() else None
+        )
         self._warmup = DecoderWarmup(
             config=self._config,
             mapping=mapping,

@@ -57,6 +57,9 @@ class _LockstepDist:
                 dist.barrier.wait()
                 return np.array(rows, dtype=np.int64)
 
+            def tp_live_rows(self, rows):
+                return rows
+
         return _Proxy()
 
 
@@ -216,12 +219,36 @@ def test_can_queue_gathers_only_the_batch_size():
         cp_size=1,
         tp_rank=0,
         tp_cp_allgather_int64=Mock(return_value=np.array([[2], [0]])),
+        tp_live_rows=lambda rows: rows,
     )
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
 
     executor.dist.tp_cp_allgather_int64.assert_called_once_with([2])
     assert can_queue is False and this_rank is True
+
+
+def test_a_rank_that_holds_its_steps_votes_with_an_empty_batch():
+    """With rank failure recovery, the recovery takes the vote over the executor's gather (it holds its steps before
+    the gather), so the gathered rows alone decide on every rank."""
+    executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = True
+    executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
+    executor.rank_failure_recovery = Mock(forward_vote=Mock(return_value=np.array([0, 3])))
+    executor.dist = SimpleNamespace(
+        tp_size=2,
+        cp_size=1,
+        tp_rank=0,
+        tp_cp_allgather_int64=Mock(),
+        tp_live_rows=lambda rows: rows,
+    )
+
+    can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
+
+    executor.rank_failure_recovery.forward_vote.assert_called_once_with(
+        2, executor.dist.tp_cp_allgather_int64
+    )
+    assert can_queue is False and this_rank is False
 
 
 @pytest.mark.parametrize("batch_size", [1, 0], ids=["padded_cp_rank", "empty_cp_rank"])
@@ -237,6 +264,7 @@ def test_can_queue_this_rank_is_shared_by_the_cp_peers_of_a_dp_rank(batch_size):
         cp_size=2,
         tp_rank=0,
         tp_cp_allgather_int64=Mock(return_value=np.array([[1], [0]])),
+        tp_live_rows=lambda rows: rows,
     )
 
     can_queue, this_rank = PyExecutor._can_queue(

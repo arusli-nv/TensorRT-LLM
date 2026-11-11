@@ -18,6 +18,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._torch.distributed.startup_record import startup_record
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
@@ -26,7 +27,8 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import (fault_tolerance_mode,
+                                 fault_tolerance_replacement, get_sm_version)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -638,7 +640,11 @@ def _create_py_executor(
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    # A replacement rank skips the estimation, whose run needs rank 0's
+    # requests, and the original ranks do not record it (startup_record): it
+    # takes the KV cache capacity they agreed on from the record.
+    skip_est = (os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+                or fault_tolerance_replacement() is not None)
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
         llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
@@ -791,6 +797,11 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
+    if fault_tolerance_mode():
+        # Before the model loads, so that an unsupported configuration fails
+        # fast.
+        from .rank_failure_recovery import check_supported
+        check_supported(llm_args, mapping, dist)
 
     vm_pools = {}
     sleep_config = llm_args.sleep_config
@@ -1348,6 +1359,8 @@ def _create_py_executor(
             log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        if estimating_kv_cache:
+            startup_record.pause()  # until the estimation's teardown
 
         # Without the estimation, build_managers sizes the final KV cache from
         # the device memory free now, so DWDP is set up first: the KV cache
@@ -1460,6 +1473,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
+            startup_record.resume()
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):
                 # Before estimating KV cache size, a minimal KV cache has been allocated using

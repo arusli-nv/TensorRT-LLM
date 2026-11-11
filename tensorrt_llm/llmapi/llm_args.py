@@ -50,7 +50,8 @@ from tensorrt_llm._torch.peft.lora.config import (
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
 from .._errors import ConfigInputError
-from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
+from .._utils import (_str_to_torch_dtype_dict,
+                      check_fault_tolerance_requirements, is_sm_100f, mpi_rank,
                       prefer_pinned)
 
 # yapf: disable
@@ -7698,6 +7699,20 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    enable_wide_ep_fault_tolerance: bool = Field(
+        default=False,
+        description=
+        "Keep a wide expert-parallel deployment serving when one of its ranks "
+        "fails (a process crash or hang): the surviving ranks continue "
+        "without it at reduced capacity, on the same CUDA graphs, until a "
+        "replacement rejoins. Requires attention DP, EPLB, NVLinkOneSided MoE "
+        "communication within one NVLink domain, KV cache manager V2, one "
+        "serving frontend and a launcher that keeps the other ranks running "
+        "when one exits; "
+        "unsupported configurations are rejected at startup with the reason. "
+        "Requests with n > 1 or beam search are rejected while it is on.",
+        status="prototype")
+
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
         default=None,
         description="The request reordering policy to use.",
@@ -7923,6 +7938,74 @@ class TorchLlmArgs(BaseLlmArgs):
                 "encode_only does not support piecewise CUDA graph in "
                 "TorchCompileConfig. Use cuda_graph_config for encoder CUDA "
                 "graphs or disable enable_piecewise_cuda_graph.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
+        """Reject what enable_wide_ep_fault_tolerance does not support.
+
+        The checks that need the resolved mapping or model, the KV cache
+        manager version included, run when the executor starts.
+        """
+        if not self.enable_wide_ep_fault_tolerance:
+            return self
+        adp_config = self.attention_dp_config
+        spec_mode = (None if self.speculative_config is None else
+                     self.speculative_config.spec_dec_mode)
+        transceiver = self.cache_transceiver_config
+        load_balancer = self.moe_config.load_balancer
+        checks = [
+            (self.enable_attention_dp,
+             "attention DP (enable_attention_dp=True)"),
+            (self.pipeline_parallel_size == 1,
+             "no pipeline parallelism (pipeline_parallel_size=1)"),
+            (self.max_beam_width
+             in (None, 1), "no beam search (max_beam_width=1)"),
+            (not self.disable_overlap_scheduler,
+             "the overlap scheduler (disable_overlap_scheduler=False)"),
+            (load_balancer is not None,
+             "EPLB (moe_config.load_balancer with num_slots), whose spare "
+             "slots take a failed rank's experts"),
+            (load_balancer is None
+             or isinstance(load_balancer, MoeLoadBalancerConfig),
+             "standard EPLB (moe_config.load_balancer.mode='standard'), "
+             "whose spare slots take a failed rank's experts; per-layer "
+             "dynamic EPLB refills its helper slots in every forward pass"),
+            # These routers and admission policies keep per-rank state that a
+            # replacement would not share.
+            (adp_config is None
+             or not (adp_config.enable_kv_balanced_admission
+                     or adp_config.enable_kv_cache_aware_routing
+                     or adp_config.kv_cache_routing_conversation_affinity),
+             "the default attention-DP routing and admission (no "
+             "enable_kv_balanced_admission, enable_kv_cache_aware_routing or "
+             "kv_cache_routing_conversation_affinity in attention_dp_config)"),
+            (self.kv_cache_config.event_buffer_max_size == 0,
+             "no KV cache events (kv_cache_config.event_buffer_max_size=0)"),
+            (transceiver is None or transceiver.backend is None,
+             "no disaggregated serving (no cache_transceiver_config.backend)"),
+            (self.kv_connector_config
+             is None, "no KV cache connector (kv_connector_config=None)"),
+            (spec_mode is None
+             or not (spec_mode.has_spec_drafter() or spec_mode.is_dspark()),
+             "no NGram or user-provided drafter and no DSpark "
+             "(speculative_config: none, or another decoding_type such as "
+             "MTP)"),
+            (not self.enable_lm_head_tp_in_adp,
+             "no LM head TP in attention DP (enable_lm_head_tp_in_adp=False)"),
+            (self.sleep_config is None, "no sleep mode (sleep_config=None)"),
+            # Its userbuffers start up over MPI_COMM_WORLD collectives, which a
+            # replacement rank, alone in its MPI world, cannot join.
+            (self.torch_compile_config
+             is None, "no torch_compile_config (torch_compile_config=None)"),
+            (self.num_serve_frontends == 1,
+             "one serving frontend (num_serve_frontends=1)"),
+            # The membership, the rank supervisors and the executor proxy that
+            # follows them come with the MPI executor only.
+            (self.orchestrator_type is None,
+             "the MPI executor (orchestrator_type unset, not 'rpc' or 'ray')"),
+        ]
+        check_fault_tolerance_requirements(checks)
         return self
 
     def _validate_dspark_confidence_environment(self) -> None:

@@ -36,8 +36,8 @@ from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
-from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
-                      nvtx_range_debug)
+from .._utils import (fault_tolerance_mode, global_mpi_rank, global_mpi_size,
+                      mpi_rank, nvtx_range_debug, set_fault_tolerance_mode)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
@@ -57,7 +57,8 @@ from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
                      prompt_logprobs_from_reduced, reduce_prompt_logprobs)
-from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
+from .utils import (ErrorResponse, RankFailureError, RequestError,
+                    bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
@@ -107,6 +108,8 @@ class BaseWorker(GenerationExecutor):
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
         # Direct worker construction also bypasses BaseLLM/worker_main.
+        set_fault_tolerance_mode(
+            getattr(llm_args, "enable_wide_ep_fault_tolerance", False))
         launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
         if llm_args is not None and llm_args.env_overrides:
             os.environ.update(llm_args.env_overrides)
@@ -151,6 +154,11 @@ class BaseWorker(GenerationExecutor):
         # Requests already answered with an error by _maybe_wrap_response and
         # aborted; their remaining engine responses are dropped.
         self._refused_client_ids: Set[int] = set()
+        # WideEP fault tolerance: the requests without multimodal data that
+        # have no response sent yet, which this worker enqueues again once if a
+        # rank failure ends them (_enqueue_after_rank_failure).
+        self._unanswered_client_ids: Optional[Set[int]] = (
+            set() if fault_tolerance_mode() else None)
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
@@ -620,6 +628,11 @@ class BaseWorker(GenerationExecutor):
             logprob_params=logprob_params)
 
         self._results[client_id] = result
+        # Before the enqueue, so that its first response finds it.
+        unanswered = (self._unanswered_client_ids is not None
+                      and request.multimodal_params is None)
+        if unanswered:
+            self._unanswered_client_ids.add(client_id)
 
         enqueued = False
         try:
@@ -628,6 +641,8 @@ class BaseWorker(GenerationExecutor):
         finally:
             if not enqueued:
                 self._results.pop(client_id, None)
+                if unanswered:
+                    self._unanswered_client_ids.discard(client_id)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 
@@ -1366,6 +1381,41 @@ class BaseWorker(GenerationExecutor):
         self._results.pop(client_id, None)
         self._client_id_to_request_id.pop(client_id, None)
 
+    def outstanding_requests(self) -> Dict[int, int]:
+        """Request id -> client id of every request without a final response.
+
+        Safe to call from any thread.
+        """
+        return {
+            request_id: client_id
+            for client_id, request_id in dict(
+                self._client_id_to_request_id).items()
+        }
+
+    def _enqueue_after_rank_failure(self, response: LlmResponse) -> bool:
+        """Enqueue a request that a WideEP rank failure ended again, once.
+
+        Only if the error of ``response`` is a ``RankFailureError`` and the
+        request has no response sent yet: from this worker's copy of it, under
+        the same client id. Its client then sees no error, as nothing of the
+        first attempt reached it. Returns whether it enqueued the request again.
+        """
+        client_id = response.client_id
+        if (not self._unanswered_client_ids
+                or client_id not in self._unanswered_client_ids
+                or not isinstance(response.error_msg, RankFailureError)):
+            return False
+        self._unanswered_client_ids.discard(client_id)
+        try:
+            request_id = self._enqueue_request(
+                self._results[client_id]._generation_request)
+        except RequestError as error:
+            logger.warning(f"Could not enqueue request {client_id} again "
+                           f"after a rank failure: {error}")
+            return False
+        self._client_id_to_request_id[client_id] = request_id
+        return True
+
     def __enter__(self):
         return self
 
@@ -1645,6 +1695,8 @@ class AwaitResponseHelper:
             elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
+                if self.worker._enqueue_after_rank_failure(response):
+                    continue
                 # Convert to ErrorResponse, because tllm.Response cannot be
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
@@ -1847,6 +1899,8 @@ def _send_rsp(
     else:
         _send_rsp_to_postproc(worker, response, None)
 
+    if worker._unanswered_client_ids:
+        worker._unanswered_client_ids.discard(response.client_id)
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
     if is_llm_response(response):

@@ -34,7 +34,9 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
-from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm._utils import (fault_tolerance_mode,
+                                 fault_tolerance_replacement, get_sm_version,
+                                 str_dtype_to_torch)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -571,6 +573,9 @@ def _checkpoint_io_incompatibility_reason(
     """
     if checkpoint_loader is not None:
         return "an explicit checkpoint loader was provided"
+    if fault_tolerance_replacement() is not None:
+        # The read-ahead splits the reads among the node's ranks, which serve while a replacement rank starts.
+        return "a replacement rank loads its checkpoint alone"
     if checkpoint_format != CheckpointFormat.HF:
         return (
             f"checkpoint_io_policy={requested_policy.value!r} requires checkpoint_format='HF' "
@@ -1339,6 +1344,9 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
+            if fault_tolerance_mode():
+                from .rank_failure_recovery import check_supported_model
+                check_supported_model(model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

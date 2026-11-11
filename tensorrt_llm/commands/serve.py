@@ -647,6 +647,8 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
         reason = "enable_resource_governor"
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
+    elif _bool_setting(llm_args.get("enable_wide_ep_fault_tolerance")):
+        reason = "enable_wide_ep_fault_tolerance"
     else:
         return
     logger.info(

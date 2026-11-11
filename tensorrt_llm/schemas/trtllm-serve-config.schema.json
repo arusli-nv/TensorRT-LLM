@@ -7499,6 +7499,13 @@
       "title": "Enable Tokenization Cache",
       "type": "boolean"
     },
+    "enable_wide_ep_fault_tolerance": {
+      "default": false,
+      "description": "Keep a wide expert-parallel deployment serving when one of its ranks fails (a process crash or hang): the surviving ranks continue without it at reduced capacity, on the same CUDA graphs, until a replacement rejoins. Requires attention DP, EPLB, NVLinkOneSided MoE communication within one NVLink domain, KV cache manager V2, one serving frontend and a launcher that keeps the other ranks running when one exits; unsupported configurations are rejected at startup with the reason. Requests with n > 1 or beam search are rejected while it is on.",
+      "status": "prototype",
+      "title": "Enable Wide Ep Fault Tolerance",
+      "type": "boolean"
+    },
     "encode_only": {
       "default": false,
       "description": "Set to True to use the batch-forward encode() path, which runs a single forward pass and returns the model output directly, bypassing the scheduler and autoregressive loop. Works for encoder-only models (BERT, RoBERTa, reward models) and decoder models used in single-prefill mode (e.g., extracting embeddings). When False (default), uses the standard generate() path.",

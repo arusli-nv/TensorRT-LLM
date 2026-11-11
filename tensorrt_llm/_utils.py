@@ -31,7 +31,8 @@ from contextlib import contextmanager
 from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Tuple, TypeVar, Union)
 
 import numpy as np
 import nvtx
@@ -513,6 +514,75 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
+_wide_ep_fault_tolerance = False
+
+
+def set_fault_tolerance_mode(enabled: bool) -> None:
+    """Turn WideEP fault tolerance on or off in this process.
+
+    Set from ``enable_wide_ep_fault_tolerance`` where the LLM arguments reach a
+    process (the LLM and every executor worker), before anything reads
+    :func:`fault_tolerance_mode`.
+    """
+    global _wide_ep_fault_tolerance
+    _wide_ep_fault_tolerance = enabled
+
+
+def fault_tolerance_mode() -> bool:
+    """True if WideEP fault tolerance is on (``enable_wide_ep_fault_tolerance``)."""
+    return _wide_ep_fault_tolerance
+
+
+def check_fault_tolerance_requirements(
+        checks: Sequence[Tuple[bool, str]]) -> None:
+    """Raise ValueError naming every requirement of WideEP fault tolerance
+    that ``checks`` (per requirement: whether it is met, its description)
+    finds not met."""
+    missing = [requirement for met, requirement in checks if not met]
+    if missing:
+        raise ValueError("WideEP fault tolerance requires " +
+                         ", ".join(missing) + "; turn it off "
+                         "(enable_wide_ep_fault_tolerance=False) or change "
+                         "the configuration")
+
+
+# Set in the process of every rank under WideEP fault tolerance, by the node
+# supervisor (``_llmapi_node_supervisor.py``) that starts it, or by
+# ``MpiPoolSession`` for rank 0: "<rank>,<world size>,<incarnation>". The rank
+# runs on GPU rank % GPUs per node.
+FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
+
+
+class RankIdentity(NamedTuple):
+    """A rank under WideEP fault tolerance, where every rank is its own
+    one-process MPI world: the rank and world size come from here rather than
+    from MPI."""
+    rank: int
+    world_size: int
+    incarnation: int  # 0 for an original rank, n for its n-th replacement
+
+
+def wide_ep_fault_tolerance_rank() -> Optional[RankIdentity]:
+    """With WideEP fault tolerance, this process's rank (None without it)."""
+    if not fault_tolerance_mode():
+        return None
+    return _parse_rank_identity(os.environ.get(FAULT_TOLERANCE_RANK_ENV))
+
+
+def fault_tolerance_replacement() -> Optional[RankIdentity]:
+    """With WideEP fault tolerance, the rank this process replaces (None for
+    an original rank)."""
+    identity = wide_ep_fault_tolerance_rank()
+    return identity if identity is not None and identity.incarnation else None
+
+
+@lru_cache(maxsize=1)
+def _parse_rank_identity(value: Optional[str]) -> Optional[RankIdentity]:
+    if value is None:
+        return None
+    return RankIdentity(*(int(field) for field in value.split(",")))
+
+
 def mpi_rank():
     if mpi_disabled():
         try:
@@ -520,6 +590,9 @@ def mpi_rank():
         except ValueError:
             # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
             return 0
+    identity = wide_ep_fault_tolerance_rank()
+    if identity is not None:
+        return identity.rank
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -527,15 +600,23 @@ def global_mpi_rank():
     if mpi_disabled():
         # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
         return 0
-
+    identity = wide_ep_fault_tolerance_rank()
+    if identity is not None:
+        return identity.rank
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_size():
+    identity = wide_ep_fault_tolerance_rank()
+    if identity is not None:
+        return identity.world_size
     return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_world_size():
+    identity = wide_ep_fault_tolerance_rank()
+    if identity is not None:
+        return identity.world_size
     return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
@@ -547,8 +628,7 @@ def local_mpi_rank():
             return torch.cuda.current_device()
         except ValueError:
             return 0
-    return mpi_comm().Get_rank() % torch.cuda.device_count(
-    ) if ENABLE_MULTI_DEVICE else 0
+    return mpi_rank() % torch.cuda.device_count() if ENABLE_MULTI_DEVICE else 0
 
 
 def local_mpi_size():

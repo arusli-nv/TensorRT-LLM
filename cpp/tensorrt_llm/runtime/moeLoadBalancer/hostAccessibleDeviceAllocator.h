@@ -87,6 +87,35 @@ public:
      */
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
+    /**
+     * @brief Copy from the host to host accessible device memory given by its device address; with GDRCopy, the
+     * range may span several recorded allocations (each has a mapping of its own).
+     *
+     * @param devDst : the device address to copy to
+     * @param src : the src pointer, on host
+     * @param size : copy size
+     */
+    void memcpyToDeviceAddress(void* devDst, void const* src, size_t size);
+
+    /**
+     * @brief Whether host accessible device memory is device memory that GDRCopy maps for the host: GPU memory is
+     * not a NUMA node (or GDRCopy is forced) and GDRCopy is available. The other forms are host memory the device
+     * reads. Only while a load balancer exists (it initializes the allocator).
+     */
+    bool usesGdrCopy() const;
+
+    /**
+     * @brief Make device memory allocated elsewhere host accessible with GDRCopy (usesGdrCopy): pins and maps
+     * [devPtr, devPtr + size), whose bytes must belong to one allocation, GPU-page aligned (GPU_PAGE_SIZE), and
+     * records it. The owner releases it with unmapDeviceMemory before it frees the memory.
+     */
+    void mapDeviceMemory(void* devPtr, size_t size);
+
+    /**
+     * @brief Unmaps and unpins device memory that mapDeviceMemory mapped at devPtr; errors are logged.
+     */
+    void unmapDeviceMemory(void* devPtr) noexcept;
+
 private:
     struct AllocationInfo
     {

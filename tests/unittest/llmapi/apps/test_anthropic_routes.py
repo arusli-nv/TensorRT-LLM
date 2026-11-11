@@ -36,11 +36,12 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    CompletionRequest,
     FunctionCall,
     ToolCall,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.openai_server import OpenAIServer, _end_stream_on_error
 from tensorrt_llm.serve.render import chat as render_chat_module
 from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
@@ -612,20 +613,69 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     server_logger.error.assert_not_called()
 
 
-def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
-    """A failure of the generation itself is still logged and raised."""
+def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, server_logger):
+    """A failure of the generation itself is logged and ends the stream with an error event and [DONE]."""
 
     async def run():
         generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
         stream, _ = await _chat_stream(monkeypatch, generation)
-        with pytest.raises(RuntimeError, match="engine failed"):
-            async for _ in stream:
-                pass
+        return [frame async for frame in stream]
 
-    asyncio.run(run())
+    frames = asyncio.run(run())
 
+    assert frames[0] == "data: one\n\n"
+    assert json.loads(frames[1][len("data: ") :])["error"]["message"] == "engine failed"
+    assert frames[2:] == ["data: [DONE]\n\n"]
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
+
+
+def test_completion_stream_of_two_prompts_reports_one_failure_and_one_done(
+    monkeypatch, server_logger
+):
+    """One failing prompt of a batched completion stream yields one error event and a single [DONE]."""
+
+    async def run():
+        server = object.__new__(OpenAIServer)
+        server.model = MODEL
+        server.model_config = _ModelConfig()
+        server.tokenizer = None
+        server._is_visual_gen = False
+        server._adjusted_steady_clock = SimpleNamespace(now=time.monotonic)
+        server.generator = SimpleNamespace(
+            args=SimpleNamespace(
+                gather_generation_logits=False,
+                reasoning_parser=None,
+                backend="pytorch",
+                num_postprocess_workers=1,
+            ),
+            generate_async=Mock(
+                side_effect=[
+                    _StreamedGeneration([["data: first\n\n"]]),
+                    _StreamedGeneration([["data: second\n\n"]], then=RuntimeError("prompt failed")),
+                ]
+            ),
+        )
+        server.await_disconnected = AsyncMock()
+        server._extract_metrics = AsyncMock()
+        # Token-id prompts skip the input processor and its executor.
+        request = CompletionRequest(model=MODEL, prompt=[[1, 2], [3, 4]], stream=True)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        response = await server.openai_completion(request, raw_request)
+        assert isinstance(response, StreamingResponse), response.body
+        return [frame async for frame in response.body_iterator]
+
+    frames = asyncio.run(run())
+
+    assert frames[-1] == "data: [DONE]\n\n"
+    assert frames.count("data: [DONE]\n\n") == 1
+    assert "data: first\n\n" in frames
+    assert "data: second\n\n" in frames
+    errors = [f for f in frames if f.startswith('data: {"error"')]
+    assert len(errors) == 1
+    assert json.loads(errors[0][len("data: ") :])["error"]["message"] == "prompt failed"
+    assert len(frames) == 4
+    server_logger.error.assert_called_once()
 
 
 @pytest.fixture
@@ -645,6 +695,30 @@ def prometheus_multiproc_dir(tmp_path, monkeypatch):
         yield tmp_path
     finally:
         prometheus_client.values.ValueClass = saved_value_class
+
+
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_messages_route_ends_a_failed_stream_with_the_upstream_error(server_kind):
+    async def failing_chat_stream():
+        chunk = ChatCompletionStreamResponse(
+            model=MODEL, choices=[{"index": 0, "delta": {"content": "Hello"}}]
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
+        raise RuntimeError("rank 2 failed; retry it")
+
+    openai_response = StreamingResponse(
+        _end_stream_on_error(failing_chat_stream()), media_type="text/event-stream"
+    )
+    client, _ = _make_route_client(server_kind, openai_response)
+
+    response = client.post("/v1/messages", json=_request(stream=True))
+
+    assert response.status_code == 200
+    assert "event: message_stop\n" not in response.text
+    assert response.text.rstrip().endswith(
+        'event: error\ndata: {"type":"error","error":'
+        '{"type":"api_error","message":"rank 2 failed; retry it"}}'
+    )
 
 
 def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):

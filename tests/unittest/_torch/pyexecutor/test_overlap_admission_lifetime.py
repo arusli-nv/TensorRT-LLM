@@ -51,6 +51,7 @@ def _admission_executor(
         _kv_connector_deadlines={},
         kv_cache_transceiver=None,
         canceled_req_ids=[],
+        rank_failure_recovery=None,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )

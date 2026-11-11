@@ -37,7 +37,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm._utils import EnergyMonitor, fault_tolerance_mode
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -45,6 +45,7 @@ from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         RANK_FAILURE_CODE, RankFailureError,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
@@ -290,6 +291,43 @@ def _configure_parser_special_token_decoding(
         # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
         # changes the protocol and prevents the K3 parsers from matching it.
         sampling_params.spaces_between_special_tokens = False
+
+
+def _stream_error_events(error: Exception) -> List[str]:
+    """The SSE events that end a stream whose request failed after it began.
+
+    The HTTP status is already committed by then, so the error travels as an
+    ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
+    """
+    message = str(error)
+    code = RANK_FAILURE_CODE if isinstance(error, RankFailureError) else None
+    error_data = json.dumps({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "code": code,
+            "param": None,
+        }
+    })
+    return [f"data: {error_data}\n\n", "data: [DONE]\n\n"]
+
+
+async def _end_stream_on_error(
+        events: AsyncIterator[str]) -> AsyncGenerator[str, None]:
+    """Pass ``events`` through; if they fail, end the stream with ``_stream_error_events``.
+
+    A failure after ``[DONE]``, such as in metrics extraction, is only logged: the stream has ended.
+    """
+    done = False
+    try:
+        async for event in events:
+            yield event
+            done = event == "data: [DONE]\n\n"
+    except Exception as error:
+        logger.error(traceback.format_exc())
+        if not done:
+            for event in _stream_error_events(error):
+                yield event
 
 
 def _record_generator_termination(generator) -> None:
@@ -1155,15 +1193,22 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
     def create_error_response(
-            message: str,
+            message: Union[str, Exception],
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        rank_failure = isinstance(message, RankFailureError)
+        message = str(message)
         # Over-length prompts are detected from the message text because they
         # cross the executor IPC boundary as plain strings (RequestError), so
         # no exception type survives to here.
         code: Union[int, str] = status_code.value
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
+        elif rank_failure:
+            # Sending the request again can succeed.
+            err_type, status_code = ("ServiceUnavailableError",
+                                     HTTPStatus.SERVICE_UNAVAILABLE)
+            code = RANK_FAILURE_CODE
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=code)
@@ -1221,6 +1266,17 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
+    async def fault_tolerance_status(self) -> JSONResponse:
+        """The WideEP fault-tolerance membership, read from its store now.
+
+        The state /health reports, whether the membership authority answers,
+        the generation, the live and lost ranks, and the last membership
+        change with its duration.
+        """
+        status = await asyncio.to_thread(
+            self.generator._executor.fault_tolerance_health.status)
+        return JSONResponse(content=status)
+
     def _check_health(self) -> bool:
         # An embedding server's requests flow through the batcher worker; if it
         # has exited the engine is up but every /v1/embeddings request hangs, so
@@ -1238,6 +1294,10 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.health_generate,
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
+        if fault_tolerance_mode():
+            self.app.add_api_route("/fault_tolerance_status",
+                                   self.fault_tolerance_status,
+                                   methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/data_transceiver_state",
                                self.data_transceiver_state,
@@ -1718,7 +1778,16 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def health(self) -> Response:
         if self._check_health():
-            return Response(status_code=200)
+            if not fault_tolerance_mode():
+                return Response(status_code=200)
+            # Under WideEP fault tolerance the deployment stays alive while it
+            # lost ranks or changes its membership; only a stopped one is not.
+            # The membership store is read off the event loop.
+            status = await asyncio.to_thread(
+                self.generator._executor.fault_tolerance_health.status)
+            state = status["state"]
+            return JSONResponse(content={"state": state},
+                                status_code=503 if state == "stopped" else 200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -1736,6 +1805,10 @@ class OpenAIServer(_VideoRoutesMixin):
                         f"server shutdown: {executor._fatal_error}")
                     _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
+            if fault_tolerance_mode():
+                # The same JSON body as in the other states.
+                return JSONResponse(content={"state": "stopped"},
+                                    status_code=503)
             return Response(
                 status_code=503,
                 content=
@@ -2076,34 +2149,27 @@ class OpenAIServer(_VideoRoutesMixin):
         async def chat_stream_generator(
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-                )
-                pp_results = first_response.outputs[
+            if not self.postproc_worker_enabled:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            first_response = await anext(promise)
+            raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
+            )
+            pp_results = first_response.outputs[
+                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                    first_response, args)
+            for pp_res in pp_results:
+                yield pp_res
+            # Making sure we can handle the situation where there is only one response
+            res = first_response
+            async for res in promise:
+                pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        first_response, args)
+                        res, args)
                 for pp_res in pp_results:
                     yield pp_res
-                # Making sure we can handle the situation where there is only one response
-                res = first_response
-                async for res in promise:
-                    pp_results = res.outputs[
-                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                            res, args)
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-                nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
+            yield "data: [DONE]\n\n"
+            await self._extract_metrics(res, raw_request)
+            nvtx_mark("generation ends")
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -2514,8 +2580,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if request.stream:
-                response_generator = chat_stream_generator(
-                    promise, postproc_params)
+                response_generator = _end_stream_on_error(
+                    chat_stream_generator(promise, postproc_params))
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
@@ -2543,7 +2609,7 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -2963,7 +3029,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3030,20 +3096,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(output, raw_request)
             except Exception as e:
                 logger.error(traceback.format_exc())
-                # StreamingResponse commits HTTP 200 before the first
-                # chunk, so we cannot change the status code.  Yield
-                # an SSE error event so the stream terminates cleanly
-                # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
+                # generator_wrapper ends the stream with [DONE].
+                yield _stream_error_events(e)[0]
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3188,7 +3242,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3199,31 +3253,25 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = (
-                    self._adjusted_steady_clock.now())
-                pp_results = (first_response.outputs[0]._postprocess_result if
+            if not self.postproc_worker_enabled:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            first_response = await anext(promise)
+            raw_request.state.server_first_token_time = (
+                self._adjusted_steady_clock.now())
+            pp_results = (first_response.outputs[0]._postprocess_result
+                          if self.postproc_worker_enabled else post_processor(
+                              first_response, args))
+            for pp_res in pp_results:
+                yield pp_res
+            res = first_response
+            async for res in promise:
+                pp_results = (res.outputs[0]._postprocess_result if
                               self.postproc_worker_enabled else post_processor(
-                                  first_response, args))
+                                  res, args))
                 for pp_res in pp_results:
                     yield pp_res
-                res = first_response
-                async for res in promise:
-                    pp_results = (res.outputs[0]._postprocess_result
-                                  if self.postproc_worker_enabled else
-                                  post_processor(res, args))
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.error(traceback.format_exc())
-                raise
+            yield "data: [DONE]\n\n"
+            await self._extract_metrics(res, raw_request)
 
         try:
             ensure_request_chat_template_allowed(
@@ -3333,8 +3381,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
+                return StreamingResponse(content=_end_stream_on_error(
+                    create_streaming_generator(promise, postproc_params)),
                                          media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
@@ -3346,7 +3394,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
-            return self.create_error_response(message=str(e),
+            return self.create_error_response(message=e,
                                               err_type="internal_error")
 
     def _responses_prompt_tokens_excluded_from_usage(
@@ -3612,7 +3660,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         return JSONResponse(content={"detail": "None"})
 

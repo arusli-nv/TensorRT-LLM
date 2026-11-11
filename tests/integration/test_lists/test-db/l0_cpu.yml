@@ -74,6 +74,7 @@ l0_cpu:
   # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
   - unittest/others/test_perf_sanity_port_reservation.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
+  - unittest/_torch/test_mnnvl_memory_remap.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
   # pytest.mark.cpu_only when the stage runs -m cpu_only, so this entry runs only the
@@ -111,6 +112,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
+  - unittest/_torch/wide_ep_ft/test_wide_ep_ft_invariants.py
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
@@ -360,6 +362,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_usage.py
   - unittest/llmapi/apps/test_serve_lazy_import.py
   - unittest/llmapi/apps/test_serving_extensions.py
+  - unittest/llmapi/apps/test_stream_error_events.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_iteration_logging.py
@@ -390,6 +393,7 @@ l0_cpu:
   - unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or worker_system_exit-2 or mixed_collective-4 or all_hang-2 or reuse-2 or sync_recovery-2 or async_drain-2" ISOLATION
   - unittest/llmapi/test_mpi_stop.py
   - unittest/llmapi/test_mpi_stop_launcher.py
+  - unittest/llmapi/test_node_supervisor.py
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
@@ -411,6 +415,7 @@ l0_cpu:
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
+  - unittest/llmapi/test_wide_ep_fault_tolerance_args.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py
   - unittest/others

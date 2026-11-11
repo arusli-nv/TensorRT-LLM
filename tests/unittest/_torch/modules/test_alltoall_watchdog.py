@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm import _utils
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -30,7 +31,6 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     CompletionFlagReadTimeout,
-    reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import get_wide_ep_ft_options
@@ -178,9 +178,11 @@ def test_watchdog_stop_is_terminal() -> None:
         watchdog.watch(phase="dispatch", expected_flag=1)
 
 
+@pytest.mark.cpu_only
 def test_wide_ep_ft_options_create_shared_health_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
@@ -198,9 +200,39 @@ def test_wide_ep_ft_options_create_shared_health_when_enabled(
     assert poll_again_s == poll_interval_s
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("env_enabled", [False, True], ids=["flag", "flag_and_env"])
+def test_wide_ep_ft_options_under_fault_tolerance_run_no_watchdog(
+    monkeypatch: pytest.MonkeyPatch, env_enabled: bool
+) -> None:
+    """enable_wide_ep_fault_tolerance creates the shared membership whether or not
+    TLLM_FAULT_TOLERANCE_MODE is set, and no watchdog: the membership authority reads the
+    kernels' wait evidence."""
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    if env_enabled:
+        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    else:
+        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    model_config = SimpleNamespace(
+        extra_attrs={},
+        mapping=SimpleNamespace(moe_ep_size=4),
+    )
+
+    health, timeout_s, poll_interval_s = get_wide_ep_ft_options(model_config)
+    health_again, timeout_again_s, poll_again_s = get_wide_ep_ft_options(model_config)
+
+    assert isinstance(health, EPGroupHealth)
+    assert health_again is health
+    assert timeout_s is None and timeout_again_s is None
+    assert poll_interval_s == DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S
+    assert poll_again_s == poll_interval_s
+
+
+@pytest.mark.cpu_only
 def test_wide_ep_ft_options_reject_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
@@ -213,17 +245,35 @@ def test_wide_ep_ft_options_reject_cuda_graphs(
     assert model_config.extra_attrs == {}
 
 
-def test_rank_mask_mode_rejects_direct_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_wide_ep_ft_options_allow_cuda_graphs_only_in_fault_tolerance_mode(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
 ) -> None:
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    """The kernels read the rank mask at execution time, so rank-mask mode works with CUDA graphs once fault
+    tolerance mode binds the communicators; an injected membership without it is refused before the model loads."""
+    import tensorrt_llm._torch.moe.fused_moe.wide_ep_ft as wide_ep_ft
 
-    reject_rank_mask_cuda_graph_capture(False)
-    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
-        reject_rank_mask_cuda_graph_capture(True)
+    monkeypatch.setattr(wide_ep_ft, "fault_tolerance_mode", lambda: fault_tolerance)
+    model_config = SimpleNamespace(
+        extra_attrs={} if fault_tolerance else {"ep_group_health": EPGroupHealth(4)},
+        mapping=SimpleNamespace(moe_ep_size=4),
+        use_cuda_graph=True,
+    )
+    if not fault_tolerance:
+        with pytest.raises(ValueError, match="does not support CUDA graphs"):
+            get_wide_ep_ft_options(model_config)
+        return
+
+    health, _, _ = get_wide_ep_ft_options(model_config)
+    assert isinstance(health, EPGroupHealth)
+    assert health.moe_world_size == 4
+    assert list(model_config.extra_attrs.values()) == [health]
 
 
+@pytest.mark.cpu_only
 def test_wide_ep_ft_options_ignore_legacy_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
     monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
     model_config = SimpleNamespace(

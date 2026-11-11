@@ -17,6 +17,20 @@ For DeepSeek-V4.1 CSA2, use these additional limits:
 See [CSA2 sparse attention](sparse-attention.md#deepseek-v41-csa2) for staging
 dtypes, replay environment variables, and accuracy-validation requirements.
 
+With WideEP fault tolerance (`enable_wide_ep_fault_tolerance`), these limits
+apply; the startup check rejects the rest:
+
+| Feature | With WideEP fault tolerance |
+|---|---|
+| Expert Parallelism / Attention Data Parallelism | Required: attention DP over all ranks within one NVLink domain with the default router and admission, `NVLinkOneSided` MoE communication, EPLB (fault tolerance adds the spare slots) |
+| Tensor Parallelism (attention) / Pipeline Parallelism | Unsupported |
+| Overlap Scheduler / CUDA Graph / KV Cache Reuse | Supported; the overlap scheduler and KV cache manager V2 are required |
+| Speculative Decoding | MTP supported; separate draft models and DSpark unsupported |
+| Disaggregated Serving / KV cache connectors / KV cache events / Sleep mode / several serving frontends | Unsupported |
+| Sampling | `n > 1`, `best_of > 1` and beam search unsupported |
+
+See [WideEP Fault Tolerance](wide-ep-fault-tolerance.md).
+
 | Feature                                                     | Overlap Scheduler | CUDA Graph | Tensor Parallelism | Pipeline Parallelism | Expert Parallelism | Helix Parallelism | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | Speculative Decoding — Linear | Speculative Decoding — Dynamic Trees | Speculative Decoding — Legacy Path (NGram, user-provided) | Torch Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding | LoRA     | Text Watermarking |
 | ----------------------------------------------------------- | ----------------- | ---------- | ------------------ | -------------------- | ------------------ | ----------------- | -------------------------- | --------------------- | --------------- | ----------------------------- | ------------------------------------ | --------------------------------------------------------- | ------------- | -------------- | ------------------------ | --------------------- | --------------- | -------- | ----------------- |
 | Overlap Scheduler                                           | ---               |            |                    |                      |                    |                   |                            |                       |                 |                               |                                      |                                                           |               |                |                          |                       |                 |          |                   |

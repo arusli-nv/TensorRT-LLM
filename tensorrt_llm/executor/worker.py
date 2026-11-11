@@ -29,7 +29,8 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._startup_errors import classify_startup_error, wrap_worker_startup_error
-from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from .._utils import (FAULT_TOLERANCE_RANK_ENV, fault_tolerance_mode, mpi_comm,
+                      mpi_rank, print_all_stacks, set_fault_tolerance_mode)
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -393,6 +394,20 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
+    set_fault_tolerance_mode(
+        getattr(llm_args, "enable_wide_ep_fault_tolerance", False))
+    if fault_tolerance_mode():
+        # Before any other local: the arguments every other rank starts with.
+        worker_main_args = dict(locals())
+        from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
+            join_startup_group, start_worker)
+        start_worker(worker_main_args)
+        join_startup_group()
+    elif FAULT_TOLERANCE_RANK_ENV in os.environ:
+        raise ValueError(
+            "The launcher started this rank as its own process for WideEP "
+            f"fault tolerance ({FAULT_TOLERANCE_RANK_ENV} is set), but "
+            "enable_wide_ep_fault_tolerance is off")
 
     launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
     if llm_args is not None and llm_args.env_overrides:
@@ -460,7 +475,10 @@ def worker_main(
             register_external_model_modules
         register_external_model_modules(_torch_external_model_modules or {})
 
-    set_mpi_session_cpp(mpi_comm())
+    # Under WideEP fault tolerance C++ keeps this process's own MPI world: it
+    # communicates over none.
+    if not fault_tolerance_mode():
+        set_mpi_session_cpp(mpi_comm())
 
     if is_leader:
         # Only set the log level for the leader process, the other processes will
@@ -650,6 +668,13 @@ def worker_main(
 
                 # Send ready signal with confirmation
                 ready_msg = (ready_signal, None, worker_process_identities)
+                recovery = getattr(worker.engine, "rank_failure_recovery", None)
+                if recovery is not None:
+                    # WideEP fault tolerance: the proxy reads the membership.
+                    from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
+                        MembershipReady
+                    recovery.outstanding_requests = worker.outstanding_requests
+                    ready_msg = MembershipReady(*ready_msg, recovery.address)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"

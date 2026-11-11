@@ -19,15 +19,19 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-#include <c10/core/Allocator.h>     // for c10::DataPtr
-#include <c10/core/StorageImpl.h>   // for c10::StorageImpl and use_byte_size_t()
+#include <c10/core/Allocator.h>   // for c10::DataPtr
+#include <c10/core/StorageImpl.h> // for c10::StorageImpl and use_byte_size_t()
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/util/accumulate.h>
 #include <c10/util/intrusive_ptr.h> // for c10::make_intrusive#include <torch/extension.h>
 #include <vector>
 
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/unbackedSlotMemory.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -162,7 +166,8 @@ torch::Tensor moeLoadBalanceRouting(
     auto tokenRoutedSlotIds = torch::empty_like(tokenSelectedExperts);
 
     tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getGpuPlacementInfo(),
-        tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream);
+        tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream,
+        loadBalancer->routesEachExpertToOneSlot());
 
     return tokenRoutedSlotIds;
 }
@@ -198,6 +203,71 @@ void migrateToHostAccessible(at::Tensor& tensor)
     // Finally replace tensor's storage，offset = 0，shape and stride kept unchanged
     tensor.set_(new_storage,
         /*storage_offset=*/0, tensor.sizes().vec(), tensor.strides().vec());
+}
+
+// Whether slotCount slots of slotBytes each take less device memory with the unbackedSlots unbacked than plainly
+// allocated (UnbackedSlotMemory::savesMemory, on the current device).
+bool moeUnbackedSlotsSaveMemory(int64_t slotBytes, int64_t slotCount, at::IntArrayRef unbackedSlots)
+{
+    TORCH_CHECK(slotBytes > 0 && slotCount > 0, "expects slots of at least one byte");
+    return tensorrt_llm::runtime::UnbackedSlotMemory::getInstance().savesMemory(static_cast<size_t>(slotBytes),
+        static_cast<int>(slotCount), std::vector<int>(unbackedSlots.begin(), unbackedSlots.end()));
+}
+
+// A new contiguous tensor of slots (dimension 0 of sizes) on the current CUDA device whose unbackedSlots map no device
+// memory of their own (UnbackedSlotMemory); for slots that moeUnbackedSlotsSaveMemory says save memory. Its contents
+// are undefined, and an access to an unbacked slot reads or writes the scratch. Releasing its storage synchronizes its
+// device, so the tensor must not be freed during CUDA graph capture. With hostAccessible, online EPLB's updates write
+// its slots with CPU copies, as the slots migrateToHostAccessible makes.
+at::Tensor moeUnbackedSlotTensor(
+    at::IntArrayRef sizes, at::ScalarType dtype, at::IntArrayRef unbackedSlots, bool hostAccessible)
+{
+    TORCH_CHECK(!sizes.empty() && sizes[0] > 0, "expects the sizes of a tensor of slots");
+    size_t const byteSize = c10::multiply_integers(sizes) * c10::elementSize(dtype);
+    TORCH_CHECK(byteSize > 0, "expects slots of at least one byte");
+    int const slotCount = static_cast<int>(sizes[0]);
+    at::Device const device(at::kCUDA, c10::cuda::current_device());
+    void* devPtr = tensorrt_llm::runtime::UnbackedSlotMemory::getInstance().allocate(
+        byteSize / slotCount, slotCount, std::vector<int>(unbackedSlots.begin(), unbackedSlots.end()), hostAccessible);
+    c10::DataPtr dp(
+        devPtr, devPtr, [](void* ptr) { tensorrt_llm::runtime::UnbackedSlotMemory::getInstance().free(ptr); }, device);
+    auto storageImpl = c10::make_intrusive<c10::StorageImpl>(c10::StorageImpl::use_byte_size_t(), byteSize,
+        std::move(dp), c10::GetAllocator(device.type()), /*resizable=*/false);
+    return at::empty({0}, at::TensorOptions().dtype(dtype).device(device))
+        .set_(at::Storage(storageImpl), /*storage_offset=*/0, sizes);
+}
+
+// Backs unbacked slots of tensors that moeUnbackedSlotTensor created with device memory of their own at the same
+// addresses (contents undefined: the caller loads them), or with backed=false maps them to the shared scratch again:
+// of tensors[i], the next slotCounts[i] of slots. Returns the device bytes mapped or released. Synchronizes the device
+// once if a mapping changes: only while no kernel uses the slots, and not during CUDA graph capture.
+int64_t moeUnbackedSlotsSetBacked(
+    at::TensorList tensors, at::IntArrayRef slots, at::IntArrayRef slotCounts, bool backed)
+{
+    TORCH_CHECK(!tensors.empty() && tensors.size() == slotCounts.size(), "expects a slot count per tensor of slots");
+    std::vector<tensorrt_llm::runtime::UnbackedSlotMemory::SlotRange> ranges;
+    ranges.reserve(tensors.size());
+    auto next = slots.begin();
+    for (size_t i = 0; i < tensors.size(); ++i)
+    {
+        TORCH_CHECK(tensors[i].device() == tensors.front().device() && tensors[i].device().is_cuda(),
+            "expects CUDA tensors of slots on one device");
+        TORCH_CHECK(
+            slotCounts[i] >= 0 && slotCounts[i] <= slots.end() - next, "expects slotCounts to sum to the slots");
+        ranges.push_back({tensors[i].storage().data_ptr().get(), std::vector<int>(next, next + slotCounts[i])});
+        next += slotCounts[i];
+    }
+    TORCH_CHECK(next == slots.end(), "expects slotCounts to sum to the slots");
+    c10::cuda::CUDAGuard const deviceGuard(tensors.front().device());
+    return static_cast<int64_t>(tensorrt_llm::runtime::UnbackedSlotMemory::getInstance().setBacked(ranges, backed));
+}
+
+// The device bytes moeUnbackedSlotsSetBacked({tensor}, slots, {slots.size()}, true) would map now.
+int64_t moeUnbackedSlotsBytesToBack(at::Tensor const& tensor, at::IntArrayRef slots)
+{
+    TORCH_CHECK(tensor.device().is_cuda(), "expects a CUDA tensor of slots");
+    return static_cast<int64_t>(tensorrt_llm::runtime::UnbackedSlotMemory::getInstance().bytesToBack(
+        tensor.storage().data_ptr().get(), std::vector<int>(slots.begin(), slots.end())));
 }
 
 } // namespace torch_ext
@@ -276,9 +346,24 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("migrate_to_host_accessible(Tensor tensor) -> ()");
+    m.def("moe_unbacked_slots_save_memory(int slot_bytes, int slot_count, int[] unbacked_slots) -> bool");
+    m.def(
+        "moe_unbacked_slot_tensor(int[] sizes, ScalarType dtype, int[] unbacked_slots, bool host_accessible=False) -> "
+        "Tensor");
+    m.def("moe_unbacked_slots_set_backed(Tensor(a!)[] tensors, int[] slots, int[] slot_counts, bool backed) -> int");
+    m.def("moe_unbacked_slots_bytes_to_back(Tensor tensor, int[] slots) -> int");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("migrate_to_host_accessible", &tensorrt_llm::torch_ext::migrateToHostAccessible);
+    m.impl("moe_unbacked_slots_set_backed", &tensorrt_llm::torch_ext::moeUnbackedSlotsSetBacked);
+    m.impl("moe_unbacked_slots_bytes_to_back", &tensorrt_llm::torch_ext::moeUnbackedSlotsBytesToBack);
+}
+
+// No tensor argument picks the backend: the slot tensor is created on the current CUDA device.
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("moe_unbacked_slots_save_memory", &tensorrt_llm::torch_ext::moeUnbackedSlotsSaveMemory);
+    m.impl("moe_unbacked_slot_tensor", &tensorrt_llm::torch_ext::moeUnbackedSlotTensor);
 }

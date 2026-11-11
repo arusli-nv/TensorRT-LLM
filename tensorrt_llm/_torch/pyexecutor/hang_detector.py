@@ -22,7 +22,13 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional
 
-from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
+from tensorrt_llm._utils import (
+    ENABLE_MULTI_DEVICE,
+    fault_tolerance_mode,
+    mpi_comm,
+    mpi_disabled,
+    print_all_stacks,
+)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -81,6 +87,10 @@ def propagate_hard_kill(
     - Fallback: self-``SIGKILL``. The launcher (``mpirun`` propagates by default;
       ``srun`` needs ``--kill-on-bad-exit``) then tears down peers.
 
+    Under WideEP fault tolerance the kill stays local: the peers go on without
+    this rank, and the launcher keeps them running (``mpirun
+    --enable-recovery``).
+
     Diagnostic exceptions are ignored. Deadline-driven callers also disable
     diagnostics so a blocked stream or logging lock cannot delay termination.
 
@@ -95,7 +105,7 @@ def propagate_hard_kill(
     if diagnostics:
         _best_effort_flush_streams()
     try:
-        if ENABLE_MULTI_DEVICE and not mpi_disabled():
+        if ENABLE_MULTI_DEVICE and not mpi_disabled() and not fault_tolerance_mode():
             from mpi4py import MPI
 
             if (
@@ -215,7 +225,7 @@ def all_ranks_crashed(world_size: int, timeout: Optional[float] = None) -> bool:
     try:
         if world_size <= 1:
             return False
-        if not ENABLE_MULTI_DEVICE or mpi_disabled():
+        if not ENABLE_MULTI_DEVICE or mpi_disabled() or fault_tolerance_mode():
             return False
         from mpi4py import MPI
 
@@ -603,6 +613,11 @@ class HangDetector:
             yield
         finally:
             self.checkpoint()
+
+    def paused(self) -> bool:
+        """Whether detection is disarmed: in :meth:`pause`, or before the first
+        checkpoint; any thread."""
+        return self._deadline == math.inf
 
     def stop(self):
         """Stop hang detection."""

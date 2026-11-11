@@ -108,6 +108,7 @@ def _forward_step_executor(
         _handle_errors=Mock(),
         _finish_inforward_snapshots=False,
         kv_cache_manager=Mock(),
+        rank_failure_recovery=None,
     )
 
 
@@ -2064,6 +2065,164 @@ def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata(
     assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_kv_pool_resize_runs_with_every_cache_suspended(fails):
+    """The resize WideEP fault tolerance gives the KV cache pool to restored experts runs in main's suspend/resume
+    of a rebalance, which reads the capacity again; a resize that raises (a peer lost during the remap it includes)
+    leaves nothing suspended."""
+
+    class Manager:
+        tokens_per_block = 32
+
+        def __init__(self):
+            self.total_blocks = 100
+            self.impl = Mock()
+            self.suspended = []
+
+        def get_primary_block_counts(self):
+            return 0, self.total_blocks
+
+        def is_request_active(self, request_id):
+            return True
+
+        def suspend_request(self, request):
+            self.suspended.append(request)
+
+        def resume_request(self, request):
+            self.suspended.remove(request)
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = [types.SimpleNamespace(py_request_id=1)]
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+
+    def shrink():
+        with executor._kv_pools_suspended() as kv_cache_manager:
+            assert kv_cache_manager is manager
+            assert manager.suspended == executor.active_requests
+            manager.total_blocks = 60
+            if fails:
+                raise RuntimeError("a peer exited during the remap")
+
+    if fails:
+        with pytest.raises(RuntimeError, match="a peer exited"):
+            shrink()
+    else:
+        shrink()
+    manager.impl.adjust.assert_not_called()
+    assert manager.suspended == []
+    executor._resume_padding_dummies_after_rebalance.assert_called_once_with(manager, [])
+    assert executor.get_kv_cache_capacity()["maxNumBlocks"] == 60
+
+
+def test_kv_pool_resize_error_is_kept_when_the_resume_fails_too():
+    """A resume that fails after a failed resize raises with the resize's error as its context."""
+
+    class Manager:
+        tokens_per_block = 32
+
+        def get_primary_block_counts(self):
+            return 0, 100
+
+        def is_request_active(self, request_id):
+            return True
+
+        def suspend_request(self, request):
+            pass
+
+        def resume_request(self, request):
+            raise KeyError(request.py_request_id)
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = [types.SimpleNamespace(py_request_id=1)]
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    resize_error = RuntimeError("a peer exited during the remap")
+
+    with pytest.raises(KeyError) as resume_error:
+        with executor._kv_pools_suspended():
+            raise resize_error
+    assert resume_error.value.__context__ is resize_error
+
+
+def _previous_batch_consumer(consumer, dropped):
+    """An overlap executor with rank failure recovery whose previous batch the recovery accepts or discards
+    (``dropped``), and ``consumer``, the path that applies that batch; records the order of the steps."""
+    executor = object.__new__(PyExecutor)
+    calls = []
+    executor.previous_batch = types.SimpleNamespace(
+        scheduled_requests=Mock(all_requests=Mock(return_value=["request"])),
+        sample_state="sample state",
+        context_commits=[],
+        guided_batch_id=3,
+    )
+
+    def drop_invalid_step():
+        calls.append("drop_invalid_step")
+        if dropped:
+            executor.previous_batch = None
+
+    executor.rank_failure_recovery = Mock(drop_invalid_step=drop_invalid_step)
+    executor.guided_decoder = Mock()
+    executor.capturable_guided_decoder = Mock()
+    executor._commit_v2_context_blocks = Mock(side_effect=lambda batch: calls.append("commit"))
+    executor._update_requests = Mock(side_effect=lambda state: calls.append("update"))
+    executor.dist = Mock(pp_size=1)
+    executor.enable_attention_dp = True
+    executor.disable_overlap_scheduler = False
+    executor.enable_kv_cache_events = False
+    executor.enable_early_first_token_response = False
+    executor.speculation_gate = None
+    executor.drafter = None
+    executor.perf_manager = Mock()
+    for name in (
+        "_send_kv_async",
+        "_flush_pending_transfer_responses",
+        "_process_previous_batch",
+        "_enqueue_responses",
+        "_commit_kv_cache_stats",
+        "_wait_for_model_engine_input_copy",
+    ):
+        setattr(executor, name, Mock())
+    return (
+        executor,
+        calls,
+        {
+            "rebalance": executor._consume_previous_batch_for_rebalance,
+            "control": executor._retire_inflight_batch_for_control,
+        }[consumer],
+    )
+
+
+@pytest.mark.parametrize("consumer", ["rebalance", "control"])
+@pytest.mark.parametrize("dropped", [False, True])
+def test_every_consumer_of_the_previous_batch_accepts_it_first(consumer, dropped):
+    """Like the executor loop, the KV pool rebalance and the control-request drain apply the previous batch only once
+    the rank failure recovery accepted it: an accepted batch commits its context chunks first; a discarded one is
+    not applied, and the grammar matchers of its requests are dropped, with the capturable guided decoder's
+    failures of that batch."""
+    executor, calls, consume = _previous_batch_consumer(consumer, dropped)
+    consume()
+    if dropped:
+        assert calls == ["drop_invalid_step"]
+        executor.guided_decoder.discard_matchers.assert_called_once_with(["request"])
+        executor.capturable_guided_decoder.discard_batch.assert_called_once_with(["request"], 3)
+    else:
+        assert calls == ["drop_invalid_step", "commit", "update"]
+        executor.guided_decoder.discard_matchers.assert_not_called()
+        executor.capturable_guided_decoder.discard_batch.assert_not_called()
+
+
+def test_without_rank_failure_recovery_the_previous_batch_is_applied_as_is():
+    executor, calls, consume = _previous_batch_consumer("rebalance", dropped=False)
+    executor.rank_failure_recovery = None
+    consume()
+    assert calls == ["update"]
+
+
 def test_adp_running_counts_update_without_a_new_block_sample():
     """The final request count must update even inside the sampling interval."""
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
@@ -3032,6 +3191,7 @@ class _CleanupStub:
     shutdown notification and PP-handle wait happen."""
 
     _executor_events = None
+    rank_failure_recovery = None
 
     def __init__(self, pp_handles_raise=False):
         self.response_lock = threading.Lock()
@@ -3136,6 +3296,7 @@ def _make_adp_request(
 
 class _StubADPExecutor:
     _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
+    rank_failure_recovery = None
 
     def __init__(
         self,
@@ -3192,6 +3353,7 @@ class _StubADPExecutor:
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
         self.dist.tp_allgather.side_effect = lambda value: [value]
+        self.dist.tp_live_rows.side_effect = lambda rows: rows
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
         self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
 
@@ -4864,6 +5026,7 @@ class TestAdpBalanceExcludesPadDummies:
         executor.dist.tp_allgather_int64 = Mock(
             return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
         )
+        executor.dist.tp_live_rows = lambda rows: rows
         executor.max_batch_size = 64
         executor.attention_dp_enable_balance = True
         executor.attention_dp_time_out_iters = 60

@@ -25,7 +25,8 @@ from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.logger import logger, set_level
 
 from .._errors import ConfigInputError
-from .._utils import mpi_world_size
+from .._utils import (fault_tolerance_mode, global_mpi_size, mpi_world_size,
+                      wide_ep_fault_tolerance_rank)
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -647,6 +648,25 @@ class GenerationExecutor(ABC):
         elif orchestrator_type is not None and orchestrator_type != "rpc":
             raise ValueError(
                 f"Unsupported orchestrator_type: {orchestrator_type}")
+
+        if fault_tolerance_mode():
+            # WideEP fault tolerance starts every rank as its own process, not
+            # in this process's MPI world: the session runs rank 0's worker,
+            # which hands its arguments to the other ranks. Under
+            # trtllm-llmapi-launch, this process has rank 0's identity.
+            if wide_ep_fault_tolerance_rank() is None and global_mpi_size() > 1:
+                raise ValueError(
+                    "WideEP fault tolerance starts every rank as its own "
+                    "process: start the server or script once, under "
+                    "trtllm-llmapi-launch for several nodes, not on every "
+                    "rank of an MPI job")
+            return GenerationExecutor._create_ipc_executor(
+                worker_kwargs,
+                model_world_size=model_world_size,
+                mpi_session=mpi_session,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                use_worker=False)
 
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)

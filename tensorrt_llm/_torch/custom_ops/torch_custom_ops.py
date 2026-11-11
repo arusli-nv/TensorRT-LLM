@@ -125,6 +125,7 @@ class MoERunner(TunableRunner):
         activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
         use_mxfp8_weight_scaling: bool = False,
+        tuner_num_local_experts: Optional[int] = None,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -147,6 +148,9 @@ class MoERunner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
+        # Profile only the first this many local experts, as if every rank had
+        # no others; None profiles every local expert.
+        self.tuner_num_local_experts = tuner_num_local_experts
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
@@ -177,7 +181,7 @@ class MoERunner(TunableRunner):
         return tactic
 
     def unique_id(self):
-        return (
+        identity = (
             self.x_dtype,
             self.weight_dtype,
             self.output_dtype,
@@ -196,6 +200,9 @@ class MoERunner(TunableRunner):
             self.unpadded_hidden_size,
             self.use_mxfp8_weight_scaling,
         )
+        if self.tuner_num_local_experts is not None:
+            identity += (self.tuner_num_local_experts, )
+        return identity
 
     def forward(
         self,
@@ -205,6 +212,11 @@ class MoERunner(TunableRunner):
         do_preparation: bool = False,
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        if self.tuner_num_local_experts is not None:
+            # The profiler routes tokens to every expert of the weights it gets.
+            fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = (
+                None if w is None else w[:self.tuner_num_local_experts]
+                for w in inputs[1:])
         tactic = self._resolve_fallback_tactic(tactic, gemm_idx)
         self.fused_moe_runner.run_gemm_profile(
             x,
@@ -261,6 +273,8 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
+    # The autotuner profiles only the first this many local experts (MoERunner).
+    tuner_num_local_experts: Optional[int] = None,
     activation_type: int = int(ActivationType.Swiglu),
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
@@ -325,6 +339,7 @@ def fused_moe(
         activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
         use_mxfp8_weight_scaling=use_mxfp8_weight_scaling,
+        tuner_num_local_experts=tuner_num_local_experts,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
@@ -445,6 +460,7 @@ def _(input: torch.Tensor,
       tune_max_num_tokens: int = 8192,
       tuner_num_tokens: Optional[int] = None,
       tuner_top_k: Optional[int] = None,
+      tuner_num_local_experts: Optional[int] = None,
       activation_type: ActivationType = ActivationType.Swiglu,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None,

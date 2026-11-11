@@ -260,6 +260,11 @@ class CutlassFusedMoEBase(MoEImplBase):
         return True
 
     @property
+    def autotunes_only_active_slots(self) -> bool:
+        # The op profiles only its ``tuner_num_local_experts`` first local experts.
+        return self.issues_fused_moe_op
+
+    @property
     def supports_alltoall(self) -> bool:
         # The internal kernel archive's fused_moe op rejects all-to-all.
         return not self.issues_fused_moe_op or collect_moe_environment().oss_cutlass_moe
@@ -376,6 +381,7 @@ class CutlassFusedMoEBase(MoEImplBase):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            **self.tuner_layout_kwargs,
             activation_type=self.activation_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,

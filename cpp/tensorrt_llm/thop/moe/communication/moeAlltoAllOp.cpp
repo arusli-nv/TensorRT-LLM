@@ -143,42 +143,58 @@ MoeA2AWorkspaceLayout const& readWorkspaceLayout(torch::Tensor const& metainfo)
     return *reinterpret_cast<MoeA2AWorkspaceLayout const*>(metainfo.data_ptr<int64_t>());
 }
 
+// Whether the layout holds the incomplete-round word (rank-mask layouts): the flag value takes offset 0, so the
+// word's offset is nonzero exactly when it is reserved.
+inline bool hasIncompleteRoundWord(MoeA2AWorkspaceLayout const& layout)
+{
+    return layout[INCOMPLETE_ROUND_OFFSET_INDEX] != 0;
+}
+
 inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
 {
     return maskTensor.has_value() && maskTensor.value().defined();
 }
 
-// Resolve a provided rank-mask tensor into a fixed-width uint64 array. On failure
-// (wrong dtype / device / shape), throw at the Python op boundary rather than launch.
-inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTensor, int64_t epRank,
-    uint64_t (&out)[tensorrt_llm::kernels::moe_comm::kRankMaskWords])
+// Return the device address of the rank-mask tensor, which the kernels read at execution time: a contiguous uint64
+// tensor of kRankMaskWords elements on the workspace's device. Its writer keeps the local rank's bit set. Wrong
+// dtype / device / shape throws at the Python op boundary rather than launch.
+inline uint64_t const* resolveActiveRankMask(
+    torch::optional<torch::Tensor> const& maskTensor, torch::Tensor const& workspace)
 {
     using tensorrt_llm::kernels::moe_comm::kRankMaskWords;
-    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
-    TORCH_CHECK(
-        epRank >= 0 && epRank < kMaxRanks, "epRank must be in the range [0, ", kMaxRanks, ") for active_rank_mask");
     TORCH_CHECK(hasActiveRankMask(maskTensor), "active_rank_mask must be defined");
     torch::Tensor const& t = maskTensor.value();
-    TORCH_CHECK(t.is_cpu(), "active_rank_mask must be a CPU tensor");
+    TORCH_CHECK(t.is_cuda() && t.device() == workspace.device(), "active_rank_mask must be on the workspace device");
     TORCH_CHECK(t.scalar_type() == torch::kUInt64, "active_rank_mask must have dtype uint64");
     TORCH_CHECK(t.dim() == 1, "active_rank_mask must be a 1D tensor");
     TORCH_CHECK(t.numel() == kRankMaskWords, "active_rank_mask must have exactly ", kRankMaskWords, " uint64 elements");
     TORCH_CHECK(t.is_contiguous(), "active_rank_mask must be contiguous");
-    auto const* src = static_cast<uint64_t const*>(t.const_data_ptr());
-    for (int w = 0; w < kRankMaskWords; ++w)
+    return static_cast<uint64_t const*>(t.const_data_ptr());
+}
+
+// Return the abort record (a MoeA2AAbortState in pinned host memory, as an int32 tensor of
+// MOE_A2A_ABORT_STATE_WORDS elements), or nullptr without one. The kernels read it at its host address, which is
+// also its device address under unified virtual addressing.
+inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torch::optional<torch::Tensor> const& abort)
+{
+    using tensorrt_llm::kernels::moe_comm::MoeA2AAbortState;
+    if (!abort.has_value())
     {
-        out[w] = src[w];
+        return nullptr;
     }
-    // Local rank's bit must be set; otherwise the kernel would be running on a "dead" rank.
-    TORCH_CHECK((out[epRank >> 6] >> (epRank & 63)) & 1ULL, "active_rank_mask must mark the local ep_rank (", epRank,
-        ") as active");
+    torch::Tensor const& t = abort.value();
+    constexpr int64_t kWords = sizeof(MoeA2AAbortState) / sizeof(int32_t);
+    TORCH_CHECK(
+        t.is_cpu() && t.scalar_type() == torch::kInt32 && t.dim() == 1 && t.numel() == kWords && t.is_contiguous(),
+        "abort_state must be a contiguous int32 CPU tensor of ", kWords, " elements");
+    return static_cast<MoeA2AAbortState*>(t.data_ptr());
 }
 
 // All offsets and capacities are per rank. Payload capacities are padded so
 // the following phase's control buffers remain aligned.
 MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTokens, int64_t topK,
     int64_t dispatchBytes, int64_t combineInputBytes, int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
-    bool canUseCft)
+    bool canUseCft, bool rankMask)
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
@@ -217,6 +233,10 @@ MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTok
     int64_t const combineSlots = epSize * maxNumTokens;
 
     reserve(FLAG_VAL_OFFSET_INDEX, sizeof(uint32_t));
+    if (rankMask)
+    {
+        reserve(INCOMPLETE_ROUND_OFFSET_INDEX, sizeof(uint32_t));
+    }
 
     // Dispatch writes these counters and routes; combine reuses the completed routes.
     reserve(LOCAL_TOKEN_COUNTER_OFFSET_INDEX, sizeof(int32_t));
@@ -259,17 +279,19 @@ MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTok
 }
 
 torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t topK, int64_t dispatchBytes,
-    int64_t combineInputBytes, int64_t combineRecvBytes, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCft)
+    int64_t combineInputBytes, int64_t combineRecvBytes, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCft,
+    bool rankMask)
 {
     auto const layout = calculateWorkspaceLayout(epSize, maxNumTokens, topK, dispatchBytes, combineInputBytes,
-        combineRecvBytes, eplbStatsNumExperts.value_or(0), canUseCft);
+        combineRecvBytes, eplbStatsNumExperts.value_or(0), canUseCft, rankMask);
     auto metainfo
         = torch::empty({NUM_METAINFO_FIELDS}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
     std::copy(layout.begin(), layout.end(), metainfo.data_ptr<int64_t>());
     return metainfo;
 }
 
-// Initialize control state after allocation; layout construction itself is CPU-only.
+// Initialize this rank's control state after allocation; layout construction itself is CPU-only. The caller keeps
+// peers from using this rank's workspace until it returns (a barrier among the ranks of the workspace).
 void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
 {
     CHECK_TH_CUDA(workspace);
@@ -281,7 +303,7 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     TORCH_CHECK(layout[EP_SIZE_INDEX] == epSize, "Workspace layout EP size mismatch");
     auto const expected = calculateWorkspaceLayout(epSize, layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
         layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
-        layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
+        layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX], hasIncompleteRoundWord(layout));
     TORCH_CHECK(layout == expected, "Workspace layout metadata is inconsistent");
     TORCH_CHECK(layout[DISPATCH_PAYLOAD_SIZE_INDEX] > 0 && layout[COMBINE_INPUT_SIZE_INDEX] > 0,
         "Dispatch and combine input payload capacities must be positive");
@@ -294,12 +316,7 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     uint8_t* rankWorkspace = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     cudaMemsetAsync(rankWorkspace + layout[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
         2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
-    // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
-    // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
-    // NVLinkOneSided strategy unusable there; fall back to the Torch process
-    // group the Ray workers already initialise, as pg_utils does elsewhere.
     cudaDeviceSynchronize();
-    moeA2ABarrier();
 }
 
 // ============================================================================
@@ -514,7 +531,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
-    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask)
+    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
+    torch::optional<torch::Tensor> abortState)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -674,6 +692,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), &params.payloads[0]);
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
+    params.incomplete_round = hasIncompleteRoundWord(offsets)
+        ? reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[INCOMPLETE_ROUND_OFFSET_INDEX])
+        : nullptr;
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
@@ -754,17 +775,17 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
             = reinterpret_cast<uint64_t*>(rankWorkSpacePtr + offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX]);
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
-    // exactly reproduces the pre-fault-tolerance kernel behavior.
+    // Rank-mask mode reads the mask through its device address; without it, the mask-free kernels run.
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
-        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, workspace);
     }
     else
     {
         TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
     }
+    params.abort = resolveAbortState(abortState);
 
     params.stream = at::cuda::getCurrentCUDAStream();
     params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
@@ -817,7 +838,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
     bool useCftCountedWrites = false, bool enableRankMask = false,
-    torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt,
+    torch::optional<torch::Tensor> abortState = torch::nullopt)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
@@ -916,6 +938,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         = useLowPrecision && !inputIsWorkspace ? params.wire_bytes_per_token : params.source_stride_per_token;
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
+    params.incomplete_round = hasIncompleteRoundWord(offsets)
+        ? reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[INCOMPLETE_ROUND_OFFSET_INDEX])
+        : nullptr;
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
     params.topk_target_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_INDICES_OFFSET_INDEX]);
     params.recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
@@ -967,16 +992,17 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         params.use_cft_for_combine = false;
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set.
+    // Rank-mask mode reads the mask through its device address; without it, the mask-free kernels run.
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
-        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, workspace);
     }
     else
     {
         TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
     }
+    params.abort = resolveAbortState(abortState);
 
     // Resolve the complete payload plan once. Prepare always launches at least one block to
     // advance flag_val, but prepare_num_tokens=0 performs no payload work.
@@ -1096,7 +1122,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int? expert_id_payload_index=None, "
         "int? invalid_token_expert_id=None, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor? active_rank_mask=None, "
+        "Tensor(b!)? abort_state=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
@@ -1105,7 +1132,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool use_low_precision=False, "
         "bool use_cft_counted_writes=False, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> Tensor");
+        "Tensor? active_rank_mask=None, "
+        "Tensor(b!)? abort_state=None) -> Tensor");
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
@@ -1122,7 +1150,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_get_workspace_layout(int ep_size, int max_num_tokens_per_rank, int top_k, "
         "int dispatch_payload_bytes, int combine_input_bytes, int combine_recv_bytes, "
-        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor",
+        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False, bool rank_mask=False) -> Tensor",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetWorkspaceLayoutOp);
 }
 

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Callable, Mapping, MutableMapping, Protocol, cast
+from typing import Callable, Mapping, MutableMapping, Protocol, Sequence, cast
 from weakref import WeakSet
 
 import torch
@@ -298,6 +298,33 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
             self._memory._checkpoint_restore_failed()
             self._stop_watchdog()
             raise
+
+    @property
+    def device_bytes(self) -> int:
+        """The device memory this rank's part of the workspace takes, which :meth:`remap` allocates again."""
+        return self._memory.local_device_bytes
+
+    def needs_fresh_pages(self, gather: Callable[[object], Sequence[object]]) -> bool:
+        """Whether a membership change must back the workspace with fresh pages
+        (:meth:`MnnvlMemory.needs_fresh_pages`)."""
+        return self._memory.needs_fresh_pages(gather)
+
+    def admit(self, gather: Callable[[object], Sequence[object]]) -> None:
+        """Map the rows of the ranks that join, keeping this rank's pages (:meth:`MnnvlMemory.admit`). The watchdog
+        stops meanwhile: a failure releases the pages whose flags it reads."""
+        self._stop_watchdog()
+        self._memory.admit(gather)
+        self._start_watchdog()
+
+    def remap(self, gather: Callable[[object], Sequence[object]]) -> None:
+        """Back the workspace with fresh pages at the same addresses, shared among the live ranks
+        (:meth:`MnnvlMemory.remap`). The watchdog stops meanwhile, as its flag reads would fault. This rank's part of
+        the fresh pages is uninitialized until its owner resets it; the watchdog reads it only for a collective it
+        watches."""
+        self._stop_watchdog()
+        self._memory.checkpoint_prepare()
+        self._memory.remap(gather)
+        self._start_watchdog()
 
     def _create_coordinator(self) -> AlltoAllWatchdogCoordinator:
         return AlltoAllWatchdogCoordinator(

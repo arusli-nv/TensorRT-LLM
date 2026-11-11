@@ -7723,6 +7723,33 @@ class KVCacheManagerV2(BaseResourceManager):
             if any(pool.storage_medium != CacheTier.GPU_MEM for pool in pool_group.pools)
         ]
 
+    @property
+    def gpu_quota(self) -> int:
+        """The device bytes of the GPU KV cache pool."""
+        return self.impl.get_quota(GPU_LEVEL)
+
+    def resize_gpu_quota(self, quota: int) -> int:
+        """Resize the GPU KV cache pool to ``quota`` bytes, rounded down to its allocation unit.
+
+        For memory the engine needs while serving, e.g. the EPLB slots that hold a lost rank's experts. A
+        shrinking pool evicts or drops the pages it gives up (reusable pages first) and may move the ones it
+        keeps. Every KV cache must be suspended, the CUDA graph padding dummies included (as for ``adjust()``,
+        see ``PyExecutor._kv_pools_suspended``), and no queued work may use the pool. The scheduler's
+        capacity must be read again afterwards.
+
+        Returns:
+            The quota the pool took.
+
+        Raises:
+            RuntimeError: The pool cannot take that quota (its minimum slots, device memory or its reserved
+                maximum).
+        """
+        unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
+        quota = max(0, quota) // unit * unit
+        if quota != self.gpu_quota and not self.impl.resize(GPU_LEVEL, quota):
+            raise RuntimeError(f"The GPU KV cache pool cannot be resized to {quota} bytes")
+        return self.gpu_quota
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:
@@ -8096,7 +8123,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
-    def try_commit_blocks(self, request: LlmRequest) -> None:
+    def try_commit_blocks(self, request: LlmRequest, *, commit_end: Optional[int] = None) -> None:
+        """Commit the request's context KV for reuse up to ``commit_end`` (default: its current context position);
+        once that is the end of the context, stop committing unless decode KV stays reusable."""
         should_block_reuse = (
             self.enable_block_reuse
             and self._can_publish_block_reuse
@@ -8109,7 +8138,13 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return
 
-        commit_end = request.context_current_position
+        context_done = request.context_remaining_length == 0
+        if commit_end is None:
+            commit_end = request.context_current_position
+        else:
+            context_done = (
+                commit_end == request.context_current_position + request.context_remaining_length
+            )
         if commit_end > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),
@@ -8121,7 +8156,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
         keep_committing = self._can_commit_generation_blocks(request)
-        if request.context_remaining_length == 0 and not keep_committing:
+        if context_done and not keep_committing:
             kv_cache.stop_committing()
 
     def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
@@ -9061,7 +9096,11 @@ class KVCacheManagerV2(BaseResourceManager):
         that the model's input preparation may still be copying to the device.
         """
 
-    def update_context_resources(self, scheduled_batch: ScheduledRequests):
+    def update_context_resources(
+        self,
+        scheduled_batch: ScheduledRequests,
+        commit_ends: Optional[Dict[int, int]] = None,
+    ):
         """Update KV cache for context requests in the current batch.
 
         This is separated from update_resources (which handles generation
@@ -9070,6 +9109,11 @@ class KVCacheManagerV2(BaseResourceManager):
         would under-estimate available KV cache for sliding-window attention
         layer. In non-overlap scheduler, you should call it together with
         update_resources().
+
+        With ``commit_ends``, the chunks' KV is not committed for reuse here:
+        each request's commit end (its context position after this chunk) is
+        recorded in it, by request id, for :meth:`commit_context_blocks` once
+        the step is accepted.
         """
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
@@ -9106,14 +9150,32 @@ class KVCacheManagerV2(BaseResourceManager):
             if should_resize:
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
-                self.try_commit_blocks(req)
+                if commit_ends is None:
+                    self.try_commit_blocks(req)
+                else:
+                    commit_ends[req.py_request_id] = req.context_current_position
             if req.context_remaining_length == 0:
-                if self.conversation_manager is not None:
+                if self.conversation_manager is not None and commit_ends is None:
                     self.conversation_manager.save_drop_plan(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
                 kv_cache.enable_swa_scratch_reuse = False
+
+    def commit_context_blocks(
+        self, scheduled_batch: ScheduledRequests, commit_ends: Dict[int, int]
+    ) -> None:
+        """Commit for reuse the context chunks of ``scheduled_batch`` up to the
+        ends :meth:`update_context_resources` recorded in ``commit_ends``, once
+        their step is accepted, and saves a finished context's conversation
+        drop plan, which covers the committed blocks, after its last commit.
+        Skips a request that has been freed or whose cache is suspended since."""
+        for req in scheduled_batch.context_requests:
+            kv_cache = self.kv_cache_map.get(req.py_request_id)
+            if req.py_request_id in commit_ends and kv_cache is not None and kv_cache.is_active:
+                self.try_commit_blocks(req, commit_end=commit_ends[req.py_request_id])
+                if self.conversation_manager is not None and req.context_remaining_length == 0:
+                    self.conversation_manager.save_drop_plan(req, kv_cache)
 
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
         """Advance a context cache's history marker, or raise."""

@@ -1181,10 +1181,19 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
     ) == expected + [("llm_args", configured)]
 
     # MPI worker process: MPI is the first runtime initialization.
+    # The launcher did not start this rank as its own process for WideEP fault tolerance.
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_RANK", raising=False)
     worker_main = _extract_function(
         _ROOT / "tensorrt_llm/executor/worker.py",
         "worker_main",
-        {**common, "GenerationExecutorWorker": object, "mpi_comm": runtime_init("mpi_comm")},
+        {
+            **common,
+            "GenerationExecutorWorker": object,
+            "mpi_comm": runtime_init("mpi_comm"),
+            "set_fault_tolerance_mode": lambda enabled: None,
+            "fault_tolerance_mode": lambda: False,
+            "FAULT_TOLERANCE_RANK_ENV": "TLLM_FAULT_TOLERANCE_RANK",
+        },
     )
     args = worker_args()
     assert run(
@@ -1207,6 +1216,8 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
             "PostprocWorkerConfig": lambda: SimpleNamespace(
                 num_postprocess_workers=0, postprocess_tokenizer_dir=None
             ),
+            "set_fault_tolerance_mode": lambda enabled: None,
+            "fault_tolerance_mode": lambda: False,
         },
         bases=("GenerationExecutor",),
     )
@@ -2789,7 +2800,7 @@ def test_standard_load_balancer_unsafe_preflight_skips_destructive_cleanup():
         _TORCH_ROOT / "moe/fused_moe/moe_load_balancer.py",
         "MoeLoadBalancer",
         {"shutdown"},
-        {},
+        {"fault_tolerance_mode": lambda: False},
     )
     calls = []
 

@@ -41,7 +41,7 @@ from tensorrt_llm.metrics.enums import MetricNames
 from .._errors import ConfigInputError
 from .._startup_errors import (classify_startup_error, log_startup_error,
                                mark_llm_initialized)
-from .._utils import nvtx_range_debug
+from .._utils import nvtx_range_debug, set_fault_tolerance_mode
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -449,6 +449,12 @@ class BaseLLM:
                                      **kwargs)
             self.args._enable_routing_load = enable_routing_load
             self.args._openengine_discovery = openengine_discovery
+            # Before the executor starts; each worker sets it from its args.
+            set_fault_tolerance_mode(self.args.enable_wide_ep_fault_tolerance)
+            if self.args.enable_wide_ep_fault_tolerance:
+                # Before any MPI pool spawns the ranks, which inherit them.
+                from .._torch.pyexecutor import rank_failure_recovery
+                rank_failure_recovery.ensure_rendezvous()
 
             self._capture_usage_startup(llm_args=self.args)
 
@@ -1641,6 +1647,14 @@ class BaseLLM:
                     f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
                     f"max_num_tokens ({max_num_tokens})")
         self._check_one_model_speculative_sampling(sampling_params)
+
+        if getattr(self.args, "enable_wide_ep_fault_tolerance",
+                   False) and (sampling_params.use_beam_search
+                               or sampling_params.n > 1
+                               or sampling_params.best_of > 1):
+            raise RequestError(
+                "WideEP fault tolerance (enable_wide_ep_fault_tolerance) does "
+                "not support requests with n > 1, best_of > 1 or beam search")
 
         if sampling_params.return_routed_experts and not (
                 self.args.backend == "pytorch"

@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The startup collectives of a WideEP fault-tolerance deployment by the names of mpi_comm()'s collectives that do not
+# go through startup_record.agree, checked by test_startup_collectives_are_agreed_or_listed. A replacement rank starts
+# alone: its collectives reach only itself. Through Distributed (MnnvlDist) they return the original ranks' results
+# from the startup record; the others return None or nothing for every other rank. A result of mpi_comm() that must
+# match the original ranks' goes through startup_record.agree; every other such collective of the modules below is
+# listed under its function with a reason.
+
+reasons:
+  replayed: a host collective of Distributed, which a replacement rank replays from the startup record
+  agreed_elsewhere: a replacement rank skips it, or holds the original ranks' result from another call (the note names
+    it)
+  barrier: a barrier or a hold of the group whose result nobody reads; a replacement rank passes it at once
+  rank0_only: only rank 0 reads the result, and rank 0 is never replaced
+  serving: runs only once the deployment serves, where the membership keeps the live ranks in step
+  shutdown: runs at shutdown
+  transport: implements a collective of the startup group or of MNNVL memory that takes absent ranks
+  device: a device collective of a forward (an AllReduce or allgather module or op), not a host collective
+  rejected: on a path fault tolerance rejects at startup (the note names what)
+  unresolved: a startup decision a replacement rank may take differently from the original ranks; agree it
+    (startup_record.agree) or show its own answer is right, then reclassify it
+
+# The modules the startup of a fault-tolerance deployment runs, from process start to the first served request.
+modules:
+  tensorrt_llm/llmapi/mgmn_worker_node.py: {}
+  tensorrt_llm/executor/worker.py:
+    worker_main: {collectives: [allgather, barrier, barrier], reason: rank0_only,
+                  note: the barriers wait for nobody on a replacement; only the leader reads the process identities}
+    GenerationExecutorWorker.shutdown: {collectives: [allgather, allgather], reason: shutdown}
+  tensorrt_llm/_torch/pyexecutor/py_executor_creator.py: {}
+  tensorrt_llm/_torch/pyexecutor/model_loader.py: {}
+  tensorrt_llm/_torch/_experimental/modeling_v2/_router_index.py:
+    modeling_v2_resolve_on_all_ranks: {collectives: [allgather], reason: replayed}
+  tensorrt_llm/_torch/models/modeling_utils.py: {}
+  tensorrt_llm/_torch/models/modeling_deepseekv3.py:
+    DeepseekV3MTPHead.forward: {collectives: [allgather], reason: device}
+    Deepseekv3MoE.forward: {collectives: [allreduce, allreduce], reason: device}
+    DeepseekV3DecoderLayer.forward_MoE: {collectives: [allreduce, allreduce], reason: device}
+    DeepseekV3DecoderLayer.forward_mlp: {collectives: [allreduce, allreduce, allreduce], reason: device}
+    DeepseekV3MTP.forward: {collectives: [allreduce, allreduce], reason: device}
+  tensorrt_llm/_torch/distributed/initialization.py:
+    ensure_cutedsl_torch_distributed: {collectives: [allgather, bcast], reason: rejected,
+                                       note: MegaMoE backends (validate_backend and MoeExecutionState.model_comms)}
+    ensure_deepgemm_torch_distributed: {collectives: [Split_type, bcast, bcast], reason: rejected,
+                                        note: MegaMoE backends (validate_backend and MoeExecutionState.model_comms)}
+  tensorrt_llm/_torch/distributed/mnnvl_memory.py:
+    ProcessGroupComm.barrier: {collectives: [barrier], reason: transport}
+    LiveGroupComm.barrier: {collectives: [allgather], reason: transport}
+    MnnvlMemory.get_comm: {collectives: [Split, subgroup], reason: transport}
+    MnnvlMemory.open_mnnvl_memory: {collectives: [allgather], reason: transport}
+    _checkpoint_allgather: {collectives: [allgather], reason: rejected, note: MNNVL memory checkpoints (sleep mode)}
+  tensorrt_llm/_torch/autotuner.py: {}
+  tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py: {}
+  tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py:
+    NVLinkOneSided.__init__: {collectives: [barrier], reason: barrier}
+  tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py:
+    SingleLayerMoeLoadBalancer.update_statistic_with_local_ids._update_statistic: {collectives: [allreduce],
+                                                                                   reason: device}
+    MoeLoadBalancer._setup_mpi_comm: {collectives: [Split_type], reason: transport, note: StartupGroup.Split_type}
+    MoeLoadBalancer.finalize_model: {collectives: [barrier], reason: barrier,
+                                     note: a replacement rank then waits for its node's host weights}
+    MoeLoadBalancer.shutdown: {collectives: [allgather, barrier, barrier], reason: shutdown}
+  tensorrt_llm/_torch/pyexecutor/_util.py: {}
+  tensorrt_llm/_torch/pyexecutor/resource_manager.py:
+    KVCacheManager.__init__: {collectives: [allgather], reason: rejected, note: KV cache manager V1 (check_supported)}
+    KVCacheManager.calculate_max_num_blocks: {collectives: [allreduce], reason: rejected,
+                                              note: KV cache manager V1 (check_supported)}
+  tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py:
+    KVCacheManagerV2.__init__: {collectives: [allreduce], reason: replayed,
+                                note: the minimum must bound a replacement rank's own token capacity}
+    _sync_host_tier_quota: {collectives: [allreduce], reason: replayed,
+                            note: the minimum must bound a replacement rank's own host quota}
+    _sync_kv_cache_manager_init_status: {collectives: [allreduce], reason: replayed,
+                                         note: the maximum must bound a replacement rank's own status}
+  tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/warmup.py:
+    WarmupAgreement.agree_flag: {collectives: [allgather, allgather], reason: replayed}
+    WarmupAgreement.agree_shapes: {collectives: [allgather, allgather], reason: replayed}
+    WarmupAgreement.should_run_warmup_batch: {collectives: [allgather, allgather, allgather], reason: replayed}
+  tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py: {}
+  tensorrt_llm/_torch/pyexecutor/py_executor.py:
+    PyExecutor._initialize_execution: {collectives: [barrier], reason: replayed}
+    PyExecutor.start_worker: {collectives: [Dup, Dup], reason: rejected,
+                              note: pipeline parallelism and sleep mode}
+    PyExecutor._enqueue_responses: {collectives: [allgather], reason: serving}
+  tensorrt_llm/_torch/pyexecutor/rank_failure_recovery.py:
+    StartupGroup.Split: {collectives: [subgroup], reason: transport,
+                         note: every member's color and key come from startup_record.agree}
+    StartupGroup.Split_type: {collectives: [subgroup], reason: transport}
+    StartupGroup.Barrier: {collectives: [barrier], reason: transport}
+    StartupGroup.bcast: {collectives: [allgather], reason: transport}
+    StartupGroup.allreduce: {collectives: [allgather], reason: transport}
+    _check_largest_failure_fits: {collectives: [allgather], reason: agreed_elsewhere,
+                                  note: a check of the original ranks; a replacement rank skips it}
+    RankFailureRecovery._finish_install: {collectives: [allgather], reason: serving}

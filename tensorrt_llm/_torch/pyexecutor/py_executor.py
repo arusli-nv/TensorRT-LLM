@@ -29,6 +29,7 @@ except ImportError:
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+                                 fault_tolerance_mode,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
@@ -73,6 +74,7 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
+from ..distributed.startup_record import startup_record
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -109,9 +111,9 @@ from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          MultimodalEncoderRequestError, get_draft_token_length,
-                          get_mm_context_chunk_start, get_mm_items_for_chunk,
-                          get_mm_pending_items,
+                          MultimodalEncoderRequestError, PyResult,
+                          get_draft_token_length, get_mm_context_chunk_start,
+                          get_mm_items_for_chunk, get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
@@ -146,6 +148,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.bindings import MpiProgressThread
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .rank_failure_recovery import RankFailureRecovery
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -562,6 +565,14 @@ class BatchState:
     # sampler event has been synchronized (_take_capturable_guided_failures);
     # None until then.
     guided_failures: Optional[List[Tuple[int, str]]] = None
+    # With rank failure recovery, the context reuse commits that wait until
+    # the step is accepted: (KV cache manager, request id -> commit end).
+    context_commits: Optional[List[Tuple[KVCacheManagerV2, Dict[int,
+                                                                int]]]] = None
+    # With rank failure recovery, where the stored context rows of each context
+    # request that returns them ended before this step.
+    context_rows: Optional[List[Tuple[LlmRequest,
+                                      PyResult.ContextRowsMark]]] = None
 
 
 @dataclasses.dataclass
@@ -684,6 +695,10 @@ class PyExecutor:
     _executor_events: Optional[ExecutorEvents] = None
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
+
+    # Recovery from rank failures under WideEP fault tolerance; joined in
+    # start_worker().
+    rank_failure_recovery: Optional["RankFailureRecovery"] = None
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
@@ -2189,6 +2204,10 @@ class PyExecutor:
                         self._sleep_wakeup_listener_thread.start()
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
+                if fault_tolerance_mode() and not self.is_warmup:
+                    from .rank_failure_recovery import RankFailureRecovery
+                    self.rank_failure_recovery = RankFailureRecovery.create(
+                        self)
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
@@ -2217,11 +2236,17 @@ class PyExecutor:
                 f"for rank {self.global_rank}")
             return
 
-        # Sync all ranks
-        self.dist.barrier()
-        # Immediately take the local steady clock timestamp
-        local_timestamp = get_steady_clock_now_in_seconds()
-        all_rank_timestamps = self.dist.allgather(local_timestamp)
+        def gather_timestamps() -> List[float]:
+            # Sync all ranks
+            self.dist.barrier()
+            # Immediately take the local steady clock timestamp
+            return self.dist.allgather(get_steady_clock_now_in_seconds())
+
+        # A replacement rank under WideEP fault tolerance runs on the node of
+        # the rank it replaces: it takes that rank's offset to rank 0.
+        all_rank_timestamps = startup_record.agree("steady_clock_timestamps",
+                                                   gather_timestamps)
+        local_timestamp = all_rank_timestamps[self.global_rank]
         if self.global_rank == 0:
             logger.info(
                 f"global_steady_clock_offset at each rank: {[local_timestamp - ts for ts in all_rank_timestamps]}"
@@ -3719,6 +3744,8 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        if self.rank_failure_recovery is not None:
+            self.rank_failure_recovery.stop(self._event_loop_completed)
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -5153,10 +5180,18 @@ class PyExecutor:
             # Vote over TP x CP. The helix CP ranks of one DP rank run each
             # forward together, but their batch sizes can differ: one CP rank
             # can pad a dummy request that its peer failed to allocate. With
-            # cp_size == 1 this is the TP gather.
-            batch_sizes = self.dist.tp_cp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0]
-            can_queue = bool(batch_sizes.all())
+            # cp_size == 1 this is the TP gather. With rank failure recovery, a
+            # rank that holds its steps for a membership change decides so
+            # before the gather and sends an empty batch, so every rank takes
+            # the same decision.
+            recovery = self.rank_failure_recovery
+            if recovery is None:
+                batch_sizes = self.dist.tp_cp_allgather_int64(
+                    [scheduled_batch.batch_size])[:, 0]
+            else:
+                batch_sizes = recovery.forward_vote(
+                    scheduled_batch.batch_size, self.dist.tp_cp_allgather_int64)
+            can_queue = bool(self.dist.tp_live_rows(batch_sizes).all())
             # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
             # together whether to defer the previous batch.
             cp_rows = batch_sizes.reshape(-1, self.dist.cp_size)
@@ -5190,16 +5225,68 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
-    def _update_v2_context_resources(self, scheduled_batch) -> None:
-        """Update self, draft, and cross caches after a context forward."""
-        self.kv_cache_manager.update_context_resources(scheduled_batch)
+    def _update_v2_context_resources(
+        self,
+        scheduled_batch,
+        context_commits: Optional[List[Tuple[KVCacheManagerV2,
+                                             Dict[int, int]]]] = None
+    ) -> None:
+        """Update self, draft, and cross caches after a context forward.
+
+        With ``context_commits``, the chunks' reuse commits wait until the step
+        is accepted (:meth:`_commit_v2_context_blocks`): each cache and its
+        commit ends are appended to it.
+        """
+        managers = [self.kv_cache_manager]
         if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.update_context_resources(
-                scheduled_batch)
+            managers.append(self.draft_kv_cache_manager)
         cross_kv_cache_manager = self.resource_manager.get_resource_manager(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         if cross_kv_cache_manager is not None:
-            cross_kv_cache_manager.update_context_resources(scheduled_batch)
+            managers.append(cross_kv_cache_manager)
+        for manager in managers:
+            if context_commits is None:
+                manager.update_context_resources(scheduled_batch)
+            else:
+                commit_ends = {}
+                manager.update_context_resources(scheduled_batch, commit_ends)
+                context_commits.append((manager, commit_ends))
+
+    def _commit_v2_context_blocks(self, batch_state: BatchState) -> None:
+        """Commit for reuse the context chunks of an accepted step whose
+        commits waited for it."""
+        if not any(commit_ends
+                   for _, commit_ends in batch_state.context_commits):
+            return
+        # A commit can rewrite host page-index rows that the current step's
+        # input copy may still be reading.
+        self._wait_for_model_engine_input_copy()
+        for manager, commit_ends in batch_state.context_commits:
+            manager.commit_context_blocks(batch_state.scheduled_requests,
+                                          commit_ends)
+
+    def _accepted_previous_batch(self) -> Optional[BatchState]:
+        """``previous_batch``, for a consumer that applies its results: every
+        one takes it here. With rank failure recovery, it is first accepted or
+        discarded: a discarded batch leaves ``previous_batch`` None and the
+        grammar matchers of its requests unknown, so they are dropped, with the
+        guided decoding failures they caused; an accepted one commits its
+        context chunks for reuse."""
+        batch = self.previous_batch
+        if self.rank_failure_recovery is None or batch is None:
+            return batch
+        self.rank_failure_recovery.drop_invalid_step()
+        if self.previous_batch is not None:
+            self._commit_v2_context_blocks(batch)
+            return batch
+        requests = batch.scheduled_requests.all_requests()
+        if self.guided_decoder is not None:
+            self.guided_decoder.discard_matchers(requests)
+        if (self.capturable_guided_decoder is not None
+                and batch.guided_batch_id is not None):
+            self.capturable_guided_decoder.discard_batch(
+                requests, batch.guided_batch_id)
+        return None
 
     def _terminate_attention_dp_dummy_requests(self) -> None:
         """Terminate every local attention-DP dummy without assuming its position.
@@ -6589,7 +6676,7 @@ class PyExecutor:
         """
         if self.dist.pp_size > 1 or self.disable_overlap_scheduler:
             return
-        batch = self.previous_batch
+        batch = self._accepted_previous_batch()
         if batch is not None:
             self._update_requests(batch.sample_state)
             if self.speculation_gate is not None:
@@ -6657,7 +6744,10 @@ class PyExecutor:
                 # the retire below issues attention-DP gathers that every rank
                 # must join in the same iteration, so fire only once all ranks
                 # are drained.
-                drained = all(self.dist.tp_allgather(int(drained)))
+                drained = all(
+                    rank_drained
+                    for rank_drained in self.dist.tp_allgather(int(drained))
+                    if rank_drained is not None)  # None: a rank that left
             if not drained:
                 # drain=True: keep the sentinel parked until the engine drains.
                 return
@@ -6953,7 +7043,7 @@ class PyExecutor:
         batch-response, and KV-event collectives even without a local batch.
         Other modes remain a no-op when there is no previous batch.
         """
-        previous_batch = self.previous_batch
+        previous_batch = self._accepted_previous_batch()
         if previous_batch is None and (not self.enable_attention_dp
                                        or self.disable_overlap_scheduler):
             return
@@ -7005,6 +7095,20 @@ class PyExecutor:
         no _KVCache may be mid-update -- because ``adjust()`` moves pages
         underneath whatever holds them.
         """
+        with self._kv_pools_suspended() as mgr:
+            try:
+                mgr.impl.adjust()
+            except OutOfPagesError as e:
+                logger.warning(f"KV pool adjust() failed: {e!r}")
+
+    @contextmanager
+    def _kv_pools_suspended(self) -> Iterator[KVCacheManagerV2]:
+        """Suspend every active request and padding dummy, yield the KV cache
+        manager, then resume them, also when the body raises.
+
+        For a body that moves or resizes the KV pools, under the quiescence
+        ``_rebalance_kv_pools_now`` requires.
+        """
         mgr = self.kv_cache_manager
 
         paused: List[LlmRequest] = []
@@ -7015,30 +7119,31 @@ class PyExecutor:
         paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
 
         try:
-            mgr.impl.adjust()
-        except OutOfPagesError as e:
-            logger.warning(f"KV pool adjust() failed: {e!r}")
+            yield mgr
+        finally:
+            remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
+            if remote_tail_adp:
+                # Preserve the one execution-only row before real requests
+                # reclaim the resized pools. It is required even when a rank
+                # is at capacity.
+                self._resume_padding_dummies_after_rebalance(
+                    mgr, paused_dummies)
+                dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
+                    0)
+                reserved = dummy is not None and mgr.is_request_active(
+                    dummy.py_request_id)
+                if not all(self.dist.tp_allgather(reserved)):
+                    raise RuntimeError(
+                        "KV pool rebalance could not preserve the reserved "
+                        "conditional attention-DP execution row on every rank")
+            for req in paused:
+                mgr.resume_request(req)
+            if not remote_tail_adp:
+                self._resume_padding_dummies_after_rebalance(
+                    mgr, paused_dummies)
 
-        remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
-        if remote_tail_adp:
-            # Preserve the one execution-only row before real requests reclaim
-            # the resized pools. It is required even when a rank is at capacity.
-            self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
-            dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
-                0)
-            reserved = dummy is not None and mgr.is_request_active(
-                dummy.py_request_id)
-            if not all(self.dist.tp_allgather(reserved)):
-                raise RuntimeError(
-                    "KV pool rebalance could not preserve the reserved "
-                    "conditional attention-DP execution row on every rank")
-        for req in paused:
-            mgr.resume_request(req)
-        if not remote_tail_adp:
-            self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
-
-        # Rebalancing can change the number of primary blocks.
-        self._kv_cache_capacity = self._read_kv_cache_capacity()
+            # Rebalancing can change the number of primary blocks.
+            self._kv_cache_capacity = self._read_kv_cache_capacity()
 
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.
@@ -7267,6 +7372,8 @@ class PyExecutor:
             can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
+                if self.rank_failure_recovery is not None:
+                    self.rank_failure_recovery.before_iteration()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -7410,6 +7517,14 @@ class PyExecutor:
                         self._submit_encoder_step(
                             scheduled_batch.encoder_requests)
 
+                    # With rank failure recovery, a discarded step drops the
+                    # context rows its forward and sampling store.
+                    context_rows = ([
+                        (request, request.py_result.mark_context_rows())
+                        for request in scheduled_batch.context_requests
+                        if request.py_return_context_logits
+                    ] if self.rank_failure_recovery is not None else None)
+
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         with self._step_scope(scheduled_batch):
@@ -7444,7 +7559,8 @@ class PyExecutor:
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
 
-                if self.previous_batch is not None and should_process_previous_batch:
+                if (should_process_previous_batch
+                        and self._accepted_previous_batch() is not None):
                     self._update_requests(self.previous_batch.sample_state)
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
@@ -7528,9 +7644,15 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
+                    # With rank failure recovery, the chunks' reuse commits
+                    # wait until the step is accepted: a step a rank failure
+                    # interrupts leaves invalid KV.
+                    context_commits = ([] if self.rank_failure_recovery
+                                       is not None else None)
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
-                        self._update_v2_context_resources(scheduled_batch)
+                        self._update_v2_context_resources(
+                            scheduled_batch, context_commits)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -7585,7 +7707,9 @@ class PyExecutor:
                         gpu_forward_end_event=gpu_forward_end,
                         gpu_forward_events_from_perf_pool=
                         gpu_forward_events_from_perf_pool,
-                        guided_batch_id=self._capturable_guided_batch_id())
+                        guided_batch_id=self._capturable_guided_batch_id(),
+                        context_commits=context_commits,
+                        context_rows=context_rows)
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -8111,10 +8235,17 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
-    def _get_request_admission_capacity(self) -> int:
-        """Return the maximum number of distinct requests admitted at once."""
+    def _get_request_admission_capacity(
+            self, all_rank_states: Optional[List[RankState]] = None) -> int:
+        """Return the maximum number of distinct requests admitted at once.
+
+        With attention DP, ``all_rank_states`` (when given) holds the ranks that
+        serve.
+        """
         if self.enable_attention_dp:
-            return self.dist.tp_size * self.max_num_active_requests
+            num_ranks = (self.dist.tp_size
+                         if all_rank_states is None else len(all_rank_states))
+            return num_ranks * self.max_num_active_requests
         return self.max_num_active_requests
 
     def _configure_benchmark_req_queues_size(self) -> None:
@@ -8236,7 +8367,8 @@ class PyExecutor:
         Returns the requests and, with attention DP, the ranks the router
         planned for them (request id -> rank; empty when none are planned).
         """
-        admission_capacity = self._get_request_admission_capacity()
+        admission_capacity = self._get_request_admission_capacity(
+            all_rank_states)
 
         max_new_requests = admission_capacity - total_num_active_requests
 
@@ -8256,6 +8388,9 @@ class PyExecutor:
             kv_balance = not (self.is_warmup or
                               (self.is_benchmark_disagg
                                and self._benchmark_fill_phase_active))
+            if self.rank_failure_recovery is not None:
+                self.rank_failure_recovery.fail_unservable_requests(
+                    waiting_queue, all_rank_states)
             return self.adp_router.pop_requests(waiting_queue,
                                                 all_rank_states,
                                                 max_new_requests,
@@ -8632,10 +8767,12 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather_int64([
-            num_scheduled_context_requests, num_scheduled_generation_requests,
-            num_scheduled_tokens, num_real_generation_requests
-        ]).tolist()
+        responses_list = self.dist.tp_live_rows(
+            self.dist.tp_allgather_int64([
+                num_scheduled_context_requests,
+                num_scheduled_generation_requests, num_scheduled_tokens,
+                num_real_generation_requests
+            ])).tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]
@@ -10316,6 +10453,10 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(
                 f"Encountered an error in forward function: {error_msg}")
+            if (self.rank_failure_recovery is not None
+                    and self.rank_failure_recovery.discard_failed_forward(
+                        scheduled_requests)):
+                return None
             if self.enable_attention_dp and self.kv_connector_manager is not None:
                 # Layer hooks and wait_for_save can fail after submitting DMA.
                 # Peers may be in model collectives. _event_loop_wrapper arms start_rank_crash_kill_watchdog and

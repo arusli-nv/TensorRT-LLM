@@ -122,6 +122,7 @@ class TestClassicSendRspLaneRouting:
             postproc_queues=None,
             frontend_result_queues=[_LaneStub() for _ in range(num_lanes)],
             _pop_result=pops.append,
+            _unanswered_client_ids=None,
         ), pops
 
     def test_error_response_routes_to_origin_lane(self):
@@ -296,5 +297,36 @@ class TestClassicFrontendProxyEndToEnd:
             while client_id in proxy._results and time.time() < deadline:
                 time.sleep(0.01)
             assert client_id not in proxy._results
+
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+
+    @pytest.mark.parametrize("fault_tolerance", [False, True])
+    def test_dispatch_reads_no_state_that_only_the_launcher_s_init_sets(
+        self, monkeypatch, fault_tolerance
+    ):
+        """An attached frontend skips GenerationExecutorProxy.__init__ (fault-tolerance state included)."""
+        import zmq
+
+        from tensorrt_llm import _utils
+        from tensorrt_llm.executor.ipc import FusedIpcQueue
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.executor.utils import ErrorResponse
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, _, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
+            worker_lane = FusedIpcQueue(
+                (result_addrs[1], hmac_key),
+                is_server=False,
+                fuse_message=False,
+                socket_type=zmq.PUSH,
+                name="fake_worker_result_lane",
+            )
+            worker_lane.put(ErrorResponse(result.request_id, "boom", 1))
+            response = result.queue.get(timeout=5)
+            assert isinstance(response, ErrorResponse) and response.error_msg == "boom"
+            assert proxy.check_health()
 
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)

@@ -53,15 +53,6 @@ _WORKSPACE_WATCHDOG_STATE_KEY = "alltoall_watchdog_shared_state"
 _WORKSPACE_WATCHDOG_STATE_INIT_LOCK = threading.Lock()
 
 
-def reject_rank_mask_cuda_graph_capture(rank_mask_enabled: bool) -> None:
-    """Reject graph capture until membership-scoped recapture is available."""
-    if rank_mask_enabled and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "rank-mask mode does not support CUDA graphs until generation-scoped "
-            "invalidation and recapture are implemented"
-        )
-
-
 def _normalize_completion_flag(value: int) -> int:
     return int(value) & _COMPLETION_FLAG_MASK
 
@@ -111,6 +102,9 @@ class EPGroupHealthLike(Protocol):
 class ActiveRankMaskSnapshot:
     """One dispatch epoch's rank mask and optional committed generation.
 
+    ``active_rank_mask`` is a host (CPU) copy of the uint64 mask words; the
+    kernels read the mask from the device record of an execution state, which
+    the frontend publishes it to.
     ``committed_generation`` is populated only when ``active_rank_mask`` was
     read from the coordinator-owned EP health object. Explicit caller masks do
     not inherit a generation from unrelated health state.
@@ -311,14 +305,14 @@ class AlltoAllWatchdogCoordinator:
     ) -> ActiveRankMaskSnapshot:
         """Capture a caller override or one coherent committed-mask epoch.
 
-        The returned tensor does not alias a caller-owned override, so it can
-        safely represent the mask used by one dispatch/combine pair. When the
-        mask comes from ``health``, derive all fixed-width ABI words from one
-        atomic mask/generation snapshot.
+        The returned tensor is a CPU copy that does not alias a caller-owned
+        override, so it can safely represent the mask used by one
+        dispatch/combine pair. When the mask comes from ``health``, derive all
+        fixed-width ABI words from one atomic mask/generation snapshot.
         """
         if active_rank_mask is not None:
             return ActiveRankMaskSnapshot(
-                active_rank_mask=active_rank_mask.detach().clone(),
+                active_rank_mask=active_rank_mask.detach().to("cpu", copy=True),
                 committed_generation=None,
             )
         if self._health is None:

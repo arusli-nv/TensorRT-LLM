@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
+from tensorrt_llm._torch.distributed.startup_record import startup_record
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -1239,11 +1240,22 @@ class DecoderWarmup:
         # cache already holds every tactic this pass would tune. The token
         # shape comes from this rank's free KV capacity, so the whole forward
         # group must agree before any rank skips the collective-bearing pass.
-        skip_completed_warmup = self._agreement.agree_flag(
-            self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
-            and not enable_flashinfer_mxfp8_autotuner
-            and not enable_native_mxfp8_autotuner
-        )
+        def agree_skip() -> bool:
+            return self._agreement.agree_flag(
+                self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
+                and not enable_flashinfer_mxfp8_autotuner
+                and not enable_native_mxfp8_autotuner
+            )
+
+        if startup_record.active:
+            # Under WideEP fault tolerance, a replacement rank skipped the warmup during the KV cache estimation: it
+            # adopts the tactics rank 0 holds here and takes the original ranks' decision, so it tunes what they do.
+            from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import adopt_tuned_tactics
+
+            adopt_tuned_tactics(AutoTuner.get().profiling_cache)
+            skip_completed_warmup = startup_record.agree("autotuner_warmup_skip", agree_skip)
+        else:
+            skip_completed_warmup = agree_skip()
         if skip_completed_warmup:
             logger.info(
                 "Skipping duplicate autotuner warmup for already completed "

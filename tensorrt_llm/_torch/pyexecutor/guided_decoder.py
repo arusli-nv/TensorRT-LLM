@@ -60,6 +60,9 @@ class GuidedRequest:
     is_draft: bool = False
     draft_tokens: Optional[List[int]] = None
     num_accepted_draft_tokens: Optional[int] = None
+    # The generated tokens a recompute moved into the prompt; the matcher
+    # created at the last context chunk accepts them first.
+    recomputed_tokens: Optional[List[int]] = None
 
     def require_matcher_init(self) -> bool:
         if self.guided_decoding_params is None:
@@ -83,14 +86,21 @@ class GuidedRequest:
 
     @classmethod
     def from_llm_request(cls, request: LlmRequest):
+        is_last_context_chunk = (request.is_context_init_state
+                                 and request.is_last_context_chunk)
+        recomputed_tokens = None
+        if (is_last_context_chunk
+                and request.py_guided_decoding_params is not None
+                and request.prompt_len > request.orig_prompt_len):
+            recomputed_tokens = request.get_tokens(
+                0)[request.orig_prompt_len:request.prompt_len]
         return cls(
             guided_decoding_params=request.py_guided_decoding_params,
             request_id=request.py_request_id,
             seq_slot=request.py_seq_slot,
             prev_seq_slot=request.py_batch_idx,
             is_context_init_state=request.is_context_init_state,
-            is_last_context_chunk=(request.is_context_init_state
-                                   and request.is_last_context_chunk),
+            is_last_context_chunk=is_last_context_chunk,
             is_generation_in_progress_state=request.
             is_generation_in_progress_state,
             is_generation_only_first_iteration=(
@@ -100,7 +110,8 @@ class GuidedRequest:
                 and request.py_batch_idx is None),
             new_token=request.get_last_tokens(0),
             draft_tokens=request.py_draft_tokens,
-            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
+            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens,
+            recomputed_tokens=recomputed_tokens)
 
     def cast_to_draft(self) -> None:
         self.is_draft = True
@@ -267,6 +278,11 @@ class GuidedDecoder:
                     matcher = self.grammar_matcher_factory.create(
                         req.guided_decoding_params)
                     self.grammar_matchers[slot] = matcher
+                    for token in req.recomputed_tokens or ():
+                        if not matcher.accept_token(token):
+                            raise ValueError(
+                                f"Request {req.request_id} at slot {slot} failed to accept recomputed token: {token}."
+                            )
 
                 if matcher_advance:
                     matcher = self.grammar_matchers[slot]
@@ -520,6 +536,14 @@ class GuidedDecoder:
     def init_disagg_gen_requests(self) -> None:
         self._init_disagg_gen_requests(self.requests)
 
+    def discard_matchers(self, requests: Iterable[LlmRequest]) -> None:
+        """Drop the grammar matchers of ``requests``, whose step was discarded
+        after its build advanced them: until the requests are computed again,
+        which creates their matchers anew, their builds skip guiding."""
+        for request in requests:
+            if request.py_seq_slot is not None:
+                self.grammar_matchers[request.py_seq_slot] = None
+
 
 class CapturableGuidedDecoder(GuidedDecoder):
 
@@ -657,6 +681,18 @@ class CapturableGuidedDecoder(GuidedDecoder):
             failure for failure in pending if failure[0] > completed_batch_id
         ]
         return taken
+
+    def discard_batch(self, requests: Iterable[LlmRequest],
+                      batch_id: int) -> None:
+        """Drop the grammar matchers of a discarded batch's ``requests`` (see
+        discard_matchers) and the build failures of batches up to
+        ``batch_id``, which come from the matchers dropped. Waits first until
+        every host function enqueued so far has run, so that none advances a
+        matcher after it is dropped or reports a failure after they are
+        taken."""
+        self._drain_host_functions()
+        self.take_failed_requests(batch_id)
+        self.discard_matchers(requests)
 
     def execute(self,
                 logits: torch.Tensor,

@@ -24,7 +24,10 @@ def store_context_logits(
     """Consume context rows from either projection path using one result contract.
 
     Prompt logprobs are reduced on the logits' device; only the reduced rows and
-    the final prompt row's log probabilities reach host memory.
+    the final prompt row's log probabilities reach host memory. Each position of
+    the original prompt is stored once: a request that replays its prefill after
+    a recompute stores only the positions past its stored rows
+    (``PyResult.context_rows_end``), and none past the original prompt.
 
     Args:
         request: Context request whose current chunk produced ``logits``.
@@ -34,25 +37,34 @@ def store_context_logits(
         reusable: ``logits`` is projection scratch that the caller overwrites
             next; host copies therefore complete before returning.
     """
-    if offset == 0 and request.prepopulated_prompt_len > 0:
+    result = request.py_result
+    position = request.context_current_position + offset
+    if position > result.context_rows_end:
         logger.warning(
             "Because of KV cache reuse, not all context logits could be produced "
             f"for request {request.request_id}."
         )
+    chunk_tail = offset + logits.shape[0] == request.context_chunk_size
+    prompt_len = request.orig_prompt_len
+    skip = max(result.context_rows_end - position, 0)
+    end = min(prompt_len, position + logits.shape[0])
+    if position + skip >= end:
+        return
+    logits = logits[skip : end - position]
+    position += skip
+    result.context_rows_end = end
     compact = request.py_prompt_logprobs is not None
     if request.py_context_logits_explicit or not compact:
-        request.py_result.append_context_logits(logits, reusable=reusable)
+        result.append_context_logits(logits, reusable=reusable)
     if not compact:
         return
-    begin = request.context_current_position + offset + 1
-    end = min(request.py_prompt_len, begin + logits.shape[0])
-    targets = request.get_tokens(0)[begin:end]
+    targets = request.get_tokens(0)[position + 1 : min(end + 1, prompt_len)]
     # Appended even when empty, so a compact request always reports its rows.
-    request.py_result.append_prompt_logprobs(
+    result.append_prompt_logprobs(
         reduce_prompt_logprobs(logits[: len(targets)], targets, request.py_prompt_logprobs)
     )
-    if offset + logits.shape[0] == request.context_chunk_size and request.is_last_context_chunk:
-        request.py_result.set_prompt_last_logprobs(_normalized_host_row(logits[-1:]))
+    if chunk_tail and request.is_last_context_chunk:
+        result.set_prompt_last_logprobs(_normalized_host_row(logits[-1:]))
 
 
 def _normalized_host_row(row: torch.Tensor) -> torch.Tensor:

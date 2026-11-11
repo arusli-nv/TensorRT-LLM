@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.guided_decoder import (
     GuidedRequests,
     row_has_valid_token,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 
@@ -457,3 +459,105 @@ def test_capturable_failures_are_released_per_batch(monkeypatch):
     assert decoder.take_failed_requests(1) == []
     assert [req_id for req_id, _ in decoder.take_failed_requests(2)] == [9]
     assert decoder.take_failed_requests(2) == []
+
+
+# --- recompute and discarded steps --------------------------------------------
+
+
+def test_a_recomputed_request_carries_its_generated_tokens_to_its_last_context_chunk():
+    """A recompute moves the generated tokens into the prompt; the new matcher must accept them."""
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=8,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.py_guided_decoding_params = _GUIDED_PARAMS
+    for token in (10, 11):
+        request.add_new_token(token, 0)
+    request.reset_for_recompute(1 << 20)
+    request.context_chunk_size = request.context_remaining_length
+
+    assert GuidedRequest.from_llm_request(request).recomputed_tokens == [10, 11]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_build_replays_the_recomputed_tokens_into_the_new_matcher(monkeypatch):
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+    matcher = _ScriptedMatcher([True])
+    decoder.grammar_matcher_factory = SimpleNamespace(create=lambda params: matcher)
+    requests = GuidedRequests(
+        [
+            GuidedRequest(
+                guided_decoding_params=_GUIDED_PARAMS,
+                request_id=7,
+                seq_slot=_SLOT,
+                is_context_init_state=True,
+                is_last_context_chunk=True,
+                # As GuidedRequest.from_llm_request gives a request without draft tokens.
+                draft_tokens=[],
+                recomputed_tokens=[10, 11],
+            )
+        ],
+        num_contexts=1,
+        num_generations=0,
+        max_num_draft_tokens=0,
+    )
+
+    assert decoder._build(requests) == []
+    assert decoder.grammar_matchers[_SLOT] is matcher
+    assert matcher.accepted == [10, 11]
+    # The bitmask of the next token follows the replayed state.
+    assert decoder.token_mask_host[0].item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_discarded_step_leaves_its_requests_unguided_until_they_are_computed_again(monkeypatch):
+    """The discarded step's build advanced the matcher past tokens that were never applied: the next build would
+    accept the request's last token a second time. Dropping the matcher skips guiding instead."""
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+    matcher = _ScriptedMatcher([True])
+    decoder.grammar_matchers[_SLOT] = matcher
+    decoder.discard_matchers(
+        [SimpleNamespace(py_seq_slot=_SLOT), SimpleNamespace(py_seq_slot=None)]
+    )
+    assert decoder.grammar_matchers[_SLOT] is None
+
+    requests = GuidedRequests(
+        [_generation_request(is_draft=False, draft_tokens=[])],
+        num_contexts=0,
+        num_generations=1,
+        max_num_draft_tokens=0,
+    )
+    assert decoder._build(requests) == []
+    assert matcher.accepted == []
+    assert decoder.token_mask_host[0].item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@_runs_host_functions
+def test_a_discarded_capturable_batch_drops_its_matchers_and_its_failures(monkeypatch):
+    """The failures a discarded batch's build reported come from matchers that are dropped: no later batch reports
+    them."""
+    decoder = _make_capturable_decoder(monkeypatch, max_num_draft_tokens=0)
+    decoder.grammar_matcher_factory = _MatcherFactory()
+    requests = GuidedRequests(
+        [
+            _disagg_generation_request(_INVALID_PARAMS, request_id=7, seq_slot=0),
+            _disagg_generation_request(_GUIDED_PARAMS, request_id=8, seq_slot=1),
+        ],
+        num_contexts=0,
+        num_generations=2,
+        max_num_draft_tokens=0,
+    )
+    _run_capturable_step(decoder, requests)
+    assert decoder.grammar_matchers[1] is not None
+
+    decoder.discard_batch(
+        [SimpleNamespace(py_seq_slot=0), SimpleNamespace(py_seq_slot=1)],
+        decoder.last_added_batch_id,
+    )
+
+    assert decoder.grammar_matchers[1] is None
+    assert decoder.take_failed_requests(decoder.last_added_batch_id) == []

@@ -37,7 +37,7 @@ which is driven from the wrapper and stays on ``MoE``.
 """
 
 import inspect
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -166,6 +166,8 @@ class MoEWeightOwnerMixin:
             return
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
+        if self._using_spare_slot_storage():
+            self._create_spare_slot_storage()
         self._weights_created = True
         self._check_configs()
 
@@ -309,8 +311,17 @@ class MoEEplbWeightLayoutMixin:
     orchestration driven from the wrapper and stays on ``MoE``.
     """
 
+    #: Whether the MoE autotuner profiles only the slots ``tuner_layout_kwargs`` names. WideEP fault
+    #: tolerance requires it of a backend so that spare slots leave its tactics unchanged.
+    autotunes_only_active_slots: bool = False
+    #: The MoE ops' ``tuner_num_local_experts`` argument (the active slots), set when the layer
+    #: registers its weights for spare-slot storage: spare slots receive no tokens while every rank is
+    #: live, so the autotuner sees the same workload as without them. Empty without spare slots: the
+    #: ops get no extra argument. Replaced, never mutated.
+    tuner_layout_kwargs: Mapping[str, int] = {}
+
     def _add_raw_shared_weights_for_unmap(self, weight_tensors: List[torch.Tensor]):
-        if self._using_dynamic_load_balancer():
+        if self.layer_load_balancer and self.layer_load_balancer.need_load_shared_weights():
             self.layer_load_balancer._add_raw_host_weight_for_unmap(weight_tensors)
 
     def _supports_load_balancer(self) -> bool:
@@ -330,6 +341,30 @@ class MoEEplbWeightLayoutMixin:
             return self.layer_load_balancer.is_dynamic_routing()
         return False
 
+    def _using_spare_slot_storage(self) -> bool:
+        """Whether this layer has the spare slots of WideEP fault tolerance, whose storage maps no device memory."""
+        return bool(getattr(self.layer_load_balancer, "spare_slot_count", 0))
+
+    def slot_parameters(self) -> List[Tuple[str, torch.nn.Parameter]]:
+        """This module's weights of local slots ([slots, ...]), with their names."""
+        return [
+            (name, param)
+            for name, param in self.named_parameters(recurse=False)
+            if param.dim() > 0 and param.shape[0] == self.expert_size_per_partition
+        ]
+
+    def _create_spare_slot_storage(self) -> None:
+        """Gives each weight of local slots ([slots, ...]) that its quantization method just created storage on the
+        device whose spare slots map no device memory, where that saves memory (see
+        ``SingleLayerMoeLoadBalancer.create_spare_slot_storage``), so that they take none while the weights load.
+        """
+        for name, param in self.slot_parameters():
+            storage = self.layer_load_balancer.create_spare_slot_storage(name, param)
+            if storage is not None:
+                self.register_parameter(
+                    name, torch.nn.Parameter(storage, requires_grad=param.requires_grad)
+                )
+
     def register_parameter_weight_slot_fn(self, weight_name: str, local_slot_id: int):
         """Register parameter weight slot function for load balancer."""
         if not self._using_dynamic_load_balancer():
@@ -341,7 +376,7 @@ class MoEEplbWeightLayoutMixin:
 
     def register_to_fix_weight_fn(self, weight_name: str):
         """Register weight fixing function for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not (self._using_dynamic_load_balancer() or self._using_spare_slot_storage()):
             return
 
         assert hasattr(self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
@@ -361,22 +396,32 @@ class MoEEplbWeightLayoutMixin:
             f"numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, "
             f"dtype={weight_tensor.dtype}"
         )
-        self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
+        if self._using_spare_slot_storage():
+            self.layer_load_balancer.use_spare_slot_storage(weight_tensor, weight_name)
+        else:
+            self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
         param.data = weight_tensor
 
     def register_all_parameter_slot_and_to_fix_weight_fns(
         self, weight_and_tensor_dict: Dict[str, torch.Tensor]
     ):
         """Register all parameter slot and weight fixing functions for load balancer."""
-        if not self._using_dynamic_load_balancer():
+        if not (self._using_dynamic_load_balancer() or self._using_spare_slot_storage()):
             return
 
-        # Register weight functions for each local slot
-        for local_slot_id, expert_id in enumerate(self.initial_local_expert_ids):
-            for weight_name in weight_and_tensor_dict:
-                self.layer_load_balancer.add_register_weight_fn(
-                    self.register_parameter_weight_slot_fn, (weight_name, local_slot_id)
-                )
+        if self._using_spare_slot_storage():
+            self.tuner_layout_kwargs = {
+                "tuner_num_local_experts": self.layer_load_balancer.active_slot_count_per_rank
+            }
+
+        # Static routing loads no slots in C++: only the storage of the spare slots changes.
+        if self._using_dynamic_load_balancer():
+            # Register weight functions for each local slot, spare slots included
+            for local_slot_id in range(self.expert_size_per_partition):
+                for weight_name in weight_and_tensor_dict:
+                    self.layer_load_balancer.add_register_weight_fn(
+                        self.register_parameter_weight_slot_fn, (weight_name, local_slot_id)
+                    )
 
         # Register weight migration functions
         for weight_name in weight_and_tensor_dict:
@@ -384,7 +429,7 @@ class MoEEplbWeightLayoutMixin:
                 self.register_to_fix_weight_fn, (weight_name,)
             )
 
-        # Setup host tensor sharing
+        # Setup host tensor sharing: online EPLB and restored experts load slots from the host weights.
         local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids()
         for expert_id in range(self.num_experts):
             for weight_name, weight_tensor in weight_and_tensor_dict.items():

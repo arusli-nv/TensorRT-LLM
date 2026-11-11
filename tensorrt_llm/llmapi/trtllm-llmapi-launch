@@ -7,6 +7,12 @@ set -Eeo pipefail
 task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
+# Under WideEP fault tolerance, the node supervisor starts each rank outside the
+# launcher's job, with its identity: "<rank>,<world size>,<incarnation>".
+fault_tolerance_world_size=
+if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+    IFS=, read -r mpi_rank fault_tolerance_world_size _ <<< "$TLLM_FAULT_TOLERANCE_RANK"
+fi
 
 flashinfer_workspace_lock_held=0
 flashinfer_temporary_workspace=
@@ -36,7 +42,9 @@ fi
 export TLLM_SPAWN_PROXY_PROCESS=1
 
 function mpi_world_size {
-    if [ -n "$SLURM_NTASKS" ]; then
+    if [ -n "$fault_tolerance_world_size" ]; then
+        echo "$fault_tolerance_world_size"
+    elif [ -n "$SLURM_NTASKS" ]; then
         echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
@@ -46,6 +54,19 @@ function mpi_world_size {
         echo "1"
     fi
 }
+
+# With the join secret of WideEP fault tolerance, the launcher runs once per
+# node: the node supervisor starts the node's ranks, each running this launcher
+# with its identity, and replaces those that fail. mpirun inside a Slurm
+# allocation leaves the batch step's SLURM_* variables in every process it
+# starts: its own variables come first.
+if [ -n "$TLLM_FAULT_TOLERANCE_JOIN_SECRET" ] && [ -z "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+    launcher_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    exec python3 "$launcher_directory/_llmapi_node_supervisor.py" \
+        --node-rank "${OMPI_COMM_WORLD_RANK:-$mpi_rank}" \
+        --nodes "${OMPI_COMM_WORLD_SIZE:-$(mpi_world_size)}" -- \
+        "$launcher_directory/$(basename -- "${BASH_SOURCE[0]}")" "${task_with_command[@]}"
+fi
 
 # A completed guard holds its workload leader unreaped until we retire the
 # registration. This pins the process group identity through the last signal.
@@ -412,6 +433,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
             wait "$server_pid"
             server_exit_code=$?
             log_stderr "MPI Comm server exited before the task (status $server_exit_code); waiting up to ${stop_timeout}s for task exit"
+            server_shut_down=$((server_exit_code == 0))
             # Even a successful server exit is a failure while its task is alive.
             [ "$server_exit_code" -eq 0 ] && server_exit_code=1
             task_exit_polls_remaining=$((stop_timeout * 10))
@@ -431,6 +453,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
             # Let the task report its own failure, including errors received
             # from the server, before falling back to the server's status.
             [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+            # Under WideEP fault tolerance, rank 0's worker ends the server
+            # with status 0 once the deployment shut down, before the task.
+            [ -n "$TLLM_FAULT_TOLERANCE_JOIN_SECRET" ] && [ "$server_shut_down" -eq 1 ] && exit 0
             exit "$server_exit_code"
         fi
         sleep 0.1
@@ -500,6 +525,12 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
+    if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+        # The worker takes this process's place as the node supervisor's
+        # child, so that it dies with the supervisor; it keeps the workspace
+        # lock for its life.
+        exec python3 -m tensorrt_llm.llmapi.mgmn_worker_node
+    fi
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"

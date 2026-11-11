@@ -427,7 +427,7 @@ class TestDefaultADPRouter:
         assert isinstance(router, ADPRouter)
 
     def test_empty_requests(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -437,7 +437,7 @@ class TestDefaultADPRouter:
         assert expected >= 0
 
     def test_balanced_distribution(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -449,7 +449,7 @@ class TestDefaultADPRouter:
         assert abs(len(result[0]) - len(result[1])) <= 1
 
     def test_target_dp_rank_respected(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -460,7 +460,7 @@ class TestDefaultADPRouter:
         assert result[1][0].id == 1
 
     def test_target_dp_rank_at_capacity_falls_through(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=2, num_active_tokens=20),
@@ -471,7 +471,7 @@ class TestDefaultADPRouter:
         assert len(result[1]) == 0
 
     def test_default_attention_dp_relax_is_relaxed(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
@@ -488,7 +488,7 @@ class TestDefaultADPRouter:
         assert req_relax in result[1]
 
     def test_favors_less_loaded_rank(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = [
             RankState(rank=0, num_active_requests=3, num_active_tokens=300),
             RankState(rank=1, num_active_requests=1, num_active_tokens=100),
@@ -507,7 +507,7 @@ class TestDefaultADPRouter:
         assert expected == 5
 
     def test_four_ranks(self):
-        router = DefaultADPRouter(dist=_mock_dist())
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=4))
         states = [RankState(rank=i, num_active_requests=0, num_active_tokens=0) for i in range(4)]
         reqs = [_make_request_item(i, num_tokens=10) for i in range(8)]
         result, _ = router.route_requests(states, reqs, max_num_active_requests=10)
@@ -515,6 +515,28 @@ class TestDefaultADPRouter:
         assert total == 8
         for rank_reqs in result.values():
             assert len(rank_reqs) == 2
+
+    def test_a_rank_that_left_the_group_gets_no_requests(self):
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=3))
+        states = [  # rank 1 left the group
+            RankState(rank=0, num_active_requests=2, num_active_tokens=200),
+            RankState(rank=2, num_active_requests=2, num_active_tokens=200),
+        ]
+        reqs = [_make_request_item(i, num_tokens=10) for i in range(4)]
+        reqs.append(_make_request_item(4, target_dp_rank=1, attention_dp_relax=True))
+        reqs.append(_make_request_item(5, target_dp_rank=2, attention_dp_relax=False))
+        result, expected = router.route_requests(states, reqs, max_num_active_requests=10)
+        assert set(result) == {0, 2}
+        assert sorted(item.id for items in result.values() for item in items) == list(range(6))
+        assert 5 in [item.id for item in result[2]]
+        assert expected == 5  # (2 + 2 + 6) / 2 serving ranks
+
+    def test_an_attention_dp_rank_outside_the_group_is_an_error(self):
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        states = [RankState(rank=r, num_active_requests=0, num_active_tokens=0) for r in range(2)]
+        req = _make_request_item(1, target_dp_rank=2, attention_dp_relax=False)
+        with pytest.raises(IndexError):
+            router.route_requests(states, [req], max_num_active_requests=10)
 
     def test_create_rank_state_default(self):
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)

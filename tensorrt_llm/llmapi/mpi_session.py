@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
+import contextlib
 import itertools
 import math
 import os
+import shutil
 import socket
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -403,6 +406,15 @@ def _process_start_time(pid: int) -> Optional[bytes]:
 _DEFAULT_IDENTITY_TIMEOUT = 300.0
 
 
+def _pool_workers(n_workers: int) -> int:
+    """The workers of an ``MpiPoolSession`` pool of ``n_workers`` ranks.
+
+    With WideEP fault tolerance, rank 0's alone: its node supervisor starts
+    the other ranks.
+    """
+    return 1 if _utils.fault_tolerance_mode() else n_workers
+
+
 def _mgmn_shutdown_grace_seconds() -> float:
     """Bound draining a failed batch and shutting down the server-owned world.
 
@@ -509,8 +521,16 @@ class MpiPoolSession(MpiSession):
                  env_overrides: Optional[Dict[str, str]] = None):
         """Spawn a pool of MPI worker processes.
 
+        With WideEP fault tolerance, the pool holds rank 0's worker only, and
+        every other rank runs as its own process, which the node supervisor
+        starts and replaces when it fails, as under ``trtllm-llmapi-launch``
+        (:meth:`_start_node_supervisor`): ``submit`` runs tasks on rank 0,
+        whose ``worker_main`` hands its arguments to the other ranks through
+        the rendezvous store.
+
         Args:
-            n_workers: number of MPI workers to spawn.
+            n_workers: number of MPI workers to spawn (with WideEP fault
+                tolerance, the number of ranks).
             wait_shutdown: when True, ``shutdown()`` blocks until the spawned
                 worker processes have actually exited.
                 ``MPIPoolExecutor.shutdown`` returns at disconnect, but a
@@ -534,6 +554,8 @@ class MpiPoolSession(MpiSession):
         # Keeps the copies of one submission contiguous in the pool's queue.
         self._submit_lock = threading.Lock()
         self.mpi_pool: Optional[MPIPoolExecutor] = None
+        # With WideEP fault tolerance: the supervisor of the other ranks.
+        self._node_supervisor: Optional[subprocess.Popen] = None
         self._start_mpi_pool()
         if wait_shutdown:
             self._worker_identities = self._collect_worker_identities()
@@ -549,6 +571,7 @@ class MpiPoolSession(MpiSession):
 
         The ranks are the ``n_workers`` spawned workers; this process is not
         one of them, and the workers' ``MPI_COMM_WORLD`` holds only them.
+        With WideEP fault tolerance, the task runs on rank 0 only.
 
         Returns:
             One future per worker, in arbitrary order.
@@ -556,7 +579,7 @@ class MpiPoolSession(MpiSession):
         with self._submit_lock:
             return [
                 self.mpi_pool.submit(_run_on_each_worker, task, *args, **kwargs)
-                for i in range(self.n_workers)
+                for i in range(_pool_workers(self.n_workers))
             ]
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
@@ -582,6 +605,8 @@ class MpiPoolSession(MpiSession):
             self.mpi_pool = None
             if self._wait_shutdown:
                 self._wait_workers_exit()
+        if _utils.fault_tolerance_mode():
+            self._stop_node_supervisor(wait)
 
     def _collect_worker_identities(self) -> Tuple:
         """(pid, start_time) of every worker, recorded right after spawn.
@@ -595,6 +620,7 @@ class MpiPoolSession(MpiSession):
         it down and raise; callers fall back to a fresh spawn.
         """
         timeout = _identity_barrier_timeout()
+        workers = _pool_workers(self.n_workers)
         try:
             futures = self.submit(_worker_identity)
             done, not_done = futures_wait(futures, timeout=timeout)
@@ -604,14 +630,14 @@ class MpiPoolSession(MpiSession):
             raise RuntimeError(
                 f"MpiPoolSession(wait_shutdown=True): worker identity "
                 f"collection failed ({e}); pool torn down") from e
-        if (not_done or len(identities) != self.n_workers
+        if (not_done or len(identities) != workers
                 or len({pid
-                        for pid, _ in identities}) != self.n_workers
+                        for pid, _ in identities}) != workers
                 or any(start is None for _, start in identities)):
             self._teardown_unidentified_pool(identities)
             raise RuntimeError(
                 "MpiPoolSession(wait_shutdown=True): worker identity "
-                f"collection incomplete ({len(identities)}/{self.n_workers} "
+                f"collection incomplete ({len(identities)}/{workers} "
                 "valid identities); pool torn down instead of handing out a "
                 "session that cannot honor the wait_shutdown contract. Raise "
                 "TRTLLM_MPI_IDENTITY_TIMEOUT if worker bootstrap is merely "
@@ -680,6 +706,8 @@ class MpiPoolSession(MpiSession):
         self._pool_dead = True
 
     def abort(self):
+        if _utils.fault_tolerance_mode():
+            self._stop_node_supervisor(wait=False)
         self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
@@ -720,10 +748,56 @@ class MpiPoolSession(MpiSession):
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
+        if _utils.fault_tolerance_mode():
+            self._start_node_supervisor({**os.environ, **env})
+            env[_utils.FAULT_TOLERANCE_RANK_ENV] = f"0,{self.n_workers},0"
+        self.mpi_pool = MPIPoolExecutor(max_workers=_pool_workers(
+            self.n_workers),
                                         path=sys.path,
                                         env=env,
                                         python_args=python_args)
+
+    def _start_node_supervisor(self, env: Dict[str, str]) -> None:
+        """Start the node supervisor of ranks 1 to ``n_workers - 1``.
+
+        WideEP fault tolerance: it starts each as its own process, through
+        ``trtllm-llmapi-launch`` as on every node under that launcher, and
+        replaces those that fail. Rank 0 runs in this session's pool, which
+        stops the supervisor when it shuts down. The supervisor takes the join
+        secret and the rendezvous address, which the LLM chose before any pool,
+        from ``env``.
+        """
+        launcher = shutil.which("trtllm-llmapi-launch")
+        if launcher is None:
+            raise RuntimeError("WideEP fault tolerance starts the ranks with "
+                               "trtllm-llmapi-launch, which is not on PATH")
+        supervisor = os.path.join(os.path.dirname(__file__),
+                                  "_llmapi_node_supervisor.py")
+        self._node_supervisor = subprocess.Popen(  # nosec B603
+            [
+                sys.executable, supervisor, "--node-rank", "0", "--nodes", "1",
+                "--gpus-per-node",
+                str(self.n_workers), "--rank-0-in-session", "--", launcher
+            ],
+            env=env)
+
+    def _stop_node_supervisor(self, wait: bool) -> None:
+        """End the node supervisor; it ends its ranks.
+
+        It ends by itself once the deployment shuts down: wait for that up to
+        the MGMN shutdown grace (``wait``), then stop it; without ``wait``,
+        stop it at once.
+        """
+        supervisor, self._node_supervisor = self._node_supervisor, None
+        if supervisor is None:
+            return
+        if wait:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                supervisor.wait(_mgmn_shutdown_grace_seconds())
+                return
+        supervisor.terminate()
+        if wait:
+            supervisor.wait()
 
     def __del__(self):
         self.shutdown_abort()

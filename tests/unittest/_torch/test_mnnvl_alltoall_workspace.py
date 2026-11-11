@@ -15,7 +15,7 @@
 
 import gc
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, call
 from weakref import WeakSet
 
 import pytest
@@ -104,6 +104,17 @@ def _register_without_watchdog(
         watchdog_poll_interval_s=0.1,
         watchdog_on_timeout=None,
     )
+
+
+def test_remap_releases_the_pages_then_maps_fresh_ones_among_the_live_ranks() -> None:
+    """The remap keeps the workspace's addresses; this rank's part is reset later, by the execution state's rearm."""
+    lifecycle, memory, _ = _make_lifecycle()
+    memory.reset_mock()
+    gather = Mock()
+
+    lifecycle.remap(gather)
+
+    assert memory.mock_calls == [call.checkpoint_prepare(), call.remap(gather)]
 
 
 def test_checkpoint_prepare_rejects_any_active_shared_client() -> None:
@@ -782,7 +793,11 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
         def initialize() -> None:
             pass
 
-        def __init__(self, mapping: object, size: int) -> None:
+        @classmethod
+        def get_comm(cls, mapping: object) -> _FakeComm:
+            return _FakeComm()
+
+        def __init__(self, mapping: object, size: int, comm: object = None) -> None:
             self.comm = _FakeComm()
 
         def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
@@ -831,6 +846,57 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     lifecycle.unregister.assert_not_called()
 
 
+@pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
+def test_one_sided_workspace_ranks_meet_over_the_allocation_group(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+) -> None:
+    """The barrier after the workspace's initialization runs over the allocation's group, not over C++'s MPI session,
+    of which each rank is the only member under WideEP fault tolerance."""
+    group = _FakeComm()
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        @classmethod
+        def get_comm(cls, mapping: object) -> _FakeComm:
+            return group
+
+        def __init__(self, mapping: object, size: int) -> None:
+            self.comm = group
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(1, dtype=torch.uint8)
+
+    initialize = Mock(return_value=torch.tensor([1]))
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", initialize)
+    mapping = SimpleNamespace(
+        world_size=2, moe_ep_size=2, moe_ep_rank=0, has_cp_helix=Mock(return_value=False)
+    )
+
+    NVLinkOneSided(mapping=mapping, num_slots=2, top_k=1, max_num_tokens_per_rank=1)
+
+    assert initialize.call_args.kwargs == {}
+    assert group.barrier_count == 1
+
+
 def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) -> None:
     """A workspace that cannot own the endpoints builds in fence mode instead of aborting.
 
@@ -846,7 +912,11 @@ def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) 
         def initialize() -> None:
             pass
 
-        def __init__(self, mapping: object, size: int) -> None:
+        @classmethod
+        def get_comm(cls, mapping: object) -> _FakeComm:
+            return _FakeComm()
+
+        def __init__(self, mapping: object, size: int, comm: object = None) -> None:
             self.comm = _FakeComm()
             self.local_mem_handle = 0
 

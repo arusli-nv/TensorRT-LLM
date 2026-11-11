@@ -90,6 +90,12 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     sm_support = SmSupport(allowed=frozenset({100, 103, 107}))
     _locality_domain_full_scale_params = ("w3_w1_weight_scale", "w2_weight_scale")
 
+    @property
+    def autotunes_only_active_slots(self) -> bool:
+        # The GEMMs of the locality-domain path and the SM107 (Rubin) kernels tune every local slot.
+        uses_rubin_kernels = get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        return self._locality_domain_runtime is None and not uses_rubin_kernels
+
     # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
     # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
     #   moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
@@ -361,6 +367,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
+            **self.tuner_layout_kwargs,
         )
 
         if use_direct_expert_metadata:
@@ -518,6 +525,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
+            **self.tuner_layout_kwargs,
         )
         if use_count_native_expert_metadata:
             gather_act_kwargs["expert_counts"] = recv_expert_count
@@ -596,6 +604,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
+                **self.tuner_layout_kwargs,
             )
             if use_rubin:
                 # The Rubin op has no count-native variant, so it does not
@@ -639,6 +648,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
+                **self.tuner_layout_kwargs,
             )
             torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,

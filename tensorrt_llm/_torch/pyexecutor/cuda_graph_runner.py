@@ -402,14 +402,17 @@ class CUDAGraphRunner:
     def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
                                      can_run_cuda_graph: bool,
                                      sample_type: SampleType):
-        """Return ``[(can_run_cuda_graph, batch_size, sample_type)]`` per TP rank.
+        """``[(can_run_cuda_graph, batch_size, sample_type)]`` per live TP rank.
 
         One fixed-size exchange, entered by every rank unconditionally. The
         sampling tier rides along because it is part of the graph key: ranks
         that resolved different tiers would otherwise replay different graphs.
         """
-        gathered = self.config.dist.tp_allgather_int64(
-            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value])
+        dist = self.config.dist
+        gathered = dist.tp_live_rows(
+            dist.tp_allgather_int64(
+                [bool(can_run_cuda_graph), batch.batch_size,
+                 sample_type.value]))
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()

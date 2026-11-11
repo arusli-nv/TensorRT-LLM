@@ -77,6 +77,13 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_preserves_cuda_graph_addresses
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_rejects_wrong_group_membership
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_growth_keeps_captured_graphs
+  - unittest/_torch/multi_gpu/test_mnnvl_dist.py
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_bound_layers_of_two_signatures_round_trip_on_one_workspace
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_abort_releases_bound_collectives_waiting_on_a_stopped_rank
+  - unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
+  - unittest/_torch/multi_gpu/test_independent_rank_startup.py
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_rank_mask_all_active_matches_no_mask
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_rank_mask_one_rank_masked_completes
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
@@ -145,3 +152,12 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
+  # WideEP fault tolerance: ranks fail under load in one deployment (a crash, then a hang), replacements rejoin.
+  - test_wide_ep_rank_failure.py::test_rank_failure_sequence TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::test_rank_failure_sequence_with_serving_options TIMEOUT (120)
+  - test_wide_ep_rank_failure.py::test_repeated_rank_reuse TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::test_invalid_joins TIMEOUT (120)
+  - test_wide_ep_rank_failure.py::test_failure_during_admission TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::test_rank_rejoins_when_the_server_spawns_its_ranks TIMEOUT (90)
+  # Strict xfail until the authority no longer holds the survivors for a joiner that never replies.
+  - test_wide_ep_rank_failure.py::test_silent_joiner_does_not_hold_survivors TIMEOUT (60)

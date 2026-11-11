@@ -19,6 +19,7 @@ from pathlib import Path
 from subprocess import PIPE, Popen
 from types import ModuleType
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import zmq
@@ -323,6 +324,159 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
     # Unset means FlashInfer derives the artifact cache from each worker's
     # isolated workspace, keeping downloaded compiler inputs per-rank.
     assert cubin_dirs == {None}
+
+
+_FAULT_TOLERANCE_ENV = ("TLLM_FAULT_TOLERANCE_JOIN_SECRET",
+                        "TLLM_FAULT_TOLERANCE_RENDEZVOUS")
+_NODE_SUPERVISOR = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+                    "_llmapi_node_supervisor.py")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_mpi_pool_session_starts_its_ranks_for_fault_tolerance(
+        monkeypatch, fault_tolerance):
+    """WideEP fault tolerance spawns rank 0's worker only, in the pool.
+
+    The node supervisor starts every other rank as its own process, through
+    trtllm-llmapi-launch as on every node under that launcher, with the join
+    secret and the rendezvous address the LLM chose. Without fault tolerance
+    the pool spawns as before.
+    """
+    from tensorrt_llm import _utils
+    from tensorrt_llm.llmapi import mpi_session
+
+    for name in _FAULT_TOLERANCE_ENV:
+        monkeypatch.setenv(name, f"chosen by the LLM: {name}")
+        if not fault_tolerance:
+            monkeypatch.delenv(name)  # unset now, and unset again afterwards
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+    pool = Mock()
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", pool, raising=False)
+    supervisor = Mock(return_value=Mock(wait=Mock(return_value=0)))
+    monkeypatch.setattr(mpi_session.subprocess, "Popen", supervisor)
+    monkeypatch.setattr(mpi_session.shutil, "which",
+                        lambda name: f"/opt/bin/{name}")
+    session = MpiPoolSession(n_workers=2)
+    assert len(session.submit(print)) == (1 if fault_tolerance else 2)
+    env = pool.call_args.kwargs["env"]
+    assert pool.call_args.kwargs["python_args"][0] == "-c"
+    if fault_tolerance:
+        assert pool.call_args.kwargs["max_workers"] == 1
+        assert env[_utils.FAULT_TOLERANCE_RANK_ENV] == "0,2,0"
+        args = supervisor.call_args.args[0]
+        assert args[0] == sys.executable
+        assert Path(args[1]).resolve() == _NODE_SUPERVISOR.resolve()
+        assert args[2:] == [
+            "--node-rank", "0", "--nodes", "1", "--gpus-per-node", "2",
+            "--rank-0-in-session", "--", "/opt/bin/trtllm-llmapi-launch"
+        ]
+        supervisor_env = supervisor.call_args.kwargs["env"]
+        assert _utils.FAULT_TOLERANCE_RANK_ENV not in supervisor_env
+        for name in _FAULT_TOLERANCE_ENV:
+            assert env[name] == supervisor_env[name] == os.environ[name]
+    else:
+        assert pool.call_args.kwargs["max_workers"] == 2
+        assert _utils.FAULT_TOLERANCE_RANK_ENV not in env
+        supervisor.assert_not_called()
+        assert not any(name in env or name in os.environ
+                       for name in _FAULT_TOLERANCE_ENV)
+    session.shutdown()
+    assert session._node_supervisor is None
+
+
+_FAULT_TOLERANT_POOL_SCRIPT = """
+import json
+import os
+import sys
+
+
+def probe(names):
+    from mpi4py import MPI
+
+    return {
+        "rank": MPI.COMM_WORLD.Get_rank(),
+        "size": MPI.COMM_WORLD.Get_size(),
+        **{name: os.environ.get(name) for name in names},
+    }
+
+
+if __name__ == "__main__":
+    from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \\
+        ensure_rendezvous
+    from tensorrt_llm._utils import (FAULT_TOLERANCE_RANK_ENV,
+                                     set_fault_tolerance_mode)
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    # As the LLM does before it creates its pool.
+    set_fault_tolerance_mode(sys.argv[2] == "1")
+    if sys.argv[2] == "1":
+        ensure_rendezvous()
+    session = MpiPoolSession(n_workers=2)
+    try:
+        workers = session.submit_sync(
+            probe, [*sys.argv[3:], FAULT_TOLERANCE_RANK_ENV])
+        supervisor = session._node_supervisor
+        supervisor = supervisor and (supervisor.args,
+                                     supervisor.poll() is None)
+    finally:
+        session.shutdown()
+    with open(sys.argv[1], "w") as out:
+        json.dump({
+            "workers": sorted(workers, key=lambda worker: worker["rank"]),
+            "node_supervisor": supervisor,
+            **{name: os.environ.get(name) for name in sys.argv[3:]},
+        }, out)
+"""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_mpi_pool_session_starts_its_ranks_for_fault_tolerance_in_mpi(
+        tmp_path: Path, fault_tolerance: bool) -> None:
+    """A real spawn, as plain trtllm-serve does it with fault tolerance.
+
+    Rank 0's worker is a one-process MPI world that knows its rank from its
+    environment; the node supervisor runs the other rank. Both have the join
+    secret and the rendezvous address the server chose, with none exported.
+    """
+    # A fresh process: Open MPI's singleton runtime keeps the environment of
+    # the process's first spawn.
+    env, _ = split_mpi_env()
+    for name in _FAULT_TOLERANCE_ENV:
+        env.pop(name, None)
+    if "PMIX_HOSTNAME" in os.environ:
+        env["PMIX_HOSTNAME"] = os.environ["PMIX_HOSTNAME"]
+    env["TLLM_MGMN_SHUTDOWN_GRACE_SECONDS"] = "1"  # rank 1 never serves here
+    script = tmp_path / "fault_tolerant_pool.py"
+    script.write_text(_FAULT_TOLERANT_POOL_SCRIPT)
+    result = tmp_path / "result.json"
+    check_output(
+        [
+            sys.executable,
+            str(script),
+            str(result),
+            str(int(fault_tolerance)), *_FAULT_TOLERANCE_ENV
+        ],
+        timeout=300,
+        env=env,
+    )
+    observed = json.loads(result.read_text())
+    workers = observed["workers"]
+    if fault_tolerance:
+        assert [(w["rank"], w["size"]) for w in workers] == [(0, 1)]
+        assert workers[0]["TLLM_FAULT_TOLERANCE_RANK"] == "0,2,0"
+        command, running = observed["node_supervisor"]
+        assert running
+        assert Path(command[1]).name == _NODE_SUPERVISOR.name
+        assert "--rank-0-in-session" in command
+    else:
+        assert [(w["rank"], w["size"]) for w in workers] == [(0, 2), (1, 2)]
+        assert observed["node_supervisor"] is None
+    for name in _FAULT_TOLERANCE_ENV:
+        assert (observed[name] is not None) == fault_tolerance
+        assert all(worker[name] == observed[name] for worker in workers)
 
 
 def simple_task(x):

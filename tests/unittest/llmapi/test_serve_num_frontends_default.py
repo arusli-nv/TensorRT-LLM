@@ -38,6 +38,15 @@ pytestmark = pytest.mark.cpu_only
         pytest.param({"orchestrator_type": "rpc"}, {}, "orchestrator_type='rpc'", id="rpc"),
         pytest.param({"enable_resource_governor": True}, {}, "enable_resource_governor", id="rg"),
         pytest.param({}, {"enable_sleep_mode": True}, "--enable_sleep_mode", id="sleep_mode"),
+        *(
+            pytest.param(
+                {"enable_wide_ep_fault_tolerance": value},
+                {},
+                "enable_wide_ep_fault_tolerance",
+                id=f"wide_ep_fault_tolerance_{value}",
+            )
+            for value in (True, "true")
+        ),
     ],
 )
 def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, reason) -> None:

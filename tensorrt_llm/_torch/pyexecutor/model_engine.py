@@ -32,6 +32,7 @@ from ..distributed import Distributed
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
+from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
@@ -631,6 +632,13 @@ class ModelEngine:
     def spec_metadata(self) -> SpecMetadata | None:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
+        return None
+
+    @property
+    def moe_execution_state(self) -> MoeExecutionState | None:
+        """The MoE all-to-all execution state in fault tolerance mode, else None."""
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner.moe_execution_state
         return None
 
     @property

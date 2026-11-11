@@ -620,7 +620,9 @@ class SparseOffloadCacheMixin:
                 "Sparse offload requires KV compression, CP Helix, and draft caches disabled"
             )
 
-    def try_commit_blocks(self, request: llm_request.LlmRequest) -> None:
+    def try_commit_blocks(
+        self, request: llm_request.LlmRequest, *, commit_end: int | None = None
+    ) -> None:
         # Committing can rebase a cache onto pages the reuse tree already holds, which a
         # published Batch row would still name, so a request commits before it is seated.
         if (
@@ -632,7 +634,7 @@ class SparseOffloadCacheMixin:
                 f"Request {request.py_request_id} commits KV blocks while seated in the "
                 "sparse Batch"
             )
-        super().try_commit_blocks(request)
+        super().try_commit_blocks(request, commit_end=commit_end)
 
     def _can_commit_generation_blocks(self, request: llm_request.LlmRequest) -> bool:
         # Offloaded decode history advances in update_forward_resources, which commits
@@ -664,12 +666,16 @@ class SparseOffloadCacheMixin:
                 raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
             self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
 
-    def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+    def update_context_resources(
+        self,
+        scheduled_batch: ScheduledRequests,
+        commit_ends: dict[int, int] | None = None,
+    ) -> None:
         self._release_sparse_batch(
             request.py_request_id for request in scheduled_batch.context_requests
         )
         self._order_sparse_history_update(scheduled_batch.context_requests)
-        super().update_context_resources(scheduled_batch)
+        super().update_context_resources(scheduled_batch, commit_ends)
 
     def try_allocate_generation(self, req: llm_request.LlmRequest) -> bool:
         """Reserve a decode request's next input token unless it is already reserved.

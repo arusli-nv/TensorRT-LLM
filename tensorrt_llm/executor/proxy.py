@@ -300,6 +300,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._engine_dead = False
 
         self.model_world_size = model_world_size
+        # WideEP fault tolerance: the reader of the deployment's membership,
+        # which the server's probes read (set once the workers are ready).
+        self.fault_tolerance_health = None
 
         _llm_args = worker_kwargs.get("llm_args", None)
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
@@ -1089,6 +1092,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 self._fail_initialization(
                     wrap_worker_startup_error("Executor worker returned error",
                                               info), ready_signal)
+        membership_address = getattr(status, "membership_address", None)
+        if membership_address is not None:
+            self._join_membership(status.worker_process_identities,
+                                  membership_address)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -1099,6 +1106,28 @@ class GenerationExecutorProxy(GenerationExecutor):
         # deaths.
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
+
+    def _join_membership(self, worker_process_identities: list,
+                         address: str) -> None:
+        """Read the WideEP fault-tolerance membership store at ``address``.
+
+        Rank 0's READY carries ``address``; the server's probes read the store
+        through ``fault_tolerance_health`` when they are served. The session
+        holds rank 0's worker only, whose death (it hosts the authority) ends
+        the server like an ABORT record: the process monitor watches it, also
+        where the session is one ``_register_worker_processes`` does not
+        monitor (the remote session of ``trtllm-llmapi-launch``). The authority
+        handles the death of any other rank.
+        """
+        from tensorrt_llm._torch.distributed.membership import JOIN_SECRET_ENV
+        from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
+            FaultToleranceHealth
+        self.fault_tolerance_health = FaultToleranceHealth(
+            address, bytes.fromhex(os.environ[JOIN_SECRET_ENV]))
+        self._worker_process_monitor.register([
+            identity for identity in worker_process_identities
+            if identity.rank == 0
+        ])
 
     def _wait_for_executor_workers_ready(self) -> tuple:
         """Wait for worker readiness while monitoring published processes."""

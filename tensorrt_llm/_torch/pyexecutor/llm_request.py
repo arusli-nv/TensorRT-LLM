@@ -14,6 +14,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
@@ -239,6 +240,10 @@ class LogitsStorage:
         except IndexError:
             return None
 
+    def truncate(self, num_appends: int) -> None:
+        """Drop the logits of every append after the first ``num_appends``."""
+        del self._logits_indices[num_appends:]
+
     def _add_fragment(self, logits: torch.Tensor):
         """Add a logits fragment to device storage"""
         self._device_fragments.append(logits.clone())
@@ -355,6 +360,14 @@ class PyResult:
                                                            default_factory=list)
         encoder_output: torch.Tensor | None = None
 
+    @dataclass(frozen=True)
+    class ContextRowsMark:
+        """Where the stored context rows end: their prompt position and the
+        number of appends of context logits and of prompt logprobs."""
+        end: int
+        logits_appends: int
+        prompt_logprob_appends: int
+
     def __init__(self,
                  *,
                  prompt_len: int,
@@ -380,6 +393,9 @@ class PyResult:
         # rows); the worker builds the user-facing values from them.
         self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logprobs: torch.Tensor | None = None
+        # The prompt position that the stored context rows (context logits and
+        # prompt logprobs) reach.
+        self.context_rows_end = 0
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
@@ -516,6 +532,33 @@ class PyResult:
         """
         self.context_prompt_last_logprobs = logprobs
         self.diff.prompt_last_logprobs = logprobs
+
+    def mark_context_rows(self) -> ContextRowsMark:
+        """Record where the stored context rows end, for
+        :meth:`rewind_context_rows`."""
+        return PyResult.ContextRowsMark(
+            end=self.context_rows_end,
+            logits_appends=len(self._context_logits._logits_indices)
+            if self._context_logits is not None else 0,
+            prompt_logprob_appends=len(self.context_prompt_logprob_rows or ()))
+
+    def rewind_context_rows(self, mark: ContextRowsMark) -> None:
+        """Drop the context rows stored after ``mark``, so that a replayed
+        prefill stores those positions again.
+
+        Args:
+            mark: From :meth:`mark_context_rows`. A mark at or past the stored
+                rows leaves them as they are.
+        """
+        if mark.end >= self.context_rows_end:
+            return
+        self.context_rows_end = mark.end
+        if self._context_logits is not None:
+            self._context_logits.truncate(mark.logits_appends)
+        if self.context_prompt_logprob_rows is not None:
+            del self.context_prompt_logprob_rows[mark.prompt_logprob_appends:]
+        # Stored with the last context chunk's rows, which follow the mark.
+        self.context_prompt_last_logprobs = None
 
     def append_context_logits(self,
                               context_logits: torch.Tensor,
@@ -781,7 +824,8 @@ class LlmResult:
 @dataclass
 class LlmResponse:
     request_id: int
-    error_msg: Optional[str] = None
+    # A RequestError reaches the client as its type.
+    error_msg: Optional[Union[str, RequestError]] = None
     result: Optional[LlmResult] = None
     client_id: Optional[int] = None
 

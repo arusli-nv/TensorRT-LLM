@@ -738,6 +738,32 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
         )
 
 
+@pytest.mark.parametrize("cft", [False, True])
+def test_only_rank_mask_layouts_reserve_the_incomplete_round(cft: bool) -> None:
+    """Only rank-mask layouts reserve the incomplete-round word, a control word next to the flag value."""
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+
+    def field(layout: torch.Tensor, name: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{name}")])
+
+    args = (8, 6, 128, 7168, torch.bfloat16, None, 0, cft, False)
+    plain = NVLinkOneSided._make_workspace_layout(*args)
+    masked = NVLinkOneSided._make_workspace_layout(*args, rank_mask=True)
+    assert field(plain, "INCOMPLETE_ROUND_OFFSET_INDEX") == 0
+    incomplete = field(masked, "INCOMPLETE_ROUND_OFFSET_INDEX")
+    assert incomplete == field(masked, "FLAG_VAL_OFFSET_INDEX") + 4
+    assert incomplete + 4 <= field(masked, "LOCAL_TOKEN_COUNTER_OFFSET_INDEX")
+    assert field(masked, "WORKSPACE_SIZE_INDEX") % 256 == 0
+    for size in (
+        "DISPATCH_PAYLOAD_SIZE_INDEX",
+        "COMBINE_INPUT_SIZE_INDEX",
+        "COMBINE_RECV_SIZE_INDEX",
+    ):
+        assert field(masked, size) == field(plain, size)
+
+
 # ============================================================================
 # CFT path selection and capability checks
 # ============================================================================
@@ -946,5 +972,352 @@ def test_cft_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
             assert result["timeouts"] == [], (
                 f"rank {rank}: watchdog reported {result['timeouts']} on a healthy collective"
             )
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ============================================================================
+# Bound layers of different payload signatures on one workspace
+# ============================================================================
+
+
+def _run_bind_layers_worker(failed_rank: int | None) -> dict:
+    """Bind an NVFP4-shaped and a BF16-shaped layer sharing one workspace to an execution state, and
+    round-trip each through the dispatch region, before and after a rearm.
+
+    With ``failed_rank``, that rank then stops taking part in the all-to-all, and the others mark it failed,
+    rearm, install the membership without it, and round-trip among themselves."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import os
+
+    import torch
+
+    from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
+    from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+
+    # Bound execution runs the fence path.
+    os.environ[FORCE_CFT_ENV] = "0"
+    rank = MPI.COMM_WORLD.Get_rank()
+    ep_size = MPI.COMM_WORLD.Get_size()
+    torch.cuda.set_device(rank)
+    MnnvlMemory.initialize()
+    if not all(MPI.COMM_WORLD.allgather(MnnvlMemory.supports_mnnvl())):
+        return {"skip": "NVLink one-sided is not supported on every participating GPU"}
+
+    hidden, top_k, capacity, slots_per_rank = 256, 2, 8, 2
+    health = EPGroupHealth(ep_size)
+    mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
+    comms = [
+        NVLinkOneSided(
+            mapping=mapping,
+            num_slots=ep_size * slots_per_rank,
+            top_k=top_k,
+            max_num_tokens_per_rank=capacity,
+            hidden_size=hidden,
+            dtype=torch.bfloat16,
+            ep_group_health=health,
+        )
+        for _ in range(2)
+    ]
+    errors = []
+
+    def check(ok: bool, what: str) -> None:
+        if not ok:
+            errors.append(f"rank {rank}: {what}")
+
+    def inputs(source: int, count: int, seed: int, live: list[int]) -> tuple[torch.Tensor, ...]:
+        """Source's (slots, weights, fp4, fp4_sf, x); every rank can rebuild every source's."""
+        generator = torch.Generator().manual_seed(seed * ep_size + source)
+        # Each token goes to one live rank, both of its slots there, so each combined row is one rank's output.
+        token = torch.arange(count)[:, None]
+        owner = torch.tensor(live)[(token + source) % len(live)]
+        slots = owner * slots_per_rank + torch.arange(top_k)
+        weights = torch.rand(count, top_k, generator=generator)
+        fp4 = torch.randint(0, 256, (count, hidden // 2), generator=generator, dtype=torch.uint8)
+        fp4_sf = torch.randint(0, 256, (count, hidden // 16), generator=generator).byte()
+        x = torch.randn(count, hidden, generator=generator).bfloat16()
+        return tuple(t.cuda() for t in (slots.int(), weights, fp4, fp4_sf, x))
+
+    layers = [
+        # Byte payloads stand in for packed FP4 values and their block scales.
+        (
+            "nvfp4",
+            lambda source: (source[2], source[3]),
+            lambda recv: torch.cat((recv[0], recv[1].repeat(1, 8)), dim=1).bfloat16(),
+        ),
+        ("bf16", lambda source: (source[4], None), lambda recv: recv[0] * 2),
+    ]
+
+    def round_trips(counts: list[int], seed: int, live: list[int]) -> None:
+        if rank not in live:
+            return
+        sources = [inputs(s, counts[s], seed, live) for s in range(ep_size)]
+        slots, weights = sources[rank][:2]
+        rows = max(counts)
+        for comm, (name, payloads, expert) in zip(comms, layers):
+            recv = comm.dispatch(*payloads(sources[rank]), slots, weights, counts)
+            check(
+                recv[0].data_ptr()
+                == comm.workspace[rank].data_ptr()
+                + int(comm.moe_a2a_metainfo[NVLinkOneSided.DISPATCH_PAYLOAD_OFFSET_INDEX]),
+                f"{name} received outside the dispatch region",
+            )
+            # Row s * rows + i holds the i-th token source s sent here, in arrival order (the target index the
+            # dispatch allocates); its rows past that count are stale, and their expert ids are sanitized to -1.
+            ids, scales = (t.view(ep_size, rows, top_k) for t in recv[2:])
+            data = [t.view(ep_size, rows, -1) for t in recv[:2] if t is not None]
+            for s, source in enumerate(sources):
+                if s not in live:
+                    # Its rows from earlier rounds are stale: the masked source routes none of them.
+                    check(bool((ids[s] == -1).all()), f"{name} rows of the failed rank {s} routed")
+                    continue
+                sent = source[0][:, 0] // slots_per_rank == rank
+                n = int(sent.sum())
+                got, want = scales[s, :n, 0].argsort(), source[1][sent, 0].argsort()
+                check(
+                    torch.equal(ids[s, :n][got], source[0][sent][want])
+                    and torch.equal(scales[s, :n][got], source[1][sent][want]),
+                    f"{name} routing from rank {s} wrong",
+                )
+                check(bool((ids[s, n:] == -1).all()), f"{name} rows past rank {s}'s tokens routed")
+                for received, sent_payload in zip(data, payloads(source)):
+                    check(
+                        torch.equal(received[s, :n][got], sent_payload[sent][want]),
+                        f"{name} payload from rank {s} wrong",
+                    )
+            # Combine must not read the rows without a token.
+            unrouted = (recv[2] < 0).all(dim=1, keepdim=True)
+            output = torch.where(unrouted, float("nan"), expert(recv))
+            combined = comm.combine(output, all_rank_max_num_tokens=rows)
+            want = expert(payloads(sources[rank]))
+            check(torch.equal(combined, want), f"{name} combined wrong with counts {counts}")
+
+    # The full round fills every source's rows; the short one (max count below capacity) packs the sources'
+    # rows closer, over rows the full round left, and combines the odd ranks' tokens from rows s * rows + i.
+    full = [capacity - 3 * (r % 2) for r in range(ep_size)]
+    short = [capacity - 3 - 2 * (r % 2) for r in range(ep_size)]
+    everyone = list(range(ep_size))
+
+    try:
+        shared = MoeExecutionState.for_health(health, torch.device("cuda"))
+        check(
+            all(comm._execution_state is shared for comm in comms),
+            "unbound layers of one membership do not share its mask record",
+        )
+        state = MoeExecutionState(health, torch.device("cuda"))
+        for comm in comms:
+            comm.bind_execution_state(state)
+        check(comms[0]._workspace_state is comms[1]._workspace_state, "workspace not shared")
+
+        MPI.COMM_WORLD.Barrier()
+        round_trips(full, 0, everyone)
+        round_trips(short, 1, everyone)
+        # The reset that the state retained at binding returns the workspace to its first round.
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        state.rearm()
+        MPI.COMM_WORLD.Barrier()
+        round_trips(full, 2, everyone)
+        round_trips(short, 3, everyone)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        if failed_rank is not None:
+            # The failed rank's rows of the earlier rounds stay in the live ranks' receive buffers.
+            live = [r for r in everyone if r != failed_rank]
+            health.mark_failed(failed_rank)
+            if rank in live:
+                state.rearm()
+            MPI.COMM_WORLD.Barrier()
+            if rank in live:
+                state.install_mask()
+            for seed, counts in ((4, full), (5, short)):
+                round_trips([c if r in live else 0 for r, c in enumerate(counts)], seed, live)
+            torch.cuda.synchronize()
+            MPI.COMM_WORLD.Barrier()
+        return {"rank": rank, "errors": errors}
+    finally:
+        for comm in comms:
+            comm.destroy()
+
+
+@pytest.mark.parametrize("ep_size,failed_rank", [(2, None), (4, 1)])
+def test_bound_layers_of_two_signatures_round_trip_on_one_workspace(
+    ep_size: int, failed_rank: int | None
+) -> None:
+    """Bound layers with an NVFP4 and a BF16 payload signature share one workspace, and bound dispatch + combine
+    of both return exact results, before and after a rearm.
+
+    With a failed middle rank, the live ranks' rows land at s * rows + i with exact values, the failed rank's rows
+    carry expert -1, and combine returns exact results without it."""
+    if torch.cuda.device_count() < ep_size:
+        pytest.skip(f"requires {ep_size} GPUs")
+    executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
+    try:
+        results = list(executor.map(_run_bind_layers_worker, [failed_rank] * ep_size))
+        skipped = [r["skip"] for r in results if "skip" in r]
+        if skipped:
+            pytest.skip(skipped[0])
+        assert [e for r in results for e in r["errors"]] == []
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ============================================================================
+# Abort of bound collectives stuck on a rank that stopped
+# ============================================================================
+
+
+def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str) -> dict:
+    """Round-trip through a bound layer, then start a round in which ``failed_rank`` stops before its
+    ``stop_before`` phase ("dispatch" or "combine").
+
+    The others see wait evidence naming the stopped rank, request an abort, which releases their waiting kernels,
+    then mark it failed, rearm, install the membership without it and round-trip among themselves."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import os
+    import time
+
+    import torch
+
+    from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
+    from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+    from tensorrt_llm.bindings import internal
+
+    # Bound execution runs the fence path.
+    os.environ[FORCE_CFT_ENV] = "0"
+    rank = MPI.COMM_WORLD.Get_rank()
+    ep_size = MPI.COMM_WORLD.Get_size()
+    torch.cuda.set_device(rank)
+    MnnvlMemory.initialize()
+    if not all(MPI.COMM_WORLD.allgather(MnnvlMemory.supports_mnnvl())):
+        return {"skip": "NVLink one-sided is not supported on every participating GPU"}
+
+    hidden, capacity, slots_per_rank = 256, 8, 2
+    evidence = int(internal.thop.MOE_A2A_ABORT_WAIT_EVIDENCE_INDEX)
+    health = EPGroupHealth(ep_size)
+    mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
+    comm = NVLinkOneSided(
+        mapping=mapping,
+        num_slots=ep_size * slots_per_rank,
+        top_k=1,
+        max_num_tokens_per_rank=capacity,
+        hidden_size=hidden,
+        dtype=torch.bfloat16,
+        ep_group_health=health,
+    )
+    everyone = list(range(ep_size))
+    live = [r for r in everyone if r != failed_rank]
+    errors = []
+
+    def check(ok: bool, what: str) -> None:
+        if not ok:
+            errors.append(f"rank {rank}: {what}")
+
+    def dispatch(senders: list[int], seed: int) -> tuple[torch.Tensor, tuple]:
+        """Dispatch this rank's tokens, each to the first slot of one of ``senders``."""
+        generator = torch.Generator().manual_seed(seed * ep_size + rank)
+        x = torch.randn(capacity, hidden, generator=generator).bfloat16().cuda()
+        owner = torch.tensor(senders)[torch.arange(capacity) % len(senders)]
+        slots = (owner * slots_per_rank)[:, None].int().cuda()
+        weights = torch.ones(capacity, 1, device="cuda")
+        counts = [capacity if r in senders else 0 for r in everyone]
+        return x, comm.dispatch(x, None, slots, weights, counts)
+
+    def round_trip(senders: list[int], seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The experts return their input, so a complete round combines each token to itself."""
+        x, recv = dispatch(senders, seed)
+        return x, comm.combine(recv[0], all_rank_max_num_tokens=capacity)
+
+    try:
+        state = MoeExecutionState(health, torch.device("cuda"))
+        comm.bind_execution_state(state)
+        MPI.COMM_WORLD.Barrier()
+        x, combined = round_trip(everyone, 0)
+        check(torch.equal(combined, x), "healthy round combined wrong")
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+
+        # Round 1: the dispatch waits for flag value 3 and the combine for 4.
+        if rank == failed_rank:
+            if stop_before == "combine":
+                dispatch(everyone, 1)
+                torch.cuda.synchronize()
+                comm.reset_state()
+        else:
+            x, combined = round_trip(everyone, 1)
+            done = torch.cuda.Event()
+            done.record()
+            stuck_on = 3 if stop_before == "dispatch" else 4
+            deadline = time.monotonic() + 10
+            while (
+                state.abort[evidence + failed_rank].item() != stuck_on
+                and not done.query()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            check(
+                state.abort[evidence + failed_rank].item() == stuck_on,
+                f"no wait evidence on rank {failed_rank}: {state.abort[evidence : evidence + ep_size].tolist()}",
+            )
+            check(not done.query(), "the round completed without the stopped rank")
+            check(not state.aborted(), "aborted before the request")
+            state.request_abort()
+            start = time.monotonic()
+            torch.cuda.synchronize()
+            check(time.monotonic() - start < 10, "the abort did not release the waiting collective")
+            check(state.abort[:2].tolist() == [1, 1], f"abort record {state.abort[:2].tolist()}")
+            check(
+                int(torch.count_nonzero(state.abort[evidence:])) == 0,
+                "wait evidence left after the abort",
+            )
+            # A combine cut short outputs zeros. After a dispatch cut short, the combine takes this rank's own rows
+            # only: the tokens it routed to itself come back, the others are zero.
+            expected = torch.zeros_like(x)
+            if stop_before == "dispatch":
+                own = torch.arange(capacity, device=x.device) % ep_size == rank
+                expected[own] = x[own]
+            check(torch.equal(combined, expected), "the cut-short round combined wrong")
+        MPI.COMM_WORLD.Barrier()
+
+        health.mark_failed(failed_rank)
+        if rank in live:
+            state.rearm()
+        MPI.COMM_WORLD.Barrier()
+        if rank in live:
+            state.install_mask()
+            for seed in (2, 3):
+                x, combined = round_trip(live, seed)
+                check(
+                    torch.equal(combined, x),
+                    f"round {seed} without rank {failed_rank} combined wrong",
+                )
+            torch.cuda.synchronize()
+            check(not state.aborted(), "a round after the recovery aborted")
+        MPI.COMM_WORLD.Barrier()
+        return {"rank": rank, "errors": errors}
+    finally:
+        comm.destroy()
+
+
+@pytest.mark.parametrize("stop_before", ["dispatch", "combine"])
+def test_abort_releases_bound_collectives_waiting_on_a_stopped_rank(stop_before: str) -> None:
+    """A bound dispatch or combine waiting on a rank that stopped publishes wait evidence on it and returns on an abort
+    request with a cancelled status; the round combines only the rows each rank routed to itself (none once the combine
+    is cut short), and the surviving ranks round-trip exactly after rearming and installing the membership without
+    it."""
+    ep_size, failed_rank = 4, 2
+    if torch.cuda.device_count() < ep_size:
+        pytest.skip(f"requires {ep_size} GPUs")
+    executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
+    try:
+        results = list(
+            executor.starmap(
+                _run_abort_stuck_collective_worker, [(failed_rank, stop_before)] * ep_size
+            )
+        )
+        skipped = [r["skip"] for r in results if "skip" in r]
+        if skipped:
+            pytest.skip(skipped[0])
+        assert [e for r in results for e in r["errors"]] == []
     finally:
         executor.shutdown(wait=True, cancel_futures=True)

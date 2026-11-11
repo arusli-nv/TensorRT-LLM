@@ -23,6 +23,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
 )
+from tensorrt_llm._utils import fault_tolerance_mode, fault_tolerance_replacement
 
 from .ep_group_health import EPGroupHealth
 
@@ -54,26 +55,40 @@ def get_wide_ep_ft_options(
 ) -> tuple[Optional[EPGroupHealth], Optional[float], float]:
     """Return committed EP membership and watchdog timing for a model.
 
-    WideEP FT remains opt-in until the integration PR wires a public model
-    option.  Callers can either inject ``wide_ep_ft_ep_group_health`` through
-    ``ModelConfig.extra_attrs`` or set ``TLLM_FAULT_TOLERANCE_MODE=1`` to create
-    one process-local membership object shared by all MoE communication layers.
+    Callers can inject ``wide_ep_ft_ep_group_health`` through
+    ``ModelConfig.extra_attrs``, set ``TLLM_FAULT_TOLERANCE_MODE=1`` or turn on
+    ``enable_wide_ep_fault_tolerance`` to create one process-local membership
+    object shared by all MoE communication layers.
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
-    committed membership directly. Rank-mask mode rejects CUDA graphs until
-    generation-scoped invalidation and recapture are implemented.
+    committed membership directly. With ``enable_wide_ep_fault_tolerance`` the
+    timeout is None: no watchdog runs, as the membership authority reads the
+    kernels' wait evidence. The kernels read the mask at execution time, so
+    rank-mask mode works with CUDA graphs once each communicator is bound to an
+    execution state, which ``enable_wide_ep_fault_tolerance`` does; without it,
+    a model that uses CUDA graphs is refused here.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
     health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
-    rank_mask_enabled = health is not None or _env_enabled()
-    if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
+    rank_mask_enabled = health is not None or _env_enabled() or fault_tolerance_mode()
+    if (
+        rank_mask_enabled
+        and getattr(model_config, "use_cuda_graph", False)
+        and not fault_tolerance_mode()
+    ):
+        # Only enable_wide_ep_fault_tolerance binds the communicators to an execution state.
         raise ValueError(
-            "WideEP fault tolerance does not support CUDA graphs until generation-scoped "
-            "invalidation and recapture are implemented"
+            "WideEP rank-mask mode does not support CUDA graphs without "
+            "enable_wide_ep_fault_tolerance; disable CUDA graphs or turn it on"
         )
     if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)
+        if fault_tolerance_replacement() is not None:
+            # Isolated startup: the all-to-all reaches no peer until the admission installs the membership.
+            for rank in range(health.moe_world_size):
+                if rank != model_config.mapping.moe_ep_rank:
+                    health.mark_failed(rank)
         extra_attrs[_HEALTH_KEY] = health
 
     poll_interval_s = _float_option(
@@ -82,8 +97,10 @@ def get_wide_ep_ft_options(
         _POLL_INTERVAL_ENV,
         DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     )
-    if health is None:
-        return None, None, poll_interval_s
+    if health is None or fault_tolerance_mode():
+        # With enable_wide_ep_fault_tolerance the membership authority reads the kernels' wait evidence:
+        # no watchdog.
+        return health, None, poll_interval_s
 
     timeout_s = _float_option(
         extra_attrs,

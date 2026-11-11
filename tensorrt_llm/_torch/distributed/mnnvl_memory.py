@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import ctypes
 import errno
 import functools
@@ -19,9 +20,9 @@ import os
 import platform
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol, Sequence
 
 import pynvml
 import torch
@@ -34,7 +35,7 @@ except ImportError:
 from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm._dlpack_utils import pack_strided_memory
-from tensorrt_llm._utils import is_sm_120f, mpi_comm, mpi_disabled
+from tensorrt_llm._utils import fault_tolerance_mode, is_sm_120f, mpi_comm, mpi_disabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -263,6 +264,102 @@ class _MnnvlAllocationRecord:
     pending_comm: Any = None
 
 
+class MnnvlPeerHandleError(RuntimeError):
+    """A peer's exported MNNVL handle could not be imported, as when the peer exited after exporting it.
+
+    ``ranks`` are the peers' ranks in the numbering of the exchange that carried the handles. A caller changing
+    membership can exclude them and retry.
+    """
+
+    def __init__(self, ranks: Sequence[int], details: str = "") -> None:
+        self.ranks = tuple(sorted(set(ranks)))
+        message = f"Cannot import the MNNVL handles of ranks {list(self.ranks)}"
+        super().__init__(f"{message}\n{details}" if details else message)
+
+
+class MnnvlMappingError(RuntimeError):
+    """MNNVL memory could not be mapped on the live ranks ``ranks``, each for a reason of its own (not a peer's
+    handle it could not import); every live rank of the exchange raises it.
+
+    ``ranks`` are numbered as in the exchange that carried the failures. A caller changing membership reports the
+    failure on those ranks only.
+    """
+
+    def __init__(self, ranks: Sequence[int], message: str) -> None:
+        self.ranks = tuple(sorted(set(ranks)))
+        super().__init__(message)
+
+
+def _mapping_outcome(failure: Exception, rank: int, membership: Sequence[int]) -> tuple:
+    """What live rank ``rank`` of an exchange, whose mapping raised ``failure``, reports to the others: its failure's
+    text and the global ranks (``membership``) of the peers whose handles it could not import; () if ``failure``
+    only names other ranks, which report their own failures."""
+    if isinstance(failure, MnnvlMappingError) and rank not in failure.ranks:
+        return ()
+    peers = failure.ranks if isinstance(failure, MnnvlPeerHandleError) else ()
+    return f"{type(failure).__name__}: {failure}", [membership[peer] for peer in peers]
+
+
+def _raise_reported_failures(
+    what: str, outcomes: Sequence[Any], local_failure: Optional[Exception]
+) -> None:
+    """Raise alike on every live rank the failures of ``what`` that the live ranks reported (``outcomes``, by global
+    rank): MnnvlPeerHandleError naming the peers whose handles some rank could not import, else MnnvlMappingError
+    naming the ranks that failed. Without a reported failure, raises this rank's ``local_failure``, if any."""
+    failures = [(rank, reported) for rank, reported in enumerate(outcomes) if reported]
+    if not failures:
+        if local_failure is not None:
+            raise local_failure
+        return
+    message = f"{what} failed on live ranks:\n" + "\n".join(
+        f"rank {rank}: {text}" for rank, (text, _) in failures
+    )
+    lost = [peer for _, (_, peers) in failures for peer in peers]
+    if lost:
+        raise MnnvlPeerHandleError(lost, message) from local_failure
+    raise MnnvlMappingError([rank for rank, _ in failures], message) from local_failure
+
+
+class LiveGroupComm:
+    """A communicator of a group whose exchanges reach only its live members.
+
+    ``gather(value)`` exchanges ``value`` among the live members and returns every member's value, indexed by
+    rank in the numbering ``membership`` uses, None for an absent member; communicator rank ``i`` is
+    ``membership[i]``. An MNNVL allocation mapped through it skips the rows of absent members (see
+    :meth:`MnnvlMemory._create_and_map_handles`). ``exchange_failed`` records that an exchange raised.
+    """
+
+    def __init__(
+        self, membership: tuple[int, ...], rank: int, gather: Callable[[Any], Sequence[Any]]
+    ) -> None:
+        self.membership = membership
+        self._rank = rank
+        self._gather = gather
+        self.exchange_failed = False
+
+    def Get_rank(self) -> int:
+        return self._rank
+
+    def Get_size(self) -> int:
+        return len(self.membership)
+
+    def allgather(self, value: Any) -> list[Any]:
+        try:
+            by_rank = self._gather(value)
+        except BaseException:
+            self.exchange_failed = True
+            raise
+        return [by_rank[member] for member in self.membership]
+
+    def barrier(self) -> None:
+        self.allgather(None)
+
+
+def isolated_gather(rank: int, size: int) -> Callable[[Any], list[Any]]:
+    """A gather over ``size`` ranks that only ``rank`` takes part in: every other rank is absent."""
+    return lambda value: [value if r == rank else None for r in range(size)]
+
+
 class MnnvlMemory:
     """MNNVL memory management for tensor parallel (TP) operations."""
 
@@ -271,6 +368,11 @@ class MnnvlMemory:
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
     force_fabric_handle: bool = False
+    # Whether :meth:`remap` maps the rows of absent ranks on one local scratch allocation instead of leaving them
+    # unmapped.
+    absent_rows_on_scratch: bool = False
+    # The communicator ranks whose rows map scratch since the last :meth:`remap` or :meth:`admit`.
+    _scratch_rows: frozenset[int] = frozenset()
 
     # Per-class state attributes. These will be auto-initialized for each subclass
     # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
@@ -324,6 +426,11 @@ class MnnvlMemory:
     def mapped(self) -> bool:
         """Whether the allocation is mapped and ready for data-path access."""
         return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
+
+    @property
+    def local_device_bytes(self) -> int:
+        """The device memory this rank's row takes: what :meth:`remap` allocates again."""
+        return type(self).allocated_map[self.ptr].aligned_size
 
     def as_torch_strided_tensor(self, dtype):
         # Describe the allocation with the layout it was created under, recorded at
@@ -401,6 +508,20 @@ class MnnvlMemory:
         )
 
     @classmethod
+    def comm_split_ranks(cls, mapping: Mapping) -> list[int]:
+        """The ranks comm_split_color_key puts in this rank's group, in key order: the group Split() forms, taken
+        from the mapping alone."""
+        color, _ = cls.comm_split_color_key(mapping)
+        members = []
+        peer = copy.copy(mapping)
+        for rank in range(mapping.world_size):
+            peer.rank = rank
+            peer_color, peer_key = cls.comm_split_color_key(peer)
+            if peer_color == color:
+                members.append((peer_key, rank))
+        return [rank for _, rank in sorted(members)]
+
+    @classmethod
     def get_comm(cls, mapping: Mapping) -> MnnvlCheckpointCommunicator:
         """Get the communicator for `mapping`, creating it on first use.
 
@@ -433,6 +554,10 @@ class MnnvlMemory:
                     "required for MNNVL memory when MPI is disabled"
                 )
             cls.comm = ProcessGroupComm(pg)
+        elif fault_tolerance_mode():
+            # Under WideEP fault tolerance, too, each rank is its own MPI world: mpi_comm() is the group of every
+            # rank over the rendezvous store (StartupGroup), whose subgroup has only the live ranks of the group.
+            cls.comm = mpi_comm().subgroup(cls.comm_split_ranks(mapping))
         else:
             color, key = cls.comm_split_color_key(mapping)
             cls.comm = mpi_comm().Split(color, key)
@@ -546,7 +671,22 @@ class MnnvlMemory:
         start_address: int,
         rank_stride: int,
         address_offset: int,
+        absent_rows_on_scratch: bool = False,
+        mapped_handles: Optional[Sequence[Any]] = None,
     ) -> List[Any]:
+        """Export this rank's handle, import the others' through ``comm`` and map every row.
+
+        A rank ``comm`` returns None for is absent: its row stays unmapped, or, with ``absent_rows_on_scratch``,
+        maps one local scratch allocation shared by every absent row. ``mapped_handles``, if given, are the handles
+        of the rows this rank maps already, its own among them, each of a live rank: this rank keeps them, exports
+        its own handle again instead of creating one, and maps only the other rows. On any failure nothing else
+        stays mapped or allocated.
+
+        Raises:
+            MnnvlPeerHandleError: A live peer's handle could not be imported.
+            MnnvlMappingError: Some live rank could not export its handle; ``ranks`` are those ranks.
+        """
+        kept = [None] * comm.Get_size() if mapped_handles is None else list(mapped_handles)
         local_handle = None
         exported_handle = None
         pidfds = []
@@ -569,9 +709,11 @@ class MnnvlMemory:
                     allocation_prop.requestedHandleTypes
                     == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
                 )
-                local_handle = _check_cu_result(
-                    cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
-                )
+                local_handle = kept[comm.Get_rank()]
+                if local_handle is None:
+                    local_handle = _check_cu_result(
+                        cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                    )
                 exported_handle = _check_cu_result(
                     cuda.cuMemExportToShareableHandle(
                         local_handle, allocation_prop.requestedHandleTypes, 0
@@ -592,24 +734,27 @@ class MnnvlMemory:
                 },
                 operation="handle export",
             )
-            export_errors = [
-                f"rank {rank}: {payload['error']}"
-                for rank, payload in enumerate(exported_by_rank)
-                if payload["error"] is not None
-            ]
-            if export_errors:
-                raise RuntimeError(
-                    "MNNVL handle export failed before mapping:\n" + "\n".join(export_errors)
+            live = [rank for rank, payload in enumerate(exported_by_rank) if payload is not None]
+            export_failed = [rank for rank in live if exported_by_rank[rank]["error"] is not None]
+            if export_failed:
+                raise MnnvlMappingError(
+                    export_failed,
+                    "MNNVL handle export failed before mapping:\n"
+                    + "\n".join(
+                        f"rank {rank}: {exported_by_rank[rank]['error']}" for rank in export_failed
+                    ),
                 )
-            fabric_modes = {payload["is_fabric"] for payload in exported_by_rank}
+            fabric_modes = {exported_by_rank[rank]["is_fabric"] for rank in live}
             if len(fabric_modes) != 1:
                 raise RuntimeError("MNNVL ranks selected inconsistent shareable handle types")
             is_fabric = fabric_modes.pop()
+            all_handles_data = [None] * len(exported_by_rank)
             if is_fabric:
-                all_handles_data = [payload["handle"] for payload in exported_by_rank]
+                for rank in live:
+                    all_handles_data[rank] = exported_by_rank[rank]["handle"]
             else:
-                all_exported_fds = [payload["handle"] for payload in exported_by_rank]
-                all_pids = [payload["pid"] for payload in exported_by_rank]
+                all_exported_fds = [exported_by_rank[rank]["handle"] for rank in live]
+                all_pids = [exported_by_rank[rank]["pid"] for rank in live]
                 syscall = ctypes.CDLL(None, use_errno=True).syscall
                 fd_import_error = None
                 try:
@@ -658,22 +803,43 @@ class MnnvlMemory:
                         "MNNVL POSIX file descriptor import failed on one or more ranks:\n"
                         + "\n".join(failed_ranks)
                     )
-                all_handles_data = remote_fds
+                for rank, remote_fd in zip(live, remote_fds):
+                    all_handles_data[rank] = remote_fd
 
             access_desc = cuda.CUmemAccessDesc()
             access_desc.location = allocation_prop.location
             access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            scratch_handle = None
             for rank, handle_data in enumerate(all_handles_data):
                 rank_ptr = start_address + rank_stride * rank + address_offset
-                handle = (
-                    local_handle
-                    if rank == comm.Get_rank()
-                    else _check_cu_result(
-                        cuda.cuMemImportFromShareableHandle(
-                            handle_data, allocation_prop.requestedHandleTypes
+                if kept[rank] is not None:
+                    if exported_by_rank[rank] is None:
+                        raise RuntimeError(
+                            f"Rank {rank} left while this rank maps its pages: remap the allocation instead"
                         )
-                    )
-                )
+                    mem_handles[rank] = kept[rank]
+                    continue
+                if rank == comm.Get_rank():
+                    handle = local_handle
+                elif exported_by_rank[rank] is not None:
+                    try:
+                        handle = _check_cu_result(
+                            cuda.cuMemImportFromShareableHandle(
+                                handle_data, allocation_prop.requestedHandleTypes
+                            )
+                        )
+                    except RuntimeError as error:
+                        raise MnnvlPeerHandleError(
+                            [rank], f"cuMemImportFromShareableHandle: {error}"
+                        ) from error
+                elif absent_rows_on_scratch:
+                    if scratch_handle is None:
+                        scratch_handle = _check_cu_result(
+                            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                        )
+                    handle = scratch_handle
+                else:
+                    continue
                 mem_handles[rank] = handle
                 _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, handle, 0))
                 mapped_rank_ptrs.append(rank_ptr)
@@ -686,9 +852,13 @@ class MnnvlMemory:
                 except RuntimeError as error:
                     logger.warning(f"Failed to unmap incomplete MNNVL allocation: {error}")
 
-            handles_to_release = [handle for handle in mem_handles if handle is not None]
-            if local_handle is not None and mem_handles[comm.Get_rank()] is None:
-                handles_to_release.append(local_handle)
+            handles_to_release = []
+            for handle in [*mem_handles, local_handle]:
+                # The scratch handle backs every absent row; release it once. The kept handles stay.
+                if handle is not None and all(
+                    handle is not other for other in [*handles_to_release, *kept]
+                ):
+                    handles_to_release.append(handle)
             for handle in handles_to_release:
                 try:
                     _check_cu_result(cuda.cuMemRelease(handle))
@@ -712,9 +882,9 @@ class MnnvlMemory:
                 except OSError as error:
                     logger.warning(f"Failed to close exported MNNVL file descriptor: {error}")
 
-    @classmethod
-    def open_mnnvl_memory(cls, mapping: Mapping, size: int):
-        # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
+    @staticmethod
+    def _init_device() -> int:
+        """Initialize MnnvlMemory (dev_id, allocation granularity) and return the current device's id."""
         MnnvlMemory.initialize()
 
         dev = _check_cu_result(cuda.cuCtxGetDevice())
@@ -724,10 +894,18 @@ class MnnvlMemory:
         assert dev_id == MnnvlMemory.dev_id, (
             f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
+        return dev_id
+
+    @classmethod
+    def open_mnnvl_memory(cls, mapping: Mapping, size: int):
+        """Collective over the class's communicator for ``mapping``; the rows of the members a LiveGroupComm reports
+        absent stay unmapped."""
+        dev_id = cls._init_device()
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
-        comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))
+        # From the group's definition: a gather would leave out a member absent from a fault-tolerant group.
+        comm_membership = tuple(cls.comm_split_ranks(mapping))
         if len(comm_membership) != comm_size:
             raise RuntimeError(
                 "MNNVL communicator membership size does not match its rank count: "
@@ -735,7 +913,9 @@ class MnnvlMemory:
             )
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
-        assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
+        assert all(x == size for x in all_rank_allocate_sizes if x is not None), (
+            "Not all rank allocating same size."
+        )
         granularity = cls.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
@@ -831,7 +1011,10 @@ class MnnvlMemory:
     @classmethod
     def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
         first_error = None
-        for rank in range(record.comm_size):
+        released = []
+        for rank, handle in enumerate(record.mem_handles):
+            if handle is None:
+                continue
             rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
             try:
                 _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
@@ -839,15 +1022,177 @@ class MnnvlMemory:
                 if first_error is None:
                     first_error = error
                 continue
-            try:
-                _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
-            except RuntimeError as error:
-                if first_error is None:
-                    first_error = error
-            else:
-                record.mem_handles[rank] = None
+            # The scratch handle of absent rows is released once, even if that release fails.
+            if all(handle is not other for other in released):
+                released.append(handle)
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    if first_error is None:
+                        first_error = error
+                    continue
+            record.mem_handles[rank] = None
         if first_error is not None:
             raise first_error
+
+    def remap(self, gather: Callable[[Any], Sequence[Any]]) -> None:
+        """Map fresh pages at the addresses :meth:`checkpoint_prepare` kept, shared only among the live ranks.
+
+        ``gather(value)`` collects ``value`` from every live rank (one entry per global rank, None for an absent
+        one, whose row stays unmapped or maps scratch, see ``absent_rows_on_scratch``); it reaches exactly the ranks
+        of a membership record that lists this rank, so an excluded process never maps the fresh pages and its late
+        writes land in pages no live rank maps. Collective over the live ranks; the fresh pages are uninitialized
+        but for this rank's row, which :meth:`_reset_own_row` initializes before the live ranks learn the outcome.
+        Every live rank either maps or raises the same error type, leaving the allocation unmapped for a later
+        attempt by every live rank together (broken if releasing the fresh pages fails too).
+
+        Raises:
+            MnnvlPeerHandleError: Some live rank could not import a peer's handle; ``ranks`` are global ranks.
+            MnnvlMappingError: Mapping failed on some live ranks for another reason; ``ranks`` are those global
+                ranks.
+        """
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot remap MNNVL allocation in {record.state.value} state")
+        self._map_live_rows("MNNVL remap", gather, None)
+
+    def admit(self, gather: Callable[[Any], Sequence[Any]]) -> None:
+        """Map the rows of the live ranks that this rank does not map yet, keeping the pages of its
+        :attr:`holders`: the membership change :meth:`remap` makes when no process outside the live ranks maps
+        them (:meth:`needs_fresh_pages`), without fresh pages. This rank exports its own handle again and imports
+        only the new rows; the rows on scratch are mapped anew.
+
+        ``gather`` is as for :meth:`remap`. Collective over the live ranks. Every live rank either maps or raises
+        the same error type; since a peer may then hold this rank's pages, every live rank also releases the pages
+        it kept, leaving the allocation unmapped for a later :meth:`remap` by every live rank together (broken if
+        that release fails).
+
+        Raises:
+            MnnvlPeerHandleError: As for :meth:`remap`.
+            MnnvlMappingError: As for :meth:`remap`.
+            RuntimeError: A rank whose row this rank maps is not live.
+        """
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            raise RuntimeError(
+                f"Cannot admit ranks to MNNVL allocation in {record.state.value} state"
+            )
+        if self._scratch_rows:
+            # A joining rank's row is mapped where scratch is; the rows of the ranks still absent map scratch again.
+            scratch = [index in self._scratch_rows for index in range(record.comm_size)]
+            try:
+                cls._unmap_and_release_handles(
+                    replace(
+                        record,
+                        mem_handles=[h if s else None for h, s in zip(record.mem_handles, scratch)],
+                    )
+                )
+            except RuntimeError:
+                record.state = _MnnvlAllocationState.BROKEN
+                raise
+            record.mem_handles = [None if s else h for h, s in zip(record.mem_handles, scratch)]
+            self._scratch_rows = frozenset()
+        self._map_live_rows("MNNVL admission", gather, record.mem_handles)
+
+    @property
+    def holders(self) -> Optional[frozenset[int]]:
+        """The global ranks whose processes map this allocation's pages: the live ranks this rank last mapped it with
+        (:meth:`remap`, :meth:`admit` or the allocation itself), its own included, since every live rank maps the
+        rows of every live rank. None while the allocation is not mapped."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            return None
+        return frozenset(
+            rank
+            for index, (rank, handle) in enumerate(zip(record.comm_membership, record.mem_handles))
+            if handle is not None and index not in self._scratch_rows
+        )
+
+    def needs_fresh_pages(self, gather: Callable[[Any], Sequence[Any]]) -> bool:
+        """Whether a membership change among the ranks ``gather`` reaches (see :meth:`remap`) must map the allocation
+        on fresh pages (:meth:`remap`) rather than keep the pages it maps (:meth:`admit`): when one of those ranks
+        does not map it, or a process that maps the pages one of them keeps may not be among them, since such a
+        process may still write into them.
+
+        A live rank's pages are kept only if each of its :attr:`holders` is live and lists it among its own holders
+        too. A holder whose process was replaced fails this: its new process did not map the allocation with the
+        ranks its old one mapped it with. Collective over those ranks, which all return the same answer.
+        """
+        views = gather(self.holders or frozenset())
+        return any(
+            not view or any(views[holder] is None or rank not in views[holder] for holder in view)
+            for rank, view in enumerate(views)
+            if view is not None
+        )
+
+    def _map_live_rows(
+        self,
+        what: str,
+        gather: Callable[[Any], Sequence[Any]],
+        mapped_handles: Optional[Sequence[Any]],
+    ) -> None:
+        """:meth:`remap` (``mapped_handles`` None) or :meth:`admit` (the handles of this rank's holders' rows); logs
+        how long it took."""
+        start_s = time.perf_counter()
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        comm = LiveGroupComm(record.comm_membership, record.comm_rank, gather)
+        # A live rank's outcome: () if it mapped, or what _mapping_outcome reports; None stands for an absent rank.
+        handles, outcome, local_failure = None, (), None
+
+        def release() -> None:
+            if handles is not None:
+                record.mem_handles = handles
+            try:
+                cls._unmap_and_release_handles(record)
+            except RuntimeError as cleanup_error:
+                # The original error decides how the recovery goes on; this allocation is not mapped again.
+                logger.error(f"Failed to release the pages of a failed {what}: {cleanup_error}")
+                record.state = _MnnvlAllocationState.BROKEN
+                return
+            record.state = _MnnvlAllocationState.UNMAPPED
+
+        try:
+            handles = cls._create_and_map_handles(
+                comm,
+                record.aligned_size,
+                record.start_address,
+                record.rank_stride,
+                record.address_offset,
+                absent_rows_on_scratch=cls.absent_rows_on_scratch,
+                mapped_handles=mapped_handles,
+            )
+            if mapped_handles is None:
+                self._reset_own_row()
+        except Exception as failure:
+            if comm.exchange_failed:
+                release()
+                raise
+            local_failure = failure
+            outcome = _mapping_outcome(failure, record.comm_rank, record.comm_membership)
+        try:
+            outcomes = gather(outcome)
+            _raise_reported_failures(what, outcomes, local_failure)
+        except BaseException:
+            release()
+            raise
+        record.mem_handles = handles
+        record.state = _MnnvlAllocationState.MAPPED
+        self._scratch_rows = frozenset(
+            index
+            for index, (rank, handle) in enumerate(zip(record.comm_membership, handles))
+            if handle is not None and outcomes[rank] is None
+        )
+        live = sum(reported is not None for reported in outcomes)
+        kept = 1 if mapped_handles is None else sum(handle is not None for handle in mapped_handles)
+        logger.info(
+            f"{what} of {cls.__name__} at {self.ptr:#x} among {live} live ranks: imported {live - kept} rows in "
+            f"{(time.perf_counter() - start_s) * 1e3:.1f} ms"
+        )
+
+    def _reset_own_row(self) -> None:
+        """Initialize this rank's freshly mapped row during :meth:`remap`; nothing by default."""
 
     def checkpoint_prepare(self) -> None:
         """Detach local backing handles while retaining graph-visible VA.
@@ -1150,6 +1495,86 @@ class TpMnnvlMemory(MnnvlMemory):
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.tp_rank,
         )
+
+
+class MnnvlRows(MnnvlMemory):
+    """MNNVL memory of one row per rank, every row mapped in every process at ``ptr + r * stride``.
+
+    Unlike other :class:`MnnvlMemory` allocations, whose rows lie a fabric page apart with unmapped address space
+    between them, the rows sit back to back, so one strided copy reaches every row. The row of an absent rank maps
+    local scratch memory. A membership change maps the rows at the same addresses, on fresh pages if a process that
+    is no longer a member may still write into the current ones (:meth:`needs_fresh_pages`): it can then only write
+    into pages nobody maps anymore. :meth:`remap` zeroes this rank's row, so on return every live rank may write
+    into any row. Per-class state is separate from MnnvlMemory's.
+    """
+
+    absent_rows_on_scratch = True
+
+    @classmethod
+    def uses_fabric_handles(cls, dev_id: int) -> bool:
+        """Whether device ``dev_id`` shares this memory through fabric handles, which the rows require."""
+        handle_type = cls.get_allocation_prop(dev_id).requestedHandleTypes
+        return handle_type == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+
+    def __init__(self, rank: int, nranks: int, nbytes: int, gather: Callable[[Any], Sequence[Any]]):
+        """Reserve the rows' addresses and map them: collective over the live ranks, which ``gather`` reaches (see
+        :meth:`remap`). On any failure nothing stays mapped, allocated or reserved.
+
+        Raises:
+            MnnvlPeerHandleError: Some live rank could not import a live rank's handle, as when that rank exited
+                after exporting it; ``ranks`` are the ranks whose handles failed.
+            MnnvlMappingError: Mapping or zeroing failed on some live ranks for another reason; ``ranks`` are those
+                ranks.
+            RuntimeError: The device does not share memory through fabric handles.
+        """
+        cls = type(self)
+        dev_id = cls._init_device()
+        if not cls.uses_fabric_handles(dev_id):
+            raise RuntimeError(
+                "MnnvlRows requires fabric memory handles, which this device does not use"
+            )
+        granularity = cls.get_allocation_granularity(dev_id)
+        stride = granularity * -(-nbytes // granularity)
+        ptr = int(_check_cu_result(cuda.cuMemAddressReserve(nranks * stride, granularity, 0, 0)))
+        cls.allocated_map[ptr] = _MnnvlAllocationRecord(
+            comm=None,
+            comm_size=nranks,
+            comm_rank=rank,
+            comm_membership=tuple(range(nranks)),
+            aligned_size=stride,
+            mem_handles=[None] * nranks,
+            start_address=ptr,
+            rank_stride=stride,
+            address_offset=0,
+            state=_MnnvlAllocationState.UNMAPPED,
+        )
+        cls.address_refcnt[ptr] = 1
+        self.segment_size = nbytes
+        self.ptr, self.rank_stride = ptr, stride
+        try:
+            self.remap(gather)
+        except BaseException:
+            self.close()
+            raise
+
+    def _reset_own_row(self) -> None:
+        _check_cu_result(
+            cuda.cuMemsetD8(self.row(type(self).allocated_map[self.ptr].comm_rank), 0, self.stride)
+        )
+        torch.cuda.synchronize()
+
+    @property
+    def stride(self) -> int:
+        return self.rank_stride
+
+    def row(self, rank: int) -> int:
+        return self.ptr + rank * self.rank_stride
+
+    def close(self) -> None:
+        """Unmap every row and free the address range; not collective. Closes at most once, even if it fails."""
+        ptr = self.ptr
+        del self.ptr
+        type(self).close_mnnvl_memory(ptr)
 
 
 def init_helix_cp_comm(mapping: Mapping) -> None:
