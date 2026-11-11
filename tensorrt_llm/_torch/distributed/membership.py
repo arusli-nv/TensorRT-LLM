@@ -213,6 +213,8 @@ class Authority:
         self._startup_progress: Dict[int, tuple] = {}
         self._joining: Set[int] = set()
         self._failed_in: Dict[int, int] = {}
+        # The resume epoch of the INSTALL that a newer change replaced before its commit, or 0.
+        self._replaced_install_epoch = 0
         self._detected_s: Optional[float] = None
         self._transaction_began_s: Optional[float] = None
         self._ready_s: Optional[float] = None
@@ -302,20 +304,31 @@ class Authority:
             )
         if failed_replies:
             self._joining -= failed_replies
-            return self._propose(self.record.active_mask & ~self._mask(failed_replies))
+            return self._propose(
+                self.record.active_mask & ~self._mask(failed_replies),
+                reason="a replacement could not install the change that adds it",
+            )
         if not all(replied(r, expected) for r in active):
             return None
         if state == MembershipState.PROPOSE:
             survivors = [
                 r for r in active if self._committed_mask >> r & 1 and r not in self._joining
             ]
-            # Epochs wrap, so the resume epoch follows the latest one, not the largest.
+            epochs = [reports[r].paused_at.epoch for r in survivors]
+            replaced = self._replaced_install_epoch
+            # Every round waits for every active rank. If a survivor stopped before the epoch of a replaced INSTALL, no
+            # rank ran a round from that epoch, and the ranks that installed it install the same epoch again.
+            if replaced and any(latest_epoch([replaced, epoch]) != epoch for epoch in epochs):
+                epoch = replaced
+            else:
+                # Epochs wrap, so the resume epoch follows the latest one, not the largest.
+                epoch = next_epoch(latest_epoch(epochs))
             resume = ResumeState(
                 iteration=max(
                     [self.record.resume.iteration]
                     + [reports[r].paused_at.iteration for r in survivors]
                 ),
-                epoch=next_epoch(latest_epoch([reports[r].paused_at.epoch for r in survivors])),
+                epoch=epoch,
             )
             self._ready_s = now_s
             payloads = tuple(
@@ -337,8 +350,12 @@ class Authority:
                 "surviving ranks, so they are not added"
             )
             self._joining -= mismatched
-            return self._propose(self.record.active_mask & ~self._mask(mismatched))
+            return self._propose(
+                self.record.active_mask & ~self._mask(mismatched),
+                reason="a replacement restored a different expert placement than the surviving ranks",
+            )
         self._joining -= set(active)
+        self._replaced_install_epoch = 0
         for r in self._ranks(self._committed_mask & ~self.record.active_mask):
             self._failed_in[r] = self.record.generation
         for r in active:
@@ -397,13 +414,18 @@ class Authority:
             self._report_sequence[r] = (sequence, now_s)
         return now_s - self._report_sequence[r][1] <= self.hang_timeout_s / 2
 
-    def _propose(self, active_mask: int) -> MembershipRecord:
+    def _propose(self, active_mask: int, reason: str = "") -> MembershipRecord:
         self._ready_s = None
         if active_mask & 1 == 0:
             logger.error("Deployment aborted: rank 0 failed")
             return self._set(MembershipState.ABORTED, active_mask, reason="rank 0 failed")
+        if self.record.state == MembershipState.INSTALL:
+            self._replaced_install_epoch = self.record.resume.epoch
         return self._set(
-            MembershipState.PROPOSE, active_mask, generation=self.record.generation + 1
+            MembershipState.PROPOSE,
+            active_mask,
+            generation=self.record.generation + 1,
+            reason=reason,
         )
 
     def abort(self, reason: str) -> MembershipRecord:

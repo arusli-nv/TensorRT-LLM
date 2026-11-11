@@ -227,15 +227,16 @@ class TPHostExchange:
     ) -> None:
         """Switch to the ranks in ``active_mask`` while stopped, collectively over the ranks ``gather`` reaches.
 
-        ``epoch`` follows the latest ``stopped_epoch`` among the active ranks. A rank that stopped one round behind
-        finishes that round from its peers' rows. The rows in ``fresh_rows`` get fresh pages.
+        ``epoch`` follows the latest ``stopped_epoch`` among the active ranks, or equals it if a newer change replaced
+        the install of ``epoch`` before every active rank installed it. A rank that stopped one round behind finishes
+        that round from its peers' rows. The rows in ``fresh_rows`` get fresh pages.
 
         Raises:
             RuntimeError: This rank stopped more than one round before the latest active rank.
         """
         if not _has_rank(active_mask, self.rank):
             pass
-        elif next_epoch(self.stopped_epoch) == epoch:
+        elif epoch in (self.stopped_epoch, next_epoch(self.stopped_epoch)):
             # An earlier attempt of this change may have finished the round with a since-failed rank's packets.
             self._finished_round = self._epoch_after_round = None
         elif self._finished_round is None:

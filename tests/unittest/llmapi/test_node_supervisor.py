@@ -389,6 +389,36 @@ def test_dropped_joining_replacement_is_restarted(tmp_path, deployment):
     assert running.wait() == 0
 
 
+def test_repeated_refusals_stop_replacements(tmp_path, deployment):
+    """Check that no replacement starts once the membership left out three in a row for the same reason.
+
+    Each replacement of rank 3 restores another expert placement than the surviving ranks, so each change that adds
+    it leaves it out. The node keeps serving without rank 3.
+    """
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
+    reason = "a replacement restored a different expert placement than the surviving ranks"
+    generation = 1
+    for incarnation in range(1, supervisor_module._MAX_REFUSALS + 1):
+        _until(lambda incarnation=incarnation: _read(tmp_path, 3, incarnation))
+        joined = (0, 0, 0, incarnation)
+        adding = _record(MembershipState.INSTALL, 0b1111, joined, generation + 1)
+        authority.push(adding.model_copy(update=dict(joining_mask=0b1000)))
+        _until(lambda: running.supervisor._processes[3].listed)
+        left_out = _record(MembershipState.PROPOSE, 0b0111, joined, generation + 2)
+        authority.push(left_out.model_copy(update=dict(reason=reason)))
+        generation += 2
+    _until(lambda: running.supervisor._given_up == {3})
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, 0b0111, joined, generation + 1)
+    )
+    assert _read(tmp_path, 3, supervisor_module._MAX_REFUSALS + 1) is None
+    authority.push(_record(MembershipState.SHUTDOWN, 0b0111, joined, generation + 2))
+    assert running.wait() == 0
+
+
 def test_each_rank_has_own_session(tmp_path, deployment):
     """Check that a terminal signal reaches only the supervisor, which needs start_new_session."""
     authority, environ = deployment

@@ -34,6 +34,7 @@ from tensorrt_llm._torch.distributed.host_exchange import (
     TPHostExchange,
 )
 from tensorrt_llm._torch.distributed.host_exchange_epoch import latest_epoch, next_epoch
+from tensorrt_llm._torch.distributed.membership import Authority, RankReport, Reply, ResumeState
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -460,6 +461,90 @@ def test_wait_for_failed_rank_stops(monkeypatch):
     assert results[1] == results[0]
     # Both ranks stop in the round that rank 2 never sent into.
     assert stopped == {0: 1, 1: 1}
+
+
+class _Replaced(Exception):
+    """Raised where a newer membership change ends a rank's wait."""
+
+
+@pytest.mark.timeout(60)
+def test_replaced_install_resumes_same_round(monkeypatch):
+    """Check that an install that a newer change replaces on some ranks leaves every rank the same results.
+
+    Rank 3 fails, then rank 2 fails while ranks 0 to 2 remap the rows for the change that drops rank 3. Rank 1
+    completes the remap. Rank 0 stops waiting in the remap's last gather, because the newer change has reached it.
+    The authority resumes the newer change from the replaced install's epoch, which rank 1 installs again.
+    """
+    exchanges = _host_exchange_group(monkeypatch, WORLD, _SLOT_BYTES)
+    authority = Authority(WORLD)
+    authority.tick(0.0, {r: RankReport(started=True) for r in range(WORLD)}, 0b1111)
+    connected = {1: 0b0111, 2: 0b0011}
+    stopped = {1: {}, 2: {}}
+    epochs = {}
+
+    def decide(generation):
+        ranks = _ranks_in(connected[generation])
+        authority.tick(generation, {r: RankReport() for r in ranks}, connected[generation])
+        ready = {
+            r: RankReport(
+                reply=Reply.READY,
+                reply_generation=generation,
+                paused_at=ResumeState(epoch=stopped[generation][r]),
+            )
+            for r in ranks
+        }
+        epochs[generation] = authority.tick(generation, ready, connected[generation]).resume.epoch
+
+    ready = {1: threading.Barrier(3, action=lambda: decide(1), timeout=20)}
+    ready[2] = threading.Barrier(2, action=lambda: decide(2), timeout=20)
+    committed = threading.Barrier(2, timeout=20)
+    generations = {0: [1, 2], 1: [1, 2], 2: [1]}
+    remaps = []
+
+    def remap_of_rank_0(gather, fresh_rows):
+        remaps.append(fresh_rows)
+        if len(remaps) == 1:
+            raise _Replaced
+        _HostRows.remap(exchanges[0].rows, gather, fresh_rows)
+
+    exchanges[0].rows.remap = remap_of_rank_0
+
+    def change(exchange):
+        # Run the membership changes this rank takes part in, from READY to the commit.
+        while True:
+            generation = generations[exchange.rank].pop(0)
+            stopped[generation][exchange.rank] = exchange.stopped_epoch
+            ready[generation].wait()
+            if exchange.rank == 2:
+                raise _Replaced  # Its process ends.
+            try:
+                exchange.install(
+                    None, connected[generation], epochs[generation], frozenset(range(WORLD))
+                )
+            except _Replaced:
+                continue
+            if generation == 2:
+                committed.wait()
+                exchange.interrupted = lambda: False
+            return
+
+    proposed = threading.Event()
+    for exchange in exchanges[:3]:
+        exchange.interrupted = proposed.is_set
+        exchange.on_interrupt = lambda exchange=exchange: change(exchange)
+
+    def survivor(exchange):
+        return exchange.exchange(b"r%d" % exchange.rank), exchange.exchange(b"s%d" % exchange.rank)
+
+    def fails(exchange):
+        with pytest.raises(_Replaced):
+            survivor(exchange)
+
+    threading.Timer(0.2, proposed.set).start()
+    results = _run_ranks(exchanges[:3], [survivor, survivor, fails])
+    assert epochs == {1: 2, 2: 2}
+    assert results[0] == ([b"r0", b"r1", None, None], [b"s0", b"s1", None, None])
+    assert results[1] == results[0]
 
 
 def test_joining_rank_installs_rows(monkeypatch):

@@ -42,6 +42,8 @@ _CONNECT_TIMEOUT_S = 2.0
 _STOP_GRACE_S = 10.0
 _MIN_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 60.0
+# The replacements of a rank that the membership leaves out in a row for the same reason before no other one starts.
+_MAX_REFUSALS = 3
 
 
 def _exit_status(returncode: int) -> int:
@@ -156,6 +158,8 @@ class NodeSupervisor:
         self._processes: Dict[int, _Process] = {}
         self._replacements = _Backoff()
         self._given_up: Set[int] = set()
+        # Per rank, the reason the membership last left out a replacement of it, and how many times in a row.
+        self._refusals: Dict[int, Tuple[str, int]] = {}
         self._relaunched: Dict[int, subprocess.Popen] = {}
         self._relaunches = _Backoff()
         self._host_weights_prefix: Optional[str] = None
@@ -471,6 +475,8 @@ class NodeSupervisor:
         self._connection = None
 
     def _on_view(self, view) -> None:
+        if self._view is not None:
+            self._count_refusals(self._view.record, view.record)
         self._view = view
         if view.record.state not in (
             self._membership.MembershipState.STARTING,
@@ -480,6 +486,27 @@ class NodeSupervisor:
             self._served = True
         if self._host_weights_prefix is None:
             self._read_host_weights_prefix()
+
+    def _count_refusals(self, previous, record) -> None:
+        """Count the replacements joining in ``previous`` that ``record`` leaves out with a reason.
+
+        Once the membership left out ``_MAX_REFUSALS`` replacements of a rank in a row for the same reason, no other
+        replacement of the rank starts.
+        """
+        committed = record.state == self._membership.MembershipState.COMMITTED
+        for rank in self._ranks:
+            if committed and record.is_active(rank):
+                self._refusals.pop(rank, None)
+            elif previous.joining_mask >> rank & 1 and not record.is_active(rank) and record.reason:
+                reason, count = self._refusals.get(rank, (record.reason, 0))
+                count = count + 1 if reason == record.reason else 1
+                self._refusals[rank] = (record.reason, count)
+                if count == _MAX_REFUSALS:
+                    self._logger.error(
+                        f"The membership left out {count} replacements of rank {rank} in a row because "
+                        f"{record.reason}, so no other one starts and the deployment serves without rank {rank}"
+                    )
+                    self._given_up.add(rank)
 
     def _read_host_weights_prefix(self) -> None:
         with contextlib.suppress(OSError, RuntimeError):

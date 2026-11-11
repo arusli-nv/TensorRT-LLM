@@ -1753,13 +1753,13 @@ def test_kv_pool_skips_ending_process_pages(monkeypatch):
     assert device.free == FREE_BYTES
 
 
-def _short_give_back(monkeypatch):
+def _short_give_back(monkeypatch, record=_INSTALL):
     """Return rank 0 after a failover whose give-back fell 4 MiB short, and its device.
 
     The excluded rank 2 still mapped the pages that the remap replaced at the commit.
     """
     monkeypatch.setattr(recovery_module.torch.cuda, "synchronize", lambda: None)
-    recovery = _resuming_recovery(placement=_PLACEMENT)
+    recovery = _resuming_recovery(record=record, placement=_PLACEMENT)
     _, _, device = _eplb(monkeypatch, recovery)
     recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: device.take(4 * MIB)
     recovery.before_iteration()  # The install and the commit.
@@ -1816,6 +1816,21 @@ def test_give_back_retries_end_after_exit(monkeypatch):
     assert _vote(recovery)[0] == [4, 0, 0]
     assert recovery._give_back_retry is None
     assert device.gpu_quota == 54 * MIB
+
+
+def test_give_back_ignores_replacement_hello(monkeypatch):
+    """Check that the retries end once the excluded process ended, though its replacement said hello.
+
+    The replacement of rank 2 said hello while the survivors waited on the hung process of rank 2, so the INSTALL
+    record names the replacement. The retries wait only for the process that the last commit listed.
+    """
+    install = _INSTALL.model_copy(update=dict(incarnations=JOINED))
+    recovery, device = _short_give_back(monkeypatch, install)
+    recovery._store.set(
+        DISCONNECTED_KEY, json.dumps([0 if r == FAILED else -1 for r in range(WORLD)]).encode()
+    )
+    assert _vote(recovery)[0] == [4, 0, 0]
+    assert recovery._give_back_retry is None
 
 
 def test_healthy_step_checks_no_device_memory(monkeypatch):
@@ -3678,6 +3693,7 @@ def _admitting(monkeypatch, rank):
         [set()] * (WORLD - 1), record=_joining_record(MembershipState.INSTALL), rank=rank
     )
     recovery.incarnation = JOINED[rank]
+    recovery._admitted = JOINED[rank] == 0  # A replacement is admitted only at its commit.
     recovery._committed_mask = SURVIVORS  # Rank 2 failed earlier.
     recovery._moe.aborted.return_value = False  # An admission does not abort its steps.
     recovery._resume_after = 20
@@ -4002,6 +4018,33 @@ def test_joining_rank_left_out_exits(monkeypatch):
     with pytest.raises(SystemExit) as exited:
         recovery.before_iteration()
     assert exited.value.code == 1
+
+
+def test_joining_rank_missing_commit_stops(monkeypatch):
+    """Check that a joining rank that reads a newer PROPOSE instead of its commit stops like an active rank.
+
+    Its membership client hands it the commit and the PROPOSE of generation 3 back to back, and rank 2 is active in
+    generation 3. It stops for the PROPOSE in the host exchange instead of replying READY from where it joined.
+    """
+    _exit_raises(monkeypatch)
+    recovery = _admitting(monkeypatch, rank=FAILED)
+    committed = _joining_record(MembershipState.COMMITTED, joining=0)
+    newer = _NEWER.model_copy(update=dict(joining_mask=0))
+    # An abort answers a READY to generation 3, so that a READY ends the test.
+    aborted = newer.model_copy(update=dict(state=MembershipState.ABORTED))
+    _newer_change(recovery, {(Reply.READY, 3): aborted})
+    report = recovery._client.report
+
+    def commit_then_propose(**changes):
+        report(**changes)
+        if changes.get("reply") == Reply.INSTALLED:
+            recovery._on_record(committed)
+            recovery._on_record(newer)
+
+    recovery._client.report = commit_then_propose
+    recovery.before_iteration()
+    assert _replies(recovery) == [Reply.INSTALLED]
+    assert recovery._membership_changing()
 
 
 @pytest.mark.parametrize("rank", [0, FAILED])

@@ -536,6 +536,8 @@ def test_replacement_with_other_placement_excluded():
     assert record.joining_mask == 0
     assert MembershipState.ABORTED not in states(cluster)
     assert states(cluster) == [MembershipState.PROPOSE, MembershipState.INSTALL] + TRANSACTION
+    # The node supervisor reads why the change left the replacement out.
+    assert "different expert placement" in cluster.published[2].reason
 
 
 @pytest.mark.parametrize("slots", ["spare", "none spare"])
@@ -1356,8 +1358,10 @@ def _deployment(world, **authority_options):
         yield store, clients
         clients[0].report(shutdown=True)
         _until(
-            lambda: MembershipRecord.model_validate_json(store.get(RECORD_KEY)).state
-            == MembershipState.SHUTDOWN
+            lambda: (
+                MembershipRecord.model_validate_json(store.get(RECORD_KEY)).state
+                == MembershipState.SHUTDOWN
+            )
         )
         # The store lives in the authority's process, which serves until every active rank has read the record.
         thread.join(0.2)
@@ -1512,8 +1516,10 @@ def test_replacement_joins_after_process_gone():
         clients.append(_member(store, 2, 3, replacement=True))
         assert clients[-1].incarnation == 1
         _until(
-            lambda: clients[0].record.active_mask == 0b111
-            and clients[0].record.state == MembershipState.COMMITTED
+            lambda: (
+                clients[0].record.active_mask == 0b111
+                and clients[0].record.state == MembershipState.COMMITTED
+            )
         )
         assert clients[0].record.incarnations == (0, 0, 1)
         assert _refused(store, 2, False)

@@ -709,6 +709,9 @@ class RankFailureRecovery:
         self._record_changed = threading.Condition()
         self._admitted = incarnation == 0
         self._committed_mask = self._record.active_mask
+        # Per rank, the newest process that an INSTALL or COMMITTED record listed as active, which may map its peers'
+        # pages until it ends.
+        self._listed_incarnations = [0] * self.world_size
         self._installed: Optional[MembershipRecord] = None
         self._attempted: Optional[MembershipRecord] = None
         # The last iteration that any survivor reached. It is set from INSTALL until the commit, while no forward runs.
@@ -838,6 +841,13 @@ class RankFailureRecovery:
                 self._admitted = True
             if record.state == MembershipState.COMMITTED:
                 self._committed_mask = record.active_mask
+            if record.state in (MembershipState.INSTALL, MembershipState.COMMITTED):
+                self._listed_incarnations = [
+                    record.incarnations[r]
+                    if record.is_active(r) and r < len(record.incarnations)
+                    else incarnation
+                    for r, incarnation in enumerate(self._listed_incarnations)
+                ]
             self._pending = self._change_pending(record)
             self._record_changed.notify_all()
         if not self._admitted:
@@ -1066,7 +1076,9 @@ class RankFailureRecovery:
         with self._hang_detection_paused():
             while True:
                 self._attempted = record
-                if self._finish_install(record) or not record.joining_mask >> self.rank & 1:
+                # A joining rank whose admission was committed stops for a newer change in the host exchange, as the
+                # other active ranks do.
+                if self._finish_install(record) or self._admitted:
                     return
                 if self._installed is record:
                     self._change_membership()
@@ -1167,7 +1179,7 @@ class RankFailureRecovery:
             self._give_back_retry = _GiveBackRetry(
                 free_to_keep,
                 {
-                    r: record.incarnations[r] if r < len(record.incarnations) else 0
+                    r: self._listed_incarnations[r]
                     for r in range(self.world_size)
                     if not record.is_active(r)
                 },
