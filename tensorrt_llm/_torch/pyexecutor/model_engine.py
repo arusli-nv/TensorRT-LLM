@@ -636,7 +636,7 @@ class ModelEngine:
 
     @property
     def moe_execution_state(self) -> MoeExecutionState | None:
-        """The MoE all-to-all execution state in fault tolerance mode, else None."""
+        """Return the MoE all-to-all execution state in fault tolerance mode."""
         if isinstance(self._runner, DecoderRunner):
             return self._runner.moe_execution_state
         return None

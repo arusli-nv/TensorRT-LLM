@@ -98,8 +98,7 @@ class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
         local_expert_offset: int,
         tuner_num_local_experts: int | None = None,
     ) -> None:
-        # The routing generated here goes through this rank's runtime moe_sort, so it keeps the
-        # runtime offset.
+        # The routing generated here goes through this rank's runtime moe_sort, so it keeps the runtime offset.
         num_experts, num_local_experts, _ = self.tuner_expert_layout(
             num_experts, num_local_experts, local_expert_offset, tuner_num_local_experts
         )
@@ -161,8 +160,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
-        # Tune as if every rank had only its first this many local experts (see
-        # GroupedGemmInputsHelper).
         self.tuner_num_local_experts = tuner_num_local_experts
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall

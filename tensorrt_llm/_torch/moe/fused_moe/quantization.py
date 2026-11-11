@@ -3603,7 +3603,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                 self._resolve_staged_w3_w1_weight_scale(entry)
             delattr(module, 'tmp_cutlass_w3_w1_weight_scales')
 
-        # Finalize w2 weight scales: interleave (regular experts, in the slots the loaders filled)
+        # Finalize w2 weight scales: interleave (regular experts)
         num_experts = len(module.initial_local_expert_ids)
         for expert_idx in range(num_experts):
             self._interleave_w2_weight_scale(
@@ -3934,8 +3934,7 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         if not module.is_gated_activation:
             return
 
-        # Then apply CuteDsl-specific interleave_linear_and_gate on the finalized buffers of the slots the loaders
-        # filled
+        # Then apply CuteDsl-specific interleave_linear_and_gate on the finalized buffers
         num_experts = len(module.initial_local_expert_ids)
         for expert_idx in range(num_experts):
             self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])

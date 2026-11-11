@@ -87,9 +87,7 @@ def propagate_hard_kill(
     - Fallback: self-``SIGKILL``. The launcher (``mpirun`` propagates by default;
       ``srun`` needs ``--kill-on-bad-exit``) then tears down peers.
 
-    Under WideEP fault tolerance the kill stays local: the peers go on without
-    this rank, and the launcher keeps them running (``mpirun
-    --enable-recovery``).
+    Under WideEP fault tolerance the kill stays local.
 
     Diagnostic exceptions are ignored. Deadline-driven callers also disable
     diagnostics so a blocked stream or logging lock cannot delay termination.
@@ -615,8 +613,7 @@ class HangDetector:
             self.checkpoint()
 
     def paused(self) -> bool:
-        """Whether detection is disarmed: in :meth:`pause`, or before the first
-        checkpoint; any thread."""
+        """Return whether detection is disarmed."""
         return self._deadline == math.inf
 
     def stop(self):

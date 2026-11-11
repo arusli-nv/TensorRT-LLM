@@ -154,11 +154,7 @@ class BaseWorker(GenerationExecutor):
         # Requests already answered with an error by _maybe_wrap_response and
         # aborted; their remaining engine responses are dropped.
         self._refused_client_ids: Set[int] = set()
-        # WideEP fault tolerance: client id -> the multimodal parameters and
-        # their multimodal input (None without multimodal data) of each request
-        # with no response sent yet, which this worker enqueues again once if
-        # a rank failure ends it (_enqueue_after_rank_failure). Its first
-        # enqueue consumes the multimodal input, so it is kept here.
+        # The first enqueue consumes the multimodal input, so a re-enqueue after a rank failure needs this copy.
         self._unanswered_requests: Optional[Dict[int, Optional[tuple]]] = (
             {} if fault_tolerance_mode() else None)
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
@@ -1385,10 +1381,7 @@ class BaseWorker(GenerationExecutor):
         self._client_id_to_request_id.pop(client_id, None)
 
     def outstanding_requests(self) -> Dict[int, int]:
-        """Request id -> client id of every request without a final response.
-
-        Safe to call from any thread.
-        """
+        """Map request id to client id of requests without a final response."""
         return {
             request_id: client_id
             for client_id, request_id in dict(
@@ -1396,14 +1389,7 @@ class BaseWorker(GenerationExecutor):
         }
 
     def _enqueue_after_rank_failure(self, response: LlmResponse) -> bool:
-        """Enqueue a request that a WideEP rank failure ended again, once.
-
-        Only if the error of ``response`` is a ``RankFailureError`` and the
-        request has no response sent yet: from this worker's copy of it, under
-        the same client id, with the multimodal parameters and input it was
-        first enqueued with. Its client then sees no error, as nothing of the
-        first attempt reached it. Returns whether it enqueued the request again.
-        """
+        """Enqueue again a request a rank failure ended before any response."""
         client_id = response.client_id
         if (not self._unanswered_requests
                 or client_id not in self._unanswered_requests

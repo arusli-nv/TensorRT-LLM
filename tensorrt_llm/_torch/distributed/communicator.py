@@ -333,8 +333,7 @@ class Distributed(ABC):
         return vec.reshape(-1, n)
 
     def tp_live_rows(self, rows: np.ndarray) -> np.ndarray:
-        """The rows of a TP gather that come from ranks taking part in the
-        group: every row here. Votes over a gather reduce over these."""
+        """Return the rows of a TP gather that come from live ranks."""
         return rows
 
     def broadcast_int64(self,

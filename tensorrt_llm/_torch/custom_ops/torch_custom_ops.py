@@ -148,8 +148,6 @@ class MoERunner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
-        # Profile only the first this many local experts, as if every rank had
-        # no others; None profiles every local expert.
         self.tuner_num_local_experts = tuner_num_local_experts
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
@@ -273,7 +271,6 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
-    # The autotuner profiles only the first this many local experts (MoERunner).
     tuner_num_local_experts: Optional[int] = None,
     activation_type: int = int(ActivationType.Swiglu),
     unpadded_hidden_size: Optional[int] = None,

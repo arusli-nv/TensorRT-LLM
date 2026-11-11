@@ -364,8 +364,7 @@ class ADPRouter(ABC):
                 all owners must then enter the executor's error vote.
 
         Returns:
-            The states of the serving ranks, in rank order; a rank that left
-            the group has none.
+            The states of the serving ranks, in rank order.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -439,8 +438,6 @@ class ADPRouter(ABC):
         return requests, {}
 
     def _per_rank(self, all_rank_states: list[RankState], field: str) -> List[int]:
-        """``field`` of every rank's state, indexed by rank; 0 for a rank
-        without a state (it left the group)."""
         values = [0] * self.dist.tp_size
         for state in all_rank_states:
             values[state.rank] = getattr(state, field)
@@ -455,10 +452,8 @@ class ADPRouter(ABC):
     ) -> List["RequestQueueItem"]:
         """Place requests carrying an explicit ``attention_dp_rank`` on that rank
         (while it is under ``max_num_active_requests``) and return the rest for
-        load-balanced assignment. A rank without a list in
-        ``all_ranks_new_requests`` does not serve and takes none. Mutates the
-        ``all_ranks_*`` accumulators in place. Shared by Default and
-        ConversationAware routers.
+        load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
+        place. Shared by Default and ConversationAware routers.
         """
         remaining: List["RequestQueueItem"] = []
         for req_item in requests:

@@ -261,7 +261,6 @@ class CutlassFusedMoEBase(MoEImplBase):
 
     @property
     def autotunes_only_active_slots(self) -> bool:
-        # The op profiles only its ``tuner_num_local_experts`` first local experts.
         return self.issues_fused_moe_op
 
     @property

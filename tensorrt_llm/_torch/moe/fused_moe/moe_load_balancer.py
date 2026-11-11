@@ -58,7 +58,6 @@ class HostMoeTensorSharer:
     A class representing a host tensor sharer.
     """
 
-    # Where the host weights start in a segment.
     data_offset = 0
 
     def __init__(self, layer_id: int, expert_count: int,
@@ -184,7 +183,7 @@ class HostMoeTensorSharer:
 
     def _own_segment(self,
                      size: int) -> Tuple[shared_memory.SharedMemory, bool]:
-        """This rank's segment of ``size`` bytes for its host weights, and whether it holds them already."""
+        """Return this rank's segment and whether it holds its host weights already."""
         shm_name = self.get_shared_memory_name()
         try:
             shm = shared_memory.SharedMemory(name=shm_name,
@@ -203,7 +202,6 @@ class HostMoeTensorSharer:
         return shm, False
 
     def _peer_segment(self, rank: int) -> shared_memory.SharedMemory:
-        """The segment holding the host weights of local ``rank``."""
         return shared_memory.SharedMemory(
             name=self.get_shared_memory_name(rank))
 
@@ -342,9 +340,8 @@ class SingleLayerMoeLoadBalancer:
             expert_count: total number of experts
             updates_enabled: whether to enable weight updates
             repeated_count: the repeated count of current layer, used when forward is repeated more than once like MTP.
-            slot_count_per_rank: the number of slots per rank, ``spare_slot_count`` of them last.
-            spare_slot_count: the spare slots per rank of WideEP fault tolerance; they stay empty and map no device
-                memory until a lost rank's expert is restored into one.
+            slot_count_per_rank: the number of slots per rank, including the spare slots.
+            spare_slot_count: the number of unbacked spare slots per rank for WideEP fault tolerance.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -354,9 +351,7 @@ class SingleLayerMoeLoadBalancer:
         self.repeated_count = repeated_count
         self.slot_count_per_rank = slot_count_per_rank
         self.spare_slot_count = spare_slot_count
-        # Per weight name, its slot tensor whose spare slots map no device memory (create_spare_slot_storage).
         self.unbacked_slot_tensors: Dict[str, torch.Tensor] = {}
-        # The placement of set_initial_weight_assignments ([ranks * slots]), with fault tolerance.
         self.initial_placement: Optional[np.ndarray] = None
         layer_id = self.single_layer_load_balancer_impl.get_layer_id()
         sharer_class = HostMoeTensorSharer
@@ -423,16 +418,14 @@ class SingleLayerMoeLoadBalancer:
 
     @property
     def active_slot_count_per_rank(self) -> int:
-        """The local slots that hold experts while every rank is live: all but the spare slots."""
         return self.slot_count_per_rank - self.spare_slot_count
 
     @property
     def spare_slots(self) -> range:
-        """The local spare slots: the last ``spare_slot_count``."""
         return range(self.active_slot_count_per_rank, self.slot_count_per_rank)
 
     def spare_slots_where(self, local: np.ndarray, filled: bool) -> List[int]:
-        """The spare slots that ``local`` (an expert per local slot, -1 = empty) fills, or leaves empty."""
+        """Return the spare slots that ``local`` fills, or leaves empty."""
         return [
             slot for slot in self.spare_slots if (local[slot] >= 0) == filled
         ]
@@ -444,8 +437,6 @@ class SingleLayerMoeLoadBalancer:
         return self.updates_enabled
 
     def need_load_shared_weights(self):
-        """Whether the ranks of a node share every expert's host weights: online EPLB loads slots from them, and
-        WideEP fault tolerance restores lost experts into spare slots from them."""
         return self.is_dynamic_routing() or self.spare_slot_count > 0
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
@@ -518,7 +509,7 @@ class SingleLayerMoeLoadBalancer:
         self._add_host_weight(expert_id, name, host_weight)
 
     def with_spare_slots(self, eplb_assignments: List[int]) -> List[int]:
-        """``eplb_assignments`` (the expert of each EPLB slot) with each rank's spare slots appended empty (-1)."""
+        """Return ``eplb_assignments`` with each rank's spare slots appended empty."""
         if not self.spare_slot_count:
             return eplb_assignments
         per_rank = np.asarray(eplb_assignments).reshape(
@@ -532,7 +523,7 @@ class SingleLayerMoeLoadBalancer:
         Set the initial weight assignments for the layer.
 
         Args:
-            initial_weight_assignments: The expert of every slot, -1 for the spare slots (see with_spare_slots).
+            initial_weight_assignments: The expert of every slot, -1 for the spare slots.
         """
         if fault_tolerance_mode():
             self.initial_placement = np.array(initial_weight_assignments,
@@ -562,11 +553,7 @@ class SingleLayerMoeLoadBalancer:
 
     def create_spare_slot_storage(
             self, name: str, slots: torch.Tensor) -> Optional[torch.Tensor]:
-        """Storage for weight ``name`` in place of ``slots`` ([local slots, ...], as its quantization method created
-        it): a CUDA tensor of the same shape and dtype whose spare slots map no device memory, holding the active
-        slots of ``slots`` unless that is a meta tensor. None if that saves no memory (no VMM chunk lies within the
-        spare slots). With online EPLB its memory is host accessible, as ``make_tensor_host_accessible`` makes slots
-        without spare slots, so that the updates write it with CPU copies."""
+        """Return storage for weight ``name`` whose spare slots map no device memory, or None if that saves none."""
         slot_bytes = slots.numel() // slots.shape[0] * slots.element_size()
         spare_slots = list(self.spare_slots)
         if not torch.ops.trtllm.moe_unbacked_slots_save_memory(
@@ -581,14 +568,7 @@ class SingleLayerMoeLoadBalancer:
         return storage
 
     def use_spare_slot_storage(self, wt: torch.Tensor, name: str):
-        """Takes the loaded ``wt`` ([local slots, ...], contiguous) as the slots of weight ``name``. Without storage
-        from ``create_spare_slot_storage``, online EPLB makes ``wt`` host accessible as without spare slots. Static
-        routing registers the slots here, where online EPLB registers them through ``add_register_weight_fn``: the
-        expert restore loads them with the C++ weight updater.
-
-        Raises:
-            RuntimeError: ``wt`` lost the storage made for it (a transform after loading replaced it).
-        """
+        """Take the loaded ``wt`` as the slots of weight ``name``."""
         unbacked = self.unbacked_slot_tensors.get(name)
         if unbacked is None:
             if self.updates_enabled:
@@ -611,7 +591,6 @@ class SingleLayerMoeLoadBalancer:
             fn(*args, **kwargs)
 
         self.to_migrate_weight_fns = []
-        # A restore loads every unbacked slot tensor from the host weights.
         without_host_weights = [
             name for name in sorted(self.unbacked_slot_tensors)
             if name not in self.host_tensor_sharer.name_info
@@ -637,7 +616,7 @@ class SingleLayerMoeLoadBalancer:
                 self._add_host_weight_from_tensor)
 
     def spare_slot_bytes_to_back(self, slots: Sequence[int]) -> int:
-        """The device bytes ``EplbExpertRestore.set_spare_slots_backed`` would map now to back ``slots``."""
+        """Return the device bytes backing ``slots`` would map now."""
         if not slots:
             return 0
         return sum(
@@ -676,8 +655,7 @@ class SingleLayerMoeLoadBalancer:
 
     def start_set_cpu_stage(self):
         """
-        Start to set the CPU stage. Called before the combine, which lets the
-        peers start their next dispatch.
+        Start to set the CPU stage.
         """
         assert self.func_called_count["done_wait_gpu_stage"] == 1
         assert self.func_called_count["start_set_cpu_stage"] == 0
@@ -687,7 +665,7 @@ class SingleLayerMoeLoadBalancer:
                 if self.func_called_count[
                         "update_statistic_with_gathered_statistic"]:
                     # A peer's next dispatch overwrites the gathered statistics
-                    # in place: the combine waits until they are summed.
+                    # in place, so the combine waits until they are summed.
                     self.event_dict[EventType.MoeBalancer].wait()
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
@@ -712,7 +690,6 @@ class SingleLayerMoeLoadBalancer:
                 self.event_dict[EventType.MoeBalancer].wait()
 
     def abandon_forward(self):
-        """Forget the calls of a forward that stopped part way through this layer."""
         for name in self.func_called_count:
             self.func_called_count[name] = 0
         self.statistic_flag_tensor = None
@@ -1032,7 +1009,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
-            mapping: The deployment's mapping; WideEP fault tolerance takes the node of each EP rank from it.
+            mapping: The deployment's mapping.
         """
         self.is_shutdown = True
         self.ep_rank = ep_rank
@@ -1049,7 +1026,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(
             'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
         if fault_tolerance_mode():
-            # The host copies outlive their processes while the deployment serves: names of this deployment alone.
+            # The host copies outlive their processes, so their names are unique to the deployment.
             from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
                 deployment_nonce
             self.shared_memory_base_name += f"_{deployment_nonce()}"
@@ -1063,7 +1040,6 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.enable_update_weights = False
 
         self.next_layer_repeated_count = None
-        # WideEP fault tolerance: the spare slots and the restore of a lost rank's experts into them.
         self.expert_restore = None
         if fault_tolerance_mode():
             from .eplb_expert_restore import EplbExpertRestore
@@ -1117,7 +1093,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         Args:
             expert_count: The number of experts in the layer
             top_k: The number of experts each token selects
-            slot_count_per_rank: The number of EPLB slots per rank; WideEP fault tolerance adds spare slots.
+            slot_count_per_rank: The number of EPLB slots per rank, excluding spare slots.
             aux_stream: The auxiliary stream for overlapping
 
         Returns:
@@ -1162,7 +1138,6 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         # All shared memory create before this barrier.
         self.shared_mpi_comm.barrier()
         if fault_tolerance_replacement() is not None:
-            # A replacement rank's barrier waits for nobody.
             self.expert_restore.wait_for_node_host_copies()
         # All shared memory mapping after this barrier.
         spare_slot_count = max((layer.spare_slot_count
@@ -1187,7 +1162,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.load_balancer_impl.set_warm_up_iter_count(iter_count)
 
     def has_host_copies(self) -> bool:
-        """Whether this node holds host copies of every expert of every layer."""
+        """Return whether this node holds host copies of every expert of every layer."""
         return all(layer.need_load_shared_weights()
                    for layer in self.single_layer_load_balancers)
 
@@ -1226,12 +1201,9 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.iter_id += 1
 
     def abandon_iterations(self) -> None:
-        """End the online EPLB work of the iterations a rank failure interrupted (WideEP fault tolerance).
+        """End the online EPLB work of the iterations a rank failure interrupted.
 
-        Every kernel already launched must be able to finish (the all-to-all honours its abort record), and no
-        forward may be launched until this returns. Waits for the launched kernels and the weight updates already
-        started, as long as they take. The statistics and the update plan restart, so survivors stay in step from
-        here; their placements may differ until one agreed placement is restored.
+        Every launched kernel must be able to finish, and no forward may launch until this returns.
         """
         if self.in_iter:
             raise RuntimeError(
@@ -1241,11 +1213,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             layer.abandon_forward()
 
     def shutdown(self, local_safe: bool = True) -> bool:
-        """Collectively release resources after an all-rank safety preflight.
-
-        With WideEP fault tolerance a rank of the node may be gone and each process releases only its own mappings
-        of the host copies, so the preflight is this rank's alone and no node barrier runs.
-        """
+        """Collectively release resources after an all-rank safety preflight."""
         if self.is_shutdown:
             return True
         local_safe = bool(local_safe and not self.in_iter)

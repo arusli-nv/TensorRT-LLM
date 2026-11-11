@@ -230,11 +230,9 @@ Several MoE communication kernels wait for their peers inside the kernel and tra
 
 Timeouts are nominal: NVLinkOneSided, DeepGEMM and DeepEP convert seconds at an assumed 2 GHz SM clock, while NcclEP uses the device's clock rate.
 
-### NVLinkOneSided rank mask
+### Wide-EP fault tolerance
 
-With committed EP membership (`ep_group_health`), NVLinkOneSided launches its rank-mask kernels, which skip masked peers. The kernels read the active-rank mask at execution time through a pointer to a device record that each communicator allocates at construction, so its address is fixed. The record is rewritten, by a copy on the current stream, only when the committed or requested mask changes, and never during CUDA graph capture. The kernels do not check the local rank's own bit: whoever writes a mask refuses one that clears it. Graphs captured once therefore follow membership changes made between captures. Capture requires an execution state bound to the communicator (`bind_execution_state`, fault-tolerance recovery): unbound, a replay would bypass the mask publication and the watchdog, so dispatch refuses capture. Without rank-mask mode the mask-free kernel variants run.
-
-Under WideEP fault tolerance every NVLinkOneSided layer is bound to one shared `MoeExecutionState` (`communication/execution_state.py`), and its kernels read that state's records instead of the per-communicator one: the device mask, which `install_mask` rewrites from the committed membership only while the model is idle, and the abort record (`MoeA2AAbortState`) in pinned host memory: `request_abort` sets its request word from any thread to release kernels waiting on a failed rank, a kernel that returns without some peer's data sets its status word, and a wait on a peer that lasts far longer than a healthy one publishes the flag value it expects from that peer (wait evidence) until it ends. One waiting thread per block reads the request, at most once per poll period.
+Under `enable_wide_ep_fault_tolerance`, a communication backend binds to the shared `MoeExecutionState` (`bind_execution_state`). Its kernels read the active-rank mask through that state's fixed device pointer, so captured CUDA graphs follow membership changes, and stop waiting on a peer once the state's abort request is set. `NVLinkOneSided` is the only backend that implements this.
 
 ### Core Design Principles
 

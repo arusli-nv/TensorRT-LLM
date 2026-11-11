@@ -165,7 +165,6 @@ class DecoderRunner(ScheduledModelRunner):
     _steady_gen_cache_supported = True
     _eager_workspace_reclaim_supported = True
     _deferred_decode_outputs_supported = True
-    # Bound to every NVLinkOneSided layer in fault tolerance mode; None otherwise.
     moe_execution_state: MoeExecutionState | None = None
 
     def __init__(
@@ -292,7 +291,7 @@ class DecoderRunner(ScheduledModelRunner):
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
         self._initialize_moe_workspace_reclaimer()
-        # Bound before warmup captures CUDA graphs, which then read the state's rank-mask and abort records.
+        # Bound before warmup captures the CUDA graphs that read it.
         self.moe_execution_state = (
             MoeExecutionState.for_model(model) if fault_tolerance_mode() else None
         )

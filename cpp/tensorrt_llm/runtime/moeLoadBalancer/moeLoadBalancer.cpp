@@ -69,7 +69,6 @@ bool isSlotUsable(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
         && (unusableSlotMask == nullptr || (*unusableSlotMask)[rank * metaInfo.slotCountPerRank + localSlotId] == 0);
 }
 
-// Per rank, the number of slots EPLB may fill.
 std::vector<int> getUsableSlotCounts(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
     std::vector<uint8_t> const* deadRankMask, std::vector<uint8_t> const* unusableSlotMask)
 {
@@ -208,7 +207,7 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     // 3. Maintain Rank state and initialize Priority Queue
     std::vector<double> currentRankLoad(metaInfo.epSize, 0.0);
     std::vector<int> currentRankSlots(metaInfo.epSize, 0); // Tracks the count of assigned slots per rank
-    std::vector<int> nextLocalSlotId(metaInfo.epSize, 0);  // The first local slot not yet considered per rank
+    std::vector<int> nextLocalSlotId(metaInfo.epSize, 0);
     for (int rank = 0; rank < metaInfo.epSize; ++rank)
     {
         std::fill_n(rankExpertIds[rank].begin(), metaInfo.slotCountPerRank, -1);
@@ -500,7 +499,6 @@ void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> co
 {
     std::fill_n(mCpuPlacementInfo.expertReplicaCount.begin(), mMetaInfo.expertCount, 0);
     mUnusableSlots.clear();
-    // Empty (-1) slots are spare slots of WideEP fault tolerance.
     int const minExpertId = mMoeLoadBalancer->mRankFailureRecovery ? -1 : 0;
     for (int rank = 0; rank < mMetaInfo.epSize; ++rank)
     {
@@ -582,7 +580,7 @@ void SingleLayerMoeLoadBalancer::setGpuStage()
 
 void SingleLayerMoeLoadBalancer::waitCpuStage()
 {
-    // Abandoned iterations (see MoeLoadBalancer::abandonIterations) may never hand the layer back: no update starts.
+    // An abandoned iteration may never hand the layer back, so no update starts.
     if (!tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal, &mMoeLoadBalancer->mAbandoning))
     {
         mUpdateWeightsEnabled = false;
@@ -669,7 +667,6 @@ std::vector<int> SingleLayerMoeLoadBalancer::computeReplicaCounts(
 
 bool SingleLayerMoeLoadBalancer::routesEachExpertToOneSlot() const
 {
-    // Without fault tolerance, routing uses the replica-choosing kernel.
     return mMoeLoadBalancer->mRankFailureRecovery && mOneReplicaPerExpert;
 }
 
@@ -733,8 +730,6 @@ void SingleLayerMoeLoadBalancer::installPlacement(
             mUnusableSlots[rank * mMetaInfo.slotCountPerRank + localSlotId] = static_cast<uint8_t>(empty);
         }
     }
-    // The updater loads the local slots whose expert differs from the current placement on the load balancer's stream,
-    // which then copies the tables and waits for both.
     mCpuPlacementInfo.rankExpertIds = rankExpertIds;
     mWeightUpdater->updateWeights(&mCpuPlacementInfo, /*useGpu=*/true);
     mCpuPlacementInfo.oldRankExpertIds = rankExpertIds;
@@ -1024,8 +1019,6 @@ void HostMemoryMoeWeightUpdater::updateWeights(
     {
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
         int newExpertId = placementCpuInfo->rankExpertIds[mMetaInfo.epRank][slotId];
-        // -1 (fault tolerance only): an empty slot (no routing to it). Emptying a slot loads nothing; filling one
-        // loads its expert.
         TLLM_CHECK_WITH_INFO(oldExpertId >= minExpertId && oldExpertId < mMetaInfo.expertCount,
             "oldExpertId=%d, should be in range [%d, %d)", oldExpertId, minExpertId, mMetaInfo.expertCount);
         TLLM_CHECK_WITH_INFO(newExpertId >= minExpertId && newExpertId < mMetaInfo.expertCount,
@@ -1289,8 +1282,7 @@ void MoeLoadBalancer::restorePlacement(
     {
         layer->waitLastUpdateDone();
     }
-    // Work already queued on any stream may still read the slots and placement tables that installPlacement rewrites
-    // on the balancer's stream; it waits for those copies, so work launched after this returns reads the new ones.
+    // Work queued on any stream may still read the slots and placement tables that installPlacement rewrites.
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
     for (size_t i = 0; i < mLayers.size(); ++i)
     {
@@ -1309,8 +1301,7 @@ void MoeLoadBalancer::abandonIterations()
         return;
     }
     workerLock.unlock();
-    // The launched kernels finish first: the worker keeps handing them the layers they wait for and taking each
-    // layer back, so its hand-overs stay paired with theirs, and afterwards no GPU work uses the signals.
+    // The worker keeps handing launched kernels their layers until they finish, so no GPU work uses the signals after.
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
     workerLock.lock();
     mAbandoning.store(true, std::memory_order_release);

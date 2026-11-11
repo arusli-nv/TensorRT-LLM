@@ -32,8 +32,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Whether slotCount slots of slotBytes each take less device memory with the unbackedSlots unbacked than plainly
-// allocated (UnbackedSlotMemory::savesMemory, on the current device).
+// Return whether leaving unbackedSlots unbacked saves device memory on the current device.
 bool moeUnbackedSlotsSaveMemory(int64_t slotBytes, int64_t slotCount, at::IntArrayRef unbackedSlots)
 {
     TORCH_CHECK(slotBytes > 0 && slotCount > 0, "expects slots of at least one byte");
@@ -41,11 +40,8 @@ bool moeUnbackedSlotsSaveMemory(int64_t slotBytes, int64_t slotCount, at::IntArr
         static_cast<int>(slotCount), std::vector<int>(unbackedSlots.begin(), unbackedSlots.end()));
 }
 
-// A new contiguous tensor of slots (dimension 0 of sizes) on the current CUDA device whose unbackedSlots map no device
-// memory of their own (UnbackedSlotMemory); for slots that moeUnbackedSlotsSaveMemory says save memory. Its contents
-// are undefined, and an access to an unbacked slot reads or writes the scratch. Releasing its storage synchronizes its
-// device, so the tensor must not be freed during CUDA graph capture. With hostAccessible, online EPLB's updates write
-// its slots with CPU copies, as the slots migrateToHostAccessible makes.
+// Create a tensor of slots whose unbackedSlots map a shared scratch. Releasing its storage synchronizes the device,
+// so the tensor must not be freed during CUDA graph capture.
 at::Tensor moeUnbackedSlotTensor(
     at::IntArrayRef sizes, at::ScalarType dtype, at::IntArrayRef unbackedSlots, bool hostAccessible)
 {
@@ -64,10 +60,8 @@ at::Tensor moeUnbackedSlotTensor(
         .set_(at::Storage(storageImpl), /*storage_offset=*/0, sizes);
 }
 
-// Backs unbacked slots of tensors that moeUnbackedSlotTensor created with device memory of their own at the same
-// addresses (contents undefined: the caller loads them), or with backed=false maps them to the shared scratch again:
-// of tensors[i], the next slotCounts[i] of slots. Returns the device bytes mapped or released. Synchronizes the device
-// once if a mapping changes: only while no kernel uses the slots, and not during CUDA graph capture.
+// Map device memory of their own at the slots' addresses, or the shared scratch again, and return the bytes changed.
+// A changed mapping synchronizes the device, so no kernel may use the slots and no CUDA graph capture may run.
 int64_t moeUnbackedSlotsSetBacked(
     at::TensorList tensors, at::IntArrayRef slots, at::IntArrayRef slotCounts, bool backed)
 {
@@ -89,7 +83,7 @@ int64_t moeUnbackedSlotsSetBacked(
     return static_cast<int64_t>(tensorrt_llm::runtime::UnbackedSlotMemory::getInstance().setBacked(ranges, backed));
 }
 
-// The device bytes moeUnbackedSlotsSetBacked({tensor}, slots, {slots.size()}, true) would map now.
+// Return the device bytes that backing the slots would map now.
 int64_t moeUnbackedSlotsBytesToBack(at::Tensor const& tensor, at::IntArrayRef slots)
 {
     TORCH_CHECK(tensor.device().is_cuda(), "expects a CUDA tensor of slots");

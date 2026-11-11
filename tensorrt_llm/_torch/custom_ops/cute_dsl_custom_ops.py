@@ -286,12 +286,7 @@ class GroupedGemmInputsHelper:
     def tuner_expert_layout(
             num_experts: int, num_local_experts: int, local_expert_offset: int,
             tuner_num_local_experts: Optional[int]) -> Tuple[int, int, int]:
-        """The ``(num_experts, num_local_experts, local_expert_offset)`` to tune with.
-
-        That of the same layer with only the first ``tuner_num_local_experts``
-        local experts per rank, whose others (spare EPLB slots) receive no
-        tokens; the given layout when it is None.
-        """
+        """Return the expert layout that tunes only ``tuner_num_local_experts``."""
         if tuner_num_local_experts is None:
             return num_experts, num_local_experts, local_expert_offset
         ep_size = num_experts // num_local_experts

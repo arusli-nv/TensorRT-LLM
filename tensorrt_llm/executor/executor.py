@@ -650,10 +650,6 @@ class GenerationExecutor(ABC):
                 f"Unsupported orchestrator_type: {orchestrator_type}")
 
         if fault_tolerance_mode():
-            # WideEP fault tolerance starts every rank as its own process, not
-            # in this process's MPI world: the session runs rank 0's worker,
-            # which hands its arguments to the other ranks. Under
-            # trtllm-llmapi-launch, this process has rank 0's identity.
             if wide_ep_fault_tolerance_rank() is None and global_mpi_size() > 1:
                 raise ValueError(
                     "WideEP fault tolerance starts every rank as its own "

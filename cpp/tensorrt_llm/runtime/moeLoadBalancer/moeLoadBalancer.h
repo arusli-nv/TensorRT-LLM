@@ -79,13 +79,10 @@ public:
 
     virtual ~MoeWeightUpdaterBase() {}
 
-    // A slot at its device address. Updates with CPU copies write it through HostAccessibleDeviceAllocator, which
-    // maps a slot whose bytes lie in several allocations piece by piece.
     void addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot);
     virtual void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) = 0;
     virtual void finalizeWeights();
-    // Loads the local slots whose expert changes from the host weights: with useGpu, GPU copies on the load balancer's
-    // stream; otherwise this thread's share (rank of size threads) of CPU copies.
+    // Load the local slots whose expert changes, with GPU copies or with this thread's share of CPU copies.
     virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, bool useGpu, int rank = 0, int size = 1)
         = 0;
 
@@ -134,8 +131,7 @@ public:
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight);
 
     // set initial weight assignments for each slot
-    // index is the global slot id, value is the expert id; under WideEP rank-failure recovery
-    // -1 leaves the slot empty and out of EPLB's updates
+    // index is the global slot id, value is the expert id, or -1 for an empty slot
     // should bind to python
     void setInitialWeightAssignments(std::vector<int> const& initialWeightAssignments);
 
@@ -172,11 +168,7 @@ public:
         return mGpuPlacementGpuAccess;
     }
 
-    // Whether routing uses the kernel for one slot per expert: fault tolerance is on and every expert has exactly one
-    // replica in the initial placement (fixed for the life of the layer, so CUDA graphs and eager routing use the same
-    // kernel). Every later placement then keeps one replica per expert: a restored one is checked, and online EPLB's
-    // updates fill exactly as many slots as there are experts (the spare slots are unusable until a restore fills
-    // them).
+    // Fixed for the life of the layer, so CUDA graphs and eager routing use the same kernel.
     bool routesEachExpertToOneSlot() const;
 
     tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal* getSignal()
@@ -204,28 +196,19 @@ private:
     void waitCpuStage();
     void maybeStartUpdateWeights();
     void waitLastUpdateDone();
-    // After abandoned iterations, while the worker and the GPU are idle: clears the statistics and gives the signal
-    // to the CPU, so the next iteration starts with the CPU stage.
     void resetAfterAbandon();
     void validateMaskOnly(std::vector<uint8_t> const& deadRankMask) const;
     void reconfigureMaskOnly(std::vector<uint8_t> const& deadRankMask);
     std::vector<int> computeMaskOnlyReplicaCounts(std::vector<uint8_t> const& deadRankMask) const;
-    // Per expert, its replicas in rankExpertIds on the ranks deadRankMask leaves alive; every expert must keep one.
     std::vector<int> computeReplicaCounts(
         std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
     void validatePlacement(
         std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds) const;
-    // Loads the local slots whose expert rankExpertIds changes with GPU copies, then installs rankExpertIds (the failed
-    // ranks' rows emptied) as the placement routing reads. A live rank's empty slots are spare: EPLB's updates leave
-    // them empty.
     void installPlacement(std::vector<uint8_t> const& deadRankMask, std::vector<std::vector<int>> const& rankExpertIds);
-    // Rejects replica counts the routing kernel cannot serve (see routesEachExpertToOneSlot).
     void checkRoutingKernelServes(std::vector<int> const& expertReplicaCount) const;
-    // Caches whether the replica counts of the initial placement are one per expert.
     void updateOneReplicaPerExpert();
 
     MoeLoadBalancer* mMoeLoadBalancer = nullptr;
-    // Every expert has exactly one replica in the initial placement (see updateOneReplicaPerExpert).
     bool mOneReplicaPerExpert = false;
 
     std::unique_ptr<MoeWeightUpdaterBase> mWeightUpdater;
@@ -241,8 +224,7 @@ private:
 
     int64_t mLastUpdateTaskId = -1;
 
-    // Per global slot (rank * slotCountPerRank + localSlotId), 1 if EPLB's updates must leave it empty: the -1 slots
-    // of the initial assignment or of a restored placement. Empty: every slot is usable.
+    // Per global slot, 1 if EPLB's updates must leave it empty.
     std::vector<uint8_t> mUnusableSlots;
 
     cudaEvent_t mUpdateWeightsDoneEvent = nullptr;
@@ -327,30 +309,16 @@ public:
     void reconfigureMaskOnly(std::vector<int> const& deadRanks);
 
     // should bind to python
-    // WideEP fault tolerance only: deadRanks become the failed ranks (a rank left out rejoined) and each layer gets
-    // its placement from layerRankExpertIds ([layer][epSize][slotCountPerRank] expert ids, -1 = an empty slot; failed
-    // ranks' rows are ignored). Every layer is validated before anything changes; only while no iteration runs and,
-    // with online updates, after abandonIterations. The device synchronizes, then each layer's weight updater loads
-    // the local slots whose expert changes from the host weights with GPU copies (the caller backs unbacked slots
-    // first) and the placement tables are rewritten; both are done when this returns, so work launched before reads
-    // the old slots and tables and work launched after the new ones. Routing reads the expert's slot on every rank:
-    // every rank must finish restoring before any rank routes with the new placement (the caller's barrier).
+    // Set the failed ranks, load the changed local slots and install a placement per layer, while no iteration runs.
+    // Every rank must finish restoring before any rank routes with the new placement.
     void restorePlacement(
         std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
 
     // should bind to python
-    // WideEP fault tolerance only, while no iteration runs, after a rank failure interrupted the forward: ends the
-    // online EPLB work of the iterations started so far. Every kernel already launched must be able to finish (the
-    // all-to-all honours its abort record), and no forward may be launched until this returns. The device
-    // synchronizes; the worker then stops waiting for layers the GPU never hands back and starts no further weight
-    // update; the updates already started finish. Then the statistics restart from zero and the update plan from its
-    // first step, so every survivor updates the same layers with the same statistics from here. The placements of the
-    // survivors may differ: the caller installs one agreed placement with restorePlacement. Waits as long as that
-    // takes; returns at once without online updates.
+    // End the online EPLB work of the iterations started before a rank failure, and restart the statistics and the
+    // update plan so that every survivor updates the same layers. Every launched kernel must be able to finish.
     void abandonIterations();
 
-    // Whether online weight updates copy the weights with GPU copies instead of host writes; required when the slot
-    // storage is not host accessible.
     void setUseGpuMemcpy(bool useGpuMemcpy = false)
     {
         mUseGpuMemcpy = useGpuMemcpy;
@@ -362,8 +330,6 @@ private:
 
     void startThreads();
 
-    // The checks every rank-failure recovery call starts with, with mWorkerThreadMutex held: recovery is on, the model
-    // is finalized, no iteration is active and the load balancer's device is current. action names the call.
     void checkRecoveryCall(char const* action) const;
 
     // worker thread is used to wait for gpu update done signal
@@ -371,13 +337,9 @@ private:
     void workerThread();
     std::mutex mWorkerThreadMutex;
     std::condition_variable mWorkerThreadCondition;
-    // WideEP rank-failure recovery: spare slots (-1 in the initial assignment) and one-slot-per-expert routing.
     bool mRankFailureRecovery = false;
-    // With rank-failure recovery, the last iteration the worker finished walking (see abandonIterations), and its
-    // notification.
     int64_t mWorkerDoneIterId = -1;
     std::condition_variable mWorkerDoneCondition;
-    // With rank-failure recovery: abandonIterations is ending the iterations started so far (read by the worker).
     std::atomic<bool> mAbandoning{false};
     bool mWorkerThreadStopped = true;
     int64_t mWarmUpUntilIter = -1;
@@ -432,8 +394,7 @@ private:
 };
 
 // functions exposed for testing
-// The planner fills every slot of the ranks deadRankMask leaves alive except the slots unusableSlotMask marks
-// (per global slot, rank * slotCountPerRank + localSlotId; nullptr: none), which it leaves -1.
+// Slots that unusableSlotMask marks are left -1.
 void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
     MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr,
     std::vector<uint8_t> const* unusableSlotMask = nullptr);

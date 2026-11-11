@@ -7725,24 +7725,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @property
     def gpu_quota(self) -> int:
-        """The device bytes of the GPU KV cache pool."""
+        """Return the device bytes of the GPU KV cache pool."""
         return self.impl.get_quota(GPU_LEVEL)
 
     def resize_gpu_quota(self, quota: int) -> int:
         """Resize the GPU KV cache pool to ``quota`` bytes, rounded down to its allocation unit.
 
-        For memory the engine needs while serving, e.g. the EPLB slots that hold a lost rank's experts. A
-        shrinking pool evicts or drops the pages it gives up (reusable pages first) and may move the ones it
-        keeps. Every KV cache must be suspended, the CUDA graph padding dummies included (as for ``adjust()``,
-        see ``PyExecutor._kv_pools_suspended``), and no queued work may use the pool. The scheduler's
-        capacity must be read again afterwards.
+        Every KV cache must be suspended, the CUDA graph padding dummies included, and no queued work may use
+        the pool.
 
         Returns:
             The quota the pool took.
-
-        Raises:
-            RuntimeError: The pool cannot take that quota (its minimum slots, device memory or its reserved
-                maximum).
         """
         unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
         quota = max(0, quota) // unit * unit
@@ -8124,8 +8117,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def try_commit_blocks(self, request: LlmRequest, *, commit_end: Optional[int] = None) -> None:
-        """Commit the request's context KV for reuse up to ``commit_end`` (default: its current context position);
-        once that is the end of the context, stop committing unless decode KV stays reusable."""
+        """Commit the request's context KV for reuse up to ``commit_end``, by default its context position."""
         should_block_reuse = (
             self.enable_block_reuse
             and self._can_publish_block_reuse
@@ -9110,10 +9102,8 @@ class KVCacheManagerV2(BaseResourceManager):
         layer. In non-overlap scheduler, you should call it together with
         update_resources().
 
-        With ``commit_ends``, the chunks' KV is not committed for reuse here:
-        each request's commit end (its context position after this chunk) is
-        recorded in it, by request id, for :meth:`commit_context_blocks` once
-        the step is accepted.
+        With ``commit_ends``, each request's commit end is recorded for
+        :meth:`commit_context_blocks` instead of committed here.
         """
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
@@ -9165,11 +9155,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def commit_context_blocks(
         self, scheduled_batch: ScheduledRequests, commit_ends: Dict[int, int]
     ) -> None:
-        """Commit for reuse the context chunks of ``scheduled_batch`` up to the
-        ends :meth:`update_context_resources` recorded in ``commit_ends``, once
-        their step is accepted, and saves a finished context's conversation
-        drop plan, which covers the committed blocks, after its last commit.
-        Skips a request that has been freed or whose cache is suspended since."""
+        """Commit for reuse the context chunks of an accepted step up to ``commit_ends``."""
         for req in scheduled_batch.context_requests:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if req.py_request_id in commit_ends and kv_cache is not None and kv_cache.is_active:

@@ -300,8 +300,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._engine_dead = False
 
         self.model_world_size = model_world_size
-        # WideEP fault tolerance: the reader of the deployment's membership,
-        # which the server's probes read (set once the workers are ready).
         self.fault_tolerance_health = None
 
         _llm_args = worker_kwargs.get("llm_args", None)
@@ -1109,14 +1107,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _join_membership(self, worker_process_identities: list,
                          address: str) -> None:
-        """Read the WideEP fault-tolerance membership store at ``address``.
+        """Follow the membership store at ``address`` and watch rank 0's worker.
 
-        Rank 0's READY carries ``address``; the server's probes read the store
-        through ``fault_tolerance_health`` when they are served. The session
-        holds rank 0's worker only, whose death (it hosts the authority) ends
-        the server like an ABORT record: the process monitor watches it, also
-        where the session is one ``_register_worker_processes`` does not
-        monitor (the remote session of ``trtllm-llmapi-launch``). The authority
+        Rank 0 hosts the authority, so its death ends the server. The authority
         handles the death of any other rank.
         """
         from tensorrt_llm._torch.distributed.membership import JOIN_SECRET_ENV

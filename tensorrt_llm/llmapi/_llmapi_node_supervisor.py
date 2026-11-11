@@ -1,13 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The node supervisor of a WideEP fault-tolerant deployment: keeps the ranks of one node served.
-
-``trtllm-llmapi-launch`` runs one per node under fault tolerance. It starts the node's ranks as its children (each in
-its own session, dying with the supervisor), follows the membership record over its own connection to the authority,
-kills a rank the record no longer lists, starts a replacement of a lost rank on the same GPU, relaunches a lost
-node's supervisor on node 0 under ``mpirun``, and ends the node's ranks once the deployment ended. It uses no GPU and
-no MPI. See ``docs/source/features/wide-ep-fault-tolerance.md``.
-"""
+"""Node supervisor of a WideEP fault-tolerant deployment, which starts and replaces the ranks of one node."""
 
 import argparse
 import contextlib
@@ -27,8 +20,7 @@ from dataclasses import dataclass
 from types import FrameType
 from typing import Callable, Dict, Hashable, List, Optional, Set, Tuple
 
-# The PMIx server URI variables a process mpirun starts holds, newest protocol first: prun reaches the job's PRRTE
-# through any of them.
+# Newest protocol first.
 _PMIX_SERVER_URI_VARS = (
     "PMIX_SERVER_URI41",
     "PMIX_SERVER_URI4",
@@ -37,41 +29,34 @@ _PMIX_SERVER_URI_VARS = (
     "PMIX_SERVER_URI2",
 )
 _PR_SET_PDEATHSIG = 1
-# Where the shared-memory segments of a node are (POSIX shared memory on Linux).
 _SHM_DIR = "/dev/shm"
-# How long a connection attempt to the authority lasts, and how long until the next one.
 _CONNECT_TIMEOUT_S = 2.0
-# How long the ranks get to end before SIGTERM, and again after it; twice this stays below the time the launcher gives
-# the supervisor to end (Kubernetes' termination grace period, 30 s by default; Slurm's KillWait).
+# Twice this stays below the grace period the launcher gives the supervisor (30 s by default on Kubernetes).
 _STOP_GRACE_S = 10.0
-# The delay before a replacement or a relaunch is attempted again doubles from the first to the last.
 _MIN_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 60.0
 
 
 def _exit_status(returncode: int) -> int:
-    """A process's status as a shell reports it: 128 plus the signal number for a process a signal ended."""
+    """Return the exit status as a shell reports it."""
     return 128 - returncode if returncode < 0 else returncode
 
 
 @dataclass
 class _Process:
-    """The process of one of the supervisor's ranks."""
-
     child: subprocess.Popen
     replacement: bool
-    pidfd: Optional[int]  # readable once the process ended; None once it was reaped
-    # The incarnation the authority assigned it, once a record listed it (an original rank's is 0).
+    pidfd: Optional[int]
     incarnation: Optional[int] = None
-    listed: bool = False  # a record listed it as a live member
-    admitted: bool = False  # a COMMITTED record listed it as a live member
+    listed: bool = False
+    # A COMMITTED record listed it as a live member.
+    admitted: bool = False
     killed: bool = False
-    status: Optional[int] = None  # once it ended
+    status: Optional[int] = None
 
 
 class _Backoff:
-    """When the next attempt of each of several things is due: the delay doubles with each attempt, until
-    :meth:`reset`."""
+    """Track per-key retry times with a delay that doubles until :meth:`reset`."""
 
     def __init__(self):
         self._due_s: Dict[Hashable, float] = {}
@@ -93,15 +78,16 @@ class _Backoff:
 _WAKE = "wake"
 _PARENT = "parent"
 _AUTHORITY = "authority"
-_RELAUNCHED = "relaunched"  # the process that relaunched a lost node's supervisor
+_RELAUNCHED = "relaunched"
 
 
 class NodeSupervisor:
-    """Supervises the ranks of node ``node`` of ``nodes``, ``gpus_per_node`` each; :meth:`run` returns the exit status.
+    """Start, supervise and replace the ranks of one node.
 
-    ``command`` starts each rank's process (with ``rank_0_in_session``, every rank but 0) in ``environ``, without the
-    launcher's MPI variables. On node 0 under ``mpirun``, ``relaunch_command`` starts a process on the host given after
-    it, and ``end_job`` ends the whole job as failed.
+    Args:
+        command: Starts each rank's process, every rank but 0 with ``rank_0_in_session``.
+        relaunch_command: On node 0 under ``mpirun``, starts a process on the host appended to it.
+        end_job: On node 0 under ``mpirun``, ends the whole job as failed.
     """
 
     def __init__(
@@ -152,17 +138,17 @@ class NodeSupervisor:
         self._wake_read, self._wake_write = socket.socketpair()
         self._wake_write.setblocking(False)
         self._store = None
-        self._connection = None  # to the authority
-        self._view = None  # the last NodeView the authority sent
-        self._served = False  # the authority has listed the deployment as serving
+        self._connection = None
+        self._view = None
+        self._served = False
         self._refused = False
         self._connect_due_s = 0.0
-        self._wake_at_s: List[float] = []  # when the next step is due without an event
+        self._wake_at_s: List[float] = []
         self._processes: Dict[int, _Process] = {}
-        self._replacements = _Backoff()  # per rank
-        self._given_up: Set[int] = set()  # ranks this supervisor starts no replacement of
+        self._replacements = _Backoff()
+        self._given_up: Set[int] = set()
         self._relaunched: Dict[int, subprocess.Popen] = {}
-        self._relaunches = _Backoff()  # per node
+        self._relaunches = _Backoff()
         self._host_weights_prefix: Optional[str] = None
         self._first_failure: Optional[int] = None
         self._signum: Optional[int] = None
@@ -173,25 +159,26 @@ class NodeSupervisor:
         def die_with_supervisor() -> None:
             if prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
                 raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
-            if os.getppid() != supervisor:  # the supervisor ended before the prctl
+            # The supervisor ended before the prctl took effect.
+            if os.getppid() != supervisor:
                 os._exit(1)
 
         self._die_with_supervisor = die_with_supervisor
 
     def on_signal(self, signum: int, frame: Optional[FrameType] = None) -> None:
-        """Signal handler: stop, forwarding the signal to rank 0's process."""
+        """Stop the supervisor and forward the signal to rank 0's process."""
         if self._signum is None:
             self._signum = signum
-        with contextlib.suppress(OSError):  # woken already, or the supervisor ended
+        with contextlib.suppress(OSError):
             self._wake_write.send(b"\0")
 
     def run(self) -> int:
-        # Bound, never listened on: keeps a second supervisor of the deployment off the node.
+        # The bound socket keeps a second supervisor of the deployment off the node.
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as node_lock:
             try:
                 node_lock.bind(self._membership.node_supervisor_address())
             except OSError:
-                self._logger.error("another node supervisor of this deployment runs on this node")
+                self._logger.error("Another node supervisor of this deployment runs on this node")
                 return 1
             try:
                 self._watch_parent()
@@ -204,7 +191,7 @@ class NodeSupervisor:
                     self._membership.MembershipState.ABORT,
                 ):
                     self._logger.error(
-                        "the deployment at the rendezvous address ended: use a new join secret"
+                        "The deployment at the rendezvous address ended. Use a new join secret."
                     )
                     return 1
                 if not self._served:
@@ -232,11 +219,11 @@ class NodeSupervisor:
             self._parent_ended = True
             return
         self._selector.register(pidfd, selectors.EVENT_READ, _PARENT)
-        if os.getppid() != self._parent:  # it ended before the pidfd was opened
+        if os.getppid() != self._parent:
             self._parent_ended = True
 
     def _wait(self) -> None:
-        """Wait for the next event, or the next step due without one, and take the events."""
+        """Wait for the next event or the next due step, and take the events."""
         timeout_s = None
         if self._wake_at_s:
             timeout_s = max(0.0, min(self._wake_at_s) - time.monotonic())
@@ -253,14 +240,14 @@ class NodeSupervisor:
                 self._reap(key.data, time.monotonic())
 
     def _step(self, now_s: float) -> Optional[int]:
-        """Act on what changed; once the supervisor is to end, stop and return the exit status."""
+        """Act on what changed, and return the exit status once the supervisor ends."""
         self._wake_at_s = []
         if self._signum is not None:
-            self._logger.warning(f"signal {self._signum}: stopping the node's ranks")
+            self._logger.warning(f"Stopping the node's ranks on signal {self._signum}")
             return self._stop(128 + self._signum, terminate=False, forward=self._signum)
         if self._parent_ended:
             self._logger.warning(
-                "the process that started this supervisor ended: stopping the node's ranks"
+                "Stopping the node's ranks because the process that started this supervisor ended"
             )
             return self._stop(128 + signal.SIGTERM)
         if self._refused:
@@ -272,10 +259,10 @@ class NodeSupervisor:
         record = None if self._view is None else self._view.record
         state = self._membership.MembershipState
         if record is not None and record.state == state.SHUTDOWN:
-            self._logger.info("the deployment shut down")
+            self._logger.info("The deployment shut down")
             return self._stop(0, terminate=False)
         if record is not None and record.state == state.ABORT:
-            self._logger.error(f"the deployment aborted: {record.reason}")
+            self._logger.error(f"Deployment aborted: {record.reason}")
             return self._stop(1)
         for rank in self._ranks:
             status = self._supervise(rank, record, now_s)
@@ -290,19 +277,19 @@ class NodeSupervisor:
         ):
             if self._served:
                 self._logger.error(
-                    "every rank of the node ended, and no authority follows the deployment"
+                    "Every rank of the node ended, and no membership authority follows the deployment"
                 )
             return self._stop(self._first_failure or 0)
         return None
 
     def _supervise(self, rank: int, record, now_s: float) -> Optional[int]:
-        """Act on ``rank``; the exit status if the node is to end."""
+        """Act on ``rank``, and return the exit status if the node is to end."""
         process = self._processes.get(rank)
         ended = process is not None and process.status is not None
         if not self._served:
             if ended and process.status != 0:
                 self._logger.error(
-                    f"rank {rank} failed before the deployment serves (status {process.status}): the node fails"
+                    f"Rank {rank} failed before the deployment serves (status {process.status}), so the node fails"
                 )
                 if rank == 0:
                     self._end_job(
@@ -312,21 +299,21 @@ class NodeSupervisor:
             return None
         if rank == 0:
             if ended:
-                self._logger.error("rank 0 ended: the deployment ends with it")
+                self._logger.error("Rank 0 ended, so the deployment ends with it")
                 self._end_job(f"rank 0 ended (status {process.status})")
                 return _exit_status(process.status)
             return None
         if self._connection is None:
             return None
         if process is not None and not ended:
-            # Its process is the rank's only one: the authority lists no other process of the rank while it runs.
             if record.is_live(rank):
                 process.listed = True
                 process.incarnation = record.incarnations[rank]
                 process.admitted |= record.state == self._membership.MembershipState.COMMITTED
             elif process.listed and not process.killed:
                 self._logger.warning(
-                    f"the record no longer lists rank {rank} (incarnation {process.incarnation}): killing it"
+                    f"Killing rank {rank} (incarnation {process.incarnation}), which the membership record "
+                    "no longer lists"
                 )
                 process.killed = True
                 process.child.kill()
@@ -340,15 +327,14 @@ class NodeSupervisor:
         return None
 
     def _end_job(self, reason: str) -> None:
-        """End the whole job as failed through ``end_job``, if any: no authority may be left to end the other nodes'
-        ranks."""
+        """End the whole job as failed, since no authority may be left to end the other nodes' ranks."""
         if self._end_job_through_launcher is None:
             return
-        self._logger.error(f"{reason}: ending the job")
+        self._logger.error(f"Ending the job: {reason}")
         try:
             self._end_job_through_launcher(self._environ, _STOP_GRACE_S)
         except (OSError, subprocess.SubprocessError) as error:
-            self._logger.error(f"cannot end the job: {error!r}")
+            self._logger.error(f"Cannot end the job: {error!r}")
 
     def _start(self, rank: int, replacement: bool) -> None:
         identity = f"{rank},{self._world_size},{self._gpus_per_node},{int(replacement)}"
@@ -365,25 +351,22 @@ class NodeSupervisor:
         self._processes[rank] = _Process(child, replacement, pidfd, None if replacement else 0)
 
     def _replace(self, rank: int, now_s: float) -> None:
-        """Start a replacement of ``rank``, whose process ended or, after this node was lost, ran under the supervisor
-        this one replaces; the authority assigns its incarnation."""
         try:
-            self._logger.warning(f"starting a replacement of rank {rank}")
+            self._logger.warning(f"Starting a replacement of rank {rank}")
             self._start(rank, replacement=True)
         except (OSError, subprocess.SubprocessError) as error:
-            self._logger.error(f"cannot start a replacement of rank {rank}: {error!r}")
+            self._logger.error(f"Cannot start a replacement of rank {rank}: {error!r}")
             self._replacements.delay(rank, now_s)
             self._wake_at_s.append(self._replacements.due_s(rank))
 
     def _reap(self, rank: int, now_s: float) -> None:
-        """Take the status of ``rank``'s process, which ended."""
         process = self._processes[rank]
         self._selector.unregister(process.pidfd)
         os.close(process.pidfd)
         process.pidfd = None
         process.status = process.child.wait()
         self._logger.warning(
-            f"rank {rank} ({'replacement' if process.replacement else 'first process'}, incarnation "
+            f"Rank {rank} ({'replacement' if process.replacement else 'first process'}, incarnation "
             f"{process.incarnation}) ended with status {process.status}"
         )
         if process.status != 0 and self._first_failure is None:
@@ -393,14 +376,14 @@ class NodeSupervisor:
             return
         if process.status == self._membership.REPLACEMENT_CANNOT_START:
             self._logger.error(
-                f"the replacement of rank {rank} cannot start, nor could another one"
+                f"The replacement of rank {rank} cannot start, nor could another one"
             )
             self._given_up.add(rank)
             return
         self._replacements.delay(rank, now_s)
 
     def _connect(self) -> None:
-        """Connect to the authority if it answers within ``_CONNECT_TIMEOUT_S``, and take the view it sends."""
+        """Connect to the authority, and take the view it sends."""
         self._connect_due_s = time.monotonic() + _CONNECT_TIMEOUT_S
         membership = self._membership
         address = os.environ[membership.RENDEZVOUS_ENV]
@@ -423,7 +406,7 @@ class NodeSupervisor:
                 data = connection.sock.recv(1 << 16)
                 if not data:
                     self._logger.error(
-                        f"the membership authority refused the supervisor of node {self._node}"
+                        f"The membership authority refused the supervisor of node {self._node}"
                     )
                     self._refused = True
                     connection.sock.close()
@@ -432,7 +415,7 @@ class NodeSupervisor:
             views = [membership.NodeView.model_validate_json(payload) for payload in payloads]
         except PermissionError as error:
             self._logger.error(
-                f"the store at {address} is another deployment's: its values are not signed with this "
+                f"The store at {address} belongs to another deployment. Its values are not signed with this "
                 f"supervisor's join secret ({error})"
             )
             self._refused = True
@@ -441,10 +424,10 @@ class NodeSupervisor:
             OSError,
             RuntimeError,
             ValueError,
-        ) as error:  # torch's store errors are RuntimeErrors
+        ) as error:
             # Until the deployment serves, the store may not listen yet.
             (self._logger.warning if self._served else self._logger.debug)(
-                f"cannot connect to the membership authority at {address}: {error!r}"
+                f"Cannot connect to the membership authority at {address}: {error!r}"
             )
             if connection is not None:
                 connection.sock.close()
@@ -468,8 +451,10 @@ class NodeSupervisor:
                     self._on_view(self._membership.NodeView.model_validate_json(payload))
                 return
             except ValueError as error:
-                self._logger.error(f"a line from the membership authority is not valid: {error}")
-        self._logger.warning("the connection to the membership authority closed")
+                self._logger.error(
+                    f"Received an invalid line from the membership authority: {error}"
+                )
+        self._logger.warning("The connection to the membership authority closed")
         self._selector.unregister(self._connection.sock)
         self._connection.sock.close()
         self._connection = None
@@ -492,7 +477,7 @@ class NodeSupervisor:
                 self._host_weights_prefix = prefix.decode()
 
     def _relaunch_lost_nodes(self, now_s: float) -> None:
-        """Node 0: relaunch the supervisor of every node whose supervisor left, unless one it relaunched still runs."""
+        """Relaunch the supervisor of every node whose supervisor left."""
         for node, host, connected in self._view.nodes:
             relaunched = self._relaunched.get(node)
             if connected:
@@ -508,7 +493,7 @@ class NodeSupervisor:
                 continue
             self._relaunches.delay(node, now_s)
             self._wake_at_s.append(self._relaunches.due_s(node))
-            self._logger.warning(f"node {node} ({host}) was lost: relaunching its supervisor")
+            self._logger.warning(f"Node {node} ({host}) was lost. Relaunching its supervisor.")
             command = [
                 *self._relaunch_command,
                 "--host",
@@ -531,15 +516,13 @@ class NodeSupervisor:
                     process.stdin.write(json.dumps(self._environ).encode() + b"\n")
                     process.stdin.close()
             except OSError as error:
-                self._logger.error(f"cannot relaunch node {node}: {error!r}")
+                self._logger.error(f"Cannot relaunch node {node}: {error!r}")
                 continue
             self._relaunched[node] = process
             self._selector.register(os.pidfd_open(process.pid), selectors.EVENT_READ, _RELAUNCHED)
 
     def _stop(self, status: int, terminate: bool = True, forward: Optional[int] = None) -> int:
-        """End: unlink the node's host weights, send ``forward`` (a signal this supervisor received) to rank 0's
-        process, SIGTERM to the processes it started at once (``terminate``) or after ``_STOP_GRACE_S``, and return
-        ``status`` once they ended or another ``_STOP_GRACE_S`` passed (those left die with this process)."""
+        """Stop the node's ranks and return ``status``; processes left die with the supervisor."""
         self._unlink_host_weights()
         rank_0 = self._processes.get(0)
         if forward is not None and rank_0 is not None and rank_0.status is None:
@@ -556,14 +539,12 @@ class NodeSupervisor:
         return status
 
     def _wait_for(self, processes: List[subprocess.Popen]) -> None:
-        """Wait until ``processes`` ended, at most ``_STOP_GRACE_S``."""
         deadline_s = time.monotonic() + _STOP_GRACE_S
         for process in processes:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(max(0.0, deadline_s - time.monotonic()))
 
     def _unlink_host_weights(self) -> None:
-        """Unlink the node's shared-memory segments of host weights."""
         if self._host_weights_prefix is None and self._store is not None:
             self._read_host_weights_prefix()
         if self._host_weights_prefix is None:
@@ -575,7 +556,7 @@ class NodeSupervisor:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(_SHM_DIR, name))
         self._logger.info(
-            f"unlinked the node's {len(names)} shared-memory segments of host weights"
+            f"Unlinked the node's {len(names)} shared-memory segments of host weights"
         )
 
 
@@ -587,10 +568,8 @@ def _local_gpu_count(environ: Dict[str, str]) -> int:
 
 
 def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: float) -> None:
-    """End the job of the PRRTE at the PMIx server URI ``uri`` as failed: SIGTERM to its ``mpirun``, whose PID ends
-    the URI's namespace (``prterun-<host>-<PID>@...``), which then ends every process of the job and exits with
-    status 1. Where that PID is no ``mpirun`` of this host, ``pterm`` ends the job instead (with ``environ``, within
-    ``timeout_s``), and ``mpirun`` exits with status 0."""
+    """End the PRRTE job at ``uri`` as failed by sending SIGTERM to its ``mpirun``, or with ``pterm`` otherwise."""
+    # The URI's namespace ends with the PID of mpirun (``prterun-<host>-<PID>@...``).
     pid = uri.split("@", 1)[0].rsplit("-", 1)[-1]
     try:
         with open(f"/proc/{int(pid)}/comm") as comm:
@@ -603,8 +582,8 @@ def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: flo
     from tensorrt_llm.logger import logger
 
     logger.error(
-        f"the PMIx server URI {uri!r} names no mpirun of this host: ending the job with pterm, after which "
-        "mpirun exits with status 0"
+        f"The PMIx server URI {uri!r} names no mpirun of this host. Ending the job with pterm, after which "
+        "mpirun exits with status 0."
     )
     subprocess.run(  # nosec B603
         [pterm, "--dvm-uri", uri],
@@ -618,9 +597,7 @@ def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: flo
 def _prrte_job_control(
     environ: Dict[str, str],
 ) -> Tuple[Optional[List[str]], Optional[Callable[[Dict[str, str], float], None]]]:
-    """Under ``mpirun``, the job's PRRTE command that starts a process on a host of the job (``prun``; the host and
-    the command come after it) and the function that ends the whole job as failed (:func:`_end_prrte_job`); None for
-    each under another launcher."""
+    """Return the ``prun`` command that starts a process on a host of the job and the function that ends the job."""
     if "OMPI_COMM_WORLD_RANK" not in environ:
         return None, None
     uri = next((environ[name] for name in _PMIX_SERVER_URI_VARS if environ.get(name)), None)
@@ -630,8 +607,8 @@ def _prrte_job_control(
         from tensorrt_llm.logger import logger
 
         logger.error(
-            "started by mpirun without a PMIx server URI, prun or pterm: a lost node is not relaunched, and the "
-            "end of rank 0 does not end the job"
+            "Started by mpirun without a PMIx server URI, prun, or pterm. A lost node is not relaunched, and "
+            "the end of rank 0 does not end the job."
         )
         return None, None
     relaunch_command = [
@@ -693,8 +670,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     gpus_per_node = args.gpus_per_node or _local_gpu_count(environ)
     if gpus_per_node <= 0:
         parser.error("this process sees no GPU: give --gpus-per-node")
-    # This process uses neither MPI nor a GPU: importing TensorRT-LLM skips its library initialization, which
-    # includes the C++ MPI_Init, and mpi4py does not initialize MPI.
+    # This process uses neither MPI nor a GPU, so it skips the library initialization that calls MPI_Init.
     os.environ.update(
         TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""
     )
@@ -715,7 +691,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    # Python puts this script's directory first on the module search path: its modules must not shadow those that
-    # TensorRT-LLM imports.
+    # The script's directory must not shadow the modules TensorRT-LLM imports.
     del sys.path[0]
     sys.exit(main())

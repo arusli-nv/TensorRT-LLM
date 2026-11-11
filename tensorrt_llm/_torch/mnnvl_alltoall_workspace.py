@@ -301,21 +301,18 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
 
     @property
     def device_bytes(self) -> int:
-        """The device memory this rank's part of the workspace takes, which :meth:`remap` allocates again on fresh
-        pages."""
         return self._memory.local_device_bytes
 
     def stale_rows(self, gather: Callable[[object], Sequence[object]]) -> frozenset[int]:
-        """The rows a membership change must back with fresh pages (:meth:`MnnvlMemory.stale_rows`)."""
         return self._memory.stale_rows(gather)
 
     def remap(
         self, gather: Callable[[object], Sequence[object]], fresh_rows: frozenset[int]
     ) -> None:
-        """Map the workspace among the live ranks at the same addresses, ``fresh_rows`` on fresh pages
-        (:meth:`MnnvlMemory.remap`). The watchdog stops meanwhile, as its flag reads would fault on a released page.
-        A fresh row is uninitialized until its owner resets it; the watchdog reads it only for a collective it
-        watches."""
+        """Map the workspace among the live ranks at the same addresses, ``fresh_rows`` on fresh pages.
+
+        The watchdog stops meanwhile, because its flag reads would fault on a released page.
+        """
         self._stop_watchdog()
         self._memory.remap(gather, fresh_rows)
         self._start_watchdog()

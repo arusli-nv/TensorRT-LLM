@@ -362,8 +362,6 @@ class PyResult:
 
     @dataclass(frozen=True)
     class ContextRowsMark:
-        """Where the stored context rows end: their prompt position and the
-        number of appends of context logits and of prompt logprobs."""
         end: int
         logits_appends: int
         prompt_logprob_appends: int
@@ -393,8 +391,6 @@ class PyResult:
         # rows); the worker builds the user-facing values from them.
         self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logprobs: torch.Tensor | None = None
-        # The prompt position that the stored context rows (context logits and
-        # prompt logprobs) reach.
         self.context_rows_end = 0
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
@@ -534,8 +530,7 @@ class PyResult:
         self.diff.prompt_last_logprobs = logprobs
 
     def mark_context_rows(self) -> ContextRowsMark:
-        """Record where the stored context rows end, for
-        :meth:`rewind_context_rows`."""
+        """Record where the stored context rows end."""
         return PyResult.ContextRowsMark(
             end=self.context_rows_end,
             logits_appends=len(self._context_logits._logits_indices)
@@ -543,13 +538,7 @@ class PyResult:
             prompt_logprob_appends=len(self.context_prompt_logprob_rows or ()))
 
     def rewind_context_rows(self, mark: ContextRowsMark) -> None:
-        """Drop the context rows stored after ``mark``, so that a replayed
-        prefill stores those positions again.
-
-        Args:
-            mark: From :meth:`mark_context_rows`. A mark at or past the stored
-                rows leaves them as they are.
-        """
+        """Drop the context rows stored after ``mark`` for a replayed prefill."""
         if mark.end >= self.context_rows_end:
             return
         self.context_rows_end = mark.end
@@ -824,7 +813,6 @@ class LlmResult:
 @dataclass
 class LlmResponse:
     request_id: int
-    # A RequestError reaches the client as its type.
     error_msg: Optional[Union[str, RequestError]] = None
     result: Optional[LlmResult] = None
     client_id: Optional[int] = None

@@ -7942,11 +7942,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
-        """Reject what enable_wide_ep_fault_tolerance does not support.
-
-        The checks that need the resolved mapping or model, the KV cache
-        manager version included, run when the executor starts.
-        """
+        """Reject what enable_wide_ep_fault_tolerance does not support."""
         if not self.enable_wide_ep_fault_tolerance:
             return self
         adp_config = self.attention_dp_config

@@ -145,7 +145,7 @@ INVALID_JOIN_WATCH_S = 20
 # before it counts as a leak.
 GPU_MEMORY_LEAK_TOLERANCE_MIB = 256
 # The authority logs why it refuses a liveness connection: this prefix, then the reason.
-REFUSAL_LOG = "Membership: closing a liveness connection: "
+REFUSAL_LOG = "Closing a liveness connection: "
 # Rank 0 logs, per membership change, how many requests that no live rank holds the rank failure ended.
 RETRYABLE_LOG = re.compile(
     r"Rank 0 resumed serving with membership generation (\d+),.* (\d+) requests no live rank holds ended by "

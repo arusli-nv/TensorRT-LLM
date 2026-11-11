@@ -422,7 +422,7 @@ void HostAccessibleDeviceAllocator::mapDeviceMemory(void* devPtr, size_t size)
         tensorrt_llm::runtime::gdrcopy::unpin_buffer(mGdrHandle, mh);
         TLLM_THROW("GDR map failed for %p (%zu bytes)", devPtr, size);
     }
-    // A pin that starts at a GPU page maps from its first byte. No device memory of its own: free() never sees it.
+    // The descriptor owns no device memory, so free() never releases this range.
     auto* memDesc = new gdrcopy::GdrMemDesc{nullptr, map, 0, size, mh};
     recordAllocation(devPtr, size, map, memDesc);
 }

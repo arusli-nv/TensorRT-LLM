@@ -97,9 +97,7 @@ enum MoeA2AMetaInfoIndex : int64_t
     CFT_ENABLED_INDEX = 23,
     // Total required bytes per rank, including all control buffers, payloads and alignment padding.
     WORKSPACE_SIZE_INDEX = 24,
-    // uint32_t scalar after the flag value, only in rank-mask layouts; the flag value takes offset 0, so 0 here marks
-    // a layout without it. Nonzero once a dispatch or combine on this rank returned without some active source's data
-    // (see MoeA2AAbortState); reset with the workspace.
+    // Offset of the incomplete-round word (see MoeA2AAbortState), 0 in layouts without a rank mask.
     INCOMPLETE_ROUND_OFFSET_INDEX = 25,
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
     NUM_METAINFO_FIELDS = 26
@@ -143,7 +141,6 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},
         {"MOE_A2A_MAX_PAYLOADS", kMaxPayloads},
         {"MOE_A2A_WORKSPACE_ALIGNMENT", kWorkspaceAlignment},
-        // The abort record (MoeA2AAbortState) as int32 words, and the word of waited_round[0].
         {"MOE_A2A_ABORT_STATE_WORDS", sizeof(MoeA2AAbortState) / sizeof(int32_t)},
         {"MOE_A2A_ABORT_WAIT_EVIDENCE_INDEX", offsetof(MoeA2AAbortState, waited_round) / sizeof(int32_t)},
     };

@@ -1,19 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Epochs of :class:`~tensorrt_llm._torch.distributed.host_exchange.TPHostExchange`, without its GPU dependencies,
-so the CPU-only membership authority can compute them."""
+"""Host-exchange epochs, importable without GPU dependencies."""
 
 from typing import List
 
-# TPHostExchange epochs run from 1 to _EPOCHS, then wrap to 1, keeping the parity alternating (0 is never sent).
+# Epochs wrap from _EPOCHS to 1, skipping 0, so the parity keeps alternating.
 _EPOCHS = 0xFFFFFFFE
 
 
 def next_epoch(epoch: int) -> int:
-    """The host-exchange epoch after ``epoch``."""
+    """Return the host-exchange epoch after ``epoch``."""
     return epoch % _EPOCHS + 1
 
 
 def latest_epoch(epochs: List[int]) -> int:
-    """The latest of host-exchange epochs that lie within half the epoch range of each other, across the wrap."""
+    """Return the latest of ``epochs``, which lie within half the epoch range of each other."""
     return max(epochs, key=lambda epoch: (epoch - epochs[0] + _EPOCHS // 2) % _EPOCHS)

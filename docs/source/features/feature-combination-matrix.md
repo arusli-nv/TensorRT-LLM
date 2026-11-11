@@ -17,20 +17,7 @@ For DeepSeek-V4.1 CSA2, use these additional limits:
 See [CSA2 sparse attention](sparse-attention.md#deepseek-v41-csa2) for staging
 dtypes, replay environment variables, and accuracy-validation requirements.
 
-With Wide-EP fault tolerance (`enable_wide_ep_fault_tolerance`), these limits
-apply; the startup check rejects the rest:
-
-| Feature | With Wide-EP fault tolerance |
-|---|---|
-| Expert Parallelism / Attention Data Parallelism | Required: attention DP over all ranks within one NVLink domain with the default router and admission, `NVLinkOneSided` MoE communication, EPLB (fault tolerance adds the spare slots); the Cutlass or CuteDSL NVFP4 MoE backend |
-| Tensor Parallelism (attention) / Pipeline Parallelism | Unsupported |
-| Overlap Scheduler / CUDA Graph / KV Cache Reuse | Supported; the overlap scheduler and KV cache manager V2 are required |
-| `torch.compile` (`torch_compile_config`, piecewise CUDA graphs) | Supported without userbuffers |
-| Speculative Decoding | MTP supported; NGram and user-provided drafters and DSpark unsupported |
-| Disaggregated Serving / KV cache connectors / KV cache events / Sleep mode / several serving frontends / Ray and RPC executors | Unsupported |
-| Sampling | `n > 1`, `best_of > 1` and beam search unsupported |
-
-See [Wide-EP Fault Tolerance](wide-ep-fault-tolerance.md).
+Wide-EP fault tolerance (`enable_wide_ep_fault_tolerance`) supports a subset of these features; see [Wide-EP Fault Tolerance](wide-ep-fault-tolerance.md#limitations).
 
 | Feature                                                     | Overlap Scheduler | CUDA Graph | Tensor Parallelism | Pipeline Parallelism | Expert Parallelism | Helix Parallelism | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | Speculative Decoding — Linear | Speculative Decoding — Dynamic Trees | Speculative Decoding — Legacy Path (NGram, user-provided) | Torch Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding | LoRA     | Text Watermarking |
 | ----------------------------------------------------------- | ----------------- | ---------- | ------------------ | -------------------- | ------------------ | ----------------- | -------------------------- | --------------------- | --------------- | ----------------------------- | ------------------------------------ | --------------------------------------------------------- | ------------- | -------------- | ------------------------ | --------------------- | --------------- | -------- | ----------------- |

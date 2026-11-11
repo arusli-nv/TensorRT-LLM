@@ -143,8 +143,7 @@ MoeA2AWorkspaceLayout const& readWorkspaceLayout(torch::Tensor const& metainfo)
     return *reinterpret_cast<MoeA2AWorkspaceLayout const*>(metainfo.data_ptr<int64_t>());
 }
 
-// Whether the layout holds the incomplete-round word (rank-mask layouts): the flag value takes offset 0, so the
-// word's offset is nonzero exactly when it is reserved.
+// The flag value takes offset 0, so only a layout that holds the incomplete-round word has a nonzero offset for it.
 inline bool hasIncompleteRoundWord(MoeA2AWorkspaceLayout const& layout)
 {
     return layout[INCOMPLETE_ROUND_OFFSET_INDEX] != 0;
@@ -155,9 +154,8 @@ inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
     return maskTensor.has_value() && maskTensor.value().defined();
 }
 
-// Return the device address of the rank-mask tensor, which the kernels read at execution time: a contiguous uint64
-// tensor of kRankMaskWords elements on the workspace's device. Its writer keeps the local rank's bit set. Wrong
-// dtype / device / shape throws at the Python op boundary rather than launch.
+// Return the device address of the rank-mask tensor, which the kernels read at execution time. On failure
+// (wrong dtype / device / shape), throw at the Python op boundary rather than launch.
 inline uint64_t const* resolveActiveRankMask(
     torch::optional<torch::Tensor> const& maskTensor, torch::Tensor const& workspace)
 {
@@ -172,9 +170,7 @@ inline uint64_t const* resolveActiveRankMask(
     return static_cast<uint64_t const*>(t.const_data_ptr());
 }
 
-// Return the abort record (a MoeA2AAbortState in pinned host memory, as an int32 tensor of
-// MOE_A2A_ABORT_STATE_WORDS elements), or nullptr without one. The kernels read it at its host address, which is
-// also its device address under unified virtual addressing.
+// The kernels read the pinned host abort record through unified virtual addressing.
 inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torch::optional<torch::Tensor> const& abort)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2AAbortState;
@@ -290,8 +286,7 @@ torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, i
     return metainfo;
 }
 
-// Initialize control state after allocation; layout construction itself is CPU-only. A rank-mask workspace's ranks
-// may not all be alive, so its caller synchronizes the ranks that are.
+// Initialize control state after allocation; layout construction itself is CPU-only.
 void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
 {
     CHECK_TH_CUDA(workspace);

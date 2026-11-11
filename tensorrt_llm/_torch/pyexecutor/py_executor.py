@@ -565,12 +565,9 @@ class BatchState:
     # sampler event has been synchronized (_take_capturable_guided_failures);
     # None until then.
     guided_failures: Optional[List[Tuple[int, str]]] = None
-    # With rank failure recovery, the context reuse commits that wait until
-    # the step is accepted: (KV cache manager, request id -> commit end).
+    # Context reuse commits held until the step is accepted.
     context_commits: Optional[List[Tuple[KVCacheManagerV2, Dict[int,
                                                                 int]]]] = None
-    # With rank failure recovery, where the stored context rows of each context
-    # request that returns them ended before this step.
     context_rows: Optional[List[Tuple[LlmRequest,
                                       PyResult.ContextRowsMark]]] = None
 
@@ -696,8 +693,6 @@ class PyExecutor:
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
 
-    # Recovery from rank failures under WideEP fault tolerance; joined in
-    # start_worker().
     rank_failure_recovery: Optional["RankFailureRecovery"] = None
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
@@ -2242,8 +2237,7 @@ class PyExecutor:
             # Immediately take the local steady clock timestamp
             return self.dist.allgather(get_steady_clock_now_in_seconds())
 
-        # A replacement rank under WideEP fault tolerance runs on the node of
-        # the rank it replaces: it takes that rank's offset to rank 0.
+        # A replacement rank takes the offset of the rank it replaces.
         all_rank_timestamps = startup_record.agree("steady_clock_timestamps",
                                                    gather_timestamps)
         local_timestamp = all_rank_timestamps[self.global_rank]
@@ -5180,10 +5174,7 @@ class PyExecutor:
             # Vote over TP x CP. The helix CP ranks of one DP rank run each
             # forward together, but their batch sizes can differ: one CP rank
             # can pad a dummy request that its peer failed to allocate. With
-            # cp_size == 1 this is the TP gather. With rank failure recovery, a
-            # rank that holds its steps for a membership change decides so
-            # before the gather and sends an empty batch, so every rank takes
-            # the same decision.
+            # cp_size == 1 this is the TP gather.
             recovery = self.rank_failure_recovery
             if recovery is None:
                 batch_sizes = self.dist.tp_cp_allgather_int64(
@@ -5233,9 +5224,8 @@ class PyExecutor:
     ) -> None:
         """Update self, draft, and cross caches after a context forward.
 
-        With ``context_commits``, the chunks' reuse commits wait until the step
-        is accepted (:meth:`_commit_v2_context_blocks`): each cache and its
-        commit ends are appended to it.
+        With ``context_commits``, the reuse commits wait until the step is
+        accepted.
         """
         managers = [self.kv_cache_manager]
         if self.enable_joint_kv_cache_reuse:
@@ -5253,8 +5243,7 @@ class PyExecutor:
                 context_commits.append((manager, commit_ends))
 
     def _commit_v2_context_blocks(self, batch_state: BatchState) -> None:
-        """Commit for reuse the context chunks of an accepted step whose
-        commits waited for it."""
+        """Commit for reuse the context chunks of an accepted step."""
         if not any(commit_ends
                    for _, commit_ends in batch_state.context_commits):
             return
@@ -5266,12 +5255,11 @@ class PyExecutor:
                                           commit_ends)
 
     def _accepted_previous_batch(self) -> Optional[BatchState]:
-        """``previous_batch``, for a consumer that applies its results: every
-        one takes it here. With rank failure recovery, it is first accepted or
-        discarded: a discarded batch leaves ``previous_batch`` None and the
-        grammar matchers of its requests unknown, so they are dropped, with the
-        guided decoding failures they caused; an accepted one commits its
-        context chunks for reuse."""
+        """Return ``previous_batch`` once rank failure recovery accepted it.
+
+        A discarded batch leaves the grammar matchers of its requests unknown,
+        so they are dropped.
+        """
         batch = self.previous_batch
         if self.rank_failure_recovery is None or batch is None:
             return batch
@@ -6747,7 +6735,7 @@ class PyExecutor:
                 drained = all(
                     rank_drained
                     for rank_drained in self.dist.tp_allgather(int(drained))
-                    if rank_drained is not None)  # None: a rank that left
+                    if rank_drained is not None)
             if not drained:
                 # drain=True: keep the sentinel parked until the engine drains.
                 return
@@ -7107,12 +7095,7 @@ class PyExecutor:
 
     @contextmanager
     def _kv_pools_suspended(self) -> Iterator[KVCacheManagerV2]:
-        """Suspend every active request and padding dummy, yield the KV cache
-        manager, then resume them, also when the body raises.
-
-        For a body that moves or resizes the KV pools, under the quiescence
-        ``_rebalance_kv_pools_now`` requires.
-        """
+        """Suspend the active requests and dummies while the KV pools change."""
         mgr = self.kv_cache_manager
         paused, paused_dummies = self._suspend_for_rebalance(mgr)
         try:
@@ -7123,8 +7106,6 @@ class PyExecutor:
     def _suspend_for_rebalance(
         self, mgr: KVCacheManagerV2
     ) -> Tuple[List[LlmRequest], List[Tuple[int, int, LlmRequest]]]:
-        """Suspend every active request and padding dummy; return them for
-        ``_resume_after_rebalance``."""
         paused: List[LlmRequest] = []
         for req in self.active_requests:
             if mgr.is_request_active(req.py_request_id):
@@ -7135,8 +7116,6 @@ class PyExecutor:
     def _resume_after_rebalance(
             self, mgr: KVCacheManagerV2, paused: List[LlmRequest],
             paused_dummies: List[Tuple[int, int, LlmRequest]]) -> None:
-        """Resume what ``_suspend_for_rebalance`` suspended and read the KV
-        cache capacity again."""
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:
             # Preserve the one execution-only row before real requests reclaim
@@ -7530,8 +7509,6 @@ class PyExecutor:
                         self._submit_encoder_step(
                             scheduled_batch.encoder_requests)
 
-                    # With rank failure recovery, a discarded step drops the
-                    # context rows its forward and sampling store.
                     context_rows = ([
                         (request, request.py_result.mark_context_rows())
                         for request in scheduled_batch.context_requests
@@ -7657,9 +7634,7 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
-                    # With rank failure recovery, the chunks' reuse commits
-                    # wait until the step is accepted: a step a rank failure
-                    # interrupts leaves invalid KV.
+                    # A step a rank failure interrupts leaves invalid KV.
                     context_commits = ([] if self.rank_failure_recovery
                                        is not None else None)
                     if (self._is_kv_manager_v2
@@ -8250,11 +8225,7 @@ class PyExecutor:
 
     def _get_request_admission_capacity(
             self, all_rank_states: Optional[List[RankState]] = None) -> int:
-        """Return the maximum number of distinct requests admitted at once.
-
-        With attention DP, ``all_rank_states`` (when given) holds the ranks that
-        serve.
-        """
+        """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
             num_ranks = (self.dist.tp_size
                          if all_rank_states is None else len(all_rank_states))

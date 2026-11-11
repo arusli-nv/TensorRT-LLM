@@ -449,10 +449,9 @@ class BaseLLM:
                                      **kwargs)
             self.args._enable_routing_load = enable_routing_load
             self.args._openengine_discovery = openengine_discovery
-            # Before the executor starts; each worker sets it from its args.
             set_fault_tolerance_mode(self.args.enable_wide_ep_fault_tolerance)
             if self.args.enable_wide_ep_fault_tolerance:
-                # Before any MPI pool spawns the ranks, which inherit them.
+                # The spawned ranks inherit the rendezvous address.
                 from .._torch.pyexecutor import rank_failure_recovery
                 rank_failure_recovery.ensure_rendezvous()
 

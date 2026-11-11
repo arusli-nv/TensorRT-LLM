@@ -244,7 +244,7 @@ def test_a_hung_rank_is_logged_with_what_every_live_rank_waits_on(monkeypatch):
     cluster.waited_rounds.update({r: ((3, 7),) for r in range(3)})
     cluster.run(3.0)
     [hung] = [w for w in warnings if "is hung" in w]
-    assert hung.startswith("Membership: rank 3 is hung")
+    assert hung.startswith("Rank 3 is hung")
     assert "rank 0: iteration" in hung and "waits for [3], all-to-all rounds [(3, 7)]" in hung
     assert "rank 3: iteration" in hung and "waits for []" in hung
 
@@ -752,7 +752,7 @@ def test_the_proposal_that_adds_replacements_logs_them(monkeypatch):
     cluster.unprepared.discard(2)
     cluster.run(1.0)
     [line] = [i for i in infos if "joining ranks" in i]
-    assert line == "Membership: adding joining ranks [2, 3]"
+    assert line == "Adding joining ranks [2, 3] to the membership"
 
 
 def test_a_transaction_s_phases_end_at_ordered_wall_clock_times_in_milliseconds():

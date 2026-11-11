@@ -12,14 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The startup record of a WideEP fault-tolerant deployment.
-
-A replacement rank starts alone (isolated startup): its host collectives reach only itself. So rank 0 records the
-results of the original ranks' startup collectives, and a replacement replays them: each of its startup collectives
-returns what rank 0 received at the same call, and fails the replacement's startup
-(:class:`~tensorrt_llm._torch.distributed.membership.ReplacementCannotStart`) where the replacement does not start as
-the original ranks did.
-"""
+"""Record of the startup collectives that a replacement rank replays, since it starts alone."""
 
 import pickle  # nosec B403
 import sys
@@ -28,7 +21,6 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence
 
 from .membership import ReplacementCannotStart
 
-# The modules whose frames lie between a startup collective's caller and the record.
 _COLLECTIVE_MODULES = frozenset(
     {
         __name__,
@@ -37,8 +29,7 @@ _COLLECTIVE_MODULES = frozenset(
     }
 )
 
-# The callers, by (file, function), whose payload is the rank's own measurement, which a replacement's differs from:
-# they take the original ranks' payloads, its predecessor's included.
+# Callers whose payload is a per-rank measurement, so a replacement's payload may differ from its predecessor's.
 RANK_VARYING_CALLERS = frozenset(
     {
         ("autotuner.py", "_merge_cache_data"),
@@ -48,7 +39,7 @@ RANK_VARYING_CALLERS = frozenset(
 
 
 class Caller(NamedTuple):
-    """Where a startup collective was called: the ``Distributed`` method and its caller's file, line and function."""
+    """The ``Distributed`` method of a startup collective and the location of its caller."""
 
     collective: str
     file: str
@@ -60,8 +51,7 @@ class Caller(NamedTuple):
 
 
 class RecordedExchange(NamedTuple):
-    """A startup collective as rank 0 ran it: where it was called, and every rank's pickled payload that rank 0
-    received (its own included; None for a rank whose payload it did not read)."""
+    """A startup collective and every rank's pickled payload as rank 0 received it."""
 
     caller: Caller
     payloads: List[Optional[bytes]]
@@ -77,27 +67,16 @@ def _caller() -> Caller:
 
 
 class StartupRecord:
-    """The results of the startup collectives of the original ranks, as rank 0 got them, for a replacement rank.
+    """The startup collectives' results as rank 0 got them, which a replacement rank replays.
 
-    Rank 0 records from :meth:`record`, a replacement replays from :meth:`replay`, until :meth:`close` at the end of
-    the startup. Two kinds of results:
-
-    - Values (:meth:`agree`), by name and call: those every rank needs before its host collectives exist, or once per
-      process, whenever it first needs them.
-    - Exchanges (:meth:`exchange`): every other host collective of ``MnnvlDist``, by call: a replacement makes them in
-      the order the original ranks did, from the same callers. Its own payload must equal its predecessor's, except
-      for :data:`RANK_VARYING_CALLERS`, and for a reduction by min (max), where it must be at least (at most) the
-      result, so the result bounds the replacement too.
-
-    Calls while the record is paused (:meth:`pause`) are neither recorded nor replayed: they reach the ranks the
-    host exchange reaches.
+    A replacement must make the same collectives in the same order from the same callers. Its payload must equal its
+    predecessor's, except for :data:`RANK_VARYING_CALLERS` and for min or max reductions that the result still bounds.
     """
 
     def __init__(self) -> None:
         self.values: Dict[str, List[Any]] = {}
         self.exchanges: List[RecordedExchange] = []
         self._recording = False
-        # A replacement rank: whether it replays exchanges (until close), and how many results it took.
         self._replacement = False
         self._replaying = False
         self._taken: Dict[str, int] = {}
@@ -106,26 +85,22 @@ class StartupRecord:
 
     @property
     def active(self) -> bool:
-        """Whether this rank records or replays its host collectives now."""
         return (self._recording or self._replaying) and not self._pauses
 
     @property
     def replaying(self) -> bool:
-        """Whether this rank's host collectives return the original ranks' results now (a replacement rank)."""
         return self._replaying and not self._pauses
 
     def record(self) -> None:
-        """Rank 0: record the startup collectives' results until :meth:`close`."""
+        """Record the startup collectives on rank 0 until :meth:`close`."""
         self._recording = True
 
     def replay(self, published: Dict[str, Any]) -> None:
-        """A replacement rank: take its startup collectives' results from ``published``, the record rank 0
-        published (:meth:`published`); its exchanges until :meth:`close`."""
+        """Replay the record that rank 0 published until :meth:`close`."""
         self.values, self.exchanges = published["values"], published["exchanges"]
         self._replacement = self._replaying = True
 
     def published(self) -> Dict[str, Any]:
-        """What a replacement rank replays (:meth:`replay`)."""
         return {"values": self.values, "exchanges": self.exchanges}
 
     def pause(self) -> None:
@@ -136,7 +111,7 @@ class StartupRecord:
         self._pauses -= 1
 
     def close(self) -> None:
-        """The end of this rank's startup: rank 0 stops recording, a replacement rank replaying exchanges.
+        """Stop recording or replaying at the end of this rank's startup.
 
         Raises:
             ReplacementCannotStart: A replacement rank made fewer startup collectives than the original ranks.
@@ -158,8 +133,7 @@ class StartupRecord:
         self._recording = self._replaying = False
 
     def agree(self, name: str, gather: Callable[[], Any]) -> Any:
-        """The result of ``gather``, a startup collective that needs every rank, as rank 0 got it at the same call of
-        ``name``: a replacement rank does not run ``gather``. Without fault tolerance, ``gather()``."""
+        """Return the result of ``gather``, or rank 0's recorded result of the same call on a replacement rank."""
         if self._replacement:
             recorded = self.values.get(name, [])
             index = self._taken.get(name, 0)
@@ -188,19 +162,12 @@ class StartupRecord:
         run: Callable[[], List[Optional[bytes]]],
         bound: Optional[Callable[[Any, Any], Any]] = None,
     ) -> List[Optional[bytes]]:
-        """Every rank's pickled payload of a host collective while :attr:`active`: ``run()`` on rank 0, which records
-        it; rank 0's at the same call on a replacement rank.
+        """Return every rank's pickled payload, from ``run()`` on rank 0 or from the record on a replacement rank.
 
-        Args:
-            rank: This rank.
-            payload: This rank's pickled payload.
-            readers: The ranks whose payloads this rank reads (None: every rank); the others come back as None.
-            run: Runs the collective; returns every rank's payload.
-            bound: ``min`` or ``max`` for a reduction by it, else None.
+        ``bound`` is ``min`` or ``max`` for a reduction by it, else None.
 
         Raises:
-            ReplacementCannotStart: A replacement rank's collective is not the original ranks' at that call (another
-                collective or caller, or one more than they made), or its payload differs from its predecessor's.
+            ReplacementCannotStart: The collective or its payload differs from the original ranks' at that call.
         """
         caller = _caller()
         if self._recording:
@@ -246,7 +213,6 @@ class StartupRecord:
     def _bounded(
         bound: Optional[Callable[[Any, Any], Any]], payload: bytes, payloads: List[Optional[bytes]]
     ) -> bool:
-        """Whether the reduction of ``payloads`` by ``bound`` (min or max) bounds ``payload`` as it bounds theirs."""
         if bound is None:
             return False
         # Only processes with the join secret write the rendezvous store the record comes from.
@@ -257,5 +223,4 @@ class StartupRecord:
         return bound(pickle.loads(payload), result) == result  # nosec B301
 
 
-# This process's startup record.
 startup_record = StartupRecord()

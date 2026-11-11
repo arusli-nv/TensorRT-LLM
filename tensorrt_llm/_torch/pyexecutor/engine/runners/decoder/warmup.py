@@ -1248,8 +1248,7 @@ class DecoderWarmup:
             )
 
         if startup_record.active:
-            # Under WideEP fault tolerance, a replacement rank skipped the warmup during the KV cache estimation: it
-            # adopts the tactics rank 0 holds here and takes the original ranks' decision, so it tunes what they do.
+            # A replacement rank adopts rank 0's tactics so that it tunes what the original ranks do.
             from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import adopt_tuned_tactics
 
             adopt_tuned_tactics(AutoTuner.get().profiling_cache)

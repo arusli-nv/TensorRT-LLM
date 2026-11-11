@@ -316,8 +316,7 @@ class NVLinkOneSided(Communication):
         use_low_precision_combine: bool,
         rank_mask: bool = False,
     ) -> torch.Tensor:
-        """Plan per-rank control buffers and independently sized payload regions; rank-mask kernels need
-        ``rank_mask``."""
+        """Plan per-rank control buffers and independently sized payload regions."""
         if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
             raise ValueError("hidden_size must be positive and extra payload size non-negative")
         tokens = ep_size * max_num_tokens
@@ -448,16 +447,9 @@ class NVLinkOneSided(Communication):
                 Corresponds to model_config.use_low_precision_moe_combine.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
-                detection never mutates it. The kernels read the mask at execution time from the device record of
-                the ``MoeExecutionState`` shared by the layers of this membership, which an unbound layer updates at
-                each collective whose mask changed. The watchdog observes the eager launches of an unbound layer. A
-                layer bound to a ``MoeExecutionState`` (``bind_execution_state``) reads that state's mask and abort
-                records instead, so CUDA graphs captured after the bind follow every later membership change; its
-                launches, eager or replayed, rely on the abort record, set by rank failure detection, and on the
-                device timeout instead of the watchdog.
+                detection never mutates it. A layer bound with ``bind_execution_state`` supports CUDA graphs.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
-                watchdog is disabled; it defaults with ``ep_group_health`` unless fault tolerance mode is on, where
-                the membership authority reads the kernels' wait evidence instead.
+                watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
@@ -633,10 +625,7 @@ class NVLinkOneSided(Communication):
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            # The allocation's handle exchange and the barrier after moe_a2a_initialize reach the ranks that start
-            # together: every startup rank, or a replacement rank alone, whose EP health marks its peers failed from
-            # the start. It maps only its own row with the deployment's layout; its admission remaps the workspace
-            # among every live rank.
+            # A replacement rank maps only its own row; its admission remaps the workspace among the live ranks.
             if (
                 ep_group_health is not None
                 and ep_group_health.snapshot().generation
@@ -650,8 +639,7 @@ class NVLinkOneSided(Communication):
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
             if ep_group_health is not None:
-                # No rank writes into a peer's workspace before the peer has initialized it; the op synchronizes
-                # all ranks only without a rank mask.
+                # No rank may write into a peer's workspace before the peer has initialized it.
                 memory_cls.get_comm(mapping).barrier()
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
@@ -698,11 +686,8 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
-        # Rank-mask mode: the kernels read the active-rank mask from the device record of this execution state, shared
-        # by the layers of the same membership until bind_execution_state binds the layer to its own.
         self._execution_state: "MoeExecutionState | None" = None
         self._bound = False
-        # The ops' abort_state argument once bound (the state's abort record); none until then.
         self._abort_state_kwargs: Dict[str, torch.Tensor] = {}
         if self._rank_mask_enabled:
             from .execution_state import MoeExecutionState  # imports this module
@@ -773,11 +758,9 @@ class NVLinkOneSided(Communication):
         self.invalid_token_expert_id: int = -1
 
     def bind_execution_state(self, state: "MoeExecutionState") -> None:
-        """Run every later dispatch/combine with the state's rank-mask and abort records, in place of the
-        membership's shared state.
+        """Run every later dispatch and combine with the state's rank-mask and abort records.
 
-        Bound execution uses the fence path, so CUDA graphs captured afterwards
-        stay valid when the state installs a new rank mask or requests an abort.
+        CUDA graphs captured afterwards stay valid when the state installs a new rank mask or requests an abort.
         """
         if self._bound:
             raise RuntimeError("NVLinkOneSided is already bound to an execution state")
@@ -795,11 +778,7 @@ class NVLinkOneSided(Communication):
         self._bound = True
 
     def _reset_local_workspace(self) -> None:
-        """Return this rank's workspace row to its initial state.
-
-        As at initialization; the caller guarantees that no rank runs a
-        collective on this workspace until every rank has reset.
-        """
+        """Return this rank's workspace row to its initial state."""
         torch.ops.trtllm.moe_a2a_initialize(
             self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
         )
@@ -1033,8 +1012,7 @@ class NVLinkOneSided(Communication):
                 committed membership for dispatch. Without an override, the committed mask and generation are
                 captured together; combine reuses that mask and fails closed if the generation changes first.
                 The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
-                artifact, not valid model output. A layer bound to an execution state reads the state's installed
-                mask instead and takes no override.
+                artifact, not valid model output.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -1090,7 +1068,6 @@ class NVLinkOneSided(Communication):
             if state is not None:
                 state.publish_rank_mask(active_rank_mask_snapshot, self.ep_rank)
         elif requested_active_rank_mask is not None:
-            # The state installs the committed membership while the model is idle.
             raise ValueError("A layer bound to an execution state takes no active_rank_mask")
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
@@ -1112,9 +1089,7 @@ class NVLinkOneSided(Communication):
                 **self._abort_state_kwargs,
             )
         )
-        # The host watchdog tracks each eager call, but replayed CUDA graphs skip
-        # this code: bound execution relies on the abort record, set by rank
-        # failure detection, and on the device timeout instead.
+        # Replayed CUDA graphs skip the host watchdog, so bound execution relies on the abort record.
         if not self._bound:
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "dispatch", active_rank_mask_snapshot.active_rank_mask
@@ -1191,7 +1166,7 @@ class NVLinkOneSided(Communication):
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
             **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` must match the mask
                 captured by dispatch for this collective when supplied. A committed-generation change since
-                dispatch aborts the collective epoch. A bound layer uses the state's installed mask throughout.
+                dispatch aborts the collective epoch.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]

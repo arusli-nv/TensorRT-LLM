@@ -169,17 +169,11 @@ def is_context_length_exceeded_message(message: str) -> bool:
     return bool(_CONTEXT_LENGTH_EXCEEDED_RE.search(message))
 
 
-# Machine-readable error code the OpenAI-compatible server attaches to a
-# ``RankFailureError``: sending the request again can succeed.
 RANK_FAILURE_CODE = "rank_failure"
 
 
 class RankFailureError(RequestError):
-    """The error of a request that a WideEP rank failure ended.
-
-    Sending the request again can succeed. The executor sets it as the error of
-    the request's response, and it reaches the client as this type.
-    """
+    """Error of a request that a WideEP rank failure ended, safe to retry."""
 
     def __init__(self,
                  message: str = ("A rank failure ended the request; "

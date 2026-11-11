@@ -1563,12 +1563,12 @@ def test_the_install_restores_the_lost_experts_from_the_agreed_placement(monkeyp
     # One line per rank tells operators what the restore did and how long each phase of the install took, and how
     # the KV cache pool's quota followed the memory needed and the free device memory.
     (restored,) = [c.args[0] for c in info.call_args_list if "restored membership" in c.args[0]]
-    assert "1 experts loaded (6291456 bytes)" in restored
+    assert "Loaded 1 experts (6291456 bytes)" in restored
     assert (
         f"KV cache quota {64 * MIB} -> {54 * MIB} bytes ({10 * MIB - 4096} bytes needed, "
-        f"{FREE_BYTES} bytes free); phases: "
+        f"{FREE_BYTES} bytes free). Phases: "
     ) in restored
-    phases = restored.split("; phases: ")[1].split(", ")
+    phases = restored.split(". Phases: ")[1].split(", ")
     assert [phase.rsplit(" ", 2)[0] for phase in phases] == [
         "prepare",
         "request gather",
@@ -1791,7 +1791,7 @@ def test_a_rejoin_releases_the_emptied_spare_slots_once_committed(monkeypatch):
     recovery._moe.health.mark_active.assert_any_call(FAILED)
     (resumed,) = [c.args[0] for c in info.call_args_list if "resumed serving" in c.args[0]]
     assert (
-        f"; {6 * MIB} bytes of empty spare slots released, KV cache quota "
+        f". Released {6 * MIB} bytes of empty spare slots, KV cache quota "
         f"{STARTUP_MEMORY.kv_cache_quota} bytes, in "
     ) in resumed
 

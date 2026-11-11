@@ -407,11 +407,7 @@ _DEFAULT_IDENTITY_TIMEOUT = 300.0
 
 
 def _pool_workers(n_workers: int) -> int:
-    """The workers of an ``MpiPoolSession`` pool of ``n_workers`` ranks.
-
-    With WideEP fault tolerance, rank 0's alone: its node supervisor starts
-    the other ranks.
-    """
+    """Return the pool size, 1 when the node supervisor starts other ranks."""
     return 1 if _utils.fault_tolerance_mode() else n_workers
 
 
@@ -521,12 +517,8 @@ class MpiPoolSession(MpiSession):
                  env_overrides: Optional[Dict[str, str]] = None):
         """Spawn a pool of MPI worker processes.
 
-        With WideEP fault tolerance, the pool holds rank 0's worker only, and
-        every other rank runs as its own process, which the node supervisor
-        starts and replaces when it fails, as under ``trtllm-llmapi-launch``
-        (:meth:`_start_node_supervisor`): ``submit`` runs tasks on rank 0,
-        whose ``worker_main`` hands its arguments to the other ranks through
-        the rendezvous store.
+        With WideEP fault tolerance, the pool holds rank 0 only, and the node
+        supervisor starts and replaces the other ranks.
 
         Args:
             n_workers: number of MPI workers to spawn (with WideEP fault
@@ -554,7 +546,6 @@ class MpiPoolSession(MpiSession):
         # Keeps the copies of one submission contiguous in the pool's queue.
         self._submit_lock = threading.Lock()
         self.mpi_pool: Optional[MPIPoolExecutor] = None
-        # With WideEP fault tolerance: the supervisor of the other ranks.
         self._node_supervisor: Optional[subprocess.Popen] = None
         self._start_mpi_pool()
         if wait_shutdown:
@@ -760,15 +751,7 @@ class MpiPoolSession(MpiSession):
                                         python_args=python_args)
 
     def _start_node_supervisor(self, env: Dict[str, str]) -> None:
-        """Start the node supervisor of ranks 1 to ``n_workers - 1``.
-
-        WideEP fault tolerance: it starts each as its own process, through
-        ``trtllm-llmapi-launch`` as on every node under that launcher, and
-        replaces those that fail. Rank 0 runs in this session's pool, which
-        stops the supervisor when it shuts down. The supervisor takes the join
-        secret and the rendezvous address, which the LLM chose before any pool,
-        from ``env``.
-        """
+        """Start the node supervisor of ranks 1 to ``n_workers - 1``."""
         launcher = shutil.which("trtllm-llmapi-launch")
         if launcher is None:
             raise RuntimeError("WideEP fault tolerance starts the ranks with "
@@ -784,12 +767,7 @@ class MpiPoolSession(MpiSession):
             env=env)
 
     def _stop_node_supervisor(self, wait: bool) -> None:
-        """End the node supervisor; it ends its ranks.
-
-        It ends by itself once the deployment shuts down: wait for that up to
-        the MGMN shutdown grace (``wait``), then stop it; without ``wait``,
-        stop it at once.
-        """
+        """Stop the node supervisor, after the shutdown grace if ``wait``."""
         supervisor, self._node_supervisor = self._node_supervisor, None
         if supervisor is None:
             return

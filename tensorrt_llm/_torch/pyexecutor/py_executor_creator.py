@@ -640,9 +640,7 @@ def _create_py_executor(
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
-    # A replacement rank skips the estimation, whose run needs rank 0's
-    # requests, and the original ranks do not record it (startup_record): it
-    # takes the KV cache capacity they agreed on from the record.
+    # A replacement rank takes the KV cache capacity from the startup record.
     skip_est = (os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
                 or fault_tolerance_replacement() is not None)
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
@@ -798,8 +796,6 @@ def _create_py_executor(
 
     dist = Distributed.get(mapping)
     if fault_tolerance_mode():
-        # Before the model loads, so that an unsupported configuration fails
-        # fast.
         from .rank_failure_recovery import check_supported
         check_supported(llm_args, mapping, dist)
 
@@ -1360,7 +1356,7 @@ def _create_py_executor(
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         if estimating_kv_cache:
-            startup_record.pause()  # until the estimation's teardown
+            startup_record.pause()
 
         # Without the estimation, build_managers sizes the final KV cache from
         # the device memory free now, so DWDP is set up first: the KV cache

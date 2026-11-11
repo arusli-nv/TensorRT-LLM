@@ -112,8 +112,7 @@ void moeHierarchicalStatisticUpdate(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBala
 // @param tokenCount: the token count to compute the route
 // @param offsetByEpRank: whether to offset the round robin position by epRank
 // @param stream: the CUDA stream to be used
-// @param oneSlotPerExpert: every expert has exactly one replica (more slots than experts, the rest empty), so no
-// replica needs choosing
+// @param oneSlotPerExpert: whether every expert has exactly one replica
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
     int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream,
     bool oneSlotPerExpert = false);
@@ -125,8 +124,8 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
 // After this function is called, functions for weight update can be called.
 //
 // @param signal: the signal
-// @param stop: optional; once it is set, stops waiting
-// @return: whether the signal was set for cpu stage (false: stopped)
+// @param stop: optional flag that ends the wait once set
+// @return: false if the wait was stopped
 bool moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, std::atomic<bool> const* stop = nullptr);
 
 // @brief set the signal for gpu stage on host

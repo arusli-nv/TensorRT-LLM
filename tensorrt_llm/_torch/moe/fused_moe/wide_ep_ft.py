@@ -61,12 +61,9 @@ def get_wide_ep_ft_options(
     object shared by all MoE communication layers.
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
-    committed membership directly. With ``enable_wide_ep_fault_tolerance`` the
-    timeout is None: no watchdog runs, as the membership authority reads the
-    kernels' wait evidence. The kernels read the mask at execution time, so
-    rank-mask mode works with CUDA graphs once each communicator is bound to an
-    execution state, which ``enable_wide_ep_fault_tolerance`` does; without it,
-    a model that uses CUDA graphs is refused here.
+    committed membership directly. Rank-mask mode supports CUDA graphs only with
+    ``enable_wide_ep_fault_tolerance``, which binds each communicator to an
+    execution state.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
@@ -77,7 +74,6 @@ def get_wide_ep_ft_options(
         and getattr(model_config, "use_cuda_graph", False)
         and not fault_tolerance_mode()
     ):
-        # Only enable_wide_ep_fault_tolerance binds the communicators to an execution state.
         raise ValueError(
             "WideEP rank-mask mode does not support CUDA graphs without "
             "enable_wide_ep_fault_tolerance; disable CUDA graphs or turn it on"
@@ -85,7 +81,6 @@ def get_wide_ep_ft_options(
     if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)
         if fault_tolerance_replacement() is not None:
-            # Isolated startup: the all-to-all reaches no peer until the admission installs the membership.
             for rank in range(health.moe_world_size):
                 if rank != model_config.mapping.moe_ep_rank:
                     health.mark_failed(rank)
@@ -98,8 +93,7 @@ def get_wide_ep_ft_options(
         DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     )
     if health is None or fault_tolerance_mode():
-        # With enable_wide_ep_fault_tolerance the membership authority reads the kernels' wait evidence:
-        # no watchdog.
+        # The membership authority reads the kernels' wait evidence instead of a watchdog.
         return health, None, poll_interval_s
 
     timeout_s = _float_option(

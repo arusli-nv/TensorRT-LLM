@@ -60,9 +60,8 @@ class GuidedRequest:
     is_draft: bool = False
     draft_tokens: Optional[List[int]] = None
     num_accepted_draft_tokens: Optional[int] = None
-    # With WideEP fault tolerance, the generated tokens a recompute moved into
-    # the prompt; the matcher created at the last context chunk accepts them
-    # first.
+    # Generated tokens a recompute moved into the prompt, which a new matcher
+    # accepts first.
     recomputed_tokens: Optional[List[int]] = None
 
     def require_matcher_init(self) -> bool:
@@ -539,9 +538,7 @@ class GuidedDecoder:
         self._init_disagg_gen_requests(self.requests)
 
     def discard_matchers(self, requests: Iterable[LlmRequest]) -> None:
-        """Drop the grammar matchers of ``requests``, whose step was discarded
-        after its build advanced them: until the requests are computed again,
-        which creates their matchers anew, their builds skip guiding."""
+        """Drop the grammar matchers of a discarded step's ``requests``."""
         for request in requests:
             if request.py_seq_slot is not None:
                 self.grammar_matchers[request.py_seq_slot] = None
@@ -686,12 +683,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
 
     def discard_batch(self, requests: Iterable[LlmRequest],
                       batch_id: int) -> None:
-        """Drop the grammar matchers of a discarded batch's ``requests`` (see
-        discard_matchers) and the build failures of batches up to
-        ``batch_id``, which come from the matchers dropped. Waits first until
-        every host function enqueued so far has run, so that none advances a
-        matcher after it is dropped or reports a failure after they are
-        taken."""
+        """Drop the grammar matchers and build failures of a discarded batch."""
+        # No host function enqueued so far may advance a dropped matcher.
         self._drain_host_functions()
         self.take_failed_requests(batch_id)
         self.discard_matchers(requests)

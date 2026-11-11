@@ -5,10 +5,7 @@ import logging
 import os
 import sys
 
-# With WideEP fault tolerance, the node supervisor starts every rank but 0 as
-# its own process, outside the launcher's MPI job, with its rank in this
-# variable (FAULT_TOLERANCE_RANK_ENV in tensorrt_llm/_utils.py): the rank takes
-# its worker arguments from rank 0 through the rendezvous store.
+# A rank the node supervisor started runs outside the launcher's MPI job.
 if "TLLM_FAULT_TOLERANCE_RANK" in os.environ:
     from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
         worker_node_main

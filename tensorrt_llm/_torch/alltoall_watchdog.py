@@ -102,9 +102,7 @@ class EPGroupHealthLike(Protocol):
 class ActiveRankMaskSnapshot:
     """One dispatch epoch's rank mask and optional committed generation.
 
-    ``active_rank_mask`` is a host (CPU) copy of the uint64 mask words; the
-    kernels read the mask from the device record of an execution state, which
-    the frontend publishes it to.
+    ``active_rank_mask`` is a CPU copy of the uint64 mask words.
     ``committed_generation`` is populated only when ``active_rank_mask`` was
     read from the coordinator-owned EP health object. Explicit caller masks do
     not inherit a generation from unrelated health state.
@@ -305,10 +303,10 @@ class AlltoAllWatchdogCoordinator:
     ) -> ActiveRankMaskSnapshot:
         """Capture a caller override or one coherent committed-mask epoch.
 
-        The returned tensor is a CPU copy that does not alias a caller-owned
-        override, so it can safely represent the mask used by one
-        dispatch/combine pair. When the mask comes from ``health``, derive all
-        fixed-width ABI words from one atomic mask/generation snapshot.
+        The returned tensor does not alias a caller-owned override, so it can
+        safely represent the mask used by one dispatch/combine pair. When the
+        mask comes from ``health``, derive all fixed-width ABI words from one
+        atomic mask/generation snapshot.
         """
         if active_rank_mask is not None:
             return ActiveRankMaskSnapshot(

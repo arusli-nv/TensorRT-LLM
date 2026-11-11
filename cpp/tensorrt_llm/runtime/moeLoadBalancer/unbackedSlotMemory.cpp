@@ -23,7 +23,6 @@ namespace tensorrt_llm::runtime
 namespace
 {
 
-// The allocations of unbacked slot memory: device memory, which GDRCopy can map for the host with hostAccessible.
 CUmemAllocationProp slotMemoryProp(int device, bool hostAccessible = false)
 {
     CUmemAllocationProp prop{};
@@ -34,8 +33,6 @@ CUmemAllocationProp slotMemoryProp(int device, bool hostAccessible = false)
     return prop;
 }
 
-// Maps a chunk's memory for the host while the chunk is materialized: set up after the device mapping, torn down
-// before it.
 struct HostMappingConfigurator : CUDAVirtualMemoryChunk::Configurator
 {
     HostMappingConfigurator(CUdeviceptr address, size_t size)
@@ -58,7 +55,6 @@ struct HostMappingConfigurator : CUDAVirtualMemoryChunk::Configurator
     size_t mSize;
 };
 
-// Read-write access for the device.
 CUmemAccessDesc slotMemoryAccess(int device)
 {
     CUmemAccessDesc desc{};
@@ -68,8 +64,7 @@ CUmemAccessDesc slotMemoryAccess(int device)
     return desc;
 }
 
-// Maps an allocation of one chunk at each chunk of [address, address + size) (cuMemMap maps whole allocations only),
-// then grants access to the whole range with one call; unmaps the range with one call.
+// cuMemMap maps whole allocations only, so the one-chunk allocation is mapped at each chunk of the range.
 struct RepeatedMappingConfigurator : CUDAVirtualMemoryChunk::Configurator
 {
     RepeatedMappingConfigurator(CUdeviceptr address, size_t size, size_t chunkSize, CUmemAccessDesc const& desc)
@@ -82,7 +77,7 @@ struct RepeatedMappingConfigurator : CUDAVirtualMemoryChunk::Configurator
 
     void setup(CUmemGenericAllocationHandle handle) override
     {
-        // A failure leaves nothing mapped: teardown runs only after a successful setup.
+        // Unmap on failure, because teardown runs only after a successful setup.
         for (size_t offset = 0; offset < mSize; offset += mChunkSize)
         {
             CUresult const result = cuMemMap(mAddress + offset, mChunkSize, 0, handle, 0);
@@ -114,7 +109,7 @@ struct RepeatedMappingConfigurator : CUDAVirtualMemoryChunk::Configurator
     CUmemAccessDesc mDesc;
 };
 
-// Creates no memory: every chunk it serves maps the same allocation, which its owner keeps alive.
+// Every chunk maps the same allocation, which mOwner keeps alive.
 struct SharedCreator : CUDAVirtualMemoryChunk::Creator
 {
     SharedCreator(std::shared_ptr<void const> owner, CUmemGenericAllocationHandle handle)
@@ -136,7 +131,6 @@ struct SharedCreator : CUDAVirtualMemoryChunk::Creator
 
 } // namespace
 
-// One chunk of device memory that every chunk of every unbacked piece maps.
 struct UnbackedSlotMemory::Scratch
 {
     Scratch(CUmemAllocationProp const& prop, size_t bytes)
@@ -351,8 +345,7 @@ void UnbackedSlotMemory::free(void* ptr) noexcept
         TLLM_LOG_ERROR("%p is not unbacked slot memory", ptr);
         return;
     }
-    // Unlike cudaFree, cuMemUnmap does not wait for the work queued on the range: wait for it here, on the range's
-    // device (a tensor deleter may run with another device current).
+    // Unlike cudaFree, cuMemUnmap does not wait for queued work. A tensor deleter may run with another device current.
     int current = -1;
     TLLM_CUDA_CHECK_WARN(cudaGetDevice(&current));
     if (current != mDevice)
@@ -419,7 +412,6 @@ size_t UnbackedSlotMemory::setBacked(std::vector<SlotRange> const& ranges, bool 
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     TLLM_CHECK_WITH_INFO(
         device == mDevice, "Unbacked slot memory of device %d changed with device %d current", mDevice, device);
-    // Per allocation, the slot states asked for: recorded once every piece maps them.
     std::map<Allocation*, std::vector<uint8_t>> requested;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
@@ -429,8 +421,6 @@ size_t UnbackedSlotMemory::setBacked(std::vector<SlotRange> const& ranges, bool 
             slotsBacked[slot] = static_cast<uint8_t>(backed);
         }
     }
-    // The pieces to map again, with the hostAccessible of their allocation: a piece is backed while any of its slots
-    // is.
     std::vector<std::pair<Piece*, bool>> changed;
     for (auto& [allocation, slotsBacked] : requested)
     {
@@ -445,7 +435,7 @@ size_t UnbackedSlotMemory::setBacked(std::vector<SlotRange> const& ranges, bool 
     size_t bytes = 0;
     if (!changed.empty())
     {
-        // Unlike cudaFree, cuMemUnmap does not wait for the work queued on the ranges: wait for it here.
+        // Unlike cudaFree, cuMemUnmap does not wait for queued work.
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
         size_t remapped = 0;
         try
@@ -458,7 +448,7 @@ size_t UnbackedSlotMemory::setBacked(std::vector<SlotRange> const& ranges, bool 
         }
         catch (...)
         {
-            // The pieces mapped again before the failure go back to their state: the call changes nothing.
+            // Restore the pieces remapped before the failure, so the call changes nothing.
             while (remapped-- > 0)
             {
                 try
@@ -482,8 +472,7 @@ size_t UnbackedSlotMemory::setBacked(std::vector<SlotRange> const& ranges, bool 
 
 void UnbackedSlotMemory::remap(Piece& piece, bool hostAccessible) const
 {
-    // An address holds one mapping at a time: the current one goes first. If the other state fails to map, the
-    // current state is mapped again (the scratch, or fresh memory of its own), so the piece stays mapped.
+    // An address holds one mapping at a time. If the new mapping fails, the old state is mapped again.
     piece.chunk.release();
     try
     {

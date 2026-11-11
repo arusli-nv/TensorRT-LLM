@@ -14,12 +14,7 @@
 # limitations under the License.
 """Keep a WideEP deployment serving when one of its ranks fails, and let a replacement rank rejoin.
 
-Every rank is its own process, which joins the membership at the entry of its worker (:func:`start_worker`,
-:func:`worker_node_main`); the startup collectives go through the rendezvous store (``StoreGroup``). Once
-serving, :class:`RankFailureRecovery` takes part in every membership change the authority proposes: it stops the
-all-to-all and the host exchange, replies READY, moves the host exchange to the live ranks at INSTALL, and at the
-resume point restores the lost experts and the all-to-all workspaces, then replies INSTALLED. See
-``docs/source/features/wide-ep-fault-tolerance.md``.
+See ``docs/source/features/wide-ep-fault-tolerance.md``.
 """
 
 from __future__ import annotations
@@ -98,13 +93,9 @@ if TYPE_CHECKING:
     from .scheduler.adp_router import RankState
     from .scheduler.waiting_queue import WaitingQueue
 
-# How long a rank that leaves the membership waits for the SHUTDOWN record, and rank 0 for the authority to end.
 _AUTHORITY_TIMEOUT_S = 10.0
-# How long a read of the server's fault-tolerance status waits for the membership store to answer.
 _STATUS_READ_TIMEOUT_S = 1.0
-# How often a rank whose KV cache pool fell short of its quota at a commit checks whether device memory was freed.
 _GIVE_BACK_RETRY_S = 1.0
-# The least length of the join secret, which keys the signatures of the membership store's values.
 _JOIN_SECRET_BYTES = 32
 
 
@@ -112,17 +103,15 @@ class _MembershipRestarted(Exception):
     """A newer membership change replaced the one being installed."""
 
 
-# The sockets that reserve the authority's ports ensure_rendezvous chose.
 _rendezvous_ports: List[socket.socket] = []
-# From the entry of this process's worker: its membership agent, and on rank 0 the authority process it started.
 _agent: Optional[MembershipAgent] = None
 _authority: Optional[subprocess.Popen] = None
 
 
 def ensure_rendezvous() -> None:
-    """Choose and export the join secret and the rendezvous address (this host and two free consecutive ports) when
-    unset, for the workers this process starts. The ports stay reserved by sockets bound with SO_REUSEADDR that never
-    listen, which still lets the authority bind them later."""
+    """Export the join secret and the rendezvous address when unset.
+
+    The two ports stay reserved by SO_REUSEADDR sockets that never listen, so the authority can still bind them."""
     global _rendezvous_ports
     if not os.environ.get(JOIN_SECRET_ENV):
         os.environ[JOIN_SECRET_ENV] = secrets.token_hex(_JOIN_SECRET_BYTES)
@@ -136,7 +125,7 @@ def ensure_rendezvous() -> None:
             try:
                 reserved[1].bind(("", port + 1))
                 break
-            except (OSError, OverflowError):  # taken, or past the last port: try another pair
+            except (OSError, OverflowError):
                 for sock in reserved:
                     sock.close()
         _rendezvous_ports = reserved
@@ -144,7 +133,6 @@ def ensure_rendezvous() -> None:
 
 
 def _host_collectives_requirements(mapping: Mapping) -> List[str]:
-    """What the host collectives over MNNVL memory (``MnnvlDist``) need that this deployment lacks."""
     from tensorrt_llm._utils import mpi_disabled
 
     from ..distributed.host_exchange import MnnvlDist
@@ -169,11 +157,11 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
         resolve_moe_comm_timeout_budgets,
     )
 
-    # The all-to-all kernels that wait on a hung rank are released when the authority excludes it, up to 1.5 hang
-    # timeouts after their wait began: they must not time out before.
+    # All-to-all kernels waiting on a hung rank are released up to 1.5 hang timeouts after their wait began, when the
+    # authority excludes the rank, so they must not time out first.
     kernel_timeout_s = resolve_moe_comm_timeout_budgets(os.environ).serving_seconds
     if kernel_timeout_s is None:
-        kernel_timeout_s = torch.ops.trtllm.moe_a2a_get_timeout()  # the kernels' own default
+        kernel_timeout_s = torch.ops.trtllm.moe_a2a_get_timeout()
     missing = [] if isinstance(dist, MnnvlDist) else _host_collectives_requirements(mapping)
     checks = [
         (not missing, ", ".join(missing)),
@@ -182,13 +170,12 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
             "expert parallelism over every rank (moe_expert_parallel_size equal to the world size), so that a "
             "failed rank holds whole experts, which the survivors restore into their spare slots",
         ),
-        # Resolved from "auto" as the model loads, after the arguments' validation: checked only here.
+        # Resolved from "auto" only as the model loads, after the arguments' validation.
         (
             llm_args.kv_cache_config.use_kv_cache_manager_v2 is True,
             "KV cache manager V2 (kv_cache_config.use_kv_cache_manager_v2=True), the only KV cache manager "
             "that holds the KV reuse commits of a step until the step is accepted",
         ),
-        # Bound execution (NVLinkOneSided.bind_execution_state) runs on the fence path.
         (
             get_force_cft() is not True,
             f"the fence path of the NVLink one-sided all-to-all ({FORCE_CFT_ENV} unset or 0), the only path "
@@ -204,11 +191,7 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
 
 
 def _launched_rank() -> RankIdentity:
-    """The rank this process stands for, once the join secret and the rendezvous address are checked.
-
-    Raises:
-        ValueError: The launch does not give the process what it needs.
-    """
+    """Return this process's rank after checking the join secret and the rendezvous address."""
     try:
         secret = bytes.fromhex(os.environ[JOIN_SECRET_ENV])
         int(os.environ[RENDEZVOUS_ENV].rsplit(":", 1)[1])
@@ -233,11 +216,6 @@ def _launched_rank() -> RankIdentity:
 
 
 def _rank_identity() -> RankIdentity:
-    """This process's rank, from its node supervisor.
-
-    Raises:
-        ValueError: The process has no rank identity.
-    """
     identity = wide_ep_fault_tolerance_rank()
     if identity is None:
         raise ValueError(
@@ -249,8 +227,7 @@ def _rank_identity() -> RankIdentity:
 
 
 def check_supported_model(model: torch.nn.Module) -> None:
-    """Check the built model before any weight loads: its architecture, MoE communication and the room for its host
-    weights.
+    """Check, before any weight loads, that the built model supports fault tolerance.
 
     Raises:
         ValueError: The model is not supported with fault tolerance.
@@ -270,16 +247,10 @@ def check_supported_model(model: torch.nn.Module) -> None:
 
 
 def _check_host_weights_fit(model: torch.nn.Module) -> None:
-    """Check that /dev/shm has room for the host weights of every expert of ``model`` beyond the node's segments that
-    exist already (those a replacement reattaches).
-
-    Raises:
-        ValueError: /dev/shm has too little free space.
-    """
+    """Check that /dev/shm has room for the host weights of every expert beyond the segments already on the node."""
     from ..moe.fused_moe.eplb_expert_restore import SHARED_MEMORY_DIR, DeploymentHostCopies
     from ..moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 
-    # Per MoE layer's host tensor sharer, the bytes of one slot of each of the layer's weights of local slots.
     slot_bytes: Dict[DeploymentHostCopies, List[int]] = {}
     for module in model.modules():
         sharer = getattr(getattr(module, "layer_load_balancer", None), "host_tensor_sharer", None)
@@ -303,20 +274,16 @@ def _check_host_weights_fit(model: torch.nn.Module) -> None:
         )
 
 
-# The agreed-startup record in the rendezvous store: the fingerprint and rank 0's startup record (startup_record).
 AGREED_STARTUP_KEY = "agreed_startup"
-# Rank 0's worker_main arguments, which every other rank runs worker_main with (see start_worker).
 WORKER_ARGS_KEY = "worker_args"
 
 _startup_fingerprint: Optional[str] = None
 _worker_main_args: Optional[dict] = None
-# A replacement rank: the agreed-startup record, once read.
 _published_record: Optional[dict] = None
 
 
 def adopt_tuned_tactics(profiling_cache) -> None:
-    """At the final executor's autotuner warmup: rank 0 records the tactics shared by every rank, and a replacement,
-    which skipped the warmup of the KV cache estimation, adopts them."""
+    """Share rank 0's tuned tactics with a replacement, which skips the KV cache estimation warmup."""
     tactics = startup_record.agree(
         "tuned_tactics",
         lambda: profiling_cache._serialize_cache_data(
@@ -331,8 +298,7 @@ _deployment_nonce: Optional[str] = None
 
 
 def deployment_nonce() -> str:
-    """A random name of this deployment, the same on every rank (a startup collective), which keeps its shared-memory
-    segments apart from another deployment's."""
+    """Return a random deployment name, the same on every rank, that keeps its shared-memory segments apart."""
     global _deployment_nonce
     if _deployment_nonce is None:
         _deployment_nonce = startup_record.agree(
@@ -343,12 +309,10 @@ def deployment_nonce() -> str:
 
 
 def _agreed_startup_record() -> bytes:
-    """Rank 0's agreed-startup record: the fingerprint and its startup record."""
     return pickle.dumps({**startup_record.published(), "fingerprint": _startup_fingerprint})
 
 
 def _agreed_startup() -> dict:
-    """A replacement rank: the agreed-startup record the live ranks published."""
     global _published_record
     if _published_record is None:
         # Only processes with the join secret write the store's values (SignedStore).
@@ -357,8 +321,7 @@ def _agreed_startup() -> dict:
 
 
 def startup_fingerprint(worker_main_args: dict) -> str:
-    """What a replacement must share with the deployment beyond rank 0's arguments: the TensorRT-LLM version and the
-    checkpoint's ``config.json``."""
+    """Return a digest of the TensorRT-LLM version and the checkpoint's ``config.json``."""
     from tensorrt_llm.version import __version__
 
     digest = hashlib.sha256(__version__.encode())
@@ -369,13 +332,7 @@ def startup_fingerprint(worker_main_args: dict) -> str:
 
 
 def start_worker(worker_main_args: dict) -> None:
-    """Called first in ``worker_main`` with fault tolerance. Rank 0 starts the authority, publishes the arguments every
-    other rank runs ``worker_main`` with, joins the membership and records its startup; the other ranks joined in
-    :func:`worker_node_main`.
-
-    Raises:
-        ValueError: The launch does not give this process what fault tolerance needs (:func:`_launched_rank`).
-    """
+    """Start the authority on rank 0, publish its worker arguments, join the membership and record the startup."""
     global _startup_fingerprint, _worker_main_args, _authority
     _startup_fingerprint = startup_fingerprint(worker_main_args)
     _worker_main_args = worker_main_args
@@ -394,8 +351,7 @@ def start_worker(worker_main_args: dict) -> None:
 
 
 def _worker_args_for_other_ranks() -> bytes:
-    """Rank 0's ``worker_main`` arguments for the other ranks, without its IPC addresses and keys: the store signs its
-    values but does not encrypt them."""
+    """Return rank 0's worker arguments without its IPC addresses and keys, which the store does not encrypt."""
     from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
 
     return pickle.dumps(
@@ -409,16 +365,13 @@ def _worker_args_for_other_ranks() -> bytes:
 
 
 def worker_node_main() -> None:
-    """The entry point of every rank other than 0 with fault tolerance (``python -m
-    tensorrt_llm.llmapi.mgmn_worker_node``): joins the membership, then runs ``worker_main`` with the arguments rank 0
-    published; a replacement replays rank 0's startup record. Its waits end when the authority ends the deployment.
+    """Run a rank other than 0 with fault tolerance (``python -m tensorrt_llm.llmapi.mgmn_worker_node``).
 
     Raises:
-        ValueError: The launch does not give this process what fault tolerance needs (:func:`_launched_rank`).
-        ReplacementCannotStart: A replacement does not match the deployment (TensorRT-LLM version or checkpoint), or
-            its startup failed in another way that a restart would repeat.
+        ReplacementCannotStart: A replacement does not match the deployment, or its startup failed in a way that a
+            restart would repeat.
     """
-    # Both before the executor's modules are imported, which may read them.
+    # Set before the executor's modules are imported, which may read the mode.
     set_fault_tolerance_mode(True)
     identity = _launched_rank()
     from tensorrt_llm.executor.worker import worker_main
@@ -442,25 +395,21 @@ def worker_node_main() -> None:
             startup_record.replay(_agreed_startup())
         worker_main(**worker_main_args)
     except ReplacementCannotStart as error:
-        logger.error(f"{error}; no replacement of this rank can start")
+        logger.error(f"No replacement of this rank can start: {error}")
         raise
 
 
 @functools.lru_cache(maxsize=1)
 def _startup_store() -> SignedStore:
-    """This process's client of the rendezvous store for its startup, which may start before rank 0's authority."""
     return rendezvous_store(RENDEZVOUS_TIMEOUT_S)
 
 
-# The startup collectives this rank completed: its progress while the deployment starts (RankReport.progress).
 _startup_steps = 0
-# The peers the startup collective in progress waits for, as last reported.
 _startup_waiting_for = 0
 
 
 def _report_startup_wait(waiting_for: int) -> None:
-    """Report each change of the peers a startup collective of this rank waits for; 0 completes a collective, a step
-    of progress."""
+    """Report each change of the peers a startup collective waits for, where 0 completes a collective."""
     global _startup_steps, _startup_waiting_for
     if waiting_for and waiting_for == _startup_waiting_for:
         return
@@ -471,15 +420,7 @@ def _report_startup_wait(waiting_for: int) -> None:
 
 
 def join_startup_group(mapping: Mapping) -> None:
-    """Called in ``worker_main`` after :func:`start_worker`: makes the startup group of every rank (a ``StoreGroup``
-    with only this rank live in a replacement, whose splits come from the startup record) this rank's ``mpi_comm()``,
-    and sets ``TLLM_RANK``.
-
-    Raises:
-        ValueError: The process has no rank identity, or ``mapping`` places the ranks on other nodes than the node
-            supervisor runs them on.
-        RuntimeError: The node's communicator was split from MPI before.
-    """
+    """Make the startup group of every rank this rank's ``mpi_comm()`` and set ``TLLM_RANK``."""
     identity = _rank_identity()
     one_node = identity.world_size <= min(identity.gpus_per_node, mapping.gpus_per_node)
     check_fault_tolerance_requirements(
@@ -510,8 +451,7 @@ def join_startup_group(mapping: Mapping) -> None:
 
 
 def _join_at_entry(store: SignedStore, identity: RankIdentity) -> None:
-    """Join the membership at the entry of this process's worker. Until the executor takes it over, the process exits
-    once the deployment ends or the authority is gone."""
+    """Join the membership, exiting the process if the deployment ends before the executor takes the agent over."""
     global _agent
     _agent = MembershipAgent(
         identity.rank,
@@ -523,7 +463,6 @@ def _join_at_entry(store: SignedStore, identity: RankIdentity) -> None:
     _agent.start()
 
 
-# Set once a record is past STARTING: every rank has started.
 _every_rank_started = threading.Event()
 
 
@@ -540,7 +479,7 @@ def _on_error_at_startup(error: Exception) -> None:
 
 
 def wait_for_every_rank() -> None:
-    """Report that this original rank's startup is done, and return once every rank's is."""
+    """Report this rank started and wait until every rank has."""
     _agent.report(started=True)
     _every_rank_started.wait()
 
@@ -553,7 +492,6 @@ def _end_process(rank: int, status: int, reason: str) -> None:
 
 
 def _moe_load_balancer_of(executor: PyExecutor):
-    """The executor's EPLB load balancer (a ``MoeLoadBalancer``), or None."""
     from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 
     balancer = executor.model_engine.moe_load_balancer
@@ -561,32 +499,25 @@ def _moe_load_balancer_of(executor: PyExecutor):
 
 
 def _admission_keys(generation: int) -> Tuple[str, str]:
-    """The keys of the host exchange's epoch and the waiting queue rank 0 hands the joining ranks of ``generation``."""
     return f"host_exchange_epoch/{generation}", f"waiting_queue/{generation}"
 
 
 class StartupMemory(NamedTuple):
-    """This rank's GPU KV cache pool once the deployment serves, which every membership change resizes."""
+    """This rank's GPU KV cache quota once the deployment serves, which every membership change resizes from."""
 
-    # The pool's quota: it keeps this quota less the device memory fault tolerance holds.
     kv_cache_quota: int
 
     def free_to_keep(self, kv_cache_manager, held: int) -> int:
-        """The device memory serving keeps free at the start of a change: the free memory less what the pool lacks of
-        its quota for ``held`` (:meth:`fit_kv_cache`), which is free as well."""
+        """Return the free device memory less what the pool lacks of its quota for ``held``."""
         return torch.cuda.mem_get_info()[0] - (
             self.kv_cache_quota - held - kv_cache_manager.gpu_quota
         )
 
     def fit_kv_cache(self, kv_cache_manager, held: int, needed: int, free_to_keep: int = 0) -> int:
-        """Resize the KV cache pool to its quota once the deployment served less ``held`` (the device memory fault
-        tolerance holds, ``EplbExpertRestore.backed_spare_slot_bytes``) and ``needed`` (the memory it allocates next),
-        growing only into memory free beyond ``free_to_keep``, and return its quota. Derived afresh at every change, so
-        repeated failures do not ratchet it down. Every KV cache must be suspended.
+        """Resize the suspended KV cache pool to its startup quota less ``held`` and ``needed`` and return the quota.
 
-        Raises:
-            RuntimeError: The pool cannot take that quota (``KVCacheManagerV2.resize_gpu_quota``), e.g. below its
-                minimum.
+        The quota is derived afresh at every change so that repeated failures do not ratchet it down. The pool grows
+        only into memory free beyond ``free_to_keep``.
         """
         return kv_cache_manager.resize_gpu_quota(
             self.kv_cache_quota
@@ -596,8 +527,7 @@ class StartupMemory(NamedTuple):
         )
 
     def shortfall(self, kv_cache_manager, held: int, free_to_keep: int = 0) -> int:
-        """How much of its quota for ``held`` (:meth:`fit_kv_cache`) the pool neither holds nor can take from the
-        device memory free beyond ``free_to_keep``."""
+        """Return how much of its quota the pool neither holds nor can take from memory free beyond ``free_to_keep``."""
         return max(
             0,
             self.kv_cache_quota
@@ -610,30 +540,19 @@ class StartupMemory(NamedTuple):
 
 @dataclass
 class _GiveBackRetry:
-    """A give-back at a commit that fell short (:meth:`RankFailureRecovery._give_back_kv_cache`): pages an excluded
-    process still maps come free once it ended."""
+    """A KV cache give-back that fell short at a commit, retried as excluded processes end and free their pages."""
 
-    # The device memory serving keeps free (StartupMemory.free_to_keep at the start of the change).
     free_to_keep: int
-    # Per rank the committed record excludes, the incarnation of its last process.
     excluded: Dict[int, int]
-    # The free device memory after the last give-back.
     free_seen: int
-    # The time.monotonic() from which the next check is due.
     check_after_s: float
-    # Whether every excluded process ended: the next give-back is the last.
     ended: bool = False
 
 
 def _check_largest_failure_fits(
     executor: PyExecutor, balancer, startup_memory: StartupMemory
 ) -> None:
-    """Check that every original rank can restore the largest failure by the rule every change applies
-    (:meth:`StartupMemory.fit_kv_cache`). Collective over the original ranks.
-
-    Raises:
-        ValueError: No membership change could restore that failure on some rank.
-    """
+    """Check on every original rank that the KV cache pool can give up the memory to restore the largest failure."""
     needed = (
         balancer.expert_restore.largest_failure_restore_bytes()
         + executor.model_engine.moe_execution_state.workspace_bytes()
@@ -657,8 +576,7 @@ def _check_largest_failure_fits(
 
 
 def _helper_process_env() -> Dict[str, str]:
-    """The environment of the membership authority, a process outside this rank's MPI job without MPI (no mpi4py
-    or C++ MPI_Init), the launcher's rank variables or a GPU, at this rank's log level."""
+    """Return the environment of the membership authority, which runs without MPI, launcher variables or a GPU."""
     env = {
         name: value
         for name, value in os.environ.items()
@@ -674,13 +592,9 @@ def _helper_process_env() -> Dict[str, str]:
 
 
 def _start_authority(world_size: int, timeout_s: float) -> Tuple[subprocess.Popen, str]:
-    """Start the membership authority, whose store listens at the rendezvous address on this node; it ends with this
-    process, which holds the writing end of its standard input.
+    """Start the membership authority and return it with the ``host:port`` its store listens on.
 
-    Returns the process and the ``host:port`` its store listens on.
-
-    Raises:
-        RuntimeError: The authority did not report that address within ``timeout_s`` (it is then killed).
+    The authority ends with this process, which holds the writing end of its standard input.
     """
     env = _helper_process_env()
     read_fd, write_fd = os.pipe()
@@ -719,8 +633,7 @@ Placement = Tuple[Tuple[int, Tuple[Tuple[int, ...], ...]], ...]
 
 
 def ready_payload(record: MembershipRecord, rank: int, view: Placement) -> Optional[str]:
-    """``rank``'s READY payload for the PROPOSE ``record``: the whole ``view`` from the lowest survivor, its own slots
-    from a joining rank, None otherwise."""
+    """Return ``rank``'s READY payload: the whole placement from the lowest survivor, own slots from a joining rank."""
     if rank == record.lowest_survivor():
         return json.dumps(view)
     if record.joining_mask >> rank & 1:
@@ -729,8 +642,10 @@ def ready_payload(record: MembershipRecord, rank: int, view: Placement) -> Optio
 
 
 def agreed_placement(record: MembershipRecord) -> Optional[list]:
-    """The placement every live rank plans the restore from: the lowest survivor's view (survivors' views can differ
-    after an interrupted EPLB update), with each joining rank's own slots. None if a payload is missing."""
+    """Return the placement every live rank plans the restore from, or None if a READY payload is missing.
+
+    The lowest survivor's view is the source because survivors' views can differ after an interrupted EPLB update.
+    """
     payloads = dict(record.ready_payloads)
     source = record.lowest_survivor()
     joining = [r for r in range(record.joining_mask.bit_length()) if record.joining_mask >> r & 1]
@@ -747,8 +662,7 @@ def agreed_placement(record: MembershipRecord) -> Optional[list]:
 
 
 class RankFailureRecovery:
-    """One rank's part in keeping the deployment serving after a rank failure; see the module docstring. The executor
-    calls its hooks; on rank 0, the executor worker attaches its requests (:meth:`set_outstanding_requests`)."""
+    """Take part in every membership change on one rank, so that the deployment keeps serving after a rank failure."""
 
     def __init__(
         self,
@@ -765,7 +679,6 @@ class RankFailureRecovery:
         self._exchange = exchange
         self._moe = moe_state
         self._store = store
-        # ``host:port`` of the membership store.
         self.address = address
         self._startup_memory = startup_memory
         self._authority = authority
@@ -780,52 +693,36 @@ class RankFailureRecovery:
             generation=0, state=MembershipState.COMMITTED, live_mask=(1 << self.world_size) - 1
         )
         self._record_changed = threading.Condition()
-        # Whether this process is admitted (MembershipRecord.admits): a replacement waits for its admission.
         self._admitted = incarnation == 0
-        # The live ranks of the last COMMITTED record.
         self._committed_mask = self._record.live_mask
-        # The INSTALL record this rank installed last, and the last one it tried to finish installing.
         self._installed: Optional[MembershipRecord] = None
         self._attempted: Optional[MembershipRecord] = None
-        # Set at INSTALL: the last iteration any survivor had reached when it stopped; None once the change is
-        # committed. Until then, no forward runs.
+        # The last iteration any survivor reached, from INSTALL until the commit. No forward runs meanwhile.
         self._resume_after: Optional[int] = None
-        # Mask of the ranks whose value this rank waits for in the store, during a membership change.
         self._waiting_in_store = 0
-        # The steps of installing membership changes this rank completed (RankReport.install_steps).
         self._install_steps = 0
-        # Rank 0: the generations whose admission keys it set and the store still holds (_admit_joining_ranks).
         self._published_admissions: List[int] = []
-        # The requests of the discarded steps; they continue by recompute once the survivors resume.
         self._interrupted: List[LlmRequest] = []
-        # Once the KV cache pool gave up memory for a change not committed yet, the device memory serving keeps free
-        # (StartupMemory.free_to_keep, _give_back_kv_cache).
         self._kv_cache_free_to_keep: Optional[int] = None
-        # A give-back at a commit that fell short, retried while device memory is freed (_retry_give_back).
         self._give_back_retry: Optional[_GiveBackRetry] = None
-        # Whether this rank, and whether some rank, asked to retry its give-back in the last forward vote.
         self._give_back_due = False
         self._give_back_agreed = False
-        # Whether the current record is a change this rank has not installed yet, under _record_changed.
+        # Guarded by _record_changed.
         self._pending = False
-        # Whether some rank held its steps for a pending change in the last forward vote (forward_vote).
         self._steps_quiet = False
         exchange.interrupted = self._membership_changing
         exchange.on_interrupt = self._on_exchange_interrupt
 
     @classmethod
     def create(cls, executor: PyExecutor) -> Optional[RankFailureRecovery]:
-        """Take over, in fault tolerance mode (None otherwise), the membership this process joined at the entry of
-        its worker, once its startup is done. An original rank returns once every rank has started, a replacement once
-        the change that adds it is installed.
+        """Take over the membership this process joined at startup, or return None without fault tolerance.
 
-        Raises:
-            ValueError: Main's hang detector could end a rank before the authority excludes a peer it waits for.
+        An original rank returns once every rank has started, a replacement once the change that adds it is installed.
         """
         if not fault_tolerance_mode():
             return None
-        # A rank whose peer hangs waits in a collective until the authority excludes the peer, up to 1.5 hang
-        # timeouts after its wait began: main's hang detector must not end the rank first.
+        # A rank waits on a hung peer until the authority excludes it, up to 1.5 hang timeouts after its wait began,
+        # so the executor's hang detector must not end the rank first.
         hang_detection_s = executor.hang_detector.timeout
         check_fault_tolerance_requirements(
             [
@@ -848,8 +745,6 @@ class RankFailureRecovery:
         startup_memory = StartupMemory(executor.kv_cache_manager.gpu_quota)
         if replacement is None and balancer is not None:
             _check_largest_failure_fits(executor, balancer, startup_memory)
-        # The deployment serves from here: a lost rank's replacement reattaches the node's host copies, which the
-        # node supervisor unlinks once the deployment ended.
         host_weights_prefix = (
             None
             if balancer is None
@@ -884,10 +779,8 @@ class RankFailureRecovery:
         self._outstanding_requests = outstanding_requests
 
     def _join(self) -> None:
-        """A replacement's admission: report that it is ready to join, take part in the change that adds it, and start
-        the executor loop at the iteration the live ranks resume at."""
-        # Its READY to the PROPOSE that adds it, which it may never see (the INSTALL may come first): it ends its own
-        # online EPLB work here, as the live ranks do before their READY.
+        """Admit this replacement and start the executor loop at the iteration the live ranks resume at."""
+        # The replacement may never see the PROPOSE that adds it, so it reports its READY payload up front.
         adding = self._record.model_copy(
             update={"state": MembershipState.PROPOSE, "joining_mask": 1 << self.rank}
         )
@@ -902,8 +795,10 @@ class RankFailureRecovery:
         self._agent.bind(self._on_record, on_tick=self._on_tick, on_error=self._on_agent_error)
 
     def stop(self, completed: bool) -> None:
-        """When the executor loop ends: after a normal end, leave the membership (wait for SHUTDOWN, so the closing
-        connection is no failure); then end the process, as a teardown would wait for ranks that failed."""
+        """Leave the membership after a normal end, then end the process.
+
+        The process ends without a teardown, which would wait for ranks that failed.
+        """
         if completed:
             if self.rank == 0:
                 self._agent.report(shutdown=True)
@@ -919,8 +814,6 @@ class RankFailureRecovery:
                     self._authority.kill()
         _end_process(self.rank, 0 if completed else 1, "the executor stopped")
 
-    # Membership agent thread.
-
     def _on_record(self, record: MembershipRecord) -> None:
         with self._record_changed:
             self._record = record
@@ -931,39 +824,31 @@ class RankFailureRecovery:
             self._pending = self._change_pending(record)
             self._record_changed.notify_all()
         if not self._admitted:
-            return  # a replacement before its admission: _join and before_iteration follow the records
+            return
         if record.state in (MembershipState.PROPOSE, MembershipState.ABORT) or self._excluded(
             record
         ):
             if self._interrupts_steps(record):
-                # The all-to-all waits end, and the steps in flight are discarded (drop_invalid_step); their requests
-                # continue by recompute.
                 self._moe.request_abort()
             if self.rank == 0:  # rank 0 may be waiting for requests rather than in a collective
                 self._executor.executor_request_queue.wake()
             loop = getattr(self._executor, "worker_thread", None)
-            # No executor loop left to take the exit path.
             if (record.state == MembershipState.ABORT or self._excluded(record)) and (
                 loop is not None and not loop.is_alive()
             ):
                 _end_process(self.rank, 1, f"the membership record is {record!r}")
 
     def _on_agent_error(self, error: Exception) -> None:
-        """The agent lost its connection: serving continues unprotected (no lease). If only this rank lost it, the
-        authority takes it for failed, and main's hang detector ends it once it waits for peers that moved on. A wait
-        for the next record ends."""
+        """Keep serving unprotected after the agent lost its connection, and end any wait for the next record."""
         with self._record_changed:
             self._record_changed.notify_all()
-        logger.warning(
-            f"WideEP fault tolerance: the membership agent stopped ({error!r}); serving continues unprotected"
-        )
+        logger.warning(f"The membership agent stopped ({error!r}). Serving continues unprotected.")
 
     def _on_tick(self) -> None:
         waited_rounds = self._moe.waited_rounds()
         host_waits, epoch = self._exchange.waiting_for, self._exchange.epoch
         self._agent.report(
             progress=self._executor.iter_counter,
-            # The executor pauses its hang detector while it waits for requests.
             idle=self._executor.hang_detector.paused(),
             waiting_for=host_waits
             | self._waiting_in_store
@@ -974,16 +859,11 @@ class RankFailureRecovery:
             ),
         )
 
-    # Executor thread, inside the host exchange.
-
     def _excluded(self, record: MembershipRecord) -> bool:
-        """Whether ``record`` no longer lists this admitted process as a live member."""
         return self._admitted and not record.is_member(self.rank, self.incarnation)
 
     def _interrupts_steps(self, record: MembershipRecord) -> bool:
-        """Whether ``record`` interrupts the steps in flight: it ends the deployment, leaves this process out, or drops
-        a process of the committed membership. A change that only adds replacements stops the live ranks at a step
-        boundary instead."""
+        """Return whether ``record`` interrupts the steps in flight rather than waiting for a step boundary."""
         survivors = record.live_mask & ~record.joining_mask
         return (
             record.state == MembershipState.ABORT
@@ -992,7 +872,6 @@ class RankFailureRecovery:
         )
 
     def _change_pending(self, record: MembershipRecord) -> bool:
-        """Whether ``record`` is a membership change this rank has not installed yet."""
         return (
             record.state in (MembershipState.PROPOSE, MembershipState.ABORT)
             or (record.state == MembershipState.INSTALL and record != self._installed)
@@ -1000,9 +879,11 @@ class RankFailureRecovery:
         )
 
     def _membership_changing(self) -> bool:
-        """Whether the host exchange must stop for a change this rank has not installed yet. One that does not
-        interrupt the steps in flight stops it only once a forward vote had a rank hold for it, or while the steps are
-        held: that vote launched no forward, so every live rank stops in the same round, after the same forwards."""
+        """Return whether the host exchange must stop for a change this rank has not installed yet.
+
+        A change that does not interrupt the steps waits for a forward vote that launched no forward, so that every
+        live rank stops in the same round, after the same forwards.
+        """
         if not self._pending:
             return False
         return (
@@ -1013,8 +894,7 @@ class RankFailureRecovery:
 
     @contextlib.contextmanager
     def _hang_detection_paused(self):
-        """Pause main's hang detector during a membership change, which the authority bounds instead; a detector
-        paused already stays paused."""
+        """Pause the hang detector during a membership change, which the authority bounds instead."""
         detector = self._executor.hang_detector
         armed = not detector.paused()
         detector.disarm()
@@ -1025,22 +905,16 @@ class RankFailureRecovery:
                 detector.checkpoint()
 
     def _on_exchange_interrupt(self) -> None:
-        """The host exchange stopped for a membership change: take part in it. A joining rank inside its admission's
-        collective leaves it once it installed a newer change; :meth:`before_iteration` admits it from there.
-
-        Raises:
-            _MembershipRestarted: This rank joins in the change it installed.
-        """
+        """Take part in the membership change the host exchange stopped for."""
         self._change_membership()
         if self._resume_after is not None and self._installed.joining_mask >> self.rank & 1:
             raise _MembershipRestarted
 
     def _change_membership(self) -> None:
-        """Take part in the membership change, main's hang detector paused; returns once the host exchange is
-        installed for the live ranks (the rest finishes in :meth:`before_iteration`)."""
+        """Take part in the membership change until the host exchange is installed for the live ranks."""
         with self._hang_detection_paused():
-            seen = self._installed  # a change this rank installed already is none to take part in
-            listed = seen is not None  # by a record of this change or an earlier one
+            seen = self._installed
+            listed = seen is not None
             while True:
                 record = self._next_record(seen)
                 seen = record
@@ -1052,14 +926,13 @@ class RankFailureRecovery:
                     _end_process(self.rank, 0, "the deployment is shutting down")
                 if not record.is_member(self.rank, self.incarnation):
                     if self._admitted or listed:
-                        # A replacement the change left out: its supervisor starts another one.
                         _end_process(self.rank, 1, "the membership no longer includes this rank")
-                    continue  # a replacement, until the authority adds it
+                    continue
                 listed = True
                 if record.state == MembershipState.PROPOSE:
                     self._end_eplb_iterations()
                     if self._record != record:
-                        continue  # a newer change replaced it while the updates ended
+                        continue
                     stopped_at = ResumeState(
                         iteration=self._executor.iter_counter, epoch=self._exchange.stopped_epoch
                     )
@@ -1070,13 +943,10 @@ class RankFailureRecovery:
                         **self._expert_placement(record),
                     )
                 elif record.state == MembershipState.INSTALL:
-                    # The INSTALL record carries the READY payloads; a joining rank's readiness stood for its READY
-                    # to this change only.
                     self._agent.report(ready_payload=None, joining_ready=False)
                     try:
                         self._install(record)
                     except (_MembershipRestarted, MnnvlPeerHandleError) as error:
-                        # A peer exited during the install: the authority finds it failed and proposes again.
                         logger.warning(
                             f"Rank {self.rank} waits for the next membership record: {error!r}"
                         )
@@ -1086,10 +956,10 @@ class RankFailureRecovery:
                         continue
                     return
                 else:
-                    return  # no change to take part in
+                    return
 
     def _next_record(self, seen: Optional[MembershipRecord]) -> MembershipRecord:
-        """The current record once it differs from ``seen``; exits if the authority's connection closes meanwhile."""
+        """Wait for a record other than ``seen``, exiting if the authority closes its connection meanwhile."""
         with self._record_changed:
             self._record_changed.wait_for(lambda: self._record != seen or not self._agent.connected)
             if self._record == seen:
@@ -1101,15 +971,12 @@ class RankFailureRecovery:
             return self._record
 
     def _end_eplb_iterations(self) -> None:
-        """End the online EPLB work of the iterations so far and restart its statistics and update plan. Before READY,
-        so the placement READY carries no longer changes, and again at the resume point, where every live rank stands
-        at the same step."""
+        """End the online EPLB work so far, so that the placement no longer changes until the resume point."""
         balancer = _moe_load_balancer_of(self._executor)
         if balancer is not None:
             balancer.abandon_iterations()
 
     def _expert_placement(self, record: MembershipRecord) -> dict:
-        """This rank's READY payload for the PROPOSE ``record`` (:func:`ready_payload`); empty without EPLB."""
         balancer = _moe_load_balancer_of(self._executor)
         if balancer is None:
             return {}
@@ -1120,8 +987,7 @@ class RankFailureRecovery:
         return {"ready_payload": ready_payload(record, self.rank, view)}
 
     def _install(self, record: MembershipRecord) -> None:
-        """Map the host exchange's rows among every live rank, on fresh pages if a process that maps them may not be
-        live; the joining ranks enter the exchange only at the resume point."""
+        """Map the host exchange's rows among the live ranks, on fresh pages if a process that maps them may be gone."""
         gather = self._live_group(record, "host_exchange_rows").allgather
         fresh_rows = self._exchange.rows.stale_rows(gather)
         self._exchange.install(
@@ -1134,13 +1000,11 @@ class RankFailureRecovery:
         self._install_step_done()
 
     def _install_step_done(self) -> None:
-        """Report one more install step, which the authority counts as progress."""
         self._install_steps += 1
         self._agent.report(install_steps=self._install_steps)
 
     def _live_group(self, record: MembershipRecord, name: str) -> StoreGroup:
-        """The group of every rank whose exchanges reach the record's live ranks through the store; it reports the
-        ranks it waits for and raises :class:`_MembershipRestarted` once the record is no longer ``record``."""
+        """Return a store group of the live ranks that stops waiting once ``record`` is replaced."""
 
         def on_wait(waiting: int) -> None:
             self._waiting_in_store = waiting
@@ -1157,8 +1021,7 @@ class RankFailureRecovery:
         )
 
     def _fail_install(self, record: MembershipRecord, error: Exception) -> None:
-        """Installing ``record`` failed: reply FAILED, unless only other live ranks failed to map MNNVL memory (they
-        reply FAILED, and this rank waits for the next record)."""
+        """Reply FAILED, unless only other ranks failed to map MNNVL memory and reply FAILED themselves."""
         if isinstance(error, MnnvlMappingError) and self.rank not in error.ranks:
             logger.warning(f"Rank {self.rank} waits for the next membership record: {error!r}")
             return
@@ -1167,13 +1030,8 @@ class RankFailureRecovery:
         )
         self._agent.report(reply=Reply.FAILED, reply_generation=record.generation)
 
-    # Executor loop hooks.
-
     def before_iteration(self) -> None:
-        """Finish installing the membership change once, at the first iteration past the resume point, where no forward
-        or EPLB iteration is active. A joining rank follows a newer change that still adds it, then finishes its
-        admission from that change's install. First, it retries a give-back if the last forward vote asked for it
-        (:meth:`_retry_give_back`)."""
+        """Finish installing the membership change at the first iteration past the resume point."""
         if self._give_back_agreed:
             self._retry_give_back()
         record = self._installed
@@ -1188,57 +1046,49 @@ class RankFailureRecovery:
                 self._attempted = record
                 if self._finish_install(record) or not record.joining_mask >> self.rank & 1:
                     return
-                if self._installed is record:  # not installed inside the admission's collective
-                    self._change_membership()  # exits if the newer change leaves this rank out
+                if self._installed is record:
+                    self._change_membership()
                 self._executor.iter_counter = self._resume_after + 1
                 record = self._installed
 
     def _finish_install(self, record: MembershipRecord) -> bool:
-        """Recompute the interrupted requests, admit the joining ranks, restore, reply INSTALLED and wait for the
-        commit; then rank 0 fails the requests no live rank holds. Returns whether the change was committed."""
+        """Restore the live ranks, reply INSTALLED and return whether the change was committed."""
         executor = self._executor
-        # Milliseconds of the phases before the restore, logged with it.
         times: Dict[str, float] = {}
         start_s = time.perf_counter()
-        torch.cuda.synchronize()  # no step is in flight
+        torch.cuda.synchronize()
         try:
-            # Every live rank ran the same EPLB iterations since its last restart; it may have run one more since
-            # its end before READY (the step it stopped in, finished after INSTALL), which other ranks ran before it.
+            # A rank may have run one more EPLB iteration since READY, in the step it stopped in.
             self._end_eplb_iterations()
             if not record.joining_mask >> self.rank & 1:
-                # As main does before an action on the KV cache, which the restore resizes; collective over the
-                # host exchange, which the joining ranks enter only below.
+                # Collective over the host exchange, which the joining ranks enter only below.
                 executor._retire_inflight_batch_for_control()
             recomputed = self._recompute_interrupted_requests()
             if record.joining_mask:
-                # A rank that installed a newer change inside those collectives leaves the joining ranks out; the
-                # others install it at their next round. Every live rank runs the gather below either way, so all
-                # of them stay in the same collective.
+                # A rank that installed a newer change meanwhile skips the admission, but every live rank still runs
+                # the gather below, so that all of them stay in the same collective.
                 if self._installed is record:
                     self._admit_joining_ranks(record)
                 self._install_step_done()
-            # Taken before the requests held, so that a request enqueued in between is not taken for a lost one.
+            # Taken before the held requests, so that a request enqueued in between is not taken for a lost one.
             outstanding = (
                 self._outstanding_requests() if self._outstanding_requests is not None else {}
             )
             times["prepare"] = (time.perf_counter() - start_s) * 1e3
             start_s = time.perf_counter()
-            # Every live rank reaches this gather at the same point of the executor loop; past it, no live rank has
-            # an all-to-all kernel in flight, and none runs another host collective before the next iteration.
+            # Past this gather no live rank has an all-to-all kernel in flight or runs another host collective before
+            # the next iteration.
             gathered = executor.dist.allgather(self._held_request_ids())
             times["request gather"] = (time.perf_counter() - start_s) * 1e3
             self._install_step_done()
             digest = self._restore(record, times)
         except (_MembershipRestarted, MnnvlPeerHandleError) as error:
-            # A newer change replaced this one, or a peer exited during the remap: the authority finds it failed and
-            # proposes again.
             logger.warning(
                 f"Rank {self.rank} stopped installing membership generation {record.generation}: {error!r}"
             )
             return False
         except Exception as error:  # noqa: BLE001 - a failure here must reach the authority
             self._fail_install(record, error)
-            # The authority answers with a newer change or ABORT; exits if it stops answering.
             self._next_record(record)
             return False
         self._agent.report(
@@ -1248,28 +1098,23 @@ class RankFailureRecovery:
         )
         committed = self._next_record(record)
         if committed.state != MembershipState.COMMITTED:
-            return False  # a newer change, or ABORT at the next exchange
-        # Every live rank, a joining one included, passes here before its next round: the next change that does not
-        # interrupt the steps in flight waits for a forward vote in which a rank holds for it.
+            return False
         self._resume_after = None
         self._steps_quiet = False
-        # The joining ranks read them before they replied INSTALLED, and a replaced change's have no reader left: the
-        # store keeps no key of a past change.
+        # The joining ranks read these keys before they replied INSTALLED.
         for generation in self._published_admissions:
             for key in _admission_keys(generation):
                 self._store.store.delete_key(key)
         self._published_admissions.clear()
         given_back = self._give_back_kv_cache()
-        # The live ranks, a joining one included, restart the attention-DP balance counters alike.
         executor.adp_ctx_waiting_iters_count = executor.adp_ctx_batching_wait_iters_count = 0
         held = set().union(*(request_ids for request_ids in gathered if request_ids is not None))
-        # Rank 0's outstanding requests that no live rank holds (other ranks have none outstanding).
         lost = {r: c for r, c in outstanding.items() if r not in held}
         for request_id, client_id in lost.items():
             self._fail(request_id, client_id, RankFailureError())
         live = [r for r in range(self.world_size) if record.is_live(r)]
         logger.info(
-            f"Rank {self.rank} resumed serving with membership generation {record.generation}, ranks {live}: "
+            f"Rank {self.rank} resumed serving with membership generation {record.generation}, ranks {live}. "
             f"{recomputed} interrupted requests continue by recompute"
             + (
                 f", {len(lost)} requests no live rank holds ended by the rank failure"
@@ -1281,12 +1126,7 @@ class RankFailureRecovery:
         return True
 
     def _give_back_kv_cache(self) -> str:
-        """Once a change is committed: release the spare slots the placement leaves empty, and let the KV cache pool
-        take back all but what fault tolerance still holds, as far as the memory freed since the change started allows.
-
-        Returns:
-            What it gave back, for the log ("" if nothing).
-        """
+        """Release the empty spare slots and give the KV cache pool back its memory, returning a log suffix."""
         start_s = time.perf_counter()
         balancer = _moe_load_balancer_of(self._executor)
         released = 0 if balancer is None else balancer.expert_restore.release_empty_spare_slots()
@@ -1312,16 +1152,16 @@ class RankFailureRecovery:
                 time.monotonic() + _GIVE_BACK_RETRY_S,
             )
         return (
-            f"; {released} bytes of empty spare slots released, KV cache quota {quota} bytes"
+            f". Released {released} bytes of empty spare slots, KV cache quota {quota} bytes"
             + (f" ({short} bytes short until device memory is freed)" if short else "")
             + f", in {(time.perf_counter() - start_s) * 1e3:.0f} ms"
         )
 
     def _give_back_retry_due(self) -> bool:
-        """Whether to retry the give-back that fell short (:meth:`_retry_give_back`): checked at most once a second,
-        when device memory was freed since the last give-back. Once every excluded process ended (the authority saw
-        its liveness connection close, ``DISCONNECTED_KEY``), that retry is the last; without memory freed, the
-        retries end at once."""
+        """Return whether device memory was freed since the last give-back, checked at most once a second.
+
+        The retries end once every excluded process has ended and no more memory was freed.
+        """
         retry = self._give_back_retry
         now_s = time.monotonic()
         if now_s < retry.check_after_s:
@@ -1339,10 +1179,10 @@ class RankFailureRecovery:
         return freed
 
     def _retry_give_back(self) -> None:
-        """At the iteration after a forward vote in which a rank asked to retry its give-back: every rank retires its
-        step in flight together (doing so runs collectives), then the ranks that asked let the KV cache pool take back
-        the device memory freed since (:meth:`StartupMemory.fit_kv_cache`). The retries end once the pool holds its
-        quota, or after the first one once every excluded process ended."""
+        """Retry a KV cache give-back that fell short.
+
+        Every rank retires its step in flight, which runs collectives, even if only another rank asked for the retry.
+        """
         self._give_back_agreed = False
         torch.cuda.synchronize()
         self._executor._retire_inflight_batch_for_control()
@@ -1359,25 +1199,15 @@ class RankFailureRecovery:
         if not short or retry.ended:
             self._give_back_retry = None
         logger.info(
-            f"Rank {self.rank} took back device memory freed since the commit: KV cache quota {quota} bytes"
+            f"Rank {self.rank} took back the device memory freed since the commit, KV cache quota {quota} bytes"
             + (f", {short} bytes short" if short else "")
         )
 
     def _restore(self, record: MembershipRecord, times: Optional[Dict[str, float]] = None) -> str:
-        """This rank's part of installing ``record``, collective over its live ranks: restore the experts from the
-        agreed placement, remap the all-to-all workspaces (on fresh pages if a process that maps them may not be live),
-        with the KV cache pool giving up the memory they need, then reset the all-to-all and install the live mask.
-
-        Args:
-            record: The INSTALL record.
-            times: The milliseconds of the install's phases so far; the restore adds its own and logs them all.
+        """Restore the lost experts and the all-to-all workspaces, collective over the live ranks of ``record``.
 
         Returns:
-            The digest of the restored EPLB placement ("" without EPLB).
-
-        Raises:
-            _MembershipRestarted: The record changed since INSTALL (checked first, in every wait for a peer, and
-                last).
+            The digest of the restored EPLB placement, or "" without EPLB.
         """
         if self._record != record:
             raise _MembershipRestarted
@@ -1386,7 +1216,7 @@ class RankFailureRecovery:
         executor = self._executor
         balancer = _moe_load_balancer_of(executor)
         plan = None
-        loaded = 0  # experts this rank loads into its slots
+        loaded = 0
         if balancer is not None:
             current = [np.array(ranks, dtype=np.int32) for _, ranks in agreed_placement(record)]
             plan = balancer.expert_restore.plan_expert_restore(
@@ -1405,8 +1235,7 @@ class RankFailureRecovery:
                 self._moe.health.mark_failed(r)
         gather = self._live_group(record, "moe_a2a_workspaces").allgather
         fresh_rows = self._moe.stale_workspace_rows(gather)
-        # The remap allocates fresh pages for this rank's rows before the pages they replace are freed; an admission
-        # keeps them and allocates nothing.
+        # The remap allocates fresh pages for this rank's rows before the pages they replace are freed.
         workspace_bytes = self._moe.workspace_bytes() if self.rank in fresh_rows else 0
         needed = workspace_bytes + (0 if plan is None else plan.device_bytes)
 
@@ -1417,9 +1246,8 @@ class RankFailureRecovery:
             self._install_step_done()
 
         kv_cache_quota = "unchanged"
-        # A rank that needs no memory, as at an admission that keeps the workspaces' pages and backs no spare slot,
-        # leaves its KV cache pool alone. Each rank decides on its own: suspending the pools runs a collective only
-        # with disaggregated serving, which fault tolerance rejects.
+        # Each rank decides on its own because suspending the pools runs a collective only with disaggregated serving,
+        # which fault tolerance rejects.
         with (
             executor._kv_pools_suspended() if needed else contextlib.nullcontext()
         ) as kv_cache_manager:
@@ -1440,8 +1268,8 @@ class RankFailureRecovery:
                 balancer.expert_restore.restore_lost_experts(plan, times)
                 self._install_step_done()
             remap()
-        # Under the lock the agent thread updates the record with, before it requests the abort of a newer change that
-        # interrupts the steps: once this check passes, that abort comes after the rearm and stays.
+        # The agent thread updates the record under this lock before it requests the abort of a newer change, so once
+        # this check passes, that abort comes after the rearm and stays.
         start_s = time.perf_counter()
         with self._record_changed:
             if self._record != record:
@@ -1451,21 +1279,20 @@ class RankFailureRecovery:
         times["rearm"] = (time.perf_counter() - start_s) * 1e3
         logger.info(
             f"Rank {self.rank} restored membership generation {record.generation} in "
-            f"{(time.perf_counter() - began_s) * 1e3:.0f} ms: {loaded} experts loaded "
-            f"({0 if plan is None else plan.device_bytes} bytes), KV cache quota {kv_cache_quota}; phases: "
+            f"{(time.perf_counter() - began_s) * 1e3:.0f} ms. Loaded {loaded} experts "
+            f"({0 if plan is None else plan.device_bytes} bytes), KV cache quota {kv_cache_quota}. Phases: "
             + ", ".join(f"{phase} {ms:.0f} ms" for phase, ms in times.items())
         )
         return "" if plan is None else plan.digest
 
     def _admit_joining_ranks(self, record: MembershipRecord) -> None:
-        """Bring the joining ranks into the host exchange at the iteration the live ranks resume at; rank 0 hands them
-        the next epoch and its waiting queue, which every live rank holds alike, through the store."""
+        """Bring the joining ranks into the host exchange with rank 0's next epoch and waiting queue."""
         epoch_key, queue_key = _admission_keys(record.generation)
         executor = self._executor
         if record.joining_mask >> self.rank & 1:
 
             def check(_unsigned: Set[str]) -> None:
-                self._waiting_in_store = 1  # rank 0 sets both keys
+                self._waiting_in_store = 1
                 if self._record != record:
                     raise _MembershipRestarted
 
@@ -1488,7 +1315,6 @@ class RankFailureRecovery:
         self._exchange.admit(record.live_mask, epoch)
 
     def _held_request_ids(self) -> Set[int]:
-        """The requests this rank holds: active, waiting, or (rank 0) not fetched yet."""
         executor = self._executor
         held = {
             request.py_request_id for request in executor.active_requests if not request.is_dummy
@@ -1497,22 +1323,18 @@ class RankFailureRecovery:
         held.update(item.id for item in executor.request_accumulated)
         request_queue = executor.executor_request_queue.request_queue
         with request_queue.mutex:
-            # A cancel item carries the id of the request it cancels: only requests count.
+            # A cancel item carries the id of the request it cancels.
             held.update(item.id for item in request_queue.queue if item.is_normal_request)
         return held
 
     def holds_steps(self) -> bool:
-        """Whether this iteration runs no forward: none runs from a change this rank has seen until it is committed, so
-        the live ranks resume at the same iteration."""
+        """Return whether this iteration runs no forward because a membership change is not committed yet."""
         return self._resume_after is not None or self._pending
 
     def forward_vote(
         self, batch_size: int, gather: Callable[[List[int]], np.ndarray]
     ) -> np.ndarray:
-        """The executor's attention-DP forward vote: ``gather`` collects every rank's batch size (0 while it holds its
-        steps), whether it holds for a pending change and whether it retries a give-back that fell short
-        (:meth:`_give_back_retry_due`); returns the batch sizes. Unless a rank held for a pending change, every rank
-        takes part in a retry at the next iteration (:meth:`_retry_give_back`)."""
+        """Run the attention-DP forward vote with the pending change and give-back flags, and return the batch sizes."""
         pending = self._pending
         held = pending or self._resume_after is not None
         self._give_back_due = (
@@ -1526,12 +1348,11 @@ class RankFailureRecovery:
         return votes[:, 0]
 
     def drop_invalid_step(self) -> None:
-        """Discard the executor's previous step before its results are applied if the all-to-all is aborted (an abort
-        may have cut its rounds short); its requests continue by recompute."""
+        """Discard the previous step if the all-to-all was aborted, which may have cut its rounds short."""
         batch = self._executor.previous_batch
         event = batch.sample_state.sampler_event if batch.sample_state is not None else None
         if event is not None:
-            event.synchronize()  # the wait that applying the step starts with
+            event.synchronize()
         if not self._moe.aborted():
             return
         self._interrupted.extend(batch.scheduled_requests.all_requests())
@@ -1547,8 +1368,7 @@ class RankFailureRecovery:
         executor.previous_batch = None
 
     def discard_failed_forward(self, scheduled_requests) -> bool:
-        """Discard a forward that raised while the all-to-all is aborted, and the previous step; their requests
-        continue by recompute. Returns False if the forward failed by itself."""
+        """Discard a forward that raised because the all-to-all was aborted, and return False if it failed by itself."""
         if not self._moe.aborted():
             return False
         self._interrupted.extend(scheduled_requests.all_requests())
@@ -1556,13 +1376,11 @@ class RankFailureRecovery:
         return True
 
     def _recompute_interrupted_requests(self) -> int:
-        """The requests of the discarded steps continue from the tokens they have, as after a preemption; returns how
-        many."""
+        """Pause the requests of the discarded steps for recompute, as after a preemption, and return how many."""
         interrupted, self._interrupted = {id(request) for request in self._interrupted}, []
         executor = self._executor
         recomputed = 0
         for request in list(executor.active_requests):
-            # A request the scheduler paused for recompute meanwhile holds no sequence slot, nor anything else.
             if (
                 id(request) in interrupted
                 and not request.is_dummy
@@ -1577,10 +1395,9 @@ class RankFailureRecovery:
     def fail_unservable_requests(
         self, waiting_queue: WaitingQueue, rank_states: List[RankState]
     ) -> None:
-        """Before admission, remove the waiting requests pinned strictly to an attention-DP rank that does not serve;
-        rank 0 fails them."""
+        """Fail the waiting requests pinned strictly to an attention-DP rank that does not serve."""
         if len(rank_states) == self._executor.dist.tp_size:
-            return  # every rank serves
+            return
         serving = {state.rank for state in rank_states}
         unservable = {}
         for item in waiting_queue:
@@ -1606,7 +1423,6 @@ class RankFailureRecovery:
     def _fail(
         self, request_id: int, client_id: Optional[int], error: Union[str, RequestError]
     ) -> None:
-        """Rank 0 fails a request with ``error``, sent with the executor's next responses."""
         from .llm_request import LlmResponse
 
         if self.rank == 0:
@@ -1623,23 +1439,22 @@ class RankFailureRecovery:
 
 
 class FaultToleranceHealth:
-    """The membership state of a deployment with WideEP fault tolerance, read from the membership store for the
-    server's ``/health`` and status endpoint: ``healthy``, ``degraded`` (some ranks lost), ``recovering`` (a change
-    is in progress), ``unprotected`` (the authority does not answer; final) or ``stopped``."""
+    """Read the membership state for the server's ``/health`` and status endpoint."""
 
     def __init__(self, address: str, secret: bytes):
         self._address = address
         self._secret = secret
         self._store: Optional[SignedStore] = None
-        self._record: Optional[MembershipRecord] = None  # the last read
-        self._next_open = 0.0  # time.monotonic() before which the store is not connected to again
+        self._record: Optional[MembershipRecord] = None
+        self._next_open = 0.0
         self._authority_ended = False
         self._lock = threading.Lock()
 
     def _read(self) -> Tuple[Optional[MembershipRecord], Optional[TransactionSummary], bool]:
-        """The record, the last transaction and whether the authority answers. Until the store first answers, a read
-        connects at most once per ``_STATUS_READ_TIMEOUT_S``; once it answered, a failed read means the authority
-        ended, and later reads answer at once."""
+        """Return the record, the last transaction and whether the authority answers.
+
+        Once the store has answered, a failed read means the authority ended, so later reads return at once.
+        """
         with self._lock:
             if self._authority_ended:
                 return self._record, None, False
@@ -1663,22 +1478,19 @@ class FaultToleranceHealth:
 
     @staticmethod
     def _parse(model: type, value: Optional[bytes]):
-        """``value`` read from the store as ``model``; None if it is absent or does not parse (logged)."""
         if value is None:
             return None
         try:
             return model.model_validate_json(value)
         except ValueError as error:
-            logger.error(
-                f"WideEP fault tolerance: cannot parse a value of the membership store: {error!r}"
-            )
+            logger.error(f"Cannot parse a value of the membership store: {error!r}")
             return None
 
     @staticmethod
     def _state(record: Optional[MembershipRecord], authority_alive: bool) -> str:
         if record is None:
             return "unprotected"
-        # Final: once the deployment ends, the authority keeps its store up until every live rank has left.
+        # The authority keeps its store up after the deployment ends until every live rank has left.
         if record.state in (MembershipState.ABORT, MembershipState.SHUTDOWN):
             return "stopped"
         if not authority_alive:
@@ -1689,9 +1501,7 @@ class FaultToleranceHealth:
         return "healthy" if record.live_mask == world else "degraded"
 
     def status(self) -> Dict[str, object]:
-        """The server's fault-tolerance status: the state, whether the authority answers, and from the last record its
-        generation, the live and lost ranks, each rank's incarnation and the last transaction that ended
-        (None until the store answers)."""
+        """Return the server's fault-tolerance status from the last membership record and transaction."""
         record, transaction, authority_alive = self._read()
         status = {
             "state": self._state(record, authority_alive),

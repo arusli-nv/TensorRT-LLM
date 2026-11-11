@@ -26,10 +26,8 @@ def store_context_logits(
 
     Prompt logprobs are reduced on the logits' device; only the reduced rows and
     the final prompt row's log probabilities reach host memory. With WideEP
-    fault tolerance each position of the original prompt is stored once: a
-    request that replays its prefill after a rank failure stores only the
-    positions past its stored rows (``PyResult.context_rows_end``), and none
-    past the original prompt.
+    fault tolerance a replayed prefill stores only the positions past its
+    stored rows.
 
     Args:
         request: Context request whose current chunk produced ``logits``.

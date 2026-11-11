@@ -318,7 +318,6 @@ class ExecutorRequestQueue:
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
 
     def wake(self):
-        """Return a waiting get_from_request_queue() without a request."""
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(WAKE_REQUEST_ID))
 

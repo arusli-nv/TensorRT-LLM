@@ -464,9 +464,8 @@ def test_previous_batch_is_read_after_acceptance():
 
 STARTUP_COLLECTIVES = HERE / "wide_ep_ft_startup_collectives.yaml"
 ENTRY_KEYS = frozenset({"collectives", "reason", "note"})
-# The mpi4py and tensorrt_llm._utils collectives the startup calls on mpi_comm() (a StartupGroup under fault
-# tolerance) and its subgroups. A replacement rank replays its host collectives through Distributed from the startup
-# record, but not these; some share a name with a Distributed method, so a call by that name counts as one of these.
+# Collectives the startup calls on mpi_comm() (a StoreGroup under fault tolerance) and its subgroups. A replacement
+# rank does not replay these from the startup record.
 STARTUP_COLLECTIVE_NAMES = frozenset(
     {"allgather", "allreduce", "bcast", "barrier", "Barrier", "Allgather", "Allreduce", "Bcast"}
     | {"Split", "Split_type", "Create_group", "Dup", "subgroup"}
@@ -503,13 +502,8 @@ def _agreed_nodes(function: ast.AST) -> set:
 def test_startup_collectives_are_agreed_or_listed():
     """A startup collective outside ``Distributed`` goes through ``startup_record.agree`` or is listed with a reason.
 
-    A replacement rank starts alone: its startup collectives reach only itself. Those through ``Distributed``
-    (``MnnvlDist``) return the original ranks' results from the startup record rank 0 made. Of the others
-    (``mpi_comm()``, a ``StartupGroup``), a result that must match the original ranks' goes through
-    ``startup_record.agree``, in the function or in its caller; any other collective of the startup modules by such a
-    name, a ``Distributed`` method of the same name included, is listed in wide_ep_ft_startup_collectives.yaml with
-    the reason a replacement rank's result is right. The check is static and covers the modules the YAML file lists,
-    the ones the startup of a fault-tolerance deployment runs: a module it does not list is not seen.
+    A replacement rank starts alone, so a collective on ``mpi_comm()`` (a ``StoreGroup``) reaches only itself. The
+    check is static and covers only the modules wide_ep_ft_startup_collectives.yaml lists.
     """
     table = _load_table(STARTUP_COLLECTIVES)
     reasons, modules = table["reasons"], table["modules"]

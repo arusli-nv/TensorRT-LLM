@@ -574,7 +574,6 @@ def _checkpoint_io_incompatibility_reason(
     if checkpoint_loader is not None:
         return "an explicit checkpoint loader was provided"
     if fault_tolerance_replacement() is not None:
-        # The read-ahead splits the reads among the node's ranks, which serve while a replacement rank starts.
         return "a replacement rank loads its checkpoint alone"
     if checkpoint_format != CheckpointFormat.HF:
         return (

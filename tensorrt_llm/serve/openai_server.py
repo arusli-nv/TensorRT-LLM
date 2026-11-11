@@ -294,11 +294,7 @@ def _configure_parser_special_token_decoding(
 
 
 def _stream_error_events(error: Exception) -> List[str]:
-    """The SSE events that end a stream whose request failed after it began.
-
-    The HTTP status is already committed by then, so the error travels as an
-    ``error`` event, which OpenAI clients raise on, followed by ``[DONE]``.
-    """
+    """Return the SSE events that end a stream whose request failed."""
     message = str(error)
     code = RANK_FAILURE_CODE if isinstance(error, RankFailureError) else None
     error_data = json.dumps({
@@ -1187,7 +1183,6 @@ class OpenAIServer(_VideoRoutesMixin):
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
         elif rank_failure:
-            # Sending the request again can succeed.
             err_type, status_code = ("ServiceUnavailableError",
                                      HTTPStatus.SERVICE_UNAVAILABLE)
             code = RANK_FAILURE_CODE
@@ -1249,12 +1244,7 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     async def fault_tolerance_status(self) -> JSONResponse:
-        """The WideEP fault-tolerance membership, read from its store now.
-
-        The state (healthy, degraded, recovering, unprotected or stopped),
-        whether the membership authority answers, the generation, the live
-        and lost ranks, and the last membership change with its duration.
-        """
+        """Return the WideEP fault-tolerance membership status."""
         status = await asyncio.to_thread(
             self.generator._executor.fault_tolerance_health.status)
         return JSONResponse(content=status)

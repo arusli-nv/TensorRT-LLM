@@ -215,7 +215,6 @@ def _init_userbuffers(
             "disabled under this orchestrator."
         )
         return False
-    # Under WideEP fault tolerance every rank is its own 1-rank MPI world too.
     if llm_args.enable_wide_ep_fault_tolerance:
         logger.info(
             "Disabling userbuffers: its bootstrap requires an MPI world of all "
