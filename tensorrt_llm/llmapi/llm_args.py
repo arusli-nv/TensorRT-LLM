@@ -50,9 +50,9 @@ from tensorrt_llm._torch.peft.lora.config import (
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
 from .._errors import ConfigInputError
-from .._utils import (_str_to_torch_dtype_dict,
-                      check_fault_tolerance_requirements, is_sm_100f, mpi_rank,
+from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
+from .._wide_ep_fault_tolerance import check_fault_tolerance_requirements
 
 # yapf: disable
 # isort: off

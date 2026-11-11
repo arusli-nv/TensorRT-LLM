@@ -36,8 +36,10 @@ from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
-from .._utils import (fault_tolerance_mode, global_mpi_rank, global_mpi_size,
-                      mpi_rank, nvtx_range_debug, set_fault_tolerance_mode)
+from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
+                      nvtx_range_debug)
+from .._wide_ep_fault_tolerance import (set_wide_ep_fault_tolerance_enabled,
+                                        wide_ep_fault_tolerance_enabled)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
@@ -107,8 +109,7 @@ class BaseWorker(GenerationExecutor):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
-        # Direct worker construction also bypasses BaseLLM/worker_main.
-        set_fault_tolerance_mode(
+        set_wide_ep_fault_tolerance_enabled(
             getattr(llm_args, "enable_wide_ep_fault_tolerance", False))
         launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
         if llm_args is not None and llm_args.env_overrides:
@@ -156,7 +157,7 @@ class BaseWorker(GenerationExecutor):
         self._refused_client_ids: Set[int] = set()
         # The first enqueue consumes the multimodal input, so a re-enqueue after a rank failure needs this copy.
         self._unanswered_requests: Optional[Dict[int, Optional[tuple]]] = (
-            {} if fault_tolerance_mode() else None)
+            {} if wide_ep_fault_tolerance_enabled() else None)
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None

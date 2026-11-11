@@ -307,13 +307,13 @@ class TestClassicFrontendProxyEndToEnd:
         """An attached frontend skips GenerationExecutorProxy.__init__ (fault-tolerance state included)."""
         import zmq
 
-        from tensorrt_llm import _utils
+        from tensorrt_llm import _wide_ep_fault_tolerance
         from tensorrt_llm.executor.ipc import FusedIpcQueue
         from tensorrt_llm.executor.request import GenerationRequest
         from tensorrt_llm.executor.utils import ErrorResponse
         from tensorrt_llm.sampling_params import SamplingParams
 
-        monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+        monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
         with tempfile.TemporaryDirectory() as tmpdir:
             proxy, _, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))

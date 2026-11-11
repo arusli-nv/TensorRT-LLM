@@ -37,7 +37,9 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._utils import EnergyMonitor, fault_tolerance_mode
+from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm._wide_ep_fault_tolerance import \
+    wide_ep_fault_tolerance_enabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -1266,7 +1268,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.health_generate,
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             self.app.add_api_route("/fault_tolerance_status",
                                    self.fault_tolerance_status,
                                    methods=["GET"])
@@ -1754,7 +1756,7 @@ class OpenAIServer(_VideoRoutesMixin):
         The deployment stays alive while it lost ranks or changes its
         membership. The membership store is read off the event loop.
         """
-        if not fault_tolerance_mode():
+        if not wide_ep_fault_tolerance_enabled():
             return False
         status = await asyncio.to_thread(
             self.generator._executor.fault_tolerance_health.status)

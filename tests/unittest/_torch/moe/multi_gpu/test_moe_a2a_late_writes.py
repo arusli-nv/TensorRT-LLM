@@ -52,7 +52,7 @@ from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspace
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._utils import set_fault_tolerance_mode
+from tensorrt_llm._wide_ep_fault_tolerance import set_wide_ep_fault_tolerance_enabled
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
@@ -527,7 +527,7 @@ def _replacement(store: TCPStore, rank: int, ep_size: int) -> None:
 def _worker(rank: int, port: int, mode: str, ep_size: int) -> None:
     store = TCPStore("127.0.0.1", port, is_master=False, timeout=_TIMEOUT)
     # Every rank of a deployment that survives a lost rank runs with WideEP fault tolerance on.
-    set_fault_tolerance_mode(True)
+    set_wide_ep_fault_tolerance_enabled(True)
     if mode == "replacement":
         _replacement(store, rank, ep_size)
         return

@@ -16,7 +16,7 @@ import pytest
 import torch
 from mpi4py import MPI
 
-from tensorrt_llm import _utils
+from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._torch.distributed.membership import (
     RECORD_KEY,
     REPLACEMENT_CANNOT_START,
@@ -33,7 +33,7 @@ from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
-from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV
+from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -56,7 +56,7 @@ def _load_balancer(
 ):
     """A MoeLoadBalancer with WideEP fault tolerance over one native layer of ``eplb_slots`` per rank, whose
     largest failure takes ``largest_failure`` ranks."""
-    monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: True)
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     monkeypatch.setattr(
         EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
@@ -88,7 +88,7 @@ def test_online_eplb_spare_slots_without_gdrcopy_are_refused_at_startup(
     """Online EPLB writes the spare slots from the host through GDRCopy mappings: where host accessible device memory
     takes another form (GPU memory is a NUMA node, or GDRCopy is missing), the load balancer is refused when it is
     created, before any weight is allocated."""
-    monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: True)
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     monkeypatch.setattr(
         EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
@@ -339,7 +339,7 @@ def test_weights_of_slots_get_spare_slot_storage_at_creation():
 
 
 def test_online_eplb_without_fault_tolerance_keeps_no_restore_state(monkeypatch):
-    monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: False)
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: False)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),
@@ -391,7 +391,7 @@ def test_the_cpp_load_balancer_keeps_the_only_references_to_the_host_weights(
 ):
     """Its weight updater loads slots from them, for online EPLB and for restoring lost experts alike: the Python
     views go once it has them."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     sharer_class = DeploymentHostCopies if fault_tolerance else HostMoeTensorSharer
     sharer = sharer_class(0, 2, MPI.COMM_SELF)
@@ -426,7 +426,7 @@ def test_shutdown_waits_for_the_node_only_without_fault_tolerance(monkeypatch, f
     """With fault tolerance a rank of the node may be gone: each rank releases its own mappings without a node
     collective, and an iteration in progress keeps only its own rank from releasing."""
     load_balancer = _load_balancer(monkeypatch, largest_failure=2, eplb_slots=1)
-    monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
     node = Mock(allgather=Mock(side_effect=lambda safe: [safe, True]))
     load_balancer.shared_mpi_comm = node
     load_balancer.in_iter = True
@@ -493,7 +493,7 @@ def test_slot_tensors_go_to_the_storage_of_their_layer(spare_slot_count):
 def test_deepseek_r1_ep32_static_256_slots_get_two_spare_slots_per_rank(monkeypatch):
     """DeepSeek-R1 at EP32 on eight nodes of four GPUs: the 28 live ranks after a node failure need
     ceil(256 / 28) = 10 slots each, two more than EPLB's 8."""
-    monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: True)
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_ER}.DeploymentHostCopies"),
@@ -792,7 +792,7 @@ def test_spare_slots_take_the_experts_whose_replicas_were_all_lost(monkeypatch):
 
 
 def _replacement(monkeypatch, rank):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"{rank},8,4,1")
 
 
@@ -823,7 +823,7 @@ def test_a_replacement_tunes_with_the_tuner_layout_of_the_ranks_it_rejoins(
     if replacement:
         _replacement(monkeypatch, 5)
     else:
-        monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+        monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
         monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
@@ -903,7 +903,7 @@ def _segments():
 def test_host_copies_are_named_after_their_deployment(monkeypatch, fault_tolerance):
     """With fault tolerance they outlive their processes: another deployment on the node, also one started with the
     same join secret, must not find them, nor its node supervisor unlink them."""
-    monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
     monkeypatch.delenv("TRTLLM_EPLB_SHM_NAME", raising=False)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     names = []
@@ -924,7 +924,7 @@ def test_a_rank_s_host_copies_end_with_it_until_the_deployment_serves(
 ):
     """Until then a failure ends the deployment, as without fault tolerance; from then on a replacement rank
     reattaches them, and the node supervisor unlinks them once the deployment ended."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     sharer_class = DeploymentHostCopies if fault_tolerance else HostMoeTensorSharer
     sibling = _sharer(1, 10.0, node_size=2, sharer_class=sharer_class)
@@ -947,10 +947,10 @@ def test_a_rank_s_host_copies_end_with_it_until_the_deployment_serves(
 @pytest.fixture
 def replacement_of_rank_0(monkeypatch):
     def become():
-        monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+        monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
         monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,4,1")
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     return become
 
@@ -1033,7 +1033,7 @@ def _replacement_of_rank_3(monkeypatch, record):
     (by expert)."""
     from tensorrt_llm._torch.distributed import membership
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "3,4,2,1")
     store = _Store(record)
     monkeypatch.setattr(membership, "rendezvous_store", lambda: store)

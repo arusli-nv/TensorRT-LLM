@@ -726,7 +726,7 @@ def test_online_eplb_loads_slots_whose_spare_slot_maps_no_memory(monkeypatch):
 
     _skip_without_gdrcopy_slots()
     monkeypatch.setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1")
-    monkeypatch.setattr(mlb, "fault_tolerance_mode", lambda: True)
+    monkeypatch.setattr(mlb, "wide_ep_fault_tolerance_enabled", lambda: True)
     # Two ranks on two nodes: if rank 1 fails, its three slots may hold three experts rank 0 does not, so rank 0
     # gets three spare slots after EPLB's three.
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
@@ -808,7 +808,7 @@ def test_a_lost_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
     if layer_updates_per_iter:
         _skip_without_gdrcopy_slots()
     monkeypatch.setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1")
-    monkeypatch.setattr(mlb, "fault_tolerance_mode", lambda: True)
+    monkeypatch.setattr(mlb, "wide_ep_fault_tolerance_enabled", lambda: True)
     # Two ranks on two nodes: rank 0 gets three spare slots after EPLB's three (rank 1's slots may hold three
     # experts rank 0 does not).
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
@@ -1004,7 +1004,8 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
     from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as mlb
     from tensorrt_llm.bindings import MemoryCounters
 
-    monkeypatch.setattr(mlb, "fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.setattr(mlb, "wide_ep_fault_tolerance_enabled",
+                        lambda: fault_tolerance)
     # Two ranks on two nodes: with fault tolerance, rank 0 alone must hold the four experts, two slots more than
     # EPLB's two.
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])

@@ -35,7 +35,8 @@ except ImportError:
 from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm._dlpack_utils import pack_strided_memory
-from tensorrt_llm._utils import fault_tolerance_mode, is_sm_120f, mpi_comm, mpi_disabled
+from tensorrt_llm._utils import is_sm_120f, mpi_comm, mpi_disabled
+from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -462,7 +463,7 @@ class MnnvlMemory:
                     "required for MNNVL memory when MPI is disabled"
                 )
             cls.comm = ProcessGroupComm(pg)
-        elif fault_tolerance_mode():
+        elif wide_ep_fault_tolerance_enabled():
             cls.comm = mpi_comm().subgroup(cls.comm_split_ranks(mapping))
         else:
             color, key = cls.comm_split_color_key(mapping)
@@ -802,7 +803,7 @@ class MnnvlMemory:
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             # A gather would leave out an absent member.
             comm_membership = tuple(cls.comm_split_ranks(mapping))
         else:

@@ -27,6 +27,8 @@ from tensorrt_llm.logger import logger
 
 from .. import _utils
 from .._utils import global_mpi_rank, mpi_rank
+from .._wide_ep_fault_tolerance import (FAULT_TOLERANCE_RANK_ENV,
+                                        wide_ep_fault_tolerance_enabled)
 from .utils import logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
@@ -408,7 +410,7 @@ _DEFAULT_IDENTITY_TIMEOUT = 300.0
 
 def _pool_workers(n_workers: int) -> int:
     """Return the pool size, 1 when the node supervisor starts other ranks."""
-    return 1 if _utils.fault_tolerance_mode() else n_workers
+    return 1 if wide_ep_fault_tolerance_enabled() else n_workers
 
 
 def _mgmn_shutdown_grace_seconds() -> float:
@@ -596,7 +598,7 @@ class MpiPoolSession(MpiSession):
             self.mpi_pool = None
             if self._wait_shutdown:
                 self._wait_workers_exit()
-        if _utils.fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             self._stop_node_supervisor(wait)
 
     def _collect_worker_identities(self) -> Tuple:
@@ -697,7 +699,7 @@ class MpiPoolSession(MpiSession):
         self._pool_dead = True
 
     def abort(self):
-        if _utils.fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             self._stop_node_supervisor(wait=False)
         self.get_comm().Abort(1)
 
@@ -739,10 +741,10 @@ class MpiPoolSession(MpiSession):
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        if _utils.fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             self._start_node_supervisor({**os.environ, **env})
             # One node of n_workers ranks, as the node supervisor's.
-            env[_utils.FAULT_TOLERANCE_RANK_ENV] = (
+            env[FAULT_TOLERANCE_RANK_ENV] = (
                 f"0,{self.n_workers},{self.n_workers},0")
         self.mpi_pool = MPIPoolExecutor(max_workers=_pool_workers(
             self.n_workers),

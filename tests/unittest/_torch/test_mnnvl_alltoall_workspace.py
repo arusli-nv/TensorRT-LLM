@@ -884,7 +884,7 @@ def test_one_sided_workspace_ranks_meet_over_the_allocation_group(
     monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
     monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
-    monkeypatch.setattr(one_sided_module, "fault_tolerance_mode", lambda: rank_mask)
+    monkeypatch.setattr(one_sided_module, "wide_ep_fault_tolerance_enabled", lambda: rank_mask)
     monkeypatch.setattr(
         _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
     )

@@ -75,7 +75,7 @@ from tensorrt_llm._torch.distributed.membership import (
     open_store,
 )
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import FaultToleranceHealth
-from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV
+from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
 from tensorrt_llm.executor.utils import RANK_FAILURE_CODE
 from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 

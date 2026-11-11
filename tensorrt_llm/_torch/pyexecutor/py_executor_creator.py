@@ -27,8 +27,9 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import (fault_tolerance_mode,
-                                 fault_tolerance_replacement, get_sm_version)
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    fault_tolerance_replacement, wide_ep_fault_tolerance_enabled)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -795,7 +796,7 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
-    if fault_tolerance_mode():
+    if wide_ep_fault_tolerance_enabled():
         from .rank_failure_recovery import check_supported
         check_supported(llm_args, mapping, dist)
 

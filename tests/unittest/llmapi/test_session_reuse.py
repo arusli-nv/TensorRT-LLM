@@ -121,7 +121,7 @@ def test_a_fault_tolerant_llm_gets_a_pool_spawned_with_its_rendezvous(reuse_cach
     """
     from unittest.mock import Mock
 
-    from tensorrt_llm import _utils
+    from tensorrt_llm import _wide_ep_fault_tolerance
     from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
     from tensorrt_llm.llmapi import LLM, startup_checks
     from tensorrt_llm.llmapi import llm as llm_module
@@ -131,7 +131,7 @@ def test_a_fault_tolerant_llm_gets_a_pool_spawned_with_its_rendezvous(reuse_cach
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)  # unset now, and unset again afterwards
     monkeypatch.setattr(rank_failure_recovery, "_rendezvous_ports", [])
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)  # the LLM sets it
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)  # the LLM sets it
     earlier = reuse_cache.acquire(_FakePool, 4)  # an earlier test's pool, back in the cache
     cached = earlier._real
     earlier.shutdown()

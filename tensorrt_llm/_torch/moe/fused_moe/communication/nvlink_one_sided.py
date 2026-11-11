@@ -48,7 +48,10 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (
     cuda,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
-from tensorrt_llm._utils import fault_tolerance_mode, fault_tolerance_replacement
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    fault_tolerance_replacement,
+    wide_ep_fault_tolerance_enabled,
+)
 from tensorrt_llm.bindings import BuildInfo
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
@@ -140,7 +143,7 @@ def _cft_device_support_reason() -> str | None:
 
 def select_cft_counted_writes(force_cft: bool | None) -> bool:
     """Resolve CFT availability identically for workspace sizing and construction."""
-    if force_cft is not True and fault_tolerance_mode():
+    if force_cft is not True and wide_ep_fault_tolerance_enabled():
         tllm_logger.warning_once(
             "CFT counted writes disabled: WideEP rank failure recovery runs on the fence path.",
             key="moe_a2a_cft_rank_failure_recovery",
@@ -698,7 +701,7 @@ class NVLinkOneSided(Communication):
         if (
             alltoall_watchdog_timeout_s is None
             and self.ep_group_health is not None
-            and not fault_tolerance_mode()
+            and not wide_ep_fault_tolerance_enabled()
         ):
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm import _utils
+from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -182,7 +182,7 @@ def test_watchdog_stop_is_terminal() -> None:
 def test_wide_ep_ft_options_create_shared_health_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
@@ -204,7 +204,7 @@ def test_wide_ep_ft_options_create_shared_health_when_enabled(
 def test_wide_ep_ft_options_reject_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
@@ -219,7 +219,7 @@ def test_wide_ep_ft_options_reject_cuda_graphs(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_wide_ep_ft_options_allow_cuda_graphs_only_in_fault_tolerance_mode(
+def test_wide_ep_ft_options_allow_cuda_graphs_only_with_fault_tolerance(
     monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
 ) -> None:
     """The kernels read the rank mask at execution time, so rank-mask mode works with CUDA graphs once fault
@@ -228,7 +228,7 @@ def test_wide_ep_ft_options_allow_cuda_graphs_only_in_fault_tolerance_mode(
     kernels' wait evidence."""
     import tensorrt_llm._torch.moe.fused_moe.wide_ep_ft as wide_ep_ft
 
-    monkeypatch.setattr(wide_ep_ft, "fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.setattr(wide_ep_ft, "wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
     model_config = SimpleNamespace(
         extra_attrs={} if fault_tolerance else {"ep_group_health": EPGroupHealth(4)},
@@ -249,7 +249,7 @@ def test_wide_ep_ft_options_allow_cuda_graphs_only_in_fault_tolerance_mode(
 
 @pytest.mark.cpu_only
 def test_wide_ep_ft_options_ignore_legacy_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
     monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
     model_config = SimpleNamespace(

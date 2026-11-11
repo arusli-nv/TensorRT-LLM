@@ -25,8 +25,8 @@ from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.logger import logger, set_level
 
 from .._errors import ConfigInputError
-from .._utils import (fault_tolerance_mode, global_mpi_size, mpi_world_size,
-                      wide_ep_fault_tolerance_rank)
+from .._utils import global_mpi_size, mpi_world_size
+from .._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -649,8 +649,8 @@ class GenerationExecutor(ABC):
             raise ValueError(
                 f"Unsupported orchestrator_type: {orchestrator_type}")
 
-        if fault_tolerance_mode():
-            if wide_ep_fault_tolerance_rank() is None and global_mpi_size() > 1:
+        if wide_ep_fault_tolerance_enabled():
+            if global_mpi_size() > 1:
                 raise ValueError(
                     "WideEP fault tolerance starts every rank as its own "
                     "process: start the server or script once, under "

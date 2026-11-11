@@ -178,7 +178,7 @@ def test_a_replacement_maps_only_its_own_row_until_its_admission_maps_every_live
     """Isolated startup: the class's group has the deployment's layout with only the replacement live, so only its
     row is mapped; the admission maps every live row in place, keeping the replacement's pages unless the live ranks
     need fresh ones."""
-    monkeypatch.setattr(mnnvl, "fault_tolerance_mode", lambda: True)
+    monkeypatch.setattr(mnnvl, "wide_ep_fault_tolerance_enabled", lambda: True)
     monkeypatch.setattr(
         _RemapMemory, "get_allocation_granularity", classmethod(lambda cls, dev_id: _SIZE)
     )

@@ -102,7 +102,7 @@ class NodeSupervisor:
         end_job: Optional[Callable[[Dict[str, str], float], None]] = None,
     ):
         from tensorrt_llm._torch.distributed import membership
-        from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV
+        from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
         from tensorrt_llm.logger import logger
         from tensorrt_llm.mapping import Mapping
 

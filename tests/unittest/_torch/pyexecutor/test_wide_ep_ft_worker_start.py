@@ -43,7 +43,7 @@ import os, sys, time
 from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery
-from tensorrt_llm._utils import mpi_rank, set_fault_tolerance_mode
+from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_rank
 from tensorrt_llm.executor import worker
 
 load_s, recovery.RENDEZVOUS_TIMEOUT_S = float(sys.argv[1]), float(sys.argv[2])
@@ -51,7 +51,7 @@ load_s, recovery.RENDEZVOUS_TIMEOUT_S = float(sys.argv[1]), float(sys.argv[2])
 
 def worker_main(**args):
     recovery.start_worker(args)  # as worker_main does first
-    rank = mpi_rank()
+    rank = wide_ep_fault_tolerance_rank().rank
     print(f"STARTED {rank} {args['marker']}", flush=True)
     if rank == 0:
         print(f"AUTHORITY {recovery._authority.pid}", flush=True)
@@ -69,7 +69,6 @@ def worker_main(**args):
 
 worker.worker_main = worker_main
 if os.environ["TLLM_FAULT_TOLERANCE_RANK"].startswith("0,"):
-    set_fault_tolerance_mode(True)
     worker_main(hf_model_dir=None, marker="rank-0-arguments", worker_queues=None, rpc_addr=None, hmac_key=b"")
 else:
     recovery.worker_node_main()

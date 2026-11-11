@@ -29,7 +29,7 @@ import pytest
 from mpi4py import MPI
 from torch.distributed import TCPStore
 
-from tensorrt_llm import _utils
+from tensorrt_llm import _utils, _wide_ep_fault_tolerance
 from tensorrt_llm._torch.distributed.membership import (
     MembershipRecord,
     MembershipState,
@@ -40,7 +40,8 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory, TpMnnvlMem
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery_module
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import join_startup_group
-from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV, OMPI_COMM_TYPE_HOST
+from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
+from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -234,7 +235,7 @@ def test_a_split_groups_the_members_of_a_color_in_key_order(store, monkeypatch):
     assert results[1] == ((3, 1), 1, [3, 1])
     assert results[3] == ((3, 1), 0, [3, 1])
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
     _replay(monkeypatch, {"startup_group_split": [_SPLITS]})
     split = StoreGroup(None, "w", 2, range(WORLD), live=[2]).Split(*_SPLITS[2])
@@ -271,12 +272,13 @@ class _RecordingComm:
 
 def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     """Rank 1 of 4, its own MPI world: after join_startup_group, main's startup collectives reach its peers through
-    the store, and none goes to mpi4py."""
+    the store, and none goes to mpi4py. It joins before its worker turns fault tolerance on."""
     calls = []
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _RecordingComm(_utils.comm, calls))
+    monkeypatch.setattr(_utils, "world_comm", _utils.world_comm)
     monkeypatch.setattr(_utils, "_local_comm", None)
     monkeypatch.setattr(MPI, "COMM_WORLD", _RecordingComm(MPI.COMM_WORLD, calls))
     monkeypatch.setattr(TpMnnvlMemory, "comm", None)
@@ -312,10 +314,11 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
 def test_the_node_of_every_rank_comes_from_its_identity(monkeypatch, replacement):
     """Rank 2 of two nodes of two GPUs, original or replacement: a split by node gives ranks 2 and 3, and joining
     the startup group exchanges and records nothing."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,{WORLD},2,{replacement}")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _utils.comm)
+    monkeypatch.setattr(_utils, "world_comm", _utils.world_comm)
     monkeypatch.setattr(_utils, "_local_comm", None)
     _replay(monkeypatch, None)
     store = Mock()
@@ -337,7 +340,7 @@ def test_a_rank_whose_mapping_places_the_ranks_on_other_nodes_does_not_start(
     """The node supervisor runs ``supervisor_gpus`` ranks per node, the mapping says ``mapping_gpus`` (one node of
     every rank under both is accepted, as in test_an_original_rank_starts_without_mpi). Fails without the change: the
     rank joined, and its splits by node grouped ranks of different nodes."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,{WORLD},{supervisor_gpus},0")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _utils.comm)
@@ -377,7 +380,7 @@ def test_an_original_rank_waits_for_every_rank_to_start(monkeypatch):
 
 
 def test_a_rank_without_its_identity_does_not_start(monkeypatch):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     with pytest.raises(ValueError, match=FAULT_TOLERANCE_RANK_ENV):
         join_startup_group(Mapping(world_size=WORLD, rank=2, tp_size=WORLD))
@@ -398,7 +401,7 @@ def test_an_mnnvl_group_has_the_ranks_split_would_give(
     mapping = Mapping(world_size=4, rank=rank, **kwargs)
     assert memory_cls.comm_split_ranks(mapping) == ranks
     world = StoreGroup(None, "startup/world", rank, range(4), live=[rank])
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setattr("tensorrt_llm._torch.distributed.mnnvl_memory.mpi_comm", lambda: world)
     monkeypatch.setattr(memory_cls, "comm", None)
     monkeypatch.setattr(memory_cls, "comm_signature", None)

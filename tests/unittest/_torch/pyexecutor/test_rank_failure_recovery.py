@@ -42,7 +42,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm import _utils
+from tensorrt_llm import _utils, _wide_ep_fault_tolerance
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import membership, mnnvl_memory
 from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
@@ -97,7 +97,10 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter, RankState
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV, fault_tolerance_mode
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    wide_ep_fault_tolerance_enabled,
+)
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.executor import GenerationExecutor
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
@@ -294,7 +297,7 @@ def test_a_rank_needs_the_rendezvous_address(join_secret, monkeypatch, rendezvou
 def test_a_rank_needs_its_identity_from_its_node_supervisor(join_secret, monkeypatch):
     """Only a node supervisor starts a rank, saying whether it is a replacement: a lost rank or node comes back by its
     node's launch, never by a rank started on its own."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     with pytest.raises(ValueError, match="'<rank>,<world size>,<GPUs per node>,<replacement>'"):
         recovery_module._launched_rank()
@@ -485,7 +488,7 @@ _NODE_BYTES = _EXPERTS * (128 * 1024 + 256) + _LOCAL_RANKS * 256
 def shm_free(monkeypatch):
     """Sets the free bytes of /dev/shm that the startup check reads."""
     monkeypatch.setattr(
-        _utils, "_wide_ep_fault_tolerance", True
+        _wide_ep_fault_tolerance, "_enabled", True
     )  # segments start with a fingerprint
     free = {}
     monkeypatch.setattr(
@@ -495,7 +498,7 @@ def shm_free(monkeypatch):
 
 
 def test_the_host_weights_take_what_finalize_layer_weights_lays_out(monkeypatch):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     sharer = _host_tensor_sharer(local_size=1)
     weights = _MoeWeights(sharer)
     for expert in range(_EXPERTS):
@@ -586,8 +589,8 @@ def test_the_model_check_binds_the_moe_layers(monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_a_worker_takes_fault_tolerance_mode_from_its_args(monkeypatch, enabled):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", not enabled)
+def test_a_worker_takes_fault_tolerance_from_its_args(monkeypatch, enabled):
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", not enabled)
     llm_args = TorchLlmArgs(
         model="dummy",
         enable_wide_ep_fault_tolerance=enabled,
@@ -596,7 +599,7 @@ def test_a_worker_takes_fault_tolerance_mode_from_its_args(monkeypatch, enabled)
     )
     worker = BaseWorker(llm_args=llm_args)
     worker.doing_shutdown = True  # nothing to shut down at exit
-    assert fault_tolerance_mode() is enabled
+    assert wide_ep_fault_tolerance_enabled() is enabled
 
 
 def test_fault_tolerance_is_off_by_default():
@@ -1180,7 +1183,7 @@ def test_a_discarded_step_drops_its_context_rows_and_the_recompute_stores_them_a
     """Context logits and prompt logprobs are stored during the forward, before the step is accepted. The steps an
     abort discards drop their rows (invalid MoE outputs), and the recompute stores them again, once, whether its
     prefill starts at the beginning or after the accepted chunk it reuses: the result is that of a clean run."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     generator = torch.Generator().manual_seed(5)
     logits = torch.randn(_PROMPT_LEN, _VOCAB, generator=generator)
     clean = _context_rows_request()
@@ -2178,7 +2181,7 @@ def test_wake_returns_a_waiting_request_fetch():
 def test_hard_kill_stays_local_under_fault_tolerance(monkeypatch):
     from mpi4py import MPI
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     comm = MagicMock()
     killed = []
     # Without fault tolerance, these make the kill go through MPI_Abort.
@@ -2214,7 +2217,7 @@ def _proxy(dead_worker=None, remote_error=None, membership=True):
 
 
 def test_joining_the_membership_watches_the_session_s_worker_rank_0(monkeypatch):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(JOIN_SECRET_ENV, "ab" * 32)
     monkeypatch.setenv(membership.RENDEZVOUS_ENV, "")
     monkeypatch.setattr(recovery_module, "open_store", Mock(side_effect=OSError("no store")))
@@ -2349,7 +2352,7 @@ def test_unsupported_models_are_refused_once_built_before_any_weight_loads(
     monkeypatch.setattr(
         loader, "_qualify_post_transform_profile", Mock(side_effect=_PastModelBuild)
     )
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     checkpoint_loader = MagicMock()
 
     with pytest.raises(ValueError if refused else _PastModelBuild) as error:
@@ -2554,7 +2557,7 @@ def test_the_ranks_the_llm_spawns_receive_the_join_secret_and_the_rendezvous(
         monkeypatch.delenv(name)  # unset now, and unset again afterwards
     monkeypatch.setattr(recovery_module, "_rendezvous_ports", [])
     # The LLM sets it; restored afterwards.
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
     monkeypatch.setattr(llm_module, "MpiPoolSession", mpi_session.MpiPoolSession)
     monkeypatch.setattr(llm_module, "get_spawn_proxy_process_env", lambda: False)
     monkeypatch.setattr(startup_checks, "get_device_count", lambda: 4)
@@ -2707,7 +2710,7 @@ def _server(monkeypatch, store):
     answer)."""
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setattr(
         recovery_module,
         "open_store",
@@ -2787,7 +2790,7 @@ def test_health_answers_503_only_once_the_deployment_stopped(monkeypatch, record
 @pytest.mark.parametrize("fault_tolerance", [False, True])
 def test_health_after_a_fatal_engine_error_answers_503(monkeypatch, fault_tolerance):
     server = _server(monkeypatch, None)
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     server.generator._check_health.return_value = False
     server.generator._executor._fatal_error = RuntimeError("engine died")
     server.generator._executor.doing_shutdown = True  # the shutdown already started: no signal
@@ -2999,7 +3002,7 @@ def _exit_raises(monkeypatch):
 @pytest.fixture
 def agreed_startup(monkeypatch):
     """Fault tolerance on, an original rank, nothing recorded yet."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     for name, value in (
         ("_startup_fingerprint", None),
@@ -3090,7 +3093,7 @@ def test_a_replacement_takes_the_startup_values_rank_0_recorded(agreed_startup, 
 
 
 def test_without_fault_tolerance_startup_values_pass_through(agreed_startup, monkeypatch):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
     assert startup_record.agree("rank_hosts", lambda: ["a"] * WORLD) == ["a"] * WORLD
     assert startup_record.published() == {"values": {}, "exchanges": []}
 
@@ -3146,32 +3149,6 @@ def test_the_deployment_nonce_is_rank_0_s_on_every_rank(agreed_startup, monkeypa
     assert recovery_module.deployment_nonce() == nonce
 
 
-def test_a_rank_turns_fault_tolerance_on_before_it_imports_the_executor(
-    agreed_startup, monkeypatch
-):
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
-    seen = []
-    worker_module = ModuleType("tensorrt_llm.executor.worker")
-
-    def lookup(name):
-        seen.append((name, fault_tolerance_mode()))
-        return lambda **kwargs: None
-
-    worker_module.__getattr__ = lookup
-    monkeypatch.setitem(sys.modules, "tensorrt_llm.executor.worker", worker_module)
-    args = {"hf_model_dir": None}
-    monkeypatch.setattr(
-        recovery_module,
-        "_published_record",
-        {**StartupRecord().published(), "fingerprint": recovery_module.startup_fingerprint(args)},
-    )
-    _published(monkeypatch, args)
-    recovery_module.worker_node_main()
-    # The import machinery also looks up module attributes such as __path__; worker_main is what matters.
-    assert ("worker_main", True) in seen
-    assert ("worker_main", False) not in seen
-
-
 def test_module_entry_runs_the_imported_module(monkeypatch):
     """``python -m`` runs the module as ``__main__``: the rank joins in the module the executor imports."""
     worker_node_main = Mock()
@@ -3208,7 +3185,7 @@ def test_every_rank_but_0_joins_then_starts_with_the_arguments_rank_0_published(
     replaying = identity.endswith(",1")
     assert startup_record.replaying == replaying
     assert startup_record.values == (published["values"] if replaying else {})
-    rank = _utils.RankIdentity(*(int(field) for field in identity.split(",")))
+    rank = _wide_ep_fault_tolerance.RankIdentity(*(int(field) for field in identity.split(",")))
     assert events == [("join", rank), ("worker_main", args)]
 
 
@@ -3386,30 +3363,24 @@ def test_the_executor_s_hang_detection_must_outlast_twice_the_hang_timeout(
 def test_a_rank_the_launcher_started_for_fault_tolerance_needs_it_on(monkeypatch):
     from tensorrt_llm.executor.worker import worker_main
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
     with pytest.raises(ValueError, match="enable_wide_ep_fault_tolerance is off"):
         worker_main(worker_queues=None, log_level="info", llm_args=None)
 
 
 @pytest.mark.parametrize(
-    "mpi_size, identity, refused",
-    [(1, None, False), (4, None, True), (4, "0,4,4,0", False)],
-    ids=["one-process", "every-rank-of-an-mpi-job", "under-trtllm-llmapi-launch"],
+    "mpi_size, refused",
+    [(1, False), (4, True)],
+    ids=["one-process", "every-rank-of-an-mpi-job"],
 )
 def test_fault_tolerance_starts_rank_0_s_worker_in_the_session_whatever_the_mpi_size(
-    monkeypatch, mpi_size, identity, refused
+    monkeypatch, mpi_size, refused
 ):
-    """Every rank is its own process: the MPI world of the frontend, which main's launch selection reads, plays no
-    part, and a frontend started on every rank of an MPI job is refused. Under trtllm-llmapi-launch the frontend has
-    rank 0's identity."""
+    """Every rank is its own process: main's launch selection plays no part, and a frontend started on every rank
+    of an MPI job is refused. Under trtllm-llmapi-launch the frontend is its own MPI world too."""
     from tensorrt_llm.executor import executor as executor_module
 
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    if identity is None:
-        monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    else:
-        monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, identity)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setattr(executor_module, "global_mpi_size", lambda: mpi_size)
     for name in ("external_mpi_comm_available", "need_spawn_mpi_workers"):
         monkeypatch.setattr(executor_module, name, Mock(side_effect=AssertionError(name)))
@@ -3472,7 +3443,7 @@ def test_the_startup_rejects_a_largest_failure_no_kv_cache_pool_can_restore(
 @pytest.mark.parametrize("identity", ["2,4,4,0", "2,4,4,1"], ids=["original", "replacement"])
 def test_no_rank_creates_a_process_group(monkeypatch, identity):
     """Every rank is its own process: a rank's replacement would never join a torch.distributed (NCCL) group."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, identity)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     with pytest.raises(RuntimeError, match="process group"):
@@ -3917,15 +3888,14 @@ def test_a_joining_rank_leaves_the_collective_a_newer_change_interrupts(monkeypa
 
 @pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
 def test_every_rank_takes_its_identity_from_its_node_supervisor(monkeypatch, replacement):
-    """Its MPI world is only itself; the rank and the world size come from the node supervisor."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    """The rank, the world size and whether it is a replacement come from the node supervisor."""
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,4,4,{int(replacement)}")
-    assert _utils.wide_ep_fault_tolerance_rank() == (2, 4, 4, replacement)
-    assert _utils.fault_tolerance_replacement() == ((2, 4, 4, True) if replacement else None)
-    assert (_utils.mpi_rank(), _utils.global_mpi_rank()) == (2, 2)
-    assert (_utils.mpi_world_size(), _utils.global_mpi_size()) == (4, 4)
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
-    assert _utils.wide_ep_fault_tolerance_rank() is None
+    assert _wide_ep_fault_tolerance.wide_ep_fault_tolerance_rank() == (2, 4, 4, replacement)
+    expected = (2, 4, 4, True) if replacement else None
+    assert _wide_ep_fault_tolerance.fault_tolerance_replacement() == expected
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
+    assert _wide_ep_fault_tolerance.fault_tolerance_replacement() is None
 
 
 def _wait_until(condition, timeout_s=5.0):

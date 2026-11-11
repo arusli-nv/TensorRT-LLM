@@ -38,7 +38,8 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     from tensorrt_llm._torch.distributed.startup_record import startup_record
     from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
     from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery
-    from tensorrt_llm._utils import mpi_comm, set_fault_tolerance_mode
+    from tensorrt_llm._utils import mpi_comm
+    from tensorrt_llm._wide_ep_fault_tolerance import set_wide_ep_fault_tolerance_enabled
     from tensorrt_llm.mapping import Mapping
 
     errors = []
@@ -48,7 +49,7 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
             errors.append(f"rank {rank}: {what}")
 
     check(MPI.COMM_WORLD.Get_size() == 1, "the rank is not its own MPI world")
-    set_fault_tolerance_mode(True)
+    set_wide_ep_fault_tolerance_enabled(True)
     torch.cuda.set_device(rank)
     # Stands for the membership agent the worker's entry starts, which takes the startup collectives' reports.
     recovery._agent = Mock()

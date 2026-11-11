@@ -40,16 +40,18 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import (
-    FAULT_TOLERANCE_RANK_ENV,
-    RankIdentity,
-    check_fault_tolerance_requirements,
-    fault_tolerance_mode,
-    fault_tolerance_replacement,
     local_mpi_comm,
     mpi_broadcast,
     mpi_rank,
-    set_fault_tolerance_mode,
     set_mpi_comm,
+    set_mpi_world_comm,
+)
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    RankIdentity,
+    check_fault_tolerance_requirements,
+    fault_tolerance_replacement,
+    wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_rank,
 )
 from tensorrt_llm.executor.utils import RankFailureError, RequestError
@@ -362,8 +364,6 @@ def worker_node_main() -> None:
         ReplacementCannotStart: A replacement does not match the deployment, or its startup failed in a way that a
             restart would repeat.
     """
-    # Set before the executor's modules are imported, which may read the mode.
-    set_fault_tolerance_mode(True)
     identity = _launched_rank()
     from tensorrt_llm.executor.worker import worker_main
 
@@ -411,7 +411,7 @@ def _report_startup_wait(waiting_for: int) -> None:
 
 
 def join_startup_group(mapping: Mapping) -> None:
-    """Make the startup group of every rank this rank's ``mpi_comm()`` and set ``TLLM_RANK``."""
+    """Make the startup group of every rank this rank's ``mpi_comm()`` and MPI world, and set ``TLLM_RANK``."""
     identity = _rank_identity()
     one_node = identity.world_size <= min(identity.gpus_per_node, mapping.gpus_per_node)
     check_fault_tolerance_requirements(
@@ -424,17 +424,17 @@ def join_startup_group(mapping: Mapping) -> None:
         ]
     )
     os.environ["TLLM_RANK"] = str(identity.rank)
-    set_mpi_comm(
-        StoreGroup(
-            _startup_store(),
-            "startup/world",
-            identity.rank,
-            range(identity.world_size),
-            _report_startup_wait,
-            live=[identity.rank] if identity.replacement else None,
-            gpus_per_node=identity.gpus_per_node,
-        )
+    startup_group = StoreGroup(
+        _startup_store(),
+        "startup/world",
+        identity.rank,
+        range(identity.world_size),
+        _report_startup_wait,
+        live=[identity.rank] if identity.replacement else None,
+        gpus_per_node=identity.gpus_per_node,
     )
+    set_mpi_comm(startup_group)
+    set_mpi_world_comm(startup_group)
     if not isinstance(local_mpi_comm(), StoreGroup):
         raise RuntimeError(
             "The node's communicator was split from MPI before the startup group was set"
@@ -710,7 +710,7 @@ class RankFailureRecovery:
 
         An original rank returns once every rank has started, a replacement once the change that adds it is installed.
         """
-        if not fault_tolerance_mode():
+        if not wide_ep_fault_tolerance_enabled():
             return None
         # A rank waits on a hung peer until the authority excludes it, up to 1.5 hang timeouts after its wait began,
         # so the executor's hang detector must not end the rank first.

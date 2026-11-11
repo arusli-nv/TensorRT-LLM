@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._utils import fault_tolerance_replacement
+from tensorrt_llm._wide_ep_fault_tolerance import fault_tolerance_replacement
 from tensorrt_llm.logger import logger
 
 from .moe_load_balancer import HostMoeTensorSharer

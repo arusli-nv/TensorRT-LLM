@@ -29,11 +29,12 @@ except ImportError:
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
-                                 fault_tolerance_mode,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
+from tensorrt_llm._wide_ep_fault_tolerance import \
+    wide_ep_fault_tolerance_enabled
 # yapf: disable
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -2199,7 +2200,7 @@ class PyExecutor:
                         self._sleep_wakeup_listener_thread.start()
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
-                if fault_tolerance_mode() and not self.is_warmup:
+                if wide_ep_fault_tolerance_enabled() and not self.is_warmup:
                     from .rank_failure_recovery import RankFailureRecovery
                     self.rank_failure_recovery = RankFailureRecovery.create(
                         self)

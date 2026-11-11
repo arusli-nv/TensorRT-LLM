@@ -23,7 +23,10 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
 )
-from tensorrt_llm._utils import fault_tolerance_mode, fault_tolerance_replacement
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    fault_tolerance_replacement,
+    wide_ep_fault_tolerance_enabled,
+)
 
 from .ep_group_health import EPGroupHealth
 
@@ -68,11 +71,11 @@ def get_wide_ep_ft_options(
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
     health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
-    rank_mask_enabled = health is not None or _env_enabled() or fault_tolerance_mode()
+    rank_mask_enabled = health is not None or _env_enabled() or wide_ep_fault_tolerance_enabled()
     if (
         rank_mask_enabled
         and getattr(model_config, "use_cuda_graph", False)
-        and not fault_tolerance_mode()
+        and not wide_ep_fault_tolerance_enabled()
     ):
         raise ValueError(
             "WideEP rank-mask mode does not support CUDA graphs without "
@@ -92,7 +95,7 @@ def get_wide_ep_ft_options(
         _POLL_INTERVAL_ENV,
         DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     )
-    if health is None or fault_tolerance_mode():
+    if health is None or wide_ep_fault_tolerance_enabled():
         # The membership authority reads the kernels' wait evidence instead of a watchdog.
         return health, None, poll_interval_s
 

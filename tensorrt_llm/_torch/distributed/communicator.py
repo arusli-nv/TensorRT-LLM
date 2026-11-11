@@ -35,12 +35,13 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
-from tensorrt_llm._utils import (fault_tolerance_mode, local_mpi_size,
-                                 mpi_allgather, mpi_barrier, mpi_comm,
-                                 mpi_disabled, mpi_isend, mpi_isend_object,
-                                 mpi_recv, mpi_recv_object, mpi_send,
-                                 mpi_send_object, mpi_world_size, prefer_pinned,
-                                 torch_pybind11_abi)
+from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
+                                 mpi_comm, mpi_disabled, mpi_isend,
+                                 mpi_isend_object, mpi_recv, mpi_recv_object,
+                                 mpi_send, mpi_send_object, mpi_world_size,
+                                 prefer_pinned, torch_pybind11_abi)
+from tensorrt_llm._wide_ep_fault_tolerance import \
+    wide_ep_fault_tolerance_enabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -113,7 +114,7 @@ class Distributed(ABC):
     def get(mapping: Mapping) -> "Distributed":
         if mpi_disabled():
             return TorchDist(mapping)
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
             if MnnvlDist.supports(mapping):
                 return MnnvlDist(mapping)

@@ -1190,8 +1190,6 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
             **common,
             "GenerationExecutorWorker": object,
             "mpi_comm": runtime_init("mpi_comm"),
-            "set_fault_tolerance_mode": lambda enabled: None,
-            "fault_tolerance_mode": lambda: False,
             "FAULT_TOLERANCE_RANK_ENV": "TLLM_FAULT_TOLERANCE_RANK",
         },
     )
@@ -1216,8 +1214,8 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
             "PostprocWorkerConfig": lambda: SimpleNamespace(
                 num_postprocess_workers=0, postprocess_tokenizer_dir=None
             ),
-            "set_fault_tolerance_mode": lambda enabled: None,
-            "fault_tolerance_mode": lambda: False,
+            "set_wide_ep_fault_tolerance_enabled": lambda enabled: None,
+            "wide_ep_fault_tolerance_enabled": lambda: False,
         },
         bases=("GenerationExecutor",),
     )
@@ -2800,7 +2798,7 @@ def test_standard_load_balancer_unsafe_preflight_skips_destructive_cleanup():
         _TORCH_ROOT / "moe/fused_moe/moe_load_balancer.py",
         "MoeLoadBalancer",
         {"shutdown"},
-        {"fault_tolerance_mode": lambda: False},
+        {"wide_ep_fault_tolerance_enabled": lambda: False},
     )
     calls = []
 

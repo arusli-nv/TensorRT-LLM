@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm import _utils
+from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
     ContextLogitsPlan,
@@ -493,7 +493,7 @@ def _recompute_after_prefill(explicit: bool) -> tuple[LlmRequest, torch.Tensor, 
 def test_a_recomputed_request_stores_each_prompt_position_once(monkeypatch, explicit: bool) -> None:
     """With WideEP fault tolerance the context rows of the original prompt are already stored, so the replay stores
     none: none twice, and none past the original prompt."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     request, logits, stored = _recompute_after_prefill(explicit)
     result = request.py_result
 
@@ -511,7 +511,7 @@ def test_a_recomputed_request_stores_each_prompt_position_once(monkeypatch, expl
 
 def test_a_recomputed_request_stores_the_replay_without_fault_tolerance() -> None:
     """Without WideEP fault tolerance the replay stores its rows as every other prefill does."""
-    assert not _utils.fault_tolerance_mode()
+    assert not _wide_ep_fault_tolerance.wide_ep_fault_tolerance_enabled()
     request, logits, _ = _recompute_after_prefill(explicit=False)
     result = request.py_result
 

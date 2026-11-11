@@ -22,13 +22,8 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional
 
-from tensorrt_llm._utils import (
-    ENABLE_MULTI_DEVICE,
-    fault_tolerance_mode,
-    mpi_comm,
-    mpi_disabled,
-    print_all_stacks,
-)
+from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
+from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -103,7 +98,7 @@ def propagate_hard_kill(
     if diagnostics:
         _best_effort_flush_streams()
     try:
-        if ENABLE_MULTI_DEVICE and not mpi_disabled() and not fault_tolerance_mode():
+        if ENABLE_MULTI_DEVICE and not mpi_disabled() and not wide_ep_fault_tolerance_enabled():
             from mpi4py import MPI
 
             if (
@@ -223,7 +218,7 @@ def all_ranks_crashed(world_size: int, timeout: Optional[float] = None) -> bool:
     try:
         if world_size <= 1:
             return False
-        if not ENABLE_MULTI_DEVICE or mpi_disabled() or fault_tolerance_mode():
+        if not ENABLE_MULTI_DEVICE or mpi_disabled() or wide_ep_fault_tolerance_enabled():
             return False
         from mpi4py import MPI
 

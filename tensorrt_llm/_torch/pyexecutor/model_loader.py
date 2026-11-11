@@ -34,9 +34,9 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
-from tensorrt_llm._utils import (fault_tolerance_mode,
-                                 fault_tolerance_replacement, get_sm_version,
-                                 str_dtype_to_torch)
+from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    fault_tolerance_replacement, wide_ep_fault_tolerance_enabled)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -1343,7 +1343,7 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
-            if fault_tolerance_mode():
+            if wide_ep_fault_tolerance_enabled():
                 from .rank_failure_recovery import prepare_model
                 prepare_model(model)
 

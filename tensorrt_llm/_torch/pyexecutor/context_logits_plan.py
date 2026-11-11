@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from tensorrt_llm._utils import fault_tolerance_mode
+from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from tensorrt_llm.executor.result import reduce_prompt_logprobs
 from tensorrt_llm.logger import logger
 
@@ -41,7 +41,7 @@ def store_context_logits(
     position = request.context_current_position + offset
     chunk_tail = offset + logits.shape[0] == request.context_chunk_size
     prompt_len = request.py_prompt_len
-    fault_tolerance = fault_tolerance_mode()
+    fault_tolerance = wide_ep_fault_tolerance_enabled()
     if fault_tolerance:
         rows_missing = position > result.context_rows_end
     else:

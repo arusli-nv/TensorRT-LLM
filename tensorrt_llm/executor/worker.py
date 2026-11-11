@@ -29,8 +29,8 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._startup_errors import classify_startup_error, wrap_worker_startup_error
-from .._utils import (FAULT_TOLERANCE_RANK_ENV, fault_tolerance_mode, mpi_comm,
-                      mpi_rank, print_all_stacks, set_fault_tolerance_mode)
+from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from .._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -394,9 +394,7 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
-    set_fault_tolerance_mode(
-        getattr(llm_args, "enable_wide_ep_fault_tolerance", False))
-    if fault_tolerance_mode():
+    if getattr(llm_args, "enable_wide_ep_fault_tolerance", False):
         # Before any other local, since every other rank starts with these.
         worker_main_args = dict(locals())
         from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
@@ -475,7 +473,7 @@ def worker_main(
             register_external_model_modules
         register_external_model_modules(_torch_external_model_modules or {})
 
-    if not fault_tolerance_mode():
+    if not getattr(llm_args, "enable_wide_ep_fault_tolerance", False):
         set_mpi_session_cpp(mpi_comm())
 
     if is_leader:

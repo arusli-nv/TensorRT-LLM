@@ -19,8 +19,8 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import EventType
-from tensorrt_llm._utils import (fault_tolerance_mode,
-                                 fault_tolerance_replacement)
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    fault_tolerance_replacement, wide_ep_fault_tolerance_enabled)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -355,7 +355,7 @@ class SingleLayerMoeLoadBalancer:
         self.initial_placement: Optional[np.ndarray] = None
         layer_id = self.single_layer_load_balancer_impl.get_layer_id()
         sharer_class = HostMoeTensorSharer
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             from .eplb_expert_restore import DeploymentHostCopies
             sharer_class = DeploymentHostCopies
         self.host_tensor_sharer = sharer_class(
@@ -525,7 +525,7 @@ class SingleLayerMoeLoadBalancer:
         Args:
             initial_weight_assignments: The expert of every slot, -1 for the spare slots.
         """
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             self.initial_placement = np.array(initial_weight_assignments,
                                               dtype=np.int32)
         self.single_layer_load_balancer_impl.set_initial_weight_assignments(
@@ -1020,12 +1020,12 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             ep_rank,
             ep_size,
             layer_updates_per_iter,
-            rank_failure_recovery=fault_tolerance_mode())
+            rank_failure_recovery=wide_ep_fault_tolerance_enabled())
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(
             'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             # The host copies outlive their processes, so their names are unique to the deployment.
             from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
                 deployment_nonce
@@ -1041,7 +1041,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
 
         self.next_layer_repeated_count = None
         self.expert_restore = None
-        if fault_tolerance_mode():
+        if wide_ep_fault_tolerance_enabled():
             from .eplb_expert_restore import EplbExpertRestore
             self.expert_restore = EplbExpertRestore(self)
 
@@ -1217,7 +1217,8 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         if self.is_shutdown:
             return True
         local_safe = bool(local_safe and not self.in_iter)
-        node_comm = None if fault_tolerance_mode() else self.shared_mpi_comm
+        node_comm = (None if wide_ep_fault_tolerance_enabled() else
+                     self.shared_mpi_comm)
         if not (local_safe if node_comm is None else all(
                 node_comm.allgather(local_safe))):
             return False

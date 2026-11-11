@@ -19,7 +19,7 @@ from typing import List
 import pytest
 import torch
 
-from tensorrt_llm import _utils
+from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._torch.pyexecutor import guided_decoder as guided_decoder_module
 from tensorrt_llm._torch.pyexecutor.guided_decoder import (
     CapturableGuidedDecoder,
@@ -472,7 +472,7 @@ def test_a_recomputed_request_replays_its_generated_tokens_into_the_new_matcher(
 ):
     """A recompute moves the generated tokens into the prompt; with WideEP fault tolerance the last context chunk
     carries them and the build replays them into the new matcher."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     request = LlmRequest(
         request_id=7,
         max_new_tokens=8,

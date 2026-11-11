@@ -347,12 +347,12 @@ def probe(names):
 if __name__ == "__main__":
     from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \\
         ensure_rendezvous
-    from tensorrt_llm._utils import (FAULT_TOLERANCE_RANK_ENV,
-                                     set_fault_tolerance_mode)
+    from tensorrt_llm._wide_ep_fault_tolerance import (
+        FAULT_TOLERANCE_RANK_ENV, set_wide_ep_fault_tolerance_enabled)
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     # As the LLM does before it creates its pool.
-    set_fault_tolerance_mode(sys.argv[2] == "1")
+    set_wide_ep_fault_tolerance_enabled(sys.argv[2] == "1")
     if sys.argv[2] == "1":
         ensure_rendezvous()
     session = MpiPoolSession(n_workers=2)
