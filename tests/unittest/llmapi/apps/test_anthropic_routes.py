@@ -27,7 +27,6 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
-from tensorrt_llm import _utils
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -42,7 +41,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ToolCall,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer, _end_stream_on_error
+from tensorrt_llm.serve.openai_server import OpenAIServer, _stream_error_events
 from tensorrt_llm.serve.render import chat as render_chat_module
 from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
@@ -614,41 +613,23 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     server_logger.error.assert_not_called()
 
 
-def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
-    """A failure of the generation itself is still logged and raised."""
+def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, server_logger):
+    """A failure of the generation is logged and ends the stream with an error event and [DONE].
 
-    async def run():
-        generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
-        stream, _ = await _chat_stream(monkeypatch, generation)
-        with pytest.raises(RuntimeError, match="engine failed"):
-            async for _ in stream:
-                pass
-
-    asyncio.run(run())
-
-    server_logger.error.assert_called_once()
-    assert "engine failed" in server_logger.error.call_args.args[0]
-
-
-def test_chat_stream_with_fault_tolerance_logs_a_failure_and_ends_with_an_error_event(
-    monkeypatch, server_logger
-):
-    """With WideEP fault tolerance a failure of the generation is logged and ends the stream with an error event.
-
-    The error event and [DONE] tell a client that it can send the request again.
+    As in a completion stream: the HTTP status is already committed.
     """
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
 
     async def run():
         generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
-        stream, _ = await _chat_stream(monkeypatch, generation)
-        return [frame async for frame in stream]
+        stream, server = await _chat_stream(monkeypatch, generation)
+        return [frame async for frame in stream], server
 
-    frames = asyncio.run(run())
+    frames, server = asyncio.run(run())
 
     assert frames[0] == "data: one\n\n"
     assert json.loads(frames[1][len("data: ") :])["error"]["message"] == "engine failed"
     assert frames[2:] == ["data: [DONE]\n\n"]
+    server._extract_metrics.assert_not_awaited()
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
 
@@ -726,11 +707,11 @@ def test_messages_route_ends_a_failed_stream_with_the_upstream_error(server_kind
             model=MODEL, choices=[{"index": 0, "delta": {"content": "Hello"}}]
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
-        raise RuntimeError("rank 2 failed; retry it")
+        # How a chat stream whose request failed ends.
+        for event in _stream_error_events(RuntimeError("rank 2 failed; retry it")):
+            yield event
 
-    openai_response = StreamingResponse(
-        _end_stream_on_error(failing_chat_stream()), media_type="text/event-stream"
-    )
+    openai_response = StreamingResponse(failing_chat_stream(), media_type="text/event-stream")
     client, _ = _make_route_client(server_kind, openai_response)
 
     response = client.post("/v1/messages", json=_request(stream=True))

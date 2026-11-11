@@ -101,7 +101,8 @@ class EPGroupHealth:
         self._lock = threading.Lock()
 
     def __deepcopy__(self, memo: dict) -> "EPGroupHealth":
-        """Return ``self``: this is shared membership, not per-copy state."""
+        """Return ``self``: ``ModelConfig.extra_attrs`` carries the one membership to every MoE layer, and a deep
+        copy of the config (models make some while building layers) must share it."""
         return self
 
     @property

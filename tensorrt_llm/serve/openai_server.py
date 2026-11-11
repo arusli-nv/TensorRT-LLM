@@ -312,26 +312,6 @@ def _stream_error_events(error: Exception) -> List[str]:
     return [f"data: {error_data}\n\n", "data: [DONE]\n\n"]
 
 
-async def _end_stream_on_error(
-        events: AsyncIterator[str]) -> AsyncGenerator[str, None]:
-    """Pass ``events`` through; if they fail, end the stream with ``_stream_error_events``.
-
-    With WideEP fault tolerance a request that loses a rank fails with a
-    retryable error, which a client of a stream reads from its error event. A
-    failure after ``[DONE]``, such as in metrics extraction, adds nothing: the
-    stream has ended.
-    """
-    done = False
-    try:
-        async for event in events:
-            yield event
-            done = event == "data: [DONE]\n\n"
-    except Exception as error:
-        if not done:
-            for event in _stream_error_events(error):
-                yield event
-
-
 def _record_generator_termination(generator) -> None:
     """Classify a fatal generator error without exposing exception details."""
     component = "llm"
@@ -1271,9 +1251,9 @@ class OpenAIServer(_VideoRoutesMixin):
     async def fault_tolerance_status(self) -> JSONResponse:
         """The WideEP fault-tolerance membership, read from its store now.
 
-        The state /health reports, whether the membership authority answers,
-        the generation, the live and lost ranks, and the last membership
-        change with its duration.
+        The state (healthy, degraded, recovering, unprotected or stopped),
+        whether the membership authority answers, the generation, the live
+        and lost ranks, and the last membership change with its duration.
         """
         status = await asyncio.to_thread(
             self.generator._executor.fault_tolerance_health.status)
@@ -1778,18 +1758,21 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
+    async def _fault_tolerance_stopped(self) -> bool:
+        """Whether WideEP fault tolerance stopped the deployment (False without it).
+
+        The deployment stays alive while it lost ranks or changes its
+        membership. The membership store is read off the event loop.
+        """
+        if not fault_tolerance_mode():
+            return False
+        status = await asyncio.to_thread(
+            self.generator._executor.fault_tolerance_health.status)
+        return status["state"] == "stopped"
+
     async def health(self) -> Response:
-        if self._check_health():
-            if not fault_tolerance_mode():
-                return Response(status_code=200)
-            # Under WideEP fault tolerance the deployment stays alive while it
-            # lost ranks or changes its membership; only a stopped one is not.
-            # The membership store is read off the event loop.
-            status = await asyncio.to_thread(
-                self.generator._executor.fault_tolerance_health.status)
-            state = status["state"]
-            return JSONResponse(content={"state": state},
-                                status_code=503 if state == "stopped" else 200)
+        if self._check_health() and not await self._fault_tolerance_stopped():
+            return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -1807,10 +1790,6 @@ class OpenAIServer(_VideoRoutesMixin):
                         f"server shutdown: {executor._fatal_error}")
                     _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
-            if fault_tolerance_mode():
-                # The same JSON body as in the other states.
-                return JSONResponse(content={"state": "stopped"},
-                                    status_code=503)
             return Response(
                 status_code=503,
                 content=
@@ -2170,15 +2149,19 @@ class OpenAIServer(_VideoRoutesMixin):
                             res, args)
                     for pp_res in pp_results:
                         yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-                nvtx_mark("generation ends")
-            except Exception:
+            except Exception as e:
                 # Only failures are logged: a consumer that stops reading closes
                 # the stream with GeneratorExit, and a client that disconnects
                 # cancels it, and neither is an error of this stream.
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first chunk, so
+                # the error ends the stream as an SSE error event.
+                for event in _stream_error_events(e):
+                    yield event
+                return
+            yield "data: [DONE]\n\n"
+            await self._extract_metrics(res, raw_request)
+            nvtx_mark("generation ends")
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -2591,9 +2574,6 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.stream:
                 response_generator = chat_stream_generator(
                     promise, postproc_params)
-                if fault_tolerance_mode():
-                    response_generator = _end_stream_on_error(
-                        response_generator)
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
@@ -3287,13 +3267,17 @@ class OpenAIServer(_VideoRoutesMixin):
                                   post_processor(res, args))
                     for pp_res in pp_results:
                         yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first chunk, so
+                # the error ends the stream as an SSE error event.
+                for event in _stream_error_events(e):
+                    yield event
+                return
+            yield "data: [DONE]\n\n"
+            await self._extract_metrics(res, raw_request)
 
         try:
             ensure_request_chat_template_allowed(
@@ -3403,12 +3387,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                response_generator = create_streaming_generator(
-                    promise, postproc_params)
-                if fault_tolerance_mode():
-                    response_generator = _end_stream_on_error(
-                        response_generator)
-                return StreamingResponse(content=response_generator,
+                return StreamingResponse(content=create_streaming_generator(
+                    promise, postproc_params),
                                          media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(

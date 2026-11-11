@@ -154,11 +154,13 @@ class BaseWorker(GenerationExecutor):
         # Requests already answered with an error by _maybe_wrap_response and
         # aborted; their remaining engine responses are dropped.
         self._refused_client_ids: Set[int] = set()
-        # WideEP fault tolerance: the requests without multimodal data that
-        # have no response sent yet, which this worker enqueues again once if a
-        # rank failure ends them (_enqueue_after_rank_failure).
-        self._unanswered_client_ids: Optional[Set[int]] = (
-            set() if fault_tolerance_mode() else None)
+        # WideEP fault tolerance: client id -> the multimodal parameters and
+        # their multimodal input (None without multimodal data) of each request
+        # with no response sent yet, which this worker enqueues again once if
+        # a rank failure ends it (_enqueue_after_rank_failure). Its first
+        # enqueue consumes the multimodal input, so it is kept here.
+        self._unanswered_requests: Optional[Dict[int, Optional[tuple]]] = (
+            {} if fault_tolerance_mode() else None)
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
@@ -629,10 +631,11 @@ class BaseWorker(GenerationExecutor):
 
         self._results[client_id] = result
         # Before the enqueue, so that its first response finds it.
-        unanswered = (self._unanswered_client_ids is not None
-                      and request.multimodal_params is None)
-        if unanswered:
-            self._unanswered_client_ids.add(client_id)
+        if self._unanswered_requests is not None:
+            params = request.multimodal_params
+            self._unanswered_requests[client_id] = (None if params is None else
+                                                    (params,
+                                                     params.multimodal_input))
 
         enqueued = False
         try:
@@ -641,8 +644,8 @@ class BaseWorker(GenerationExecutor):
         finally:
             if not enqueued:
                 self._results.pop(client_id, None)
-                if unanswered:
-                    self._unanswered_client_ids.discard(client_id)
+                if self._unanswered_requests is not None:
+                    self._unanswered_requests.pop(client_id, None)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 
@@ -1397,18 +1400,22 @@ class BaseWorker(GenerationExecutor):
 
         Only if the error of ``response`` is a ``RankFailureError`` and the
         request has no response sent yet: from this worker's copy of it, under
-        the same client id. Its client then sees no error, as nothing of the
+        the same client id, with the multimodal parameters and input it was
+        first enqueued with. Its client then sees no error, as nothing of the
         first attempt reached it. Returns whether it enqueued the request again.
         """
         client_id = response.client_id
-        if (not self._unanswered_client_ids
-                or client_id not in self._unanswered_client_ids
+        if (not self._unanswered_requests
+                or client_id not in self._unanswered_requests
                 or not isinstance(response.error_msg, RankFailureError)):
             return False
-        self._unanswered_client_ids.discard(client_id)
+        multimodal = self._unanswered_requests.pop(client_id)
+        request = self._results[client_id]._generation_request
+        if multimodal is not None:
+            request.multimodal_params, multimodal_input = multimodal
+            request.multimodal_params.multimodal_input = multimodal_input
         try:
-            request_id = self._enqueue_request(
-                self._results[client_id]._generation_request)
+            request_id = self._enqueue_request(request)
         except RequestError as error:
             logger.warning(f"Could not enqueue request {client_id} again "
                            f"after a rank failure: {error}")
@@ -1899,8 +1906,8 @@ def _send_rsp(
     else:
         _send_rsp_to_postproc(worker, response, None)
 
-    if worker._unanswered_client_ids:
-        worker._unanswered_client_ids.discard(response.client_id)
+    if worker._unanswered_requests:
+        worker._unanswered_requests.pop(response.client_id, None)
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
     if is_llm_response(response):

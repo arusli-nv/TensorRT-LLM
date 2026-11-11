@@ -119,16 +119,6 @@ _agent: Optional[MembershipAgent] = None
 _authority: Optional[subprocess.Popen] = None
 
 
-class MembershipReady(NamedTuple):
-    """The READY that rank 0's executor worker sends the proxy with fault tolerance, with the membership store's
-    address."""
-
-    signal: bytes
-    error: Optional[str]
-    worker_process_identities: list
-    membership_address: str
-
-
 def ensure_rendezvous() -> None:
     """Choose and export the join secret and the rendezvous address (this host and two free consecutive ports) when
     unset, for the workers this process starts. The ports stay reserved by sockets bound with SO_REUSEADDR that never
@@ -760,7 +750,7 @@ def agreed_placement(record: MembershipRecord) -> Optional[list]:
 
 class RankFailureRecovery:
     """One rank's part in keeping the deployment serving after a rank failure; see the module docstring. The executor
-    calls its hooks; on rank 0, the executor worker sets :attr:`outstanding_requests`."""
+    calls its hooks; on rank 0, the executor worker attaches its requests (:meth:`set_outstanding_requests`)."""
 
     def __init__(
         self,
@@ -784,8 +774,9 @@ class RankFailureRecovery:
         self.rank = executor.dist.rank
         self.world_size = executor.dist.world_size
         self.incarnation = incarnation
-        # Rank 0: request id -> client id of every request without a final response.
-        self.outstanding_requests: Optional[Callable[[], Dict[int, int]]] = None
+        # Rank 0: request id -> client id of every request without a final response; None (no request) until the
+        # executor worker attaches it, before it reports READY and so before the proxy sends any request.
+        self._outstanding_requests: Optional[Callable[[], Dict[int, int]]] = None
         self._agent: Optional[MembershipAgent] = None
         self._record = MembershipRecord(
             generation=0, state=MembershipState.COMMITTED, live_mask=(1 << self.world_size) - 1
@@ -888,6 +879,11 @@ class RankFailureRecovery:
             recovery._join()
         logger.info(f"Rank {dist.rank} joined the fault-tolerance membership at {recovery.address}")
         return recovery
+
+    def set_outstanding_requests(self, outstanding_requests: Callable[[], Dict[int, int]]) -> None:
+        """Attach the executor worker's request id -> client id of every request without a final response; rank 0
+        fails those no live rank holds when it resumes after a membership change."""
+        self._outstanding_requests = outstanding_requests
 
     def _join(self) -> None:
         """A replacement's admission: report that it is ready to join, take part in the change that adds it, and start
@@ -1225,7 +1221,7 @@ class RankFailureRecovery:
                 self._install_step_done()
             # Taken before the requests held, so that a request enqueued in between is not taken for a lost one.
             outstanding = (
-                self.outstanding_requests() if self.outstanding_requests is not None else {}
+                self._outstanding_requests() if self._outstanding_requests is not None else {}
             )
             times["prepare"] = (time.perf_counter() - start_s) * 1e3
             start_s = time.perf_counter()
@@ -1696,14 +1692,13 @@ class FaultToleranceHealth:
 
     def status(self) -> Dict[str, object]:
         """The server's fault-tolerance status: the state, whether the authority answers, and from the last record its
-        generation and state, the live and lost ranks, each rank's incarnation and the last transaction that ended
+        generation, the live and lost ranks, each rank's incarnation and the last transaction that ended
         (None until the store answers)."""
         record, transaction, authority_alive = self._read()
         status = {
             "state": self._state(record, authority_alive),
             "authority_alive": authority_alive,
             "generation": None,
-            "membership_state": None,
             "live_ranks": None,
             "lost_ranks": None,
             "incarnations": None,
@@ -1715,7 +1710,6 @@ class FaultToleranceHealth:
             world_size = len(record.incarnations)
             status.update(
                 generation=record.generation,
-                membership_state=record.state.name,
                 live_ranks=[r for r in range(world_size) if record.is_live(r)],
                 lost_ranks=[r for r in range(world_size) if not record.is_live(r)],
                 incarnations=list(record.incarnations),

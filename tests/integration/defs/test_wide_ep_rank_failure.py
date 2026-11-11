@@ -309,9 +309,9 @@ def _merged(config: dict, overrides: dict) -> dict:
 def _wait_until_healthy(base: str, alive: Callable[[], bool], fault_tolerance: bool) -> None:
     deadline = time.monotonic() + STARTUP_TIMEOUT_S
     while True:
-        code, body = _get_json(f"{base}/health")
-        # Without fault tolerance /health answers 200 with no state.
-        if code == 200 and (not fault_tolerance or body == {"state": "healthy"}):
+        code, _ = _get_json(f"{base}/health")
+        # /health carries no state; with fault tolerance the status endpoint does.
+        if code == 200 and (not fault_tolerance or (_status(base) or {}).get("state") == "healthy"):
             return
         assert alive(), "the server exited during startup"
         assert time.monotonic() < deadline, "the server did not become healthy"
@@ -926,13 +926,15 @@ def _percentiles(values: List[float]) -> Optional[dict]:
 class Monitor:
     """Watches the deployment: its ``/health`` four times a second and, with fault tolerance, its membership.
 
-    ``health``: (time, HTTP status, state) per sample. ``membership``: (time, status) per change of the status
-    (``FaultToleranceHealth.status``), read from the membership store every STORE_POLL_S with the server's own reader;
-    the time is when the change was first read.
+    ``health``: (time, HTTP status of ``/health``, state from ``/fault_tolerance_status``) per sample.
+    ``membership``: (time, status) per change of the status (``FaultToleranceHealth.status``, with the record's own
+    ``membership_state``), read from the membership store every STORE_POLL_S with the server's own reader; the time is
+    when the change was first read.
     """
 
     def __init__(self, deployment: Deployment):
         self._base = deployment.base
+        self._fault_tolerance = deployment.fault_tolerance
         self._stop = threading.Event()
         self._changed = threading.Condition()
         self._failures: List[str] = []
@@ -956,14 +958,19 @@ class Monitor:
 
     def _sample_health(self) -> None:
         while not self._stop.is_set():
-            code, body = _get_json(f"{self._base}/health")
-            state = body.get("state") if isinstance(body, dict) else None
-            self.health.append((time.monotonic(), code, state))
+            code, _ = _get_json(f"{self._base}/health")
+            status = _status(self._base) if self._fault_tolerance else None
+            self.health.append(
+                (time.monotonic(), code, None if status is None else status["state"])
+            )
             self._stop.wait(0.25)
 
     def _sample_membership(self, reader: FaultToleranceHealth) -> None:
         while not self._stop.is_set():
             status = reader.status()
+            # The record's own state, which the public status leaves out: the checks time kills within a change.
+            record = reader._record
+            status["membership_state"] = None if record is None else record.state.name
             t = time.monotonic()
             if not self.membership or status != self.membership[-1][1]:
                 with self._changed:
@@ -996,7 +1003,7 @@ class Monitor:
                 self._changed.wait(min(remaining, 1.0))
 
     def wait_for_health(self, code: int, state: str, since: float, timeout_s: float) -> float:
-        """When ``/health`` first answered ``code`` with ``state`` after ``since``."""
+        """When ``/health`` first answered ``code``, with the status endpoint's ``state``, after ``since``."""
         checked = 0
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline and not self._failures:
@@ -1008,7 +1015,7 @@ class Monitor:
             time.sleep(0.1)
         last = self.health[-1] if self.health else None
         raise AssertionError(
-            f"/health did not answer {code} {state} within {timeout_s} s; last sample: {last}; "
+            f"/health did not answer {code} in state {state} within {timeout_s} s; last sample: {last}; "
             f"failed samplers: {self._failures}"
         )
 
@@ -1295,9 +1302,7 @@ class Run:
             self._check_captures(report["cuda_graph_capture_lines"])
             if self.deployment.fault_tolerance:
                 states = {str(s[2]) for s in self.monitor.health}
-                self.check(
-                    states <= HEALTH_STATES, f"/health states during the run: {sorted(states)}"
-                )
+                self.check(states <= HEALTH_STATES, f"states during the run: {sorted(states)}")
                 retryable = sum(1 for r in self.clients.requests if r.retryable)
                 logged = _retryable_failures_logged(self.deployment.logs)
                 self.check(

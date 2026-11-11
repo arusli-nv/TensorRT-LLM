@@ -1283,7 +1283,7 @@ def test_resume_recomputes_the_interrupted_requests_and_fails_the_lost_ones(monk
     executor.executor_request_queue.request_queue.put(
         RequestQueueItem(11, is_canceled_request=True)
     )
-    recovery.outstanding_requests = lambda: {r: 100 + r for r in (10, 11, 12, 13, 20)}
+    recovery.set_outstanding_requests(lambda: {r: 100 + r for r in (10, 11, 12, 13, 20)})
 
     recovery._resume_after, executor.iter_counter = 10, 10
     recovery.before_iteration()  # not yet past the last iteration a survivor reached
@@ -1347,7 +1347,7 @@ def test_a_newer_change_stops_the_install_without_resetting_the_all_to_all(
     """The record is checked first, in every wait for a peer, and just before the all-to-all is reset."""
     monkeypatch.setattr(recovery_module.torch.cuda, "synchronize", lambda: None)
     recovery = _resuming_recovery()
-    recovery.outstanding_requests = lambda: {11: 111}
+    recovery.set_outstanding_requests(lambda: {11: 111})
     newer = _record(MembershipState.PROPOSE, generation=2, live_mask=0b0011)
     if change_after_remap:
         recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: recovery._on_record(
@@ -2368,7 +2368,7 @@ def _ipc_worker(monkeypatch, fault_tolerance=True):
     worker._results = {}
     worker._client_id_to_request_id = {}
     worker._refused_client_ids = set()
-    worker._unanswered_client_ids = set() if fault_tolerance else None
+    worker._unanswered_requests = {} if fault_tolerance else None
     worker.start = Mock()
     worker._get_logprob_params = Mock(return_value=None)
     worker._handle_background_error = Mock()
@@ -2443,16 +2443,29 @@ def test_the_worker_enqueues_a_request_a_rank_failure_ended_again_once_if_it_sen
     helper.handle_for_ipc_batched([_ended_by_rank_failure(9)])  # enqueued again once already
     assert _sent(worker)[9] == [("error", RankFailureError)]
     assert worker._enqueue_request.call_count == 5
-    assert worker._unanswered_client_ids == set() and worker._results == {}
+    assert worker._unanswered_requests == {} and worker._results == {}
 
 
-def test_the_worker_enqueues_no_multimodal_request_again(monkeypatch):
-    """Its enqueue consumes its multimodal input."""
+def test_the_worker_enqueues_a_multimodal_request_again_with_its_multimodal_input(monkeypatch):
+    """The first enqueue consumes the multimodal input, and an in-process executor then drops the request's
+    multimodal parameters: the request is enqueued again with both, as first sent."""
     worker, helper = _ipc_worker(monkeypatch)
-    _submit(worker, 7, multimodal_params=Mock())
+    multimodal_input = object()
+    params = SimpleNamespace(multimodal_input=multimodal_input)
+    enqueued = []
+
+    def enqueue(request):
+        enqueued.append((request.multimodal_params, request.multimodal_params.multimodal_input))
+        request.multimodal_params.multimodal_input = None
+        return 100 + len(enqueued)
+
+    worker._enqueue_request = Mock(side_effect=enqueue)
+    request = _submit(worker, 7, multimodal_params=params)
+    del request.multimodal_params
     helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
-    assert _sent(worker) == {7: [("error", RankFailureError)]}
-    assert worker._enqueue_request.call_count == 1
+    assert enqueued == [(params, multimodal_input)] * 2
+    assert _sent(worker) == {}
+    assert worker._client_id_to_request_id == {7: 102}
 
 
 def test_without_fault_tolerance_the_worker_enqueues_no_request_again(monkeypatch):
@@ -2468,7 +2481,7 @@ def test_a_request_whose_enqueue_fails_is_not_enqueued_again(monkeypatch):
     worker._enqueue_request = Mock(side_effect=RequestError("refused"))
     with pytest.raises(RequestError):
         _submit(worker, 7)
-    assert worker._unanswered_client_ids == set()
+    assert worker._unanswered_requests == {}
 
 
 def test_the_rank_failure_error_reaches_the_client_as_its_type():
@@ -2501,18 +2514,12 @@ def test_a_request_a_rank_failure_ended_answers_503_with_its_code(error, status,
 @pytest.mark.parametrize("rank_failure", [False, True])
 def test_a_streamed_request_a_rank_failure_ended_gets_its_code(rank_failure):
     """A stream that already answered 200 ends with an error event that carries the code."""
-    from tensorrt_llm.serve.openai_server import _end_stream_on_error
+    from tensorrt_llm.serve.openai_server import _stream_error_events
 
-    async def failing():
-        yield "data: first\n\n"
-        raise RankFailureError() if rank_failure else RequestError(str(RankFailureError()))
-
-    async def collect():
-        return [event async for event in _end_stream_on_error(failing())]
-
-    events = asyncio.run(collect())
+    error = RankFailureError() if rank_failure else RequestError(str(RankFailureError()))
+    events = _stream_error_events(error)
     assert events[-1] == "data: [DONE]\n\n"
-    error = json.loads(events[1][len("data: ") :])["error"]
+    error = json.loads(events[0][len("data: ") :])["error"]
     assert error["code"] == (RANK_FAILURE_CODE if rank_failure else None)
 
 
@@ -2718,7 +2725,6 @@ def test_status_endpoint_reports_the_membership_and_the_last_transaction(monkeyp
         "state": "degraded",
         "authority_alive": True,
         "generation": 1,
-        "membership_state": "COMMITTED",
         "live_ranks": [0, 1, 3],
         "lost_ranks": [FAILED],
         "incarnations": [0] * WORLD,
@@ -2743,26 +2749,29 @@ def test_status_endpoint_while_the_store_does_not_answer(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "record, code, state",
+    "record, code",
     [
-        (_record(MembershipState.COMMITTED), 200, "degraded"),
+        (_record(MembershipState.COMMITTED), 200),
         # A liveness probe must not restart the server while the membership changes.
-        (_record(MembershipState.PROPOSE), 200, "recovering"),
-        (_record(MembershipState.INSTALL), 200, "recovering"),
-        (_record(MembershipState.ABORT), 503, "stopped"),
-        (None, 200, "unprotected"),
+        (_record(MembershipState.PROPOSE), 200),
+        (_record(MembershipState.INSTALL), 200),
+        (_record(MembershipState.ABORT), 503),
+        (None, 200),
     ],
 )
-def test_health_answers_503_only_once_the_deployment_stopped(monkeypatch, record, code, state):
+def test_health_answers_503_only_once_the_deployment_stopped(monkeypatch, record, code):
+    """The status code carries the health; the body stays main's (the state is the status endpoint's)."""
     server = _server(monkeypatch, None if record is None else FakeSignedStore(record))
     response = asyncio.run(server.health())
     assert response.status_code == code
-    assert json.loads(response.body) == {"state": state}
+    if code == 200:
+        assert response.body == b""
+    else:
+        assert response.body.startswith(b"LLM is unavailable")
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_health_after_a_fatal_engine_error_answers_the_stopped_state(monkeypatch, fault_tolerance):
-    """Under fault tolerance the 503 body is JSON like in every other state; without it, main's text."""
+def test_health_after_a_fatal_engine_error_answers_503(monkeypatch, fault_tolerance):
     server = _server(monkeypatch, None)
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
     server.generator._check_health.return_value = False
@@ -2770,10 +2779,7 @@ def test_health_after_a_fatal_engine_error_answers_the_stopped_state(monkeypatch
     server.generator._executor.doing_shutdown = True  # the shutdown already started: no signal
     response = asyncio.run(server.health())
     assert response.status_code == 503
-    if fault_tolerance:
-        assert json.loads(response.body) == {"state": "stopped"}
-    else:
-        assert response.body.startswith(b"LLM is unavailable")
+    assert response.body.startswith(b"LLM is unavailable")
 
 
 @pytest.mark.timeout(60)
@@ -2796,7 +2802,7 @@ def test_health_stays_stopped_after_abort_while_a_rank_lingers(monkeypatch):
     try:
         _wait_until(lambda: health.status()["state"] == "healthy", timeout_s=10)
         connections[0].sock.close()  # rank 0's process ends: the deployment aborts
-        _wait_until(lambda: health.status()["membership_state"] == "ABORT", timeout_s=10)
+        _wait_until(lambda: health.status()["state"] == "stopped", timeout_s=10)
         # Rank 1 has not left yet.
         assert thread.is_alive()
         status = health.status()
@@ -2810,7 +2816,7 @@ def test_health_stays_stopped_after_abort_while_a_rank_lingers(monkeypatch):
     server.generator._executor.fault_tolerance_health = health
     response = asyncio.run(server.health())
     assert response.status_code == 503
-    assert json.loads(response.body) == {"state": "stopped"}
+    assert response.body.startswith(b"LLM is unavailable")
 
 
 def _start_authority_at_a_free_port(monkeypatch):
@@ -3745,7 +3751,7 @@ def test_an_admission_lets_the_step_in_flight_finish_and_recomputes_nothing(monk
 
     recovery._agent.report = report
     executor.dist.allgather.side_effect = lambda local: [local, set(), set(), set()]
-    recovery.outstanding_requests = lambda: {10: 110, 11: 111}
+    recovery.set_outstanding_requests(lambda: {10: 110, 11: 111})
     executor.iter_counter = 21
     info = Mock()
     monkeypatch.setattr(recovery_module.logger, "info", info)

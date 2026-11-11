@@ -24,7 +24,8 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
-# Returns a waiting get_from_request_queue() without a request; never broadcast.
+# Returns a waiting get_from_request_queue() without a request; never broadcast,
+# unlike CONTROL_REQUEST_ID, which every rank receives and runs a control action for.
 WAKE_REQUEST_ID = -6
 
 

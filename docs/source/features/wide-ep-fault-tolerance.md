@@ -3,13 +3,13 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# WideEP Fault Tolerance (Prototype)
+# Wide-EP Fault Tolerance (Prototype)
 
 ```{warning}
-WideEP fault tolerance is a prototype and is subject to change.
+Wide-EP fault tolerance is a prototype and is subject to change.
 ```
 
-A wide expert-parallel (WideEP) deployment spreads the experts of every MoE layer over all its ranks, so without
+A wide expert-parallel (Wide-EP) deployment spreads the experts of every MoE layer over all its ranks, so without
 fault tolerance one failed rank ends the whole deployment. With `enable_wide_ep_fault_tolerance`, it keeps serving:
 
 ```text
@@ -138,19 +138,18 @@ leader pod's address (`LWS_LEADER_ADDRESS`). A restarted pod starts its node aga
 
 ## Monitoring
 
-- `GET /health` answers 200 while the deployment serves, with a JSON body whose `state` is `healthy` (every rank
-  serves), `degraded` (some ranks are lost), `recovering` (a membership change is in progress; serving pauses) or
-  `unprotected` (the authority does not answer, so a further failure is not recovered).
-- It answers 503 with `state` `stopped` once the deployment cannot recover; the server then shuts down, so an
-  orchestrator restarts the instance.
-- `GET /fault_tolerance_status` reports the membership:
+- `GET /health` answers 200 while the deployment serves, also while it lost ranks or changes its membership. It
+  answers 503 once the deployment cannot recover; the server then shuts down, so an orchestrator restarts the
+  instance.
+- `GET /fault_tolerance_status` reports the membership. Its `state` is `healthy` (every rank serves), `degraded` (some
+  ranks are lost), `recovering` (a membership change is in progress; serving pauses), `unprotected` (the authority
+  does not answer, so a further failure is not recovered) or `stopped` (the deployment cannot recover):
 
 ```json
 {
   "state": "degraded",
   "authority_alive": true,
   "generation": 1,
-  "membership_state": "COMMITTED",
   "live_ranks": [0, 1, 3],
   "lost_ranks": [2],
   "incarnations": [0, 0, 0, 0],

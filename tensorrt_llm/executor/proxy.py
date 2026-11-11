@@ -1092,10 +1092,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 self._fail_initialization(
                     wrap_worker_startup_error("Executor worker returned error",
                                               info), ready_signal)
-        membership_address = getattr(status, "membership_address", None)
-        if membership_address is not None:
-            self._join_membership(status.worker_process_identities,
-                                  membership_address)
+        if len(status) > 3:
+            # WideEP fault tolerance: READY also carries the address of the
+            # membership store.
+            self._join_membership(status[2], status[3])
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the

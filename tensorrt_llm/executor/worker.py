@@ -670,11 +670,11 @@ def worker_main(
                 ready_msg = (ready_signal, None, worker_process_identities)
                 recovery = getattr(worker.engine, "rank_failure_recovery", None)
                 if recovery is not None:
-                    # WideEP fault tolerance: the proxy reads the membership.
-                    from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
-                        MembershipReady
-                    recovery.outstanding_requests = worker.outstanding_requests
-                    ready_msg = MembershipReady(*ready_msg, recovery.address)
+                    # WideEP fault tolerance: the address of the membership
+                    # store, which the proxy reads.
+                    recovery.set_outstanding_requests(
+                        worker.outstanding_requests)
+                    ready_msg += (recovery.address, )
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
