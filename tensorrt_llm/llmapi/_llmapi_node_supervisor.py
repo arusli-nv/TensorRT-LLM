@@ -28,6 +28,13 @@ _PMIX_SERVER_URI_VARS = (
     "PMIX_SERVER_URI21",
     "PMIX_SERVER_URI2",
 )
+# The deployment's opt-in to running as root, without which prun and pterm refuse to run as root.
+_RUN_AS_ROOT_VARS = (
+    "OMPI_ALLOW_RUN_AS_ROOT",
+    "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM",
+    "PRTE_ALLOW_RUN_AS_ROOT",
+    "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM",
+)
 _PR_SET_PDEATHSIG = 1
 _SHM_DIR = "/dev/shm"
 _CONNECT_TIMEOUT_S = 2.0
@@ -124,7 +131,7 @@ class NodeSupervisor:
         self._environ = {
             name: value
             for name, value in environ.items()
-            if not name.startswith(membership.LAUNCHER_ENV_PREFIXES)
+            if name in _RUN_AS_ROOT_VARS or not name.startswith(membership.LAUNCHER_ENV_PREFIXES)
         }
         # Each rank started here is a one-process MPI world, which has no shared-memory peer: without the sm transport
         # it creates no /dev/shm segment that its exit (os._exit, or a kill) would leave behind.

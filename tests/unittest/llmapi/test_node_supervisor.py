@@ -652,6 +652,43 @@ def test_under_mpirun_node_0_ends_the_job_through_the_job_s_prrte(tmp_path, depl
     assert not (tmp_path / "prun-args").exists()
 
 
+@pytest.mark.parametrize("opt_in", [True, False])
+def test_prrte_tools_get_run_as_root_opt_in(tmp_path, deployment, opt_in):
+    """PRRTE's tools run with the deployment's opt-in to running as root, and never gain one.
+
+    Under a root deployment prun and pterm refuse to run without it. Fails without the change: the supervisor
+    dropped it with the launcher's variables.
+    """
+    _, environ = deployment
+    for name in supervisor_module._RUN_AS_ROOT_VARS:
+        environ.pop(name, None)
+        if opt_in:
+            environ[name] = "1"
+    bin_dir = tmp_path / "bin"
+    _fake_tool(bin_dir, "prun", tmp_path)
+    pterm = bin_dir / "pterm"
+    pterm.write_text(
+        f"#!{sys.executable}\nimport json, os\n"
+        f"open({str(tmp_path / 'pterm-environ')!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+    )
+    pterm.chmod(0o755)
+    environ.update(
+        PATH=f"{bin_dir}:{environ['PATH']}",
+        # The PID in the URI names no mpirun, so the supervisor ends the job with pterm.
+        PMIX_SERVER_URI41="prterun-host-0-0@0.0;tcp4://127.0.0.1:1",
+        SUPERVISOR_TEST_MODES="0:0=crashes",
+    )
+    node_0 = ["--node-rank", "0", "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
+    supervisor = _supervisor_process(tmp_path, environ, *node_0, *_rank_command(tmp_path))
+    try:
+        assert supervisor.wait(30) == 7
+    finally:
+        supervisor.kill()
+    pterm_environ = json.loads((tmp_path / "pterm-environ").read_text())
+    for name in supervisor_module._RUN_AS_ROOT_VARS:
+        assert (pterm_environ.get(name) == "1") == opt_in
+
+
 def test_the_ranks_die_with_their_supervisor(tmp_path, deployment):
     """Kill -9 of the supervisor is the loss of its node: its ranks end, and its authority connection closes."""
     authority, environ = deployment
@@ -812,8 +849,9 @@ def test_node_0_relaunches_a_failed_node_once_through_prun(tmp_path, deployment)
     assert secret not in " ".join(args)
     relaunched_environ = json.loads((tmp_path / "prun-0.stdin").read_text())
     assert relaunched_environ[SHARED_SECRET_ENV] == secret
+    kept = ("OMPI_MCA_btl", *supervisor_module._RUN_AS_ROOT_VARS)
     assert not any(
-        key.startswith(("OMPI_", "PMIX_")) for key in relaunched_environ if key != "OMPI_MCA_btl"
+        key.startswith(("OMPI_", "PMIX_")) for key in relaunched_environ if key not in kept
     )
     assert relaunched_environ["OMPI_MCA_btl"] == "^sm"
     connected = _record(MembershipState.COMMITTED, active_mask=0b0011)
