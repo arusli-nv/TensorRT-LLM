@@ -102,7 +102,7 @@ void initMoeBindings(nb::module_& m)
         .def(nb::init<int, int, int, bool>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
             nb::arg("rank_failure_recovery") = false,
             "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, update frequency and "
-            "whether WideEP rank-failure recovery is enabled",
+            "whether Wide-EP fault tolerance is enabled",
             nb::call_guard<nb::gil_scoped_release>())
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, nb::arg("use_gpu_memcpy"),
             "Set whether to use GPU memcpy for weight updates", nb::call_guard<nb::gil_scoped_release>())
@@ -124,11 +124,11 @@ void initMoeBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
             nb::arg("layer_rank_expert_ids"),
-            "Under WideEP fault tolerance, set the failed EP ranks, load the local slots whose expert changes from the "
-            "host weights and install a placement per layer",
+            "Under Wide-EP fault tolerance, set the failed EP ranks, load the local slots whose expert changes from "
+            "the host weights and install a placement per layer",
             nb::call_guard<nb::gil_scoped_release>())
         .def("abandon_iterations", &tr::MoeLoadBalancer::abandonIterations,
-            "Under WideEP fault tolerance, after a rank failure interrupted the forward, end the online EPLB work of "
+            "Under Wide-EP fault tolerance, after a rank failure interrupted the forward, end the online EPLB work of "
             "the iterations started so far and restart the statistics and the update plan",
             nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
@@ -140,7 +140,7 @@ void initMoeBindings(nb::module_& m)
         "host_accessible_device_memory_uses_gdrcopy",
         [] { return tr::HostAccessibleDeviceAllocator::getInstance().usesGdrCopy(); },
         "Whether host accessible device memory is device memory that GDRCopy maps for the host, which spare EPLB "
-        "slots of online EPLB need under WideEP fault tolerance; only while a load balancer exists");
+        "slots of online EPLB need under Wide-EP fault tolerance; only while a load balancer exists");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, nb::arg("meta_info"), nb::arg("expert_load_factor"),

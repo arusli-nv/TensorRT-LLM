@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host collectives over MNNVL memory for WideEP fault tolerance."""
+"""Host collectives over MNNVL memory for Wide-EP fault tolerance."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from .mnnvl_memory import (
 from .startup_record import startup_record
 
 
-class MnnvlRows(MnnvlMemory):
+class HostExchangeMnnvlMemory(MnnvlMemory):
     """MNNVL memory of one row per rank, every row mapped in every process at ``ptr + r * stride``.
 
     The rows sit back to back, so one strided copy reaches every row. The row of an absent rank maps local scratch
@@ -48,15 +48,15 @@ class MnnvlRows(MnnvlMemory):
         """Reserve and map the rows, collectively over the ranks ``gather`` reaches.
 
         Raises:
-            MnnvlPeerHandleError: A live rank could not import a peer's handle.
-            MnnvlMappingError: Mapping or zeroing failed on some live ranks.
+            MnnvlPeerHandleError: An active rank could not import a peer's handle.
+            MnnvlMappingError: Mapping or zeroing failed on some active ranks.
             RuntimeError: The device does not share memory through fabric handles.
         """
         cls = type(self)
         dev_id = cls._init_device()
         if not cls.uses_fabric_handles(dev_id):
             raise RuntimeError(
-                "MnnvlRows requires fabric memory handles, which this device does not use"
+                "HostExchangeMnnvlMemory requires fabric memory handles, which this device does not use"
             )
         granularity = cls.get_allocation_granularity(dev_id)
         stride = granularity * -(-nbytes // granularity)
@@ -117,7 +117,7 @@ class TPHostExchange:
 
     The exchange uses the LL protocol of the all-to-all kernels through the copy engines, so it takes no SMs. Each
     exchange alternates between two slot sets, so a rank never overwrites a slot that a slower rank still reads. After
-    a membership change every live rank gets the same result, because a round that some rank finished is finished by
+    a membership change every active rank gets the same result, because a round that some rank finished is finished by
     the others from its packets and any other round runs again.
     """
 
@@ -128,7 +128,9 @@ class TPHostExchange:
     _IDLE_SPIN_S = 20e-6
     _IDLE_SLEEP_S = 20e-6
 
-    def __init__(self, rank: int, nranks: int, rows: MnnvlRows, slot_payload_bytes: int):
+    def __init__(
+        self, rank: int, nranks: int, rows: HostExchangeMnnvlMemory, slot_payload_bytes: int
+    ):
         from .mnnvl_memory import _check_cu_result, cuda
 
         self._cuda = cuda
@@ -141,13 +143,13 @@ class TPHostExchange:
         self._parity_bytes = nranks * self._slot_bytes
         # Epoch 0 is never sent because the buffers start zeroed.
         self._epoch = 0
-        self.live_mask = (1 << nranks) - 1
+        self.active_mask = (1 << nranks) - 1
         self.interrupted: Callable[[], bool] = lambda: False
         self.on_interrupt: Optional[Callable[[], None]] = None
         self.stopped_epoch = 0
         self._stale_packets: Optional[np.ndarray] = None
         self._missing = 0
-        self._lost = 0
+        self._failed = 0
         self._round_readers = 0
         self._finished_round: Optional[np.ndarray] = None
         self._epoch_after_round: Optional[int] = None
@@ -182,42 +184,42 @@ class TPHostExchange:
     def create(cls, mapping) -> "TPHostExchange":
         """Create the exchange of the TP group over the ranks its communicator reaches; collective."""
         comm = TpMnnvlMemory.get_comm(mapping)
-        live_mask = sum(1 << rank for rank, live in enumerate(comm.allgather(True)) if live)
-        rows = MnnvlRows(
+        active_mask = sum(1 << rank for rank, active in enumerate(comm.allgather(True)) if active)
+        rows = HostExchangeMnnvlMemory(
             mapping.tp_rank,
             mapping.tp_size,
             cls.buffer_bytes(mapping.tp_size, cls.DEFAULT_SLOT_PAYLOAD_BYTES),
             comm.allgather,
         )
         exchange = cls(mapping.tp_rank, mapping.tp_size, rows, cls.DEFAULT_SLOT_PAYLOAD_BYTES)
-        exchange.live_mask = live_mask
+        exchange.active_mask = active_mask
         return exchange
 
     @property
     def epoch(self) -> int:
         return self._epoch
 
-    def admit(self, live_mask: int, epoch: int) -> None:
-        """Continue with the ranks in ``live_mask`` from ``epoch``, in step on every rank in ``live_mask``."""
-        self.live_mask = live_mask
+    def admit(self, active_mask: int, epoch: int) -> None:
+        """Continue with the ranks in ``active_mask`` from ``epoch``, in step on every rank in ``active_mask``."""
+        self.active_mask = active_mask
         self._epoch = epoch - 1
 
     def install(
         self,
         gather: Callable[[Any], Sequence[Any]],
-        live_mask: int,
+        active_mask: int,
         epoch: int,
         fresh_rows: frozenset[int],
     ) -> None:
-        """Switch to the ranks in ``live_mask`` while stopped, collectively over the ranks ``gather`` reaches.
+        """Switch to the ranks in ``active_mask`` while stopped, collectively over the ranks ``gather`` reaches.
 
-        ``epoch`` follows the latest ``stopped_epoch`` among the live ranks. A rank that stopped one round behind
+        ``epoch`` follows the latest ``stopped_epoch`` among the active ranks. A rank that stopped one round behind
         finishes that round from its peers' rows. The rows in ``fresh_rows`` get fresh pages.
 
         Raises:
-            RuntimeError: This rank stopped more than one round before the latest live rank.
+            RuntimeError: This rank stopped more than one round before the latest active rank.
         """
-        if not live_mask >> self.rank & 1:
+        if not active_mask >> self.rank & 1:
             pass
         elif next_epoch(self.stopped_epoch) == epoch:
             # An earlier attempt of this change may have finished the round with a since-failed rank's packets.
@@ -229,26 +231,26 @@ class TPHostExchange:
             ):
                 raise RuntimeError(
                     f"host exchange stopped at epoch {self.stopped_epoch}, more than one round before the "
-                    f"latest live rank (epoch {epoch} is next)"
+                    f"latest active rank (epoch {epoch} is next)"
                 )
             # Read before the remap, which may release the peers' rows.
-            self._finished_round = self._finish_from_peers(live_mask)
+            self._finished_round = self._finish_from_peers(active_mask)
         round_epoch = self._epoch
         self.rows.remap(gather, fresh_rows)
-        self.admit(live_mask, epoch)
+        self.admit(active_mask, epoch)
         if self._finished_round is not None:
             self._epoch_after_round, self._epoch = self._epoch, round_epoch
 
-    def _finish_from_peers(self, live_mask: int) -> np.ndarray:
+    def _finish_from_peers(self, active_mask: int) -> np.ndarray:
         """Return this rank's current round, taking each slot it lacks from a peer row that holds it."""
         parity_offset = (self._epoch & 1) * self._parity_bytes
         rows = self._pinned((self.nranks, 1 + self._words))
         self._copy_to_host(self.rows.row(self.rank) + parity_offset, rows)
         epochs = self._epochs(rows)
-        peers = [p for p in range(self.nranks) if p != self.rank and live_mask >> p & 1]
+        peers = [p for p in range(self.nranks) if p != self.rank and active_mask >> p & 1]
         for sender in range(self.nranks):
             reads = self._round_readers >> sender & 1
-            if not self.live_mask >> sender & 1 or (
+            if not self.active_mask >> sender & 1 or (
                 self._slot_complete(rows[sender]) if reads else epochs[sender, 0] == self._epoch
             ):
                 continue
@@ -383,12 +385,12 @@ class TPHostExchange:
         Args:
             payload: The bytes this rank sends.
             readers: The ranks whose payloads this rank needs (default all). The others come back as None, as do
-                ranks outside ``live_mask`` and ranks whose payload a membership change cut short.
+                ranks outside ``active_mask`` and ranks whose payload a membership change left incomplete.
             recipients: The ranks that need this rank's payload (default all). It must include every rank that
                 names this rank among its ``readers``.
             idle: Sleep between polls, for waits that may last until the next request.
         """
-        reader_mask = self.live_mask
+        reader_mask = self.active_mask
         if readers is not None:
             reader_mask &= sum(1 << r for r in readers)
         if recipients is not None:
@@ -402,7 +404,7 @@ class TPHostExchange:
             received = [b"".join(parts) for parts in zip(received, *later)]
         payloads = [None] * self.nranks
         for r, received_payload in zip(ranks, received):
-            if not self._lost >> r & 1:
+            if not self._failed >> r & 1:
                 payloads[r] = received_payload
         return payloads
 
@@ -414,11 +416,11 @@ class TPHostExchange:
         """
         row = np.ascontiguousarray(row).reshape(-1)
         data = row.view(np.uint8)
-        readers = self.live_mask
+        readers = self.active_mask
         out = np.zeros((self.nranks, -(-data.size // 4)), dtype=np.uint32)
         step = 4 * self._words
         for k, (lengths, rows) in enumerate(self._rounds(data.tobytes(), readers)):
-            if k == 0 and (lengths[self._ranks_of(readers & ~self._lost)[0]] != data.size).any():
+            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != data.size).any():
                 raise ValueError(
                     f"allgather_array rows differ in size across ranks: {lengths.tolist()}"
                 )
@@ -427,7 +429,7 @@ class TPHostExchange:
                 out[:, self._words * k : self._words * k + words] = rows.view(np.uint32)[
                     :, 2 : 2 + 2 * words : 2
                 ]
-        kept = readers & ~self._lost
+        kept = readers & ~self._failed
         if kept != (1 << self.nranks) - 1:
             out[~self._ranks_of(kept)[0]] = 0
         return out.view(np.uint8)[:, : data.size].view(row.dtype)
@@ -461,7 +463,7 @@ class TPHostExchange:
     ) -> Iterator[Tuple[np.ndarray, Optional[np.ndarray]]]:
         """Yield the header lengths and packets of each round, one slot of ``data`` per round."""
         self._round_readers = readers
-        self._lost = 0
+        self._failed = 0
         step = 4 * self._words
         lengths, rows = self._round(data[:step], len(data), readers, recipients, idle)
         yield lengths, rows
@@ -495,20 +497,20 @@ class TPHostExchange:
         parity_offset = (self._epoch & 1) * self._parity_bytes
         words = np.frombuffer(chunk + b"\0" * (-len(chunk) % 4), dtype=np.uint32)
         self._send_round(parity_offset, words, length, recipients)
-        round_mask = self.live_mask
-        round_live, live_ranks = self._ranks_of(round_mask)
+        round_mask = self.active_mask
+        round_active, active_ranks = self._ranks_of(round_mask)
         headers = self._wait(
             parity_offset,
-            round_live[:, None],
-            live_ranks,
+            round_active[:, None],
+            active_ranks,
             1 + min(self._words, self._POLL_PACKETS) if readers else 1,
             idle,
         )
-        live = round_mask & ~self._missing
-        lengths = headers.view(np.uint32)[:, 0] * self._ranks_of(live)[0]
-        reader_live, reader_ranks = self._ranks_of(readers & live)
+        active = round_mask & ~self._missing
+        lengths = headers.view(np.uint32)[:, 0] * self._ranks_of(active)[0]
+        reader_active, reader_ranks = self._ranks_of(readers & active)
         # Signed, because -1 marks a rank this rank does not read.
-        payload_bytes = np.where(reader_live, lengths.astype(np.int64), -1)
+        payload_bytes = np.where(reader_active, lengths.astype(np.int64), -1)
         packets = 1 + min(self._words, -(-int(payload_bytes.max()) // 4))
         rows = None
         if packets > 1:
@@ -518,7 +520,7 @@ class TPHostExchange:
                 if self._arrived(headers, wanted)
                 else self._wait(parity_offset, wanted, reader_ranks, 1, idle)
             )
-        self._lost |= readers & (~round_mask | self._missing)
+        self._failed |= readers & (~round_mask | self._missing)
         if self._epoch_after_round is not None:
             self._epoch, self._epoch_after_round = self._epoch_after_round, None
             self._finished_round = None
@@ -606,7 +608,7 @@ class MnnvlDist(MPIDist):
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
         self._host_exchange = None
-        self._live_rows_index = (None, None)
+        self._active_rows_index = (None, None)
 
     @staticmethod
     def unmet_requirements(mapping: Mapping) -> List[str]:
@@ -628,7 +630,7 @@ class MnnvlDist(MPIDist):
             return unmet
         if not MnnvlMemory.supports_mnnvl():
             return ["GPUs in one multi-node NVLink (MNNVL) domain, such as a GB200 NVL72"]
-        if not MnnvlRows.uses_fabric_handles(torch.cuda.current_device()):
+        if not HostExchangeMnnvlMemory.uses_fabric_handles(torch.cuda.current_device()):
             return [
                 "MNNVL memory shared through fabric handles (GB200-class "
                 "aarch64 nodes with IMEX running and an IMEX channel in the "
@@ -726,16 +728,16 @@ class MnnvlDist(MPIDist):
         rows = startup_record.exchange(self.mapping.tp_rank, values.tobytes(), None, run)
         return np.stack([np.frombuffer(row, dtype=np.int64) for row in rows])
 
-    def tp_live_rows(self, rows: np.ndarray) -> np.ndarray:
-        live_mask = self.host_exchange.live_mask
-        if live_mask == (1 << self.tp_size) - 1 or startup_record.replaying:
+    def tp_active_rows(self, rows: np.ndarray) -> np.ndarray:
+        active_mask = self.host_exchange.active_mask
+        if active_mask == (1 << self.tp_size) - 1 or startup_record.replaying:
             return rows
-        if self._live_rows_index[0] != live_mask:
-            self._live_rows_index = (
-                live_mask,
-                np.array([r for r in range(self.tp_size) if live_mask >> r & 1], dtype=np.intp),
+        if self._active_rows_index[0] != active_mask:
+            self._active_rows_index = (
+                active_mask,
+                np.array([r for r in range(self.tp_size) if active_mask >> r & 1], dtype=np.intp),
             )
-        return rows[self._live_rows_index[1]]
+        return rows[self._active_rows_index[1]]
 
     def broadcast_int64(
         self, values: ArrayLike, root: int = 0, *, prefer_cpu: bool = False

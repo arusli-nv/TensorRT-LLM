@@ -1247,7 +1247,7 @@ void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
 
 void MoeLoadBalancer::checkRecoveryCall(char const* action) const
 {
-    TLLM_CHECK_WITH_INFO(mRankFailureRecovery, "Cannot %s without WideEP rank-failure recovery.", action);
+    TLLM_CHECK_WITH_INFO(mRankFailureRecovery, "Cannot %s without Wide-EP fault tolerance.", action);
     TLLM_CHECK_WITH_INFO(mModelFinalized, "Model is not finalized, cannot %s.", action);
     TLLM_CHECK_WITH_INFO(!mIterActive, "Cannot %s while an iteration is active.", action);
     int device = -1;

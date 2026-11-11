@@ -116,7 +116,7 @@ def test_cached_handover_reaps_in_flight_retires(reuse_cache):
 def test_a_fault_tolerant_llm_gets_a_pool_spawned_with_its_rendezvous(reuse_cache, monkeypatch):
     """The cache hands a bare LLM(...) a pool spawned earlier, whose workers froze their environment then.
 
-    A WideEP fault-tolerant LLM chooses the join secret and the rendezvous address before it asks for its pool, so
+    A Wide-EP fault-tolerant LLM chooses the shared secret and the rendezvous address before it asks for its pool, so
     the changed environment retires the cached pool, and the workers of the pool it gets have both.
     """
     from unittest.mock import Mock
@@ -126,7 +126,7 @@ def test_a_fault_tolerant_llm_gets_a_pool_spawned_with_its_rendezvous(reuse_cach
     from tensorrt_llm.llmapi import LLM, startup_checks
     from tensorrt_llm.llmapi import llm as llm_module
 
-    pair = ("TLLM_FAULT_TOLERANCE_JOIN_SECRET", "TLLM_FAULT_TOLERANCE_RENDEZVOUS")
+    pair = ("TLLM_FAULT_TOLERANCE_SHARED_SECRET", "TLLM_FAULT_TOLERANCE_RENDEZVOUS")
     for name in pair:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)  # unset now, and unset again afterwards

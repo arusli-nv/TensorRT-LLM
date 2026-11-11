@@ -40,7 +40,7 @@ as its own process and replaces a failed one.
 
 ## Launching on several nodes
 
-1. Export the same join secret (at least 32 bytes, hex) and rendezvous address (rank 0's node and a free port, with
+1. Export the same shared secret (at least 32 bytes, hex) and rendezvous address (rank 0's node and a free port, with
    the next port free too) on every node. Pass them in the environment, never on the command line.
 2. Give `/dev/shm` on every node room for the host weights of every expert (DeepSeek-R1 FP4: about 364 GB). Use
    `docker run --shm-size`, or on Kubernetes an `emptyDir` volume with `medium: Memory` mounted at `/dev/shm`.
@@ -52,10 +52,10 @@ rejected because Slurm cancels the whole job step when one task exits.
 
 ```bash
 #SBATCH --no-requeue
-export TLLM_FAULT_TOLERANCE_JOIN_SECRET=$(openssl rand -hex 32)
+export TLLM_FAULT_TOLERANCE_SHARED_SECRET=$(openssl rand -hex 32)
 export TLLM_FAULT_TOLERANCE_RENDEZVOUS=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1):29600
 mpirun --enable-recovery -np 8 --map-by ppr:1:node \
-    -x TLLM_FAULT_TOLERANCE_JOIN_SECRET -x TLLM_FAULT_TOLERANCE_RENDEZVOUS \
+    -x TLLM_FAULT_TOLERANCE_SHARED_SECRET -x TLLM_FAULT_TOLERANCE_RENDEZVOUS \
     trtllm-llmapi-launch trtllm-serve <model> --tp_size 32 --ep_size 32 --config config.yaml
 ```
 
@@ -68,17 +68,18 @@ no `RecreateGroupOnPodRestart`). Set `PMI_RANK` to the node rank, `PMI_SIZE` to 
 - Requests in flight on the surviving ranks continue by recompute, and tokens already streamed are kept.
 - A request of the failed rank runs again on a surviving rank if it has not streamed output yet. Otherwise it fails
   with HTTP 503, or an `error` event when streaming, with the error `code` `rank_failure`. Send it again.
-- `GET /health` answers 200 while the deployment serves, also with lost ranks. It answers 503 once the deployment
+- `GET /health` answers 200 while the deployment serves, also with failed ranks. It answers 503 once the deployment
   cannot recover, and the server then shuts down.
-- `GET /fault_tolerance_status` reports the live and lost ranks, the last membership change and the `state`:
+- `GET /fault_tolerance_status` reports the active and failed ranks (`active_ranks`, `failed_ranks`), the membership
+  generation, each rank's incarnation, the last membership change and the `state`:
 
 | State | Meaning |
 | --- | --- |
 | `healthy` | Every rank serves |
-| `degraded` | Some ranks are lost and the rest serve |
+| `degraded` | Some ranks failed and the rest serve |
 | `recovering` | A membership change is in progress and serving pauses |
 | `unprotected` | The authority does not answer, so a further failure is not recovered |
-| `stopped` | The deployment cannot recover |
+| `failed` | The deployment cannot recover |
 
 ## Limitations
 

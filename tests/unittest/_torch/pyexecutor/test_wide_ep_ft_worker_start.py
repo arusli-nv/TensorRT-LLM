@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The start of a WideEP fault-tolerant deployment, with every rank its own process (CPU processes, fake workers).
+"""The start of a Wide-EP fault-tolerant deployment, with every rank its own process (CPU processes, fake workers).
 
 Each process runs the real worker start (``start_worker`` on rank 0, ``worker_node_main`` on the others) and the real
 membership authority, around a fake ``worker_main`` that "loads a model" for a while, then reports that its startup is
@@ -57,11 +57,11 @@ def worker_main(**args):
         print(f"AUTHORITY {recovery._authority.pid}", flush=True)
     time.sleep(load_s)  # the model load
     recovery.wait_for_every_rank()
-    # As the executor takes the membership over: the real handler of a lost authority.
+    # As the executor takes the membership over: the real handler of a failed authority.
     executor = SimpleNamespace(rank=rank, _exit=lambda status, reason: recovery._end_process(rank, status, reason))
-    recovery._agent.bind(
+    recovery._client.bind(
         recovery._on_record_at_startup,
-        on_error=lambda error: recovery.RankFailureRecovery._on_agent_error(executor, error),
+        on_error=lambda error: recovery.RankFailureRecovery._on_client_error(executor, error),
     )
     print(f"SERVING {rank}", flush=True)
     time.sleep(3600)
@@ -99,7 +99,7 @@ class Deployment:
     def start(self, rank, load_s=LOAD_S):
         env = {k: v for k, v in os.environ.items() if not k.startswith(_LAUNCHER_PREFIXES)}
         env.update(
-            TLLM_FAULT_TOLERANCE_JOIN_SECRET="ab" * 32,
+            TLLM_FAULT_TOLERANCE_SHARED_SECRET="ab" * 32,
             TLLM_FAULT_TOLERANCE_RENDEZVOUS=f"127.0.0.1:{self.port}",
             TLLM_FAULT_TOLERANCE_RANK=f"{rank},{self.world},{self.world},0",
             TRT_LLM_NO_LIB_INIT="1",
@@ -203,16 +203,16 @@ def test_every_rank_starts_from_rank_0_s_arguments_and_rank_0_may_start_last():
 
 
 @pytest.mark.timeout(900)
-@pytest.mark.parametrize("lost", [0, 1])
-def test_a_rank_lost_during_the_startup_ends_every_process_at_once(lost):
-    """Not at a timeout: the authority aborts as soon as the lost rank's connection closes."""
+@pytest.mark.parametrize("failed_rank", [0, 1])
+def test_a_rank_failure_during_the_startup_ends_every_process_at_once(failed_rank):
+    """Not at a timeout: the authority aborts as soon as the failed rank's connection closes."""
     with Deployment(3) as ranks:
         for rank in range(3):
             ranks.start(rank)
         ranks.wait_for_all("STARTED", range(3))
         authority = ranks.authority_pid()
-        ranks.processes[lost].kill()
-        others = [rank for rank in range(3) if rank != lost]
+        ranks.processes[failed_rank].kill()
+        others = [rank for rank in range(3) if rank != failed_rank]
         assert set(ranks.statuses_within(others, PROMPT_EXIT_S).values()) == {1}
         assert _process_ended(authority, PROMPT_EXIT_S)
 

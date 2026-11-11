@@ -1246,7 +1246,7 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     async def fault_tolerance_status(self) -> JSONResponse:
-        """Return the WideEP fault-tolerance membership status."""
+        """Return the Wide-EP fault-tolerance membership status."""
         status = await asyncio.to_thread(
             self.generator._executor.fault_tolerance_health.status)
         return JSONResponse(content=status)
@@ -1750,20 +1750,20 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
-    async def _fault_tolerance_stopped(self) -> bool:
-        """Whether WideEP fault tolerance stopped the deployment (False without it).
+    async def _fault_tolerance_failed(self) -> bool:
+        """Whether Wide-EP fault tolerance found that the deployment failed (False without it).
 
-        The deployment stays alive while it lost ranks or changes its
-        membership. The membership store is read off the event loop.
+        The deployment stays alive while some ranks failed or it changes its
+        membership. The rendezvous store is read off the event loop.
         """
         if not wide_ep_fault_tolerance_enabled():
             return False
         status = await asyncio.to_thread(
             self.generator._executor.fault_tolerance_health.status)
-        return status["state"] == "stopped"
+        return status["state"] == "failed"
 
     async def health(self) -> Response:
-        if self._check_health() and not await self._fault_tolerance_stopped():
+        if self._check_health() and not await self._fault_tolerance_failed():
             return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the

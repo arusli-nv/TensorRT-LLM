@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The host collectives over MNNVL memory (``TPHostExchange``, ``MnnvlDist``) of WideEP fault tolerance, over rows
+"""The host collectives over MNNVL memory (``TPHostExchange``, ``MnnvlDist``) of Wide-EP fault tolerance, over rows
 of host memory and fake exchange rounds."""
 
 import ctypes
@@ -26,7 +26,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed import host_exchange, mnnvl_memory
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
+from tensorrt_llm._torch.distributed.host_exchange import (
+    HostExchangeMnnvlMemory,
+    MnnvlDist,
+    TPHostExchange,
+)
 from tensorrt_llm._torch.distributed.host_exchange_epoch import latest_epoch, next_epoch
 from tensorrt_llm.mapping import Mapping
 
@@ -38,11 +42,11 @@ SURVIVORS = 0b1011
 
 def test_int64_gather_gives_absent_ranks_zero_rows_and_votes_skip_them():
     exchange = TPHostExchange.__new__(TPHostExchange)
-    exchange.nranks, exchange.live_mask, exchange._words = WORLD, SURVIVORS, 16
+    exchange.nranks, exchange.active_mask, exchange._words = WORLD, SURVIVORS, 16
     exchange._masks = {}
 
     def one_round(chunk, length, readers, recipients=None, idle=False):
-        """The packets of a round in which every live rank r sent [r, 10 * r]; the absent rank's slot is stale."""
+        """The packets of a round in which every active rank r sent [r, 10 * r]; the absent rank's slot is stale."""
         readers = [r for r in range(WORLD) if readers >> r & 1]
         assert readers == [r for r in range(WORLD) if SURVIVORS >> r & 1]
         packets = np.full((WORLD, 5), 0xDEAD, dtype=np.uint64)
@@ -55,10 +59,10 @@ def test_int64_gather_gives_absent_ranks_zero_rows_and_votes_skip_them():
     dist = MnnvlDist.__new__(MnnvlDist)
     dist.mapping = SimpleNamespace(tp_size=WORLD)
     dist._host_exchange = exchange
-    dist._live_rows_index = (None, None)
+    dist._active_rows_index = (None, None)
     gathered = dist.tp_allgather_int64([0, 0])
     assert gathered.tolist() == [[0, 0], [1, 10], [0, 0], [3, 30]]
-    assert dist.tp_live_rows(gathered).tolist() == [[0, 0], [1, 10], [3, 30]]
+    assert dist.tp_active_rows(gathered).tolist() == [[0, 0], [1, 10], [3, 30]]
     dist._exchange = lambda obj, readers=None, bound=None: [1, 2, None, 4]
     assert dist.allreduce(1) == 7
 
@@ -76,7 +80,7 @@ def test_mnnvl_dist_needs_fabric_handles(monkeypatch, fabric):
     )
     monkeypatch.setattr(mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
     monkeypatch.setattr(
-        MnnvlRows,
+        HostExchangeMnnvlMemory,
         "get_allocation_prop",
         classmethod(lambda cls, dev_id: SimpleNamespace(requestedHandleTypes=handle_type)),
     )
@@ -126,8 +130,8 @@ class _HostCopies:
 
 
 class _HostRows:
-    """MnnvlRows in host memory as rank ``rank`` maps them: every rank's row at ``ptr + r * stride``, in ``memory``,
-    which the views of every rank share."""
+    """HostExchangeMnnvlMemory in host memory as rank ``rank`` maps it: every rank's row at ``ptr + r * stride``,
+    in ``memory``, which the views of every rank share."""
 
     def __init__(self, memory, stride, rank):
         self._memory, self.stride, self.rank = memory, stride, rank
@@ -359,7 +363,7 @@ def test_a_change_that_loses_no_process_gives_every_rank_the_same_results(host_e
     def change(rank, exchange):  # the membership change, from READY to the commit
         stopped[rank] = exchange.stopped_epoch
         transaction.wait()
-        # Every process that maps the rows is live: they keep their pages.
+        # Every process that maps the rows is active: they keep their pages.
         exchange.install(None, 0b11, next_epoch(latest_epoch(list(stopped.values()))), frozenset())
         seen[rank] = False
         transaction.wait()
@@ -395,8 +399,8 @@ def test_a_change_that_loses_no_process_gives_every_rank_the_same_results(host_e
 
 
 @pytest.mark.timeout(60)
-def test_a_wait_for_a_lost_rank_stops_for_the_change(monkeypatch):
-    """Rank 2 is lost before it sends: ranks 0 and 1 spin in their wait for it (the executor has work) until the
+def test_a_wait_for_a_failed_rank_stops_for_the_change(monkeypatch):
+    """Rank 2 fails before it sends: ranks 0 and 1 spin in their wait for it (the executor has work) until the
     change that drops it reaches them. They stop there, install it, and the round runs again without rank 2."""
     exchanges = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)
     survivors = 0b011
@@ -427,12 +431,12 @@ def test_a_wait_for_a_lost_rank_stops_for_the_change(monkeypatch):
 
 
 def test_a_joining_rank_installs_the_rows_without_entering_the_exchange(monkeypatch):
-    """A joining rank, in no round, maps the rows at INSTALL with the live ranks and continues with them from the
+    """A joining rank, in no round, maps the rows at INSTALL with the active ranks and continues with them from the
     record's epoch; it enters the exchange only when admitted."""
     joining = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)[2]
     joining.rows._memory[:] = 1
     joining.install(None, 0b011, 7, frozenset(range(3)))
-    assert joining.live_mask == 0b011 and joining.epoch == 6
+    assert joining.active_mask == 0b011 and joining.epoch == 6
     row = joining.rows._memory[2 * joining.rows.stride : 3 * joining.rows.stride]
     assert not row.any()
 
@@ -445,11 +449,11 @@ def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
     poll and payloads of several rounds that go only to their readers. Then it is admitted again."""
     nranks = 4
     exchanges = _host_exchange_group(monkeypatch, nranks, _LONG_SLOT_BYTES)
-    live = ((1 << nranks) - 1) & ~(1 << absent)
-    live_ranks = [r for r in range(nranks) if live >> r & 1]
+    active = ((1 << nranks) - 1) & ~(1 << absent)
+    active_ranks = [r for r in range(nranks) if active >> r & 1]
     for exchange in exchanges:
         if exchange.rank != absent:
-            exchange.admit(live, next_epoch(exchange.epoch))
+            exchange.admit(active, next_epoch(exchange.epoch))
     payloads = (
         lambda r: {"rank": r},
         lambda r: bytes([r]) * (2 * _LONG_SLOT_BYTES + 100 * r),
@@ -459,7 +463,7 @@ def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
         dist = MnnvlDist.__new__(MnnvlDist)
         dist.mapping = SimpleNamespace(tp_rank=exchange.rank, tp_size=nranks)
         dist._host_exchange = exchange
-        dist._live_rows_index = (None, None)
+        dist._active_rows_index = (None, None)
         return dist
 
     def collectives(exchange):
@@ -468,19 +472,19 @@ def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
             expected = [payload(r) if r != absent else None for r in range(nranks)]
             assert dist.allgather(payload(rank)) == expected
             assert dist.tp_gather(payload(rank), root=0) == (expected if rank == 0 else None)
-            for root in live_ranks:
+            for root in active_ranks:
                 assert dist.broadcast(payload(rank), root=root) == payload(root)
             assert dist.broadcast_or_none(payload(rank) if rank == 0 else None) == payload(0)
             assert dist.broadcast_or_none(None) is None
-        assert dist.allreduce(rank + 1) == sum(r + 1 for r in live_ranks)
+        assert dist.allreduce(rank + 1) == sum(r + 1 for r in active_ranks)
         for n in (3, _LONG_SLOT_BYTES // 8 + 5):
             gathered = dist.tp_allgather_int64(np.full(n, rank + 1))
             assert gathered.tolist() == [[r + 1 if r != absent else 0] * n for r in range(nranks)]
-            assert dist.tp_live_rows(gathered).tolist() == [[r + 1] * n for r in live_ranks]
+            assert dist.tp_active_rows(gathered).tolist() == [[r + 1] * n for r in active_ranks]
         assert dist.broadcast_int64([7, rank], root=0).tolist() == [7, 0]
         dist.barrier()
 
-    _run_ranks([exchanges[r] for r in live_ranks], [collectives] * len(live_ranks))
+    _run_ranks([exchanges[r] for r in active_ranks], [collectives] * len(active_ranks))
     epoch = next_epoch(max(exchange.epoch for exchange in exchanges))
     for exchange in exchanges:
         exchange.admit((1 << nranks) - 1, epoch)

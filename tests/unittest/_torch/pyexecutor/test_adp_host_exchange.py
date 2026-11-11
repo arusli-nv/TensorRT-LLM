@@ -57,7 +57,7 @@ class _LockstepDist:
                 dist.barrier.wait()
                 return np.array(rows, dtype=np.int64)
 
-            def tp_live_rows(self, rows):
+            def tp_active_rows(self, rows):
                 return rows
 
         return _Proxy()
@@ -219,7 +219,7 @@ def test_can_queue_gathers_only_the_batch_size():
         cp_size=1,
         tp_rank=0,
         tp_cp_allgather_int64=Mock(return_value=np.array([[2], [0]])),
-        tp_live_rows=lambda rows: rows,
+        tp_active_rows=lambda rows: rows,
     )
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
@@ -240,7 +240,7 @@ def test_a_rank_that_holds_its_steps_votes_with_an_empty_batch():
         cp_size=1,
         tp_rank=0,
         tp_cp_allgather_int64=Mock(),
-        tp_live_rows=lambda rows: rows,
+        tp_active_rows=lambda rows: rows,
     )
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
@@ -264,7 +264,7 @@ def test_can_queue_this_rank_is_shared_by_the_cp_peers_of_a_dp_rank(batch_size):
         cp_size=2,
         tp_rank=0,
         tp_cp_allgather_int64=Mock(return_value=np.array([[1], [0]])),
-        tp_live_rows=lambda rows: rows,
+        tp_active_rows=lambda rows: rows,
     )
 
     can_queue, this_rank = PyExecutor._can_queue(

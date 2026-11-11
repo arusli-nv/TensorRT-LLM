@@ -309,7 +309,7 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
     def remap(
         self, gather: Callable[[object], Sequence[object]], fresh_rows: frozenset[int]
     ) -> None:
-        """Map the workspace among the live ranks at the same addresses, ``fresh_rows`` on fresh pages.
+        """Map the workspace among the active ranks at the same addresses, ``fresh_rows`` on fresh pages.
 
         The watchdog stops meanwhile, because its flag reads would fault on a released page.
         """

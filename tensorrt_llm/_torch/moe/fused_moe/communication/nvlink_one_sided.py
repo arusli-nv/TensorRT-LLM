@@ -145,7 +145,7 @@ def select_cft_counted_writes(force_cft: bool | None) -> bool:
     """Resolve CFT availability identically for workspace sizing and construction."""
     if force_cft is not True and wide_ep_fault_tolerance_enabled():
         tllm_logger.warning_once(
-            "CFT counted writes disabled: WideEP rank failure recovery runs on the fence path.",
+            "CFT counted writes disabled: Wide-EP fault tolerance runs on the fence path.",
             key="moe_a2a_cft_rank_failure_recovery",
         )
         return False
@@ -628,7 +628,7 @@ class NVLinkOneSided(Communication):
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            # A replacement rank maps only its own row; its admission remaps the workspace among the live ranks.
+            # A replacement rank maps only its own row; its admission remaps the workspace among the active ranks.
             if (
                 ep_group_health is not None
                 and ep_group_health.snapshot().generation
@@ -761,7 +761,7 @@ class NVLinkOneSided(Communication):
         self.invalid_token_expert_id: int = -1
 
     def bind_execution_state(self, state: "MoeExecutionState") -> None:
-        """Run every later dispatch and combine with the state's rank-mask and abort records.
+        """Run every later dispatch and combine with the state's rank-mask and abort states.
 
         CUDA graphs captured afterwards stay valid when the state installs a new rank mask or requests an abort.
         """
@@ -1092,7 +1092,7 @@ class NVLinkOneSided(Communication):
                 **self._abort_state_kwargs,
             )
         )
-        # Replayed CUDA graphs skip the host watchdog, so bound execution relies on the abort record.
+        # Replayed CUDA graphs skip the host watchdog, so bound execution relies on the abort state.
         if not self._bound:
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "dispatch", active_rank_mask_snapshot.active_rank_mask

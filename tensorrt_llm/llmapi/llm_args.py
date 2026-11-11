@@ -7963,7 +7963,7 @@ class TorchLlmArgs(BaseLlmArgs):
              "restore its beams"),
             (not self.disable_overlap_scheduler,
              "the overlap scheduler (disable_overlap_scheduler=False), "
-             "because rank failure recovery accepts or discards each step "
+             "because Wide-EP fault tolerance accepts or discards each step "
              "when the next one starts, which only the overlap scheduler's "
              "executor loop does yet"),
             (load_balancer is not None,

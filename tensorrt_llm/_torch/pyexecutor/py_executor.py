@@ -5183,7 +5183,7 @@ class PyExecutor:
             else:
                 batch_sizes = recovery.forward_vote(
                     scheduled_batch.batch_size, self.dist.tp_cp_allgather_int64)
-            can_queue = bool(self.dist.tp_live_rows(batch_sizes).all())
+            can_queue = bool(self.dist.tp_active_rows(batch_sizes).all())
             # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
             # together whether to defer the previous batch.
             cp_rows = batch_sizes.reshape(-1, self.dist.cp_size)
@@ -8752,7 +8752,7 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_live_rows(
+        responses_list = self.dist.tp_active_rows(
             self.dist.tp_allgather_int64([
                 num_scheduled_context_requests,
                 num_scheduled_generation_requests, num_scheduled_tokens,

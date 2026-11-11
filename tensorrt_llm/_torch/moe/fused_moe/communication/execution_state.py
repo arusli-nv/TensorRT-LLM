@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Rank-mask and abort records of the MoE All-to-All collectives of one model."""
+"""Rank-mask and abort states of the MoE All-to-All collectives of one model."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _require_active(mask_words: tuple[int, ...], ep_rank: int) -> None:
 
 
 class MembershipWorkspace(Protocol):
-    """Peer-writable memory that a membership change remaps among the live ranks at the same addresses."""
+    """Peer-writable memory that a membership change remaps among the active ranks at the same addresses."""
 
     @property
     def device_bytes(self) -> int:
@@ -37,7 +37,7 @@ class MembershipWorkspace(Protocol):
         """Return the global ranks whose rows need fresh pages."""
 
     def remap(self, gather: Callable[[Any], Sequence[Any]], fresh_rows: frozenset[int]) -> None:
-        """Map the workspace among the live ranks with ``fresh_rows`` on fresh pages."""
+        """Map the workspace among the active ranks with ``fresh_rows`` on fresh pages."""
 
 
 class BindableCommunication(Protocol):
@@ -54,7 +54,7 @@ _shared_states: weakref.WeakValueDictionary[int, MoeExecutionState] = weakref.We
 
 
 class MoeExecutionState:
-    """Own the rank mask and abort records that rank-mask NVLinkOneSided kernels read at execution time.
+    """Own the rank mask and abort states that rank-mask NVLinkOneSided kernels read at execution time.
 
     Both records are only edited in place, so captured CUDA graphs keep running.
     """
@@ -72,7 +72,7 @@ class MoeExecutionState:
                 pin_memory=prefer_pinned(),
             )
             if not self.abort.is_pinned():
-                raise RuntimeError("The MoE All-to-All abort record requires pinned host memory")
+                raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
             self._abort_words = self.abort.numpy()[_ABORT_WORDS]
         self._mask_words = ep_group_health.get_mask_words()
         self._mask_generation: int | None = None
@@ -112,7 +112,7 @@ class MoeExecutionState:
             if not hasattr(comm, "bind_execution_state"):
                 uses = "no communication strategy" if comm is None else type(comm).__name__
                 raise ValueError(
-                    "WideEP fault tolerance requires MoE communication that survives a lost rank (a strategy "
+                    "Wide-EP fault tolerance requires MoE communication that survives a failed rank (a strategy "
                     f"with bind_execution_state, such as NVLinkOneSided), but MoE layer {name} "
                     f"({type(layer).__name__}) uses {uses}; turn it off (enable_wide_ep_fault_tolerance=False) "
                     "or select NVLinkOneSided (TRTLLM_FORCE_COMM_METHOD=NVLINK_ONE_SIDED) with a MoE backend "
@@ -121,13 +121,13 @@ class MoeExecutionState:
             comms[id(comm)] = comm
         if not comms:
             raise ValueError(
-                "WideEP fault tolerance requires a model with MoE layers; turn it off "
+                "Wide-EP fault tolerance requires a model with MoE layers; turn it off "
                 "(enable_wide_ep_fault_tolerance=False)"
             )
         healths = {id(comm.ep_group_health) for comm in comms.values()}
         if len(healths) != 1 or next(iter(comms.values())).ep_group_health is None:
             raise ValueError(
-                "WideEP fault tolerance requires the communication of every MoE layer in rank-mask mode on "
+                "Wide-EP fault tolerance requires the communication of every MoE layer in rank-mask mode on "
                 "one shared EPGroupHealth: create the communication of every MoE layer with the communication "
                 "factory from the model's ModelConfig, which shares one EPGroupHealth through its extra_attrs "
                 "(get_wide_ep_ft_options); or turn it off (enable_wide_ep_fault_tolerance=False)"
@@ -170,12 +170,12 @@ class MoeExecutionState:
     def track_layer(self, ep_rank: int, reset_state: Callable[[], None]) -> None:
         """Record a bound layer's EP rank and the reset of its dispatch/combine state machine."""
         if self.abort is None:
-            raise RuntimeError("A MoeExecutionState without an abort record binds no layer")
+            raise RuntimeError("A MoeExecutionState without an abort state binds no layer")
         _require_active(self._mask_words, ep_rank)
         self._layers.append((ep_rank, reset_state))
 
     def rearm(self) -> None:
-        """Clear the abort record and reset every bound workspace and layer to its first round."""
+        """Clear the abort state and reset every bound workspace and layer to its first round."""
         torch.cuda.synchronize(self.active_rank_mask.device)
         self.abort.zero_()
         for _, reset in self._workspaces.values():
@@ -224,9 +224,7 @@ class MoeExecutionState:
         """Publish the committed EP membership to the kernels. Only call while the model is idle."""
         torch.cuda.synchronize(self.active_rank_mask.device)
         if self.aborted():
-            raise RuntimeError(
-                f"MoE All-to-All abort record is {self.abort[_ABORT_WORDS].tolist()}"
-            )
+            raise RuntimeError(f"MoE All-to-All abort state is {self.abort[_ABORT_WORDS].tolist()}")
         words = self.health.get_mask_words()
         for ep_rank, _ in self._layers:
             _require_active(words, ep_rank)

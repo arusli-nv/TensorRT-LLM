@@ -651,7 +651,7 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
         # An explicit count above one is rejected, so this one has no override.
         logger.warning(
             f"num_serve_frontends defaults to {num_frontends} for the OpenAI "
-            "HTTP server only; running 1 frontend because WideEP fault "
+            "HTTP server only; running 1 frontend because Wide-EP fault "
             "tolerance (enable_wide_ep_fault_tolerance) does not support more "
             "yet: the frontends that attach to the executor do not follow its "
             "membership.")

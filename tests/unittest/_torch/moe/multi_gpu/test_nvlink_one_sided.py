@@ -1025,12 +1025,12 @@ def _run_bind_layers_worker(failed_rank: int | None) -> dict:
         if not ok:
             errors.append(f"rank {rank}: {what}")
 
-    def inputs(source: int, count: int, seed: int, live: list[int]) -> tuple[torch.Tensor, ...]:
+    def inputs(source: int, count: int, seed: int, active: list[int]) -> tuple[torch.Tensor, ...]:
         """Source's (slots, weights, fp4, fp4_sf, x); every rank can rebuild every source's."""
         generator = torch.Generator().manual_seed(seed * ep_size + source)
-        # Each token goes to one live rank, both of its slots there, so each combined row is one rank's output.
+        # Each token goes to one active rank, both of its slots there, so each combined row is one rank's output.
         token = torch.arange(count)[:, None]
-        owner = torch.tensor(live)[(token + source) % len(live)]
+        owner = torch.tensor(active)[(token + source) % len(active)]
         slots = owner * slots_per_rank + torch.arange(top_k)
         weights = torch.rand(count, top_k, generator=generator)
         fp4 = torch.randint(0, 256, (count, hidden // 2), generator=generator, dtype=torch.uint8)
@@ -1048,10 +1048,10 @@ def _run_bind_layers_worker(failed_rank: int | None) -> dict:
         ("bf16", lambda source: (source[4], None), lambda recv: recv[0] * 2),
     ]
 
-    def round_trips(counts: list[int], seed: int, live: list[int]) -> None:
-        if rank not in live:
+    def round_trips(counts: list[int], seed: int, active: list[int]) -> None:
+        if rank not in active:
             return
-        sources = [inputs(s, counts[s], seed, live) for s in range(ep_size)]
+        sources = [inputs(s, counts[s], seed, active) for s in range(ep_size)]
         slots, weights = sources[rank][:2]
         rows = max(counts)
         for comm, (name, payloads, expert) in zip(comms, layers):
@@ -1067,7 +1067,7 @@ def _run_bind_layers_worker(failed_rank: int | None) -> dict:
             ids, scales = (t.view(ep_size, rows, top_k) for t in recv[2:])
             data = [t.view(ep_size, rows, -1) for t in recv[:2] if t is not None]
             for s, source in enumerate(sources):
-                if s not in live:
+                if s not in active:
                     # Its rows from earlier rounds are stale: the masked source routes none of them.
                     check(bool((ids[s] == -1).all()), f"{name} rows of the failed rank {s} routed")
                     continue
@@ -1122,16 +1122,16 @@ def _run_bind_layers_worker(failed_rank: int | None) -> dict:
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
         if failed_rank is not None:
-            # The failed rank's rows of the earlier rounds stay in the live ranks' receive buffers.
-            live = [r for r in everyone if r != failed_rank]
+            # The failed rank's rows of the earlier rounds stay in the active ranks' receive buffers.
+            active = [r for r in everyone if r != failed_rank]
             health.mark_failed(failed_rank)
-            if rank in live:
+            if rank in active:
                 state.rearm()
             MPI.COMM_WORLD.Barrier()
-            if rank in live:
+            if rank in active:
                 state.install_mask()
             for seed, counts in ((4, full), (5, short)):
-                round_trips([c if r in live else 0 for r, c in enumerate(counts)], seed, live)
+                round_trips([c if r in active else 0 for r, c in enumerate(counts)], seed, active)
             torch.cuda.synchronize()
             MPI.COMM_WORLD.Barrier()
         return {"rank": rank, "errors": errors}
@@ -1147,7 +1147,7 @@ def test_bound_layers_of_two_signatures_round_trip_on_one_workspace(
     """Bound layers with an NVFP4 and a BF16 payload signature share one workspace, and bound dispatch + combine
     of both return exact results, before and after a rearm.
 
-    With a failed middle rank, the live ranks' rows land at s * rows + i with exact values, the failed rank's rows
+    With a failed middle rank, the active ranks' rows land at s * rows + i with exact values, the failed rank's rows
     carry expert -1, and combine returns exact results without it."""
     if torch.cuda.device_count() < ep_size:
         pytest.skip(f"requires {ep_size} GPUs")
@@ -1206,7 +1206,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str) -> di
         ep_group_health=health,
     )
     everyone = list(range(ep_size))
-    live = [r for r in everyone if r != failed_rank]
+    active = [r for r in everyone if r != failed_rank]
     errors = []
 
     def check(ok: bool, what: str) -> None:
@@ -1265,28 +1265,28 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str) -> di
             start = time.monotonic()
             torch.cuda.synchronize()
             check(time.monotonic() - start < 10, "the abort did not release the waiting collective")
-            check(state.abort[:2].tolist() == [1, 1], f"abort record {state.abort[:2].tolist()}")
+            check(state.abort[:2].tolist() == [1, 1], f"abort state {state.abort[:2].tolist()}")
             check(
                 int(torch.count_nonzero(state.abort[evidence:])) == 0,
                 "wait evidence left after the abort",
             )
-            # A combine cut short outputs zeros. After a dispatch cut short, the combine takes this rank's own rows
+            # An incomplete combine outputs zeros. After an incomplete dispatch, the combine takes this rank's own rows
             # only: the tokens it routed to itself come back, the others are zero.
             expected = torch.zeros_like(x)
             if stop_before == "dispatch":
                 own = torch.arange(capacity, device=x.device) % ep_size == rank
                 expected[own] = x[own]
-            check(torch.equal(combined, expected), "the cut-short round combined wrong")
+            check(torch.equal(combined, expected), "the incomplete round combined wrong")
         MPI.COMM_WORLD.Barrier()
 
         health.mark_failed(failed_rank)
-        if rank in live:
+        if rank in active:
             state.rearm()
         MPI.COMM_WORLD.Barrier()
-        if rank in live:
+        if rank in active:
             state.install_mask()
             for seed in (2, 3):
-                x, combined = round_trip(live, seed)
+                x, combined = round_trip(active, seed)
                 check(
                     torch.equal(combined, x),
                     f"round {seed} without rank {failed_rank} combined wrong",
@@ -1303,7 +1303,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str) -> di
 def test_abort_releases_bound_collectives_waiting_on_a_stopped_rank(stop_before: str) -> None:
     """A bound dispatch or combine waiting on a rank that stopped publishes wait evidence on it and returns on an abort
     request with a cancelled status; the round combines only the rows each rank routed to itself (none once the combine
-    is cut short), and the surviving ranks round-trip exactly after rearming and installing the membership without
+    is left incomplete), and the surviving ranks round-trip exactly after rearming and installing the membership without
     it."""
     ep_size, failed_rank = 4, 2
     if torch.cuda.device_count() < ep_size:

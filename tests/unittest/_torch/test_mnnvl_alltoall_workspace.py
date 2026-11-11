@@ -107,7 +107,9 @@ def _register_without_watchdog(
     )
 
 
-def test_remap_maps_the_workspace_among_the_live_ranks_with_the_rows_asked_on_fresh_pages() -> None:
+def test_remap_maps_the_workspace_among_the_active_ranks_with_the_rows_asked_on_fresh_pages() -> (
+    None
+):
     """The remap keeps the workspace's addresses; this rank's part is reset later, by the execution state's rearm."""
     lifecycle, memory, _ = _make_lifecycle()
     memory.reset_mock()
@@ -852,7 +854,7 @@ def test_one_sided_workspace_ranks_meet_over_the_allocation_group(
     monkeypatch: pytest.MonkeyPatch, rank_mask: bool
 ) -> None:
     """In rank-mask mode the ranks meet after the workspace's initialization over the allocation's group, not over C++'s
-    MPI session, of which each rank is the only member under WideEP fault tolerance; without a rank mask the
+    MPI session, of which each rank is the only member under Wide-EP fault tolerance; without a rank mask the
     initialization op synchronizes the ranks itself."""
     group = _FakeComm()
 

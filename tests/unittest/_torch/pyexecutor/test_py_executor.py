@@ -2104,7 +2104,7 @@ def test_kv_pool_rebalance_raises_the_adjust_error_without_resuming():
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_kv_pool_resize_runs_with_every_cache_suspended(fails):
-    """The resize WideEP fault tolerance gives the KV cache pool to restored experts runs in main's suspend/resume
+    """The resize Wide-EP fault tolerance gives the KV cache pool to restored experts runs in main's suspend/resume
     of a rebalance, which reads the capacity again; a resize that raises (a peer lost during the remap it includes)
     leaves nothing suspended."""
 
@@ -3390,7 +3390,7 @@ class _StubADPExecutor:
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
         self.dist.tp_allgather.side_effect = lambda value: [value]
-        self.dist.tp_live_rows.side_effect = lambda rows: rows
+        self.dist.tp_active_rows.side_effect = lambda rows: rows
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
         self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
 
@@ -5063,7 +5063,7 @@ class TestAdpBalanceExcludesPadDummies:
         executor.dist.tp_allgather_int64 = Mock(
             return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
         )
-        executor.dist.tp_live_rows = lambda rows: rows
+        executor.dist.tp_active_rows = lambda rows: rows
         executor.max_batch_size = 64
         executor.attention_dp_enable_balance = True
         executor.attention_dp_time_out_iters = 60

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Source checks of what WideEP fault tolerance relies on in shared code.
+"""Source checks of what Wide-EP fault tolerance relies on in shared code.
 
 A change to shared code can break fault tolerance (``enable_wide_ep_fault_tolerance``) without failing any test of
 its own: a host collective that ``MnnvlDist`` does not take over, a vote over a gather that counts failed ranks, a
@@ -266,7 +266,7 @@ _REMOTE_TAIL = (
 _DSPARK = "DSpark, rejected with fault tolerance"
 _KV_CONNECTOR = "KV cache connectors, rejected with fault tolerance"
 _WARMUP = f"{TORCH}/pyexecutor/engine/runners/decoder/warmup.py"
-# The functions that vote over such a gather without Distributed.tp_live_rows: (votes, why that is right).
+# The functions that vote over such a gather without Distributed.tp_active_rows: (votes, why that is right).
 RAW_GATHER_VOTES = {
     f"{TORCH}/distributed/ll_exchange.py::_PeerBuffers.create": (
         1,
@@ -321,11 +321,11 @@ def _vote_operand(call: ast.Call):
 
 
 def _uses_raw_gather(expr: ast.AST, names: set) -> bool:
-    """Whether ``expr`` reads a gather, or one of ``names``, outside a ``tp_live_rows`` call."""
+    """Whether ``expr`` reads a gather, or one of ``names``, outside a ``tp_active_rows`` call."""
     stack = [expr]
     while stack:
         node = stack.pop()
-        if isinstance(node, ast.Call) and _call_name(node) == "tp_live_rows":
+        if isinstance(node, ast.Call) and _call_name(node) == "tp_active_rows":
             continue
         if (isinstance(node, ast.Call) and _call_name(node) in GATHERS) or (
             isinstance(node, ast.Name) and node.id in names
@@ -354,10 +354,10 @@ def _raw_gather_votes(function: ast.AST) -> int:
 
 
 def test_votes_over_gathers_take_active_rank_rows():
-    """An ``all`` vote over a TP gather reduces over ``Distributed.tp_live_rows(rows)``.
+    """An ``all`` vote over a TP gather reduces over ``Distributed.tp_active_rows(rows)``.
 
     Under fault tolerance a failed rank's None or zero row is a "no" in a vote over the raw gather;
-    ``tp_live_rows`` keeps the rows of the active ranks (every row without fault tolerance).
+    ``tp_active_rows`` keeps the rows of the active ranks (every row without fault tolerance).
     """
     found = {}
     for path in _sources(TORCH, "tensorrt_llm/executor"):
@@ -368,7 +368,7 @@ def test_votes_over_gathers_take_active_rank_rows():
         found,
         RAW_GATHER_VOTES,
         "RAW_GATHER_VOTES",
-        "vote over dist.tp_live_rows(rows), or list the votes with why an absent rank cannot decide them",
+        "vote over dist.tp_active_rows(rows), or list the votes with why an absent rank cannot decide them",
     )
     assert not problems, "\n".join(problems)
 

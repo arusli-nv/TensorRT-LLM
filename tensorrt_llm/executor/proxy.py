@@ -1091,8 +1091,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                     wrap_worker_startup_error("Executor worker returned error",
                                               info), ready_signal)
         if len(status) > 3:
-            # WideEP fault tolerance: READY also carries the address of the
-            # membership store.
+            # Wide-EP fault tolerance: READY also carries the address of the
+            # rendezvous store.
             self._join_membership(status[2], status[3])
 
         # Register the fast-death callback only after the world reported
@@ -1107,16 +1107,16 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _join_membership(self, worker_process_identities: list,
                          address: str) -> None:
-        """Follow the membership store at ``address`` and watch rank 0's worker.
+        """Follow the rendezvous store at ``address`` and watch rank 0's worker.
 
         Rank 0 hosts the authority, so its death ends the server. The authority
         handles the death of any other rank.
         """
-        from tensorrt_llm._torch.distributed.membership import JOIN_SECRET_ENV
+        from tensorrt_llm._torch.distributed.membership import SHARED_SECRET_ENV
         from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
             FaultToleranceHealth
         self.fault_tolerance_health = FaultToleranceHealth(
-            address, bytes.fromhex(os.environ[JOIN_SECRET_ENV]))
+            address, bytes.fromhex(os.environ[SHARED_SECRET_ENV]))
         self._worker_process_monitor.register([
             identity for identity in worker_process_identities
             if identity.rank == 0

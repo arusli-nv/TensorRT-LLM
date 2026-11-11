@@ -524,7 +524,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         from tensorrt_llm.bindings.internal import runtime as _tbr
         native_balancer = _tbr.MoeLoadBalancer
 
-        # Only the native balancer recovers: this single process is not a WideEP job.
+        # Only the native balancer recovers: this single process is not a Wide-EP job.
         def native(*args, **kwargs):
             return native_balancer(*args, rank_failure_recovery=True)
 
@@ -720,8 +720,8 @@ def _skip_without_gdrcopy_slots():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_online_eplb_loads_slots_whose_spare_slot_maps_no_memory(monkeypatch):
-    """With WideEP fault tolerance, online EPLB moves experts between the active slots with CPU copies from the
-    host weights, as without spare slots; the spare slots map no memory and stay empty while every rank is live."""
+    """With Wide-EP fault tolerance, online EPLB moves experts between the active slots with CPU copies from the
+    host weights, as without spare slots; the spare slots map no memory and stay empty while every rank is active."""
     from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as mlb
 
     _skip_without_gdrcopy_slots()
@@ -795,7 +795,7 @@ def test_online_eplb_loads_slots_whose_spare_slot_maps_no_memory(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("layer_updates_per_iter", [0, 1],
                          ids=["static", "online"])
-def test_a_lost_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
+def test_a_failed_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
         monkeypatch, layer_updates_per_iter):
     """Rank 0 of two in one process. Rank 1 fails: its expert 3 moves into rank 0's first spare slot, which gets
     device memory of its own and the expert's exact host weights, and routing reaches it there; the other spare slots
@@ -1081,7 +1081,7 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
                          ids=["meta_init", "regular_init"])
 def test_spare_slots_take_no_device_memory_while_the_weights_load(
         monkeypatch, meta_init):
-    """With WideEP fault tolerance the slot tensors are created with their spare slots unbacked and the loaders
+    """With Wide-EP fault tolerance the slot tensors are created with their spare slots unbacked and the loaders
     skip those slots, so loading a layer takes the device memory it takes without fault tolerance, at its peak
     and after it: within one VMM chunk per unbacked slot tensor and the scratch chunk of the process."""
     torch.cuda.set_device(0)

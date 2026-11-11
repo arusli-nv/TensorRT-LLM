@@ -31,7 +31,11 @@ from mpi4py import MPI
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import host_exchange
 from tensorrt_llm._torch.distributed.communicator import MPIDist, ReduceOp
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
+from tensorrt_llm._torch.distributed.host_exchange import (
+    HostExchangeMnnvlMemory,
+    MnnvlDist,
+    TPHostExchange,
+)
 from tensorrt_llm._torch.distributed.host_exchange_epoch import latest_epoch, next_epoch
 from tensorrt_llm.mapping import Mapping
 
@@ -80,8 +84,8 @@ def _collectives(tp):
         mnnvl.broadcast_int64(values, root=1), mpi.broadcast_int64(values, root=1)
     )
     gathered = mnnvl.tp_allgather_int64(values)
-    # With every rank live, the gather itself (no copy).
-    assert mnnvl.tp_live_rows(gathered) is gathered
+    # With every rank active, the gather itself (no copy).
+    assert mnnvl.tp_active_rows(gathered) is gathered
     mnnvl.barrier()
 
     # A round whose payloads fit the header poll's copy waits once.
@@ -116,7 +120,7 @@ def _collectives(tp):
 
 def _absent(tp):
     """Every collective with the last rank absent: object gathers return None in its place, reductions skip it,
-    int64 gathers give it a zero row that ``tp_live_rows`` drops. MPI stands in for the membership transaction."""
+    int64 gathers give it a zero row that ``tp_active_rows`` drops. MPI stands in for the membership transaction."""
     mnnvl, mpi, rank = _dists(tp)
     leaver = tp - 1
     exchange = mnnvl.host_exchange
@@ -159,7 +163,7 @@ def _absent(tp):
                 gathered, [np.full(n, r + 1 if r != leaver else 0) for r in range(tp)]
             ), n
             assert np.array_equal(
-                mnnvl.tp_live_rows(gathered), [np.full(n, r + 1) for r in range(tp - 1)]
+                mnnvl.tp_active_rows(gathered), [np.full(n, r + 1) for r in range(tp - 1)]
             )
         assert np.array_equal(mnnvl.broadcast_int64([7, rank], root=0), [7, 0])
         mnnvl.barrier()
@@ -168,7 +172,7 @@ def _absent(tp):
     _rebuild(exchange, gather_handles, (1 << tp) - 1, epoch)
     mpi.barrier()
     gathered = mnnvl.tp_allgather_int64([rank + 1])
-    assert np.array_equal(mnnvl.tp_live_rows(gathered), [[r + 1] for r in range(tp)])
+    assert np.array_equal(mnnvl.tp_active_rows(gathered), [[r + 1] for r in range(tp)])
 
 
 def _stress(tp):
@@ -249,7 +253,7 @@ def _membership(tp):
             r + 1 for r in range(tp) if r != leaver
         )
 
-    # The admission: every live rank maps fresh rows at INSTALL (the rank that left still maps the rows it mapped
+    # The admission: every active rank maps fresh rows at INSTALL (the rank that left still maps the rows it mapped
     # before), the joining rank's included, which the others keep writing into until it enters the exchange where
     # they resume.
     all_ranks = (1 << tp) - 1
@@ -261,11 +265,11 @@ def _membership(tp):
     assert mnnvl.allgather(rank) == list(range(tp))
 
 
-def _rebuild(exchange, gather, live_mask, epoch):
+def _rebuild(exchange, gather, active_mask, epoch):
     """Map the host exchange's rows among the ranks ``gather`` reaches, as an INSTALL does, then continue with the
-    ranks in ``live_mask`` from ``epoch``, outside any round."""
+    ranks in ``active_mask`` from ``epoch``, outside any round."""
     exchange.rows.remap(gather, exchange.rows.stale_rows(gather))
-    exchange.admit(live_mask, epoch)
+    exchange.admit(active_mask, epoch)
 
 
 def _skip_rebuild(gather_handles):
@@ -292,8 +296,10 @@ def _admission(tp):
         _skip_rebuild(mpi.allgather)
         exchange.rows.close()
         slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
-        isolated = StoreGroup(None, "rows", rank, range(tp), live=[rank])
-        rows = MnnvlRows(rank, tp, TPHostExchange.buffer_bytes(tp, slot), isolated.allgather)
+        isolated = StoreGroup(None, "rows", rank, range(tp), active=[rank])
+        rows = HostExchangeMnnvlMemory(
+            rank, tp, TPHostExchange.buffer_bytes(tp, slot), isolated.allgather
+        )
         exchange = mnnvl._host_exchange = TPHostExchange(rank, tp, rows, slot)
     else:
         _rebuild(exchange, mpi.allgather, survivors, epoch)

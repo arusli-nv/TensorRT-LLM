@@ -170,7 +170,7 @@ inline uint64_t const* resolveActiveRankMask(
     return static_cast<uint64_t const*>(t.const_data_ptr());
 }
 
-// The kernels read the pinned host abort record through unified virtual addressing.
+// The kernels read the pinned host abort state through unified virtual addressing.
 inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torch::optional<torch::Tensor> const& abort)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2AAbortState;

@@ -337,7 +337,7 @@ def test_cutlass_moe_public_activation_ids(
 
 
 def test_cutlass_moe_tunes_only_the_active_slots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Spare EPLB slots receive no tokens while every rank is live. Given the active slots as its
+    """Spare EPLB slots receive no tokens while every rank is active. Given the active slots as its
     tuner layout, the op profiles their weights only, finds the tactics again at runtime, and the
     kernel over every slot runs with them, also once experts restored after a failure fill the
     spare slots."""

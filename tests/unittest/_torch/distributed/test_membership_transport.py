@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The authority process and the ranks' agents over the signed store and liveness connections (CPU processes): a
-killed rank is removed within seconds, a frozen one is kept, a replacement joins once the process it replaces is
-gone, and connections or values not signed with the join secret are ignored without disturbing the authority."""
+"""The authority process and the ranks' membership clients over the rendezvous store and liveness connections (CPU
+processes): a killed rank is removed within seconds, a hung one is kept, a replacement joins once the process it
+replaces is gone, and connections or values not signed with the shared secret are ignored without disturbing the
+authority."""
 
 import multiprocessing as mp
 import os
@@ -32,11 +33,11 @@ from tensorrt_llm._torch.distributed.membership import (
     RECORD_KEY,
     Authority,
     AuthorityProcess,
-    MembershipAgent,
+    MembershipClient,
     MembershipState,
     NodeView,
+    RendezvousStore,
     Reply,
-    SignedStore,
     open_liveness_connection,
     open_node_supervisor_connection,
 )
@@ -44,12 +45,12 @@ from tensorrt_llm._torch.distributed.membership import (
 pytestmark = pytest.mark.cpu_only
 
 WORLD = 4
-SECRET = b"test-join-secret"
+SECRET = b"test-shared-secret"
 STARTUP_S = 180  # each spawned process imports tensorrt_llm
 
 
 def _store(port, secret=SECRET):
-    return SignedStore(
+    return RendezvousStore(
         TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=60)), secret
     )
 
@@ -82,42 +83,42 @@ _STOP_KEY = "test_stop"
 def _rank(port, rank, replacement, results):
     """Follow the records and answer them like an executor would, until shut down or no longer a member. A
     ``replacement`` asks to join by connecting, and then reports that it is ready to join."""
-    agent = None
+    client = None
 
     def on_record(record):
         if record.state == MembershipState.PROPOSE:
-            agent.report(
+            client.report(
                 reply=Reply.READY, reply_generation=record.generation, ready_payload=f"rank {rank}"
             )
         elif record.state == MembershipState.INSTALL:
-            agent.report(reply=Reply.INSTALLED, reply_generation=record.generation)
+            client.report(reply=Reply.INSTALLED, reply_generation=record.generation)
         results.put(
             (
                 rank,
-                agent.incarnation,
+                client.incarnation,
                 record.generation,
                 record.state.name,
-                record.live_mask,
+                record.active_mask,
                 time.time(),
             )
         )
 
     store = _store(port)
-    agent = MembershipAgent(rank, store, on_record, replacement=replacement)
-    agent.start()
+    client = MembershipClient(rank, store, on_record, replacement=replacement)
+    client.start()
     if replacement:
-        agent.report(joining_ready=True, ready_payload=f"rank {rank}")
+        client.report(joining_ready=True, ready_payload=f"rank {rank}")
     else:
-        agent.report(started=True)
+        client.report(started=True)
     progress = 0
-    while agent._thread.is_alive():
+    while client._thread.is_alive():
         progress += 1
-        agent.report(
+        client.report(
             progress=progress, shutdown=rank == 0 and store.get_if_set(_STOP_KEY) is not None
         )
-        if agent.record is not None and agent.record.state in (
+        if client.record is not None and client.record.state in (
             MembershipState.SHUTDOWN,
-            MembershipState.ABORT,
+            MembershipState.ABORTED,
         ):
             break
         time.sleep(0.01)
@@ -174,8 +175,8 @@ def cluster():
         )
         return ranks
 
-    yield SignedStore(master, SECRET), results, start, start_cluster
-    SignedStore(master, SECRET).set(_STOP_KEY, b"")
+    yield RendezvousStore(master, SECRET), results, start, start_cluster
+    RendezvousStore(master, SECRET).set(_STOP_KEY, b"")
     _until(
         results, lambda item: item == ("authority", "SHUTDOWN")
     )  # the authority survived the test
@@ -192,7 +193,7 @@ def _committed(rank, generation, mask):
 def _kill_and_expect_removal(results, proc, rank, generation, mask):
     killed_at = time.time()
     os.kill(proc.pid, signal.SIGKILL)
-    # Items are (rank, incarnation, generation, state, live mask, time).
+    # Items are (rank, incarnation, generation, state, active mask, time).
     seen = _until(results, _committed(0, generation, mask))
     assert seen[-1][5] - killed_at < 5.0, f"removed {seen[-1][5] - killed_at:.2f} s after the kill"
 
@@ -205,7 +206,7 @@ def test_a_killed_rank_is_removed_quickly_and_its_replacement_joins(cluster):
     _until(results, _committed(0, 2, 0b1111), timeout_s=STARTUP_S)
 
 
-def test_a_frozen_rank_keeps_its_connection_and_stays_live(cluster):
+def test_a_hung_rank_keeps_its_connection_and_stays_active(cluster):
     _, results, _, start_cluster = cluster
     ranks = start_cluster()
     os.kill(
@@ -221,7 +222,7 @@ def test_a_frozen_rank_keeps_its_connection_and_stays_live(cluster):
 
 
 def test_a_replacement_joins_once_the_process_it_replaces_is_gone(cluster):
-    """While rank 2's process serves, a replacement for it is refused: only the authority's verdict removes a live
+    """While rank 2's process serves, a replacement for it is refused: only the authority's verdict removes an active
     process."""
     _, results, start, start_cluster = cluster
     ranks = start_cluster()
@@ -241,7 +242,7 @@ def _refused(store, rank, replacement):
         return connection.sock.recv(1) == b""
 
 
-def test_a_join_for_a_live_rank_is_refused(cluster):
+def test_a_join_for_an_active_rank_is_refused(cluster):
     """A replacement's hello for rank 2 while rank 2's process holds its connection is refused, with the reason; the
     membership does not change."""
     store, results, _, start_cluster = cluster
@@ -249,7 +250,7 @@ def test_a_join_for_a_live_rank_is_refused(cluster):
     assert _refused(store, 2, True)
     _until(
         results,
-        lambda item: item == ("refused", 2, 1, "rank 2 is live: no replacement joins for it"),
+        lambda item: item == ("refused", 2, 1, "rank 2 is active: no replacement joins for it"),
     )
     with pytest.raises(AssertionError):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=2)
@@ -270,10 +271,10 @@ def test_a_second_connection_of_a_first_process_is_refused(cluster):
     _kill_and_expect_removal(results, ranks[1], 1, 1, 0b1101)
 
 
-def test_input_not_signed_with_the_join_secret_is_ignored(cluster):
+def test_input_not_signed_with_the_shared_secret_is_ignored(cluster):
     store, results, _, start_cluster = cluster
     ranks = start_cluster()
-    forged = SignedStore(store.store, b"another-secret")
+    forged = RendezvousStore(store.store, b"another-secret")
     host, port = store.get(LIVENESS_KEY).decode().rsplit(":", 1)
     with socket.create_connection((host, int(port))) as garbage:
         garbage.sendall(b"zz not-hex\n")
@@ -283,7 +284,7 @@ def test_input_not_signed_with_the_join_secret_is_ignored(cluster):
         hello.sendall(forged.tag(b"hello", nonce + line).hex().encode() + b" " + line + b"\n")
         hello.settimeout(10)
         assert hello.recv(1) == b""  # a forged replacement for rank 3 is closed
-    forged.set(RECORD_KEY, b'{"generation": 9, "state": 3, "live_mask": 0}')  # a forged ABORT
+    forged.set(RECORD_KEY, b'{"generation": 9, "state": 3, "active_mask": 0}')  # a forged ABORT
     with pytest.raises(AssertionError):
         _until(results, lambda item: item[3] in ("PROPOSE", "ABORT"), timeout_s=2)
     assert store.get_if_set(RECORD_KEY) is None  # counts as absent for the watchers and the server
@@ -341,7 +342,7 @@ def test_a_node_supervisor_s_loss_fails_its_ranks_at_once(cluster):
     node_1.connection.sock.close()
     seen = _until(results, _committed(0, 1, 0b0011))
     assert seen[-1][5] - left_at < 5.0
-    view = node_0.until(lambda view: view.record.live_mask == 0b0011)
+    view = node_0.until(lambda view: view.record.active_mask == 0b0011)
     assert view.nodes == ((0, "host-0", True), (1, "host-1", False))
     # The deployment shuts down while node 0's supervisor stays: its leaving would be node 0's loss, which aborts.
     store.set(_STOP_KEY, b"")
@@ -363,7 +364,7 @@ def test_a_second_supervisor_of_a_node_or_of_its_ranks_is_refused(cluster):
         store, 0, [0, 1]
     )  # a supervisor that connects: every supervisor's view lists it
     expected = ((0, "host-0", True), (1, "host-1", True))
-    assert first.until(lambda view: view.nodes == expected).record.live_mask == 0b1111
+    assert first.until(lambda view: view.nodes == expected).record.active_mask == 0b1111
     # The deployment shuts down while node 0's supervisor stays: its leaving would be node 0's loss, which aborts.
     store.set(_STOP_KEY, b"")
     node_0.until(lambda view: view.record.state == MembershipState.SHUTDOWN)

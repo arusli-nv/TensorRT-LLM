@@ -916,7 +916,7 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
         del moe
         if self._using_spare_slot_storage():
             raise ValueError(
-                "WideEP fault tolerance does not support the DeepGEMM MoE backend yet: its workspace "
+                "Wide-EP fault tolerance does not support the DeepGEMM MoE backend yet: its workspace "
                 "holds rows for every received token in every local slot, so each unused spare EPLB "
                 "slot would take device memory. Turn it off (enable_wide_ep_fault_tolerance=False) or "
                 "use the Cutlass or the CuteDSL NVFP4 MoE backend.")

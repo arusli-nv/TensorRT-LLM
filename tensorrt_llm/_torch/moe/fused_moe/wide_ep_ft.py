@@ -78,7 +78,7 @@ def get_wide_ep_ft_options(
         and not wide_ep_fault_tolerance_enabled()
     ):
         raise ValueError(
-            "WideEP rank-mask mode does not support CUDA graphs without "
+            "Wide-EP rank-mask mode does not support CUDA graphs without "
             "enable_wide_ep_fault_tolerance; disable CUDA graphs or turn it on"
         )
     if health is None and rank_mask_enabled:

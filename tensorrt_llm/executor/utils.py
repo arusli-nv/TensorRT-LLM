@@ -173,7 +173,7 @@ RANK_FAILURE_CODE = "rank_failure"
 
 
 class RankFailureError(RequestError):
-    """Error of a request that a WideEP rank failure ended, safe to retry."""
+    """Error of a request that a Wide-EP rank failure ended, safe to retry."""
 
     def __init__(self,
                  message: str = ("A rank failure ended the request; "

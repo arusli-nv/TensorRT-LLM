@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""WideEP fault tolerance end to end: DeepSeek keeps serving under load when ranks fail; a replacement rejoins.
+"""Wide-EP fault tolerance end to end: DeepSeek keeps serving under load when ranks fail; a replacement rejoins.
 
 By default each test starts DeepSeek-V3-Lite with attention DP and EP over 4 GPUs (``trtllm-llmapi-launch`` under
 ``mpirun --enable-recovery``; :func:`test_rank_rejoins_when_the_server_spawns_its_ranks` starts plain ``trtllm-serve``,
@@ -24,7 +24,7 @@ instead (for example DeepSeek-R1 over 8 nodes), one test per deployment, and run
 - ``TLLM_FT_E2E_VICTIM``: the rank to fail, which runs on this node.
 - ``TLLM_FT_E2E_SEQUENCE``: the failures :func:`test_rank_failure_sequence` runs, comma-separated (default
   ``crash,hang``; ``crash,node`` on several nodes).
-- The deployment's join secret (``TLLM_FAULT_TOLERANCE_JOIN_SECRET``) identifies its processes.
+- The deployment's shared secret (``TLLM_FAULT_TOLERANCE_SHARED_SECRET``) identifies its processes.
 
 ``TLLM_FT_E2E_CONFIG`` (JSON) is merged into the configuration of a deployment a test starts. The phases and cycles
 are written as JSON to ``TLLM_FT_E2E_REPORT`` (default: the test's tmp_path).
@@ -37,7 +37,7 @@ A test runs its failures in sequence in one deployment, under one closed-loop lo
 - Every failure is a cycle of phases: ``failover`` (the requests in flight at the failure), ``degraded`` (N-K ranks
   serve while the replacement starts on its own), ``admission`` (the requests in flight when the replacement's
   admission begins) and ``rejoined`` (back at N ranks); the run starts with a ``healthy`` phase.
-- Membership events are timed from the membership store, read with the server's own reader every STORE_POLL_S.
+- Membership events are timed from the rendezvous store, read with the server's own reader every STORE_POLL_S.
 """
 
 import contextlib
@@ -68,8 +68,8 @@ import pytest
 import yaml
 
 from tensorrt_llm._torch.distributed.membership import (
-    JOIN_SECRET_ENV,
     RENDEZVOUS_ENV,
+    SHARED_SECRET_ENV,
     Authority,
     open_liveness_connection,
     open_store,
@@ -85,9 +85,9 @@ WORLD_SIZE = 4
 VICTIM = 2
 # Model loading and CUDA graph capture.
 STARTUP_TIMEOUT_S = 1800
-# The deployment's status endpoint: generation, live and lost ranks, the last membership transaction.
+# The deployment's status endpoint: generation, active and failed ranks, the last membership transaction.
 STATUS_PATH = "/fault_tolerance_status"
-# The endpoint refreshes from the membership store once a second; membership events are timed, and acted on during a
+# The endpoint refreshes from the rendezvous store once a second; membership events are timed, and acted on during a
 # membership change, from the store itself, read this often.
 STORE_POLL_S = 0.01
 EXTERNAL = bool(os.environ.get("TLLM_FT_E2E_SERVER"))
@@ -127,13 +127,13 @@ WINDOW_S = 60
 # A stall: no streamed token for this long while the load runs.
 STALL_S = 5.0
 
-# Targets: failover pause after a crash, after a hang (beyond the authority's progress timeout), and the survivors'
+# Targets: failover pause after a crash, after a hang (beyond the authority's hang timeout), and the survivors'
 # pause while a replacement is admitted.
 CRASH_PAUSE_TARGET_S = 5.0
 HANG_PAUSE_MARGIN_S = 5.0
-T_HUNG_S = inspect.signature(Authority).parameters["progress_timeout_s"].default
+HANG_TIMEOUT_S = inspect.signature(Authority).parameters["hang_timeout_s"].default
 ADMISSION_PAUSE_TARGET_S = 3.0
-# Time to detect a crash and commit the smaller membership; a hang is detected T_HUNG_S later.
+# Time to detect a crash and commit the smaller membership; a hang is detected HANG_TIMEOUT_S later.
 RECOVERY_TIMEOUT_S = 120
 # A replacement loads the model and captures its CUDA graphs alone before it is admitted.
 REJOIN_TIMEOUT_S = 1200
@@ -146,9 +146,9 @@ INVALID_JOIN_WATCH_S = 20
 GPU_MEMORY_LEAK_TOLERANCE_MIB = 256
 # The authority logs why it refuses a liveness connection: this prefix, then the reason.
 REFUSAL_LOG = "Closing a liveness connection: "
-# Rank 0 logs, per membership change, how many requests that no live rank holds the rank failure ended.
+# Rank 0 logs, per membership change, how many requests that no active rank holds the rank failure ended.
 RETRYABLE_LOG = re.compile(
-    r"Rank 0 resumed serving with membership generation (\d+),.* (\d+) requests no live rank holds ended by "
+    r"Rank 0 resumed serving with membership generation (\d+),.* (\d+) requests no active rank holds ended by "
     r"the rank failure"
 )
 
@@ -237,7 +237,7 @@ def _serving_config(model: Path, serving_options: bool = False) -> dict:
         "kv_cache_config": {"free_gpu_memory_fraction": 0.5, "use_kv_cache_manager_v2": True},
         "speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
         # One slot per expert (static EPLB): fault tolerance adds the spare slots the survivors of a failure need to
-        # hold every expert, and restores a lost rank's experts into them from host copies.
+        # hold every expert, and restores a failed rank's experts into them from host weights.
         "moe_config": {"load_balancer": {"num_slots": num_experts}},
     }
     if serving_options:
@@ -287,14 +287,14 @@ def _wait_until_healthy(base: str, alive: Callable[[], bool]) -> None:
 
 
 def _chosen_secret(since: float) -> str:
-    """The join secret a server that spawns its ranks chose, from the environment of its node supervisor."""
+    """The shared secret a server that spawns its ranks chose, from the environment of its node supervisor."""
     for process in psutil.process_iter(["cmdline", "create_time"]):
         with contextlib.suppress(psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
             cmdline = process.info["cmdline"] or []
             if process.info["create_time"] >= since and any(
                 arg.endswith("_llmapi_node_supervisor.py") for arg in cmdline
             ):
-                return process.environ()[JOIN_SECRET_ENV]
+                return process.environ()[SHARED_SECRET_ENV]
     raise LookupError("no node supervisor of the deployment runs on this node")
 
 
@@ -302,7 +302,7 @@ def _chosen_secret(since: float) -> str:
 def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: bool = False):
     """A deployment (:func:`_serving_config`) for the test, or the one at ``TLLM_FT_E2E_SERVER``.
 
-    ``server_spawns_ranks``: plain ``trtllm-serve``, which spawns its ranks itself and chooses the join secret and the
+    ``server_spawns_ranks``: plain ``trtllm-serve``, which spawns its ranks itself and chooses the shared secret and the
     rendezvous address (none is exported); otherwise ``trtllm-llmapi-launch`` under ``mpirun``. A deployment this
     starts leaves no /dev/shm segment once it ended (whoever starts the external one checks that).
     """
@@ -315,8 +315,8 @@ def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: 
             base,
             _get_json(f"{base}/v1/models")[1]["data"][0]["id"],
             os.environ["TLLM_FT_E2E_SERVER_LOGS"],
-            os.environ[JOIN_SECRET_ENV],
-            len(status["live_ranks"]),
+            os.environ[SHARED_SECRET_ENV],
+            len(status["active_ranks"]),
             int(os.environ.get("TLLM_FT_E2E_VICTIM", VICTIM)),
         )
         return
@@ -348,12 +348,12 @@ def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: 
             env["PMIX_HOSTNAME"] = os.environ["PMIX_HOSTNAME"]
         command = serve
     else:
-        # Under trtllm-llmapi-launch the server does not start the workers: they take the join secret and the
-        # rendezvous address (rank 0's host, where the membership store listens) from the launch. The launcher runs
+        # Under trtllm-llmapi-launch the server does not start the workers: they take the shared secret and the
+        # rendezvous address (rank 0's host, where the rendezvous store listens) from the launch. The launcher runs
         # once on this node (--enable-recovery keeps it running when a rank exits): its node supervisor starts the
         # node's ranks.
         secret = os.urandom(32).hex()
-        env[JOIN_SECRET_ENV] = secret
+        env[SHARED_SECRET_ENV] = secret
         env[RENDEZVOUS_ENV] = f"{socket.gethostname()}:{_free_port()}"
         command = ["mpirun", "--enable-recovery", "--allow-run-as-root", "-np", "1"]
         command += ["trtllm-llmapi-launch", *serve]
@@ -426,7 +426,7 @@ def _process_rank(env: Dict[str, str]) -> Optional[int]:
 
 
 def _rank_workers(secret: str) -> Dict[int, psutil.Process]:
-    """The worker process of each rank on this node of the deployment with join secret ``secret``.
+    """The worker process of each rank on this node of the deployment with shared secret ``secret``.
 
     That is the outermost process of the rank that holds a GPU: a launcher or node supervisor holds
     none, and a worker's helper processes have it as parent.
@@ -434,13 +434,13 @@ def _rank_workers(secret: str) -> Dict[int, psutil.Process]:
     candidates = {}
     for process in psutil.process_iter():
         if process.pid == os.getpid():
-            continue  # under a launcher, this test carries a rank and the join secret too
+            continue  # under a launcher, this test carries a rank and the shared secret too
         try:
             env = process.environ()
         except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
             continue
         rank = _process_rank(env)
-        if env.get(JOIN_SECRET_ENV) == secret and rank is not None and _holds_gpu(process.pid):
+        if env.get(SHARED_SECRET_ENV) == secret and rank is not None and _holds_gpu(process.pid):
             candidates[process.pid] = (rank, process)
     workers = {}
     for pid, (rank, process) in candidates.items():
@@ -459,7 +459,7 @@ def _rank_workers(secret: str) -> Dict[int, psutil.Process]:
 
 
 def _node_processes(secret: str) -> List[psutil.Process]:
-    """Every process on this node of the deployment with join secret ``secret``: what the loss of the node ends.
+    """Every process on this node of the deployment with shared secret ``secret``: what the loss of the node ends.
 
     That is every process carrying the secret in its environment (rank workers, node supervisors, launcher
     processes), except this test and the processes it runs under.
@@ -471,17 +471,17 @@ def _node_processes(secret: str) -> List[psutil.Process]:
         if process.pid in own:
             continue
         with contextlib.suppress(psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-            if process.environ().get(JOIN_SECRET_ENV) == secret:
+            if process.environ().get(SHARED_SECRET_ENV) == secret:
                 found.append(process)
     return found
 
 
 def _rendezvous(secret: str) -> str:
-    """The address of the membership store, from the environment of a process of the deployment on this node."""
+    """The address of the rendezvous store, from the environment of a process of the deployment on this node."""
     for process in psutil.process_iter():
         with contextlib.suppress(psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
             env = process.environ()
-            if env.get(JOIN_SECRET_ENV) == secret and RENDEZVOUS_ENV in env:
+            if env.get(SHARED_SECRET_ENV) == secret and RENDEZVOUS_ENV in env:
                 return env[RENDEZVOUS_ENV]
     raise LookupError("no process of the deployment on this node has the rendezvous address")
 
@@ -813,7 +813,7 @@ class Monitor:
 
     ``health``: (time, HTTP status of ``/health``, state from ``/fault_tolerance_status``) per sample.
     ``membership``: (time, status) per change of the status (``FaultToleranceHealth.status``, with the record's own
-    ``membership_state``), read from the membership store every STORE_POLL_S with the server's own reader; the time is
+    ``membership_state``), read from the rendezvous store every STORE_POLL_S with the server's own reader; the time is
     when the change was first read.
     """
 
@@ -913,8 +913,10 @@ class Monitor:
         }
 
 
-def _all_live(world: int) -> Callable[[dict], bool]:
-    return lambda s: s["membership_state"] == "COMMITTED" and s["live_ranks"] == list(range(world))
+def _all_active(world: int) -> Callable[[dict], bool]:
+    return lambda s: s["membership_state"] == "COMMITTED" and s["active_ranks"] == list(
+        range(world)
+    )
 
 
 def _committed_after(generation: int) -> Callable[[dict], bool]:
@@ -928,7 +930,7 @@ def _admitting(
     return lambda s: (
         s["membership_state"] in states
         and s["generation"] > after_generation
-        and set(ranks) <= set(s["live_ranks"])
+        and set(ranks) <= set(s["active_ranks"])
     )
 
 
@@ -1036,7 +1038,7 @@ class Run:
     def __enter__(self) -> "Run":
         d = self.deployment
         status = _status(d.base)
-        assert status["live_ranks"] == list(range(d.world_size)) and not status["lost_ranks"], (
+        assert status["active_ranks"] == list(range(d.world_size)) and not status["failed_ranks"], (
             status
         )
         self.status_after_warmup = status
@@ -1108,13 +1110,13 @@ class Run:
         d, index = self.deployment, len(self.cycles) + 1
         world, all_ranks = d.world_size, list(range(d.world_size))
         status = _status(d.base)
-        assert status["live_ranks"] == all_ranks and status["lost_ranks"] == [], status
+        assert status["active_ranks"] == all_ranks and status["failed_ranks"] == [], status
         workers_before = _rank_workers(d.secret)  # scanning the processes takes seconds
         gpus_before = _rank_gpus(workers_before)
         captures_before = _capture_lines(d.logs)
         victims = _victims(d, failure, workers_before)
-        lost = sorted(victims)
-        record = {"cycle": index, "failure": failure, "lost_ranks": lost}
+        failed_ranks = sorted(victims)
+        record = {"cycle": index, "failure": failure, "failed_ranks": failed_ranks}
         self.cycles.append(record)
 
         t_fail = time.monotonic()
@@ -1127,7 +1129,7 @@ class Run:
             } and not left, (
                 f"the node's processes were not all killed: killed {killed}, left {left}"
             )
-        detection_s = T_HUNG_S if failure == "hang" else 0.0
+        detection_s = HANG_TIMEOUT_S if failure == "hang" else 0.0
         t_degraded, failover_status = self.monitor.wait_for(
             _committed_after(status["generation"]), t_fail, detection_s + RECOVERY_TIMEOUT_S
         )
@@ -1159,7 +1161,7 @@ class Run:
             # ``at_admission_state``.
             states = ("PROPOSE", "INSTALL") if at_admission_state is None else (at_admission_state,)
             t_admitting, admitting = self.monitor.wait_for(
-                _admitting(lost, failover_status["generation"], states),
+                _admitting(failed_ranks, failover_status["generation"], states),
                 t_degraded,
                 REJOIN_TIMEOUT_S,
             )
@@ -1181,12 +1183,12 @@ class Run:
             }
             self.check(
                 admitting["generation"] not in self.monitor.committed_generations()
-                and not set(killed_at_admission) & set(after_kill["live_ranks"]),
+                and not set(killed_at_admission) & set(after_kill["active_ranks"]),
                 f"cycle {index}: the kill did not land during the admission: {after_kill}",
             )
 
         t_rejoined, rejoined_status = self.monitor.wait_for(
-            _all_live(world), t_degraded, REJOIN_TIMEOUT_S
+            _all_active(world), t_degraded, REJOIN_TIMEOUT_S
         )
         self.monitor.wait_for_health(200, "healthy", t_rejoined, RECOVERY_TIMEOUT_S)
         admission = rejoined_status["last_transaction"]
@@ -1209,9 +1211,9 @@ class Run:
         gpus_after = _rank_gpus(workers_after)
         captures_after = _capture_lines(d.logs)
         record["cuda_graph_capture_lines"] = {"before": captures_before, "after": captures_after}
-        survivors = [r for r in all_ranks if r not in lost]
+        survivors = [r for r in all_ranks if r not in failed_ranks]
         local_survivors = [
-            r for r in workers_before if r not in lost and r not in killed_at_admission
+            r for r in workers_before if r not in failed_ranks and r not in killed_at_admission
         ]
 
         # Pauses: the longest time no stream received a token, at the failure and while the replacement was admitted.
@@ -1227,7 +1229,7 @@ class Run:
                 f"{CRASH_PAUSE_TARGET_S} s",
             )
         pause_target_s = (
-            T_HUNG_S + HANG_PAUSE_MARGIN_S if failure == "hang" else CRASH_PAUSE_TARGET_S
+            HANG_TIMEOUT_S + HANG_PAUSE_MARGIN_S if failure == "hang" else CRASH_PAUSE_TARGET_S
         )
         self.check(
             pause_s <= pause_target_s if failure == "hang" else pause_s < pause_target_s,
@@ -1250,8 +1252,8 @@ class Run:
         )
         self.check(
             failover_status["generation"] > status["generation"]
-            and failover_status["lost_ranks"] == lost
-            and failover_status["live_ranks"] == survivors
+            and failover_status["failed_ranks"] == failed_ranks
+            and failover_status["active_ranks"] == survivors
             and failover_status["authority_alive"],
             f"cycle {index}: status after the failover: {failover_status}",
         )
@@ -1273,14 +1275,14 @@ class Run:
             rejoined.start, rejoined.end
         )
         self.check(
-            rejoined_status["lost_ranks"] == []
+            rejoined_status["failed_ranks"] == []
             and rejoined_status["generation"] > failover_status["generation"],
             f"cycle {index}: status after the rejoin: {rejoined_status}",
         )
         # A survivor keeps its incarnation; a replacement has the one after the process it replaces (a replacement
         # killed during its admission is replaced once more).
         expected = [
-            n + (r in lost) + (r in killed_at_admission)
+            n + (r in failed_ranks) + (r in killed_at_admission)
             for r, n in enumerate(status["incarnations"])
         ]
         self.check(
@@ -1289,14 +1291,14 @@ class Run:
             f"expected {expected}",
         )
         # A replacement runs on the GPU of the process it replaces.
-        for rank in sorted((set(lost) | set(killed_at_admission)) & set(workers_before)):
+        for rank in sorted((set(failed_ranks) | set(killed_at_admission)) & set(workers_before)):
             self.check(
                 bool(gpus_before[rank]) and gpus_after.get(rank) == gpus_before[rank],
                 f"cycle {index}: rank {rank}'s replacement runs on GPUs {gpus_after.get(rank)}, the process it "
                 f"replaces ran on {gpus_before[rank]}",
             )
         # A replacement captures its own CUDA graphs at startup.
-        for rank in sorted(set(lost) | set(killed_at_admission)):
+        for rank in sorted(set(failed_ranks) | set(killed_at_admission)):
             self.check(
                 captures_after.get(rank, 0) > captures_before.get(rank, 0),
                 f"cycle {index}: no CUDA graph capture lines of rank {rank}'s replacement",
@@ -1444,11 +1446,11 @@ class Run:
     def _check_captures(self) -> None:
         """Every rank captured CUDA graphs at startup, and no rank still served by its first process captured since.
 
-        A rank is still served by its first process while it is live with the incarnation it had after warmup.
+        A rank is still served by its first process while it is active with the incarnation it had after warmup.
         """
         d = self.deployment
         start, end = self.status_after_warmup["incarnations"], _status(d.base)
-        first_processes = [r for r in end["live_ranks"] if end["incarnations"][r] == start[r]]
+        first_processes = [r for r in end["active_ranks"] if end["incarnations"][r] == start[r]]
         before, after = self.captures_after_warmup, _capture_lines(d.logs)
         for rank in range(d.world_size):
             self.check(before.get(rank, 0) > 0, f"no CUDA graph capture lines of rank {rank}")
@@ -1559,7 +1561,7 @@ def _refused_join(run: Run, kind: str, replacement: bool, reason: str) -> None:
     after, after_workers = _status(d.base), _rank_workers(d.secret)
     run.check(
         after["generation"] == before["generation"]
-        and after["live_ranks"] == list(range(d.world_size)),
+        and after["active_ranks"] == list(range(d.world_size)),
         f"a {kind} join for rank {d.victim} changed the membership: {before} -> {after}",
     )
     run.check(
@@ -1573,8 +1575,8 @@ def _refused_join(run: Run, kind: str, replacement: bool, reason: str) -> None:
 def test_invalid_joins(deployment: Deployment, tmp_path: Path):
     """Joins the authority refuses, and a replacement that fails during its admission, under load in one deployment.
 
-    - A second connection of a live first process: the process's crash is still failed over at once.
-    - A replaced first process, and a replacement of a live rank (as a second supervisor would send).
+    - A second connection of an active first process: the process's crash is still failed over at once.
+    - A replaced first process, and a replacement of an active rank (as a second supervisor would send).
     - A replacement killed during its admission: the survivors go on without it, and the next replacement rejoins.
 
     The authority logs each refusal; the deployment keeps serving, and no survivor restarts.
@@ -1585,7 +1587,7 @@ def test_invalid_joins(deployment: Deployment, tmp_path: Path):
             run.cycle("crash")
         _refused_join(run, "stale", False, f"rank {d.victim}'s first process was replaced")
         _refused_join(
-            run, "duplicate", True, f"rank {d.victim} is live: no replacement joins for it"
+            run, "duplicate", True, f"rank {d.victim} is active: no replacement joins for it"
         )
 
         victim_pid = _rank_workers(d.secret)[d.victim].pid
@@ -1600,7 +1602,7 @@ def test_invalid_joins(deployment: Deployment, tmp_path: Path):
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + 1200)
 def test_silent_joiner_does_not_hold_survivors(deployment: Deployment, tmp_path: Path):
-    """A joiner for a lost rank that connects and never replies pauses the survivors less than an admission does."""
+    """A joiner for a failed rank that connects and never replies pauses the survivors less than an admission does."""
     d = deployment
     with Run(d, tmp_path, "silent_joiner") as run:
         victim = _rank_workers(d.secret)[d.victim]
@@ -1608,18 +1610,18 @@ def test_silent_joiner_does_not_hold_survivors(deployment: Deployment, tmp_path:
         victim.kill()
         run.failure_times.append(t_fail)
         t_degraded = run.monitor.wait_for(
-            lambda s: s["membership_state"] == "COMMITTED" and d.victim in s["lost_ranks"],
+            lambda s: s["membership_state"] == "COMMITTED" and d.victim in s["failed_ranks"],
             t_fail,
             RECOVERY_TIMEOUT_S,
         )[0]
         time.sleep(SETTLE_S)
         # It never reports that it is ready to join, so the authority never stops the survivors for it.
         with run.connect(d.victim, True) as t_join:
-            time.sleep(T_HUNG_S + SETTLE_S)
+            time.sleep(HANG_TIMEOUT_S + SETTLE_S)
         run.phases.append(Phase("failover", 0, t_fail, t_degraded, event=t_fail))
         run.phases.append(Phase("silent_joiner", 0, t_join, time.monotonic()))
         pause_s = _largest_gap(
-            run.clients.stream_arrivals(), t_join - 1.0, t_join + T_HUNG_S + SETTLE_S
+            run.clients.stream_arrivals(), t_join - 1.0, t_join + HANG_TIMEOUT_S + SETTLE_S
         )[0]
         run.check(
             pause_s < ADMISSION_PAUSE_TARGET_S,
@@ -1655,7 +1657,7 @@ def test_failure_during_admission(deployment: Deployment, tmp_path: Path):
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
 def test_failure_during_install(deployment: Deployment, tmp_path: Path):
-    """A second rank crashes while the live ranks install the first one's admission, not before it.
+    """A second rank crashes while the active ranks install the first one's admission, not before it.
 
     INSTALL is the remap of the all-to-all memory and the expert placement. The admission does not commit, the
     survivors go on without the second rank, and both replacements rejoin.
@@ -1677,7 +1679,7 @@ def test_rank_rejoins_when_the_server_spawns_its_ranks(
 ):
     """Plain trtllm-serve, without trtllm-llmapi-launch and with no variable exported.
 
-    The server starts with fault tolerance (it chooses the join secret and the rendezvous address before it spawns
+    The server starts with fault tolerance (it chooses the shared secret and the rendezvous address before it spawns
     the ranks), a killed rank fails over, and its node supervisor restarts it as a replacement that rejoins.
     """
     with Run(spawned_deployment, tmp_path, "server_spawns_ranks") as run:

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Restore a lost rank's experts into EPLB spare slots under WideEP fault tolerance."""
+"""Restore a failed rank's experts into EPLB spare slots under Wide-EP fault tolerance."""
 
 import hashlib
 import os
@@ -26,23 +26,23 @@ if TYPE_CHECKING:
 def plan_layer_placement(
     current: np.ndarray,
     home: np.ndarray,
-    live: np.ndarray,
+    active: np.ndarray,
     active_slot_count: int,
     expert_count: int,
 ) -> np.ndarray:
-    """Return a [ranks, slots] placement that holds every expert on the ``live`` ranks.
+    """Return a [ranks, slots] placement that holds every expert on the ``active`` ranks.
 
     The plan is deterministic, so every rank plans the same placement from the same arguments.
 
     Raises:
-        ValueError: The live ranks' spare slots cannot hold every expert.
+        ValueError: The active ranks' spare slots cannot hold every expert.
     """
     placement = np.full_like(current, -1)
-    placement[live, :active_slot_count] = home[live, :active_slot_count]
+    placement[active, :active_slot_count] = home[active, :active_slot_count]
     replicas = np.bincount(placement[placement >= 0], minlength=expert_count)
-    live_ranks = np.flatnonzero(live)
+    active_ranks = np.flatnonzero(active)
     spare_slots = range(active_slot_count, current.shape[1])
-    for rank in live_ranks:
+    for rank in active_ranks:
         for slot in spare_slots:
             expert_id = current[rank, slot]
             if expert_id >= 0 and replicas[expert_id] == 0:
@@ -56,13 +56,13 @@ def plan_layer_placement(
                 current[rank, slot] < 0,
                 slot,
             )
-            for rank in live_ranks
+            for rank in active_ranks
             for slot in spare_slots
             if placement[rank, slot] < 0
         ]
         if not empty:
             raise ValueError(
-                f"The spare slots of live ranks {live_ranks.tolist()} cannot hold expert {expert_id}"
+                f"The spare slots of active ranks {active_ranks.tolist()} cannot hold expert {expert_id}"
             )
         _, rank, _, slot = min(empty)
         placement[rank, slot] = expert_id
@@ -72,9 +72,9 @@ def plan_layer_placement(
 
 @dataclass(frozen=True, eq=False)
 class ExpertRestorePlan:
-    """Placement of every MoE layer for a membership, identical on every live rank except ``device_bytes``."""
+    """Placement of every MoE layer for a membership, identical on every active rank except ``device_bytes``."""
 
-    live_ranks: Tuple[bool, ...]
+    active_ranks: Tuple[bool, ...]
     placements: Tuple[np.ndarray, ...]
     digest: str
     device_bytes: int
@@ -92,22 +92,22 @@ def _outlive_this_process(shm: shared_memory.SharedMemory) -> None:
     resource_tracker.unregister(shm._name, "shared_memory")
 
 
-def host_copies_prefix(shared_memory_base_name: str) -> str:
-    """Return the name prefix of the host-copy segments under ``shared_memory_base_name``."""
+def host_weights_prefix(shared_memory_base_name: str) -> str:
+    """Return the name prefix of the host-weight segments under ``shared_memory_base_name``."""
     return f"{shared_memory_base_name}_"
 
 
 _FINGERPRINT_BYTES = 32
 SHARED_MEMORY_DIR = "/dev/shm"
-_HOST_COPIES_CHECK_S = 1.0
+_HOST_WEIGHTS_CHECK_S = 1.0
 
 
-def host_copies_key(rank: int) -> str:
-    """Return the store key a replacement of ``rank`` sets once its node holds the rank's host copies."""
-    return f"eplb_host_copies/{rank}"
+def host_weights_key(rank: int) -> str:
+    """Return the store key a replacement of ``rank`` sets once its node holds the rank's host weights."""
+    return f"eplb_host_weights/{rank}"
 
 
-class DeploymentHostCopies(HostMoeTensorSharer):
+class DeploymentHostWeights(HostMoeTensorSharer):
     """Host tensor sharer whose segments outlive their processes so that a replacement rank can reattach them."""
 
     data_offset = HostMoeTensorSharer.align_size(_FINGERPRINT_BYTES)
@@ -207,7 +207,7 @@ class DeploymentHostCopies(HostMoeTensorSharer):
         resource_tracker.unregister(shm._name, "shared_memory")
         return None
 
-    def holds_host_copies(self, rank: int) -> bool:
+    def holds_host_weights(self, rank: int) -> bool:
         """Return whether the segment of local ``rank`` holds that rank's host weights."""
         shm = self._attach(rank)
         if shm is None:
@@ -225,7 +225,7 @@ class DeploymentHostCopies(HostMoeTensorSharer):
 
 
 class EplbExpertRestore:
-    """Size the spare slots of a ``MoeLoadBalancer`` and restore a lost rank's experts into them."""
+    """Size the spare slots of a ``MoeLoadBalancer`` and restore a failed rank's experts into them."""
 
     def __init__(self, balancer: "MoeLoadBalancer"):
         self.balancer = balancer
@@ -236,19 +236,19 @@ class EplbExpertRestore:
             and not _tbr.host_accessible_device_memory_uses_gdrcopy()
         ):
             raise ValueError(
-                "WideEP fault tolerance keeps the spare slots of online EPLB host accessible through GDRCopy, "
+                "Wide-EP fault tolerance keeps the spare slots of online EPLB host accessible through GDRCopy, "
                 "which this system does not use for EPLB slots (GPU memory is a NUMA node, or GDRCopy is "
                 "unavailable): use static EPLB (layer_updates_per_iter 0) or turn fault tolerance off "
                 "(enable_wide_ep_fault_tolerance=False)"
             )
-        self.live_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
+        self.active_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
         self.backed_spare_slot_bytes = 0
 
     def spare_slot_count(self, expert_count: int, eplb_slot_count: int) -> int:
         """Return the spare slots per rank that hold every expert the largest recoverable failure can lose."""
         lost_experts = min(self.largest_failure * eplb_slot_count, expert_count)
-        live_ranks = self.balancer.ep_size - self.largest_failure
-        return -(-lost_experts // live_ranks)
+        active_ranks = self.balancer.ep_size - self.largest_failure
+        return -(-lost_experts // active_ranks)
 
     def _rank_nodes(self) -> List[int]:
         return [self.balancer.mapping.get_node_rank(rank) for rank in range(self.balancer.ep_size)]
@@ -295,18 +295,18 @@ class EplbExpertRestore:
             for layer in self.balancer.single_layer_load_balancers
         ]
 
-    def _host_tensor_sharers(self) -> List[DeploymentHostCopies]:
+    def _host_tensor_sharers(self) -> List[DeploymentHostWeights]:
         return [
             layer.host_tensor_sharer
             for layer in self.balancer.single_layer_load_balancers
             if layer.need_load_shared_weights()
         ]
 
-    def wait_for_node_host_copies(self):
-        """Wait until every other rank on this replacement rank's node holds its host copies.
+    def wait_for_node_host_weights(self):
+        """Wait until every other rank on this replacement rank's node holds its host weights.
 
         Raises:
-            ReplacementCannotStart: The host copies of a live rank, or of a rank whose replacement announced them,
+            ReplacementCannotStart: The host weights of an active rank, or of a rank whose replacement announced them,
                 are missing or broken.
             RuntimeError: The deployment ended.
         """
@@ -321,7 +321,7 @@ class EplbExpertRestore:
 
         ep_rank = self.balancer.ep_rank
         store = rendezvous_store()
-        store.set(host_copies_key(ep_rank), b"")
+        store.set(host_weights_key(ep_rank), b"")
         sharers = self._host_tensor_sharers()
 
         def missing() -> List[int]:
@@ -329,7 +329,7 @@ class EplbExpertRestore:
                 rank
                 for local_rank, rank in enumerate(self._node_ranks())
                 if rank != ep_rank
-                and not all(sharer.holds_host_copies(local_rank) for sharer in sharers)
+                and not all(sharer.holds_host_weights(local_rank) for sharer in sharers)
             ]
 
         def record() -> MembershipRecord:
@@ -337,64 +337,66 @@ class EplbExpertRestore:
 
         def check_running(unsigned) -> None:
             state = record().state
-            if state in (MembershipState.SHUTDOWN, MembershipState.ABORT):
+            if state in (MembershipState.SHUTDOWN, MembershipState.ABORTED):
                 raise RuntimeError(
-                    f"The deployment ended ({state.name}) before the EPLB host copies of ranks {waited} were built "
+                    f"The deployment ended ({state.name}) before the EPLB host weights of ranks {waited} were built "
                     "again"
                 )
 
         waited = missing()
         if not waited:
             return
-        live = [rank for rank in waited if record().is_live(rank)]
-        if live:
+        active = [rank for rank in waited if record().is_active(rank)]
+        if active:
             raise ReplacementCannotStart(
-                f"The EPLB host copies of live ranks {live} on this node are missing or broken"
+                f"The EPLB host weights of active ranks {active} on this node are missing or broken"
             )
         logger.info(
-            f"Waiting for the replacements of ranks {waited} to build their EPLB host copies again"
+            f"Waiting for the replacements of ranks {waited} to build their EPLB host weights again"
         )
         wait_for_keys(
-            store, [host_copies_key(rank) for rank in waited], _HOST_COPIES_CHECK_S, check_running
+            store, [host_weights_key(rank) for rank in waited], _HOST_WEIGHTS_CHECK_S, check_running
         )
         broken = missing()
         if broken:
             raise ReplacementCannotStart(
-                f"The EPLB host copies the replacements of ranks {broken} on this node built are missing or broken"
+                f"The EPLB host weights the replacements of ranks {broken} on this node built are missing or broken"
             )
 
-    def keep_host_copies_for_the_deployment(self) -> str:
-        """Let the node's host copies outlive this process and return their name prefix."""
+    def keep_host_weights_for_the_deployment(self) -> str:
+        """Let the node's host weights outlive this process and return their name prefix."""
         for sharer in self._host_tensor_sharers():
             sharer.keep_for_the_deployment()
-        return host_copies_prefix(self.balancer.shared_memory_base_name)
+        return host_weights_prefix(self.balancer.shared_memory_base_name)
 
     def plan_expert_restore(
         self,
-        live_ranks: Sequence[bool],
+        active_ranks: Sequence[bool],
         current: Sequence[np.ndarray],
         rejoining: Optional[Sequence[bool]] = None,
     ) -> ExpertRestorePlan:
-        """Plan every layer's placement for ``live_ranks``.
+        """Plan every layer's placement for ``active_ranks``.
 
         Args:
-            live_ranks: Per EP rank, whether it is live.
-            current: Per layer, the placement the live ranks agreed on, so every live rank plans the same.
+            active_ranks: Per EP rank, whether it is active.
+            current: Per layer, the placement the active ranks agreed on, so every active rank plans the same.
             rejoining: Per EP rank, whether it rejoins. The active slots then take the initial placement.
 
         Raises:
             RuntimeError: An iteration is active.
-            ValueError: The live ranks cannot hold every expert, or a layer would need to load an expert without
+            ValueError: The active ranks cannot hold every expert, or a layer would need to load an expert without
                 host weights.
         """
         balancer = self.balancer
-        live = np.asarray(live_ranks, dtype=bool)
-        if live.shape != (balancer.ep_size,) or not live[balancer.ep_rank]:
-            raise ValueError(f"EP rank {balancer.ep_rank} plans for live ranks {live.tolist()}")
+        active = np.asarray(active_ranks, dtype=bool)
+        if active.shape != (balancer.ep_size,) or not active[balancer.ep_rank]:
+            raise ValueError(f"EP rank {balancer.ep_rank} plans for active ranks {active.tolist()}")
         if balancer.in_iter:
             raise RuntimeError("Cannot plan an expert restore while an iteration is active")
-        rejoined = rejoining is not None and bool((live & np.asarray(rejoining, dtype=bool)).any())
-        digest = hashlib.sha256(live.tobytes())
+        rejoined = rejoining is not None and bool(
+            (active & np.asarray(rejoining, dtype=bool)).any()
+        )
+        digest = hashlib.sha256(active.tobytes())
         placements = []
         device_bytes = 0
         for layer, layer_current in zip(balancer.single_layer_load_balancers, current, strict=True):
@@ -403,7 +405,7 @@ class EplbExpertRestore:
                 layer.initial_placement.reshape(layer_current.shape) if rejoined else layer_current
             )
             placement = plan_layer_placement(
-                layer_current, home, live, layer.active_slot_count_per_rank, layer.expert_count
+                layer_current, home, active, layer.active_slot_count_per_rank, layer.expert_count
             )
             loaded = (placement >= 0) & (placement != layer_current)
             if loaded.any() and not layer.need_load_shared_weights():
@@ -417,7 +419,7 @@ class EplbExpertRestore:
             digest.update(placement.tobytes())
             placements.append(placement)
         return ExpertRestorePlan(
-            tuple(bool(rank) for rank in live),
+            tuple(bool(rank) for rank in active),
             tuple(placements),
             digest.hexdigest()[:16],
             device_bytes,
@@ -463,13 +465,13 @@ class EplbExpertRestore:
     ) -> int:
         """Install ``plan`` on this rank and return the device bytes mapped.
 
-        Every live rank must restore the same plan before any rank routes with it.
+        Every active rank must restore the same plan before any rank routes with it.
         """
         balancer = self.balancer
         if balancer.in_iter:
             raise RuntimeError("Cannot restore experts while an iteration is active")
         layers = balancer.single_layer_load_balancers
-        if plan.live_ranks == self.live_ranks and all(
+        if plan.active_ranks == self.active_ranks and all(
             np.array_equal(placement, layer.get_old_rank_expert_ids())
             for placement, layer in zip(plan.placements, layers)
         ):
@@ -485,9 +487,9 @@ class EplbExpertRestore:
         )
         start_s = _phase_done(times, "back", start_s)
         balancer.load_balancer_impl.restore_placement(
-            [rank for rank, live in enumerate(plan.live_ranks) if not live],
+            [rank for rank, active in enumerate(plan.active_ranks) if not active],
             [placement.tolist() for placement in plan.placements],
         )
         _phase_done(times, "load and install", start_s)
-        self.live_ranks = plan.live_ranks
+        self.active_ranks = plan.active_ranks
         return mapped

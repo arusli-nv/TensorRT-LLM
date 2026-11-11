@@ -943,7 +943,7 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
     torch.testing.assert_close(c[:num_valid_permuted_tokens], c_ref[:num_valid_permuted_tokens])
 
 
-# DeepSeek-R1 on 32 ranks with WideEP fault tolerance: 8 EPLB slots and 2 spare slots per rank.
+# DeepSeek-R1 on 32 ranks with Wide-EP fault tolerance: 8 EPLB slots and 2 spare slots per rank.
 _EP_SIZE, _EP_RANK, _ACTIVE_SLOTS, _SPARE_SLOTS = 32, 5, 8, 2
 _SLOTS = _ACTIVE_SLOTS + _SPARE_SLOTS
 
@@ -954,7 +954,7 @@ _SLOTS = _ACTIVE_SLOTS + _SPARE_SLOTS
 )
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
 def test_nvfp4_grouped_gemm_tunes_only_the_active_slots(monkeypatch: pytest.MonkeyPatch):
-    """Spare EPLB slots receive no tokens while every rank is live. The autotuner profiles the row
+    """Spare EPLB slots receive no tokens while every rank is active. The autotuner profiles the row
     buckets of the same layer without spare slots, finds its tactic again at runtime, and the GEMM
     over every slot runs with it, also once experts restored after a failure fill the spare slots."""
     sf_vec_size, hidden_size, interm_size = 16, 4096, 8192

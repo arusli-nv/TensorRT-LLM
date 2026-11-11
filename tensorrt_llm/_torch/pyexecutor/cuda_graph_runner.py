@@ -409,7 +409,7 @@ class CUDAGraphRunner:
         that resolved different tiers would otherwise replay different graphs.
         """
         dist = self.config.dist
-        gathered = dist.tp_live_rows(
+        gathered = dist.tp_active_rows(
             dist.tp_allgather_int64(
                 [bool(can_run_cuda_graph), batch.batch_size,
                  sample_type.value]))

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Node supervisor of a WideEP fault-tolerant deployment, which starts and replaces the ranks of one node."""
+"""Node supervisor of a Wide-EP fault-tolerant deployment, which starts and replaces the ranks of one node."""
 
 import argparse
 import contextlib
@@ -49,7 +49,7 @@ class _Process:
     pidfd: Optional[int]
     incarnation: Optional[int] = None
     listed: bool = False
-    # A COMMITTED record listed it as a live member.
+    # A COMMITTED record listed it as an active member.
     admitted: bool = False
     killed: bool = False
     status: Optional[int] = None
@@ -188,10 +188,10 @@ class NodeSupervisor:
                     return 1
                 if self._view is not None and self._view.record.state in (
                     self._membership.MembershipState.SHUTDOWN,
-                    self._membership.MembershipState.ABORT,
+                    self._membership.MembershipState.ABORTED,
                 ):
                     self._logger.error(
-                        "The deployment at the rendezvous address ended. Use a new join secret."
+                        "The deployment at the rendezvous address ended. Use a new shared secret."
                     )
                     return 1
                 if not self._served:
@@ -261,7 +261,7 @@ class NodeSupervisor:
         if record is not None and record.state == state.SHUTDOWN:
             self._logger.info("The deployment shut down")
             return self._stop(0, terminate=False)
-        if record is not None and record.state == state.ABORT:
+        if record is not None and record.state == state.ABORTED:
             self._logger.error(f"Deployment aborted: {record.reason}")
             return self._stop(1)
         for rank in self._ranks:
@@ -269,7 +269,7 @@ class NodeSupervisor:
             if status is not None:
                 return self._stop(status)
         if self._relaunch_command is not None and self._connection is not None and self._served:
-            self._relaunch_lost_nodes(now_s)
+            self._relaunch_failed_nodes(now_s)
         if (
             self._processes
             and all(process.status is not None for process in self._processes.values())
@@ -306,7 +306,7 @@ class NodeSupervisor:
         if self._connection is None:
             return None
         if process is not None and not ended:
-            if record.is_live(rank):
+            if record.is_active(rank):
                 process.listed = True
                 process.incarnation = record.incarnations[rank]
                 process.admitted |= record.state == self._membership.MembershipState.COMMITTED
@@ -318,7 +318,7 @@ class NodeSupervisor:
                 process.killed = True
                 process.child.kill()
             return None
-        if record.is_live(rank) or rank in self._given_up:
+        if record.is_active(rank) or rank in self._given_up:
             return None
         if now_s < self._replacements.due_s(rank):
             self._wake_at_s.append(self._replacements.due_s(rank))
@@ -395,7 +395,7 @@ class NodeSupervisor:
         connection = None
         try:
             store = membership.open_store(
-                address, bytes.fromhex(os.environ[membership.JOIN_SECRET_ENV]), left_s()
+                address, bytes.fromhex(os.environ[membership.SHARED_SECRET_ENV]), left_s()
             )
             connection = membership.open_node_supervisor_connection(
                 store, self._node, self._ranks, socket.gethostname(), left_s()
@@ -416,7 +416,7 @@ class NodeSupervisor:
         except PermissionError as error:
             self._logger.error(
                 f"The store at {address} belongs to another deployment. Its values are not signed with this "
-                f"supervisor's join secret ({error})"
+                f"supervisor's shared secret ({error})"
             )
             self._refused = True
             return
@@ -464,7 +464,7 @@ class NodeSupervisor:
         if view.record.state not in (
             self._membership.MembershipState.STARTING,
             self._membership.MembershipState.SHUTDOWN,
-            self._membership.MembershipState.ABORT,
+            self._membership.MembershipState.ABORTED,
         ):
             self._served = True
         if self._host_weights_prefix is None:
@@ -476,7 +476,7 @@ class NodeSupervisor:
             if prefix is not None:
                 self._host_weights_prefix = prefix.decode()
 
-    def _relaunch_lost_nodes(self, now_s: float) -> None:
+    def _relaunch_failed_nodes(self, now_s: float) -> None:
         """Relaunch the supervisor of every node whose supervisor left."""
         for node, host, connected in self._view.nodes:
             relaunched = self._relaunched.get(node)
@@ -493,7 +493,7 @@ class NodeSupervisor:
                 continue
             self._relaunches.delay(node, now_s)
             self._wake_at_s.append(self._relaunches.due_s(node))
-            self._logger.warning(f"Node {node} ({host}) was lost. Relaunching its supervisor.")
+            self._logger.warning(f"Node {node} ({host}) failed. Relaunching its supervisor.")
             command = [
                 *self._relaunch_command,
                 "--host",
@@ -607,7 +607,7 @@ def _prrte_job_control(
         from tensorrt_llm.logger import logger
 
         logger.error(
-            "Started by mpirun without a PMIx server URI, prun, or pterm. A lost node is not relaunched, and "
+            "Started by mpirun without a PMIx server URI, prun, or pterm. A failed node is not relaunched, and "
             "the end of rank 0 does not end the job."
         )
         return None, None
@@ -628,7 +628,7 @@ def _prrte_job_control(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="_llmapi_node_supervisor.py",
-        description="WideEP fault tolerance: supervise the ranks of one node",
+        description="Wide-EP fault tolerance: supervise the ranks of one node",
     )
     parser.add_argument("--node-rank", type=int, required=True)
     parser.add_argument("--nodes", type=int, required=True)
@@ -663,7 +663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         and not args.rank_0_in_session
     ):
         parser.error(
-            "WideEP fault tolerance does not support node supervisors started as Slurm tasks (srun): Slurm's PMIx "
+            "Wide-EP fault tolerance does not support node supervisors started as Slurm tasks (srun): Slurm's PMIx "
             "plugin cancels the whole job step when one of them exits. Start trtllm-llmapi-launch with `mpirun "
             "--enable-recovery` inside the allocation (submitted with --no-requeue)"
         )

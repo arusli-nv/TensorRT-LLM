@@ -25,7 +25,7 @@ def store_context_logits(
     """Consume context rows from either projection path using one result contract.
 
     Prompt logprobs are reduced on the logits' device; only the reduced rows and
-    the final prompt row's log probabilities reach host memory. With WideEP
+    the final prompt row's log probabilities reach host memory. With Wide-EP
     fault tolerance a replayed prefill stores only the positions past its
     stored rows.
 

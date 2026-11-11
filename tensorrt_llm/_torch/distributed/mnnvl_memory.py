@@ -41,7 +41,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .membership import StoreGroup
-from .mnnvl_live_group import (
+from .mnnvl_active_group import (
     MnnvlMappingError,
     MnnvlPeerHandleError,
     _mapping_outcome,
@@ -584,8 +584,8 @@ class MnnvlMemory:
         """Export this rank's handle, import the others' through ``comm`` and map every row not in ``mapped_handles``.
 
         Raises:
-            MnnvlPeerHandleError: A live peer's handle could not be imported.
-            MnnvlMappingError: Some live rank could not export its handle.
+            MnnvlPeerHandleError: An active peer's handle could not be imported.
+            MnnvlMappingError: Some active rank could not export its handle.
         """
         kept = [None] * comm.Get_size() if mapped_handles is None else list(mapped_handles)
         local_handle = None
@@ -635,8 +635,8 @@ class MnnvlMemory:
                 },
                 operation="handle export",
             )
-            live = [rank for rank, payload in enumerate(exported_by_rank) if payload is not None]
-            export_failed = [rank for rank in live if exported_by_rank[rank]["error"] is not None]
+            active = [rank for rank, payload in enumerate(exported_by_rank) if payload is not None]
+            export_failed = [rank for rank in active if exported_by_rank[rank]["error"] is not None]
             if export_failed:
                 raise MnnvlMappingError(
                     export_failed,
@@ -645,17 +645,17 @@ class MnnvlMemory:
                         f"rank {rank}: {exported_by_rank[rank]['error']}" for rank in export_failed
                     ),
                 )
-            fabric_modes = {exported_by_rank[rank]["is_fabric"] for rank in live}
+            fabric_modes = {exported_by_rank[rank]["is_fabric"] for rank in active}
             if len(fabric_modes) != 1:
                 raise RuntimeError("MNNVL ranks selected inconsistent shareable handle types")
             is_fabric = fabric_modes.pop()
             all_handles_data = [None] * len(exported_by_rank)
             if is_fabric:
-                for rank in live:
+                for rank in active:
                     all_handles_data[rank] = exported_by_rank[rank]["handle"]
             else:
-                all_exported_fds = [exported_by_rank[rank]["handle"] for rank in live]
-                all_pids = [exported_by_rank[rank]["pid"] for rank in live]
+                all_exported_fds = [exported_by_rank[rank]["handle"] for rank in active]
+                all_pids = [exported_by_rank[rank]["pid"] for rank in active]
                 syscall = ctypes.CDLL(None, use_errno=True).syscall
                 fd_import_error = None
                 try:
@@ -704,7 +704,7 @@ class MnnvlMemory:
                         "MNNVL POSIX file descriptor import failed on one or more ranks:\n"
                         + "\n".join(failed_ranks)
                     )
-                for rank, remote_fd in zip(live, remote_fds):
+                for rank, remote_fd in zip(active, remote_fds):
                     all_handles_data[rank] = remote_fd
 
             access_desc = cuda.CUmemAccessDesc()
@@ -939,7 +939,7 @@ class MnnvlMemory:
     def stale_rows(self, gather: Callable[[Any], Sequence[Any]]) -> frozenset[int]:
         """Return the rows that need fresh pages because a former member may still write into them.
 
-        The pages are kept only if every rank that mapped them is live and mapped them with the same ranks. Collective
+        The pages are kept only if every rank that mapped them is active and mapped them with the same ranks. Collective
         over the ranks ``gather`` reaches.
         """
         record = type(self).allocated_map[self.ptr]
@@ -961,15 +961,15 @@ class MnnvlMemory:
         return frozenset(record.comm_membership) if stale else frozenset()
 
     def remap(self, gather: Callable[[Any], Sequence[Any]], fresh_rows: frozenset[int]) -> None:
-        """Map the allocation among the live ranks at the same addresses, the rows in ``fresh_rows`` on fresh pages.
+        """Map the allocation among the active ranks at the same addresses, the rows in ``fresh_rows`` on fresh pages.
 
-        A former member's late writes then land in pages no live rank maps. Collective over the ranks ``gather``
-        reaches. Every live rank either maps or raises the same error type.
+        A former member's late writes then land in pages no active rank maps. Collective over the ranks ``gather``
+        reaches. Every active rank either maps or raises the same error type.
 
         Raises:
-            MnnvlPeerHandleError: Some live rank could not import a peer's handle.
-            MnnvlMappingError: Mapping failed on some live ranks for another reason.
-            RuntimeError: This rank's row is unmapped but not in ``fresh_rows``, or a kept row's rank is not live.
+            MnnvlPeerHandleError: Some active rank could not import a peer's handle.
+            MnnvlMappingError: Mapping failed on some active ranks for another reason.
+            RuntimeError: This rank's row is unmapped but not in ``fresh_rows``, or a kept row's rank is not active.
         """
         start_s = time.perf_counter()
         cls = type(self)
@@ -1053,10 +1053,10 @@ class MnnvlMemory:
             for index, (rank, handle) in enumerate(zip(record.comm_membership, handles))
             if handle is not None and outcomes[rank] is None
         )
-        live = sum(reported is not None for reported in outcomes)
-        imported = live - sum(handle is not None for handle in kept) - own_row_fresh
+        active = sum(reported is not None for reported in outcomes)
+        imported = active - sum(handle is not None for handle in kept) - own_row_fresh
         logger.info(
-            f"MNNVL remap of {cls.__name__} at {self.ptr:#x} among {live} live ranks: "
+            f"MNNVL remap of {cls.__name__} at {self.ptr:#x} among {active} active ranks: "
             f"{sum(outcomes[rank] is not None for rank in fresh_rows)} rows on fresh pages, imported "
             f"{imported} rows in {(time.perf_counter() - start_s) * 1e3:.1f} ms"
         )

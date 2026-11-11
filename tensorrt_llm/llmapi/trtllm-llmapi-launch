@@ -55,7 +55,7 @@ function mpi_world_size {
 }
 
 # Prefer OMPI_*, since mpirun inside a Slurm allocation passes the batch step's SLURM_* variables.
-if [ -n "$TLLM_FAULT_TOLERANCE_JOIN_SECRET" ] && [ -z "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+if [ -n "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] && [ -z "$TLLM_FAULT_TOLERANCE_RANK" ]; then
     launcher_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     exec python3 "$launcher_directory/_llmapi_node_supervisor.py" \
         --node-rank "${OMPI_COMM_WORLD_RANK:-$mpi_rank}" \
@@ -449,7 +449,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
             # from the server, before falling back to the server's status.
             [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
             # Rank 0's worker stops the server after a fault-tolerant deployment shuts down.
-            [ -n "$TLLM_FAULT_TOLERANCE_JOIN_SECRET" ] && [ "$server_shut_down" -eq 1 ] && exit 0
+            [ -n "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] && [ "$server_shut_down" -eq 1 ] && exit 0
             exit "$server_exit_code"
         fi
         sleep 0.1

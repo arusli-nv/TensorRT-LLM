@@ -233,7 +233,7 @@ class StartupRecord:
     ) -> bool:
         if bound is None:
             return False
-        # Only processes with the join secret write the rendezvous store the record comes from.
+        # Only processes with the shared secret write the rendezvous store the record comes from.
         values = [pickle.loads(p) for p in payloads if p is not None]  # nosec B301
         result = values[0]
         for value in values[1:]:

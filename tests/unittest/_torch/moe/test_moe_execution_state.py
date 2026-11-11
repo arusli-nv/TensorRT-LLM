@@ -36,7 +36,7 @@ def _frontend(health: EPGroupHealth | None, *, cft: bool = False) -> NVLinkOneSi
 
 
 _EP_SIZE, _TOKENS, _HIDDEN = 2, 8, 128
-# Word of the abort record holding the wait evidence on peer 0.
+# Word of the abort state holding the wait evidence on peer 0.
 _EVIDENCE = int(internal.thop.MOE_A2A_ABORT_WAIT_EVIDENCE_INDEX)
 
 
@@ -160,7 +160,7 @@ def test_abort_rearm_and_exclusion_resume_after_rank_failure_mid_collective() ->
     assert _workspace_word(workspace, meta, 1, "COMBINE_COMPLETION_FLAGS", 0) == 0
 
     health.mark_failed(1)
-    with pytest.raises(RuntimeError, match="abort record"):
+    with pytest.raises(RuntimeError, match="abort state"):
         state.install_mask()
     assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
     state.rearm()
@@ -292,7 +292,7 @@ def test_layers_of_one_membership_share_one_mask_record() -> None:
     assert MoeExecutionState.for_health(health, torch.device("cuda")) is state
     assert MoeExecutionState.for_health(EPGroupHealth(2), torch.device("cuda")) is not state
     assert state.abort is None
-    with pytest.raises(RuntimeError, match="without an abort record binds no layer"):
+    with pytest.raises(RuntimeError, match="without an abort state binds no layer"):
         _frontend(health).bind_execution_state(state)
 
 
@@ -365,7 +365,7 @@ def _collective_frontend(health: EPGroupHealth | None) -> NVLinkOneSided:
 @pytest.mark.cpu_only
 def test_only_a_bound_layer_hands_the_ops_an_abort_record(monkeypatch) -> None:
     """Without rank-mask mode, dispatch and combine call the all-to-all ops with their positional
-    arguments only; a bound layer adds its state's abort record, settled when it binds."""
+    arguments only; a bound layer adds its state's abort state, settled when it binds."""
     calls = []
     received = [
         torch.zeros(_EP_SIZE, _TOKENS, _HIDDEN),

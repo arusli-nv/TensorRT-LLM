@@ -218,7 +218,7 @@ def _init_userbuffers(
     if llm_args.enable_wide_ep_fault_tolerance:
         logger.info(
             "Disabling userbuffers: its bootstrap requires an MPI world of all "
-            "ranks, and WideEP fault tolerance runs each rank in its own."
+            "ranks, and Wide-EP fault tolerance runs each rank in its own."
         )
         return False
 

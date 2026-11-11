@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The WideEP fault-tolerance node supervisor, with fake ranks and a fake membership authority.
+"""The Wide-EP fault-tolerance node supervisor, with fake ranks and a fake membership authority.
 
 The authority is a real rendezvous store with a listener that speaks the authority's side of a node supervisor's
 connection and sends the views a test gives it. The supervisor runs in a thread, or as a process where a test sends
@@ -26,13 +26,13 @@ from torch.distributed import TCPStore
 
 from tensorrt_llm._torch.distributed.membership import (
     HOST_WEIGHTS_PREFIX_KEY,
-    JOIN_SECRET_ENV,
     LIVENESS_KEY,
     RENDEZVOUS_ENV,
+    SHARED_SECRET_ENV,
     MembershipRecord,
     MembershipState,
     NodeView,
-    SignedStore,
+    RendezvousStore,
 )
 
 # The tests run supervisors, ranks and launchers as processes: one that hangs fails its test, not the job.
@@ -101,10 +101,10 @@ sys.exit(module.main())
 
 
 def _record(
-    state=MembershipState.COMMITTED, live_mask=0b1111, incarnations=(0, 0, 0, 0), generation=1
+    state=MembershipState.COMMITTED, active_mask=0b1111, incarnations=(0, 0, 0, 0), generation=1
 ):
     return MembershipRecord(
-        generation=generation, state=state, live_mask=live_mask, incarnations=incarnations
+        generation=generation, state=state, active_mask=active_mask, incarnations=incarnations
     )
 
 
@@ -138,7 +138,7 @@ class FakeAuthority:
         if record is not None:
             self._view = NodeView(record=record, nodes=nodes)
         port = self._reserved.getsockname()[1]
-        self.store = SignedStore(
+        self.store = RendezvousStore(
             TCPStore("127.0.0.1", port, is_master=True, wait_for_workers=False), self._secret
         )
         self.store.set(LIVENESS_KEY, f"127.0.0.1:{self._listener.getsockname()[1]}".encode())
@@ -204,12 +204,12 @@ class FakeAuthority:
 
 @pytest.fixture
 def deployment(tmp_path, monkeypatch):
-    """The deployment's join secret and authority (not started), and this test's fake rank.
+    """The deployment's shared secret and authority (not started), and this test's fake rank.
 
     Returns the authority and the environment the node's launcher would give the supervisor.
     """
     secret = secrets.token_hex(32)
-    monkeypatch.setenv(JOIN_SECRET_ENV, secret)
+    monkeypatch.setenv(SHARED_SECRET_ENV, secret)
     authority = FakeAuthority(secret)
     monkeypatch.setenv(RENDEZVOUS_ENV, authority.address)
     (tmp_path / "rank.py").write_text(_RANK)
@@ -304,8 +304,8 @@ def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deplo
             if key != "OMPI_MCA_btl"
         )
         assert started["environ"]["OMPI_MCA_btl"] == "^sm"  # no /dev/shm segment to leave behind
-        assert started["environ"][JOIN_SECRET_ENV] == os.environ[JOIN_SECRET_ENV]
-        assert os.environ[JOIN_SECRET_ENV] not in " ".join(started["argv"])
+        assert started["environ"][SHARED_SECRET_ENV] == os.environ[SHARED_SECRET_ENV]
+        assert os.environ[SHARED_SECRET_ENV] not in " ".join(started["argv"])
     assert authority.hellos == [["node", "1", "2,3", socket.gethostname()]]
     authority.push(_record(MembershipState.SHUTDOWN))
     assert running.wait() == 0
@@ -321,7 +321,7 @@ def test_a_crashed_rank_is_replaced_on_its_gpu_once_the_record_lists_it_as_faile
     # The record still lists it: the authority has not decided yet.
     _push_and_wait_for_step(running, authority, _record(generation=2))
     assert not running.supervisor._processes[3].replacement
-    authority.push(_record(MembershipState.PROPOSE, live_mask=0b0111))
+    authority.push(_record(MembershipState.PROPOSE, active_mask=0b0111))
     _until(lambda: _read(tmp_path, 3, 1))
     replacement = _read(tmp_path, 3, 1)
     assert replacement["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == "3,4,2,1"
@@ -336,10 +336,10 @@ def test_a_rank_the_authority_excludes_while_it_runs_is_killed_and_replaced(tmp_
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     hung = _read(tmp_path, 3, 0)["pid"]
-    authority.push(_record(MembershipState.PROPOSE, live_mask=0b0111))
+    authority.push(_record(MembershipState.PROPOSE, active_mask=0b0111))
     _until(lambda: _read(tmp_path, 3, 1))
     assert not _alive(hung)
-    authority.push(_record(MembershipState.ABORT, live_mask=0b0111))
+    authority.push(_record(MembershipState.ABORTED, active_mask=0b0111))
     assert running.wait() == 1
 
 
@@ -352,16 +352,16 @@ def test_a_replacement_that_ends_before_its_admission_is_started_again_unless_it
     environ["SUPERVISOR_TEST_MODES"] = "3:1=fails 3:2=cannot-start"
     running = _serving(tmp_path, authority, environ)
     os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
-    authority.push(_record(MembershipState.COMMITTED, live_mask=0b0111))
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
     _until(lambda: _read(tmp_path, 3, 2))
     _until(lambda: running.supervisor._given_up == {3})
     _push_and_wait_for_step(
-        running, authority, _record(MembershipState.COMMITTED, live_mask=0b0111, generation=2)
+        running, authority, _record(MembershipState.COMMITTED, active_mask=0b0111, generation=2)
     )
     # No replacement runs, as another one would fail alike.
     assert running.supervisor._processes[3].status is not None
     assert running.supervisor._given_up == {3}
-    authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0111))
+    authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0111))
     assert running.wait() == 0
 
 
@@ -375,7 +375,7 @@ def test_a_replacement_the_change_that_would_add_it_leaves_out_is_killed_and_sta
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
-    authority.push(_record(MembershipState.PROPOSE, live_mask=0b0111))
+    authority.push(_record(MembershipState.PROPOSE, active_mask=0b0111))
     _until(lambda: _read(tmp_path, 3, 1))
     joining = _read(tmp_path, 3, 1)["pid"]
     joined = (0, 0, 0, 1)
@@ -385,7 +385,7 @@ def test_a_replacement_the_change_that_would_add_it_leaves_out_is_killed_and_sta
     authority.push(_record(MembershipState.PROPOSE, 0b0111, incarnations=joined, generation=3))
     _until(lambda: not _alive(joining))
     _until(lambda: _read(tmp_path, 3, 2))
-    authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0111, generation=3))
+    authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0111, generation=3))
     assert running.wait() == 0
 
 
@@ -463,7 +463,7 @@ def test_rank_0_in_the_session_is_started_by_the_session(tmp_path, deployment):
     assert running.wait() == 0
 
 
-def test_a_supervisor_given_another_deployment_s_join_secret_ends(
+def test_a_supervisor_given_another_deployment_s_shared_secret_ends(
     tmp_path, deployment, monkeypatch
 ):
     """The store's values are not signed with its secret: it ends with status 1 and starts no rank.
@@ -472,7 +472,7 @@ def test_a_supervisor_given_another_deployment_s_join_secret_ends(
     """
     authority, environ = deployment
     authority.start()
-    monkeypatch.setenv(JOIN_SECRET_ENV, secrets.token_hex(32))
+    monkeypatch.setenv(SHARED_SECRET_ENV, secrets.token_hex(32))
     supervisor = supervisor_module.NodeSupervisor(
         NODE, NODES, GPUS, [sys.executable, str(tmp_path / "rank.py")], environ
     )
@@ -494,7 +494,7 @@ def test_a_node_has_one_supervisor_of_a_deployment(tmp_path, deployment):
 def test_a_supervisor_the_authority_refuses_ends(tmp_path, monkeypatch):
     """Another one supervises its node or one of its ranks."""
     secret = secrets.token_hex(32)
-    monkeypatch.setenv(JOIN_SECRET_ENV, secret)
+    monkeypatch.setenv(SHARED_SECRET_ENV, secret)
     authority = FakeAuthority(secret, refuse=True).start()
     monkeypatch.setenv(RENDEZVOUS_ENV, authority.address)
     try:
@@ -511,16 +511,16 @@ def test_a_supervisor_the_authority_refuses_ends(tmp_path, monkeypatch):
         authority.close()
 
 
-def test_a_supervisor_started_while_the_deployment_serves_replaces_its_lost_ranks(
+def test_a_supervisor_started_while_the_deployment_serves_replaces_its_failed_ranks(
     tmp_path, deployment
 ):
-    """The node's launch started again after the node was lost: no original rank, a replacement for each rank."""
+    """The node's launch started again after the node failed: no original rank, a replacement for each rank."""
     authority, environ = deployment
-    authority.start(_record(MembershipState.COMMITTED, live_mask=0b0011))
+    authority.start(_record(MembershipState.COMMITTED, active_mask=0b0011))
     running = Running(tmp_path, environ)
     _until(lambda: _read(tmp_path, 2, 1) and _read(tmp_path, 3, 1))
     assert _read(tmp_path, 2, 0) is None and _read(tmp_path, 3, 0) is None
-    authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0011))
+    authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0011))
     assert running.wait() == 0
 
 
@@ -764,7 +764,7 @@ while not os.path.exists(os.path.join(root, "prun-exit")):
 """
 
 
-def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
+def test_node_0_relaunches_a_failed_node_once_through_prun(tmp_path, deployment):
     """Node 0 relaunches a node whose supervisor left, through the job's PRRTE.
 
     The deployment's environment goes on standard input, never on the command line; once, while that one runs or
@@ -775,14 +775,14 @@ def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
     prun.write_text(_FAKE_PRUN % {"root": str(tmp_path)})
     prun.chmod(0o755)
     nodes = ((0, "host-0", True), (1, "host-1", True))
-    lost = ((0, "host-0", True), (1, "host-1", False))
+    node_1_failed = ((0, "host-0", True), (1, "host-1", False))
     running = _serving(
         tmp_path, authority, environ, node=0, relaunch_command=[str(prun), "--dvm-uri", "uri"]
     )
     _push_and_wait_for_step(running, authority, _record(), nodes)
     assert not running.supervisor._relaunched
     for _ in range(10):  # the record comes again, also changed
-        authority.push(_record(MembershipState.PROPOSE, live_mask=0b0011), lost)
+        authority.push(_record(MembershipState.PROPOSE, active_mask=0b0011), node_1_failed)
         time.sleep(0.05)
     _until(lambda: (tmp_path / "prun-0.stdin").exists() and (tmp_path / "prun-0.stdin").read_text())
     args = (tmp_path / "prun-0.args").read_text().split("\n")
@@ -804,24 +804,24 @@ def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
         sys.executable,
         str(tmp_path / "rank.py"),
     ]
-    secret = os.environ[JOIN_SECRET_ENV]
+    secret = os.environ[SHARED_SECRET_ENV]
     assert secret not in " ".join(args)
     relaunched_environ = json.loads((tmp_path / "prun-0.stdin").read_text())
-    assert relaunched_environ[JOIN_SECRET_ENV] == secret
+    assert relaunched_environ[SHARED_SECRET_ENV] == secret
     assert not any(
         key.startswith(("OMPI_", "PMIX_")) for key in relaunched_environ if key != "OMPI_MCA_btl"
     )
     assert relaunched_environ["OMPI_MCA_btl"] == "^sm"
-    connected = _record(MembershipState.COMMITTED, live_mask=0b0011)
+    connected = _record(MembershipState.COMMITTED, active_mask=0b0011)
     _push_and_wait_for_step(running, authority, connected, nodes)
     # Still the first relaunch, which a later one would have replaced.
     assert running.supervisor._relaunched[1].pid == int((tmp_path / "prun-0.pid").read_text())
-    authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0011), nodes)
+    authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0011), nodes)
     assert running.wait() == 0
 
 
 def test_a_relaunched_supervisor_takes_its_environment_from_standard_input(tmp_path, deployment):
-    """Prun forwards no value: the environment, the join secret included, comes in one JSON line."""
+    """Prun forwards no value: the environment, the shared secret included, comes in one JSON line."""
     authority, environ = deployment
     bare = {"PATH": os.environ["PATH"], "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
     supervisor = _supervisor_process(
@@ -836,7 +836,7 @@ def test_a_relaunched_supervisor_takes_its_environment_from_standard_input(tmp_p
         supervisor.stdin.write(json.dumps(environ).encode() + b"\n")
         supervisor.stdin.close()
         _until(lambda: _read(tmp_path, 2, 0))
-        assert _read(tmp_path, 2, 0)["environ"][JOIN_SECRET_ENV] == os.environ[JOIN_SECRET_ENV]
+        assert _read(tmp_path, 2, 0)["environ"][SHARED_SECRET_ENV] == os.environ[SHARED_SECRET_ENV]
         authority.start()
         _until(lambda: authority.hellos)
         authority.push(_record(MembershipState.SHUTDOWN))
@@ -887,11 +887,11 @@ def _run_launcher(tmp_path, procid, task, **extra):
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])
 def test_under_fault_tolerance_the_launch_of_a_node_runs_its_supervisor(tmp_path, fault_tolerance):
-    """The exported join secret is all the launcher sees of fault tolerance.
+    """The exported shared secret is all the launcher sees of fault tolerance.
 
     Its launch on node 1 of 2 runs the node supervisor, which runs this launcher for each rank of the node.
     """
-    extra = {"TLLM_FAULT_TOLERANCE_JOIN_SECRET": secrets.token_hex(32)} if fault_tolerance else {}
+    extra = {"TLLM_FAULT_TOLERANCE_SHARED_SECRET": secrets.token_hex(32)} if fault_tolerance else {}
     result = _run_launcher(tmp_path, 1, ["task"], **extra)
     assert result.returncode == 0, result.stderr
     args = (tmp_path / "python3-args").read_text().split()
@@ -914,7 +914,7 @@ def test_under_mpirun_in_a_slurm_allocation_a_node_s_launch_takes_mpirun_s_rank(
         tmp_path,
         0,
         ["task"],
-        TLLM_FAULT_TOLERANCE_JOIN_SECRET=secrets.token_hex(32),
+        TLLM_FAULT_TOLERANCE_SHARED_SECRET=secrets.token_hex(32),
         OMPI_COMM_WORLD_RANK="1",
         OMPI_COMM_WORLD_SIZE="3",
     )
@@ -933,7 +933,7 @@ def test_a_rank_the_node_supervisor_starts_takes_its_rank_from_its_identity(tmp_
         tmp_path,
         0,
         ["task"],
-        TLLM_FAULT_TOLERANCE_JOIN_SECRET=secrets.token_hex(32),
+        TLLM_FAULT_TOLERANCE_SHARED_SECRET=secrets.token_hex(32),
         TLLM_FAULT_TOLERANCE_RANK="3,4,2,0",
     )
     assert result.returncode == 0, result.stderr
@@ -964,7 +964,7 @@ def test_rank_0_s_server_ending_before_its_task_fails_only_without_fault_toleran
         extra = {}
         if fault_tolerance:
             extra = {
-                "TLLM_FAULT_TOLERANCE_JOIN_SECRET": secrets.token_hex(32),
+                "TLLM_FAULT_TOLERANCE_SHARED_SECRET": secrets.token_hex(32),
                 "TLLM_FAULT_TOLERANCE_RENDEZVOUS": f"127.0.0.1:{port}",
                 "TLLM_FAULT_TOLERANCE_RANK": "0,4,2,0",
             }

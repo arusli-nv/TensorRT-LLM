@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""With WideEP fault tolerance every rank is its own process (a one-process MPI world). Four such processes, started
+"""With Wide-EP fault tolerance every rank is its own process (a one-process MPI world). Four such processes, started
 independently on four GPUs, meet in the rendezvous store: they build MnnvlDist's host collectives and an
 NVLinkOneSided workspace and round-trip a dispatch and combine. A replacement rank alone builds both with only its
-own rank live. Run directly, this file is one such rank."""
+own rank active. Run directly, this file is one such rank."""
 
 import json
 import os
@@ -51,8 +51,8 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     check(MPI.COMM_WORLD.Get_size() == 1, "the rank is not its own MPI world")
     set_wide_ep_fault_tolerance_enabled(True)
     torch.cuda.set_device(rank)
-    # Stands for the membership agent the worker's entry starts, which takes the startup collectives' reports.
-    recovery._agent = Mock()
+    # Stands for the membership client the worker's entry starts, which takes the startup collectives' reports.
+    recovery._client = Mock()
     if incarnation:
         # The startup record rank 0 published: its ranks agreed on nothing before this point.
         startup_record.replay({"values": {}, "exchanges": []})
@@ -67,13 +67,13 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     recovery.join_startup_group(mapping)
     # Past the startup record (a replacement's host collectives reach only itself).
     startup_record.close()
-    live = [rank] if incarnation else list(range(world_size))
+    active = [rank] if incarnation else list(range(world_size))
     dist = MnnvlDist(mapping)
     check(
-        dist.tp_allgather(rank) == [r if r in live else None for r in range(world_size)],
+        dist.tp_allgather(rank) == [r if r in active else None for r in range(world_size)],
         "host collective",
     )
-    check(dist.allreduce(rank + 1) == sum(r + 1 for r in live), "host reduction")
+    check(dist.allreduce(rank + 1) == sum(r + 1 for r in active), "host reduction")
 
     hidden, top_k, capacity, slots_per_rank = 256, 2, 8, 2
     comm = NVLinkOneSided(
@@ -110,7 +110,7 @@ def _spawn(rank: int, identity: str, port: int, secret: str) -> subprocess.Popen
     env.update(
         TLLM_FAULT_TOLERANCE_RANK=identity,
         TLLM_FAULT_TOLERANCE_RENDEZVOUS=f"127.0.0.1:{port}",
-        TLLM_FAULT_TOLERANCE_JOIN_SECRET=secret,
+        TLLM_FAULT_TOLERANCE_SHARED_SECRET=secret,
     )
     return subprocess.Popen(  # nosec B603
         [sys.executable, __file__, identity], env=env, stdout=subprocess.PIPE, text=True
@@ -128,7 +128,7 @@ def _results(processes, timeout_s=900):
 
 @pytest.fixture
 def rendezvous():
-    """The rendezvous store, as the authority hosts it: its port and the join secret."""
+    """The rendezvous store, as the authority hosts it: its port and the shared secret."""
     from torch.distributed import TCPStore
 
     store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)

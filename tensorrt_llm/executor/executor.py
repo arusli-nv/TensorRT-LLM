@@ -652,7 +652,7 @@ class GenerationExecutor(ABC):
         if wide_ep_fault_tolerance_enabled():
             if global_mpi_size() > 1:
                 raise ValueError(
-                    "WideEP fault tolerance starts every rank as its own "
+                    "Wide-EP fault tolerance starts every rank as its own "
                     "process: start the server or script once, under "
                     "trtllm-llmapi-launch for several nodes, not on every "
                     "rank of an MPI job")

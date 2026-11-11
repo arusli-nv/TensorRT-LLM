@@ -839,7 +839,7 @@ bool cpuHoldsSignal(SingleLayerMoeLoadBalancer& layer)
         == tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal::kCPU;
 }
 
-// One EP rank of a model with online EPLB under WideEP fault tolerance, its weights in GPU-copied slots. Every byte of
+// One EP rank of a model with online EPLB under Wide-EP fault tolerance, its weights in GPU-copied slots. Every byte of
 // expert e's weight in layer l is expertByte(l, e); an empty slot's bytes are 0.
 class SimulatedEpRank
 {
@@ -1023,7 +1023,7 @@ TEST(MoeLoadBalancerAbandonTest, SurvivorsInterruptedAtDifferentLayersResumeFrom
     // One agreed placement: rank 3's expert 4 moves into rank 0's spare slot. Each survivor's restore loads the local
     // slots whose expert differs from its own placement.
     Placement const restored{{0, 1, 4}, {2, 0, -1}, {3, 1, -1}, {4, 2, -1}};
-    Placement const restoredLive{{0, 1, 4}, {2, 0, -1}, {3, 1, -1}, {-1, -1, -1}};
+    Placement const restoredActive{{0, 1, 4}, {2, 0, -1}, {3, 1, -1}, {-1, -1, -1}};
     for (auto& rank : survivors)
     {
         rank->balancer().restorePlacement({kFailedRank}, {restored, restored});
@@ -1032,7 +1032,7 @@ TEST(MoeLoadBalancerAbandonTest, SurvivorsInterruptedAtDifferentLayersResumeFrom
     {
         for (int layerId = 0; layerId < kLayerCount; ++layerId)
         {
-            EXPECT_EQ(rank->layer(layerId).getOldRankExpertIds(), restoredLive);
+            EXPECT_EQ(rank->layer(layerId).getOldRankExpertIds(), restoredActive);
             EXPECT_EQ(rank->routingTable(layerId), survivors[0]->routingTable(layerId));
             rank->expectSlotsHoldPlacement(layerId);
         }
@@ -1053,14 +1053,14 @@ TEST(MoeLoadBalancerAbandonTest, SurvivorsInterruptedAtDifferentLayersResumeFrom
         rank->balancer().shutdown();
     }
     auto const updated = survivors[0]->layer(0).getOldRankExpertIds();
-    EXPECT_NE(updated, restoredLive);
+    EXPECT_NE(updated, restoredActive);
     EXPECT_EQ(updated[kFailedRank], (std::vector<int>{-1, -1, -1}));
     EXPECT_EQ(updated[1][2], -1);
     EXPECT_EQ(updated[2][2], -1);
     for (auto& rank : survivors)
     {
         EXPECT_EQ(rank->layer(0).getOldRankExpertIds(), updated);
-        EXPECT_EQ(rank->layer(1).getOldRankExpertIds(), restoredLive);
+        EXPECT_EQ(rank->layer(1).getOldRankExpertIds(), restoredActive);
         rank->expectSlotsHoldPlacement(0);
         rank->expectSlotsHoldPlacement(1);
     }

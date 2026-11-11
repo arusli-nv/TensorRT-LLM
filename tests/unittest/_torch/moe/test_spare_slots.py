@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The spare slots WideEP fault tolerance adds to EPLB so that the live ranks after a failure can hold every
+"""The spare slots Wide-EP fault tolerance adds to EPLB so that the active ranks after a failure can hold every
 expert."""
 
 import os
@@ -25,9 +25,9 @@ from tensorrt_llm._torch.distributed.membership import (
     ReplacementCannotStart,
 )
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
-    DeploymentHostCopies,
+    DeploymentHostWeights,
     EplbExpertRestore,
-    host_copies_key,
+    host_weights_key,
     plan_layer_placement,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
@@ -47,14 +47,14 @@ EXPERTS = 4
 
 @pytest.fixture(autouse=True)
 def deployment_nonce(monkeypatch):
-    """Each test's own deployment nonce, which names its host copies."""
+    """Each test's own deployment nonce, which names its host weights."""
     monkeypatch.setattr(rank_failure_recovery, "_deployment_nonce", secrets.token_hex(8))
 
 
 def _load_balancer(
     monkeypatch, *, largest_failure, eplb_slots, layer_updates_per_iter=1, ep_rank=0
 ):
-    """A MoeLoadBalancer with WideEP fault tolerance over one native layer of ``eplb_slots`` per rank, whose
+    """A MoeLoadBalancer with Wide-EP fault tolerance over one native layer of ``eplb_slots`` per rank, whose
     largest failure takes ``largest_failure`` ranks."""
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
@@ -64,7 +64,7 @@ def _load_balancer(
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(_USES_GDRCOPY, return_value=True),
-        patch(f"{_ER}.DeploymentHostCopies"),
+        patch(f"{_ER}.DeploymentHostWeights"),
         patch("torch.cuda.Event"),
     ):
         load_balancer = MoeLoadBalancer(ep_rank, WORLD_SIZE, layer_updates_per_iter)
@@ -122,11 +122,11 @@ def test_the_nodes_of_the_ranks_follow_gpus_per_node():
 @pytest.mark.parametrize(
     "largest_failure, eplb_slots, spare_slot_count",
     [
-        # A node of two: the two live ranks need two slots each for four experts.
+        # A node of two: the two active ranks need two slots each for four experts.
         (2, 1, 1),
-        # One rank: the three live ranks still need two slots each.
+        # One rank: the three active ranks still need two slots each.
         (1, 1, 1),
-        # Replicas: the node may hold both replicas of up to four experts, which the live ranks' spare slots take.
+        # Replicas: the node may hold both replicas of up to four experts, which the active ranks' spare slots take.
         (2, 2, 2),
         # No rank to lose: no spare slot is added.
         (0, 1, 0),
@@ -214,7 +214,7 @@ def test_spare_slots_start_empty_and_without_memory(monkeypatch, layer_updates_p
     )
     migrate.assert_not_called()
     # The C++ weight updater gets every slot, which online EPLB's slot functions register and static routing's
-    # storage migration, and every expert's host weights: restoring a lost rank's experts loads them with GPU copies.
+    # storage migration, and every expert's host weights: restoring a failed rank's experts loads them with GPU copies.
     registered = [
         (call.args[0], call.args[1], call.args[2].weight_ptr)
         for call in impl.add_single_weight_slot.call_args_list
@@ -393,7 +393,7 @@ def test_the_cpp_load_balancer_keeps_the_only_references_to_the_host_weights(
     views go once it has them."""
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    sharer_class = DeploymentHostCopies if fault_tolerance else HostMoeTensorSharer
+    sharer_class = DeploymentHostWeights if fault_tolerance else HostMoeTensorSharer
     sharer = sharer_class(0, 2, MPI.COMM_SELF)
     sharer.set_shared_memory_base_name(f"test_spare_slots_{os.getpid()}")
     for expert_id in range(2):
@@ -491,12 +491,12 @@ def test_slot_tensors_go_to_the_storage_of_their_layer(spare_slot_count):
 
 
 def test_deepseek_r1_ep32_static_256_slots_get_two_spare_slots_per_rank(monkeypatch):
-    """DeepSeek-R1 at EP32 on eight nodes of four GPUs: the 28 live ranks after a node failure need
+    """DeepSeek-R1 at EP32 on eight nodes of four GPUs: the 28 active ranks after a node failure need
     ceil(256 / 28) = 10 slots each, two more than EPLB's 8."""
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
-        patch(f"{_ER}.DeploymentHostCopies"),
+        patch(f"{_ER}.DeploymentHostWeights"),
     ):
         load_balancer = MoeLoadBalancer(
             0, 32, 0, mapping=Mapping(world_size=32, tp_size=32, gpus_per_node=4)
@@ -510,7 +510,7 @@ def _placement(*rows):
     return np.array(rows, dtype=np.int32)
 
 
-def test_a_lost_rank_s_experts_go_to_spare_slots_and_return_when_it_rejoins():
+def test_a_failed_rank_s_experts_go_to_spare_slots_and_return_when_it_rejoins():
     """Static routing at four ranks of two experts and two spare slots each."""
     initial = _placement([0, 1, -1, -1], [2, 3, -1, -1], [4, 5, -1, -1], [6, 7, -1, -1])
     # Rank 3 fails: its experts go to the spare slots of the ranks with the fewest filled.
@@ -534,28 +534,28 @@ def test_a_lost_rank_s_experts_go_to_spare_slots_and_return_when_it_rejoins():
 
 
 def test_a_lost_expert_never_replaces_an_extra_replica():
-    """Only empty spare slots take a lost expert while a rank is lost: the live ranks' active slots keep theirs."""
+    """Only empty spare slots take a lost expert after a rank failed: the active ranks' active slots keep theirs."""
     initial = _placement([0, 1], [2, 3], [0, 1])
-    with pytest.raises(ValueError, match=r"live ranks \[0, 2\] cannot hold expert 2"):
+    with pytest.raises(ValueError, match=r"active ranks \[0, 2\] cannot hold expert 2"):
         plan_layer_placement(initial, initial, np.array([1, 0, 1], bool), 2, 4)
 
 
-def test_a_plan_fails_when_the_live_ranks_cannot_hold_every_expert():
+def test_a_plan_fails_when_the_active_ranks_cannot_hold_every_expert():
     initial = _placement([0, 1], [2, 3])
-    with pytest.raises(ValueError, match=r"live ranks \[0\] cannot hold expert 2"):
+    with pytest.raises(ValueError, match=r"active ranks \[0\] cannot hold expert 2"):
         plan_layer_placement(initial, initial, np.array([1, 0], bool), 2, 4)
 
 
-def test_a_survivor_lost_during_an_admission_leaves_the_spare_slot_the_joining_rank_frees():
-    """Ranks 2 and 3 were lost and their experts restored into the spare slots of ranks 0 and 1. Rank 2's
+def test_a_survivor_failing_during_an_admission_leaves_the_spare_slot_the_joining_rank_frees():
+    """Ranks 2 and 3 failed and their experts were restored into the spare slots of ranks 0 and 1. Rank 2's
     replacement joins, and rank 1 fails before the admission installs. On a join the active slots take their experts
     of the initial placement: the joining rank holds expert 2 again, so rank 0's spare slot that held it takes a lost
-    expert, and the live ranks keep every expert, although only one of their spare slots was empty. The plan is the
-    one rule for this (the membership authority leaves it to the live ranks)."""
+    expert, and the active ranks keep every expert, although only one of their spare slots was empty. The plan is the
+    one rule for this (the membership authority leaves it to the active ranks)."""
     initial = _placement([0, -1], [1, -1], [2, -1], [3, -1])
     agreed = _placement([0, 2], [1, 3], [2, -1], [-1, -1])  # rank 2's row: its own slots
-    live = np.array([True, False, True, False])
-    placement = plan_layer_placement(agreed, initial, live, 1, 4)
+    active = np.array([True, False, True, False])
+    placement = plan_layer_placement(agreed, initial, active, 1, 4)
     np.testing.assert_array_equal(placement, _placement([0, 1], [-1, -1], [2, 3], [-1, -1]))
 
 
@@ -582,8 +582,8 @@ _ONLINE = _placement([1, 0, -1, -1], [3, 2, -1, -1], [2, 0, -1, -1], [1, 2, -1, 
 _ONLINE_WITHOUT_1 = _placement([1, 0, 3, -1], [-1] * 4, [2, 0, -1, -1], [1, 2, -1, -1])
 
 
-def test_every_live_rank_plans_the_same_restore_from_the_agreed_placement(monkeypatch):
-    live = [True, False, True, True]
+def test_every_active_rank_plans_the_same_restore_from_the_agreed_placement(monkeypatch):
+    active = [True, False, True, True]
     # An interrupted online update left rank 2 with another view of the placement than rank 0's.
     views = {
         0: _ONLINE,
@@ -591,12 +591,12 @@ def test_every_live_rank_plans_the_same_restore_from_the_agreed_placement(monkey
     }
     plans = [
         _online_balancer(monkeypatch, view, ep_rank)[0].expert_restore.plan_expert_restore(
-            live, [_ONLINE]
+            active, [_ONLINE]
         )
         for ep_rank, view in views.items()
     ]
     for plan in plans:
-        # Online EPLB keeps the experts the live ranks' active slots hold; expert 3 goes to a spare slot.
+        # Online EPLB keeps the experts the active ranks' active slots hold; expert 3 goes to a spare slot.
         np.testing.assert_array_equal(plan.placements[0], _ONLINE_WITHOUT_1)
     assert plans[0].digest == plans[1].digest
     # Rank 0 backs one 4 MiB slot, rank 2 none.
@@ -617,15 +617,15 @@ def test_the_largest_failure_restore_is_the_most_a_rank_backs_for_a_failure_it_s
     assert load_balancer.expert_restore.largest_failure_restore_bytes() == restore_bytes
 
 
-def test_a_joining_rank_plans_the_same_restore_as_the_live_ranks(monkeypatch):
+def test_a_joining_rank_plans_the_same_restore_as_the_active_ranks(monkeypatch):
     """The joining rank's own view of the deployment is only its startup, and its slots may no longer hold its
     initial experts: the record's joining ranks, not each rank's history, decide that the active slots return to the
     initial placement."""
     # Rank 1's replacement reports its slots holding [3, 2]; its initial experts are [2, 3].
     agreed = _placement([1, 0, 3, -1], [3, 2, -1, -1], [2, 0, -1, -1], [1, 2, -1, -1])
-    live, rejoining = [True] * 4, [False, True, False, False]
+    active, rejoining = [True] * 4, [False, True, False, False]
     survivor, _ = _online_balancer(monkeypatch, _ONLINE_WITHOUT_1)
-    survivor.expert_restore.live_ranks = (
+    survivor.expert_restore.active_ranks = (
         True,
         False,
         True,
@@ -633,7 +633,7 @@ def test_a_joining_rank_plans_the_same_restore_as_the_live_ranks(monkeypatch):
     )  # restored without rank 1 at the failure
     joining, _ = _online_balancer(monkeypatch, agreed, ep_rank=1)
     plans = [
-        balancer.expert_restore.plan_expert_restore(live, [agreed], rejoining=rejoining)
+        balancer.expert_restore.plan_expert_restore(active, [agreed], rejoining=rejoining)
         for balancer in (survivor, joining)
     ]
     assert plans[0].digest == plans[1].digest
@@ -641,20 +641,20 @@ def test_a_joining_rank_plans_the_same_restore_as_the_live_ranks(monkeypatch):
 
 
 def test_a_rejoin_under_online_eplb_empties_every_spare_slot(monkeypatch):
-    """While rank 1 was lost, online EPLB moved expert 1 into rank 0's restored spare slot, so no active slot holds
+    """After rank 1 failed, online EPLB moved expert 1 into rank 0's restored spare slot, so no active slot holds
     it. When rank 1 rejoins, every active slot takes its expert of the initial placement: the active slots hold every
     expert again and every spare slot is empty, the same plan on every rank."""
     degraded = _placement([3, 2, 1, -1], [-1] * 4, [3, 2, -1, -1], [0, 2, -1, -1])
     # The lowest survivor's view, with rank 1's slots as its replacement reports them: its initial experts.
     agreed = degraded.copy()
     agreed[1] = [2, 3, -1, -1]
-    live, rejoining = [True] * 4, [False, True, False, False]
+    active, rejoining = [True] * 4, [False, True, False, False]
     plans = []
     for ep_rank in range(WORLD_SIZE):
         view = agreed if ep_rank == 1 else degraded
         load_balancer, _ = _online_balancer(monkeypatch, view, ep_rank)
         plans.append(
-            load_balancer.expert_restore.plan_expert_restore(live, [agreed], rejoining=rejoining)
+            load_balancer.expert_restore.plan_expert_restore(active, [agreed], rejoining=rejoining)
         )
     assert len({plan.digest for plan in plans}) == 1
     assert [plan.device_bytes for plan in plans] == [0] * WORLD_SIZE
@@ -664,7 +664,7 @@ def test_a_rejoin_under_online_eplb_empties_every_spare_slot(monkeypatch):
 
 @pytest.mark.parametrize("layer_updates_per_iter", [1, 0], ids=["online", "static"])
 def test_active_slots_keep_their_experts_until_a_rank_rejoins(monkeypatch, layer_updates_per_iter):
-    """One rule in both routing modes: a failure leaves the live ranks' active slots as they are (static routing
+    """One rule in both routing modes: a failure leaves the active ranks' active slots as they are (static routing
     never moves them from the initial placement), a join returns them to the initial placement."""
     load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
     monkeypatch.setattr(load_balancer, "layer_updates_per_iter", layer_updates_per_iter)
@@ -676,7 +676,7 @@ def test_active_slots_keep_their_experts_until_a_rank_rejoins(monkeypatch, layer
         [True] * 4, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
     )
     np.testing.assert_array_equal(rejoin.placements[0], _INITIAL)
-    # A rejoining rank that is not live yet (it failed again) changes nothing.
+    # A rejoining rank that is not active yet (it failed again) changes nothing.
     np.testing.assert_array_equal(
         load_balancer.expert_restore.plan_expert_restore(
             [True, False, True, True], [_ONLINE], rejoining=[False, True, False, False]
@@ -714,7 +714,7 @@ def test_restore_backs_then_restores_and_the_release_empties_spare_slots_later(m
     assert events == [("backed", [2], True), ("restore", [1], [_ONLINE_WITHOUT_1.tolist()])]
     assert list(times) == ["back", "load and install"]
     assert backed == {2}
-    assert load_balancer.expert_restore.live_ranks == (True, False, True, True)
+    assert load_balancer.expert_restore.active_ranks == (True, False, True, True)
 
     events.clear()
     impl.get_old_rank_expert_ids.return_value = _ONLINE_WITHOUT_1.tolist()
@@ -742,7 +742,7 @@ def test_restore_backs_then_restores_and_the_release_empties_spare_slots_later(m
     assert load_balancer.expert_restore.backed_spare_slot_bytes == 0
 
 
-def test_a_plan_the_load_balancer_rejects_keeps_the_live_ranks(monkeypatch):
+def test_a_plan_the_load_balancer_rejects_keeps_the_active_ranks(monkeypatch):
     """The C++ load balancer validates every layer's placement before it loads any slot."""
     load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
     load_balancer.load_balancer_impl.restore_placement.side_effect = RuntimeError(
@@ -754,7 +754,7 @@ def test_a_plan_the_load_balancer_rejects_keeps_the_live_ranks(monkeypatch):
     plan = load_balancer.expert_restore.plan_expert_restore([True, False, True, True], [_ONLINE])
     with pytest.raises(RuntimeError, match="expert 3 has no replica"):
         load_balancer.expert_restore.restore_lost_experts(plan)
-    assert load_balancer.expert_restore.live_ranks == (True,) * 4
+    assert load_balancer.expert_restore.active_ranks == (True,) * 4
 
 
 def test_restore_without_a_change_does_nothing(monkeypatch):
@@ -797,20 +797,20 @@ def _replacement(monkeypatch, rank):
 
 
 def test_a_replacement_keeps_its_node_layout_without_mpi(monkeypatch):
-    """Its startup group (mpi_comm()) splits by its node supervisor's GPUs per node, with only itself live."""
+    """Its startup group (mpi_comm()) splits by its node supervisor's GPUs per node, with only itself active."""
     from tensorrt_llm._torch.distributed.membership import StoreGroup
 
     _replacement(monkeypatch, 5)
     mapping = Mapping(world_size=8, rank=5, tp_size=8, gpus_per_node=4)
-    world = StoreGroup(None, "startup/world", 5, range(8), live=[5], gpus_per_node=4)
+    world = StoreGroup(None, "startup/world", 5, range(8), active=[5], gpus_per_node=4)
     monkeypatch.setattr("tensorrt_llm.mpi_comm", lambda: world)
     monkeypatch.setattr("tensorrt_llm.local_mpi_size", lambda: 4)
     load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
     load_balancer.ep_rank, load_balancer.ep_size, load_balancer.mapping = 5, 8, mapping
     load_balancer._setup_mpi_comm()
     node = load_balancer.shared_mpi_comm
-    assert (node.Get_rank(), node.Get_size()) == (1, 4)  # its share of the node's host copies
-    node.barrier()  # the node's host copies already exist: nobody to wait for
+    assert (node.Get_rank(), node.Get_size()) == (1, 4)  # its share of the node's host weights
+    node.barrier()  # the node's host weights already exist: nobody to wait for
     assert node.allgather(True) == [None, True, None, None]
 
 
@@ -828,7 +828,7 @@ def test_a_replacement_tunes_with_the_tuner_layout_of_the_ranks_it_rejoins(
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(_USES_GDRCOPY, return_value=True),
-        patch(f"{_ER}.DeploymentHostCopies"),
+        patch(f"{_ER}.DeploymentHostWeights"),
         patch("torch.cuda.Event"),
     ):
         load_balancer = MoeLoadBalancer(
@@ -844,7 +844,7 @@ def test_a_replacement_tunes_with_the_tuner_layout_of_the_ranks_it_rejoins(
     assert moe.tuner_layout_kwargs == {"tuner_num_local_experts": 2}
 
 
-# The host copies of a node with fault tolerance: they outlive their processes while the deployment serves.
+# The host weights of a node with fault tolerance: they outlive their processes while the deployment serves.
 
 
 @pytest.fixture
@@ -860,7 +860,7 @@ def tracked(monkeypatch):
     )
     yield names
     for name in os.listdir("/dev/shm"):
-        if name.startswith(f"test_host_copies_{os.getpid()}"):
+        if name.startswith(f"test_host_weights_{os.getpid()}"):
             os.unlink(f"/dev/shm/{name}")
 
 
@@ -871,16 +871,16 @@ def _sharer(
     dtype=torch.float32,
     shape=(4,),
     base_name=None,
-    sharer_class=DeploymentHostCopies,
+    sharer_class=DeploymentHostWeights,
 ):
-    """The host copies of local ``rank``'s experts (two per rank) of a layer, each filled with ``value`` plus its
+    """The host weights of local ``rank``'s experts (two per rank) of a layer, each filled with ``value`` plus its
     expert id, under ``base_name`` (default: the test's), by a ``sharer_class``."""
     sharer = sharer_class(
         0,
         2 * node_size,
         Mock(Get_rank=Mock(return_value=rank), Get_size=Mock(return_value=node_size)),
     )
-    sharer.set_shared_memory_base_name(base_name or f"test_host_copies_{os.getpid()}")
+    sharer.set_shared_memory_base_name(base_name or f"test_host_weights_{os.getpid()}")
     for expert_id in range(2 * node_size):
         if sharer.expert_start <= expert_id < sharer.expert_end:
             sharer.share_host_tensor_with_shape(
@@ -895,14 +895,14 @@ def _segments():
     return sorted(
         name
         for name in os.listdir("/dev/shm")
-        if name.startswith(f"test_host_copies_{os.getpid()}")
+        if name.startswith(f"test_host_weights_{os.getpid()}")
     )
 
 
 @pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
-def test_host_copies_are_named_after_their_deployment(monkeypatch, fault_tolerance):
+def test_host_weights_are_named_after_their_deployment(monkeypatch, fault_tolerance):
     """With fault tolerance they outlive their processes: another deployment on the node, also one started with the
-    same join secret, must not find them, nor its node supervisor unlink them."""
+    same shared secret, must not find them, nor its node supervisor unlink them."""
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
     monkeypatch.delenv("TRTLLM_EPLB_SHM_NAME", raising=False)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
@@ -926,7 +926,7 @@ def test_a_rank_s_host_copies_end_with_it_until_the_deployment_serves(
     reattaches them, and the node supervisor unlinks them once the deployment ended."""
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    sharer_class = DeploymentHostCopies if fault_tolerance else HostMoeTensorSharer
+    sharer_class = DeploymentHostWeights if fault_tolerance else HostMoeTensorSharer
     sibling = _sharer(1, 10.0, node_size=2, sharer_class=sharer_class)
     sibling.finalize_layer_weights()
     tracked.clear()  # by the sibling's process
@@ -958,12 +958,12 @@ def replacement_of_rank_0(monkeypatch):
 def test_a_replacement_takes_over_the_host_copies_of_the_rank_it_replaces(
     tracked, replacement_of_rank_0
 ):
-    """Its rank's host copies outlived it, and the replacement reattaches them instead of filling new ones."""
+    """Its rank's host weights outlived it, and the replacement reattaches them instead of filling new ones."""
     original = _sharer(0, 1.0)
     original.finalize_layer_weights()
     original.keep_for_the_deployment()
     replacement_of_rank_0()
-    replacement = _sharer(0, -1.0)  # what it loaded must not overwrite the host copies
+    replacement = _sharer(0, -1.0)  # what it loaded must not overwrite the host weights
     replacement.finalize_layer_weights()
     assert replacement.own_shm.name == original.own_shm.name
     assert replacement.host_weights[(1, "w")].tolist() == [2.0] * 4
@@ -992,7 +992,7 @@ def test_a_replacement_builds_its_rank_s_host_copies_again_unless_they_are_intac
         original = _sharer(0, 1.0)
         original.finalize_layer_weights()
         os.fchmod(original.own_shm._fd, 0o666)
-        assert not original.holds_host_copies(0)
+        assert not original.holds_host_weights(0)
         original.pre_shutdown_cleanup()
     elif found == "other host weights":
         original = _sharer(0, 1.0, dtype=torch.float64, shape=(2,))  # the same size
@@ -1002,7 +1002,7 @@ def test_a_replacement_builds_its_rank_s_host_copies_again_unless_they_are_intac
     replacement = _sharer(0, -1.0)
     replacement.finalize_layer_weights()
     assert replacement.host_weights[(1, "w")].tolist() == [0.0] * 4
-    assert replacement.holds_host_copies(0)
+    assert replacement.holds_host_weights(0)
     # Its own until it joins the deployment: if it fails before, the next replacement builds them again.
     assert tracked == {replacement.get_shared_memory_name()}
     replacement.pre_shutdown_cleanup()
@@ -1011,7 +1011,7 @@ def test_a_replacement_builds_its_rank_s_host_copies_again_unless_they_are_intac
 
 
 class _Store:
-    """The deployment's store as the load balancer uses it (values by key; signing aside), holding ``record``."""
+    """The rendezvous store as the load balancer uses it (values by key; signing aside), holding ``record``."""
 
     def __init__(self, record):
         self.values = {RECORD_KEY: record.model_dump_json().encode()}
@@ -1028,7 +1028,7 @@ class _Store:
 
 
 def _replacement_of_rank_3(monkeypatch, record):
-    """Rank 3's replacement on the node of ranks 2 and 3, with ``record`` in the deployment's store: the host
+    """Rank 3's replacement on the node of ranks 2 and 3, with ``record`` in the rendezvous store: the host
     copies of rank 3 it built, its load balancer over them, the store, and the host weights the load balancer gets
     (by expert)."""
     from tensorrt_llm._torch.distributed import membership
@@ -1037,7 +1037,7 @@ def _replacement_of_rank_3(monkeypatch, record):
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "3,4,2,1")
     store = _Store(record)
     monkeypatch.setattr(membership, "rendezvous_store", lambda: store)
-    monkeypatch.setattr(f"{_ER}._HOST_COPIES_CHECK_S", 0.01)
+    monkeypatch.setattr(f"{_ER}._HOST_WEIGHTS_CHECK_S", 0.01)
     sharer = _sharer(1, 0.0, node_size=2)
     sharer.finalize_layer_weights()
     host_weights = {}
@@ -1064,17 +1064,17 @@ def _replacement_of_rank_3(monkeypatch, record):
 def test_a_replacement_waits_for_the_host_copies_its_node_s_other_replacement_builds(
     monkeypatch, tracked
 ):
-    """Every process of the node was lost with its host copies: rank 2's replacement builds rank 2's again and
+    """Every process of the node failed and its host weights are gone: rank 2's replacement builds rank 2's again and
     announces them in the store, which rank 3's replacement waits for; rank 3's announces its own."""
     record = MembershipRecord(
-        generation=1, state=MembershipState.COMMITTED, live_mask=0b0011, incarnations=(0, 0, 1, 1)
+        generation=1, state=MembershipState.COMMITTED, active_mask=0b0011, incarnations=(0, 0, 1, 1)
     )
     replacement, load_balancer, store, host_weights = _replacement_of_rank_3(monkeypatch, record)
     other = _sharer(0, 10.0, node_size=2)
 
     def build():
         other.finalize_layer_weights()
-        store.set(host_copies_key(2), b"")
+        store.set(host_weights_key(2), b"")
 
     built = threading.Timer(0.2, build)
     built.start()
@@ -1082,7 +1082,7 @@ def test_a_replacement_waits_for_the_host_copies_its_node_s_other_replacement_bu
         load_balancer.finalize_model()
     finally:
         built.join()
-    assert host_copies_key(3) in store.values
+    assert host_weights_key(3) in store.values
     assert host_weights[0] == [10.0] * 4
     replacement.pre_shutdown_cleanup()
     other.pre_shutdown_cleanup()
@@ -1091,24 +1091,24 @@ def test_a_replacement_waits_for_the_host_copies_its_node_s_other_replacement_bu
 @pytest.mark.parametrize(
     "record, announced, error, message",
     [
-        # Rank 2 is live: nobody builds its host copies again.
+        # Rank 2 is active: nobody builds its host weights again.
         (
             MembershipRecord(
                 generation=1,
                 state=MembershipState.COMMITTED,
-                live_mask=0b0111,
+                active_mask=0b0111,
                 incarnations=(0, 0, 0, 1),
             ),
             False,
             ReplacementCannotStart,
-            r"live ranks \[2\]",
+            r"active ranks \[2\]",
         ),
-        # Rank 2's replacement announced host copies the node does not hold.
+        # Rank 2's replacement announced host weights the node does not hold.
         (
             MembershipRecord(
                 generation=1,
                 state=MembershipState.COMMITTED,
-                live_mask=0b0011,
+                active_mask=0b0011,
                 incarnations=(0, 0, 1, 1),
             ),
             True,
@@ -1116,20 +1116,20 @@ def test_a_replacement_waits_for_the_host_copies_its_node_s_other_replacement_bu
             r"replacements of ranks \[2\] .* built are missing",
         ),
         (
-            MembershipRecord(generation=1, state=MembershipState.ABORT, live_mask=0b0011),
+            MembershipRecord(generation=1, state=MembershipState.ABORTED, active_mask=0b0011),
             False,
             RuntimeError,
             "deployment ended",
         ),
     ],
-    ids=["live", "announced", "aborted"],
+    ids=["active", "announced", "aborted"],
 )
 def test_a_replacement_without_the_host_copies_of_its_node_does_not_start(
     monkeypatch, tracked, record, announced, error, message
 ):
     replacement, load_balancer, store, _ = _replacement_of_rank_3(monkeypatch, record)
     if announced:
-        store.set(host_copies_key(2), b"")
+        store.set(host_weights_key(2), b"")
     with pytest.raises(error, match=message) as raised:
         load_balancer.finalize_model()
     if error is ReplacementCannotStart:
@@ -1138,12 +1138,12 @@ def test_a_replacement_without_the_host_copies_of_its_node_does_not_start(
     replacement.post_shutdown_cleanup()
 
 
-def test_host_copies_round_trip_under_the_names_of_their_deployment(
+def test_host_weights_round_trip_under_the_names_of_their_deployment(
     monkeypatch, tracked, replacement_of_rank_0
 ):
-    """An original rank creates its host copies, a replacement reattaches them, and the node supervisor unlinks
-    them, all by the names of the load balancer's one base name (``host_copies_prefix``)."""
-    monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", f"test_host_copies_{os.getpid()}")
+    """An original rank creates its host weights, a replacement reattaches them, and the node supervisor unlinks
+    them, all by the names of the load balancer's one base name (``host_weights_prefix``)."""
+    monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", f"test_host_weights_{os.getpid()}")
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
@@ -1153,7 +1153,7 @@ def test_host_copies_round_trip_under_the_names_of_their_deployment(
     load_balancer.single_layer_load_balancers = [
         SimpleNamespace(need_load_shared_weights=lambda: True, host_tensor_sharer=original)
     ]
-    prefix = load_balancer.expert_restore.keep_host_copies_for_the_deployment()
+    prefix = load_balancer.expert_restore.keep_host_weights_for_the_deployment()
     assert _segments() == [original.get_shared_memory_name()]
     assert original.get_shared_memory_name().startswith(prefix) and prefix.startswith(base_name)
     replacement_of_rank_0()

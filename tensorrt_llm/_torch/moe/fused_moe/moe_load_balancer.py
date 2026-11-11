@@ -341,7 +341,7 @@ class SingleLayerMoeLoadBalancer:
             updates_enabled: whether to enable weight updates
             repeated_count: the repeated count of current layer, used when forward is repeated more than once like MTP.
             slot_count_per_rank: the number of slots per rank, including the spare slots.
-            spare_slot_count: the number of unbacked spare slots per rank for WideEP fault tolerance.
+            spare_slot_count: the number of unbacked spare slots per rank for Wide-EP fault tolerance.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -356,8 +356,8 @@ class SingleLayerMoeLoadBalancer:
         layer_id = self.single_layer_load_balancer_impl.get_layer_id()
         sharer_class = HostMoeTensorSharer
         if wide_ep_fault_tolerance_enabled():
-            from .eplb_expert_restore import DeploymentHostCopies
-            sharer_class = DeploymentHostCopies
+            from .eplb_expert_restore import DeploymentHostWeights
+            sharer_class = DeploymentHostWeights
         self.host_tensor_sharer = sharer_class(
             layer_id, expert_count,
             shared_mpi_comm) if self.need_load_shared_weights() else None
@@ -1026,7 +1026,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(
             'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
         if wide_ep_fault_tolerance_enabled():
-            # The host copies outlive their processes, so their names are unique to the deployment.
+            # The host weights outlive their processes, so their names are unique to the deployment.
             from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
                 deployment_nonce
             self.shared_memory_base_name += f"_{deployment_nonce()}"
@@ -1138,7 +1138,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         # All shared memory create before this barrier.
         self.shared_mpi_comm.barrier()
         if fault_tolerance_replacement() is not None:
-            self.expert_restore.wait_for_node_host_copies()
+            self.expert_restore.wait_for_node_host_weights()
         # All shared memory mapping after this barrier.
         spare_slot_count = max((layer.spare_slot_count
                                 for layer in self.single_layer_load_balancers),
@@ -1148,7 +1148,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.load_balancer_impl.finalize_model()
         if spare_slot_count and self.ep_rank == 0:
             logger.info(
-                f"WideEP fault tolerance adds up to {spare_slot_count} unbacked spare slots per rank"
+                f"Wide-EP fault tolerance adds up to {spare_slot_count} unbacked spare slots per rank"
             )
         torch.cuda.empty_cache()
 
@@ -1161,8 +1161,8 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         """
         self.load_balancer_impl.set_warm_up_iter_count(iter_count)
 
-    def has_host_copies(self) -> bool:
-        """Return whether this node holds host copies of every expert of every layer."""
+    def has_host_weights(self) -> bool:
+        """Return whether this node holds host weights of every expert of every layer."""
         return all(layer.need_load_shared_weights()
                    for layer in self.single_layer_load_balancers)
 

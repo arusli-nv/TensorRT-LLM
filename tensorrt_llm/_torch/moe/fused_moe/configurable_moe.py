@@ -883,7 +883,7 @@ class ConfigurableMoE(MoE):
              must be able to honor it: the backend returns the unfinalized
              triple, the combine (if any) is an unweighted row sum, and the
              routing weights are not folded into the activations.
-          4. With spare EPLB slots (WideEP fault tolerance), the backend's
+          4. With spare EPLB slots (Wide-EP fault tolerance), the backend's
              MoE autotuner profiles only the active slots, so the spare ones
              leave its tactics unchanged.
 
@@ -916,7 +916,7 @@ class ConfigurableMoE(MoE):
             and not backend.autotunes_only_active_slots
         ):
             raise ValueError(
-                "WideEP fault tolerance requires a MoE backend that autotunes only the active EPLB slots; "
+                "Wide-EP fault tolerance requires a MoE backend that autotunes only the active EPLB slots; "
                 f"{type(backend).__name__} autotunes every local slot, the spare slots included. Turn it off "
                 "(enable_wide_ep_fault_tolerance=False) or use the Cutlass or the CuteDSL NVFP4 MoE backend "
                 "(CuteDSL NVFP4 without locality domains or the SM107 Rubin kernels)."

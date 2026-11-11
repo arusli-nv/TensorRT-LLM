@@ -470,7 +470,7 @@ def test_capturable_failures_are_released_per_batch(monkeypatch):
 def test_a_recomputed_request_replays_its_generated_tokens_into_the_new_matcher(
     monkeypatch, fault_tolerance
 ):
-    """A recompute moves the generated tokens into the prompt; with WideEP fault tolerance the last context chunk
+    """A recompute moves the generated tokens into the prompt; with Wide-EP fault tolerance the last context chunk
     carries them and the build replays them into the new matcher."""
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
     request = LlmRequest(

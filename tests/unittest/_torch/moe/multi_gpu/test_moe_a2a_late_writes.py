@@ -28,7 +28,7 @@ import each other's fresh pages and exchange tokens among themselves after the r
 admits the victim's replacement, which keeps the survivors' pages (``MoeExecutionState.remap_workspaces`` without
 fresh rows), and every rank exchanges tokens with every other.
 
-``no-remap`` is the negative control: without the remap the victim's writes reach the survivors' live
+``no-remap`` is the negative control: without the remap the victim's writes reach the survivors' active
 rows.
 """
 
@@ -58,7 +58,7 @@ from tensorrt_llm.mapping import Mapping
 
 _CAPACITY, _HIDDEN = 1024, 7168
 _GRACE_S = 2.0
-# The negative control polls the live rows this often until the victim's writes show, at most this long.
+# The negative control polls the active rows this often until the victim's writes show, at most this long.
 _POLL_S, _CONTROL_DEADLINE_S = 0.05, 10.0
 _TIMEOUT = timedelta(seconds=300)
 
@@ -87,19 +87,19 @@ class _StoreComm:
 
 
 class _StoreGather:
-    """A membership change's exchange among the EP ranks in ``live`` over a TCPStore, under keys of ``name``: one
-    entry per EP rank, None for a rank not in ``live``."""
+    """A membership change's exchange among the EP ranks in ``active`` over a TCPStore, under keys of ``name``: one
+    entry per EP rank, None for a rank not in ``active``."""
 
-    def __init__(self, store: TCPStore, rank: int, ep_size: int, name: str, live: range) -> None:
+    def __init__(self, store: TCPStore, rank: int, ep_size: int, name: str, active: range) -> None:
         self.store, self.rank, self.ep_size, self.calls = store, rank, ep_size, 0
-        self.name, self.live = name, live
+        self.name, self.active = name, active
 
     def __call__(self, value: Any) -> list[Any]:
         self.calls += 1
         self.store.set(f"{self.name}/{self.calls}/{self.rank}", pickle.dumps(value))
         return [
             pickle.loads(self.store.get(f"{self.name}/{self.calls}/{rank}"))
-            if rank in self.live
+            if rank in self.active
             else None
             for rank in range(self.ep_size)
         ]
@@ -223,21 +223,21 @@ def _victim(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor, ep_siz
             store.set("running", "1")
 
 
-def _check_late_writes(store: TCPStore, row: torch.Tensor, live: torch.Tensor, mode: str) -> None:
+def _check_late_writes(store: TCPStore, row: torch.Tensor, active: torch.Tensor, mode: str) -> None:
     """With the remap, no byte of this survivor's ``row`` changes for _GRACE_S while the victim, unless killed,
-    keeps writing. Without it (``no-remap``), the victim's writes reach ``live``, source 0's rows of ``row``."""
+    keeps writing. Without it (``no-remap``), the victim's writes reach ``active``, source 0's rows of ``row``."""
     torch.cuda.synchronize()
     before = row.clone()
     steps = _victim_steps(store)
     # The victim alternates two patterns, so a single later look can find a byte it rewrote unchanged: look
     # every _POLL_S.
     if mode == "no-remap":
-        start = live.data_ptr() - row.data_ptr()
-        end = start + live.numel() * live.element_size()
+        start = active.data_ptr() - row.data_ptr()
+        end = start + active.numel() * active.element_size()
         deadline = time.monotonic() + _CONTROL_DEADLINE_S
         while not bool((row[start:end] != before[start:end]).any()):
             assert time.monotonic() < deadline, (
-                "the victim's writes missed the survivor's live rows without the remap"
+                "the victim's writes missed the survivor's active rows without the remap"
             )
             time.sleep(_POLL_S)
         return
@@ -500,8 +500,8 @@ def _replacement(store: TCPStore, rank: int, ep_size: int) -> None:
     torch.cuda.set_device(rank)
     mapping = Mapping(ep_size, rank, ep_size, tp_size=ep_size, moe_ep_size=ep_size)
     MnnvlMemory.initialize()
-    # The class's group at an isolated startup: the deployment's layout with only this rank live.
-    MnnvlMemory.comm = StoreGroup(None, "workspace", rank, range(ep_size), live=[rank])
+    # The class's group at an isolated startup: the deployment's layout with only this rank active.
+    MnnvlMemory.comm = StoreGroup(None, "workspace", rank, range(ep_size), active=[rank])
     MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
     meta = _workspace_layout(ep_size)
     memory = MnnvlMemory(mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)]))
@@ -526,7 +526,7 @@ def _replacement(store: TCPStore, rank: int, ep_size: int) -> None:
 
 def _worker(rank: int, port: int, mode: str, ep_size: int) -> None:
     store = TCPStore("127.0.0.1", port, is_master=False, timeout=_TIMEOUT)
-    # Every rank of a deployment that survives a lost rank runs with WideEP fault tolerance on.
+    # Every rank of a deployment that survives a failed rank runs with Wide-EP fault tolerance on.
     set_wide_ep_fault_tolerance_enabled(True)
     if mode == "replacement":
         _replacement(store, rank, ep_size)
@@ -608,7 +608,7 @@ def test_failed_peer_late_writes_land_only_on_orphaned_pages(
 ) -> None:
     """After the remap the survivor's results stay exact and none of its bytes change, whether the victim was
     killed mid-dispatch (``killed``) or keeps writing to the end (``writing``); ``no-remap`` is the negative
-    control, whose victim writes must reach the survivor's live rows."""
+    control, whose victim writes must reach the survivor's active rows."""
     _run(2, mode, kill_delay_s)
 
 

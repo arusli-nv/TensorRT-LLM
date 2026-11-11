@@ -519,11 +519,11 @@ class MpiPoolSession(MpiSession):
                  env_overrides: Optional[Dict[str, str]] = None):
         """Spawn a pool of MPI worker processes.
 
-        With WideEP fault tolerance, the pool holds rank 0 only, and the node
+        With Wide-EP fault tolerance, the pool holds rank 0 only, and the node
         supervisor starts and replaces the other ranks.
 
         Args:
-            n_workers: number of MPI workers to spawn (with WideEP fault
+            n_workers: number of MPI workers to spawn (with Wide-EP fault
                 tolerance, the number of ranks).
             wait_shutdown: when True, ``shutdown()`` blocks until the spawned
                 worker processes have actually exited.
@@ -564,7 +564,7 @@ class MpiPoolSession(MpiSession):
 
         The ranks are the ``n_workers`` spawned workers; this process is not
         one of them, and the workers' ``MPI_COMM_WORLD`` holds only them.
-        With WideEP fault tolerance, the task runs on rank 0 only.
+        With Wide-EP fault tolerance, the task runs on rank 0 only.
 
         Returns:
             One future per worker, in arbitrary order.
@@ -756,7 +756,7 @@ class MpiPoolSession(MpiSession):
         """Start the node supervisor of ranks 1 to ``n_workers - 1``."""
         launcher = shutil.which("trtllm-llmapi-launch")
         if launcher is None:
-            raise RuntimeError("WideEP fault tolerance starts the ranks with "
+            raise RuntimeError("Wide-EP fault tolerance starts the ranks with "
                                "trtllm-llmapi-launch, which is not on PATH")
         supervisor = os.path.join(os.path.dirname(__file__),
                                   "_llmapi_node_supervisor.py")

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """A replacement rank's startup collectives return what rank 0 received at the same calls (the startup record of
-WideEP fault tolerance). ``MnnvlDist``'s host collectives run over a fake host exchange: rank 0 records them, then a
+Wide-EP fault tolerance). ``MnnvlDist``'s host collectives run over a fake host exchange: rank 0 records them, then a
 replacement of rank 2, whose own exchange reaches only itself, replays them."""
 
 import contextlib
@@ -47,11 +47,11 @@ GIB = 1 << 30
 
 
 class FakeHostExchange:
-    """The ``TPHostExchange`` of ``rank`` with the ranks in ``live_mask``, where a peer ``r`` sends ``peers(r, obj)``
+    """The ``TPHostExchange`` of ``rank`` with the ranks in ``active_mask``, where a peer ``r`` sends ``peers(r, obj)``
     when this rank sends ``obj``."""
 
-    def __init__(self, rank, live_mask=(1 << WORLD) - 1, peers=lambda r, obj: obj):
-        self.rank, self.live_mask, self.peers = rank, live_mask, peers
+    def __init__(self, rank, active_mask=(1 << WORLD) - 1, peers=lambda r, obj: obj):
+        self.rank, self.active_mask, self.peers = rank, active_mask, peers
         self.calls = 0
 
     def _sent(self, r, obj):
@@ -62,7 +62,7 @@ class FakeHostExchange:
         obj = pickle.loads(payload)
         read = range(WORLD) if readers is None else readers
         return [
-            pickle.dumps(self._sent(r, obj)) if r in read and self.live_mask >> r & 1 else None
+            pickle.dumps(self._sent(r, obj)) if r in read and self.active_mask >> r & 1 else None
             for r in range(WORLD)
         ]
 
@@ -71,7 +71,7 @@ class FakeHostExchange:
         return np.stack(
             [
                 np.asarray(self._sent(r, row), dtype=np.int64)
-                if self.live_mask >> r & 1
+                if self.active_mask >> r & 1
                 else np.zeros_like(row)
                 for r in range(WORLD)
             ]
@@ -84,7 +84,7 @@ def _dist(rank, host_exchange):
         rank=rank, tp_rank=rank, tp_size=WORLD, cp_size=1, world_size=WORLD, dwdp_enabled=False
     )
     dist._host_exchange = host_exchange
-    dist._live_rows_index = (None, None)
+    dist._active_rows_index = (None, None)
     return dist
 
 
@@ -113,7 +113,7 @@ def _replacement(published: bytes, host_exchange=False):
         setattr(startup_record, name, value)
     startup_record.replay(pickle.loads(published))
     if host_exchange is False:
-        host_exchange = FakeHostExchange(REPLACED, live_mask=1 << REPLACED)
+        host_exchange = FakeHostExchange(REPLACED, active_mask=1 << REPLACED)
     return _dist(REPLACED, host_exchange)
 
 
@@ -305,17 +305,17 @@ def test_votes_on_a_replacement_count_every_original_rank_during_the_replay():
     _rows(_rank_0())
     replacement = _replacement(_publish())
     rows = _rows(replacement)
-    assert replacement.tp_live_rows(rows).tolist() == [[8, 1]] * WORLD
+    assert replacement.tp_active_rows(rows).tolist() == [[8, 1]] * WORLD
     startup_record.close()
-    # Past its startup, only its own row is live until it is admitted.
-    assert replacement.tp_live_rows(rows).tolist() == [[8, 1]]
+    # Past its startup, only its own row is active until it is admitted.
+    assert replacement.tp_active_rows(rows).tolist() == [[8, 1]]
 
 
 def test_a_replacement_creates_its_host_exchange_at_its_first_replayed_collective(monkeypatch):
     """At the same call as the original ranks: its creation (a collective of its isolated group) maps memory."""
     _barrier(_rank_0())
     published = _publish()
-    host_exchange = FakeHostExchange(REPLACED, live_mask=1 << REPLACED)
+    host_exchange = FakeHostExchange(REPLACED, active_mask=1 << REPLACED)
     created = []
     monkeypatch.setattr(
         TPHostExchange,

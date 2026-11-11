@@ -1654,7 +1654,7 @@ class BaseLLM:
                                or sampling_params.n > 1
                                or sampling_params.best_of > 1):
             raise RequestError(
-                "WideEP fault tolerance (enable_wide_ep_fault_tolerance) does "
+                "Wide-EP fault tolerance (enable_wide_ep_fault_tolerance) does "
                 "not support requests with n > 1, best_of > 1 or beam search "
                 "yet: continuing such a request by recompute after a rank "
                 "failure, or running it again on another rank, would need to "

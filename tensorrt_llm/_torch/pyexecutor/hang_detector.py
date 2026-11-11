@@ -82,7 +82,7 @@ def propagate_hard_kill(
     - Fallback: self-``SIGKILL``. The launcher (``mpirun`` propagates by default;
       ``srun`` needs ``--kill-on-bad-exit``) then tears down peers.
 
-    Under WideEP fault tolerance the kill stays local.
+    Under Wide-EP fault tolerance the kill stays local.
 
     Diagnostic exceptions are ignored. Deadline-driven callers also disable
     diagnostics so a blocked stream or logging lock cannot delay termination.

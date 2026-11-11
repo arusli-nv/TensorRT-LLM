@@ -278,7 +278,7 @@ __device__ __forceinline__ void publish_round_flag(uint32_t* address, uint32_t v
     asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
 }
 
-//! Record in the abort record that this kernel returned without the data of some active source.
+//! Record in the abort state that this kernel returned without the data of some active source.
 __device__ __forceinline__ void record_cancelled(MoeA2AAbortState* abort)
 {
     asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(&abort->status), "r"(MoeA2AAbortState::kCancelled));
@@ -347,8 +347,8 @@ __device__ __forceinline__ bool abort_requested(MoeA2AAbortState* abort, AbortPo
     return true;
 }
 
-//! Wait until a peer's round flag reaches `expected`, and trap on timeout. With HONOUR_ABORT, return false on abort.
-template <bool HONOUR_ABORT>
+//! Wait until a peer's round flag reaches `expected`, and trap on timeout. With HONOR_ABORT, return false on abort.
+template <bool HONOR_ABORT>
 __device__ __forceinline__ bool wait_round_flag(uint32_t const* address, uint32_t expected, int64_t timeout_cycles,
     MoeA2AAbortState* abort, AbortPoll* poll, int rank_id, int peer_rank, char const* phase)
 {
@@ -365,9 +365,9 @@ __device__ __forceinline__ bool wait_round_flag(uint32_t const* address, uint32_
         {
             return true;
         }
-    } while (HONOUR_ABORT ? clock64() - start < kAbortPollCycles : !check_timeout(start, timeout_cycles));
+    } while (HONOR_ABORT ? clock64() - start < kAbortPollCycles : !check_timeout(start, timeout_cycles));
 
-    if constexpr (HONOUR_ABORT)
+    if constexpr (HONOR_ABORT)
     {
         bool evidence = false;
         do
@@ -615,7 +615,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         if (thread_idx < warpSize)
         {
             load_rank_mask_words(ptrs.active_rank_mask, rank_mask);
-            // Live peers may still read the rows of an incomplete collective, so exchange with this rank only.
+            // Active peers may still read the rows of an incomplete collective, so exchange with this rank only.
             if (ptrs.incomplete_round != nullptr && *ptrs.incomplete_round != 0)
             {
                 keep_only_rank_in_words(rank_mask, rank_id);
@@ -1325,7 +1325,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
     TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
-        "an abort record needs a workspace laid out with rank_mask");
+        "an abort state needs a workspace laid out with rank_mask");
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -1386,7 +1386,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 
     kernel_ptrs.active_rank_mask = params.active_rank_mask;
     TLLM_CHECK_WITH_INFO(params.abort == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes),
-        "the abort record needs the rank-mask fence path");
+        "the abort state needs the rank-mask fence path");
     kernel_ptrs.abort = params.abort;
 
     int grid_size = params.local_num_tokens;
@@ -2280,9 +2280,9 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
         "rank-mask mode needs the device address of active_rank_mask");
     TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
-        "an abort record needs a workspace laid out with rank_mask");
+        "an abort state needs a workspace laid out with rank_mask");
     TLLM_CHECK_WITH_INFO(params.abort == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine),
-        "the abort record needs the rank-mask fence path");
+        "the abort state needs the rank-mask fence path");
 
     // ---- CFT combine path (one block per token). ----
     // Bypasses the base fence combine below entirely. The CFT push is launched separately by

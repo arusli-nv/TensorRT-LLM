@@ -12,26 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whether WideEP fault tolerance is on in this process, and the rank identity its launcher gives it."""
+"""Whether Wide-EP fault tolerance is on in this process, and the rank identity its launcher gives it."""
 
 import os
 from functools import lru_cache
 from typing import NamedTuple, Optional, Sequence, Tuple
 
-# "<rank>,<world size>,<GPUs per node>,<replacement>", set for every rank under WideEP fault tolerance.
+# "<rank>,<world size>,<GPUs per node>,<replacement>", set for every rank under Wide-EP fault tolerance.
 FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 
 _enabled = False
 
 
 def set_wide_ep_fault_tolerance_enabled(enabled: bool) -> None:
-    """Turn WideEP fault tolerance on or off in this process."""
+    """Turn Wide-EP fault tolerance on or off in this process."""
     global _enabled
     _enabled = enabled
 
 
 def wide_ep_fault_tolerance_enabled() -> bool:
-    """Return whether WideEP fault tolerance is on."""
+    """Return whether Wide-EP fault tolerance is on."""
     return _enabled
 
 
@@ -40,14 +40,14 @@ def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> No
     missing = [requirement for met, requirement in checks if not met]
     if missing:
         raise ValueError(
-            "WideEP fault tolerance requires "
+            "Wide-EP fault tolerance requires "
             + "; ".join(missing)
             + "; turn it off (enable_wide_ep_fault_tolerance=False) or change the configuration"
         )
 
 
 class RankIdentity(NamedTuple):
-    """A rank under WideEP fault tolerance, where each rank is its own MPI world."""
+    """A rank under Wide-EP fault tolerance, where each rank is its own MPI world."""
 
     rank: int
     world_size: int

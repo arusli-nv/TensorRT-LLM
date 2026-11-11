@@ -56,7 +56,7 @@ struct CftCombinePeerInfo
 static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
 static constexpr int64_t kDefaultTimeoutCycles = 300ll * kAssumedClockHz;
 
-// A healthy wait on a peer ends within kAbortPollCycles, so only longer waits read the host abort record.
+// A healthy wait on a peer ends within kAbortPollCycles, so only longer waits read the host abort state.
 static constexpr int64_t kAbortPollCycles = 100ll * 1000ll;
 
 static constexpr int64_t kWaitEvidenceCycles = 20ll * 1000ll * 1000ll;
@@ -67,7 +67,7 @@ static constexpr int64_t kWaitEvidenceCycles = 20ll * 1000ll * 1000ll;
 //! The incomplete-round word in the local workspace keeps the round flag value (bit 0 set) of the first collective
 //! that returned without the data of some active source, until the workspace reset. While it is nonzero, every later
 //! collective of this rank exchanges with this rank only, so no peer reads rows of an incomplete round and this rank
-//! writes nothing into rows that a live peer may still read.
+//! writes nothing into rows that an active peer may still read.
 struct MoeA2AAbortState
 {
     static constexpr int32_t kCancelled = 1;
@@ -241,7 +241,7 @@ struct MoeA2ADispatchParams
     int32_t invalid_expert_id;
 
     // Whether to instantiate a kernel with active-rank checks.
-    // This is a launch-lifetime mode, required by the abort record.
+    // This is a launch-lifetime mode, required by the abort state.
     bool enable_rank_mask{false};
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Required when enable_rank_mask is true.
@@ -321,7 +321,7 @@ struct MoeA2ACombineParams
     int combine_counter_ep_stride = 0;      // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
 
     // Whether to instantiate a kernel with active-rank checks in peer synchronization.
-    // This is a launch-lifetime mode, required by the abort record.
+    // This is a launch-lifetime mode, required by the abort state.
     bool enable_rank_mask{false};
 
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Required when enable_rank_mask is true.

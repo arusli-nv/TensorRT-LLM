@@ -370,7 +370,7 @@ def test_r1_default_matches(mapping_kwargs):
 
 
 def _fault_tolerant_args(mode):
-    """A deployment with WideEP fault tolerance on, as its argument validation accepts it."""
+    """A deployment with Wide-EP fault tolerance on, as its argument validation accepts it."""
     return _llm_args(
         mode,
         enable_wide_ep_fault_tolerance=True,
@@ -380,7 +380,7 @@ def _fault_tolerant_args(mode):
 
 
 def test_fault_tolerance_falls_back_under_auto():
-    """No target supports WideEP fault tolerance: a deployment the R1 target claims builds the built-in model."""
+    """No target supports Wide-EP fault tolerance: a deployment the R1 target claims builds the built-in model."""
     config = _model_config(_r1_config(), **_R1_DEFAULT_LAYOUTS["dep4"])
     assert _qualified(modeling_v2_resolve(config, _llm_args("auto"))) == _R1_DEFAULT_TARGET
     assert modeling_v2_resolve(config, _fault_tolerant_args("auto")) is None

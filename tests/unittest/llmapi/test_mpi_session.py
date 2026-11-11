@@ -325,7 +325,7 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
     assert cubin_dirs == {None}
 
 
-_FAULT_TOLERANCE_ENV = ("TLLM_FAULT_TOLERANCE_JOIN_SECRET",
+_FAULT_TOLERANCE_ENV = ("TLLM_FAULT_TOLERANCE_SHARED_SECRET",
                         "TLLM_FAULT_TOLERANCE_RENDEZVOUS")
 
 _FAULT_TOLERANT_POOL_SCRIPT = """

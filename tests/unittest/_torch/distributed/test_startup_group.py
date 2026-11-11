@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""WideEP fault tolerance starts every rank as its own process: the ranks that start together meet in the rendezvous
+"""Wide-EP fault tolerance starts every rank as its own process: the ranks that start together meet in the rendezvous
 store (StoreGroup), the loss of the store ends their waits, and a replacement's groups answer alone. Threads stand
 for ranks; the store is a real TCPStore."""
 
@@ -33,7 +33,7 @@ from tensorrt_llm import _utils, _wide_ep_fault_tolerance
 from tensorrt_llm._torch.distributed.membership import (
     MembershipRecord,
     MembershipState,
-    SignedStore,
+    RendezvousStore,
     StoreGroup,
 )
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory, TpMnnvlMemory
@@ -51,7 +51,7 @@ WORLD = 4
 
 
 def _client(port):
-    return SignedStore(
+    return RendezvousStore(
         TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=30)), SECRET
     )
 
@@ -59,7 +59,7 @@ def _client(port):
 @pytest.fixture
 def store(monkeypatch):
     """The rendezvous store, as the authority hosts it; each thread (a rank) gets its own client. The ranks share one
-    membership agent, which takes their startup reports."""
+    membership client, which takes their startup reports."""
     server = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
     clients = threading.local()
 
@@ -69,7 +69,7 @@ def store(monkeypatch):
         return clients.store
 
     monkeypatch.setattr(recovery_module, "_startup_store", client)
-    monkeypatch.setattr(recovery_module, "_agent", Mock())
+    monkeypatch.setattr(recovery_module, "_client", Mock())
     _replay(monkeypatch, None)
     yield server.port
 
@@ -98,7 +98,7 @@ def _on_ranks(ranks, fn):
 def test_the_ranks_that_start_together_gather_through_the_store(store):
     def rank(r):
         world = StoreGroup(_client(store), "g", r, range(WORLD))
-        pairs = StoreGroup(_client(store), "pair", r, range(WORLD), live=[1, 3])
+        pairs = StoreGroup(_client(store), "pair", r, range(WORLD), active=[1, 3])
         return world.allgather(10 * r), world.allgather(f"x{r}"), r in (1, 3) and pairs.allgather(r)
 
     results = _on_ranks(range(WORLD), rank)
@@ -111,7 +111,7 @@ def test_a_startup_collective_reports_each_change_of_the_peers_it_waits_for_and_
     store, monkeypatch
 ):
     """The authority's startup hang rule reads these reports; a wait that polls on reports no more."""
-    agent = recovery_module._agent
+    client = recovery_module._client
     monkeypatch.setattr(recovery_module, "_startup_steps", 0)
     monkeypatch.setattr(recovery_module, "_startup_waiting_for", 0)
 
@@ -126,7 +126,7 @@ def test_a_startup_collective_reports_each_change_of_the_peers_it_waits_for_and_
         assert group.allgather(0) == [0, 1]
     finally:
         peer.join(30)
-    assert [call.kwargs for call in agent.report.call_args_list] == [
+    assert [call.kwargs for call in client.report.call_args_list] == [
         dict(waiting_for=0b10, progress=0),
         dict(waiting_for=0, progress=1),
     ]
@@ -147,7 +147,7 @@ def test_a_group_keeps_only_its_last_call_s_keys(store):
     assert counter.num_keys() - before <= 3
 
 
-def test_the_startup_ends_when_the_authority_is_lost(monkeypatch):
+def test_the_startup_ends_when_the_authority_fails(monkeypatch):
     """The store lives in the authority's process: once that process is gone, a wait for a peer ends at once."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -176,13 +176,13 @@ def test_the_startup_ends_when_the_authority_is_lost(monkeypatch):
 
 
 def test_a_replacement_starts_alone(monkeypatch):
-    """Its groups have the deployment's layout with only itself live, and never reach the store; each exchange is a
+    """Its groups have the deployment's layout with only itself active, and never reach the store; each exchange is a
     step of startup progress it reports, which the authority bounds a joiner by."""
-    agent = Mock()
-    monkeypatch.setattr(recovery_module, "_agent", agent)
+    client = Mock()
+    monkeypatch.setattr(recovery_module, "_client", client)
     monkeypatch.setattr(recovery_module, "_startup_steps", 0)
     world = StoreGroup(
-        None, "w", 5, range(8), recovery_module._report_startup_wait, live=[5], gpus_per_node=4
+        None, "w", 5, range(8), recovery_module._report_startup_wait, active=[5], gpus_per_node=4
     )
     assert (world.Get_rank(), world.Get_size()) == (5, 8)
     assert world.allgather("v") == [None] * 5 + ["v", None, None]
@@ -191,7 +191,7 @@ def test_a_replacement_starts_alone(monkeypatch):
     assert (node.membership, node.Get_rank(), node.Get_size()) == ((4, 5, 6, 7), 1, 4)
     assert node.allgather(True) == [None, True, None, None]
     assert node.allreduce(3, op=MPI.MIN) == 3
-    assert [call.kwargs["progress"] for call in agent.report.call_args_list] == [1, 2, 3, 4]
+    assert [call.kwargs["progress"] for call in client.report.call_args_list] == [1, 2, 3, 4]
 
 
 def test_original_ranks_split_and_reduce_through_the_store(store):
@@ -238,7 +238,7 @@ def test_a_split_groups_the_members_of_a_color_in_key_order(store, monkeypatch):
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
     _replay(monkeypatch, {"startup_group_split": [_SPLITS]})
-    split = StoreGroup(None, "w", 2, range(WORLD), live=[2]).Split(*_SPLITS[2])
+    split = StoreGroup(None, "w", 2, range(WORLD), active=[2]).Split(*_SPLITS[2])
     assert (split.membership, split.Get_rank()) == ((2, 0), 0)
 
 
@@ -354,11 +354,11 @@ def test_a_rank_whose_mapping_places_the_ranks_on_other_nodes_does_not_start(
 
 
 def test_an_original_rank_waits_for_every_rank_to_start(monkeypatch):
-    """It returns once a record past STARTING arrives, on the agent's thread. Fails without the change: the wait
-    polled the agent's record, which this agent never updates."""
-    starting = MembershipRecord(generation=0, state=MembershipState.STARTING, live_mask=0b1111)
-    agent = Mock(record=starting)
-    monkeypatch.setattr(recovery_module, "_agent", agent)
+    """It returns once a record past STARTING arrives, on the client's thread. Fails without the change: the wait
+    polled the client's record, which this client never updates."""
+    starting = MembershipRecord(generation=0, state=MembershipState.STARTING, active_mask=0b1111)
+    client = Mock(record=starting)
+    monkeypatch.setattr(recovery_module, "_client", client)
     monkeypatch.setattr(recovery_module, "_every_rank_started", threading.Event())
 
     def records():
@@ -376,7 +376,7 @@ def test_an_original_rank_waits_for_every_rank_to_start(monkeypatch):
     waiter.join(10)
     assert not waiter.is_alive()
     assert time.monotonic() - began >= 0.4
-    agent.report.assert_called_once_with(started=True)
+    client.report.assert_called_once_with(started=True)
 
 
 def test_a_rank_without_its_identity_does_not_start(monkeypatch):
@@ -400,7 +400,7 @@ def test_an_mnnvl_group_has_the_ranks_split_would_give(
     """Under fault tolerance the group comes from the mapping, as a subgroup of the startup group."""
     mapping = Mapping(world_size=4, rank=rank, **kwargs)
     assert memory_cls.comm_split_ranks(mapping) == ranks
-    world = StoreGroup(None, "startup/world", rank, range(4), live=[rank])
+    world = StoreGroup(None, "startup/world", rank, range(4), active=[rank])
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setattr("tensorrt_llm._torch.distributed.mnnvl_memory.mpi_comm", lambda: world)
     monkeypatch.setattr(memory_cls, "comm", None)

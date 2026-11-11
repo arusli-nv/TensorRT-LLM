@@ -403,7 +403,7 @@ def worker_main(
         join_startup_group(llm_args.parallel_config.to_mapping())
     elif FAULT_TOLERANCE_RANK_ENV in os.environ:
         raise ValueError(
-            "The launcher started this rank as its own process for WideEP "
+            "The launcher started this rank as its own process for Wide-EP "
             f"fault tolerance ({FAULT_TOLERANCE_RANK_ENV} is set), but "
             "enable_wide_ep_fault_tolerance is off")
 

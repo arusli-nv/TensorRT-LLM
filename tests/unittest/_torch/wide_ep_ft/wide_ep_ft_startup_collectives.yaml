@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The startup collectives of a WideEP fault-tolerance deployment by the names of mpi_comm()'s collectives that do not
+# The startup collectives of a Wide-EP fault-tolerance deployment by the names of mpi_comm()'s collectives that do not
 # go through startup_record.agree, checked by test_startup_collectives_are_agreed_or_listed. A replacement rank starts
 # alone: its collectives reach only itself. Through Distributed (MnnvlDist) they return the original ranks' results
 # from the startup record; the others return None or nothing for every other rank. A result of mpi_comm() that must
@@ -14,7 +14,7 @@ reasons:
     it)
   barrier: a barrier or a hold of the group whose result nobody reads; a replacement rank passes it at once
   rank0_only: only rank 0 reads the result, and rank 0 is never replaced
-  serving: runs only once the deployment serves, where the membership keeps the live ranks in step
+  serving: runs only once the deployment serves, where the membership keeps the active ranks in step
   shutdown: runs at shutdown
   transport: implements a collective of the startup group or of MNNVL memory that takes absent ranks
   device: a device collective of a forward (an AllReduce or allgather module or op), not a host collective
