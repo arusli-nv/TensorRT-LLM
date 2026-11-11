@@ -140,6 +140,9 @@ class NodeSupervisor:
             for name, value in environ.items()
             if not name.startswith(membership.LAUNCHER_ENV_PREFIXES)
         }
+        # Each rank started here is a one-process MPI world, which has no shared-memory peer: without the sm transport
+        # it creates no /dev/shm segment that its exit (os._exit, or a kill) would leave behind.
+        self._environ["OMPI_MCA_btl"] = "^sm"
         self._relaunch_command = relaunch_command
         self._end_job_through_launcher = end_job
         self._parent = os.getppid()

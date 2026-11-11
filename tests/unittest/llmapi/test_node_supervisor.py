@@ -285,7 +285,10 @@ def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deplo
     for rank in RANKS:
         started = _read(tmp_path, rank, 0)
         assert started["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == f"{rank},4,2,0"  # on GPU rank % 2
-        assert not any(key.startswith(("OMPI_", "PMIX_")) for key in started["environ"])
+        assert not any(
+            key.startswith(("OMPI_", "PMIX_")) for key in started["environ"] if key != "OMPI_MCA_btl"
+        )
+        assert started["environ"]["OMPI_MCA_btl"] == "^sm"  # no /dev/shm segment to leave behind
         assert started["environ"][JOIN_SECRET_ENV] == os.environ[JOIN_SECRET_ENV]
         assert os.environ[JOIN_SECRET_ENV] not in " ".join(started["argv"])
     assert authority.hellos == [["node", "1", "2,3", socket.gethostname()]]
