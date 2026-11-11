@@ -35,7 +35,7 @@ _LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "PRTE_", "SLURM_")
 def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     from mpi4py import MPI
 
-    from tensorrt_llm._torch.distributed.communicator import MnnvlDist
+    from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
     from tensorrt_llm._torch.distributed.startup_record import startup_record
     from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
     from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery
@@ -147,7 +147,7 @@ def _require_mnnvl(gpus: int) -> None:
 def test_independent_ranks_build_host_collectives_and_the_all_to_all(rendezvous):
     _require_mnnvl(WORLD)
     port, secret = rendezvous
-    processes = [_spawn(rank, f"{rank},{WORLD},0", port, secret) for rank in range(WORLD)]
+    processes = [_spawn(rank, f"{rank},{WORLD},{WORLD},0", port, secret) for rank in range(WORLD)]
     for result in _results(processes):
         assert result["errors"] == []
 
@@ -155,11 +155,11 @@ def test_independent_ranks_build_host_collectives_and_the_all_to_all(rendezvous)
 def test_a_replacement_builds_its_groups_alone(rendezvous):
     _require_mnnvl(WORLD)
     port, secret = rendezvous
-    (result,) = _results([_spawn(2, f"2,{WORLD},1", port, secret)])
+    (result,) = _results([_spawn(2, f"2,{WORLD},{WORLD},1", port, secret)])
     assert result["errors"] == []
 
 
 if __name__ == "__main__":
-    rank, world_size, incarnation = (int(field) for field in sys.argv[1].split(","))
+    rank, world_size, _, incarnation = (int(field) for field in sys.argv[1].split(","))
     print(json.dumps(_rank_main(rank, world_size, incarnation)), flush=True)
     os._exit(0)  # no MPI_Finalize: nothing ran over MPI

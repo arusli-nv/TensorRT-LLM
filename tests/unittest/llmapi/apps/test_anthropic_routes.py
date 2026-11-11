@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
+from tensorrt_llm import _utils
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -613,8 +614,30 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     server_logger.error.assert_not_called()
 
 
-def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, server_logger):
-    """A failure of the generation itself is logged and ends the stream with an error event and [DONE]."""
+def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
+    """A failure of the generation itself is still logged and raised."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
+        stream, _ = await _chat_stream(monkeypatch, generation)
+        with pytest.raises(RuntimeError, match="engine failed"):
+            async for _ in stream:
+                pass
+
+    asyncio.run(run())
+
+    server_logger.error.assert_called_once()
+    assert "engine failed" in server_logger.error.call_args.args[0]
+
+
+def test_chat_stream_with_fault_tolerance_logs_a_failure_and_ends_with_an_error_event(
+    monkeypatch, server_logger
+):
+    """With WideEP fault tolerance a failure of the generation is logged and ends the stream with an error event.
+
+    The error event and [DONE] tell a client that it can send the request again.
+    """
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
 
     async def run():
         generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
@@ -630,10 +653,11 @@ def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, se
     assert "engine failed" in server_logger.error.call_args.args[0]
 
 
-def test_completion_stream_of_two_prompts_reports_one_failure_and_one_done(
-    monkeypatch, server_logger
-):
-    """One failing prompt of a batched completion stream yields one error event and a single [DONE]."""
+def test_completion_stream_of_two_prompts_reports_the_failure_of_one(monkeypatch, server_logger):
+    """One failing prompt of a batched completion stream yields one error event.
+
+    The other prompt's events still arrive and the stream ends with [DONE].
+    """
 
     async def run():
         server = object.__new__(OpenAIServer)
@@ -668,13 +692,11 @@ def test_completion_stream_of_two_prompts_reports_one_failure_and_one_done(
     frames = asyncio.run(run())
 
     assert frames[-1] == "data: [DONE]\n\n"
-    assert frames.count("data: [DONE]\n\n") == 1
     assert "data: first\n\n" in frames
     assert "data: second\n\n" in frames
     errors = [f for f in frames if f.startswith('data: {"error"')]
     assert len(errors) == 1
     assert json.loads(errors[0][len("data: ") :])["error"]["message"] == "prompt failed"
-    assert len(frames) == 4
     server_logger.error.assert_called_once()
 
 

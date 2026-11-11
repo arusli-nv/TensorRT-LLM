@@ -15,27 +15,12 @@
 """Membership of a WideEP deployment with fault tolerance: the record every rank follows, and the authority that
 writes it.
 
-The authority is the one process that decides membership. It reads every rank's report (its progress, whether it
-is idle, the peers it waits for, and its replies) and writes one :class:`MembershipRecord` that every rank follows:
-the generation, the transaction state, the live ranks and the state every rank resumes from. A change of membership
-is a transaction of two rounds: ``PROPOSE`` (ranks stop and reply ``READY`` with where they stopped and what their
-restore needs from them, which the authority passes on unread), ``INSTALL`` (ranks switch to the new membership,
-restore the lost experts and reply ``INSTALLED``, or ``FAILED``), then ``COMMITTED``. ``ABORT`` ends the deployment
-when recovery cannot succeed, with the reason in the record. Before the deployment serves, the record is
-``STARTING``: every rank joins at the entry of its worker, and the loss of any rank during the startup aborts.
-
-The decision logic (:class:`Authority`) does no I/O, so it is tested by itself. The authority process
-(:class:`AuthorityProcess`) needs no GPU: it hosts a torch ``TCPStore`` whose values are signed with the join secret
-(:class:`SignedStore`), where the record and the ranks' rendezvous values are, and a listener every rank keeps one TCP
-connection to, which carries the record to the rank as it changes and the rank's report to the authority. The
-connection is the rank's liveness: the kernel closes it when the process ends, however it ends, while a rank whose
-Python thread is starved keeps it open (a rank that becomes unreachable stops reporting, and the hang rule finds it).
-It is the authority's liveness for the
-rank as well, and its hello, signed with the join secret, authenticates it. Each node supervisor
-(``tensorrt_llm/llmapi/_llmapi_node_supervisor.py``) keeps a connection too, over which it follows the record
-(:class:`NodeView`); once that connection closes, the authority takes the node's ranks for failed.
-
-Run as ``python -m tensorrt_llm._torch.distributed.membership`` (:func:`main`), the module is the authority process.
+The authority (:class:`Authority`, no I/O) decides membership from the ranks' reports and publishes one
+:class:`MembershipRecord`; a change is a two-round transaction (PROPOSE, INSTALL, then COMMITTED, or ABORT). The
+authority process (:class:`AuthorityProcess`, run as ``python -m tensorrt_llm._torch.distributed.membership``) hosts
+a ``TCPStore`` whose values are signed with the join secret, and a listener every rank and node supervisor keeps one
+connection to: the connection carries the records and reports, and its close is the process's loss. See
+``docs/source/features/wide-ep-fault-tolerance.md``.
 """
 
 import argparse
@@ -56,7 +41,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field
 
 from tensorrt_llm.logger import logger
 
@@ -69,18 +54,14 @@ MAX_RANKS = 256
 PROGRESS_TIMEOUT_S = 30.0
 # How often a rank's agent sends its report when nothing changes (MembershipAgent).
 REPORT_INTERVAL_S = 0.5
-# How long the original ranks have to reach the rendezvous, from the entry of their workers before any model loads:
-# every rank's startup waits share this deadline, and the authority waits this long for every rank to connect. During
-# the startup, a rank waited on in a startup collective may make no progress for this long (Authority).
+# The authority's bound on the startup: every rank must connect within it, and a rank waited on in a startup
+# collective may make no progress for this long.
 RENDEZVOUS_TIMEOUT_S = 600.0
 
-# ``host:port`` on rank 0's node where the authority hosts its store (the rendezvous address; its liveness listener
-# takes the next port, authority_ports), and the join secret (hex) that signs its values. Every process of the
-# deployment takes both from its environment.
+# The rendezvous address (``host:port`` of the authority's store on rank 0's node) and the hex join secret.
 RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 JOIN_SECRET_ENV = "TLLM_FAULT_TOLERANCE_JOIN_SECRET"
-# The environment variables through which MPI and Slurm launchers give a process its rank in their job: a process
-# started outside that job (the authority, a rank a node supervisor starts) runs without them.
+# The launchers' rank variables, which a process started outside the launcher's job must not inherit.
 LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "PRTE_", "SLURM_")
 
 
@@ -102,21 +83,16 @@ class Reply(enum.IntEnum):
 
 
 class _Message(BaseModel):
-    """A value of the membership protocol, sent as JSON (``model_dump_json``, ``model_validate_json``)."""
+    """A value of the membership protocol, sent as JSON."""
 
     model_config = ConfigDict(frozen=True)
 
 
 class ResumeState(_Message):
-    """Where every rank continues after a membership change; the authority sets it from the READY replies."""
+    """Where every rank continues after a membership change."""
 
     iteration: int = 0  # the executor's step counter (main gates some collectives on it)
     epoch: int = 0  # the next epoch every backend derives its round counters from
-
-    def at_least(self, other: "ResumeState") -> "ResumeState":
-        return ResumeState(
-            iteration=max(self.iteration, other.iteration), epoch=max(self.epoch, other.epoch)
-        )
 
 
 class MembershipRecord(_Message):
@@ -124,16 +100,12 @@ class MembershipRecord(_Message):
     state: MembershipState
     live_mask: int
     resume: ResumeState = ResumeState()
-    incarnations: Tuple[
-        int, ...
-    ] = ()  # the process each rank currently stands for (0 = original, n = n-th replacement)
-    # Mask of the live ranks whose replacement joins in this transaction: they enter the host exchange only at the
-    # iteration the live ranks resume after.
+    # The process each rank currently stands for (0 = original, n = n-th replacement).
+    incarnations: Tuple[int, ...] = ()
+    # The live ranks whose replacement joins in this transaction: they enter the host exchange only at the iteration
+    # the live ranks resume after.
     joining_mask: int = 0
-    # Advanced by the authority with every record it publishes: a reader ignores a record older than one it has.
-    sequence: int = 0
-    # With INSTALL: per live rank that sent one, the payload of its READY (RankReport.ready_payload), unread by the
-    # authority; every live rank restores from these. Left out of the record's log line.
+    # With INSTALL: the READY payloads (RankReport.ready_payload) by rank, unread by the authority.
     ready_payloads: Tuple[Tuple[int, str], ...] = Field(default=(), repr=False)
     # With ABORT: why the deployment ends.
     reason: str = ""
@@ -152,14 +124,13 @@ class MembershipRecord(_Message):
         return self.is_live(rank) and current == incarnation
 
     def admits(self, rank: int, incarnation: int) -> bool:
-        """Whether the process ``incarnation`` of ``rank`` is admitted: a COMMITTED record lists it as a live
-        member. A process stays admitted until a record no longer lists it."""
+        """Whether a COMMITTED record lists the process ``incarnation`` of ``rank`` as a live member."""
         return self.state == MembershipState.COMMITTED and self.is_member(rank, incarnation)
 
 
 class NodeView(_Message):
-    """What the authority sends a node supervisor: the record, and per node whose supervisor connected once, the node,
-    its host and whether its supervisor's connection is open."""
+    """What the authority sends a node supervisor: the record, and per known node its host and whether its supervisor
+    is connected."""
 
     record: MembershipRecord
     nodes: Tuple[Tuple[int, str, bool], ...] = ()
@@ -168,92 +139,47 @@ class NodeView(_Message):
 class RankReport(_Message):
     """What one rank last reported to the authority."""
 
-    # The executor's iteration (a replacement continues from the resume state's); during the startup, the startup
-    # collectives the rank completed.
+    # The executor's iteration; during the startup, the startup collectives the rank completed.
     progress: int = 0
     idle: bool = False  # main's hang detector is paused, as while the executor waits for requests
-    waiting_for: int = (
-        0  # mask of the ranks the rank has waited for past a threshold, 0 when not waiting
-    )
+    waiting_for: int = 0  # mask of the ranks the rank has waited for past a threshold
     reply_generation: int = 0
     reply: Reply = Reply.NONE
     stopped_at: ResumeState = ResumeState()  # with READY: where the rank stopped
     # With INSTALLED: the digest of the EPLB placement the rank restored, the same on every live rank.
     placement_digest: str = ""
-    # With READY: what the live ranks' restore needs from this rank, if anything; the INSTALL record carries it to
-    # every live rank, so it is kept small (None from most ranks).
+    # With READY: what the live ranks' restore needs from this rank (None from most ranks); kept small, as the INSTALL
+    # record carries it to every rank.
     ready_payload: Optional[str] = None
-    incarnation: int = 0  # 0 for the original process of the rank, n for its n-th replacement
-    # Advanced with every report the rank sends: a rank whose reports stop advancing is frozen or gone.
+    incarnation: int = 0
+    # Advanced with every report: a rank whose reports stop advancing is frozen or gone.
     sequence: int = 0
-    # Of the ranks in waiting_for, those a MoE all-to-all kernel waits for, each with the round flag it waits for: a
-    # rank that delivers the round and is then waited for in a later one makes progress.
+    # Of the ranks in waiting_for, those an all-to-all kernel waits for, with the round flag it waits for.
     waited_rounds: Tuple[Tuple[int, int], ...] = ()
-    # Of the ranks in waiting_for, those the host exchange waits for, each with the epoch of the round it waits in.
+    # Of the ranks in waiting_for, those the host exchange waits for, with the epoch of the round it waits in.
     waited_epochs: Tuple[Tuple[int, int], ...] = ()
-    # Advanced with every step of installing a membership change the rank completes: a long install is progress.
+    # Advanced with every install step the rank completes: a long install is progress.
     install_steps: int = 0
-    # A replacement: it prepared everything it can without the live ranks, its READY payload included, so the
-    # authority may add it. Until it installs the change that adds it, this report stands for its READY.
+    # A replacement prepared everything it can without the live ranks; until it installs the change that adds it, this
+    # stands for its READY.
     joining_ready: bool = False
-    # An original rank: its startup is done (its executor is ready to serve).
-    started: bool = False
-    # From rank 0: the deployment ends normally, so the authority publishes SHUTDOWN.
-    shutdown: bool = False
+    started: bool = False  # an original rank's startup is done
+    shutdown: bool = False  # from rank 0: the deployment ends normally
 
 
 class TransactionSummary(_Message):
-    """A membership transaction that ended, from its first PROPOSE to its COMMIT or ABORT, for the server's status.
-
-    When each phase ended, in milliseconds since the Unix epoch on the authority's host, to compare with the ranks'
-    logs: the authority saw the failure (a closed connection or a hang verdict) or the join request, sent the first
-    PROPOSE, received the last READY of the attempt that went on (restarts included; None if none did), and ended the
-    transaction with the COMMIT, which follows the last INSTALLED at once, or the ABORT. The durations of the phases
-    derive from these times.
-    """
+    """A membership transaction that ended, for the server's status: when the authority detected it (the failure or
+    the join request), proposed, received the last READY (None if it did not) and ended it, in milliseconds since the
+    Unix epoch on the authority's host."""
 
     generation: int
-    state: MembershipState  # COMMITTED or ABORT
-    removed_ranks: Tuple[int, ...]  # live before the transaction and not after it
-    added_ranks: Tuple[int, ...]  # live after the transaction and not before it
+    outcome: Literal["COMMITTED", "ABORT"]
+    removed_ranks: Tuple[int, ...]
+    added_ranks: Tuple[int, ...]
     detected_unix_ms: float
     began_unix_ms: float
     ready_unix_ms: Optional[float] = None
     ended_unix_ms: float
-
-    @computed_field
-    @property
-    def duration_s(self) -> float:
-        return (self.ended_unix_ms - self.began_unix_ms) / 1e3
-
-    @computed_field
-    @property
-    def detect_to_propose_ms(self) -> float:
-        return round(self.began_unix_ms - self.detected_unix_ms, 1)
-
-    @computed_field
-    @property
-    def propose_to_ready_ms(self) -> Optional[float]:
-        ready = self.ready_unix_ms
-        return None if ready is None else round(ready - self.began_unix_ms, 1)
-
-    @computed_field
-    @property
-    def ready_to_installed_ms(self) -> Optional[float]:
-        if self.state != MembershipState.COMMITTED:
-            return None
-        return round(self.ended_unix_ms - self.ready_unix_ms, 1)
-
-    def times_unix_ms(self) -> Dict[str, Optional[int]]:
-        """When each phase ended (see the class), by name; None for a phase the transaction did not reach."""
-        committed = self.ended_unix_ms if self.state == MembershipState.COMMITTED else None
-        times = {
-            "detected": self.detected_unix_ms,
-            "proposed": self.began_unix_ms,
-            "ready": self.ready_unix_ms,
-            "committed": committed,
-        }
-        return {phase: None if t is None else round(t) for phase, t in times.items()}
 
 
 def _bits(mask: int):
@@ -266,9 +192,8 @@ def _bits(mask: int):
 
 def _chain_end(rank: int, waits: Dict[int, int]) -> bool:
     """Whether ``rank`` is an end of the wait-for graph ``waits`` (rank -> mask of the ranks it waits on): it waits on
-    no rank, or only on ranks that wait back on it, as the members of a cycle that waits on no other rank. Such a cycle
-    forms while a stopped process's last report, which names a peer that now waits on it, has not expired: the
-    stopped process is an end from its stop on, so it is found hung one hang timeout later."""
+    no rank, or only on ranks that wait back on it. Such a cycle forms while a stopped process's last report, which
+    names a peer that now waits on it, has not expired."""
     if any(not waits.get(q, 0) for q in _bits(waits.get(rank, 0))):
         return False  # it waits on a rank that waits on none
 
@@ -288,42 +213,16 @@ def _chain_end(rank: int, waits: Dict[int, int]) -> bool:
 class Authority:
     """Decides membership from the ranks' reports; :meth:`tick` returns a record to publish when it changes.
 
-    A rank is dead when its connection to the authority is gone, and hung when it is the end of a wait-for chain that
-    does not move for ``progress_timeout_s``: it is waited on, makes no progress, and waits on no live rank, or only on
-    ranks that wait back on it (a cycle, whose members are one end), all along that time. A rank waits on the ranks
-    its report names, but only while its reports advance (within half of ``progress_timeout_s``): a stopped process
-    stops its agent thread too, so its last report names no rank and exempts it from nothing. While a membership
-    change is in progress, the authority also waits on every live rank that has not replied in the current phase
-    (PROPOSE or INSTALL): a rank that hangs during the change counts as failed like one that crashes, which restarts
-    the change with the larger set of failed ranks. A rank's progress is
-    its iteration, the rounds its peers wait for it in (all-to-all round flags, host-exchange epochs) and the steps of
-    an install it completed: a rank that delivers the rounds its peers wait for, or goes on installing, advances. The
-    one wait that may last is for client requests: rank 0 is exempt while its reports advance and say it is idle, and
-    the membership is committed. Rank 0's report also ends the deployment normally (``shutdown``: SHUTDOWN).
+    A rank fails when its connection closes, or when it is hung: the end of a wait-for chain (waited on, waiting on no
+    live rank but those that wait back on it) that makes no progress for the timeout. A rank's waits count only while
+    its reports advance. During a change, the authority waits on every live rank that has not replied in the phase.
+    Progress is the iteration, the rounds peers wait for the rank in, and its install steps; rank 0 waiting for
+    requests while COMMITTED is idle, not hung.
 
-    A membership without rank 0 is aborted, never served. The INSTALL record carries the payloads of the READY replies
-    unread (``ready_payloads``): every live rank plans the expert restore from them alike, and that plan is the one
-    rule for whether the live ranks keep every expert. A surviving rank that replies FAILED (a plan that cannot keep
-    every expert fails on every live rank), or surviving ranks whose INSTALLED replies carry different placement
-    digests, abort the transaction.
-
-    A replacement asks to join (:meth:`request_join`) and is added once its report says it is ready to join
-    (``joining_ready``: it prepared everything it can without the live ranks), so the live ranks stop for it only
-    then; it is marked in the record's joining mask until the transaction commits. Its readiness stands for its READY:
-    the live ranks never wait for a joining rank's reply before INSTALL. The hang rule bounds the wait for it as for
-    any live rank. The ranks lost in one transaction (a node's) are added in one: a ready join waits for every other
-    replacement of a rank lost in the same transaction that asked to join and whose reports advance, and the log of
-    the proposal says how long after the first one each was ready. A joining rank that replies FAILED, fails or
-    restores another placement than the survivors is not added: the transaction restarts without it, so a replacement
-    never ends a deployment that serves without it. :attr:`last_transaction` summarizes the last transaction that
-    ended.
-
-    The record is STARTING while the original ranks start up, from the entry of their workers, and becomes generation
-    0's COMMITTED once every rank reports that its startup is done (``started``). A deployment that loses a rank
-    before then cannot serve: the authority aborts as soon as a rank's connection closes, a connected rank's reports
-    stop advancing for ``progress_timeout_s``, ``rendezvous_timeout_s`` passes before every rank has connected, or a
-    rank waited on in a startup collective is the end of a wait-for chain that does not move for
-    ``rendezvous_timeout_s`` (the hang rule, with the startup's bound).
+    While STARTING, any failure (with ``rendezvous_timeout_s`` as the hang timeout), or a rank that does not connect
+    within ``rendezvous_timeout_s``, aborts. A replacement (:meth:`request_join`) is proposed once it reports
+    ``joining_ready``, together with the other replacements of ranks lost in the same transaction whose reports
+    advance; one that fails to join is left out, never ending the deployment.
     """
 
     def __init__(
@@ -350,9 +249,9 @@ class Authority:
         # rank -> ((incarnation, report sequence), time it last advanced)
         self._report_sequence: Dict[int, tuple] = {}
         self._requested: Set[int] = set()  # ranks whose replacement asked to join, not proposed yet
+        # rank -> ((incarnation, startup progress) of its replacement, time it last advanced)
+        self._startup_progress: Dict[int, tuple] = {}
         self._joining: Set[int] = set()  # ranks whose replacement the current transaction adds
-        # rank -> when its replacement, not proposed yet, was first seen ready to join
-        self._ready_to_join_s: Dict[int, float] = {}
         self._lost_in: Dict[
             int, int
         ] = {}  # lost rank -> generation of the transaction that removed it
@@ -362,18 +261,13 @@ class Authority:
         self.last_transaction: Optional[TransactionSummary] = None
 
     def request_join(self, rank: int) -> None:
-        """A replacement for ``rank`` asks to become live; it is proposed once it reports that it is ready to join. If
-        ``rank`` is still live (its old process was not yet found failed), the replacement takes it over."""
+        """A replacement for ``rank`` asks to become live; if ``rank`` is still live, the replacement takes it over."""
         self._requested.add(rank)
-
-    def abort(self, reason: str) -> MembershipRecord:
-        return self._abort(reason)
 
     def tick(
         self, now_s: float, reports: Dict[int, RankReport], connected: int
     ) -> Optional[MembershipRecord]:
-        """``now_s``: the current time on a clock that does not jump (``time.monotonic()``); ``connected``: mask of the
-        ranks whose current process holds its connection to the authority."""
+        """``now_s``: ``time.monotonic()``; ``connected``: mask of the ranks whose current process is connected."""
         before, committed = self.record.state, self._committed_mask
         record = self._decide(now_s, reports, connected)
         if record is None:
@@ -392,7 +286,7 @@ class Authority:
             began_s = self._transaction_began_s
             self.last_transaction = TransactionSummary(
                 generation=record.generation,
-                state=record.state,
+                outcome=record.state.name,
                 removed_ranks=tuple(self._ranks(committed & ~record.live_mask)),
                 added_ranks=tuple(self._ranks(record.live_mask & ~committed)),
                 detected_unix_ms=unix_ms(began_s if self._detected_s is None else self._detected_s),
@@ -419,26 +313,19 @@ class Authority:
         self._joining -= gone
         if state == MembershipState.COMMITTED:
             ready = {r for r in self._requested if r in reports and reports[r].joining_ready}
-            self._ready_to_join_s = {r: self._ready_to_join_s.get(r, now_s) for r in ready}
+            starting = {r for r in self._requested if self._starting(r, reports, now_s)}
             if not failed and not ready:
                 # Nothing is due, also after a ready join whose replacement died while it waited for others.
                 self._detected_s = None
                 return None
             if self._detected_s is None:
                 self._detected_s = now_s
-            if not failed and self._awaits_more_joins(now_s, reports, ready):
+            if not failed and self._awaits_more_joins(now_s, reports, ready, starting):
                 return None
             self._requested -= ready
             self._joining |= ready
             if ready:
-                first_s = min(self._ready_to_join_s.values())
-                after_first = ", ".join(
-                    f"{self._ready_to_join_s[r] - first_s:.2f}" for r in sorted(ready)
-                )
-                logger.info(
-                    f"Membership: adding joining ranks {sorted(ready)}, ready to join {after_first} s after "
-                    f"the first one; proposed {now_s - first_s:.2f} s after it"
-                )
+                logger.info(f"Membership: adding joining ranks {sorted(ready)}")
             return self._propose((self.record.live_mask & ~failed) | self._mask(ready))
         if failed:  # a failure during the transaction: restart it without those ranks too
             return self._propose(self.record.live_mask & ~failed)
@@ -453,7 +340,7 @@ class Authority:
 
         failed_replies = {r for r in live if replied(r, Reply.FAILED)}
         if failed_replies - self._joining:
-            return self._abort(
+            return self.abort(
                 f"in {state.name}, ranks {sorted(failed_replies - self._joining)} replied FAILED"
             )
         if failed_replies:
@@ -466,14 +353,15 @@ class Authority:
             survivors = [
                 r for r in live if self._committed_mask >> r & 1 and r not in self._joining
             ]
-            # The survivors decide where every live rank resumes, a joining rank included: at the furthest iteration
-            # a survivor stopped at, and one past the latest epoch a survivor stopped in (epochs wrap, so not the
-            # largest).
-            resume = self.record.resume
-            for r in survivors:
-                resume = resume.at_least(reports[r].stopped_at)
-            last = latest_epoch([reports[r].stopped_at.epoch for r in survivors])
-            resume = resume.model_copy(update={"epoch": next_epoch(last)})
+            # Every live rank resumes past the furthest iteration a survivor stopped at, and one past the latest epoch a
+            # survivor stopped in (epochs wrap, so not the largest).
+            resume = ResumeState(
+                iteration=max(
+                    [self.record.resume.iteration]
+                    + [reports[r].stopped_at.iteration for r in survivors]
+                ),
+                epoch=next_epoch(latest_epoch([reports[r].stopped_at.epoch for r in survivors])),
+            )
             self._ready_s = now_s
             payloads = tuple(
                 (r, reports[r].ready_payload) for r in live if reports[r].ready_payload is not None
@@ -481,12 +369,11 @@ class Authority:
             return self._set(
                 MembershipState.INSTALL, self.record.live_mask, resume, ready_payloads=payloads
             )
-        # Every live rank restored the placement it planned from the INSTALL record's: the plans must agree. Survivors
-        # that disagree hold no placement the deployment can serve with; a joining rank that disagrees is left out.
+        # Survivors whose placements differ cannot serve; a joining rank whose placement differs is left out.
         joining = self.record.joining_mask
         digests = {reports[r].placement_digest for r in live if not joining >> r & 1}
         if len(digests) > 1:
-            return self._abort("the surviving ranks restored different expert placements")
+            return self.abort("the surviving ranks restored different expert placements")
         mismatched = {r for r in self._ranks(joining) if reports[r].placement_digest not in digests}
         if mismatched:
             logger.warning(
@@ -510,34 +397,20 @@ class Authority:
     def _form(
         self, now_s: float, reports: Dict[int, RankReport], connected: int
     ) -> Optional[MembershipRecord]:
-        """While STARTING: generation 0's COMMITTED once every rank has started, or ABORT (see the class
-        docstring)."""
+        """While STARTING: generation 0's COMMITTED once every rank has started; any failure aborts."""
         if self._rendezvous_began_s is None:
             self._rendezvous_began_s = now_s
         everyone = self.record.live_mask
-        ended = self._connected_once & ~connected
         self._connected_once |= connected
-        if ended:
-            return self._abort(f"ranks {self._ranks(ended)} ended during the startup")
+        failed = self._failed(now_s, reports, connected, self.rendezvous_timeout_s)
+        if failed & self._connected_once:
+            return self.abort(
+                f"ranks {self._ranks(failed & self._connected_once)} failed during the startup"
+            )
         absent = everyone & ~self._connected_once
         if absent and now_s - self._rendezvous_began_s > self.rendezvous_timeout_s:
-            return self._abort(
+            return self.abort(
                 f"ranks {self._ranks(absent)} did not reach the rendezvous within {self.rendezvous_timeout_s:.0f} s"
-            )
-        silent = []
-        for r in self._ranks(connected):
-            self._reports_advance(r, reports, now_s)
-            if now_s - self._report_sequence[r][1] > self.progress_timeout_s:
-                silent.append(r)
-        if silent:
-            return self._abort(
-                f"ranks {silent} stopped reporting for {self.progress_timeout_s:.0f} s during the startup"
-            )
-        hung = self._failed(now_s, reports, connected, self.rendezvous_timeout_s) & connected
-        if hung:
-            return self._abort(
-                f"ranks {self._ranks(hung)} made no progress for {self.rendezvous_timeout_s:.0f} s while other "
-                "ranks waited for them in a startup collective"
             )
         if absent or not all(reports.get(r, RankReport()).started for r in self._ranks(everyone)):
             return None
@@ -548,20 +421,27 @@ class Authority:
         return self._set(MembershipState.COMMITTED, everyone)
 
     def _awaits_more_joins(
-        self, now_s: float, reports: Dict[int, RankReport], ready: Set[int]
+        self, now_s: float, reports: Dict[int, RankReport], ready: Set[int], starting: Set[int]
     ) -> bool:
-        """Whether the replacements ``ready`` to join wait for another replacement of a rank lost in the same
-        transaction as one of them, which asked to join and whose reports advance, so that one transaction adds them
-        all. One whose process ends or stops reporting is not waited for."""
+        """Whether the replacements ``ready`` to join wait for another one of a rank lost in the same transaction, which
+        asked to join, whose reports advance and whose startup progresses (``starting``)."""
         lost_with = {self._lost_in[r] for r in ready if r in self._lost_in}
         return any(
             self._lost_in.get(r) in lost_with and self._reports_advance(r, reports, now_s)
-            for r in self._requested - ready
+            for r in starting - ready
         )
 
+    def _starting(self, r: int, reports: Dict[int, RankReport], now_s: float) -> bool:
+        """Whether the startup of ``r``'s replacement progressed within ``rendezvous_timeout_s``, the startup's bound
+        on a rank's progress."""
+        report = reports.get(r, RankReport())
+        progress = (report.incarnation, report.progress)
+        if self._startup_progress.get(r, (None,))[0] != progress:
+            self._startup_progress[r] = (progress, now_s)
+        return now_s - self._startup_progress[r][1] <= self.rendezvous_timeout_s
+
     def _reports_advance(self, r: int, reports: Dict[int, RankReport], now_s: float) -> bool:
-        """Whether the reports of ``r``'s current process advanced within half of ``progress_timeout_s``: a stopped
-        or unreachable process's do not."""
+        """Whether the reports of ``r``'s current process advanced within half of ``progress_timeout_s``."""
         report = reports.get(r, RankReport())
         sequence = (report.incarnation, report.sequence)
         if self._report_sequence.get(r, (None,))[0] != sequence:
@@ -575,7 +455,7 @@ class Authority:
             return self._set(MembershipState.ABORT, live_mask, reason="rank 0 failed")
         return self._set(MembershipState.PROPOSE, live_mask, generation=self.record.generation + 1)
 
-    def _abort(self, reason: str) -> MembershipRecord:
+    def abort(self, reason: str) -> MembershipRecord:
         logger.error(f"Membership: the deployment aborts: {reason}")
         return self._set(MembershipState.ABORT, self.record.live_mask, reason=reason)
 
@@ -610,7 +490,7 @@ class Authority:
     def _failed(
         self, now_s: float, reports: Dict[int, RankReport], connected: int, timeout_s: float
     ) -> int:
-        """Mask of the live ranks that are dead, or hung for ``timeout_s``, at ``now_s`` (see the class docstring)."""
+        """Mask of the live ranks that are dead, or hung for ``timeout_s``."""
         state, live_mask = self.record.state, self.record.live_mask
         live = self._ranks(live_mask)
 
@@ -681,8 +561,8 @@ class Authority:
 
 
 class SignedStore:
-    """A torch ``TCPStore`` whose values carry an HMAC-SHA256 tag under the join secret: only processes started with
-    the secret can publish membership values, and a value without a valid tag counts as absent."""
+    """A torch ``TCPStore`` whose values carry an HMAC-SHA256 tag under the join secret; a value without a valid tag
+    counts as absent."""
 
     def __init__(self, store, secret: bytes):
         self.store = store
@@ -692,7 +572,7 @@ class SignedStore:
         self.store.set(key, self.tag(key.encode(), value) + value)
 
     def get(self, key: str) -> bytes:
-        """The value of ``key``; waits until it is set.
+        """The value of ``key``; waits until it is set, up to the store's timeout.
 
         Raises:
             PermissionError: The value is not signed with the join secret.
@@ -703,27 +583,15 @@ class SignedStore:
         return value
 
     def get_if_set(self, key: str) -> Optional[bytes]:
-        """The value of ``key``; None while it is not set, or if it is not signed with the join secret."""
+        """The value of ``key``; None while it is not set, or if it is not signed."""
         return self._verified(key, self.store.get(key)) if self.store.check([key]) else None
 
     def multi_get(self, keys: List[str]) -> List[Optional[bytes]]:
-        """The values of ``keys``, which must all be set; None for a value not signed with the join secret."""
+        """The values of ``keys``, which must all be set; None for a value not signed."""
         return [
             self._verified(key, raw)
             for key, raw in zip(keys, self.store.multi_get(keys) if keys else [])
         ]
-
-    def wait(self, keys: List[str], timeout_s: float) -> bool:
-        """Whether every key of ``keys`` is set within ``timeout_s``."""
-        from datetime import timedelta
-
-        from torch.distributed import DistStoreError
-
-        try:
-            self.store.wait(keys, timedelta(seconds=timeout_s))
-        except DistStoreError:  # not all set in time
-            return False
-        return True
 
     def tag(self, key: bytes, value: bytes) -> bytes:
         message = len(key).to_bytes(4, "little") + key + value
@@ -738,14 +606,12 @@ class SignedStore:
 LIVENESS_KEY = "liveness"  # host:port of the authority's liveness listener
 RECORD_KEY = "record"
 TRANSACTION_KEY = "last_transaction"  # the authority's last TransactionSummary
-# How the names of the shared-memory segments of every node's host weights start (rank 0 sets it with EPLB): the
-# node supervisors unlink them once the deployment ended.
+# The name prefix of every node's shared-memory segments of host weights, which the node supervisors unlink at the end.
 HOST_WEIGHTS_PREFIX_KEY = "host_weights_prefix"
 
 
 def incarnation_key(rank: int) -> str:
-    """The last incarnation claimed for ``rank`` (:func:`claim_incarnation`): ``<incarnation> <nonce>``, unset before
-    the rank's first replacement."""
+    """The last incarnation claimed for ``rank``: ``<incarnation> <nonce>``, unset before its first replacement."""
     return f"incarnation/{rank}"
 
 
@@ -761,9 +627,8 @@ def claimed_incarnation(store: SignedStore, rank: int) -> int:
 
 
 def claim_incarnation(store: SignedStore, rank: int, failed: int) -> Optional[int]:
-    """Claim the incarnation of a replacement for the process ``failed`` of ``rank``: ``failed + 1``, if the rank's
-    last claim is ``failed``, by one compare-and-set in the store. Of the claims that replace one process, one wins;
-    None for the others."""
+    """Claim ``failed + 1`` for a replacement of the process ``failed`` of ``rank`` by one compare-and-set; of the
+    claims that replace one process one wins, None for the others."""
     last = _last_claim(store, rank)
     if (int(last.split()[0]) if last else 0) != failed:
         return None
@@ -773,30 +638,13 @@ def claim_incarnation(store: SignedStore, rank: int, failed: int) -> Optional[in
     return failed + 1 if won else None
 
 
-def replacement_key(rank: int) -> str:
-    """Where the node supervisor of ``rank`` publishes how replacing it goes (:class:`ReplacementState`)."""
-    return f"replacement/{rank}"
-
-
-class ReplacementState(_Message):
-    """How the node supervisor's replacement of a rank goes, for the server's status: the last replacement it
-    started is ``starting`` (until a record admits it), or ended before its admission and the next one starts after
-    a backoff (``retrying``), or no replacement can start (``cannot_start``: one exited with
-    :data:`REPLACEMENT_CANNOT_START`, or another claim replaced the process)."""
-
-    incarnation: int
-    state: Literal["starting", "retrying", "cannot_start"]
-    exit_status: Optional[int] = None  # of the last replacement that ended before its admission
-
-
 # Ranks per store counter of an arrival mask: the store's counters are signed 64-bit integers.
 _RANKS_PER_COUNTER = 63
 
 
 def mark_arrived(store: SignedStore, prefix: str, rank: int) -> None:
-    """Record that ``rank`` set its value of the gather under ``prefix``: one bit of a counter of 63 ranks, so that
-    :func:`arrived_ranks` tells who did with one store call per 63 ranks rather than one per rank. The counters carry
-    no value, only whose value to wait for, so they are not signed."""
+    """Record that ``rank`` set its value of the gather under ``prefix``: one bit of a counter of 63 ranks. The
+    counters only say whose value to wait for, so they are not signed."""
     store.store.add(
         f"{prefix}/arrived/{rank // _RANKS_PER_COUNTER}", 1 << rank % _RANKS_PER_COUNTER
     )
@@ -817,9 +665,7 @@ def arrived_ranks(store: SignedStore, prefix: str, world_size: int) -> int:
 
 
 def authority_ports(address: str) -> Tuple[str, int, int]:
-    """The host and the two ports of the authority at the rendezvous address ``address`` (``host:port``): its store
-    listens at ``port`` and its liveness listener, bound to ``host``, at ``port + 1``. A firewall or network policy
-    opens these two ports of rank 0's node to the deployment's nodes."""
+    """The host, store port and liveness port (the next one) of the authority at the rendezvous ``address``."""
     host, port = address.rsplit(":", 1)
     return host, int(port), int(port) + 1
 
@@ -842,15 +688,15 @@ def open_store(address: str, secret: bytes, timeout_s: float) -> SignedStore:
 
 
 def rendezvous_store(timeout_s: float = 60.0) -> SignedStore:
-    """A client of the deployment's store, at the rendezvous address and with the join secret of this process's
-    environment."""
+    """A client of the deployment's store, from this process's environment."""
     return open_store(
         os.environ[RENDEZVOUS_ENV], bytes.fromhex(os.environ[JOIN_SECRET_ENV]), timeout_s
     )
 
 
-# The first poll of a wait for values in the store (wait_for_keys).
+# The first poll of a wait for values in the store (wait_for_keys), and the longest poll of a gather's wait.
 _FIRST_POLL_S = 0.001
+STORE_POLL_S = 0.1
 
 
 def wait_for_keys(
@@ -859,10 +705,9 @@ def wait_for_keys(
     poll_s: float,
     check: Callable[[Set[str]], None],
 ) -> List[bytes]:
-    """The values of ``keys`` once every one is set and signed with the join secret (:class:`SignedStore`). Polls
-    with a backoff up to ``poll_s`` (torch logs a warning for every blocking wait of the store that times out), and
-    calls ``check`` after every poll with the keys set without a valid signature (yet); ``check`` raises to stop
-    waiting."""
+    """The values of ``keys`` once every one is set and signed. Polls with a backoff up to ``poll_s`` (a blocking
+    store wait that times out logs a warning), calling ``check`` after every poll with the keys set unsigned;
+    ``check`` raises to stop waiting."""
     backoff_s = _FIRST_POLL_S
     while True:
         unsigned: Set[str] = set()
@@ -882,14 +727,12 @@ def store_gather(
     rank: int,
     ranks: Sequence[int],
     size: int,
-    wait: Callable[[List[str], List[int], Callable[[], int]], List[bytes]],
+    on_wait: Callable[[int], None],
 ) -> Callable[[object], List[object]]:
-    """An allgather among ``ranks`` (``rank`` among them) through ``store``, under keys of ``name`` and the call:
-    every call returns the values of ranks ``0 .. size - 1``, None for a rank outside ``ranks``.
-    ``wait(keys, ranks, missing)`` returns the values of ``keys``, which ``ranks`` set (:func:`wait_for_keys`);
-    ``missing()`` is the mask of those ranks that have not set theirs yet (:func:`arrived_ranks`). Only processes with
-    the join secret can write the values. The keys of a call are deleted once every rank has completed the next one,
-    so that only the last call's stay."""
+    """An allgather among ``ranks`` through ``store``: every call returns the values of ranks ``0 .. size - 1``, None
+    for a rank outside ``ranks``. While a call waits, ``on_wait`` gets after every poll the mask of the ranks whose
+    values are missing (the arrival mask, read once per report interval) and raises to stop waiting; it gets 0 once
+    the call's wait ends. Only the last call's keys stay in the store."""
     ranks = list(ranks)
     mask = sum(1 << r for r in ranks)
     calls = itertools.count()
@@ -897,13 +740,22 @@ def store_gather(
     def gather(value: object) -> List[object]:
         call = next(calls)
         prefix = f"{name}/{call}"
+        keys = [f"{prefix}/{r}" for r in ranks]
         store.set(f"{prefix}/{rank}", pickle.dumps(value))
         mark_arrived(store, prefix, rank)
-        values = wait(
-            [f"{prefix}/{r}" for r in ranks],
-            ranks,
-            lambda: mask & ~arrived_ranks(store, prefix, size),
-        )
+        read_s, missing = None, 0
+
+        def check(unsigned: Set[str]) -> None:
+            nonlocal read_s, missing
+            if read_s is None or time.monotonic() - read_s >= REPORT_INTERVAL_S:
+                read_s = time.monotonic()
+                missing = mask & ~arrived_ranks(store, prefix, size)
+            on_wait(missing | sum(1 << r for r, key in zip(ranks, keys) if key in unsigned))
+
+        try:
+            values = wait_for_keys(store, keys, STORE_POLL_S, check)
+        finally:
+            on_wait(0)
         if call:
             # Every rank set its value of this call, so each has read the values of the call before.
             previous = f"{name}/{call - 1}"
@@ -928,68 +780,63 @@ def startup_gather(
     size: int,
     on_wait: Callable[[int], None],
 ) -> Callable[[object], List[object]]:
-    """A :func:`store_gather` among the ``ranks`` that start the deployment together, under keys of
-    ``startup/<name>``. A wait for peers' values blocks: the rank's membership agent ends the process once the
-    deployment ends, and the loss of the store, which the authority's process hosts, ends the wait with an error.
-    ``on_wait`` is called with the mask of the peers the wait is for before it blocks, and with 0 once it returns.
+    """A :func:`store_gather` among the ranks that start together, under ``startup/<name>``; ``on_wait`` gets each
+    change of the peers it waits for, then 0. Its waits end only when the membership agent ends the process or the
+    store is lost.
 
     Raises:
-        PermissionError: A value is not signed with the join secret.
+        RuntimeError: The store, which the authority's process hosts, is lost.
     """
+    from torch.distributed import DistError
 
-    def wait(keys: List[str], _ranks: List[int], missing: Callable[[], int]) -> List[bytes]:
-        from torch.distributed import DistNetworkError
+    reported = 0
 
+    def report_changes(waiting: int) -> None:
+        nonlocal reported
+        if waiting != reported or not waiting:
+            reported = waiting
+            on_wait(waiting)
+
+    gather = store_gather(store, f"startup/{name}", rank, ranks, size, report_changes)
+
+    def startup(value: object) -> List[object]:
         try:
-            waiting_for = missing()
-            if waiting_for:
-                on_wait(waiting_for)
-            while not store.wait(keys, RENDEZVOUS_TIMEOUT_S):
-                pass  # the authority decides how long a startup wait may last
-            values = store.multi_get(keys)
-        except DistNetworkError as error:
+            return gather(value)
+        except DistError as error:
             raise RuntimeError(
                 f"Rank {rank} lost the rendezvous store, which the membership authority hosts, while it waited for "
                 "ranks to start"
             ) from error
-        on_wait(0)
-        if None in values:
-            raise PermissionError(f"a startup value of {keys} is not signed with the join secret")
-        return values
 
-    return store_gather(store, f"startup/{name}", rank, ranks, size, wait)
+    return startup
 
 
 def join_secret_digest() -> str:
-    """Names this deployment where every process of a node can list the name: a digest of the join secret of this
-    process's environment, not the secret."""
+    """A name of this deployment that every process of a node may list: a digest of the join secret."""
     return hashlib.sha256(bytes.fromhex(os.environ[JOIN_SECRET_ENV])).hexdigest()[:32]
 
 
 def node_supervisor_address() -> bytes:
-    """The abstract Unix socket the deployment's node supervisor binds, which keeps a second node supervisor of the
-    deployment off the node."""
+    """The abstract Unix socket that keeps a second node supervisor of the deployment off the node."""
     return f"\0tllm-wide-ep-ft-{join_secret_digest()}".encode()
 
 
-# The exit status of a replacement rank whose startup fails in a way that starting another one would repeat: its
-# node supervisor then starts no other one.
+# The exit status of a replacement whose startup failure another replacement would repeat: its node supervisor then
+# starts no other one.
 REPLACEMENT_CANNOT_START = 78
 
 
 class ReplacementCannotStart(SystemExit):
-    """Ends a replacement rank whose startup fails in a way that starting another one would repeat, with exit status
-    :data:`REPLACEMENT_CANNOT_START`; ``str()`` gives the reason."""
+    """Ends a replacement rank with :data:`REPLACEMENT_CANNOT_START`; ``str()`` gives the reason."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
         self.code = REPLACEMENT_CANNOT_START
 
 
-# A liveness connection opens with the authority's nonce line and the hello line, which announces the process and is
-# tagged under the join secret and the authority's nonce: only a process started with the secret opens a connection,
-# and a recorded hello opens no other. The connection is then authenticated, and each side sends JSON lines over it:
-# the authority the record, the rank its report.
+# A liveness connection opens with the authority's nonce line and the hello line, tagged under the join secret and that
+# nonce, so a recorded hello opens no other connection. Then each side sends JSON lines: records one way, reports the
+# other.
 HELLO_TIMEOUT_S = 10.0  # the authority closes a connection without a valid hello by then
 _NONCE_BYTES = 16
 _MAX_LINE_BYTES = 1 << 20
@@ -1003,7 +850,7 @@ def _line(message: _Message) -> bytes:
 
 
 def _decided_at_once(report: RankReport) -> tuple:
-    """The fields of ``report`` the authority decides on as soon as they change (AuthorityProcess._serve)."""
+    """The fields of ``report`` the authority decides on as soon as they change."""
     return (
         report.reply_generation,
         report.reply,
@@ -1043,8 +890,7 @@ def _read_line(sock: socket.socket) -> bytes:
 
 @dataclass
 class LivenessConnection:
-    """A process's liveness connection to the authority, and the lines it receives after the hello; closed at the end
-    of a ``with`` block."""
+    """A process's liveness connection to the authority; closed at the end of a ``with`` block."""
 
     sock: socket.socket
     lines: _Lines
@@ -1070,8 +916,8 @@ def _open_connection(store: SignedStore, announcement: str, timeout_s: float) ->
 def open_liveness_connection(
     store: SignedStore, rank: int, incarnation: int, timeout_s: float = HELLO_TIMEOUT_S
 ) -> LivenessConnection:
-    """This process's liveness connection to the authority, announced with a hello for ``rank`` and
-    ``incarnation``: a replacement, whose incarnation is above the rank's current one, thereby asks to join."""
+    """This process's liveness connection to the authority for ``rank`` and ``incarnation``; a newer incarnation
+    asks to join."""
     connection = _open_connection(store, f"{rank} {incarnation}", timeout_s)
     # A forked child must not keep the connection open.
     os.register_at_fork(after_in_child=connection.sock.close)
@@ -1081,28 +927,22 @@ def open_liveness_connection(
 def open_node_supervisor_connection(
     store: SignedStore, node: int, ranks: List[int], host: str, timeout_s: float = HELLO_TIMEOUT_S
 ) -> LivenessConnection:
-    """The connection of the supervisor of ``node`` (on ``host``, running ``ranks``) to the authority, which sends a
-    :class:`NodeView` over it, and takes ``ranks`` for failed once it closes. The authority refuses it (closes it at
-    once) while another node supervisor holds ``node`` or one of ``ranks``."""
+    """The connection of the supervisor of ``node`` (on ``host``, running ``ranks``) to the authority, which sends
+    :class:`NodeView` lines over it and takes ``ranks`` for failed once it closes."""
     return _open_connection(store, f"node {node} {','.join(map(str, ranks))} {host}", timeout_s)
 
 
 class MembershipAgent:
-    """A rank's side of membership: a thread that keeps the liveness connection, follows the records the authority
-    sends over it and sends the rank's report: every ``interval_s``, after ``on_tick`` (called on this thread) has
-    updated it, and at once when :meth:`report` changes it. ``on_record`` is called on this thread with every newer
-    record. Once a record no longer lists this process as a live member after one did (excluded, left out of the
-    change that would add it, or replaced by a newer incarnation), the thread stops; so does an error, which also
-    closes the connection, so the authority treats the rank as failed rather than silent, and then calls ``on_error``
-    with it. :meth:`bind` replaces the callbacks, as
-    once the rank's executor takes over the membership the rank joined at the entry of its worker."""
+    """A rank's side of membership: a thread that keeps the liveness connection, calls ``on_record`` with every
+    record and sends the rank's report every ``REPORT_INTERVAL_S`` (after ``on_tick``) and at once when
+    :meth:`report` changes it. It stops once a record no longer lists this process after one did, or on an error,
+    which closes the connection and is passed to ``on_error``."""
 
     def __init__(
         self,
         rank: int,
         store: SignedStore,
         on_record: Callable[[MembershipRecord], None],
-        interval_s: float = REPORT_INTERVAL_S,
         incarnation: int = 0,
         on_tick: Optional[Callable[[], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
@@ -1112,15 +952,13 @@ class MembershipAgent:
         self._on_record = on_record
         self._on_tick = on_tick
         self._on_error = on_error
-        self._interval_s = interval_s
         self._report = RankReport(incarnation=incarnation)
         self.record: Optional[MembershipRecord] = None
         # Whether the liveness connection is open: the authority closes it only when it ends or fails this rank.
         self.connected = False
         self._lock = threading.Lock()
-        self._delivery = (
-            threading.Lock()
-        )  # held while a record is delivered and while the callbacks change
+        # Held while a record is delivered and while the callbacks change.
+        self._delivery = threading.Lock()
         self._stop = threading.Event()
         self._wake_read, self._wake_write = os.pipe()
         os.set_blocking(self._wake_read, False)
@@ -1163,8 +1001,7 @@ class MembershipAgent:
                 on_record(self.record)
 
     def report(self, **changes) -> None:
-        """Update fields of the report (progress, idle, waiting_for, replies, placement_digest...), which the
-        agent then sends."""
+        """Update fields of the report, which the agent then sends."""
         with self._lock:
             self._report = self._report.model_copy(update=changes)
         self._wake()
@@ -1210,7 +1047,7 @@ class MembershipAgent:
                         listed = member
                 due = time.monotonic() >= tick_s
                 if due:
-                    tick_s = time.monotonic() + self._interval_s
+                    tick_s = time.monotonic() + REPORT_INTERVAL_S
                     if self._on_tick is not None:
                         self._on_tick()
                 if due or self._wake_read in readable:
@@ -1229,8 +1066,7 @@ class MembershipAgent:
 
 @dataclass
 class _Connection:
-    """A liveness connection the authority accepted: its nonce and, until the hello, what it sent; then the process
-    it stands for (a rank's process or a node supervisor), the lines it sends and the rank's last report."""
+    """A liveness connection the authority accepted, and once its hello is valid, the process it stands for."""
 
     nonce: bytes
     accepted_s: float
@@ -1244,25 +1080,14 @@ class _Connection:
 
 
 class AuthorityProcess:
-    """The authority as a process: publishes the record in the store and sends it over every liveness connection,
-    reads the ranks' reports from their connections, and decides with :class:`Authority`.
+    """The authority as a process: publishes every record in the store and over every connection, and decides with
+    :class:`Authority` from the reports.
 
-    A replacement for rank r joins by connecting with a newer incarnation of r (:func:`open_liveness_connection`):
-    never for rank 0, and not while r is live and its current process holds its connection, so that only the
-    authority's own verdict removes a live process. From then on only that incarnation counts for r; the record lists
-    every rank's current incarnation, so a replaced process learns it is no longer a member. A process has one
-    connection; one without a valid hello within ``hello_timeout_s`` is closed, as is one that sends a line that is
-    not a report. No replacement joins while the original ranks start (STARTING). Rank 0's report stops the authority
-    (``shutdown``). Once ``parent``, a descriptor that becomes readable only at its end of file, ends (the process that
-    started the authority, rank 0's, ended), the deployment aborts, and the authority waits for the live ranks to leave
-    for at most the hang timeout. If the authority itself fails, it ends without a verdict: the ranks find their
-    connections closed and serve on without protection (no lease).
-
-    A node supervisor connects with a hello for its node, its host and the ranks it runs
-    (:func:`open_node_supervisor_connection`); one node, and each rank, has at most one. It receives a
-    :class:`NodeView` instead of the record, also whenever a node supervisor connects or leaves. Its ranks die with it,
-    so once its connection closes while the deployment serves, the authority closes theirs too: they count as failed
-    at once, a process of theirs that outlives its supervisor included.
+    A replacement joins by connecting with a newer incarnation of its rank: never for rank 0, before the deployment
+    has started, or while the rank's current process is connected, so only the authority's verdict removes a live
+    process. Once ``parent`` (readable only at its end of file: rank 0's process ended) ends, the deployment aborts. A
+    node supervisor's connection receives :class:`NodeView` lines; once it closes while the deployment serves, the
+    connections of its ranks are closed too.
     """
 
     def __init__(
@@ -1270,15 +1095,11 @@ class AuthorityProcess:
         world_size: int,
         store: SignedStore,
         authority: Authority,
-        interval_s: float = REPORT_INTERVAL_S,
-        hello_timeout_s: float = HELLO_TIMEOUT_S,
         parent: Optional[int] = None,
     ):
         self.world_size = world_size
         self._store = store
         self._authority = authority
-        self._interval_s = interval_s
-        self._hello_timeout_s = hello_timeout_s
         self._parent = parent
         self._parent_ended_s: Optional[float] = None
         # Something the authority decides on at once changed since its last decision (see _serve).
@@ -1311,16 +1132,15 @@ class AuthorityProcess:
             self._selector.close()
 
     def _serve(self) -> MembershipRecord:
-        """Decide every ``interval_s``, and at once when a connection opens or closes, rank 0's process ends or a
-        report changes a reply or what the rank says of its startup, readiness to join or shutdown; a report that only
-        advances the rank's progress or waits waits for the next interval."""
+        """Decide every ``REPORT_INTERVAL_S``, and at once when a connection opens or closes, rank 0's process ends or
+        a report changes a field of :func:`_decided_at_once`."""
         decide_s = time.monotonic()
         while True:
             self._poll(max(0.0, decide_s - time.monotonic()))
             if not self._changed and time.monotonic() < decide_s:
                 continue
             self._changed = False
-            decide_s = time.monotonic() + self._interval_s
+            decide_s = time.monotonic() + REPORT_INTERVAL_S
             summary = self._authority.last_transaction
             if self._parent_ended_s is not None:
                 record = self._authority.abort("rank 0's process ended")
@@ -1341,24 +1161,19 @@ class AuthorityProcess:
                     self._parent_ended_s is None
                     or time.monotonic() - self._parent_ended_s < self._authority.progress_timeout_s
                 ):
-                    self._poll(self._interval_s)
+                    self._poll(REPORT_INTERVAL_S)
                 return record
 
     def _publish(self, record: MembershipRecord) -> MembershipRecord:
-        record = record.model_copy(
-            update={
-                "incarnations": tuple(self._incarnation),
-                "sequence": 0 if self._record is None else self._record.sequence + 1,
-            }
-        )
+        record = record.model_copy(update={"incarnations": tuple(self._incarnation)})
         self._store.set(RECORD_KEY, record.model_dump_json().encode())
         self._record = record
         self._send_record()
         return record
 
     def _send_record(self, ranks: bool = True) -> None:
-        """Send every process that announced itself the record (with ``ranks``; the replaced and excluded ones
-        included), and every node supervisor its :class:`NodeView`."""
+        """Send the record to every rank's process (with ``ranks``), and the :class:`NodeView` to every node
+        supervisor."""
         record = _line(self._record)
         connected = {c.node for c in self._connections.values() if c.node is not None}
         view = _line(
@@ -1415,14 +1230,13 @@ class AuthorityProcess:
             if (
                 sock in self._connections
                 and connection.lines is None
-                and now_s - connection.accepted_s > self._hello_timeout_s
+                and now_s - connection.accepted_s > HELLO_TIMEOUT_S
             ):
                 logger.warning("Membership: closing a liveness connection without a valid hello")
                 self._drop(sock)
 
     def _accept(self, listener: socket.socket) -> None:
-        """Accept a connection; at most ``MAX_RANKS`` wait for their hello: the oldest goes first, as when the process
-        is out of descriptors."""
+        """Accept a connection; at most ``MAX_RANKS`` wait for their hello, the oldest dropped first."""
         waiting = [sock for sock, c in self._connections.items() if c.lines is None]
         if len(waiting) >= MAX_RANKS:
             logger.warning(
@@ -1475,8 +1289,7 @@ class AuthorityProcess:
             self._drop(sock)
 
     def _read_hello(self, sock: socket.socket, connection: _Connection, data: bytes) -> bytes:
-        """Admit the connection once its hello line is complete and valid; returns what follows the line (nothing
-        before).
+        """Admit the connection once its hello line is complete and valid; returns what follows the line.
 
         Raises:
             ValueError: The hello is not valid, or opens no connection (:meth:`_refusal`).
@@ -1581,13 +1394,9 @@ class AuthorityProcess:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """The authority process: hosts the store at the rendezvous address (``RENDEZVOUS_ENV``, which must name this
-    node) and its liveness listener at the next port (:func:`authority_ports`), writes that ``host:port`` to
-    ``--address-fd`` (default stdout) once it listens, then serves until the record is SHUTDOWN (exit status 0) or
-    ABORT (1). The join secret comes from ``JOIN_SECRET_ENV``. Once the process that started it (rank 0's) has ended,
-    the deployment aborts and the process ends: that process holds the writing end of a pipe that is this process's
-    standard input, which nothing writes to.
-    """
+    """The authority process: hosts the store at the rendezvous address, writes it to ``--address-fd`` once it
+    listens, and serves until SHUTDOWN (exit status 0) or ABORT (1). Its standard input is a pipe whose writing end
+    the starting process (rank 0's) holds: at its end of file the deployment aborts."""
     parser = argparse.ArgumentParser(description="WideEP fault-tolerance membership authority")
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument("--address-fd", type=int, default=1)
@@ -1604,8 +1413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.address_fd != 1:
         os.close(args.address_fd)
     authority = Authority(args.world_size, rendezvous_timeout_s=args.rendezvous_timeout_s)
-    # A signal for the deployment (Ctrl-C in its terminal) is its ranks' to act on: the authority ends with rank 0's
-    # process, or once the deployment shut down.
+    # A signal for the deployment (Ctrl-C in its terminal) is its ranks' to act on.
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, signal.SIG_IGN)
     process = AuthorityProcess(args.world_size, store, authority, parent=sys.stdin.fileno())

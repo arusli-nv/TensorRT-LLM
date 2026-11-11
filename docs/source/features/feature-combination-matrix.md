@@ -25,8 +25,8 @@ apply; the startup check rejects the rest:
 | Expert Parallelism / Attention Data Parallelism | Required: attention DP over all ranks within one NVLink domain with the default router and admission, `NVLinkOneSided` MoE communication, EPLB (fault tolerance adds the spare slots) |
 | Tensor Parallelism (attention) / Pipeline Parallelism | Unsupported |
 | Overlap Scheduler / CUDA Graph / KV Cache Reuse | Supported; the overlap scheduler and KV cache manager V2 are required |
-| Speculative Decoding | MTP supported; separate draft models and DSpark unsupported |
-| Disaggregated Serving / KV cache connectors / KV cache events / Sleep mode / several serving frontends | Unsupported |
+| Speculative Decoding | MTP supported; NGram and user-provided drafters and DSpark unsupported |
+| Disaggregated Serving / KV cache connectors / KV cache events / Sleep mode / several serving frontends / `torch_compile_config` / Ray and RPC executors | Unsupported |
 | Sampling | `n > 1`, `best_of > 1` and beam search unsupported |
 
 See [WideEP Fault Tolerance](wide-ep-fault-tolerance.md).

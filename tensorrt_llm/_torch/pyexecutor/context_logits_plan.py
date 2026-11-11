@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
+from tensorrt_llm._utils import fault_tolerance_mode
 from tensorrt_llm.executor.result import reduce_prompt_logprobs
 from tensorrt_llm.logger import logger
 
@@ -24,10 +25,11 @@ def store_context_logits(
     """Consume context rows from either projection path using one result contract.
 
     Prompt logprobs are reduced on the logits' device; only the reduced rows and
-    the final prompt row's log probabilities reach host memory. Each position of
-    the original prompt is stored once: a request that replays its prefill after
-    a recompute stores only the positions past its stored rows
-    (``PyResult.context_rows_end``), and none past the original prompt.
+    the final prompt row's log probabilities reach host memory. With WideEP
+    fault tolerance each position of the original prompt is stored once: a
+    request that replays its prefill after a rank failure stores only the
+    positions past its stored rows (``PyResult.context_rows_end``), and none
+    past the original prompt.
 
     Args:
         request: Context request whose current chunk produced ``logits``.
@@ -39,26 +41,35 @@ def store_context_logits(
     """
     result = request.py_result
     position = request.context_current_position + offset
-    if position > result.context_rows_end:
+    chunk_tail = offset + logits.shape[0] == request.context_chunk_size
+    prompt_len = request.py_prompt_len
+    fault_tolerance = fault_tolerance_mode()
+    if fault_tolerance:
+        rows_missing = position > result.context_rows_end
+    else:
+        rows_missing = offset == 0 and request.prepopulated_prompt_len > 0
+    if rows_missing:
         logger.warning(
             "Because of KV cache reuse, not all context logits could be produced "
             f"for request {request.request_id}."
         )
-    chunk_tail = offset + logits.shape[0] == request.context_chunk_size
-    prompt_len = request.orig_prompt_len
-    skip = max(result.context_rows_end - position, 0)
-    end = min(prompt_len, position + logits.shape[0])
-    if position + skip >= end:
-        return
-    logits = logits[skip : end - position]
-    position += skip
-    result.context_rows_end = end
+    if fault_tolerance:
+        prompt_len = request.orig_prompt_len
+        skip = max(result.context_rows_end - position, 0)
+        end = min(prompt_len, position + logits.shape[0])
+        if position + skip >= end:
+            return
+        logits = logits[skip : end - position]
+        position += skip
+        result.context_rows_end = end
     compact = request.py_prompt_logprobs is not None
     if request.py_context_logits_explicit or not compact:
         result.append_context_logits(logits, reusable=reusable)
     if not compact:
         return
-    targets = request.get_tokens(0)[position + 1 : min(end + 1, prompt_len)]
+    begin = position + 1
+    end = min(prompt_len, begin + logits.shape[0])
+    targets = request.get_tokens(0)[begin:end]
     # Appended even when empty, so a compact request always reports its rows.
     result.append_prompt_logprobs(
         reduce_prompt_logprobs(logits[: len(targets)], targets, request.py_prompt_logprobs)

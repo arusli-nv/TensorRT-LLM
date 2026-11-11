@@ -29,7 +29,13 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence
 from .membership import ReplacementCannotStart
 
 # The modules whose frames lie between a startup collective's caller and the record.
-_COLLECTIVE_MODULES = frozenset({__name__, "tensorrt_llm._torch.distributed.communicator"})
+_COLLECTIVE_MODULES = frozenset(
+    {
+        __name__,
+        "tensorrt_llm._torch.distributed.communicator",
+        "tensorrt_llm._torch.distributed.host_exchange",
+    }
+)
 
 # The callers, by (file, function), whose payload is the rank's own measurement, which a replacement's differs from:
 # they take the original ranks' payloads, its predecessor's included.
@@ -215,7 +221,6 @@ class StartupRecord:
                 f"Host collective {index} of this replacement rank's startup is {caller}, the original ranks' "
                 f"{recorded.caller}"
             )
-        self._replayed_exchanges += 1
         predecessor = recorded.payloads[rank]
         if (
             predecessor is not None
@@ -234,6 +239,7 @@ class StartupRecord:
                 f"Host collective {index} of this replacement rank's startup, {caller}, reads the payloads of ranks "
                 f"{unread}, which rank 0 did not receive"
             )
+        self._replayed_exchanges += 1
         return [p if r in readers else None for r, p in enumerate(recorded.payloads)]
 
     @staticmethod

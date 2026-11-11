@@ -123,8 +123,12 @@ def test_a_startup_collective_reports_the_peers_it_waits_for_and_then_a_step_don
         time.sleep(0.3)
         startup_gather(_client(store), "g", 1, range(2), 2, _ignore_waits)(1)
 
-    threading.Thread(target=late_peer).start()
-    assert startup_gather(_client(store), "g", 0, range(2), 2, waits.append)(0) == [0, 1]
+    peer = threading.Thread(target=late_peer)
+    peer.start()
+    try:
+        assert startup_gather(_client(store), "g", 0, range(2), 2, waits.append)(0) == [0, 1]
+    finally:
+        peer.join(30)
     assert waits == [0b10, 0]
 
 
@@ -172,12 +176,19 @@ def test_the_startup_ends_when_the_authority_is_lost(monkeypatch):
 
 
 def test_a_replacement_starts_alone(monkeypatch):
-    """Its groups have the deployment's layout with only itself live, and never reach the store."""
+    """Its groups have the deployment's layout with only itself live, and never reach the store; each exchange is a
+    step of startup progress it reports, which the authority bounds a joiner by. Fails without the change: a
+    replacement reported no startup progress."""
     monkeypatch.setattr(
         recovery_module, "_startup_store", lambda: pytest.fail("a replacement used the store")
     )
-    monkeypatch.setattr(recovery_module, "_rank_nodes", (0, 0, 0, 0, 1, 1, 1, 1))
-    world = StartupGroup(RankIdentity(5, 8, 1), range(8))
+    monkeypatch.setattr(
+        recovery_module, "_mapping", Mapping(world_size=8, rank=5, tp_size=8, gpus_per_node=4)
+    )
+    agent = Mock()
+    monkeypatch.setattr(recovery_module, "_agent", agent)
+    monkeypatch.setattr(recovery_module, "_startup_steps", 0)
+    world = StartupGroup(RankIdentity(5, 8, 4, 1), range(8))
     assert (world.Get_rank(), world.Get_size()) == (5, 8)
     assert world.allgather("v") == [None] * 5 + ["v", None, None]
     world.Barrier()
@@ -185,13 +196,16 @@ def test_a_replacement_starts_alone(monkeypatch):
     assert (node.membership, node.Get_rank(), node.Get_size()) == ((4, 5, 6, 7), 1, 4)
     assert node.allgather(True) == [None, True, None, None]
     assert node.allreduce(3, op=MPI.MIN) == 3
+    assert [call.kwargs["progress"] for call in agent.report.call_args_list] == [1, 2, 3, 4]
 
 
 def test_original_ranks_split_and_reduce_through_the_store(store, monkeypatch):
-    monkeypatch.setattr(recovery_module, "_rank_nodes", (0, 0, 1, 1))
+    monkeypatch.setattr(
+        recovery_module, "_mapping", Mapping(world_size=WORLD, tp_size=WORLD, gpus_per_node=2)
+    )
 
     def rank(r):
-        world = StartupGroup(RankIdentity(r, WORLD, 0), range(WORLD))
+        world = StartupGroup(RankIdentity(r, WORLD, 2, 0), range(WORLD))
         node = world.Split_type(OMPI_COMM_TYPE_HOST)
         reversed_group = world.subgroup([3, 2, 1, 0])
         world.Barrier()
@@ -219,7 +233,7 @@ def test_a_split_groups_the_members_of_a_color_in_key_order(store, monkeypatch):
     reaches the store. Fails without the change: StartupGroup had no Split."""
 
     def rank(r):
-        world = StartupGroup(RankIdentity(r, WORLD, 0), range(WORLD))
+        world = StartupGroup(RankIdentity(r, WORLD, WORLD, 0), range(WORLD))
         color, key = _SPLITS[r]
         split = world.Split(color, key)
         return split.membership, split.Get_rank(), split.allgather(r)
@@ -231,19 +245,18 @@ def test_a_split_groups_the_members_of_a_color_in_key_order(store, monkeypatch):
     assert results[3] == ((3, 1), 0, [3, 1])
 
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,1")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
     _replay(monkeypatch, {"startup_group_split": [_SPLITS]})
     monkeypatch.setattr(
         recovery_module, "_startup_store", lambda: pytest.fail("a replacement used the store")
     )
-    split = StartupGroup(RankIdentity(2, WORLD, 1), range(WORLD)).Split(*_SPLITS[2])
+    split = StartupGroup(RankIdentity(2, WORLD, WORLD, 1), range(WORLD)).Split(*_SPLITS[2])
     assert (split.membership, split.Get_rank()) == ((2, 0), 0)
 
 
 def _mirror(store_port, rank, steps):
     """A peer of rank 1's process in test_an_original_rank_starts_without_mpi: the same collectives on its groups."""
-    world = StartupGroup(RankIdentity(rank, WORLD, 0), range(WORLD))
-    world.allgather(socket.gethostname())  # join_startup_group's gather of the ranks' hosts
+    world = StartupGroup(RankIdentity(rank, WORLD, WORLD, 0), range(WORLD))
     node = world.Split_type(OMPI_COMM_TYPE_HOST)  # local_mpi_comm()
     tp = world.subgroup(range(WORLD))  # TpMnnvlMemory.get_comm()
     for step in steps:
@@ -272,27 +285,27 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     the store, and none goes to mpi4py."""
     calls = []
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,0")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _RecordingComm(_utils.comm, calls))
     monkeypatch.setattr(_utils, "_local_comm", None)
     monkeypatch.setattr(MPI, "COMM_WORLD", _RecordingComm(MPI.COMM_WORLD, calls))
     monkeypatch.setattr(TpMnnvlMemory, "comm", None)
     monkeypatch.setattr(TpMnnvlMemory, "comm_signature", None)
-    # Every rank on this host; set before the peers split by node, which rank 1 finds in join_startup_group.
-    monkeypatch.setattr(recovery_module, "_rank_nodes", (0,) * WORLD)
+    # Every rank on one node; set before the peers split by node, as rank 1 sets it in join_startup_group.
+    mapping = Mapping(
+        world_size=WORLD, rank=1, tp_size=WORLD, moe_ep_size=WORLD, enable_attention_dp=True
+    )
+    monkeypatch.setattr(recovery_module, "_mapping", mapping)
     steps = ["barrier", "allgather", "node_barrier", "node_min", "tp_allgather"]
     peers = ThreadPoolExecutor(3)
     mirrored = [peers.submit(_mirror, store, rank, steps) for rank in (0, 2, 3)]
 
-    join_startup_group()
+    join_startup_group(mapping)
     _utils.mpi_barrier()
     gathered = _utils.mpi_comm().allgather(1)
     _utils.local_mpi_barrier()
     least = _utils.local_mpi_comm().allreduce(1, op=MPI.MIN)
-    mapping = Mapping(
-        world_size=WORLD, rank=1, tp_size=WORLD, moe_ep_size=WORLD, enable_attention_dp=True
-    )
     tp_values = TpMnnvlMemory.get_comm(mapping).allgather(1)
     for peer in mirrored:
         peer.result(timeout=60)
@@ -307,51 +320,49 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     assert recovery_module.os.environ["TLLM_RANK"] == "1"
 
 
-@pytest.mark.parametrize(
-    "hosts, nodes", [("aabb", (0, 0, 1, 1)), ("abab", (0, 1, 0, 1))], ids=["block", "cyclic"]
-)
-def test_the_node_of_every_rank_comes_from_the_ranks_hosts(store, monkeypatch, hosts, nodes):
-    """Nodes numbered in the order of their first rank; a split by node follows them. Fails without the change: the
-    node of rank r was r // gpus_per_node, and a cyclic placement was refused."""
+@pytest.mark.parametrize("incarnation", [0, 1], ids=["original", "replacement"])
+def test_the_node_of_every_rank_comes_from_the_mapping(monkeypatch, incarnation):
+    """Rank 2 of two nodes of two GPUs, original or replacement: a split by node gives ranks 2 and 3, and joining
+    the startup group exchanges and records nothing. Fails without the change: the ranks agreed on their hosts,
+    gathered through the store, when they joined."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,0")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,{WORLD},2,{incarnation}")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _utils.comm)
     monkeypatch.setattr(_utils, "_local_comm", None)
-    monkeypatch.setattr(recovery_module, "_rank_nodes", None)
-    monkeypatch.setattr(recovery_module.socket, "gethostname", lambda: hosts[1])
-
-    def peer(rank):
-        world = StartupGroup(RankIdentity(rank, WORLD, 0), range(WORLD))
-        world.allgather(hosts[rank])
-
-    with ThreadPoolExecutor(3) as pool:
-        mirrored = [pool.submit(peer, rank) for rank in (0, 2, 3)]
-        join_startup_group()
-        for done in mirrored:
-            done.result(timeout=60)
-    assert recovery_module.rank_nodes() == nodes
+    monkeypatch.setattr(recovery_module, "_mapping", None)
+    _replay(monkeypatch, None)
+    store = Mock()
+    monkeypatch.setattr(recovery_module, "_startup_store", lambda: store)
+    join_startup_group(Mapping(world_size=WORLD, rank=2, tp_size=WORLD, gpus_per_node=2))
     node = _utils.local_mpi_comm()
     assert isinstance(node, StartupGroup)
-    assert node.membership == tuple(r for r in range(WORLD) if nodes[r] == nodes[1])
+    assert (node.membership, node.Get_rank()) == ((2, 3), 0)
+    assert store.method_calls == []
+    assert startup_record.values == {}
 
 
-def test_a_replacement_takes_the_node_of_every_rank_from_the_agreed_startup(monkeypatch):
-    """Not from the store: its peers' hosts are the original ranks'. Fails without the change: there was no node map
-    to agree on."""
+@pytest.mark.parametrize(
+    "supervisor_gpus, mapping_gpus", [(2, 4), (4, 2), (1, 8)], ids=["fewer", "more", "one-per-node"]
+)
+def test_a_rank_whose_mapping_places_the_ranks_on_other_nodes_does_not_start(
+    monkeypatch, supervisor_gpus, mapping_gpus
+):
+    """The node supervisor runs ``supervisor_gpus`` ranks per node, the mapping says ``mapping_gpus`` (one node of
+    every rank under both is accepted, as in test_an_original_rank_starts_without_mpi). Fails without the change: the
+    rank joined, and its splits by node grouped ranks of different nodes."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,1")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,{WORLD},{supervisor_gpus},0")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _utils.comm)
-    monkeypatch.setattr(_utils, "_local_comm", None)
-    monkeypatch.setattr(recovery_module, "_rank_nodes", None)
-    _replay(monkeypatch, {"rank_hosts": [["a", "b", "b", "c"]]})
-    monkeypatch.setattr(
-        recovery_module, "_startup_store", lambda: pytest.fail("a replacement used the store")
-    )
-    join_startup_group()
-    assert recovery_module.rank_nodes() == (0, 1, 1, 2)
-    assert _utils.local_mpi_comm().membership == (1, 2)
+    monkeypatch.setattr(recovery_module, "_mapping", None)
+    mapping = Mapping(world_size=WORLD, rank=2, tp_size=WORLD, gpus_per_node=mapping_gpus)
+    with pytest.raises(
+        ValueError, match=f"gpus_per_node {supervisor_gpus}, .* not {mapping_gpus}; turn it off"
+    ):
+        join_startup_group(mapping)
+    assert recovery_module._mapping is None
+    assert recovery_module.os.environ["TLLM_RANK"] == "-"
 
 
 def test_an_original_rank_waits_for_every_rank_to_start(monkeypatch):
@@ -401,7 +412,7 @@ def test_an_mnnvl_group_has_the_ranks_split_would_give(
     """Under fault tolerance the group comes from the mapping, as a subgroup of the startup group."""
     mapping = Mapping(world_size=4, rank=rank, **kwargs)
     assert memory_cls.comm_split_ranks(mapping) == ranks
-    world = StartupGroup(RankIdentity(rank, 4, 1), range(4))
+    world = StartupGroup(RankIdentity(rank, 4, 4, 1), range(4))
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
     monkeypatch.setattr("tensorrt_llm._torch.distributed.mnnvl_memory.mpi_comm", lambda: world)
     monkeypatch.setattr(memory_cls, "comm", None)

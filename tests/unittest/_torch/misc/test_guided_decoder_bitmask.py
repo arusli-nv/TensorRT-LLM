@@ -19,6 +19,7 @@ from typing import List
 import pytest
 import torch
 
+from tensorrt_llm import _utils
 from tensorrt_llm._torch.pyexecutor import guided_decoder as guided_decoder_module
 from tensorrt_llm._torch.pyexecutor.guided_decoder import (
     CapturableGuidedDecoder,
@@ -464,8 +465,13 @@ def test_capturable_failures_are_released_per_batch(monkeypatch):
 # --- recompute and discarded steps --------------------------------------------
 
 
-def test_a_recomputed_request_carries_its_generated_tokens_to_its_last_context_chunk():
-    """A recompute moves the generated tokens into the prompt; the new matcher must accept them."""
+@pytest.mark.parametrize("fault_tolerance", [True, False])
+def test_a_recomputed_request_carries_its_generated_tokens_to_its_last_context_chunk(
+    monkeypatch, fault_tolerance
+):
+    """A recompute moves the generated tokens into the prompt; with WideEP fault tolerance the new matcher must
+    accept them."""
+    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
     request = LlmRequest(
         request_id=1,
         max_new_tokens=8,
@@ -479,7 +485,8 @@ def test_a_recomputed_request_carries_its_generated_tokens_to_its_last_context_c
     request.reset_for_recompute(1 << 20)
     request.context_chunk_size = request.context_remaining_length
 
-    assert GuidedRequest.from_llm_request(request).recomputed_tokens == [10, 11]
+    expected = [10, 11] if fault_tolerance else None
+    assert GuidedRequest.from_llm_request(request).recomputed_tokens == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

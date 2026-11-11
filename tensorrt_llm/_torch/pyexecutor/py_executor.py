@@ -7095,11 +7095,15 @@ class PyExecutor:
         no _KVCache may be mid-update -- because ``adjust()`` moves pages
         underneath whatever holds them.
         """
-        with self._kv_pools_suspended() as mgr:
-            try:
-                mgr.impl.adjust()
-            except OutOfPagesError as e:
-                logger.warning(f"KV pool adjust() failed: {e!r}")
+        mgr = self.kv_cache_manager
+        paused, paused_dummies = self._suspend_for_rebalance(mgr)
+
+        try:
+            mgr.impl.adjust()
+        except OutOfPagesError as e:
+            logger.warning(f"KV pool adjust() failed: {e!r}")
+
+        self._resume_after_rebalance(mgr, paused, paused_dummies)
 
     @contextmanager
     def _kv_pools_suspended(self) -> Iterator[KVCacheManagerV2]:
@@ -7110,40 +7114,49 @@ class PyExecutor:
         ``_rebalance_kv_pools_now`` requires.
         """
         mgr = self.kv_cache_manager
+        paused, paused_dummies = self._suspend_for_rebalance(mgr)
+        try:
+            yield mgr
+        finally:
+            self._resume_after_rebalance(mgr, paused, paused_dummies)
 
+    def _suspend_for_rebalance(
+        self, mgr: KVCacheManagerV2
+    ) -> Tuple[List[LlmRequest], List[Tuple[int, int, LlmRequest]]]:
+        """Suspend every active request and padding dummy; return them for
+        ``_resume_after_rebalance``."""
         paused: List[LlmRequest] = []
         for req in self.active_requests:
             if mgr.is_request_active(req.py_request_id):
                 mgr.suspend_request(req)
                 paused.append(req)
-        paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
+        return paused, self._suspend_padding_dummies_for_rebalance(mgr)
 
-        try:
-            yield mgr
-        finally:
-            remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
-            if remote_tail_adp:
-                # Preserve the one execution-only row before real requests
-                # reclaim the resized pools. It is required even when a rank
-                # is at capacity.
-                self._resume_padding_dummies_after_rebalance(
-                    mgr, paused_dummies)
-                dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
-                    0)
-                reserved = dummy is not None and mgr.is_request_active(
-                    dummy.py_request_id)
-                if not all(self.dist.tp_allgather(reserved)):
-                    raise RuntimeError(
-                        "KV pool rebalance could not preserve the reserved "
-                        "conditional attention-DP execution row on every rank")
-            for req in paused:
-                mgr.resume_request(req)
-            if not remote_tail_adp:
-                self._resume_padding_dummies_after_rebalance(
-                    mgr, paused_dummies)
+    def _resume_after_rebalance(
+            self, mgr: KVCacheManagerV2, paused: List[LlmRequest],
+            paused_dummies: List[Tuple[int, int, LlmRequest]]) -> None:
+        """Resume what ``_suspend_for_rebalance`` suspended and read the KV
+        cache capacity again."""
+        remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
+        if remote_tail_adp:
+            # Preserve the one execution-only row before real requests reclaim
+            # the resized pools. It is required even when a rank is at capacity.
+            self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+            dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
+                0)
+            reserved = dummy is not None and mgr.is_request_active(
+                dummy.py_request_id)
+            if not all(self.dist.tp_allgather(reserved)):
+                raise RuntimeError(
+                    "KV pool rebalance could not preserve the reserved "
+                    "conditional attention-DP execution row on every rank")
+        for req in paused:
+            mgr.resume_request(req)
+        if not remote_tail_adp:
+            self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
 
-            # Rebalancing can change the number of primary blocks.
-            self._kv_cache_capacity = self._read_kv_cache_capacity()
+        # Rebalancing can change the number of primary blocks.
+        self._kv_cache_capacity = self._read_kv_cache_capacity()
 
     def _start_pp_rebalance_drain(self) -> None:
         """Begin emptying the microbatch ring ahead of a PP rebalance.

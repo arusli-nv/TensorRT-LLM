@@ -290,8 +290,8 @@ torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, i
     return metainfo;
 }
 
-// Initialize this rank's control state after allocation; layout construction itself is CPU-only. The caller keeps
-// peers from using this rank's workspace until it returns (a barrier among the ranks of the workspace).
+// Initialize control state after allocation; layout construction itself is CPU-only. A rank-mask workspace's ranks
+// may not all be alive, so its caller synchronizes the ranks that are.
 void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
 {
     CHECK_TH_CUDA(workspace);
@@ -316,7 +316,15 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     uint8_t* rankWorkspace = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     cudaMemsetAsync(rankWorkspace + layout[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
         2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
+    // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
+    // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
+    // NVLinkOneSided strategy unusable there; fall back to the Torch process
+    // group the Ray workers already initialise, as pg_utils does elsewhere.
     cudaDeviceSynchronize();
+    if (!hasIncompleteRoundWord(layout))
+    {
+        moeA2ABarrier();
+    }
 }
 
 // ============================================================================

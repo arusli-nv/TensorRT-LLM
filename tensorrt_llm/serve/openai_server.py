@@ -316,7 +316,10 @@ async def _end_stream_on_error(
         events: AsyncIterator[str]) -> AsyncGenerator[str, None]:
     """Pass ``events`` through; if they fail, end the stream with ``_stream_error_events``.
 
-    A failure after ``[DONE]``, such as in metrics extraction, is only logged: the stream has ended.
+    With WideEP fault tolerance a request that loses a rank fails with a
+    retryable error, which a client of a stream reads from its error event. A
+    failure after ``[DONE]``, such as in metrics extraction, adds nothing: the
+    stream has ended.
     """
     done = False
     try:
@@ -324,7 +327,6 @@ async def _end_stream_on_error(
             yield event
             done = event == "data: [DONE]\n\n"
     except Exception as error:
-        logger.error(traceback.format_exc())
         if not done:
             for event in _stream_error_events(error):
                 yield event
@@ -2149,27 +2151,34 @@ class OpenAIServer(_VideoRoutesMixin):
         async def chat_stream_generator(
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            first_response = await anext(promise)
-            raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-            )
-            pp_results = first_response.outputs[
-                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                    first_response, args)
-            for pp_res in pp_results:
-                yield pp_res
-            # Making sure we can handle the situation where there is only one response
-            res = first_response
-            async for res in promise:
-                pp_results = res.outputs[
+            try:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
+                )
+                pp_results = first_response.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        res, args)
+                        first_response, args)
                 for pp_res in pp_results:
                     yield pp_res
-            yield "data: [DONE]\n\n"
-            await self._extract_metrics(res, raw_request)
-            nvtx_mark("generation ends")
+                # Making sure we can handle the situation where there is only one response
+                res = first_response
+                async for res in promise:
+                    pp_results = res.outputs[
+                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                            res, args)
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
+                nvtx_mark("generation ends")
+            except Exception:
+                # Only failures are logged: a consumer that stops reading closes
+                # the stream with GeneratorExit, and a client that disconnects
+                # cancels it, and neither is an error of this stream.
+                logger.error(traceback.format_exc())
+                raise
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -2580,8 +2589,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if request.stream:
-                response_generator = _end_stream_on_error(
-                    chat_stream_generator(promise, postproc_params))
+                response_generator = chat_stream_generator(
+                    promise, postproc_params)
+                if fault_tolerance_mode():
+                    response_generator = _end_stream_on_error(
+                        response_generator)
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
@@ -3096,8 +3108,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(output, raw_request)
             except Exception as e:
                 logger.error(traceback.format_exc())
-                # generator_wrapper ends the stream with [DONE].
-                yield _stream_error_events(e)[0]
+                # StreamingResponse commits HTTP 200 before the first
+                # chunk, so we cannot change the status code.  Yield
+                # an SSE error event so the stream terminates cleanly
+                # instead of breaking the HTTP connection.
+                for event in _stream_error_events(e):
+                    yield event
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3253,25 +3269,31 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            first_response = await anext(promise)
-            raw_request.state.server_first_token_time = (
-                self._adjusted_steady_clock.now())
-            pp_results = (first_response.outputs[0]._postprocess_result
-                          if self.postproc_worker_enabled else post_processor(
-                              first_response, args))
-            for pp_res in pp_results:
-                yield pp_res
-            res = first_response
-            async for res in promise:
-                pp_results = (res.outputs[0]._postprocess_result if
+            try:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = (
+                    self._adjusted_steady_clock.now())
+                pp_results = (first_response.outputs[0]._postprocess_result if
                               self.postproc_worker_enabled else post_processor(
-                                  res, args))
+                                  first_response, args))
                 for pp_res in pp_results:
                     yield pp_res
-            yield "data: [DONE]\n\n"
-            await self._extract_metrics(res, raw_request)
+                res = first_response
+                async for res in promise:
+                    pp_results = (res.outputs[0]._postprocess_result
+                                  if self.postproc_worker_enabled else
+                                  post_processor(res, args))
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(traceback.format_exc())
+                raise
 
         try:
             ensure_request_chat_template_allowed(
@@ -3381,8 +3403,12 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # Handle streaming
             if request.stream:
-                return StreamingResponse(content=_end_stream_on_error(
-                    create_streaming_generator(promise, postproc_params)),
+                response_generator = create_streaming_generator(
+                    promise, postproc_params)
+                if fault_tolerance_mode():
+                    response_generator = _end_stream_on_error(
+                        response_generator)
+                return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(

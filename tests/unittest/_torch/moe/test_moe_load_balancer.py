@@ -17,6 +17,9 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import \
+    EplbExpertRestore
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import \
     MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
@@ -387,6 +390,53 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Clean up
             balancer.shutdown()
 
+    def test_combine_waits_for_the_gathered_statistics_to_be_summed(self):
+        """The gathered statistics stay in the all-to-all workspace, where a
+        peer's next dispatch writes once this rank's combine has started: the
+        main stream must not pass start_set_cpu_stage before the load
+        balancer's stream has summed them."""
+        torch.cuda.set_device(0)
+        balancer = MoeLoadBalancer(0, 2, 1)
+        balancer.set_use_gpu_memcpy(True)
+        layer = balancer.add_layer(4, 2, 2)
+        layer.set_initial_weight_assignments([0, 1, 2, 3])
+        balancer.finalize_model()
+        balancer.set_iter_info(True, False)
+
+        local_expert_ids = torch.tensor([[0, 1], [2, 3]],
+                                        dtype=torch.int32,
+                                        device="cuda")
+        gathered = torch.tensor([[1, 0, 2, 0], [0, 3, 0, 4]],
+                                dtype=torch.int32,
+                                device="cuda")
+        summed = torch.zeros(4, dtype=torch.int32, device="cuda")
+
+        def record_sum(global_statistic_info, statistic_flag_tensor,
+                       single_layer_load_balancer_ptr):
+            summed.copy_(global_statistic_info)
+
+        try:
+            with patch.object(torch.ops.trtllm,
+                              "moe_hierarchical_statistic_update",
+                              record_sum), with_multi_stream(True):
+                with MoeLoadBalancerIterContext(balancer):
+                    layer.start_wait_gpu_stage()
+                    layer.done_wait_gpu_stage()
+                    layer.update_local_statistic(local_expert_ids, True, True)
+                    layer.get_local_statistic_tensor()
+                    # The load balancer's stream runs late.
+                    with torch.cuda.stream(layer.aux_stream):
+                        torch.cuda._sleep(int(1e8))
+                    layer.update_statistic_with_gathered_statistic(gathered)
+                    layer.start_set_cpu_stage()
+                    # The combine, then a peer's next dispatch.
+                    gathered.fill_(100)
+                    layer.done_set_cpu_stage()
+            torch.cuda.synchronize()
+            self.assertEqual(summed.tolist(), [1, 3, 2, 4])
+        finally:
+            balancer.shutdown()
+
     def test_real_routing_kernel(self):
         """Test the real routing kernel functionality and verify results."""
 
@@ -720,7 +770,7 @@ def test_online_eplb_loads_slots_whose_spare_slot_maps_no_memory(monkeypatch):
     monkeypatch.setattr(mlb, "fault_tolerance_mode", lambda: True)
     # Two ranks on two nodes: if rank 1 fails, its three slots may hold three experts rank 0 does not, so rank 0
     # gets three spare slots after EPLB's three.
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
     torch.cuda.set_device(0)
     expert_count, slot_elements = 4, 1 << 21  # 8 MiB slots: whole VMM chunks
     balancer = MoeLoadBalancer(
@@ -802,7 +852,7 @@ def test_a_lost_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
     monkeypatch.setattr(mlb, "fault_tolerance_mode", lambda: True)
     # Two ranks on two nodes: rank 0 gets three spare slots after EPLB's three (rank 1's slots may hold three
     # experts rank 0 does not).
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
     torch.cuda.set_device(0)
     expert_count = 4
     # Slots of 8 MiB (whole VMM chunks), of 3 MiB + 4 bytes (chunks shared with the neighbour slots) and of 4 bytes
@@ -893,13 +943,14 @@ def test_a_lost_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
         assert set(route([3] * 8)) == {slot_count}
 
         balancer.abandon_iterations()
-        plan = balancer.plan_expert_restore([True, False],
-                                            [layer.get_old_rank_expert_ids()])
+        plan = balancer.expert_restore.plan_expert_restore(
+            [True, False], [layer.get_old_rank_expert_ids()])
         # Backing spare slot 3: its four whole "w" chunks, and the two "s" chunks holding its bytes (one shared with
         # spare slot 4); spare slots 4 and 5 stay unbacked.
         assert plan.device_bytes == 8 * mib + 4 * mib
         free = torch.cuda.mem_get_info()[0]
-        assert balancer.restore_lost_experts(plan) == plan.device_bytes
+        assert balancer.expert_restore.restore_lost_experts(
+            plan) == plan.device_bytes
         assert free - torch.cuda.mem_get_info(
         )[0] >= plan.device_bytes - scratch
         # Only spare slot 3 is backed: backing it again maps nothing, backing slot 4 or 5 would.
@@ -934,13 +985,14 @@ def test_a_lost_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
         balancer.abandon_iterations()
         if layer_updates_per_iter:
             assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
-        rejoin = balancer.plan_expert_restore([True, True],
-                                              [layer.get_old_rank_expert_ids()],
-                                              rejoining=[False, True])
+        rejoin = balancer.expert_restore.plan_expert_restore(
+            [True, True], [layer.get_old_rank_expert_ids()],
+            rejoining=[False, True])
         assert rejoin.device_bytes == 0
-        assert balancer.restore_lost_experts(rejoin) == 0
+        assert balancer.expert_restore.restore_lost_experts(rejoin) == 0
         free = torch.cuda.mem_get_info()[0]
-        assert balancer.release_empty_spare_slots() == plan.device_bytes
+        assert balancer.expert_restore.release_empty_spare_slots(
+        ) == plan.device_bytes
         assert torch.cuda.mem_get_info(
         )[0] - free >= plan.device_bytes - scratch
         # No spare slot is backed.
@@ -1013,11 +1065,12 @@ import threading
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as mlb
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import EplbExpertRestore
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer, MoeLoadBalancerIterContext
 from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2_utils as copy_helpers
 
 mlb.fault_tolerance_mode = lambda: True
-MoeLoadBalancer._rank_nodes = lambda self: [0, 1]  # rank 0 of two nodes: spare slots after EPLB's three
+EplbExpertRestore._rank_nodes = lambda self: [0, 1]  # rank 0 of two nodes: spare slots after EPLB's three
 torch.cuda.set_device(0)
 expert_count, slot_elements = 4, 1 << 21  # 8 MiB slots: whole VMM chunks
 balancer = MoeLoadBalancer(0, 2, 1, shared_memory_base_name=f"stall_{os.getpid()}")
@@ -1112,7 +1165,7 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
     monkeypatch.setattr(mlb, "fault_tolerance_mode", lambda: fault_tolerance)
     # Two ranks on two nodes: with fault tolerance, rank 0 alone must hold the four experts, two slots more than
     # EPLB's two.
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
     eplb_config = MoeLoadBalancerConfig(num_slots=_EXPERTS,
                                         layer_updates_per_iter=0)
     eplb_config.setup(ep_rank=0, ep_size=2)

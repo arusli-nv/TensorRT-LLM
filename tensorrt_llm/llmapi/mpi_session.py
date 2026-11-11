@@ -750,7 +750,9 @@ class MpiPoolSession(MpiSession):
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
         if _utils.fault_tolerance_mode():
             self._start_node_supervisor({**os.environ, **env})
-            env[_utils.FAULT_TOLERANCE_RANK_ENV] = f"0,{self.n_workers},0"
+            # One node of n_workers ranks, as the node supervisor's.
+            env[_utils.FAULT_TOLERANCE_RANK_ENV] = (
+                f"0,{self.n_workers},{self.n_workers},0")
         self.mpi_pool = MPIPoolExecutor(max_workers=_pool_workers(
             self.n_workers),
                                         path=sys.path,

@@ -46,7 +46,8 @@ import torch
 from torch.distributed import TCPStore
 
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch.distributed.mnnvl_memory import LiveGroupComm, MnnvlMemory, isolated_gather
+from tensorrt_llm._torch.distributed.mnnvl_live_group import LiveGroupComm, isolated_gather
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided

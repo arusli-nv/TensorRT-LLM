@@ -84,6 +84,8 @@ def test_the_executor_resumes_every_cache_when_a_resize_fails(manager):
         model_engine=SimpleNamespace(cuda_graph_runner=None),
         _read_kv_cache_capacity=lambda: None,
     )
+    executor._suspend_for_rebalance = partial(PyExecutor._suspend_for_rebalance, executor)
+    executor._resume_after_rebalance = partial(PyExecutor._resume_after_rebalance, executor)
     executor._suspend_padding_dummies_for_rebalance = partial(
         PyExecutor._suspend_padding_dummies_for_rebalance, executor
     )

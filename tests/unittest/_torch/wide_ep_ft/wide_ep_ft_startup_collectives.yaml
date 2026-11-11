@@ -45,11 +45,13 @@ modules:
                                        note: MegaMoE backends (validate_backend and MoeExecutionState.model_comms)}
     ensure_deepgemm_torch_distributed: {collectives: [Split_type, bcast, bcast], reason: rejected,
                                         note: MegaMoE backends (validate_backend and MoeExecutionState.model_comms)}
+  tensorrt_llm/_torch/distributed/mnnvl_live_group.py:
+    LiveGroupComm.barrier: {collectives: [allgather], reason: transport}
   tensorrt_llm/_torch/distributed/mnnvl_memory.py:
     ProcessGroupComm.barrier: {collectives: [barrier], reason: transport}
-    LiveGroupComm.barrier: {collectives: [allgather], reason: transport}
     MnnvlMemory.get_comm: {collectives: [Split, subgroup], reason: transport}
-    MnnvlMemory.open_mnnvl_memory: {collectives: [allgather], reason: transport}
+    MnnvlMemory.open_mnnvl_memory: {collectives: [allgather, allgather], reason: transport,
+                                    note: the membership gather runs only without fault tolerance}
     _checkpoint_allgather: {collectives: [allgather], reason: rejected, note: MNNVL memory checkpoints (sleep mode)}
   tensorrt_llm/_torch/autotuner.py: {}
   tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py: {}

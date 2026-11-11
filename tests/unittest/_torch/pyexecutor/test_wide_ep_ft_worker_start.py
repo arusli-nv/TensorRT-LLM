@@ -102,7 +102,7 @@ class Deployment:
         env.update(
             TLLM_FAULT_TOLERANCE_JOIN_SECRET="ab" * 32,
             TLLM_FAULT_TOLERANCE_RENDEZVOUS=f"127.0.0.1:{self.port}",
-            TLLM_FAULT_TOLERANCE_RANK=f"{rank},{self.world},0",
+            TLLM_FAULT_TOLERANCE_RANK=f"{rank},{self.world},{self.world},0",
             TRT_LLM_NO_LIB_INIT="1",
             MPI4PY_RC_INITIALIZE="false",
             CUDA_VISIBLE_DEVICES="",
@@ -159,6 +159,12 @@ class Deployment:
                 raise AssertionError(f"rank {rank} did not end within {timeout_s} s") from None
         return statuses
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.end()
+
     def end(self):
         for process in self.processes.values():
             if process.poll() is None:
@@ -181,79 +187,66 @@ def _process_ended(pid, timeout_s):
     return False
 
 
-@pytest.fixture
-def deployment():
-    deployments = []
-
-    def create(*args, **kwargs):
-        deployments.append(Deployment(*args, **kwargs))
-        return deployments[-1]
-
-    yield create
-    for created in deployments:
-        created.end()
-
-
 @pytest.mark.timeout(900)
-def test_every_rank_starts_from_rank_0_s_arguments_and_rank_0_may_start_last(deployment):
+def test_every_rank_starts_from_rank_0_s_arguments_and_rank_0_may_start_last():
     """Ranks other than 0 wait at the rendezvous for rank 0, which starts after them; they run worker_main with the
     arguments rank 0 published, and the deployment serves once every rank has started."""
-    ranks = deployment(3)
-    ranks.start(1, load_s=1)
-    ranks.start(2, load_s=1)
-    time.sleep(5)
-    ranks.start(0, load_s=1)
-    ranks.wait_for_all("STARTED", range(3))
-    assert {line for _, line in ranks.seen if line.startswith("STARTED")} == {
-        f"STARTED {rank} rank-0-arguments" for rank in range(3)
-    }
-    ranks.wait_for_all("SERVING", range(3))
+    with Deployment(3) as ranks:
+        ranks.start(1, load_s=1)
+        ranks.start(2, load_s=1)
+        time.sleep(5)
+        ranks.start(0, load_s=1)
+        ranks.wait_for_all("STARTED", range(3))
+        assert {line for _, line in ranks.seen if line.startswith("STARTED")} == {
+            f"STARTED {rank} rank-0-arguments" for rank in range(3)
+        }
+        ranks.wait_for_all("SERVING", range(3))
 
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("lost", [0, 1])
-def test_a_rank_lost_during_the_startup_ends_every_process_at_once(deployment, lost):
+def test_a_rank_lost_during_the_startup_ends_every_process_at_once(lost):
     """Not at a timeout: the authority aborts as soon as the lost rank's connection closes."""
-    ranks = deployment(3)
-    for rank in range(3):
-        ranks.start(rank)
-    ranks.wait_for_all("STARTED", range(3))
-    authority = ranks.authority_pid()
-    ranks.processes[lost].kill()
-    others = [rank for rank in range(3) if rank != lost]
-    assert set(ranks.statuses_within(others, PROMPT_EXIT_S).values()) == {1}
-    assert _process_ended(authority, PROMPT_EXIT_S)
+    with Deployment(3) as ranks:
+        for rank in range(3):
+            ranks.start(rank)
+        ranks.wait_for_all("STARTED", range(3))
+        authority = ranks.authority_pid()
+        ranks.processes[lost].kill()
+        others = [rank for rank in range(3) if rank != lost]
+        assert set(ranks.statuses_within(others, PROMPT_EXIT_S).values()) == {1}
+        assert _process_ended(authority, PROMPT_EXIT_S)
 
 
 @pytest.mark.timeout(900)
-def test_ranks_that_do_not_all_reach_the_rendezvous_in_time_end_within_the_bound(deployment):
+def test_ranks_that_do_not_all_reach_the_rendezvous_in_time_end_within_the_bound():
     """Ranks started 0 s, a few seconds and past the rendezvous timeout apart: the deployment aborts at the timeout,
     and the late rank, which finds no store, ends at its own."""
-    ranks = deployment(3)
-    ranks.start(0)
-    ranks.wait_for(lambda rank, line: line.startswith("STARTED"), STARTUP_S)
-    ranks.start(1)
-    assert ranks.statuses_within([0], 2 * RENDEZVOUS_TIMEOUT_S)[0] == 1
-    ranks.start(2)
-    statuses = ranks.statuses_within([1, 2], STARTUP_S + 2 * RENDEZVOUS_TIMEOUT_S)
-    assert 0 not in statuses.values()
+    with Deployment(3) as ranks:
+        ranks.start(0)
+        ranks.wait_for(lambda rank, line: line.startswith("STARTED"), STARTUP_S)
+        ranks.start(1)
+        assert ranks.statuses_within([0], 2 * RENDEZVOUS_TIMEOUT_S)[0] == 1
+        ranks.start(2)
+        statuses = ranks.statuses_within([1, 2], STARTUP_S + 2 * RENDEZVOUS_TIMEOUT_S)
+        assert 0 not in statuses.values()
 
 
 @pytest.mark.timeout(900)
-def test_a_rank_without_rank_0_ends_at_the_rendezvous_timeout(deployment):
-    ranks = deployment(2)
-    ranks.start(1)
-    assert ranks.statuses_within([1], STARTUP_S + RENDEZVOUS_TIMEOUT_S)[1] != 0
+def test_a_rank_without_rank_0_ends_at_the_rendezvous_timeout():
+    with Deployment(2) as ranks:
+        ranks.start(1)
+        assert ranks.statuses_within([1], STARTUP_S + RENDEZVOUS_TIMEOUT_S)[1] != 0
 
 
 @pytest.mark.timeout(900)
-def test_the_ranks_serve_on_without_the_authority(deployment):
+def test_the_ranks_serve_on_without_the_authority():
     """No lease: every rank serves on unprotected. Once rank 0 is gone too, node 0's supervisor ends the job
     (test_node_supervisor.py)."""
-    ranks = deployment(3)
-    for rank in range(3):
-        ranks.start(rank, load_s=1)
-    ranks.wait_for_all("SERVING", range(3))
-    os.kill(ranks.authority_pid(), signal.SIGKILL)
-    time.sleep(5)
-    assert all(process.poll() is None for process in ranks.processes.values())
+    with Deployment(3) as ranks:
+        for rank in range(3):
+            ranks.start(rank, load_s=1)
+        ranks.wait_for_all("SERVING", range(3))
+        os.kill(ranks.authority_pid(), signal.SIGKILL)
+        time.sleep(5)
+        assert all(process.poll() is None for process in ranks.processes.values())

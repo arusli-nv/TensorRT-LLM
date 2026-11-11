@@ -8,7 +8,8 @@ task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 # Under WideEP fault tolerance, the node supervisor starts each rank outside the
-# launcher's job, with its identity: "<rank>,<world size>,<incarnation>".
+# launcher's job, with its identity:
+# "<rank>,<world size>,<GPUs per node>,<incarnation>".
 fault_tolerance_world_size=
 if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
     IFS=, read -r mpi_rank fault_tolerance_world_size _ <<< "$TLLM_FAULT_TOLERANCE_RANK"

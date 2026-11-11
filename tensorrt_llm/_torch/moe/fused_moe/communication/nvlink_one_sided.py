@@ -649,8 +649,10 @@ class NVLinkOneSided(Communication):
             mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
-            # No rank writes into a peer's workspace before the peer has initialized it.
-            memory_cls.get_comm(mapping).barrier()
+            if ep_group_health is not None:
+                # No rank writes into a peer's workspace before the peer has initialized it; the op synchronizes
+                # all ranks only without a rank mask.
+                memory_cls.get_comm(mapping).barrier()
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,

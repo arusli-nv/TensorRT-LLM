@@ -48,6 +48,12 @@ WORLD = 4
 ALL = (1 << WORLD) - 1
 
 
+@pytest.fixture(autouse=True)
+def _report_interval(monkeypatch):
+    """The agents' report interval and the authority process's decision interval, short for the tests."""
+    monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 0.05)
+
+
 def _formed(authority):
     """``authority`` once every rank has started: generation 0 is COMMITTED."""
     world = authority.world_size
@@ -729,12 +735,12 @@ def test_the_replacements_of_ranks_lost_together_are_added_in_one_transaction():
     assert states(cluster) == TRANSACTION and record.live_mask == ALL
     assert cluster.authority.last_transaction.added_ranks == (2, 3)
     # Detected at rank 2's readiness: the wait for rank 3's is part of the transaction.
-    assert cluster.authority.last_transaction.detect_to_propose_ms >= 2000
+    summary = cluster.authority.last_transaction
+    assert summary.began_unix_ms - summary.detected_unix_ms >= 2000
 
 
-def test_the_proposal_that_adds_replacements_logs_when_each_was_ready_to_join(monkeypatch):
-    """One line per admission, none for the failure: how long after the first ready replacement each one was ready
-    to join, and when the authority proposed."""
+def test_the_proposal_that_adds_replacements_logs_them(monkeypatch):
+    """One line per admission, none for the failure."""
     infos = []
     monkeypatch.setattr(membership.logger, "info", infos.append)
     cluster = Cluster()
@@ -747,10 +753,7 @@ def test_the_proposal_that_adds_replacements_logs_when_each_was_ready_to_join(mo
     cluster.unprepared.discard(2)
     cluster.run(1.0)
     [line] = [i for i in infos if "joining ranks" in i]
-    assert line == (
-        "Membership: adding joining ranks [2, 3], ready to join 1.00, 0.00 s after the first one; "
-        "proposed 1.00 s after it"
-    )
+    assert line == "Membership: adding joining ranks [2, 3]"
 
 
 def test_a_transaction_s_phases_end_at_ordered_wall_clock_times_in_milliseconds():
@@ -770,9 +773,13 @@ def test_a_transaction_s_phases_end_at_ordered_wall_clock_times_in_milliseconds(
     record = cluster.run(1.0)
     after_s = time.time()
     assert states(cluster) == TRANSACTION and record.live_mask == ALL
-    times = cluster.authority.last_transaction.times_unix_ms()
-    assert list(times) == ["detected", "proposed", "ready", "committed"]
-    assert all(isinstance(t, int) for t in times.values())
+    summary = cluster.authority.last_transaction
+    times = {
+        "detected": summary.detected_unix_ms,
+        "proposed": summary.began_unix_ms,
+        "ready": summary.ready_unix_ms,
+        "committed": summary.ended_unix_ms,
+    }
     assert times["detected"] < times["proposed"] < times["ready"] < times["committed"]
     # The authority's clock at the detection and at each record it published (PROPOSE, then INSTALL once every READY
     # was in, then COMMITTED once every INSTALLED was in), in milliseconds.
@@ -808,6 +815,24 @@ def test_a_ready_join_waits_for_a_replacement_lost_with_its_rank_only_while_its_
     assert states(cluster) == TRANSACTION and record.live_mask == ALL & ~(1 << 3)
 
 
+def test_a_ready_join_stops_waiting_for_a_replacement_whose_startup_makes_no_progress():
+    """Rank 3's replacement reports on but its startup stalls: rank 2's, ready, waits for it only until its startup
+    made no progress for the rendezvous timeout, then is added alone. Fails without the change: it waited forever."""
+    cluster = Cluster(rendezvous_timeout_s=5.0)
+    cluster.alive -= {2, 3}
+    cluster.run(1.0)
+    cluster.published.clear()
+    _join(cluster, 2)
+    _join(cluster, 3)
+    cluster.unprepared.add(3)
+    cluster.run(8.0)  # its startup progresses: rank 2's waits past the bound
+    assert cluster.published == []
+    cluster.hung.add(3)  # its startup stalls while its agent reports on
+    assert cluster.run(4.5).state == MembershipState.COMMITTED and cluster.published == []
+    record = cluster.run(1.0)
+    assert states(cluster) == TRANSACTION and record.live_mask == ALL & ~(1 << 3)
+
+
 def test_a_join_that_ends_before_it_is_proposed_leaves_no_detection_time_behind():
     """Rank 2's replacement is ready and waits for rank 3's, lost with it, then dies: nothing is due any longer. A
     later failure is detected when it happens, not at that join."""
@@ -825,7 +850,8 @@ def test_a_join_that_ends_before_it_is_proposed_leaves_no_detection_time_behind(
     cluster.alive.discard(5)
     record = cluster.run(1.0)
     assert states(cluster) == TRANSACTION and not record.is_live(5)
-    assert cluster.authority.last_transaction.detect_to_propose_ms == 0.0
+    summary = cluster.authority.last_transaction
+    assert summary.began_unix_ms == summary.detected_unix_ms
 
 
 def test_a_ready_join_waits_for_the_replacements_lost_with_its_rank_to_be_ready_too():
@@ -1054,7 +1080,7 @@ def test_a_rank_lost_during_the_startup_aborts_at_once(lost):
     authority.tick(0.0, _starting_reports(), ALL)
     record = authority.tick(0.05, _starting_reports(started={1}), ALL & ~(1 << lost))
     assert record.state == MembershipState.ABORT
-    assert record.reason == f"ranks [{lost}] ended during the startup"
+    assert record.reason == f"ranks [{lost}] failed during the startup"
 
 
 def test_the_startup_waits_for_the_ranks_not_connected_yet_until_the_rendezvous_timeout():
@@ -1076,16 +1102,20 @@ def test_the_startup_waits_for_the_ranks_not_connected_yet_until_the_rendezvous_
     assert never.tick(601.0, _starting_reports(sequence=3), late).state == MembershipState.ABORT
 
 
-def test_a_rank_whose_reports_stop_during_the_startup_aborts_it_after_the_hang_timeout():
-    """A stopped process (SIGSTOP) keeps its connection open but its agent stops reporting too."""
-    authority = Authority(WORLD, progress_timeout_s=30.0)
-    for second in range(0, 61):
-        reports = _starting_reports(sequence=second)
-        reports[1] = RankReport(sequence=min(second, 10))  # stopped at 10 s
+def test_a_rank_whose_reports_stop_during_the_startup_aborts_it_once_waited_on_for_the_rendezvous_timeout():
+    """A stopped process (SIGSTOP) keeps its connection open but its agent stops reporting too: once its peers wait
+    for it in a startup collective, it is the end of their wait-for chain."""
+    authority = Authority(WORLD, rendezvous_timeout_s=60.0)
+    for second in range(0, 91):
+        reports = {
+            r: RankReport(sequence=second, progress=3, waiting_for=1 << 1) for r in range(WORLD)
+        }
+        reports[1] = RankReport(sequence=min(second, 10), progress=3)  # stopped at 10 s
         record = authority.tick(float(second), reports, ALL)
-        if second <= 40:
+        if second <= 60:
             assert record is None
     assert authority.record.state == MembershipState.ABORT
+    assert authority.record.reason == "ranks [1] failed during the startup"
 
 
 @pytest.mark.parametrize("peer", ["hangs", "progresses"])
@@ -1106,7 +1136,7 @@ def test_a_rank_others_wait_for_in_a_startup_collective_is_hung_after_the_rendez
             assert record is None
     if peer == "hangs":
         assert authority.record.state == MembershipState.ABORT
-        assert "ranks [2] made no progress for 600 s" in authority.record.reason
+        assert authority.record.reason == "ranks [2] failed during the startup"
 
 
 def test_no_replacement_joins_before_the_deployment_has_started():
@@ -1144,9 +1174,7 @@ def test_the_authority_aborts_once_the_process_that_started_it_has_ended():
     the hang timeout."""
     store = SignedStore(DictStore(), b"join-secret")
     read_fd, write_fd = os.pipe()
-    process = AuthorityProcess(
-        1, store, Authority(1, progress_timeout_s=2.0), parent=read_fd, interval_s=0.01
-    )
+    process = AuthorityProcess(1, store, Authority(1, progress_timeout_s=2.0), parent=read_fd)
     returned = []
     thread = threading.Thread(
         target=lambda: returned.append(process.run(host="127.0.0.1")), daemon=True
@@ -1173,9 +1201,7 @@ def test_the_authority_aborts_once_the_process_that_started_it_has_ended():
 def test_an_agent_hands_the_newest_record_to_the_callbacks_it_is_bound_to():
     """The executor takes over the membership its process joined at the start of its worker."""
     agent = MembershipAgent(1, SignedStore(None, b"secret"), lambda record: None)
-    agent.record = MembershipRecord(
-        generation=0, state=MembershipState.COMMITTED, live_mask=ALL, sequence=3
-    )
+    agent.record = MembershipRecord(generation=0, state=MembershipState.COMMITTED, live_mask=ALL)
     records = []
     agent.bind(records.append)
     assert records == [agent.record]
@@ -1213,18 +1239,17 @@ def test_an_agent_whose_connection_ends_closes_it_and_reports_the_error():
     assert not agent.connected
 
 
-def test_an_agent_follows_every_record_and_reports_at_once():
+def test_an_agent_follows_every_record_and_reports_at_once(monkeypatch):
     """The records and reports are JSON lines over the connection its hello authenticated."""
+    monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 60.0)
     records = []
-    agent = MembershipAgent(1, SignedStore(None, b"secret"), records.append, interval_s=60.0)
+    agent = MembershipAgent(1, SignedStore(None, b"secret"), records.append)
     agent._sock, authority_side = _socket_pair()
     agent._lines = membership._Lines()
     agent._thread.start()
     try:
-        current = MembershipRecord(
-            generation=1, state=MembershipState.COMMITTED, live_mask=ALL, sequence=5
-        )
-        newer = current.model_copy(update=dict(sequence=6, generation=2))
+        current = MembershipRecord(generation=1, state=MembershipState.COMMITTED, live_mask=ALL)
+        newer = current.model_copy(update=dict(generation=2))
         authority_side.sendall(b"".join(membership._line(record) for record in (current, newer)))
         _until(lambda: len(records) == 2)
         agent.report(reply=Reply.READY, reply_generation=2)
@@ -1278,10 +1303,7 @@ def _deployment(world, **authority_options):
     yields the store and the agents. Ends as a deployment's normal exit does: rank 0 reports ``shutdown``, the agents
     stop once the authority has published the SHUTDOWN record, and the authority then returns that record."""
     store = SignedStore(DictStore(), b"join-secret")
-    hello_timeout_s = authority_options.pop("hello_timeout_s", membership.HELLO_TIMEOUT_S)
-    process = AuthorityProcess(
-        world, store, Authority(world, **authority_options), hello_timeout_s=hello_timeout_s
-    )
+    process = AuthorityProcess(world, store, Authority(world, **authority_options))
     returned = []
     thread = threading.Thread(
         target=lambda: returned.append(process.run(host="127.0.0.1")), daemon=True
@@ -1333,7 +1355,7 @@ def _member(store, rank, world, incarnation=0):
         elif record.state == MembershipState.INSTALL:
             agent.report(reply=Reply.INSTALLED, reply_generation=record.generation)
 
-    agent = MembershipAgent(rank, store, on_record, interval_s=0.05, incarnation=incarnation)
+    agent = MembershipAgent(rank, store, on_record, incarnation=incarnation)
     agent.start()
     if not incarnation:
         agent.report(started=True)
@@ -1389,11 +1411,12 @@ def _committed_without_rank_1(agent):
     return agent.record.state == MembershipState.COMMITTED and agent.record.live_mask == 0b01
 
 
-def test_only_a_valid_hello_of_a_process_not_connected_yet_opens_a_connection():
+def test_only_a_valid_hello_of_a_process_not_connected_yet_opens_a_connection(monkeypatch):
     """Rank 1's process is gone, so a replacement's hello for it opens a connection, but only signed with the join
     secret for this connection: an unsigned hello, one tagged for another connection (a recorded one), a second
     connection of a connected process, or none at all are closed."""
-    with _deployment(2, hello_timeout_s=0.5) as (store, agents):
+    monkeypatch.setattr(membership, "HELLO_TIMEOUT_S", 0.5)
+    with _deployment(2) as (store, agents):
         agents[1]._sock.shutdown(socket.SHUT_RDWR)
         _until(lambda: _committed_without_rank_1(agents[0]))
         host, port = store.get(membership.LIVENESS_KEY).decode().rsplit(":", 1)
@@ -1406,7 +1429,7 @@ def test_only_a_valid_hello_of_a_process_not_connected_yet_opens_a_connection():
         assert _refused(store, 0, 0)
         with socket.create_connection((host, int(port)), timeout=10) as silent:
             membership._read_line(silent)
-            assert silent.recv(1) == b""  # after hello_timeout_s
+            assert silent.recv(1) == b""  # after HELLO_TIMEOUT_S
         assert agents[0].record.live_mask == 0b01
         agents[1] = _member(store, 1, 2, incarnation=1)  # the same hello, signed for its connection
         _until(lambda: agents[0].record.live_mask == 0b11)
@@ -1485,8 +1508,7 @@ def test_an_authority_that_fails_ends_without_a_verdict():
     _until(lambda: store.store.check([membership.LIVENESS_KEY]))
     errors = []
     agents = [
-        MembershipAgent(r, store, lambda record: None, interval_s=0.05, on_error=errors.append)
-        for r in range(2)
+        MembershipAgent(r, store, lambda record: None, on_error=errors.append) for r in range(2)
     ]
     for agent in agents:
         agent.start()
@@ -1526,16 +1548,13 @@ def test_a_transaction_is_summarized_from_its_first_propose_to_its_commit():
     began = cluster.published_at[0]
     ended = cluster.published_at[-1]
     summary = cluster.authority.last_transaction
-    assert (summary.generation, summary.state) == (record.generation, MembershipState.COMMITTED)
+    assert (summary.generation, summary.outcome) == (record.generation, "COMMITTED")
     assert (summary.removed_ranks, summary.added_ranks) == ((2, 3), ())
     assert summary.ended_unix_ms - summary.began_unix_ms == pytest.approx((ended - began) * 1e3)
-    assert summary.duration_s == pytest.approx(ended - began) and ended - began > 0
+    assert ended - began > 0
     # A closed connection is proposed in the tick that sees it; the simulated ranks install in one step.
-    assert summary.detect_to_propose_ms == 0.0
-    assert summary.ready_to_installed_ms == pytest.approx(50.0)
-    assert summary.propose_to_ready_ms + summary.ready_to_installed_ms == pytest.approx(
-        (ended - began) * 1e3, abs=0.2
-    )
+    assert summary.detected_unix_ms == summary.began_unix_ms
+    assert summary.ended_unix_ms - summary.ready_unix_ms == pytest.approx(50.0)
 
 
 def test_an_abort_and_a_rejoin_are_summarized():
@@ -1553,45 +1572,25 @@ def test_an_abort_and_a_rejoin_are_summarized():
     cluster.alive.discard(0)
     assert cluster.run(1.0).state == MembershipState.ABORT
     summary = cluster.authority.last_transaction
-    assert (summary.generation, summary.state) == (record.generation, MembershipState.ABORT)
+    assert (summary.generation, summary.outcome) == (record.generation, "ABORT")
     assert (summary.removed_ranks, summary.added_ranks) == ((0,), ())
-    assert summary.duration_s == 0.0 and summary.detect_to_propose_ms == 0.0
-    assert summary.propose_to_ready_ms is None and summary.ready_to_installed_ms is None
-    # An ABORT ends the transaction before any READY: only its detection and PROPOSE have times.
-    times = dict(detected=round(summary.began_unix_ms), proposed=round(summary.began_unix_ms))
-    assert summary.times_unix_ms() == dict(times, ready=None, committed=None)
+    # An ABORT ends the transaction before any READY, in the tick that detected it.
+    assert summary.ready_unix_ms is None
+    assert summary.detected_unix_ms == summary.began_unix_ms == summary.ended_unix_ms
 
 
-def test_transaction_summary_round_trip_and_log():
-    """The summary holds when each phase ended; its JSON and its log line carry the phases' durations too."""
-    began_unix_ms = 1_762_000_000_123.0
+def test_transaction_summary_round_trip():
     summary = TransactionSummary(
         generation=3,
-        state=MembershipState.COMMITTED,
+        outcome="COMMITTED",
         removed_ranks=(0, 5),
         added_ranks=(2,),
-        detected_unix_ms=began_unix_ms - 1.0,
-        began_unix_ms=began_unix_ms,
-        ready_unix_ms=began_unix_ms + 120.0,
-        ended_unix_ms=began_unix_ms + 1250.0,
+        detected_unix_ms=1_762_000_000_122.0,
+        began_unix_ms=1_762_000_000_123.0,
+        ready_unix_ms=1_762_000_000_243.0,
+        ended_unix_ms=1_762_000_001_373.0,
     )
     assert TransactionSummary.model_validate_json(summary.model_dump_json()) == summary
-    phases = dict(
-        duration_s=1.25,
-        detect_to_propose_ms=1.0,
-        propose_to_ready_ms=120.0,
-        ready_to_installed_ms=1130.0,
-    )
-    assert all(f"{name}={value!r}" in repr(summary) for name, value in phases.items())
-    assert repr(summary).startswith(
-        "TransactionSummary(generation=3, state=<MembershipState.COMMITTED: 0>"
-    )
-    assert summary.times_unix_ms() == dict(
-        detected=1_762_000_000_122,
-        proposed=1_762_000_000_123,
-        ready=1_762_000_000_243,
-        committed=1_762_000_001_373,
-    )
 
 
 def test_of_the_claims_that_replace_one_process_one_wins():
@@ -1606,13 +1605,12 @@ def test_of_the_claims_that_replace_one_process_one_wins():
     assert claim_incarnation(store, 3, 0) == 1
 
 
-def test_an_agent_stops_once_a_record_no_longer_lists_its_process_after_one_did():
+def test_an_agent_stops_once_a_record_no_longer_lists_its_process_after_one_did(monkeypatch):
     """A replacement is listed by the PROPOSE that adds it; the change that restarts without it ends its membership,
     before any COMMITTED record admitted it."""
+    monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 60.0)
     records = []
-    agent = MembershipAgent(
-        1, SignedStore(None, b"secret"), records.append, interval_s=60.0, incarnation=1
-    )
+    agent = MembershipAgent(1, SignedStore(None, b"secret"), records.append, incarnation=1)
     agent._sock, authority_side = _socket_pair()
     agent._lines = membership._Lines()
     agent._thread.start()
@@ -1653,16 +1651,17 @@ class CountingAuthority(Authority):
         return super().tick(now_s, reports, connected)
 
 
-def test_the_authority_decides_once_per_interval_and_at_once_on_a_reply():
+def test_the_authority_decides_once_per_interval_and_at_once_on_a_reply(monkeypatch):
     """A report that only advances progress waits for the next decision; the start of the deployment and its shutdown
     are decided at once."""
+    monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 1.0)
     store = SignedStore(DictStore(), b"join-secret")
     authority = CountingAuthority(1)
-    process = AuthorityProcess(1, store, authority, interval_s=1.0)
+    process = AuthorityProcess(1, store, authority)
     thread = threading.Thread(target=lambda: process.run(host="127.0.0.1"), daemon=True)
     thread.start()
     _until(lambda: store.store.check([membership.LIVENESS_KEY]))
-    agent = MembershipAgent(0, store, lambda record: None, interval_s=60.0)
+    agent = MembershipAgent(0, store, lambda record: None)
     try:
         agent.start()
         reported_s = time.monotonic()

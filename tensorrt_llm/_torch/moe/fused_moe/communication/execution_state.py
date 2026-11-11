@@ -30,9 +30,7 @@ def _require_active(mask_words: tuple[int, ...], ep_rank: int) -> None:
 
 class MembershipWorkspace(Protocol):
     """Peer-writable memory of a bound layer, which a membership change maps among the live ranks at the same
-    addresses, so that CUDA graphs captured once keep running (``_MnnvlAlltoAllWorkspaceLifecycle`` for MNNVL
-    memory). Each method that takes ``gather`` is collective over the ranks it reaches (see ``MnnvlMemory.remap``).
-    """
+    addresses. Each method that takes ``gather`` is collective over the ranks it reaches."""
 
     @property
     def device_bytes(self) -> int:
@@ -49,14 +47,9 @@ class MembershipWorkspace(Protocol):
 
 
 class BindableCommunication(Protocol):
-    """A MoE communication strategy whose collectives can run under a :class:`MoeExecutionState`.
-
-    It runs in rank-mask mode on the EP membership every MoE layer shares (``ep_group_health``), and its
-    ``workspace`` is on the device the state's records go to. ``bind_execution_state`` registers its EP rank and the
-    reset of its collective state machine (:meth:`MoeExecutionState.track_layer`) and its workspace with the reset of
-    this rank's part (:meth:`MoeExecutionState.retain`); every later collective reads the state's active rank mask and
-    abort state by address. ``NVLinkOneSided`` is one.
-    """
+    """A MoE communication strategy whose collectives can run under a :class:`MoeExecutionState`, in rank-mask mode
+    on the shared ``ep_group_health``: ``bind_execution_state`` registers its layer and workspace, and every later
+    collective reads the state's records by address. ``NVLinkOneSided`` is one."""
 
     ep_group_health: EPGroupHealth | None
     workspace: torch.Tensor
@@ -72,17 +65,13 @@ _shared_states: weakref.WeakValueDictionary[int, MoeExecutionState] = weakref.We
 class MoeExecutionState:
     """Own the records that rank-mask NVLinkOneSided kernels read at execution time.
 
-    ``active_rank_mask`` is the device copy of the rank mask, the only one the kernels read, and ``abort`` the native
-    ``MoeA2AAbortState`` in pinned host memory: ``int32`` words ``(requested, status)``, then per peer the
-    round flag a kernel has been waiting for from it for long, or 0 (wait evidence). Both
-    are only edited in place, so CUDA graphs captured once keep running after :meth:`install_mask`
-    changes the membership. :meth:`install_mask` and :meth:`rearm` are only valid while the model is
-    idle; :meth:`request_abort` may be called from any thread while kernels run.
+    ``active_rank_mask`` is the device rank mask the kernels read, and ``abort`` the native ``MoeA2AAbortState`` in
+    pinned host memory: ``int32`` words ``(requested, status)``, then per peer the round flag a kernel has long waited
+    for from it (wait evidence). Both are only edited in place, so captured CUDA graphs keep running.
+    :meth:`install_mask` and :meth:`rearm` need an idle model; :meth:`request_abort` works from any thread.
 
-    Layers bound with ``NVLinkOneSided.bind_execution_state`` read both records, and the state installs the
-    membership while the model is idle. Every other rank-mask layer reads the mask of its membership's shared
-    state (:meth:`for_health`), which it publishes at each dispatch (:meth:`publish_rank_mask`). A shared state
-    has no abort record (``abort`` is None) and binds no layer.
+    A shared state (:meth:`for_health`) serves the layers not bound to a state, which publish its mask at each
+    dispatch; it has no abort record and binds no layer.
     """
 
     def __init__(
@@ -128,12 +117,8 @@ class MoeExecutionState:
 
     @staticmethod
     def model_comms(model: torch.nn.Module) -> list[BindableCommunication]:
-        """Return the communicators of the MoE layers of ``model``, which :meth:`for_model` binds. They are fixed
-        once the model is built, so fault tolerance checks them then, before any weight loads.
-
-        A MoE layer (``MoE`` or ``VanillaMoE``, what ``create_moe`` builds) takes part through its ``comm``, which
-        must be one that can be bound to an execution state (:class:`BindableCommunication`), in rank-mask mode on
-        the ``ep_group_health`` that every layer shares.
+        """Return the communicators of the MoE layers of ``model``, which :meth:`for_model` binds; each must be a
+        :class:`BindableCommunication` on one shared ``ep_group_health``.
 
         Raises:
             ValueError: A MoE layer's communication cannot be bound, the model has no MoE layer, or the
@@ -192,29 +177,21 @@ class MoeExecutionState:
         self._workspaces.setdefault(id(workspace), (workspace, reset_workspace))
 
     def workspace_bytes(self) -> int:
-        """The device memory :meth:`remap_workspaces` allocates on this rank (:meth:`admit_to_workspaces` allocates
-        none). The pages it replaces are freed only once every peer has released them, so until the remap returns
-        both are allocated."""
+        """The device memory :meth:`remap_workspaces` allocates on this rank, on top of the pages it replaces until it
+        returns."""
         return sum(workspace.device_bytes for workspace, _ in self._workspaces.values())
 
     def workspaces_need_fresh_pages(self, gather: Callable[[Any], Sequence[Any]]) -> bool:
-        """Whether a membership change among the ranks ``gather`` reaches must back the bound workspaces with fresh
-        pages (:meth:`remap_workspaces`): when a process that maps the pages of one may not be among those ranks
-        (``MnnvlMemory.needs_fresh_pages``). Otherwise :meth:`admit_to_workspaces` maps only the rows of the ranks
-        that join.
-
-        Collective over those ranks, which all return the same answer for each workspace.
-        """
+        """Whether a change among the ranks ``gather`` reaches must back the bound workspaces with fresh pages
+        (:meth:`remap_workspaces`) rather than map only the joining ranks' rows (:meth:`admit_to_workspaces`).
+        Collective over those ranks."""
         return any(
             workspace.needs_fresh_pages(gather) for workspace, _ in self._workspaces.values()
         )
 
     def admit_to_workspaces(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Map the rows of the ranks that join into every bound workspace, keeping this rank's pages (see
-        ``MnnvlMemory.admit``), when :meth:`workspaces_need_fresh_pages` is False.
-
-        Only while no rank is in a collective. Collective over the ranks ``gather`` reaches, which admit to the
-        workspaces in the same order; :meth:`rearm` resets every rank's part before the next collective.
+        """Map the joining ranks' rows into every bound workspace, keeping this rank's pages. Only while no rank is in a
+        collective; collective over the ranks ``gather`` reaches.
 
         Raises:
             MnnvlPeerHandleError: As for :meth:`remap_workspaces`.
@@ -224,12 +201,8 @@ class MoeExecutionState:
             workspace.admit(gather)
 
     def remap_workspaces(self, gather: Callable[[Any], Sequence[Any]]) -> None:
-        """Back every bound workspace with fresh pages at the same addresses, shared only among the ranks
-        ``gather`` reaches (see ``MnnvlMemory.remap``).
-
-        Only while no rank is in a collective. Collective over those ranks, which bind the layers, and so remap
-        the workspaces, in the same order. The installed mask must exclude every other rank, and every rank must
-        :meth:`rearm`, which resets its part of each workspace, before any rank runs the next collective.
+        """Back every bound workspace with fresh pages at the same addresses, shared only among the ranks ``gather``
+        reaches. Only while no rank is in a collective; every rank must :meth:`rearm` before the next one.
 
         Raises:
             MnnvlPeerHandleError: A rank ``gather`` reached could not import a peer's handle, as when the
@@ -252,14 +225,8 @@ class MoeExecutionState:
         self._layers.append((ep_rank, reset_state))
 
     def rearm(self) -> None:
-        """Clear the abort record and reset every bound workspace to its first round.
-
-        After an abort, ranks may have stopped in different collective rounds,
-        and an eager layer may have dispatched without combining. Every
-        surviving rank must rearm while all of them are quiescent and before
-        any of them runs another collective. The abort record is cleared first,
-        so an abort requested while the workspaces reset is kept.
-        """
+        """Clear the abort record, then reset every bound workspace and layer to its first round (an abort requested
+        meanwhile is kept). Every live rank rearms while all are quiescent, before any runs another collective."""
         torch.cuda.synchronize(self.active_rank_mask.device)
         self.abort.zero_()
         for _, reset in self._workspaces.values():
@@ -269,20 +236,12 @@ class MoeExecutionState:
         torch.cuda.synchronize(self.active_rank_mask.device)
 
     def request_abort(self) -> None:
-        """Make running and future collectives of this state return without peers.
-
-        Kernels poll the request while they wait, so collectives stuck on a failed
-        peer finish and record a cancelled status; their outputs are invalid.
-        A plain host store: it never waits for the GPU.
-        """
+        """Make running and future collectives return without peers (their outputs are invalid); a plain host store
+        that never waits for the GPU."""
         self.abort[_ABORT_REQUESTED] = 1
 
     def aborted(self) -> bool:
-        """Whether, since :meth:`rearm`, an abort was requested or a collective returned without some peer's data.
-
-        A step whose collectives all completed while this is False read every
-        active source's complete data (see ``MoeA2AAbortState``).
-        """
+        """Whether, since :meth:`rearm`, an abort was requested or a collective returned without some peer's data."""
         return bool(self._abort_words.any())
 
     def waited_rounds(self) -> dict[int, int]:
@@ -295,11 +254,8 @@ class MoeExecutionState:
         }
 
     def publish_rank_mask(self, snapshot: ActiveRankMaskSnapshot, ep_rank: int) -> None:
-        """Write the snapshot's mask (host uint64 words) into the device record before a dispatch.
-
-        A committed mask is compared by its generation, so an unchanged membership costs no host read of the mask.
-        The write is a copy on the current stream (:meth:`_copy_mask`), so collectives launched before it still read
-        the previous mask.
+        """Write the snapshot's mask into the device record before a dispatch, in order on the current stream; an
+        unchanged committed generation costs nothing.
 
         Raises:
             RuntimeError: If the mask excludes ``ep_rank``; the kernels do not check the local rank's bit.
@@ -315,8 +271,7 @@ class MoeExecutionState:
         self._mask_generation = generation
 
     def _copy_mask(self, words: torch.Tensor) -> None:
-        """Copy the host uint64 ``words`` into the device record, in order on the current stream, through the
-        staging buffer: the host waits only for the previous copy from the staging, not for the GPU's other work."""
+        """Copy the host uint64 ``words`` into the device record on the current stream, through the staging buffer."""
         if self._mask_staged is not None:
             self._mask_staged.synchronize()
         self._mask_staging.copy_(words)

@@ -29,10 +29,10 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed import ll_exchange
-from tensorrt_llm._torch.distributed.communicator import MnnvlDist, MPIDist, ReduceOp
+from tensorrt_llm._torch.distributed import host_exchange
+from tensorrt_llm._torch.distributed.communicator import MPIDist, ReduceOp
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
 from tensorrt_llm._torch.distributed.host_exchange_epoch import latest_epoch, next_epoch
-from tensorrt_llm._torch.distributed.ll_exchange import TPHostExchange
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -268,7 +268,7 @@ def _admission(tp):
     an isolated startup. No process that maps the survivors' rows is gone, so every rank keeps the pages it maps and
     imports only the rows it does not map yet; then every rank exchanges with every other. MPI stands in for the
     membership transaction."""
-    from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlRows, isolated_gather
+    from tensorrt_llm._torch.distributed.mnnvl_live_group import isolated_gather
 
     mnnvl, mpi, rank = _dists(tp)
     leaver = tp - 1
@@ -421,9 +421,9 @@ def _backoff(tp):
     """A wait never sleeps while the executor has work, however late the peer; on the idle path (the request probe
     with prefer_cpu) it sleeps between polls."""
     mnnvl, _, rank = _dists(tp)
-    real_time = ll_exchange.time
+    real_time = host_exchange.time
     sleeps = []
-    ll_exchange.time = SimpleNamespace(
+    host_exchange.time = SimpleNamespace(
         monotonic=real_time.monotonic,
         sleep=lambda s: sleeps.append(s) or real_time.sleep(s),
     )
@@ -441,7 +441,7 @@ def _backoff(tp):
             if rank != 0:
                 assert bool(sleeps) == idle, (idle, len(sleeps))
     finally:
-        ll_exchange.time = real_time
+        host_exchange.time = real_time
 
 
 def _payload_rows(tp):

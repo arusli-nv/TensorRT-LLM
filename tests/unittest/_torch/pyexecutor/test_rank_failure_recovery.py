@@ -17,7 +17,6 @@
 import asyncio
 import collections
 import contextlib
-import ctypes
 import errno
 import json
 import os
@@ -42,10 +41,8 @@ import pytest
 import torch
 
 from tensorrt_llm import _utils
-from tensorrt_llm._torch.distributed import ll_exchange, membership, mnnvl_memory
-from tensorrt_llm._torch.distributed.communicator import MnnvlDist
-from tensorrt_llm._torch.distributed.host_exchange_epoch import latest_epoch, next_epoch
-from tensorrt_llm._torch.distributed.ll_exchange import TPHostExchange
+from tensorrt_llm._torch.distributed import membership, mnnvl_memory
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, MnnvlRows, TPHostExchange
 from tensorrt_llm._torch.distributed.membership import (
     HOST_WEIGHTS_PREFIX_KEY,
     JOIN_SECRET_ENV,
@@ -60,15 +57,16 @@ from tensorrt_llm._torch.distributed.membership import (
     SignedStore,
     TransactionSummary,
 )
-from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
+from tensorrt_llm._torch.distributed.mnnvl_live_group import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
+    SHARED_MEMORY_DIR,
+    DeploymentHostCopies,
+    EplbExpertRestore,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import SERVING_TIMEOUT_ENV
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    SHARED_MEMORY_DIR,
-    HostMoeTensorSharer,
-    MoeLoadBalancer,
-)
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery_module
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import store_context_logits
@@ -107,6 +105,7 @@ from tensorrt_llm.executor.utils import (
 from tensorrt_llm.executor.worker_process_monitor import capture_worker_process_identity
 from tensorrt_llm.llmapi import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import AttentionDpConfig, KvCacheConfig, TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -164,33 +163,6 @@ def test_relaxed_request_pinned_to_absent_rank_is_balanced():
         _survivor_states(), [_item(0, target=FAILED, relax=True)], max_num_active_requests=4
     )
     assert sum(len(items) for items in routed.values()) == 1
-
-
-def test_int64_gather_gives_absent_ranks_zero_rows_and_votes_skip_them():
-    exchange = TPHostExchange.__new__(TPHostExchange)
-    exchange.nranks, exchange.live_mask, exchange._words = WORLD, SURVIVORS, 16
-    exchange._masks = {}
-
-    def one_round(chunk, length, readers, recipients=None, idle=False):
-        """The packets of a round in which every live rank r sent [r, 10 * r]; the absent rank's slot is stale."""
-        readers = [r for r in range(WORLD) if readers >> r & 1]
-        assert readers == [r for r in range(WORLD) if SURVIVORS >> r & 1]
-        packets = np.full((WORLD, 5), 0xDEAD, dtype=np.uint64)
-        for r in readers:
-            packets[r, 0] = length
-            packets[r, 1:] = np.array([r, 10 * r], dtype=np.int64).view(np.uint32)
-        return np.array([length if r in readers else 0 for r in range(WORLD)], np.uint32), packets
-
-    exchange._round = one_round
-    dist = MnnvlDist.__new__(MnnvlDist)
-    dist.mapping = SimpleNamespace(tp_size=WORLD)
-    dist._host_exchange = exchange
-    dist._live_rows_index = (None, None)
-    gathered = dist.tp_allgather_int64([0, 0])
-    assert gathered.tolist() == [[0, 0], [1, 10], [0, 0], [3, 30]]
-    assert dist.tp_live_rows(gathered).tolist() == [[0, 0], [1, 10], [3, 30]]
-    dist._exchange = lambda obj, readers=None, bound=None: [1, 2, None, 4]
-    assert dist.allreduce(1) == 7
 
 
 def test_cuda_graph_agreement_skips_absent_ranks_and_keeps_the_captured_sizes():
@@ -287,30 +259,6 @@ def _startup_config():
     return llm_args, mapping, MnnvlDist.__new__(MnnvlDist)
 
 
-@pytest.mark.parametrize("fabric", [True, False])
-def test_mnnvl_dist_needs_fabric_handles(monkeypatch, fabric):
-    """MnnvlDist's rows are shared through fabric handles only: elsewhere fault tolerance is refused at startup."""
-    from tensorrt_llm._torch.distributed import mnnvl_memory
-
-    handle_types = mnnvl_memory.cuda.CUmemAllocationHandleType
-    handle_type = (
-        handle_types.CU_MEM_HANDLE_TYPE_FABRIC
-        if fabric
-        else handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-    )
-    monkeypatch.setattr(mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
-    monkeypatch.setattr(
-        mnnvl_memory.MnnvlRows,
-        "get_allocation_prop",
-        classmethod(lambda cls, dev_id: SimpleNamespace(requestedHandleTypes=handle_type)),
-    )
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    mapping = SimpleNamespace(
-        enable_attention_dp=True, pp_size=1, cp_size=1, tp_size=WORLD, world_size=WORLD
-    )
-    assert MnnvlDist.supports(mapping) == fabric
-
-
 @pytest.fixture
 def join_secret(monkeypatch):
     monkeypatch.setenv(JOIN_SECRET_ENV, "ab" * 32)
@@ -342,7 +290,7 @@ def test_a_rank_needs_its_identity_from_its_node_supervisor(join_secret, monkeyp
     launch, never by a rank started on its own."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    with pytest.raises(ValueError, match="'<rank>,<world size>,<incarnation>'"):
+    with pytest.raises(ValueError, match="'<rank>,<world size>,<GPUs per node>,<incarnation>'"):
         recovery_module._launched_rank()
 
 
@@ -450,7 +398,7 @@ def test_the_startup_check_names_what_the_host_collectives_over_mnnvl_lack(
         mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: lacks != "mnnvl")
     )
     monkeypatch.setattr(
-        mnnvl_memory.MnnvlRows,
+        MnnvlRows,
         "uses_fabric_handles",
         classmethod(lambda cls, dev_id: lacks != "fabric"),
     )
@@ -500,7 +448,7 @@ _LOCAL_RANKS = 2
 
 
 def _host_tensor_sharer(local_rank=0, local_size=_LOCAL_RANKS):
-    sharer = HostMoeTensorSharer(
+    sharer = DeploymentHostCopies(
         0,
         _EXPERTS,
         Mock(Get_rank=Mock(return_value=local_rank), Get_size=Mock(return_value=local_size)),
@@ -691,12 +639,11 @@ class FakeExchange:
 
 
 class FakeStore:
-    """The SignedStore calls of a rank, in memory; ``waits`` counts the waits for values not all set yet."""
+    """The SignedStore calls of a rank, in memory."""
 
     def __init__(self):
         self.values = {}
         self.store = self
-        self.waits = 0
 
     def set(self, key, value):
         self.values[key] = value
@@ -713,13 +660,6 @@ class FakeStore:
 
     def check(self, keys):
         return all(key in self.values for key in keys)
-
-    def wait(self, keys, timeout_s):
-        if all(key in self.values for key in keys):
-            return True
-        self.waits += 1
-        time.sleep(min(timeout_s, 0.01))
-        return False
 
     def multi_get(self, keys):
         return [self.values[key] for key in keys]
@@ -1040,7 +980,8 @@ def test_main_s_hang_detector_is_paused_while_a_rank_takes_part_in_a_membership_
         recovery = _recovery(rank=1)
         recovery._executor.hang_detector = detector
         seen = []
-        recovery._follow_change = lambda: seen.append(detector.paused())
+        # The committed record: no change to take part in.
+        recovery._next_record = lambda record: seen.append(detector.paused()) or recovery._record
         recovery._finish_install = lambda record: seen.append(detector.paused())
         recovery._change_membership()
         assert detector.paused() == paused_before
@@ -1109,396 +1050,37 @@ def test_a_gather_reads_the_ranks_it_waits_for_from_arrival_counters_once_per_re
     record = recovery._record = MembershipRecord(
         generation=1, state=MembershipState.INSTALL, live_mask=(1 << world) - 1
     )
-    calls = collections.Counter()
+    adds = []
+    checked = []  # per store check, the number of keys it checks
     store = recovery._store
-    for name in ("check", "add"):
-        method = getattr(store, name)
-        monkeypatch.setattr(
-            store,
-            name,
-            lambda *args, _name=name, _method=method: (calls.update([_name]), _method(*args))[1],
-        )
+    add, check = store.add, store.check
+    monkeypatch.setattr(store, "add", lambda *args: (adds.append(args), add(*args))[1])
+    monkeypatch.setattr(store, "check", lambda keys: (checked.append(len(keys)), check(keys))[1])
     gather = recovery._gather_through_store(record, "rows")
     for r in range(world):
         if r not in (1, 200):
             store.set(f"rows/1/0/{r}", pickle.dumps(r))
             membership.mark_arrived(store, "rows/1/0", r)
-    calls.clear()
+    adds.clear()
+    checked.clear()
     gathered = []
     gathering = threading.Thread(target=lambda: gathered.append(gather(1)), daemon=True)
     started_s = time.monotonic()
     gathering.start()
-    _wait_until(lambda: recovery._waiting_in_store == 1 << 200)
-    time.sleep(1.0)
-    waited_s = time.monotonic() - started_s
-    assert calls["check"] == 0
-    # This rank's own arrival, then 5 counters per read, at most once per report interval.
-    assert calls["add"] <= 1 + 5 * (waited_s / membership.REPORT_INTERVAL_S + 1)
-    store.set("rows/1/0/200", pickle.dumps(200))
-    membership.mark_arrived(store, "rows/1/0", 200)
-    gathering.join(10)
+    try:
+        _wait_until(lambda: recovery._waiting_in_store == 1 << 200)
+        time.sleep(1.0)
+        waited_s = time.monotonic() - started_s
+        # A poll for the values checks all of them in one store call, never a rank's alone.
+        assert checked and set(checked) == {world}
+        assert len(checked) <= 10 + waited_s / membership.STORE_POLL_S
+        # This rank's own arrival, then 5 counters per read, at most once per report interval.
+        assert len(adds) <= 1 + 5 * (waited_s / membership.REPORT_INTERVAL_S + 1)
+    finally:
+        store.set("rows/1/0/200", pickle.dumps(200))
+        membership.mark_arrived(store, "rows/1/0", 200)
+        gathering.join(10)
     assert gathered == [list(range(world))]
-
-
-# The host exchange under a membership change, two ranks of one process over rows of host memory.
-
-
-class _HostCopies:
-    """The CUDA driver calls of TPHostExchange, as copies between host addresses, each done at once and whole (the
-    GPU writes a packet whole)."""
-
-    CUresult = SimpleNamespace(CUDA_SUCCESS=0)
-    CUmemorytype = SimpleNamespace(CU_MEMORYTYPE_DEVICE="device", CU_MEMORYTYPE_HOST="host")
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        # Every copy as (source, destination, width, rows), source and destination as (memory type, address).
-        self.log = []
-
-    @staticmethod
-    def CUDA_MEMCPY2D():
-        return SimpleNamespace()
-
-    def cuMemcpy2DAsync(self, copy, stream):
-        src = copy.srcHost if copy.srcMemoryType == "host" else copy.srcDevice
-        dst = copy.dstHost if copy.dstMemoryType == "host" else copy.dstDevice
-        with self._lock:
-            self.log.append(
-                (
-                    (copy.srcMemoryType, src),
-                    (copy.dstMemoryType, dst),
-                    copy.WidthInBytes,
-                    copy.Height,
-                )
-            )
-            for row in range(copy.Height):
-                ctypes.memmove(
-                    dst + row * copy.dstPitch, src + row * copy.srcPitch, copy.WidthInBytes
-                )
-        return (0,)
-
-
-class _HostRows:
-    """MnnvlRows in host memory as rank ``rank`` maps them: every rank's row at ``ptr + r * stride``, in ``memory``,
-    which the views of every rank share."""
-
-    def __init__(self, memory, stride, rank):
-        self._memory, self.stride, self.rank = memory, stride, rank
-        self.ptr = memory.ctypes.data
-
-    def row(self, rank):
-        return self.ptr + rank * self.stride
-
-    def needs_fresh_pages(self, gather):
-        return True
-
-    def checkpoint_prepare(self):
-        pass
-
-    def remap(self, gather):
-        """Fresh pages, of which this rank zeroes its own row (``gather`` is unused: the memory is shared)."""
-        self._memory[self.rank * self.stride : (self.rank + 1) * self.stride] = 0
-
-    def close(self):
-        pass
-
-
-_SLOT_BYTES = 64
-# Slots longer than a header poll copies (TPHostExchange._POLL_PACKETS payload packets).
-_LONG_SLOT_BYTES = 4 * 1024
-
-
-def _host_exchange_group(monkeypatch, nranks, slot_bytes):
-    """``nranks`` ranks' TPHostExchange over shared host rows; a change's ``install`` zeroes this rank's row."""
-    monkeypatch.setattr(mnnvl_memory, "cuda", _HostCopies())
-    monkeypatch.setattr(ll_exchange, "prefer_pinned", lambda: False)
-    monkeypatch.setattr(
-        torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=0, synchronize=lambda: None)
-    )
-    stride = TPHostExchange.buffer_bytes(nranks, slot_bytes)
-    memory = np.zeros(nranks * stride, dtype=np.uint8)
-    return [
-        TPHostExchange(rank, nranks, _HostRows(memory, stride, rank), slot_bytes)
-        for rank in range(nranks)
-    ]
-
-
-@pytest.fixture
-def host_exchanges(monkeypatch):
-    return _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
-
-
-def _run_ranks(exchanges, calls):
-    """``calls[rank](exchanges[rank])`` for every rank, each in a thread: their results by rank."""
-    results, errors = {}, []
-
-    def run(rank):
-        try:
-            results[rank] = calls[rank](exchanges[rank])
-        except BaseException as error:  # noqa: BLE001 - reported by the test
-            errors.append(error)
-
-    ranks = [threading.Thread(target=run, args=(rank,), daemon=True) for rank in range(len(calls))]
-    for thread in ranks:
-        thread.start()
-    for thread in ranks:
-        thread.join(30)
-    assert not errors and not any(thread.is_alive() for thread in ranks), errors
-    return results
-
-
-@pytest.mark.timeout(60)
-@pytest.mark.parametrize("idle", [False, True])
-def test_only_an_idle_wait_sleeps(host_exchanges, monkeypatch, idle):
-    """A wait for a late peer spins while the executor has work: it never sleeps, yet it reports the rank it waits
-    for. Only a wait of an idle exchange sleeps between polls."""
-    sleeps = []
-    monkeypatch.setattr(
-        ll_exchange,
-        "time",
-        SimpleNamespace(
-            monotonic=time.monotonic, sleep=lambda s: sleeps.append(s) or time.sleep(s)
-        ),
-    )
-    waiter = host_exchanges[1]
-    reported = []
-
-    def late(exchange):  # rank 0 sends well after rank 1 has reported waiting for it
-        deadline = time.monotonic() + 10
-        while waiter.waiting_for != 1 << 0 and time.monotonic() < deadline:
-            time.sleep(1e-3)
-        reported.append(waiter.waiting_for)
-        time.sleep(0.02)
-        return exchange.exchange(b"r0", idle=idle)
-
-    results = _run_ranks(
-        host_exchanges, [late, lambda exchange: exchange.exchange(b"r1", idle=idle)]
-    )
-    assert results == {0: [b"r0", b"r1"], 1: [b"r0", b"r1"]}
-    assert reported == [1 << 0]
-    assert bool(sleeps) == idle, sleeps
-
-
-def test_mnnvl_dist_marks_only_the_idle_request_probe_idle():
-    """The executor's idle path (prefer_cpu) is the only idle host exchange; a broadcast's non-roots and a gather's
-    senders name the ranks that read their payloads."""
-    calls = []
-
-    def exchange(payload, readers, recipients, idle):
-        calls.append((readers, recipients, idle))
-        return [pickle.dumps(np.array([5])), None, None, None]
-
-    dist = MnnvlDist.__new__(MnnvlDist)
-    dist.mapping = SimpleNamespace(tp_rank=1)
-    dist._host_exchange = SimpleNamespace(exchange=exchange)
-    assert dist.broadcast_int64([0], root=0, prefer_cpu=True).tolist() == [5]
-    dist.broadcast_or_none(None)
-    assert dist.tp_gather([], root=0) is None
-    dist.barrier()
-    assert calls == [((0,), (), True), ((0,), (), False), ((), (0,), False), ((), (), False)]
-
-
-def test_mnnvl_dist_marks_the_root_of_the_idle_request_probe_idle():
-    """The broadcast's root, which waits for its readers, takes the idle path of the request probe too."""
-    calls = []
-
-    def exchange(payload, readers, recipients, idle):
-        calls.append((readers, recipients, idle))
-        return [None] * 4
-
-    dist = MnnvlDist.__new__(MnnvlDist)
-    dist.mapping = SimpleNamespace(tp_rank=0)
-    dist._host_exchange = SimpleNamespace(exchange=exchange)
-    assert dist.broadcast_int64([5], root=0, prefer_cpu=True).tolist() == [5]
-    dist.broadcast_or_none(None)
-    assert calls == [((), None, True), ((), None, False)]
-
-
-@pytest.mark.timeout(60)
-def test_a_long_payload_goes_only_into_its_readers_rows(monkeypatch):
-    """In a gather to rank 0 of payloads longer than a header poll copies, every row gets every sender's header and
-    only rank 0's row their payloads. A rank that finishes this round from the rows (as after a stop) needs nothing
-    from its peers' rows: it reads no payload, and its own row holds every header."""
-    exchanges = _host_exchange_group(monkeypatch, 3, _LONG_SLOT_BYTES)
-    payloads = [bytes([1 + rank]) * (3000 + rank) for rank in range(3)]
-    results = _run_ranks(
-        exchanges,
-        [lambda exchange: exchange.exchange(payloads[0], recipients=(0,))]
-        + [lambda exchange: exchange.exchange(payloads[exchange.rank], readers=(), recipients=(0,))]
-        * 2,
-    )
-    assert results == {0: payloads, 1: [None] * 3, 2: [None] * 3}
-    exchange = exchanges[1]
-    # [row, sender, packet] of the gather's slot set.
-    slots = np.frombuffer(
-        ctypes.string_at(exchange.rows.ptr, 3 * exchange.rows.stride), dtype=np.uint64
-    ).reshape(3, 2, 3, -1)[:, exchange.epoch & 1]
-    epochs = slots >> np.uint64(32)
-    assert (epochs[:, :, 0] == exchange.epoch).all()
-    assert (epochs[0, :, 1:751] == exchange.epoch).all()
-    assert not slots[1:, :, 1:].any()
-    log = mnnvl_memory.cuda.log
-    copies = len(log)
-    finished = exchange._finish_from_peers(0b111)
-    assert len(log) == copies + 1  # its own row only
-    assert (exchange._epochs(finished)[:, 0] == exchange.epoch).all()
-
-
-@pytest.mark.timeout(60)
-def test_a_broadcast_receiver_polls_only_the_roots_payload(monkeypatch):
-    """The ranks reading a broadcast longer than a header poll copies poll every rank's header, then only the
-    root's slot."""
-    exchanges = _host_exchange_group(monkeypatch, 3, _LONG_SLOT_BYTES)
-    payload = bytes(range(256)) * 12
-    results = _run_ranks(
-        exchanges,
-        [lambda exchange: exchange.exchange(payload, readers=())]
-        + [lambda exchange: exchange.exchange(b"", readers=(0,), recipients=())] * 2,
-    )
-    assert [results[rank][0] for rank in (1, 2)] == [payload, payload]
-    head = 8 * (1 + TPHostExchange._POLL_PACKETS)
-    for exchange in exchanges[1:]:
-        recv = exchange._recv.ctypes.data
-        polls = [
-            (src, width, count)
-            for (_, src), (memory, dst), width, count in mnnvl_memory.cuda.log
-            if memory == "host" and recv <= dst < recv + exchange._recv.nbytes
-        ]
-        own_slots = exchange.rows.row(exchange.rank) + (exchange.epoch & 1) * exchange._parity_bytes
-        assert polls[0] == (own_slots, head, 3)
-        assert {poll for poll in polls if poll[1] > head} == {
-            (own_slots, 8 * (1 + len(payload) // 4), 1)
-        }
-
-
-@pytest.mark.timeout(60)
-def test_a_change_that_loses_no_process_gives_every_rank_the_same_results(host_exchanges):
-    """A change that only adds a replacement reaches rank 1 while it waits for rank 0 in a round, and rank 0 only after
-    it finished that round and waits in the next. Each stops where the change reaches it, as for a failure: rank 1 in
-    the round rank 0 finished, which the change finishes for rank 1 with the packets rank 0 received; rank 0 in the
-    next round, which runs again on the new rows. Both get the same results from every exchange."""
-    seen = [False, False]  # whether each rank has the PROPOSE
-    stopped = {}
-    transaction = threading.Barrier(2, timeout=20)
-
-    def change(rank, exchange):  # the membership change, from READY to the commit
-        stopped[rank] = exchange.stopped_epoch
-        transaction.wait()
-        exchange.install(None, 0b11, next_epoch(latest_epoch(list(stopped.values()))))
-        seen[rank] = False
-        transaction.wait()
-
-    for rank, exchange in enumerate(host_exchanges):
-        exchange.interrupted = lambda rank=rank: seen[rank]
-        exchange.on_interrupt = lambda rank=rank, exchange=exchange: change(rank, exchange)
-    results, errors = {0: [], 1: []}, []
-
-    def run(rank):
-        exchange = host_exchanges[rank]
-        try:
-            if rank == 0:
-                # Rank 0 has the PROPOSE only once it waits in the round after the one it is late to.
-                threading.Timer(0.35, seen.__setitem__, (0, True)).start()
-                time.sleep(0.2)  # rank 1 waits for rank 0's packets ...
-                seen[1] = True  # ... and has the PROPOSE meanwhile
-                time.sleep(0.05)
-            results[rank].append(exchange.exchange(b"r%d" % rank))
-            results[rank].append(exchange.exchange(b"s%d" % rank))
-        except BaseException as error:  # noqa: BLE001 - reported by the test
-            errors.append(error)
-            transaction.abort()
-
-    ranks = [threading.Thread(target=run, args=(rank,), daemon=True) for rank in range(2)]
-    for thread in ranks:
-        thread.start()
-    for thread in ranks:
-        thread.join(30)
-    assert not errors and not any(thread.is_alive() for thread in ranks)
-    assert results[0] == results[1] == [[b"r0", b"r1"], [b"s0", b"s1"]]
-    assert stopped == {0: 2, 1: 1}  # rank 0 one round ahead
-
-
-@pytest.mark.timeout(60)
-def test_a_wait_for_a_lost_rank_stops_for_the_change(monkeypatch):
-    """Rank 2 is lost before it sends: ranks 0 and 1 spin in their wait for it (the executor has work) until the
-    change that drops it reaches them. They stop there, install it, and the round runs again without rank 2."""
-    exchanges = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)
-    survivors = 0b011
-    proposed = threading.Event()
-    stopped = {}
-    transaction = threading.Barrier(2, timeout=20)
-
-    def change(exchange):  # the membership change, from READY to the commit
-        stopped[exchange.rank] = exchange.stopped_epoch
-        transaction.wait()
-        exchange.install(None, survivors, next_epoch(latest_epoch(list(stopped.values()))))
-        exchange.interrupted = lambda: False
-        transaction.wait()
-
-    for exchange in exchanges[:2]:
-        exchange.interrupted = proposed.is_set
-        exchange.on_interrupt = lambda exchange=exchange: change(exchange)
-
-    def survivor(exchange):
-        return exchange.exchange(b"r%d" % exchange.rank), exchange.exchange(b"s%d" % exchange.rank)
-
-    threading.Timer(0.2, proposed.set).start()
-    results = _run_ranks(exchanges[:2], [survivor, survivor])
-    assert results[0] == results[1] == ([b"r0", b"r1", None], [b"s0", b"s1", None])
-    assert stopped == {0: 1, 1: 1}  # in the round rank 2 never sent into
-
-
-@pytest.mark.timeout(60)
-@pytest.mark.parametrize("absent", [1, 3])
-def test_every_collective_leaves_out_an_absent_rank(monkeypatch, absent):
-    """MnnvlDist's collectives with a rank that never writes its row absent, inside the group or last: object
-    gathers give None in its place, reductions skip it, int64 gathers give it a zero row; payloads that fit a header
-    poll and payloads of several rounds that go only to their readers. Then it is admitted again."""
-    nranks = 4
-    exchanges = _host_exchange_group(monkeypatch, nranks, _LONG_SLOT_BYTES)
-    live = ((1 << nranks) - 1) & ~(1 << absent)
-    live_ranks = [r for r in range(nranks) if live >> r & 1]
-    for exchange in exchanges:
-        if exchange.rank != absent:
-            exchange.rebuild(None, live, next_epoch(exchange.epoch))
-    payloads = (
-        lambda r: {"rank": r},
-        lambda r: bytes([r]) * (2 * _LONG_SLOT_BYTES + 100 * r),
-    )
-
-    def dist_of(exchange):
-        dist = MnnvlDist.__new__(MnnvlDist)
-        dist.mapping = SimpleNamespace(tp_rank=exchange.rank, tp_size=nranks)
-        dist._host_exchange = exchange
-        dist._live_rows_index = (None, None)
-        return dist
-
-    def collectives(exchange):
-        dist, rank = dist_of(exchange), exchange.rank
-        for payload in payloads:
-            expected = [payload(r) if r != absent else None for r in range(nranks)]
-            assert dist.allgather(payload(rank)) == expected
-            assert dist.tp_gather(payload(rank), root=0) == (expected if rank == 0 else None)
-            for root in live_ranks:
-                assert dist.broadcast(payload(rank), root=root) == payload(root)
-            assert dist.broadcast_or_none(payload(rank) if rank == 0 else None) == payload(0)
-            assert dist.broadcast_or_none(None) is None
-        assert dist.allreduce(rank + 1) == sum(r + 1 for r in live_ranks)
-        for n in (3, _LONG_SLOT_BYTES // 8 + 5):
-            gathered = dist.tp_allgather_int64(np.full(n, rank + 1))
-            assert gathered.tolist() == [[r + 1 if r != absent else 0] * n for r in range(nranks)]
-            assert dist.tp_live_rows(gathered).tolist() == [[r + 1] * n for r in live_ranks]
-        assert dist.broadcast_int64([7, rank], root=0).tolist() == [7, 0]
-        dist.barrier()
-
-    _run_ranks([exchanges[r] for r in live_ranks], [collectives] * len(live_ranks))
-    epoch = next_epoch(max(exchange.epoch for exchange in exchanges))
-    for exchange in exchanges:
-        exchange.rebuild(None, (1 << nranks) - 1, epoch)
-    results = _run_ranks(
-        exchanges, [lambda exchange: dist_of(exchange).allgather(exchange.rank)] * nranks
-    )
-    assert results == {r: list(range(nranks)) for r in range(nranks)}
 
 
 # Dropping steps and continuing requests.
@@ -1905,9 +1487,6 @@ def _eplb(monkeypatch, recovery, restored=6 * MIB, workspace=4 * MIB, device=Non
     planned = (np.array([[0, 3], [1, -1], [-1, -1], [2, -1]]),)
     plan = SimpleNamespace(device_bytes=restored, digest="restored", placements=planned)
     calls = device.calls
-    balancer.plan_expert_restore = (
-        lambda live, current, rejoining: calls.append(("plan", live, current, rejoining)) or plan
-    )
 
     def restore_lost_experts(restore, times):
         calls.append(("restore", restore))
@@ -1920,8 +1499,13 @@ def _eplb(monkeypatch, recovery, restored=6 * MIB, workspace=4 * MIB, device=Non
         device.take(-released)
         return released
 
-    balancer.restore_lost_experts = restore_lost_experts
-    balancer.release_empty_spare_slots = release_empty_spare_slots
+    balancer.expert_restore = SimpleNamespace(
+        plan_expert_restore=lambda live, current, rejoining: (
+            calls.append(("plan", live, current, rejoining)) or plan
+        ),
+        restore_lost_experts=restore_lost_experts,
+        release_empty_spare_slots=release_empty_spare_slots,
+    )
     balancer.abandon_iterations = lambda: calls.append("abandon")
 
     @contextlib.contextmanager
@@ -2160,10 +1744,18 @@ def test_without_eplb_or_workspace_nothing_is_suspended():
     recovery._moe.remap_workspaces.assert_called_once()
 
 
+def _bare_balancer():
+    """A MoeLoadBalancer with its expert restore, both without their startup: the test sets the fields they read."""
+    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer.expert_restore = EplbExpertRestore.__new__(EplbExpertRestore)
+    balancer.expert_restore.balancer = balancer
+    return balancer
+
+
 def _online_eplb(recovery, on_abandon=lambda: None):
     """``recovery``'s online EPLB; ``on_abandon()`` runs while its blocking end of the interrupted iterations waits.
     Returns the calls: each end and each read of the placement."""
-    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer = _bare_balancer()
     balancer.ep_rank = recovery.rank
     calls = []
 
@@ -2331,7 +1923,7 @@ def test_at_deepseek_r1_size_one_ready_payload_carries_the_placement_every_rank_
     ],
 )
 def test_ready_carries_the_rank_s_part_of_the_placement(rank, joining, payload):
-    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer = _bare_balancer()
     balancer.ep_rank = rank
     balancer.abandon_iterations = lambda: None
     # Per rank, the expert of each slot; -1: an empty spare slot.
@@ -2361,6 +1953,7 @@ def test_ready_carries_the_rank_s_part_of_the_placement(rank, joining, payload):
         recovery = _recovery(rank)
         proposal = _record(MembershipState.PROPOSE)
     recovery._executor.model_engine.moe_load_balancer = balancer
+    recovery._on_record(proposal)
     recovery._next_record = Mock(side_effect=[proposal, _record(MembershipState.ABORT)])
     with (
         patch.object(recovery_module.os, "_exit", side_effect=SystemExit),
@@ -2376,7 +1969,7 @@ def test_ready_carries_the_rank_s_part_of_the_placement(rank, joining, payload):
 def test_a_replacement_reports_that_it_is_ready_to_join_with_its_ready():
     """Before any PROPOSE adds it, a started replacement reports that it is ready to join, with what its READY carries
     (its own slots): the authority stops the live ranks for it only then, and takes its READY from this report."""
-    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer = _bare_balancer()
     balancer.ep_rank = FAILED
     balancer.single_layer_load_balancers = [
         SimpleNamespace(
@@ -2567,7 +2160,6 @@ def test_unsupported_models_are_refused_once_built_before_any_weight_loads(
     from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
     from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
     from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
-    from tensorrt_llm.mapping import Mapping
 
     model = torch.nn.Module()
     model.model_config = SimpleNamespace(
@@ -2882,23 +2474,6 @@ def test_health_state(monkeypatch, record, state):
     assert FaultToleranceHealth("host:1", b"secret").status()["state"] == state
 
 
-def test_health_ignores_a_record_older_than_one_it_read(monkeypatch):
-    """A value replayed into the store by a process without the join secret."""
-    store = FakeSignedStore(
-        _record(MembershipState.COMMITTED, live_mask=0b1111).model_copy(update=dict(sequence=4))
-    )
-    monkeypatch.setattr(recovery_module, "open_store", lambda *args, **kwargs: store)
-    health = FaultToleranceHealth("host:1", b"secret")
-    assert health.status()["state"] == "healthy"
-    store.values[membership.RECORD_KEY] = (
-        _record(MembershipState.ABORT)
-        .model_copy(update=dict(sequence=3))
-        .model_dump_json()
-        .encode()
-    )
-    assert health.status()["state"] == "healthy"
-
-
 # Not JSON; JSON without a record's fields; JSON that is not an object.
 @pytest.mark.parametrize("value", [b"not a membership record", b"{}", b"[1, 2]"])
 def test_health_keeps_the_record_past_a_value_it_cannot_parse(monkeypatch, value):
@@ -2987,7 +2562,7 @@ def test_status_endpoint_reports_the_membership_and_the_last_transaction(monkeyp
     began_unix_ms = 1_762_000_000_000
     transaction = TransactionSummary(
         generation=1,
-        state=MembershipState.COMMITTED,
+        outcome="COMMITTED",
         removed_ranks=(FAILED,),
         added_ranks=(),
         detected_unix_ms=began_unix_ms - 12,
@@ -3011,18 +2586,10 @@ def test_status_endpoint_reports_the_membership_and_the_last_transaction(monkeyp
             "outcome": "COMMITTED",
             "removed_ranks": [FAILED],
             "added_ranks": [],
-            "duration_s": 1.5,
-            "phases_ms": {
-                "detect_to_propose": 12.0,
-                "propose_to_ready": 400.0,
-                "ready_to_installed": 1100.0,
-            },
-            "times_unix_ms": {
-                "detected": began_unix_ms - 12,
-                "proposed": began_unix_ms,
-                "ready": began_unix_ms + 400,
-                "committed": began_unix_ms + 1500,
-            },
+            "detected_unix_ms": began_unix_ms - 12,
+            "began_unix_ms": began_unix_ms,
+            "ready_unix_ms": began_unix_ms + 400,
+            "ended_unix_ms": began_unix_ms + 1500,
         },
     }
 
@@ -3277,14 +2844,13 @@ def agreed_startup(monkeypatch):
         ("_startup_fingerprint", None),
         ("_worker_main_args", None),
         ("_published_record", None),
-        ("_startup_deadline_s", None),
     ):
         monkeypatch.setattr(recovery_module, name, value)
     for name, value in vars(StartupRecord()).items():
         monkeypatch.setattr(startup_record, name, value)
 
 
-def _published(monkeypatch, worker_main_args, identity="2,4,1"):
+def _published(monkeypatch, worker_main_args, identity="2,4,4,1"):
     """A rank other than 0 whose launcher gave it ``identity``, and the rendezvous store it reads, with
     ``worker_main_args`` as rank 0 published them; its membership agent is not started. Returns the store."""
     monkeypatch.setenv(JOIN_SECRET_ENV, "ab" * 32)
@@ -3318,7 +2884,7 @@ def _replacement_of(monkeypatch, published: bytes) -> None:
     published, as ``worker_node_main`` makes it."""
     for name, value in vars(StartupRecord()).items():
         setattr(startup_record, name, value)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,1")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
     monkeypatch.setattr(recovery_module, "_published_record", pickle.loads(published))
     startup_record.replay(recovery_module._agreed_startup())
 
@@ -3443,7 +3009,7 @@ def test_a_rank_turns_fault_tolerance_on_before_it_imports_the_executor(
     assert ("worker_main", False) not in seen
 
 
-@pytest.mark.parametrize("identity", ["2,4,0", "2,4,1"])
+@pytest.mark.parametrize("identity", ["2,4,4,0", "2,4,4,1"])
 def test_every_rank_but_0_joins_then_starts_with_the_arguments_rank_0_published(
     agreed_startup, monkeypatch, identity
 ):
@@ -3472,19 +3038,9 @@ def test_every_rank_but_0_joins_then_starts_with_the_arguments_rank_0_published(
     assert events == [("join", rank), ("worker_main", args)]
 
 
-def test_a_rank_whose_rank_0_does_not_publish_its_arguments_in_time_ends(
-    agreed_startup, monkeypatch
-):
-    store = _published(monkeypatch, {}, "1,4,0")
-    del store.values[WORKER_ARGS_KEY]
-    monkeypatch.setattr(recovery_module, "RENDEZVOUS_TIMEOUT_S", 0.2)
-    with pytest.raises(TimeoutError, match="Rank 0 did not publish its worker arguments"):
-        recovery_module.worker_node_main()
-
-
 @pytest.mark.parametrize(
     "identity, entry",
-    [("0,4,0", "worker_node_main"), ("1,4,0", "start_worker"), (None, "start_worker")],
+    [("0,4,4,0", "worker_node_main"), ("1,4,4,0", "start_worker"), (None, "start_worker")],
 )
 def test_a_rank_started_by_the_wrong_entry_or_without_its_rank_fails_with_the_reason(
     agreed_startup, join_secret, monkeypatch, identity, entry
@@ -3509,7 +3065,7 @@ def test_rank_0_starts_the_authority_then_publishes_its_arguments_without_its_ip
 
     events = []
     store = FakeStore()
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,4,0")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,4,4,0")
     monkeypatch.setattr(recovery_module, "_agent", None)
     monkeypatch.setattr(
         recovery_module,
@@ -3604,13 +3160,16 @@ def test_an_original_rank_takes_over_its_membership_once_every_rank_has_started(
     executor.model_engine.moe_execution_state = MagicMock()
     executor.model_engine.moe_execution_state.workspace_bytes.return_value = 4 * MIB
     executor.model_engine.moe_load_balancer = MagicMock(spec=MoeLoadBalancer)
-    executor.model_engine.moe_load_balancer.largest_failure_restore_bytes.side_effect = lambda: (
+    expert_restore = MagicMock(spec=EplbExpertRestore)
+    executor.model_engine.moe_load_balancer.expert_restore = expert_restore
+    expert_restore.largest_failure_restore_bytes.side_effect = lambda: (
         events.append("restore fits"),
         6 * MIB,
     )[1]
-    executor.model_engine.moe_load_balancer.keep_host_copies_for_the_deployment.side_effect = (
-        lambda: (events.append("host copies"), "moe_shared_deployment_")[1]
-    )
+    expert_restore.keep_host_copies_for_the_deployment.side_effect = lambda: (
+        events.append("host copies"),
+        "moe_shared_deployment_",
+    )[1]
     recovery = RankFailureRecovery.create(executor)
     # Until the deployment serves, a rank's failure ends it, and the rank's host copies with it; from then on the
     # node supervisor keeps them until the deployment ended, by the prefix rank 0 publishes.
@@ -3652,14 +3211,14 @@ def test_a_rank_the_launcher_started_for_fault_tolerance_needs_it_on(monkeypatch
     from tensorrt_llm.executor.worker import worker_main
 
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,0")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
     with pytest.raises(ValueError, match="enable_wide_ep_fault_tolerance is off"):
         worker_main(worker_queues=None, log_level="info", llm_args=None)
 
 
 @pytest.mark.parametrize(
     "mpi_size, identity, refused",
-    [(1, None, False), (4, None, True), (4, "0,4,0", False)],
+    [(1, None, False), (4, None, True), (4, "0,4,4,0", False)],
     ids=["one-process", "every-rank-of-an-mpi-job", "under-trtllm-llmapi-launch"],
 )
 def test_fault_tolerance_starts_rank_0_s_worker_in_the_session_whatever_the_mpi_size(
@@ -3719,7 +3278,9 @@ def test_the_startup_rejects_a_largest_failure_no_kv_cache_pool_can_restore(
         ),
         _kv_pools_suspended=kv_pools_suspended,
     )
-    balancer = Mock(largest_failure_restore_bytes=Mock(return_value=restore_bytes))
+    balancer = Mock(
+        expert_restore=Mock(largest_failure_restore_bytes=Mock(return_value=restore_bytes))
+    )
     if short is None:
         recovery_module._check_largest_failure_fits(executor, balancer, STARTUP_MEMORY)
     else:
@@ -3732,7 +3293,7 @@ def test_the_startup_rejects_a_largest_failure_no_kv_cache_pool_can_restore(
     assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
 
 
-@pytest.mark.parametrize("identity", ["2,4,0", "2,4,1"], ids=["original", "replacement"])
+@pytest.mark.parametrize("identity", ["2,4,4,0", "2,4,4,1"], ids=["original", "replacement"])
 def test_no_rank_creates_a_process_group(monkeypatch, identity):
     """Every rank is its own process: a rank's replacement would never join a torch.distributed (NCCL) group."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
@@ -3817,6 +3378,7 @@ def test_a_replacement_the_change_leaves_out_exits(monkeypatch):
     """Its supervisor starts another replacement; the live ranks commit without it."""
     _exit_raises(monkeypatch)
     recovery = _replacement()
+    recovery._on_record(_joining_record(MembershipState.PROPOSE))
     recovery._next_record = Mock(
         side_effect=[
             _joining_record(MembershipState.PROPOSE),
@@ -4181,20 +3743,13 @@ def test_a_joining_rank_leaves_the_collective_a_newer_change_interrupts(monkeypa
 def test_every_rank_takes_its_identity_from_its_node_supervisor(monkeypatch, incarnation):
     """Its MPI world is only itself; the rank and the world size come from the node supervisor."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,4,{incarnation}")
-    assert _utils.wide_ep_fault_tolerance_rank() == (2, 4, incarnation)
-    assert _utils.fault_tolerance_replacement() == ((2, 4, 1) if incarnation else None)
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,4,4,{incarnation}")
+    assert _utils.wide_ep_fault_tolerance_rank() == (2, 4, 4, incarnation)
+    assert _utils.fault_tolerance_replacement() == ((2, 4, 4, 1) if incarnation else None)
     assert (_utils.mpi_rank(), _utils.global_mpi_rank()) == (2, 2)
     assert (_utils.mpi_world_size(), _utils.global_mpi_size()) == (4, 4)
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", False)
     assert _utils.wide_ep_fault_tolerance_rank() is None
-
-
-@pytest.mark.parametrize("rank, local", [(0, 4), (3, 4), (5, 2)])
-def test_the_ranks_of_a_node_follow_gpus_per_node(rank, local):
-    dist = MnnvlDist.__new__(MnnvlDist)
-    dist.mapping = SimpleNamespace(rank=rank, world_size=6, gpus_per_node=4)
-    assert dist.local_world_size == local
 
 
 def _wait_until(condition, timeout_s=5.0):

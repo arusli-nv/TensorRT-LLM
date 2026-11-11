@@ -363,7 +363,7 @@ def test_mpi_pool_session_starts_its_ranks_for_fault_tolerance(
     assert pool.call_args.kwargs["python_args"][0] == "-c"
     if fault_tolerance:
         assert pool.call_args.kwargs["max_workers"] == 1
-        assert env[_utils.FAULT_TOLERANCE_RANK_ENV] == "0,2,0"
+        assert env[_utils.FAULT_TOLERANCE_RANK_ENV] == "0,2,2,0"
         args = supervisor.call_args.args[0]
         assert args[0] == sys.executable
         assert Path(args[1]).resolve() == _NODE_SUPERVISOR.resolve()
@@ -466,7 +466,7 @@ def test_mpi_pool_session_starts_its_ranks_for_fault_tolerance_in_mpi(
     workers = observed["workers"]
     if fault_tolerance:
         assert [(w["rank"], w["size"]) for w in workers] == [(0, 1)]
-        assert workers[0]["TLLM_FAULT_TOLERANCE_RANK"] == "0,2,0"
+        assert workers[0]["TLLM_FAULT_TOLERANCE_RANK"] == "0,2,2,0"
         command, running = observed["node_supervisor"]
         assert running
         assert Path(command[1]).name == _NODE_SUPERVISOR.name

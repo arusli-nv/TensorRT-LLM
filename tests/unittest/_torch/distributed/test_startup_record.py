@@ -26,8 +26,9 @@ import pytest
 
 from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
 from tensorrt_llm._torch.autotuner import AutoTuner, AutoTunerProfilingCache
-from tensorrt_llm._torch.distributed import communicator, ll_exchange
-from tensorrt_llm._torch.distributed.communicator import MnnvlDist, ReduceOp
+from tensorrt_llm._torch.distributed import communicator
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup
@@ -317,7 +318,7 @@ def test_a_replacement_creates_its_host_exchange_at_its_first_replayed_collectiv
     host_exchange = FakeHostExchange(REPLACED, live_mask=1 << REPLACED)
     created = []
     monkeypatch.setattr(
-        ll_exchange.TPHostExchange,
+        TPHostExchange,
         "create",
         staticmethod(lambda mapping: (created.append(mapping), host_exchange)[1]),
     )

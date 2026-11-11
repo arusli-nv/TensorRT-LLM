@@ -34,10 +34,7 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._torch.distributed.mnnvl_memory import (MnnvlMemory,
-                                                          MnnvlRows,
-                                                          init_helix_cp_comm)
-from tensorrt_llm._torch.distributed.startup_record import startup_record
+from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
 from tensorrt_llm._utils import (fault_tolerance_mode, local_mpi_size,
                                  mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
@@ -116,8 +113,10 @@ class Distributed(ABC):
     def get(mapping: Mapping) -> "Distributed":
         if mpi_disabled():
             return TorchDist(mapping)
-        if fault_tolerance_mode() and MnnvlDist.supports(mapping):
-            return MnnvlDist(mapping)
+        if fault_tolerance_mode():
+            from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
+            if MnnvlDist.supports(mapping):
+                return MnnvlDist(mapping)
         return MPIDist(mapping)
 
     @property
@@ -959,227 +958,6 @@ class MPIDist(Distributed):
         if self.cp_size > 1:
             buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
         return buf
-
-
-class MnnvlDist(MPIDist):
-    """``MPIDist`` whose host collectives go through MNNVL memory instead of MPI.
-
-    Used with WideEP fault tolerance on pure attention-DP layouts, where the TP
-    group spans the world. The collectives run as rounds of a
-    ``TPHostExchange``: every rank copies its payload into the receive buffers
-    of the ranks that read it and reads its own, with no MPI call. The host
-    exchange buffers are allocated on first use, which every rank reaches in
-    step. Ranks outside the exchange's live mask are absent: object gathers
-    return None in their place, reductions skip them, and
-    ``tp_allgather_int64`` gives them zero rows, so rows stay indexed by rank
-    and counts summed over them stay true; votes take ``tp_live_rows``. Every
-    live rank gets the same result from a collective that a membership change
-    interrupted. During the startup, rank 0 records the collectives, and a
-    replacement rank, whose exchange reaches only itself, takes their results
-    from the record (``startup_record``). Methods not overridden here, such as
-    point-to-point calls and the PP/CP groups, stay on MPI.
-    """
-
-    _REDUCE = {
-        ReduceOp.SUM: lambda a, b: a + b,
-        ReduceOp.PRODUCT: lambda a, b: a * b,
-        ReduceOp.MIN: min,
-        ReduceOp.MAX: max,
-        ReduceOp.BAND: lambda a, b: a & b,
-        ReduceOp.BOR: lambda a, b: a | b,
-        ReduceOp.BXOR: lambda a, b: a ^ b,
-    }
-
-    # broadcast_or_none is one exchange: the root's pickled None stands for
-    # "nothing".
-    supports_single_round_broadcast = True
-
-    def __init__(self, mapping: Mapping):
-        super().__init__(mapping)
-        self._host_exchange = None
-        # (live mask, rows of the live ranks) of the last tp_live_rows call.
-        self._live_rows_index = (None, None)
-
-    @staticmethod
-    def unmet_requirements(mapping: Mapping) -> List[str]:
-        """What the layout lacks of pure attention DP (one TP group over the
-        world), or else what the GPUs lack of MNNVL memory shared through
-        fabric handles (MnnvlRows); empty if both are met."""
-        unmet = [
-            requirement for supported, requirement in (
-                (mapping.enable_attention_dp,
-                 "attention DP (enable_attention_dp=True)"),
-                (mapping.pp_size == 1, "pipeline_parallel_size=1"),
-                (mapping.cp_size == 1, "context_parallel_size=1"),
-                (mapping.tp_size == mapping.world_size,
-                 "tensor_parallel_size equal to the world size"),
-            ) if not supported
-        ]
-        if unmet:
-            return unmet
-        if not MnnvlMemory.supports_mnnvl():
-            return [
-                "GPUs in one multi-node NVLink (MNNVL) domain, such as a "
-                "GB200 NVL72"
-            ]
-        if not MnnvlRows.uses_fabric_handles(torch.cuda.current_device()):
-            return [
-                "MNNVL memory shared through fabric handles (GB200-class "
-                "aarch64 nodes with IMEX running and an IMEX channel in the "
-                "container)"
-            ]
-        return []
-
-    @staticmethod
-    def supports(mapping: Mapping) -> bool:
-        """Whether the layout and the GPUs meet ``unmet_requirements``."""
-        return not MnnvlDist.unmet_requirements(mapping)
-
-    @property
-    def local_world_size(self):
-        """The ranks on this rank's node, from the mapping: a replacement
-        rank's MPI world is only itself."""
-        gpus_per_node = self.mapping.gpus_per_node
-        return min(gpus_per_node,
-                   self.world_size - self.rank // gpus_per_node * gpus_per_node)
-
-    @property
-    def host_exchange(self):
-        """The ``TPHostExchange`` under the collectives; collective on first
-        use."""
-        if self._host_exchange is None:
-            from .ll_exchange import TPHostExchange
-            self._host_exchange = TPHostExchange.create(self.mapping)
-        return self._host_exchange
-
-    def _exchange(self,
-                  obj,
-                  readers=None,
-                  recipients=None,
-                  idle=False,
-                  bound=None) -> list:
-        """Every rank's pickled ``obj`` (only live ``readers``' are unpickled);
-        the other arguments are ``TPHostExchange.exchange``'s, and ``bound``
-        ``StartupRecord.exchange``'s."""
-        host_exchange = self.host_exchange
-        payload = pickle.dumps(obj)
-        if not startup_record.active:
-            payloads = host_exchange.exchange(payload, readers, recipients,
-                                              idle)
-        else:
-
-            def run():
-                return host_exchange.exchange(payload, readers, recipients,
-                                              idle)
-
-            payloads = startup_record.exchange(self.mapping.tp_rank, payload,
-                                               readers, run, bound)
-        return [
-            None if payload is None else pickle.loads(payload)  # nosec B301
-            for payload in payloads
-        ]
-
-    def broadcast(self,
-                  obj,
-                  root=0,
-                  chunk_size: int = 4 * 1024 * 1024,
-                  prefer_cpu=False):
-        # prefer_cpu marks the idle path, where the ranks may wait long for
-        # each other: a long wait there sleeps between polls; others spin.
-        if self.mapping.tp_rank == root:
-            self._exchange(obj, readers=(), idle=prefer_cpu)
-            return obj
-        return self._exchange(None,
-                              readers=(root, ),
-                              recipients=(),
-                              idle=prefer_cpu)[root]
-
-    def broadcast_or_none(self, obj, root=0):
-        return self.broadcast(obj, root)
-
-    def allgather(self, obj):
-        return self._exchange(obj)
-
-    def barrier(self):
-        self._exchange(None, readers=(), recipients=())
-
-    def tp_barrier(self):
-        self.barrier()
-
-    def tp_allgather(self,
-                     obj,
-                     chunk_size: int = 4 * 1024 * 1024,
-                     *,
-                     small_payload: bool = False):
-        return self._exchange(obj)
-
-    def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-        if self.mapping.tp_rank != root:
-            self._exchange(obj, readers=(), recipients=(root, ))
-            return None
-        return self._exchange(obj, recipients=(root, ))
-
-    def tp_broadcast(self,
-                     obj,
-                     root=0,
-                     chunk_size: int = 4 * 1024 * 1024,
-                     **kwargs):
-        return self.broadcast(obj, root)
-
-    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
-        _check_reduce_op(op)
-        bound = self._REDUCE[op] if op in (ReduceOp.MIN, ReduceOp.MAX) else None
-        values = [
-            value for value in self._exchange(obj, bound=bound)
-            if value is not None
-        ]
-        result = values[0]
-        for value in values[1:]:
-            result = self._REDUCE[op](result, value)
-        return result
-
-    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
-        return self.allreduce(obj, op)
-
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
-        host_exchange = self.host_exchange
-        values = np.asarray(values, dtype=np.int64)
-        if not startup_record.active:
-            return host_exchange.allgather_array(values)
-
-        def run():
-            return [
-                row.tobytes() for row in host_exchange.allgather_array(values)
-            ]
-
-        rows = startup_record.exchange(self.mapping.tp_rank, values.tobytes(),
-                                       None, run)
-        return np.stack([np.frombuffer(row, dtype=np.int64) for row in rows])
-
-    def tp_live_rows(self, rows: np.ndarray) -> np.ndarray:
-        live_mask = self.host_exchange.live_mask
-        if live_mask == (1 << self.tp_size) - 1 or startup_record.replaying:
-            return rows  # every rank takes part
-        if self._live_rows_index[0] != live_mask:
-            self._live_rows_index = (
-                live_mask,
-                np.array([r for r in range(self.tp_size) if live_mask >> r & 1],
-                         dtype=np.intp))
-        return rows[self._live_rows_index[1]]
-
-    def broadcast_int64(self,
-                        values: ArrayLike,
-                        root: int = 0,
-                        *,
-                        prefer_cpu: bool = False) -> np.ndarray:
-        row = np.ascontiguousarray(
-            np.asarray(values, dtype=np.int64).reshape(-1))
-        return self.broadcast(row, root, prefer_cpu=prefer_cpu)
-
-    def tp_cp_broadcast_int64(self,
-                              values: ArrayLike,
-                              root: int = 0) -> np.ndarray:
-        return self.broadcast_int64(values, root)
 
 
 class MultiHandleWrapper:

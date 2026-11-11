@@ -33,6 +33,7 @@ REPO = Path(__file__).resolve().parents[4]
 HERE = Path(__file__).resolve().parent
 TORCH = "tensorrt_llm/_torch"
 COMMUNICATOR = f"{TORCH}/distributed/communicator.py"
+HOST_EXCHANGE = f"{TORCH}/distributed/host_exchange.py"
 PY_EXECUTOR = f"{TORCH}/pyexecutor/py_executor.py"
 # Code no fault-tolerance deployment runs: modeling_v2 targets, kernels, image and video generation, and what
 # fault tolerance rejects at startup (disaggregated serving, per-layer dynamic EPLB).
@@ -184,7 +185,10 @@ def _public_methods(cls: ast.ClassDef) -> dict:
 
 def _communicator_classes() -> dict:
     classes = {
-        node.name: node for node in _tree(COMMUNICATOR).body if isinstance(node, ast.ClassDef)
+        node.name: node
+        for path in (COMMUNICATOR, HOST_EXCHANGE)
+        for node in _tree(path).body
+        if isinstance(node, ast.ClassDef)
     }
     return {
         name: _public_methods(classes[name]) for name in ("Distributed", "MPIDist", "MnnvlDist")
@@ -298,7 +302,7 @@ RAW_GATHER_VOTES = {
     f"{PY_EXECUTOR}::PyExecutor._can_queue": (1, _REMOTE_TAIL),
     f"{PY_EXECUTOR}::PyExecutor._kv_connector_sync_status": (1, _KV_CONNECTOR),
     f"{PY_EXECUTOR}::PyExecutor._handle_control_request": (1, _SKIPS_ABSENT),
-    f"{PY_EXECUTOR}::PyExecutor._kv_pools_suspended": (1, _REMOTE_TAIL),
+    f"{PY_EXECUTOR}::PyExecutor._resume_after_rebalance": (1, _REMOTE_TAIL),
 }
 
 
@@ -577,7 +581,7 @@ REJECTING_CHECKS = {
         f"{TORCH}/pyexecutor/rank_failure_recovery.py",
         "check_supported_model",
     ),
-    "unmet_requirements": (COMMUNICATOR, "MnnvlDist.unmet_requirements"),
+    "unmet_requirements": (HOST_EXCHANGE, "MnnvlDist.unmet_requirements"),
     "validate_backend": (
         f"{TORCH}/moe/fused_moe/configurable_moe.py",
         "ConfigurableMoE.validate_backend",

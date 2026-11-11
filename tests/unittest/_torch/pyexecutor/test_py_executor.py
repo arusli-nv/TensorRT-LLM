@@ -2065,6 +2065,43 @@ def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata(
     assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
 
 
+def test_kv_pool_rebalance_raises_the_adjust_error_without_resuming():
+    """An adjust() failure other than OutOfPagesError propagates as it is: the rebalance does not resume the
+    requests over pools in an unknown state, so no resume error replaces it."""
+
+    class Manager:
+        tokens_per_block = 32
+
+        def __init__(self):
+            self.impl = Mock()
+            self.impl.adjust.side_effect = RuntimeError("adjust failed")
+            self.suspended = []
+
+        def get_primary_block_counts(self):
+            return 0, 100
+
+        def is_request_active(self, request_id):
+            return True
+
+        def suspend_request(self, request):
+            self.suspended.append(request)
+
+        def resume_request(self, request):
+            raise KeyError(request.py_request_id)
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = [types.SimpleNamespace(py_request_id=1)]
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+
+    with pytest.raises(RuntimeError, match="adjust failed"):
+        executor._rebalance_kv_pools_now()
+    assert manager.suspended == executor.active_requests
+    executor._resume_padding_dummies_after_rebalance.assert_not_called()
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_kv_pool_resize_runs_with_every_cache_suspended(fails):
     """The resize WideEP fault tolerance gives the KV cache pool to restored experts runs in main's suspend/resume

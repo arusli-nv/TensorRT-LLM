@@ -56,9 +56,9 @@ struct CftCombinePeerInfo
 static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
 static constexpr int64_t kDefaultTimeoutCycles = 300ll * kAssumedClockHz;
 
-// The waits on peers of a block read the host abort record only once they have lasted this long (50 us at an assumed
-// 2 GHz), and then one thread of the block reads it once per period: healthy waits are shorter, and concurrent host
-// reads from every waiting thread would slow them down.
+// A wait on a peer spins on the peer's round flag alone for this long (50 us at an assumed 2 GHz), which a healthy
+// wait does not outlast; a longer wait then also reads the host abort record, which one waiting thread of the block
+// reads once per period.
 static constexpr int64_t kAbortPollCycles = 100ll * 1000ll;
 
 // A wait on a peer that lasts this long (10 ms at an assumed 2 GHz, far beyond a healthy wait) is published as wait

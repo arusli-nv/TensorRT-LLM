@@ -548,8 +548,9 @@ def check_fault_tolerance_requirements(
 
 # Set in the process of every rank under WideEP fault tolerance, by the node
 # supervisor (``_llmapi_node_supervisor.py``) that starts it, or by
-# ``MpiPoolSession`` for rank 0: "<rank>,<world size>,<incarnation>". The rank
-# runs on GPU rank % GPUs per node.
+# ``MpiPoolSession`` for rank 0:
+# "<rank>,<world size>,<GPUs per node>,<incarnation>". The rank runs on GPU
+# rank % GPUs per node.
 FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 
 
@@ -559,6 +560,8 @@ class RankIdentity(NamedTuple):
     from MPI."""
     rank: int
     world_size: int
+    # The ranks the node supervisor runs on each node, one per GPU.
+    gpus_per_node: int
     incarnation: int  # 0 for an original rank, n for its n-th replacement
 
 
@@ -590,9 +593,10 @@ def mpi_rank():
         except ValueError:
             # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
             return 0
-    identity = wide_ep_fault_tolerance_rank()
-    if identity is not None:
-        return identity.rank
+    if _wide_ep_fault_tolerance:
+        identity = wide_ep_fault_tolerance_rank()
+        if identity is not None:
+            return identity.rank
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -600,23 +604,27 @@ def global_mpi_rank():
     if mpi_disabled():
         # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
         return 0
-    identity = wide_ep_fault_tolerance_rank()
-    if identity is not None:
-        return identity.rank
+
+    if _wide_ep_fault_tolerance:
+        identity = wide_ep_fault_tolerance_rank()
+        if identity is not None:
+            return identity.rank
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_size():
-    identity = wide_ep_fault_tolerance_rank()
-    if identity is not None:
-        return identity.world_size
+    if _wide_ep_fault_tolerance:
+        identity = wide_ep_fault_tolerance_rank()
+        if identity is not None:
+            return identity.world_size
     return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_world_size():
-    identity = wide_ep_fault_tolerance_rank()
-    if identity is not None:
-        return identity.world_size
+    if _wide_ep_fault_tolerance:
+        identity = wide_ep_fault_tolerance_rank()
+        if identity is not None:
+            return identity.world_size
     return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 

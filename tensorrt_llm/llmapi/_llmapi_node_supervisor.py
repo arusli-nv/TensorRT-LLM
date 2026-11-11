@@ -2,49 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """The node supervisor of a WideEP fault-tolerant deployment: keeps the ranks of one node served.
 
-Under fault tolerance, ``trtllm-llmapi-launch`` is launched once per node and runs this supervisor, which starts the
-node's ranks as its children, each with the launcher's command: rank ``node rank x GPUs per node + local GPU index``,
-on that GPU, given to each in ``TLLM_FAULT_TOLERANCE_RANK`` (``<rank>,<world size>,<incarnation>``) without the
-launcher's MPI variables. Each rank's launcher then runs rank 0's server and task, or becomes the worker of any other
-rank (``python -m tensorrt_llm.llmapi.mgmn_worker_node``), outside the launcher's MPI job. Each rank runs in its own
-session, so a signal for the terminal reaches the supervisor alone, and dies with the supervisor
-(``PR_SET_PDEATHSIG``), so the supervisor's death is the loss of its node. ``MpiPoolSession`` (``trtllm-serve`` or the
-LLM API starting its ranks) runs one for its single node, which starts every rank but 0 (``--rank-0-in-session``):
-rank 0 runs in the session's MPI pool, and the session stops the supervisor.
-
-A lost rank, or a lost node, comes back through this supervisor alone: it starts the replacements of its ranks, and a
-supervisor started again for a lost node replaces each of its ranks. It follows the membership record over its own
-connection to the authority, which pushes every record to it:
-
-- It kills a rank's process once a record no longer lists it as a live member after one did (excluded while hung, or
-  a replacement the change that would add it left out).
-- Once a rank's process ended and the record no longer lists the rank as live, it starts a replacement on the same
-  GPU with the same command and the rank's next incarnation, claimed in the rendezvous store from the incarnation that
-  failed (:func:`~tensorrt_llm._torch.distributed.membership.claim_incarnation`), and publishes how the replacement
-  goes (:class:`~tensorrt_llm._torch.distributed.membership.ReplacementState`). A replacement that ends before its
-  admission is started again after a backoff, unless it exits with ``REPLACEMENT_CANNOT_START``. Rank 0 is never
-  replaced: the deployment ends with it, and on node 0 under ``mpirun`` the supervisor ends the job at once, as no
-  authority may be left (or started yet) to end the other nodes' ranks.
-- Once the deployment ended (``SHUTDOWN`` or ``ABORT``), it unlinks the node's host weights (shared-memory
-  segments, which the ranks that map them keep using), then ends its ranks: after ``SHUTDOWN`` they end by themselves
-  within ``stop_grace_s``; after ``ABORT``, or when the node fails, it sends them SIGTERM at once. A signal for the
-  supervisor goes to rank 0's process, which runs the deployment's frontend; the other ranks end with the deployment.
-  Ranks left after ``stop_grace_s`` get SIGTERM, and those left another ``stop_grace_s`` later die with the
-  supervisor. It does the same when the process that started it ends.
-
-On node 0 under ``mpirun``, the supervisor relaunches the supervisor of a lost node through the job's own PRRTE
-(``prun``), with the deployment's environment on standard input, never on a command line; other launchers
-(Kubernetes) start a lost node's launch again themselves.
-
-Before the deployment serves (while the record is ``STARTING``), a rank that fails ends the node, and the authority
-aborts the deployment. The supervisor waits on events only (the ends of its
-children and of its parent, the authority's records, signals). It imports TensorRT-LLM without its library or MPI
-initialization, and uses no GPU.
+``trtllm-llmapi-launch`` runs one per node under fault tolerance. It starts the node's ranks as its children (each in
+its own session, dying with the supervisor), follows the membership record over its own connection to the authority,
+kills a rank the record no longer lists, starts a replacement of a lost rank on the same GPU, relaunches a lost
+node's supervisor on node 0 under ``mpirun``, and ends the node's ranks once the deployment ended. It uses no GPU and
+no MPI. See ``docs/source/features/wide-ep-fault-tolerance.md``.
 """
 
 import argparse
 import contextlib
 import ctypes
+import functools
 import glob
 import json
 import os
@@ -57,7 +25,7 @@ import sys
 import time
 from dataclasses import dataclass
 from types import FrameType
-from typing import Dict, Hashable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Hashable, List, Optional, Set, Tuple
 
 # The PMIx server URI variables a process mpirun starts holds, newest protocol first: prun reaches the job's PRRTE
 # through any of them.
@@ -71,6 +39,14 @@ _PMIX_SERVER_URI_VARS = (
 _PR_SET_PDEATHSIG = 1
 # Where the shared-memory segments of a node are (POSIX shared memory on Linux).
 _SHM_DIR = "/dev/shm"
+# How long a connection attempt to the authority lasts, and how long until the next one.
+_CONNECT_TIMEOUT_S = 2.0
+# How long the ranks get to end before SIGTERM, and again after it; twice this stays below the time the launcher gives
+# the supervisor to end (Kubernetes' termination grace period, 30 s by default; Slurm's KillWait).
+_STOP_GRACE_S = 10.0
+# The delay before a replacement or a relaunch is attempted again doubles from the first to the last.
+_MIN_BACKOFF_S = 1.0
+_MAX_BACKOFF_S = 60.0
 
 
 def _exit_status(returncode: int) -> int:
@@ -92,12 +68,10 @@ class _Process:
 
 
 class _Backoff:
-    """When the next attempt of each of several things is due: the delay doubles from ``min_s`` up to ``max_s`` with
-    each attempt, until :meth:`reset`."""
+    """When the next attempt of each of several things is due: the delay doubles with each attempt, until
+    :meth:`reset`."""
 
-    def __init__(self, min_s: float, max_s: float):
-        self._min_s = min_s
-        self._max_s = max_s
+    def __init__(self):
         self._due_s: Dict[Hashable, float] = {}
         self._delay_s: Dict[Hashable, float] = {}
 
@@ -105,9 +79,9 @@ class _Backoff:
         return self._due_s.get(key, 0.0)
 
     def delay(self, key: Hashable, now_s: float) -> None:
-        delay_s = self._delay_s.get(key, self._min_s)
+        delay_s = self._delay_s.get(key, _MIN_BACKOFF_S)
         self._due_s[key] = now_s + delay_s
-        self._delay_s[key] = min(2 * delay_s, self._max_s)
+        self._delay_s[key] = min(2 * delay_s, _MAX_BACKOFF_S)
 
     def reset(self, key: Hashable) -> None:
         self._delay_s.pop(key, None)
@@ -121,16 +95,11 @@ _RELAUNCHED = "relaunched"  # the process that relaunched a lost node's supervis
 
 
 class NodeSupervisor:
-    """Supervises the ranks of node ``node`` of ``nodes``, ``gpus_per_node`` each, as the module docstring describes.
+    """Supervises the ranks of node ``node`` of ``nodes``, ``gpus_per_node`` each; :meth:`run` returns the exit status.
 
-    ``command`` starts each rank's process, the original one and its replacements; with ``rank_0_in_session``, rank 0
-    is started otherwise. ``environ`` is the environment the ranks start with, without the launcher's MPI variables.
-    ``relaunch_command`` (node 0 under ``mpirun``) starts a process on the host given after it. ``end_job_command``
-    (node 0 under ``mpirun``) ends the whole job, as the supervisor does when rank 0 ends. A connection attempt
-    to the authority lasts at most ``connect_timeout_s``, and is made again that long later. Ranks get ``stop_grace_s``
-    to end before SIGTERM, then as long again; keep twice ``stop_grace_s`` below the time the launcher gives the
-    supervisor to end (Kubernetes' termination grace period, 30 s by default; Slurm's KillWait). :meth:`run` returns
-    the exit status.
+    ``command`` starts each rank's process (with ``rank_0_in_session``, every rank but 0) in ``environ``, without the
+    launcher's MPI variables. On node 0 under ``mpirun``, ``relaunch_command`` starts a process on the host given after
+    it, and ``end_job`` ends the whole job as failed.
     """
 
     def __init__(
@@ -142,15 +111,12 @@ class NodeSupervisor:
         environ: Dict[str, str],
         rank_0_in_session: bool = False,
         relaunch_command: Optional[List[str]] = None,
-        end_job_command: Optional[List[str]] = None,
-        connect_timeout_s: float = 2.0,
-        stop_grace_s: float = 10.0,
-        min_backoff_s: float = 1.0,
-        max_backoff_s: float = 60.0,
+        end_job: Optional[Callable[[Dict[str, str], float], None]] = None,
     ):
         from tensorrt_llm._torch.distributed import membership
         from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV
         from tensorrt_llm.logger import logger
+        from tensorrt_llm.mapping import Mapping
 
         self._membership = membership
         self._logger = logger
@@ -159,7 +125,12 @@ class NodeSupervisor:
         self._nodes = nodes
         self._gpus_per_node = gpus_per_node
         self._world_size = nodes * gpus_per_node
-        self._ranks = list(range(node * gpus_per_node, (node + 1) * gpus_per_node))
+        mapping = Mapping(
+            world_size=self._world_size, tp_size=self._world_size, gpus_per_node=gpus_per_node
+        )
+        self._ranks = [
+            rank for rank in range(self._world_size) if mapping.get_node_rank(rank) == node
+        ]
         self._command = command
         self._rank_0_in_session = rank_0_in_session
         self._environ = {
@@ -168,9 +139,7 @@ class NodeSupervisor:
             if not name.startswith(membership.LAUNCHER_ENV_PREFIXES)
         }
         self._relaunch_command = relaunch_command
-        self._end_job_command = end_job_command
-        self._connect_timeout_s = connect_timeout_s
-        self._stop_grace_s = stop_grace_s
+        self._end_job_through_launcher = end_job
         self._parent = os.getppid()
         self._parent_ended = False
         self._selector = selectors.DefaultSelector()
@@ -185,10 +154,10 @@ class NodeSupervisor:
         self._connect_due_s = 0.0
         self._wake_at_s: List[float] = []  # when the next step is due without an event
         self._processes: Dict[int, _Process] = {}
-        self._replacements = _Backoff(min_backoff_s, max_backoff_s)  # per rank
+        self._replacements = _Backoff()  # per rank
         self._given_up: Set[int] = set()  # ranks this supervisor starts no replacement of
         self._relaunched: Dict[int, subprocess.Popen] = {}
-        self._relaunches = _Backoff(min_backoff_s, max_backoff_s)  # per node
+        self._relaunches = _Backoff()  # per node
         self._host_weights_prefix: Optional[str] = None
         self._first_failure: Optional[int] = None
         self._signum: Optional[int] = None
@@ -365,24 +334,19 @@ class NodeSupervisor:
         return None
 
     def _end_job(self, reason: str) -> None:
-        """End the whole job through its launcher, if this supervisor has one (``end_job_command``): the deployment
-        ends with rank 0, and no authority may be left to end the other nodes' ranks."""
-        if self._end_job_command is None:
+        """End the whole job as failed through ``end_job``, if any: no authority may be left to end the other nodes'
+        ranks."""
+        if self._end_job_through_launcher is None:
             return
         self._logger.error(f"{reason}: ending the job")
         try:
-            subprocess.run(  # nosec B603
-                self._end_job_command,
-                env=self._environ,
-                stdin=subprocess.DEVNULL,
-                timeout=self._stop_grace_s,
-                check=True,
-            )
+            self._end_job_through_launcher(self._environ, _STOP_GRACE_S)
         except (OSError, subprocess.SubprocessError) as error:
             self._logger.error(f"cannot end the job: {error!r}")
 
     def _start(self, rank: int, incarnation: int) -> None:
-        environ = {**self._environ, self._rank_env: f"{rank},{self._world_size},{incarnation}"}
+        identity = f"{rank},{self._world_size},{self._gpus_per_node},{incarnation}"
+        environ = {**self._environ, self._rank_env: identity}
         child = subprocess.Popen(  # nosec B603
             self._command,
             env=environ,
@@ -395,8 +359,8 @@ class NodeSupervisor:
         self._processes[rank] = _Process(child, incarnation, pidfd)
 
     def _replace(self, rank: int, process: Optional[_Process], now_s: float) -> None:
-        """Start a replacement of ``rank``, whose ``process`` ended (None: this supervisor ran none, as one started
-        again after its node was lost, and replaces the rank's last claimed incarnation)."""
+        """Start a replacement of ``rank``, whose ``process`` ended (None: a supervisor started again after its node
+        was lost replaces the rank's last claimed incarnation)."""
         membership = self._membership
         try:
             failed = (
@@ -414,25 +378,10 @@ class NodeSupervisor:
                 return
             self._logger.warning(f"starting replacement {incarnation} of rank {rank}")
             self._start(rank, incarnation)
-            self._publish(rank, incarnation, "starting")
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             self._logger.error(f"cannot start a replacement of rank {rank}: {error!r}")
             self._replacements.delay(rank, now_s)
             self._wake_at_s.append(self._replacements.due_s(rank))
-
-    def _publish(
-        self, rank: int, incarnation: int, state: str, exit_status: Optional[int] = None
-    ) -> None:
-        """Publish how replacing ``rank`` goes, for the server's status."""
-        replacement = self._membership.ReplacementState(
-            incarnation=incarnation, state=state, exit_status=exit_status
-        )
-        try:
-            self._store.set(
-                self._membership.replacement_key(rank), replacement.model_dump_json().encode()
-            )
-        except (OSError, RuntimeError) as error:  # torch's store errors are RuntimeErrors
-            self._logger.warning(f"cannot publish {replacement!r} of rank {rank}: {error!r}")
 
     def _reap(self, rank: int, now_s: float) -> None:
         """Take the status of ``rank``'s process, which ended."""
@@ -454,18 +403,15 @@ class NodeSupervisor:
                 f"replacement {process.incarnation} of rank {rank} cannot start, nor could another one"
             )
             self._given_up.add(rank)
-            self._publish(rank, process.incarnation, "cannot_start", process.status)
             return
         self._replacements.delay(rank, now_s)
-        self._publish(rank, process.incarnation, "retrying", process.status)
 
     def _connect(self) -> None:
-        """Connect to the authority if its store answers at the rendezvous address within ``connect_timeout_s``, and
-        take the view it sends."""
-        self._connect_due_s = time.monotonic() + self._connect_timeout_s
+        """Connect to the authority if it answers within ``_CONNECT_TIMEOUT_S``, and take the view it sends."""
+        self._connect_due_s = time.monotonic() + _CONNECT_TIMEOUT_S
         membership = self._membership
         address = os.environ[membership.RENDEZVOUS_ENV]
-        deadline_s = time.monotonic() + self._connect_timeout_s
+        deadline_s = time.monotonic() + _CONNECT_TIMEOUT_S
 
         def left_s() -> float:
             return max(0.001, deadline_s - time.monotonic())
@@ -475,8 +421,6 @@ class NodeSupervisor:
             store = membership.open_store(
                 address, bytes.fromhex(os.environ[membership.JOIN_SECRET_ENV]), left_s()
             )
-            if not store.wait([membership.LIVENESS_KEY], left_s()):
-                return
             connection = membership.open_node_supervisor_connection(
                 store, self._node, self._ranks, socket.gethostname(), left_s()
             )
@@ -555,8 +499,7 @@ class NodeSupervisor:
                 self._host_weights_prefix = prefix.decode()
 
     def _relaunch_lost_nodes(self, now_s: float) -> None:
-        """Node 0: relaunch the supervisor of every node whose supervisor left, unless one it relaunched still runs;
-        again, after a backoff, while relaunched ones end without connecting."""
+        """Node 0: relaunch the supervisor of every node whose supervisor left, unless one it relaunched still runs."""
         for node, host, connected in self._view.nodes:
             relaunched = self._relaunched.get(node)
             if connected:
@@ -602,9 +545,8 @@ class NodeSupervisor:
 
     def _stop(self, status: int, terminate: bool = True, forward: Optional[int] = None) -> int:
         """End: unlink the node's host weights, send ``forward`` (a signal this supervisor received) to rank 0's
-        process, and SIGTERM to the other processes it started at once (``terminate``) or, as to every process left,
-        once ``stop_grace_s`` passed; returns ``status`` once they ended or another ``stop_grace_s`` passed (the
-        ranks left then die with this process)."""
+        process, SIGTERM to the processes it started at once (``terminate``) or after ``_STOP_GRACE_S``, and return
+        ``status`` once they ended or another ``_STOP_GRACE_S`` passed (those left die with this process)."""
         self._unlink_host_weights()
         rank_0 = self._processes.get(0)
         if forward is not None and rank_0 is not None and rank_0.status is None:
@@ -621,15 +563,14 @@ class NodeSupervisor:
         return status
 
     def _wait_for(self, processes: List[subprocess.Popen]) -> None:
-        """Wait until ``processes`` ended, at most ``stop_grace_s``."""
-        deadline_s = time.monotonic() + self._stop_grace_s
+        """Wait until ``processes`` ended, at most ``_STOP_GRACE_S``."""
+        deadline_s = time.monotonic() + _STOP_GRACE_S
         for process in processes:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(max(0.0, deadline_s - time.monotonic()))
 
     def _unlink_host_weights(self) -> None:
-        """Unlink the node's shared-memory segments of host weights, which outlive their processes while the
-        deployment serves."""
+        """Unlink the node's shared-memory segments of host weights."""
         if self._host_weights_prefix is None and self._store is not None:
             self._read_host_weights_prefix()
         if self._host_weights_prefix is None:
@@ -652,13 +593,41 @@ def _local_gpu_count(environ: Dict[str, str]) -> int:
     return len(glob.glob("/dev/nvidia[0-9]*"))
 
 
-def _prrte_commands(
+def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: float) -> None:
+    """End the job of the PRRTE at the PMIx server URI ``uri`` as failed: SIGTERM to its ``mpirun``, whose PID ends
+    the URI's namespace (``prterun-<host>-<PID>@...``), which then ends every process of the job and exits with
+    status 1. Where that PID is no ``mpirun`` of this host, ``pterm`` ends the job instead (with ``environ``, within
+    ``timeout_s``), and ``mpirun`` exits with status 0."""
+    pid = uri.split("@", 1)[0].rsplit("-", 1)[-1]
+    try:
+        with open(f"/proc/{int(pid)}/comm") as comm:
+            launcher = comm.read().strip()
+    except (OSError, ValueError):
+        launcher = None
+    if launcher in ("prterun", "mpirun"):
+        os.kill(int(pid), signal.SIGTERM)
+        return
+    from tensorrt_llm.logger import logger
+
+    logger.error(
+        f"the PMIx server URI {uri!r} names no mpirun of this host: ending the job with pterm, after which "
+        "mpirun exits with status 0"
+    )
+    subprocess.run(  # nosec B603
+        [pterm, "--dvm-uri", uri],
+        env=environ,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout_s,
+        check=True,
+    )
+
+
+def _prrte_job_control(
     environ: Dict[str, str],
-) -> Tuple[Optional[List[str]], Optional[List[str]]]:
-    """Under ``mpirun`` (Open MPI's PRRTE), how node 0's supervisor acts on the job through the PRRTE that started
-    this process: the command that starts a process on a host of the job (``prun``, a new job of one process; the
-    host and the process's command come after it), and the one that ends the whole job (``pterm``). None for each
-    under another launcher."""
+) -> Tuple[Optional[List[str]], Optional[Callable[[Dict[str, str], float], None]]]:
+    """Under ``mpirun``, the job's PRRTE command that starts a process on a host of the job (``prun``; the host and
+    the command come after it) and the function that ends the whole job as failed (:func:`_end_prrte_job`); None for
+    each under another launcher."""
     if "OMPI_COMM_WORLD_RANK" not in environ:
         return None, None
     uri = next((environ[name] for name in _PMIX_SERVER_URI_VARS if environ.get(name)), None)
@@ -683,7 +652,7 @@ def _prrte_commands(
         "--bind-to",
         "none",
     ]
-    return relaunch_command, [pterm, "--dvm-uri", uri]
+    return relaunch_command, functools.partial(_end_prrte_job, uri, pterm)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -736,9 +705,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.environ.update(
         TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""
     )
-    relaunch_command, end_job_command = (
-        _prrte_commands(environ) if args.node_rank == 0 else (None, None)
-    )
+    relaunch_command, end_job = _prrte_job_control(environ) if args.node_rank == 0 else (None, None)
     supervisor = NodeSupervisor(
         args.node_rank,
         args.nodes,
@@ -747,7 +714,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         environ,
         rank_0_in_session=args.rank_0_in_session,
         relaunch_command=relaunch_command,
-        end_job_command=end_job_command,
+        end_job=end_job,
     )
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, supervisor.on_signal)

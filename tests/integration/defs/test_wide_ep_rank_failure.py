@@ -1454,7 +1454,9 @@ class Run:
         if rejoined_status is not None:
             admission = rejoined_status["last_transaction"]
             # The commit was read within STORE_POLL_S; the authority measures the transaction itself.
-            t_admission = t_rejoined - admission["duration_s"]
+            t_admission = (
+                t_rejoined - (admission["ended_unix_ms"] - admission["began_unix_ms"]) / 1e3
+            )
             self.event(f"cycle {index}: admission began", t_admission)
             self.event(f"cycle {index}: back to N ranks", t_rejoined)
         degraded_end = (time.monotonic() if t_admission is None else t_admission) - 1.0
@@ -2197,7 +2199,8 @@ def test_every_rank_serves_as_its_own_process(launch: str, request, tmp_path: Pa
     assert sorted(workers) == list(range(deployment.world_size))
     for rank, process in workers.items():
         environ = process.environ()
-        assert environ[FAULT_TOLERANCE_RANK_ENV] == f"{rank},{deployment.world_size},0"
+        given_rank, world_size, _, incarnation = environ[FAULT_TOLERANCE_RANK_ENV].split(",")
+        assert (given_rank, world_size, incarnation) == (str(rank), str(deployment.world_size), "0")
         if rank != 0:
             assert not any(name in environ for name in RANK_ENV)
     with Run(deployment, tmp_path, f"independent_ranks_{launch}"):

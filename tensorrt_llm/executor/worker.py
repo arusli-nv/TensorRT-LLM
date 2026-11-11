@@ -402,7 +402,7 @@ def worker_main(
         from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
             join_startup_group, start_worker)
         start_worker(worker_main_args)
-        join_startup_group()
+        join_startup_group(llm_args.parallel_config.to_mapping())
     elif FAULT_TOLERANCE_RANK_ENV in os.environ:
         raise ValueError(
             "The launcher started this rank as its own process for WideEP "

@@ -23,6 +23,13 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlRows
+from tensorrt_llm._torch.distributed.mnnvl_live_group import (
+    LiveGroupComm,
+    MnnvlMappingError,
+    MnnvlPeerHandleError,
+    isolated_gather,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -177,7 +184,7 @@ def test_a_replacement_maps_only_its_own_row_until_its_admission_maps_every_live
     monkeypatch.setattr(
         _RemapMemory, "get_allocation_granularity", classmethod(lambda cls, dev_id: _SIZE)
     )
-    group = mnnvl.LiveGroupComm((0, 1, 2, 3), 2, mnnvl.isolated_gather(2, 4))
+    group = LiveGroupComm((0, 1, 2, 3), 2, isolated_gather(2, 4))
     monkeypatch.setattr(_RemapMemory, "get_comm", classmethod(lambda cls, mapping: group))
     memory = _RemapMemory(Mapping(world_size=4, rank=2, tp_size=4, moe_ep_size=4), _SIZE)
     try:
@@ -271,7 +278,7 @@ def test_an_admission_refuses_a_row_whose_rank_left(memory, driver):
 def test_a_failed_admission_releases_the_kept_pages_too(memory, driver):
     """A peer may have imported rank 1's pages before the admission failed elsewhere: rank 1 releases every page
     it mapped, its own included, so that the next change remaps."""
-    with pytest.raises(mnnvl.MnnvlMappingError, match="rank 3: RuntimeError"):
+    with pytest.raises(MnnvlMappingError, match="rank 3: RuntimeError"):
         memory.admit(_gather_outcomes({3: ("RuntimeError: map failed", [])}, absent=set()))
     assert driver.mapped == {} and not memory.mapped and memory.holders is None
     assert sorted(driver.released) == sorted(("old", rank) for rank in range(4))
@@ -330,7 +337,7 @@ def test_an_admission_maps_a_joining_rank_s_row_where_scratch_was(rows_driver):
     """Rank 1 of 4 started with ranks 2 and 3 absent, their rows on scratch, which no other process maps. Rank 2
     joins: rank 1 keeps its own and rank 0's rows, imports rank 2's in place of scratch, and maps rank 3's, still
     absent, on scratch again."""
-    rows = mnnvl.MnnvlRows(1, 4, _SIZE, _gather_without({2, 3}))
+    rows = MnnvlRows(1, 4, _SIZE, _gather_without({2, 3}))
     assert rows.holders == {0, 1}
     kept = [rows_driver.mapped[rows.row(rank)] for rank in (0, 1)]
     scratch = rows_driver.mapped[rows.row(2)]
@@ -372,7 +379,7 @@ def test_a_peer_s_failed_mapping_unmaps_this_rank_too(memory, driver):
     with pytest.raises(RuntimeError, match="rank 3: RuntimeError") as raised:
         memory.remap(_gather_outcomes({3: ("RuntimeError: map failed", [])}, absent={2}))
     # It names the rank that failed, which alone reports the failure in a membership change.
-    assert isinstance(raised.value, mnnvl.MnnvlMappingError) and raised.value.ranks == (3,)
+    assert isinstance(raised.value, MnnvlMappingError) and raised.value.ranks == (3,)
     assert driver.mapped == {} and not memory.mapped
     # The fresh local handle and the imported ones were released.
     assert len(driver.released) == 3
@@ -389,7 +396,7 @@ def test_this_rank_s_failed_import_is_reported_to_the_others(memory, driver):
         reported.append(value)
         return [None if rank == 2 else value for rank in range(4)]
 
-    with pytest.raises(mnnvl.MnnvlPeerHandleError, match="rank 1: MnnvlPeerHandleError") as raised:
+    with pytest.raises(MnnvlPeerHandleError, match="rank 1: MnnvlPeerHandleError") as raised:
         memory.remap(gather)
     # Rank 1 failed on the first peer it imports, global rank 0; the CUDA result reaches every live rank.
     assert reported[-1][1] == [0] and raised.value.ranks == (0,)
@@ -411,7 +418,7 @@ def test_only_the_rank_whose_export_failed_is_named(memory, driver):
         theirs = ("MnnvlMappingError: rank 3: RuntimeError: 2", [])
         return [None if rank == 2 else theirs if rank == 3 else value for rank in range(4)]
 
-    with pytest.raises(mnnvl.MnnvlMappingError, match="rank 3: MnnvlMappingError") as raised:
+    with pytest.raises(MnnvlMappingError, match="rank 3: MnnvlMappingError") as raised:
         memory.remap(gather)
     assert raised.value.ranks == (3,) and reported[-1] == ()
     assert driver.mapped == {} and not memory.mapped
@@ -451,7 +458,7 @@ def test_a_peer_s_failed_import_raises_the_lost_global_rank_on_every_live_rank(m
         failure = ("MnnvlPeerHandleError: Cannot import", [7])
         return [{4: failure, 5: value}.get(rank) for rank in range(8)]
 
-    with pytest.raises(mnnvl.MnnvlPeerHandleError, match="rank 4: MnnvlPeerHandleError") as raised:
+    with pytest.raises(MnnvlPeerHandleError, match="rank 4: MnnvlPeerHandleError") as raised:
         memory.remap(gather)
     assert calls[-1] == () and raised.value.ranks == (7,)
     assert driver.mapped == {} and not memory.mapped
@@ -508,10 +515,10 @@ def test_a_failed_cleanup_keeps_the_remap_s_error_and_breaks_the_allocation(
 
 @pytest.fixture
 def rows_driver(driver, monkeypatch):
-    monkeypatch.setattr(mnnvl.MnnvlRows, "allocation_granularity", _SIZE)
+    monkeypatch.setattr(MnnvlRows, "allocation_granularity", _SIZE)
     yield driver
-    mnnvl.MnnvlRows.allocated_map.clear()
-    mnnvl.MnnvlRows.address_refcnt.clear()
+    MnnvlRows.allocated_map.clear()
+    MnnvlRows.address_refcnt.clear()
 
 
 def _exchange_once(live, size=4):
@@ -530,7 +537,7 @@ def test_mnnvl_rows_sit_back_to_back_with_absent_rows_on_one_scratch_allocation(
     allocation, after one exchange of handles and one once the rank's row is zeroed; closing releases every
     allocation once and frees the range."""
     allgather, calls = _exchange_once(live={0, 1})
-    rows = mnnvl.MnnvlRows(1, 4, _SIZE - 100, allgather)
+    rows = MnnvlRows(1, 4, _SIZE - 100, allgather)
 
     assert len(calls) == 2 and calls[1] == ()
     assert rows.stride == _SIZE and rows.row(3) == rows.ptr + 3 * _SIZE
@@ -542,7 +549,7 @@ def test_mnnvl_rows_sit_back_to_back_with_absent_rows_on_one_scratch_allocation(
     rows.close()
     assert rows_driver.mapped == {} and rows_driver.reserved == []
     assert sorted(rows_driver.released) == sorted(handles[:3])
-    assert mnnvl.MnnvlRows.allocated_map == {}
+    assert MnnvlRows.allocated_map == {}
 
 
 def test_a_membership_change_remaps_mnnvl_rows_at_the_same_addresses(rows_driver, monkeypatch):
@@ -563,7 +570,7 @@ def test_a_membership_change_remaps_mnnvl_rows_at_the_same_addresses(rows_driver
 
         return gather
 
-    rows = mnnvl.MnnvlRows(1, 4, _SIZE, gather_among({0, 1, 2, 3}))
+    rows = MnnvlRows(1, 4, _SIZE, gather_among({0, 1, 2, 3}))
     ptr = rows.ptr
     for live in ({0, 1, 2}, {0, 1, 2, 3}):
         before = [rows_driver.mapped[rows.row(rank)] for rank in range(4)]
@@ -600,21 +607,21 @@ def test_failed_mnnvl_rows_leave_nothing_mapped_allocated_or_reserved(
 
         monkeypatch.setattr(rows_driver, "cuMemImportFromShareableHandle", import_handle)
         expected = pytest.raises(
-            mnnvl.MnnvlPeerHandleError, match=r"ranks \[3\]\ncuMemImportFromShareableHandle: 2"
+            MnnvlPeerHandleError, match=r"ranks \[3\]\ncuMemImportFromShareableHandle: 2"
         )
     else:
         monkeypatch.setattr(rows_driver, "cuMemsetD8", lambda address, value, size: 2)
         expected = pytest.raises(RuntimeError)
 
     with expected:
-        mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
+        MnnvlRows(1, 4, _SIZE, allgather)
 
     assert rows_driver.mapped == {} and rows_driver.reserved == []
     created = 2  # this rank's row and the scratch row of rank 2
     imported = 1 if failure == "import" else 2
     released = rows_driver.released
     assert len(released) == len({id(handle) for handle in released}) == created + imported
-    assert mnnvl.MnnvlRows.allocated_map == {} and mnnvl.MnnvlRows.address_refcnt == {}
+    assert MnnvlRows.allocated_map == {} and MnnvlRows.address_refcnt == {}
     assert len(calls) == 2 and calls[1] is not None
 
 
@@ -630,12 +637,12 @@ def test_mnnvl_rows_fail_on_every_live_rank_when_one_fails(rows_driver):
         failed = ("MnnvlPeerHandleError: rank 3's handle", [3])
         return [failed if rank == 0 else payload if rank in (1, 3) else None for rank in range(4)]
 
-    with pytest.raises(mnnvl.MnnvlPeerHandleError, match="rank 0: MnnvlPeerHandleError") as error:
-        mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
+    with pytest.raises(MnnvlPeerHandleError, match="rank 0: MnnvlPeerHandleError") as error:
+        MnnvlRows(1, 4, _SIZE, allgather)
 
     assert error.value.ranks == (3,)
     assert rows_driver.mapped == {} and rows_driver.reserved == []
-    assert mnnvl.MnnvlRows.allocated_map == {} and mnnvl.MnnvlRows.address_refcnt == {}
+    assert MnnvlRows.allocated_map == {} and MnnvlRows.address_refcnt == {}
 
 
 def test_mnnvl_rows_name_only_the_rank_whose_export_failed(rows_driver):
@@ -651,12 +658,12 @@ def test_mnnvl_rows_name_only_the_rank_whose_export_failed(rows_driver):
         theirs = ("MnnvlMappingError: rank 0: RuntimeError: 2", [])
         return [theirs if rank == 0 else payload if rank == 1 else None for rank in range(4)]
 
-    with pytest.raises(mnnvl.MnnvlMappingError, match="rank 0: MnnvlMappingError") as error:
-        mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
+    with pytest.raises(MnnvlMappingError, match="rank 0: MnnvlMappingError") as error:
+        MnnvlRows(1, 4, _SIZE, allgather)
 
     assert error.value.ranks == (0,) and calls[-1] == ()
     assert rows_driver.mapped == {} and rows_driver.reserved == []
-    assert mnnvl.MnnvlRows.allocated_map == {} and mnnvl.MnnvlRows.address_refcnt == {}
+    assert MnnvlRows.allocated_map == {} and MnnvlRows.address_refcnt == {}
 
 
 def test_collecting_failed_mnnvl_rows_leaves_a_retry_at_the_same_address_open(
@@ -675,17 +682,17 @@ def test_collecting_failed_mnnvl_rows_leaves_a_retry_at_the_same_address_open(
     allgather, _ = _exchange_once(live={0, 1})
     rows_driver.fail_import = True
     try:
-        mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
-    except mnnvl.MnnvlPeerHandleError:
+        MnnvlRows(1, 4, _SIZE, allgather)
+    except MnnvlPeerHandleError:
         # The error's traceback keeps the failed object alive during the retry.
         rows_driver.fail_import = False
-        rows = mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
+        rows = MnnvlRows(1, 4, _SIZE, allgather)
     else:
         pytest.fail("MnnvlRows did not raise for a handle it could not import")
     assert rows.ptr == base
     gc.collect()
 
-    assert base in mnnvl.MnnvlRows.allocated_map
+    assert base in MnnvlRows.allocated_map
     assert all(rows.row(rank) in rows_driver.mapped for rank in range(4))
     rows.close()
     assert rows_driver.mapped == {} and rows_driver.reserved == []
@@ -695,7 +702,7 @@ def test_a_failed_release_of_the_scratch_allocation_is_not_repeated(rows_driver,
     """Absent ranks 2 and 3 share one scratch allocation: when releasing it fails, closing unmaps every row,
     reports the failure and does not release the scratch allocation again for the second absent row."""
     allgather, _ = _exchange_once(live={0, 1})
-    rows = mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
+    rows = MnnvlRows(1, 4, _SIZE, allgather)
     scratch = rows_driver.mapped[rows.row(2)]
     attempts = []
 
@@ -722,5 +729,5 @@ def test_mnnvl_rows_refuse_a_device_without_fabric_handles(rows_driver, monkeypa
     )
     allgather, calls = _exchange_once(live={0, 1})
     with pytest.raises(RuntimeError, match="requires fabric memory handles"):
-        mnnvl.MnnvlRows(1, 4, _SIZE, allgather)
+        MnnvlRows(1, 4, _SIZE, allgather)
     assert calls == [] and rows_driver.reserved == []

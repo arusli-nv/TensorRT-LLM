@@ -351,24 +351,29 @@ class ExecutorRequestQueue:
             List of RequestQueueItem fetched from the queue.
         """
         items = []
+        woken = False
         timeout_secs = timeout.total_seconds() if timeout is not None else None
 
         try:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
                 # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
+                queue_item = self.request_queue.get(timeout=timeout_secs)
+                if queue_item.id == WAKE_REQUEST_ID:
+                    woken = True
+                else:
+                    items.append(queue_item)
             else:
                 # if not empty or don't want to wait, just return all items in queue
                 while True:
                     queue_item = self.request_queue.get_nowait()
-                    items.append(queue_item)
+                    if queue_item.id == WAKE_REQUEST_ID:
+                        woken = True
+                    else:
+                        items.append(queue_item)
         except queue.Empty:
             pass
 
-        woken = any(item.id == WAKE_REQUEST_ID for item in items)
-        if woken:
-            items = [item for item in items if item.id != WAKE_REQUEST_ID]
         if not wait_for_batch or self.batch_wait_timeout_ms == 0 or woken:
             return items
 

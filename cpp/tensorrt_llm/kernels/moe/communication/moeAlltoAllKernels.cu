@@ -304,7 +304,7 @@ __device__ __forceinline__ void record_wait_evidence(MoeA2AAbortState* abort, in
 
 // Abort polling shared, in shared memory, by the threads of a block that wait on peers: one waiting thread per
 // kAbortPollCycles period reads the host abort record and publishes what it saw here, where the other waiting
-// threads read it. Concurrent host reads from every waiting thread would slow down healthy waits.
+// threads read it, rather than every waiting thread reading the host record.
 struct AbortPoll
 {
     unsigned long long next_poll; // clock64() value from which the next read of the host record is due
@@ -312,8 +312,8 @@ struct AbortPoll
 };
 
 // The block's AbortPoll, set up by lane 0 of the one warp of the block that waits on peers before it starts waiting:
-// the first read of the host record is due once the waits have lasted kAbortPollCycles. nullptr without
-// ENABLE_RANK_MASK, whose waits do not honour an abort.
+// the first read of the host record is due at once, since a wait polls only once it has lasted kAbortPollCycles.
+// nullptr without ENABLE_RANK_MASK, whose waits do not honour an abort.
 template <bool ENABLE_RANK_MASK>
 __device__ __forceinline__ AbortPoll* start_abort_poll(int lane_id)
 {
@@ -322,7 +322,7 @@ __device__ __forceinline__ AbortPoll* start_abort_poll(int lane_id)
         __shared__ AbortPoll poll;
         if (lane_id == 0)
         {
-            poll.next_poll = static_cast<unsigned long long>(clock64()) + kAbortPollCycles;
+            poll.next_poll = 0;
             poll.requested = 0;
         }
         __syncwarp();
@@ -352,14 +352,15 @@ __device__ __forceinline__ bool abort_requested(MoeA2AAbortState* abort, AbortPo
     return true;
 }
 
-// Wait until a peer's round flag reaches `expected`. Returns false if the host requested an abort through `abort`,
-// which the waiting threads of a block poll through `poll` (see AbortPoll); traps on timeout. With `abort`, a wait
-// that lasts kWaitEvidenceCycles is published as wait evidence until it ends.
+// Wait until a peer's round flag reaches `expected`; traps on timeout. With HONOUR_ABORT, returns false if the host
+// requested an abort through `abort`, which the waiting threads of a block poll through `poll` (see AbortPoll), and a
+// wait that lasts kWaitEvidenceCycles is published as wait evidence until it ends. Every wait first spins on the flag
+// alone, for kAbortPollCycles with HONOUR_ABORT: a healthy wait ends within it and checks nothing else.
+template <bool HONOUR_ABORT>
 __device__ __forceinline__ bool wait_round_flag(uint32_t const* address, uint32_t expected, int64_t timeout_cycles,
     MoeA2AAbortState* abort, AbortPoll* poll, int rank_id, int peer_rank, char const* phase)
 {
     auto const start = clock64();
-    bool evidence = false;
     uint32_t observed;
     do
     {
@@ -370,29 +371,46 @@ __device__ __forceinline__ bool wait_round_flag(uint32_t const* address, uint32_
 #endif
         if (observed == expected)
         {
-            if (evidence)
-            {
-                record_wait_evidence(abort, peer_rank, 0);
-            }
             return true;
         }
-        if (abort != nullptr)
+    } while (HONOUR_ABORT ? clock64() - start < kAbortPollCycles : !check_timeout(start, timeout_cycles));
+
+    if constexpr (HONOUR_ABORT)
+    {
+        bool evidence = false;
+        do
         {
-            if (!evidence && clock64() - start >= kWaitEvidenceCycles)
-            {
-                record_wait_evidence(abort, peer_rank, expected);
-                evidence = true;
-            }
-            if (abort_requested(abort, poll))
+            asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(observed) : "l"(address) : "memory");
+#if ENABLE_DEBUG_PRINT
+            printf("%s: rank %d waiting for rank %d flag=%u expected=%u address=%p\n", phase, rank_id, peer_rank,
+                observed, expected, address);
+#endif
+            if (observed == expected)
             {
                 if (evidence)
                 {
                     record_wait_evidence(abort, peer_rank, 0);
                 }
-                return false;
+                return true;
             }
-        }
-    } while (!check_timeout(start, timeout_cycles));
+            if (abort != nullptr)
+            {
+                if (!evidence && clock64() - start >= kWaitEvidenceCycles)
+                {
+                    record_wait_evidence(abort, peer_rank, expected);
+                    evidence = true;
+                }
+                if (abort_requested(abort, poll))
+                {
+                    if (evidence)
+                    {
+                        record_wait_evidence(abort, peer_rank, 0);
+                    }
+                    return false;
+                }
+            }
+        } while (!check_timeout(start, timeout_cycles));
+    }
 
     printf("%s: rank %d timed out waiting for rank %d flag=%u expected=%u\n", phase, rank_id, peer_rank, observed,
         expected);
@@ -794,8 +812,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         continue;
                     }
                 }
-                if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
-                        ENABLE_RANK_MASK ? ptrs.abort : nullptr, abort_poll, rank_id, peer_rank, "dispatch"))
+                if (!wait_round_flag<ENABLE_RANK_MASK>(&ptrs.completion_flags[rank_id][peer_rank], expected_value,
+                        ptrs.timeout_cycles, ptrs.abort, abort_poll, rank_id, peer_rank, "dispatch"))
                 {
                     if constexpr (ENABLE_RANK_MASK)
                     {
@@ -1904,8 +1922,8 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
                 if (!is_rank_active_in_words(rank_mask, peer_rank))
                     continue;
             }
-            if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
-                    ENABLE_RANK_MASK ? ptrs.abort : nullptr, abort_poll, rank_id, peer_rank, "combine"))
+            if (!wait_round_flag<ENABLE_RANK_MASK>(&ptrs.completion_flags[rank_id][peer_rank], expected_value,
+                    ptrs.timeout_cycles, ptrs.abort, abort_poll, rank_id, peer_rank, "combine"))
             {
                 if constexpr (ENABLE_RANK_MASK)
                 {
@@ -2165,7 +2183,7 @@ __global__ void moeA2ACombineKernel_Cft(const CombineKernelPointers ptrs, int ma
                 if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
                     continue;
             }
-            if (!wait_round_flag(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
+            if (!wait_round_flag<false>(&ptrs.completion_flags[rank_id][peer_rank], expected_value, ptrs.timeout_cycles,
                     nullptr, nullptr, rank_id, peer_rank, "combine(cft)"))
             {
                 return;

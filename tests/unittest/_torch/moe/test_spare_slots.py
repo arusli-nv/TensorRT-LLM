@@ -24,19 +24,22 @@ from tensorrt_llm._torch.distributed.membership import (
     MembershipState,
     ReplacementCannotStart,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    HostMoeTensorSharer,
-    MoeLoadBalancer,
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
+    DeploymentHostCopies,
+    EplbExpertRestore,
     host_copies_key,
     plan_layer_placement,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
 from tensorrt_llm._utils import FAULT_TOLERANCE_RANK_ENV
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
+_ER = "tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore"
 _USES_GDRCOPY = "tensorrt_llm.bindings.internal.runtime.host_accessible_device_memory_uses_gdrcopy"
 WORLD_SIZE = 4
 EXPERTS = 4
@@ -54,14 +57,14 @@ def _load_balancer(
     """A MoeLoadBalancer with WideEP fault tolerance over one native layer of ``eplb_slots`` per rank, whose
     largest failure takes ``largest_failure`` ranks."""
     monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: True)
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 0, 1, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     monkeypatch.setattr(
-        MoeLoadBalancer, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
+        EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
     )
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(_USES_GDRCOPY, return_value=True),
-        patch(f"{_MLB}.HostMoeTensorSharer"),
+        patch(f"{_ER}.DeploymentHostCopies"),
         patch("torch.cuda.Event"),
     ):
         load_balancer = MoeLoadBalancer(ep_rank, WORLD_SIZE, layer_updates_per_iter)
@@ -86,9 +89,9 @@ def test_online_eplb_spare_slots_without_gdrcopy_are_refused_at_startup(
     takes another form (GPU memory is a NUMA node, or GDRCopy is missing), the load balancer is refused when it is
     created, before any weight is allocated."""
     monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: True)
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 0, 1, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     monkeypatch.setattr(
-        MoeLoadBalancer, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
+        EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
     )
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
@@ -99,7 +102,7 @@ def test_online_eplb_spare_slots_without_gdrcopy_are_refused_at_startup(
 
 
 def test_the_largest_failure_is_a_node_other_than_rank_0_s_or_one_rank():
-    largest = MoeLoadBalancer._largest_failure_size
+    largest = EplbExpertRestore._largest_failure_size
     assert largest([0] * 4 + [1] * 4) == 4
     assert largest([0, 1, 0, 1, 2, 2, 2]) == 3
     # One node: one rank other than rank 0.
@@ -109,9 +112,11 @@ def test_the_largest_failure_is_a_node_other_than_rank_0_s_or_one_rank():
 
 def test_the_nodes_of_the_ranks_follow_gpus_per_node():
     """No gather over MPI: a replacement rank's MPI world is only itself."""
-    load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
-    load_balancer.ep_size, load_balancer.gpus_per_node = 6, 4
-    assert load_balancer._rank_nodes() == [0, 0, 0, 0, 1, 1]
+    expert_restore = EplbExpertRestore.__new__(EplbExpertRestore)
+    expert_restore.balancer = SimpleNamespace(
+        ep_size=6, mapping=Mapping(world_size=6, tp_size=6, gpus_per_node=4)
+    )
+    assert expert_restore._rank_nodes() == [0, 0, 0, 0, 1, 1]
 
 
 @pytest.mark.parametrize(
@@ -148,7 +153,7 @@ def test_without_rank_failure_recovery_no_spare_slot_is_added(monkeypatch):
     def nodes(self):
         raise AssertionError("placed the ranks on nodes without rank failure recovery")
 
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", nodes)
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", nodes)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer"),
@@ -272,7 +277,7 @@ def test_slots_whose_spare_slots_fill_no_whole_chunk_keep_their_storage(
         ops["migrate_to_host_accessible"].assert_not_called()
         assert registered == [(slot, "alpha", scales[slot].data_ptr()) for slot in range(2)]
     assert layer.spare_slot_bytes_to_back([1]) == 0
-    assert load_balancer.set_spare_slots_backed([[1]], True) == 0
+    assert load_balancer.expert_restore.set_spare_slots_backed([[1]], True) == 0
     ops["moe_unbacked_slots_bytes_to_back"].assert_not_called()
     ops["moe_unbacked_slots_set_backed"].assert_not_called()
 
@@ -350,7 +355,7 @@ def test_online_eplb_without_fault_tolerance_keeps_no_restore_state(monkeypatch)
 
 
 def test_static_routing_without_fault_tolerance_shares_no_host_weights(monkeypatch):
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", Mock(side_effect=AssertionError))
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", Mock(side_effect=AssertionError))
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_MLB}.HostMoeTensorSharer") as sharer,
@@ -388,7 +393,8 @@ def test_the_cpp_load_balancer_keeps_the_only_references_to_the_host_weights(
     views go once it has them."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    sharer = HostMoeTensorSharer(0, 2, MPI.COMM_SELF)
+    sharer_class = DeploymentHostCopies if fault_tolerance else HostMoeTensorSharer
+    sharer = sharer_class(0, 2, MPI.COMM_SELF)
     sharer.set_shared_memory_base_name(f"test_spare_slots_{os.getpid()}")
     for expert_id in range(2):
         sharer.share_host_tensor_with_shape(expert_id, "w", torch.full((4, 64), float(expert_id)))
@@ -490,9 +496,11 @@ def test_deepseek_r1_ep32_static_256_slots_get_two_spare_slots_per_rank(monkeypa
     monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: True)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
-        patch(f"{_MLB}.HostMoeTensorSharer"),
+        patch(f"{_ER}.DeploymentHostCopies"),
     ):
-        load_balancer = MoeLoadBalancer(0, 32, 0, gpus_per_node=4)
+        load_balancer = MoeLoadBalancer(
+            0, 32, 0, mapping=Mapping(world_size=32, tp_size=32, gpus_per_node=4)
+        )
         layer = load_balancer.add_layer(256, 8, 8)
     load_balancer.load_balancer_impl.add_layer.assert_called_once_with(256, 8, 10)
     assert (layer.slot_count_per_rank, layer.spare_slot_count) == (10, 2)
@@ -582,7 +590,9 @@ def test_every_live_rank_plans_the_same_restore_from_the_agreed_placement(monkey
         2: _placement([1, 0, -1, -1], [3, 2, -1, -1], [2, 0, -1, -1], [3, 2, -1, -1]),
     }
     plans = [
-        _online_balancer(monkeypatch, view, ep_rank)[0].plan_expert_restore(live, [_ONLINE])
+        _online_balancer(monkeypatch, view, ep_rank)[0].expert_restore.plan_expert_restore(
+            live, [_ONLINE]
+        )
         for ep_rank, view in views.items()
     ]
     for plan in plans:
@@ -591,7 +601,7 @@ def test_every_live_rank_plans_the_same_restore_from_the_agreed_placement(monkey
     assert plans[0].digest == plans[1].digest
     # Rank 0 backs one 4 MiB slot, rank 2 none.
     assert [plan.device_bytes for plan in plans] == [4 << 20, 0]
-    other = _online_balancer(monkeypatch, _ONLINE)[0].plan_expert_restore(
+    other = _online_balancer(monkeypatch, _ONLINE)[0].expert_restore.plan_expert_restore(
         [True, True, False, True], [_ONLINE]
     )
     assert other.digest != plans[0].digest
@@ -604,7 +614,7 @@ def test_the_largest_failure_restore_is_the_most_a_rank_backs_for_a_failure_it_s
     """Nodes [0, 1] and [2, 3]: a failure takes node 1 or rank 1. Losing node 1 loses no expert the other ranks lack;
     losing rank 1 loses expert 3, which goes to rank 0's spare slot (4 MiB). Rank 1 survives only node 1's loss."""
     load_balancer, _ = _online_balancer(monkeypatch, _ONLINE, ep_rank)
-    assert load_balancer.largest_failure_restore_bytes() == restore_bytes
+    assert load_balancer.expert_restore.largest_failure_restore_bytes() == restore_bytes
 
 
 def test_a_joining_rank_plans_the_same_restore_as_the_live_ranks(monkeypatch):
@@ -615,10 +625,15 @@ def test_a_joining_rank_plans_the_same_restore_as_the_live_ranks(monkeypatch):
     agreed = _placement([1, 0, 3, -1], [3, 2, -1, -1], [2, 0, -1, -1], [1, 2, -1, -1])
     live, rejoining = [True] * 4, [False, True, False, False]
     survivor, _ = _online_balancer(monkeypatch, _ONLINE_WITHOUT_1)
-    survivor.live_ranks = (True, False, True, True)  # restored without rank 1 at the failure
+    survivor.expert_restore.live_ranks = (
+        True,
+        False,
+        True,
+        True,
+    )  # restored without rank 1 at the failure
     joining, _ = _online_balancer(monkeypatch, agreed, ep_rank=1)
     plans = [
-        balancer.plan_expert_restore(live, [agreed], rejoining=rejoining)
+        balancer.expert_restore.plan_expert_restore(live, [agreed], rejoining=rejoining)
         for balancer in (survivor, joining)
     ]
     assert plans[0].digest == plans[1].digest
@@ -638,7 +653,9 @@ def test_a_rejoin_under_online_eplb_empties_every_spare_slot(monkeypatch):
     for ep_rank in range(WORLD_SIZE):
         view = agreed if ep_rank == 1 else degraded
         load_balancer, _ = _online_balancer(monkeypatch, view, ep_rank)
-        plans.append(load_balancer.plan_expert_restore(live, [agreed], rejoining=rejoining))
+        plans.append(
+            load_balancer.expert_restore.plan_expert_restore(live, [agreed], rejoining=rejoining)
+        )
     assert len({plan.digest for plan in plans}) == 1
     assert [plan.device_bytes for plan in plans] == [0] * WORLD_SIZE
     for plan in plans:
@@ -651,15 +668,17 @@ def test_active_slots_keep_their_experts_until_a_rank_rejoins(monkeypatch, layer
     never moves them from the initial placement), a join returns them to the initial placement."""
     load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
     monkeypatch.setattr(load_balancer, "layer_updates_per_iter", layer_updates_per_iter)
-    failover = load_balancer.plan_expert_restore([True, False, True, True], [_ONLINE])
+    failover = load_balancer.expert_restore.plan_expert_restore(
+        [True, False, True, True], [_ONLINE]
+    )
     np.testing.assert_array_equal(failover.placements[0], _ONLINE_WITHOUT_1)
-    rejoin = load_balancer.plan_expert_restore(
+    rejoin = load_balancer.expert_restore.plan_expert_restore(
         [True] * 4, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
     )
     np.testing.assert_array_equal(rejoin.placements[0], _INITIAL)
     # A rejoining rank that is not live yet (it failed again) changes nothing.
     np.testing.assert_array_equal(
-        load_balancer.plan_expert_restore(
+        load_balancer.expert_restore.plan_expert_restore(
             [True, False, True, True], [_ONLINE], rejoining=[False, True, False, False]
         ).placements[0],
         _ONLINE_WITHOUT_1,
@@ -689,34 +708,34 @@ def test_restore_backs_then_restores_and_the_release_empties_spare_slots_later(m
     monkeypatch.setattr(
         torch.ops.trtllm, "moe_unbacked_slots_set_backed", set_backed, raising=False
     )
-    plan = load_balancer.plan_expert_restore([True, False, True, True], [_ONLINE])
+    plan = load_balancer.expert_restore.plan_expert_restore([True, False, True, True], [_ONLINE])
     times = {}
-    assert load_balancer.restore_lost_experts(plan, times) == 4 << 20
+    assert load_balancer.expert_restore.restore_lost_experts(plan, times) == 4 << 20
     assert events == [("backed", [2], True), ("restore", [1], [_ONLINE_WITHOUT_1.tolist()])]
     assert list(times) == ["back", "load and install"]
     assert backed == {2}
-    assert load_balancer.live_ranks == (True, False, True, True)
+    assert load_balancer.expert_restore.live_ranks == (True, False, True, True)
 
     events.clear()
     impl.get_old_rank_expert_ids.return_value = _ONLINE_WITHOUT_1.tolist()
     # The empty spare slot was never backed.
-    assert load_balancer.release_empty_spare_slots() == 0
+    assert load_balancer.expert_restore.release_empty_spare_slots() == 0
     assert events == [("backed", [3], False)]
 
     events.clear()
-    rejoin = load_balancer.plan_expert_restore(
+    rejoin = load_balancer.expert_restore.plan_expert_restore(
         [True] * 4, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
     )
     assert rejoin.device_bytes == 0
     # Every rank's active slots take their experts of the initial placement; the spare slot keeps its memory.
-    assert load_balancer.restore_lost_experts(rejoin) == 0
+    assert load_balancer.expert_restore.restore_lost_experts(rejoin) == 0
     assert events == [("restore", [], [_INITIAL.tolist()])]
     assert backed == {2}
 
     # Routing no longer reads it: the release maps it to the scratch again.
     events.clear()
     impl.get_old_rank_expert_ids.return_value = _INITIAL.tolist()
-    assert load_balancer.release_empty_spare_slots() == 4 << 20
+    assert load_balancer.expert_restore.release_empty_spare_slots() == 4 << 20
     assert events == [("backed", [2, 3], False)]
     assert backed == set()
 
@@ -730,17 +749,17 @@ def test_a_plan_the_load_balancer_rejects_keeps_the_live_ranks(monkeypatch):
     monkeypatch.setattr(
         torch.ops.trtllm, "moe_unbacked_slots_set_backed", Mock(return_value=0), raising=False
     )
-    plan = load_balancer.plan_expert_restore([True, False, True, True], [_ONLINE])
+    plan = load_balancer.expert_restore.plan_expert_restore([True, False, True, True], [_ONLINE])
     with pytest.raises(RuntimeError, match="expert 3 has no replica"):
-        load_balancer.restore_lost_experts(plan)
-    assert load_balancer.live_ranks == (True,) * 4
+        load_balancer.expert_restore.restore_lost_experts(plan)
+    assert load_balancer.expert_restore.live_ranks == (True,) * 4
 
 
 def test_restore_without_a_change_does_nothing(monkeypatch):
     load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
-    plan = load_balancer.plan_expert_restore([True] * 4, [_ONLINE])
+    plan = load_balancer.expert_restore.plan_expert_restore([True] * 4, [_ONLINE])
     assert plan.device_bytes == 0
-    assert load_balancer.restore_lost_experts(plan) == 0
+    assert load_balancer.expert_restore.restore_lost_experts(plan) == 0
     load_balancer.load_balancer_impl.restore_placement.assert_not_called()
 
 
@@ -761,9 +780,9 @@ def test_spare_slots_take_the_experts_whose_replicas_were_all_lost(monkeypatch):
         lambda tensor, slots: len(slots) * (4 << 20),
         raising=False,
     )
-    placement = load_balancer.plan_expert_restore([True, False, True, False], [initial]).placements[
-        0
-    ]
+    placement = load_balancer.expert_restore.plan_expert_restore(
+        [True, False, True, False], [initial]
+    ).placements[0]
     assert sorted(set(placement[[0, 2]].ravel()) - {-1}) == [0, 1, 2, 3]
 
 
@@ -772,19 +791,21 @@ def test_spare_slots_take_the_experts_whose_replicas_were_all_lost(monkeypatch):
 
 def _replacement(monkeypatch, rank):
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"{rank},8,1")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"{rank},8,4,1")
 
 
 def test_a_replacement_keeps_its_node_layout_without_mpi(monkeypatch):
-    """Its startup group (mpi_comm()) splits by gpus_per_node, with only itself live."""
+    """Its startup group (mpi_comm()) splits by the mapping's gpus_per_node, with only itself live."""
     from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import StartupGroup
 
     _replacement(monkeypatch, 5)
-    world = StartupGroup(_utils.wide_ep_fault_tolerance_rank(), range(8), gpus_per_node=4)
+    mapping = Mapping(world_size=8, rank=5, tp_size=8, gpus_per_node=4)
+    monkeypatch.setattr(rank_failure_recovery, "_mapping", mapping)
+    world = StartupGroup(_utils.wide_ep_fault_tolerance_rank(), range(8))
     monkeypatch.setattr("tensorrt_llm.mpi_comm", lambda: world)
     monkeypatch.setattr("tensorrt_llm.local_mpi_size", lambda: 4)
     load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
-    load_balancer.ep_rank, load_balancer.ep_size, load_balancer.gpus_per_node = 5, 8, 4
+    load_balancer.ep_rank, load_balancer.ep_size, load_balancer.mapping = 5, 8, mapping
     load_balancer._setup_mpi_comm()
     node = load_balancer.shared_mpi_comm
     assert (node.Get_rank(), node.Get_size()) == (1, 4)  # its share of the node's host copies
@@ -806,10 +827,12 @@ def test_a_replacement_tunes_with_the_tuner_layout_of_the_ranks_it_rejoins(
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(_USES_GDRCOPY, return_value=True),
-        patch(f"{_MLB}.HostMoeTensorSharer"),
+        patch(f"{_ER}.DeploymentHostCopies"),
         patch("torch.cuda.Event"),
     ):
-        load_balancer = MoeLoadBalancer(5, 8, 1, gpus_per_node=4)
+        load_balancer = MoeLoadBalancer(
+            5, 8, 1, mapping=Mapping(world_size=8, tp_size=8, gpus_per_node=4)
+        )
         layer = load_balancer.add_layer(16, 2, 2, aux_stream=Mock())
     moe = MoEEplbWeightLayoutMixin()
     moe.layer_load_balancer, moe.num_experts, moe.initial_local_expert_ids = layer, 16, [0, 1]
@@ -840,10 +863,18 @@ def tracked(monkeypatch):
             os.unlink(f"/dev/shm/{name}")
 
 
-def _sharer(rank, value, node_size=1, dtype=torch.float32, shape=(4,), base_name=None):
+def _sharer(
+    rank,
+    value,
+    node_size=1,
+    dtype=torch.float32,
+    shape=(4,),
+    base_name=None,
+    sharer_class=DeploymentHostCopies,
+):
     """The host copies of local ``rank``'s experts (two per rank) of a layer, each filled with ``value`` plus its
-    expert id, under ``base_name`` (default: the test's)."""
-    sharer = HostMoeTensorSharer(
+    expert id, under ``base_name`` (default: the test's), by a ``sharer_class``."""
+    sharer = sharer_class(
         0,
         2 * node_size,
         Mock(Get_rank=Mock(return_value=rank), Get_size=Mock(return_value=node_size)),
@@ -873,7 +904,7 @@ def test_host_copies_are_named_after_their_deployment(monkeypatch, fault_toleran
     same join secret, must not find them, nor its node supervisor unlink them."""
     monkeypatch.setattr(f"{_MLB}.fault_tolerance_mode", lambda: fault_tolerance)
     monkeypatch.delenv("TRTLLM_EPLB_SHM_NAME", raising=False)
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 0, 1, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     names = []
     for _ in range(2):  # two deployments, one after the other: rank 0 draws the nonce
         monkeypatch.setattr(rank_failure_recovery, "_deployment_nonce", None)
@@ -894,10 +925,11 @@ def test_a_rank_s_host_copies_end_with_it_until_the_deployment_serves(
     reattaches them, and the node supervisor unlinks them once the deployment ended."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    sibling = _sharer(1, 10.0, node_size=2)
+    sharer_class = DeploymentHostCopies if fault_tolerance else HostMoeTensorSharer
+    sibling = _sharer(1, 10.0, node_size=2, sharer_class=sharer_class)
     sibling.finalize_layer_weights()
     tracked.clear()  # by the sibling's process
-    sharer = _sharer(0, 0.0, node_size=2)
+    sharer = _sharer(0, 0.0, node_size=2, sharer_class=sharer_class)
     sharer.finalize_layer_weights()
     sharer.finalize_host_tensor_sharing()
     assert {sharer.get_shared_memory_name(rank) for rank in (0, 1)} <= tracked
@@ -915,7 +947,7 @@ def test_a_rank_s_host_copies_end_with_it_until_the_deployment_serves(
 def replacement_of_rank_0(monkeypatch):
     def become():
         monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-        monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,1")
+        monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,4,1")
 
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
@@ -1001,15 +1033,18 @@ def _replacement_of_rank_3(monkeypatch, record):
     from tensorrt_llm._torch.distributed import membership
 
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "3,4,1")
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "3,4,2,1")
     store = _Store(record)
     monkeypatch.setattr(membership, "rendezvous_store", lambda: store)
-    monkeypatch.setattr(f"{_MLB}._HOST_COPIES_CHECK_S", 0.01)
+    monkeypatch.setattr(f"{_ER}._HOST_COPIES_CHECK_S", 0.01)
     sharer = _sharer(1, 0.0, node_size=2)
     sharer.finalize_layer_weights()
     host_weights = {}
     load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
-    load_balancer.ep_rank, load_balancer.ep_size, load_balancer.gpus_per_node = 3, 4, 2
+    load_balancer.ep_rank, load_balancer.ep_size = 3, 4
+    load_balancer.mapping = Mapping(world_size=4, tp_size=4, gpus_per_node=2)
+    load_balancer.layer_updates_per_iter = 0
+    load_balancer.expert_restore = EplbExpertRestore(load_balancer)
     load_balancer.shared_mpi_comm = Mock()
     load_balancer.load_balancer_impl = Mock()
     load_balancer.single_layer_load_balancers = [
@@ -1108,7 +1143,7 @@ def test_host_copies_round_trip_under_the_names_of_their_deployment(
     """An original rank creates its host copies, a replacement reattaches them, and the node supervisor unlinks
     them, all by the names of the load balancer's one base name (``host_copies_prefix``)."""
     monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", f"test_host_copies_{os.getpid()}")
-    monkeypatch.setattr(MoeLoadBalancer, "_rank_nodes", lambda self: [0, 0, 1, 1])
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
         load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
     base_name = load_balancer.shared_memory_base_name
@@ -1117,7 +1152,7 @@ def test_host_copies_round_trip_under_the_names_of_their_deployment(
     load_balancer.single_layer_load_balancers = [
         SimpleNamespace(need_load_shared_weights=lambda: True, host_tensor_sharer=original)
     ]
-    prefix = load_balancer.keep_host_copies_for_the_deployment()
+    prefix = load_balancer.expert_restore.keep_host_copies_for_the_deployment()
     assert _segments() == [original.get_shared_memory_name()]
     assert original.get_shared_memory_name().startswith(prefix) and prefix.startswith(base_name)
     replacement_of_rank_0()

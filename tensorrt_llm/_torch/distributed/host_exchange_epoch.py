@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Epochs of :class:`~tensorrt_llm._torch.distributed.ll_exchange.TPHostExchange`, without its GPU dependencies,
+"""Epochs of :class:`~tensorrt_llm._torch.distributed.host_exchange.TPHostExchange`, without its GPU dependencies,
 so the CPU-only membership authority can compute them."""
 
 from typing import List
