@@ -1070,13 +1070,6 @@ class Run:
                 retryable <= logged,
                 f"{retryable} requests failed as retryable, but rank 0 failed {logged} as retryable",
             )
-        # Whole-node restart is not in place yet: a node cycle's rejoin checks are pending (an expected failure), until
-        # they all pass.
-        pending = [p for c in self.cycles for p in c.get("pending_node_restart", [])]
-        self.check(
-            not pending or not all(p["ok"] for p in pending),
-            "every pending rejoin check of the node cycles passed: whole-node restart works, so make them real checks",
-        )
         report = {
             "test": self.name,
             "world_size": self.deployment.world_size,
@@ -1088,11 +1081,6 @@ class Run:
         print(json.dumps(report, indent=2))
         if not failed:
             assert not self.failures, "\n".join(self.failures) + f"\nreport: {self.report_path}"
-            if pending:
-                pytest.xfail(
-                    "whole-node restart is not in place yet; pending node-cycle checks: "
-                    + "; ".join(f"{'ok' if p['ok'] else 'NOT ok'}: {p['check']}" for p in pending)
-                )
 
     def window(self, name: str, cycle: int) -> Phase:
         """Serve WINDOW_S, and on until the phase answered every eval question (at most EVAL_COVER_EXTRA_S more)."""
@@ -1197,40 +1185,25 @@ class Run:
                 f"cycle {index}: the kill did not land during the admission: {after_kill}",
             )
 
-        # Whole-node restart is not in place yet: a node cycle's rejoin checks are pending (Run.__exit__), and it
-        # serves one window at N-K instead of waiting for a rejoin that nothing starts.
-        rejoin_check = self._pending_check(record) if failure == "node" else self.check
-        rejoined = rejoined_status = t_rejoined = t_admission = None
-        try:
-            t_rejoined, rejoined_status = self.monitor.wait_for(
-                _all_live(world), t_degraded, WINDOW_S if failure == "node" else REJOIN_TIMEOUT_S
-            )
-            self.monitor.wait_for_health(200, "healthy", t_rejoined, RECOVERY_TIMEOUT_S)
-        except AssertionError as error:
-            if failure != "node":
-                raise
-            rejoin_check(False, f"cycle {index}: back to N ranks: {error}")
-        if rejoined_status is not None:
-            admission = rejoined_status["last_transaction"]
-            # The commit was read within STORE_POLL_S; the authority measures the transaction itself.
-            t_admission = (
-                t_rejoined - (admission["ended_unix_ms"] - admission["began_unix_ms"]) / 1e3
-            )
-            record["time_to_n_s"] = round(t_rejoined - t_fail, 3)
-        degraded_end = (time.monotonic() if t_admission is None else t_admission) - 1.0
+        t_rejoined, rejoined_status = self.monitor.wait_for(
+            _all_live(world), t_degraded, REJOIN_TIMEOUT_S
+        )
+        self.monitor.wait_for_health(200, "healthy", t_rejoined, RECOVERY_TIMEOUT_S)
+        admission = rejoined_status["last_transaction"]
+        # The commit was read within STORE_POLL_S; the authority measures the transaction itself.
+        t_admission = t_rejoined - (admission["ended_unix_ms"] - admission["began_unix_ms"]) / 1e3
+        record["time_to_n_s"] = round(t_rejoined - t_fail, 3)
+        degraded_end = t_admission - 1.0
         self.phases.append(Phase("degraded", index, t_settled, degraded_end))
-        if rejoined_status is not None:
-            self.phases.append(
-                Phase("admission", index, t_admission, t_rejoined, event=t_admission)
-            )
-            time.sleep(SETTLE_S)
-            rejoined = self.window("rejoined", index)
-            # Serving resumed at N ranks: the streamed tokens do not stall from the commit to the window's end.
-            stall_s = _largest_gap(self.clients.stream_arrivals(), t_rejoined, rejoined.end)[0]
-            self.check(
-                stall_s <= STALL_S,
-                f"cycle {index}: serving stalled after the admission: no streamed token for {stall_s:.1f} s",
-            )
+        self.phases.append(Phase("admission", index, t_admission, t_rejoined, event=t_admission))
+        time.sleep(SETTLE_S)
+        rejoined = self.window("rejoined", index)
+        # Serving resumed at N ranks: the streamed tokens do not stall from the commit to the window's end.
+        stall_s = _largest_gap(self.clients.stream_arrivals(), t_rejoined, rejoined.end)[0]
+        self.check(
+            stall_s <= STALL_S,
+            f"cycle {index}: serving stalled after the admission: no streamed token for {stall_s:.1f} s",
+        )
 
         workers_after = _rank_workers(d.secret)
         gpus_after = _rank_gpus(workers_after)
@@ -1293,16 +1266,13 @@ class Run:
             "healthy": self.clients.throughput(self.healthy.start, self.healthy.end),
             "degraded": self.clients.throughput(t_settled, degraded_end),
         }
-        if rejoined_status is None:
-            return record
-
         # The rejoin.
         admission_pause_s = _largest_gap(arrivals, t_admission - 1.0, t_rejoined + SETTLE_S)[0]
         record["admission_pause_s"] = round(admission_pause_s, 3)
         record["throughput_tok_s"]["rejoined"] = self.clients.throughput(
             rejoined.start, rejoined.end
         )
-        rejoin_check(
+        self.check(
             rejoined_status["lost_ranks"] == []
             and rejoined_status["generation"] > failover_status["generation"],
             f"cycle {index}: status after the rejoin: {rejoined_status}",
@@ -1313,38 +1283,29 @@ class Run:
             n + (r in lost) + (r in killed_at_admission)
             for r, n in enumerate(status["incarnations"])
         ]
-        rejoin_check(
+        self.check(
             rejoined_status["incarnations"] == expected,
             f"cycle {index}: incarnations {status['incarnations']} -> {rejoined_status['incarnations']}, "
             f"expected {expected}",
         )
         # A replacement runs on the GPU of the process it replaces.
         for rank in sorted((set(lost) | set(killed_at_admission)) & set(workers_before)):
-            rejoin_check(
+            self.check(
                 bool(gpus_before[rank]) and gpus_after.get(rank) == gpus_before[rank],
                 f"cycle {index}: rank {rank}'s replacement runs on GPUs {gpus_after.get(rank)}, the process it "
                 f"replaces ran on {gpus_before[rank]}",
             )
         # A replacement captures its own CUDA graphs at startup.
         for rank in sorted(set(lost) | set(killed_at_admission)):
-            rejoin_check(
+            self.check(
                 captures_after.get(rank, 0) > captures_before.get(rank, 0),
                 f"cycle {index}: no CUDA graph capture lines of rank {rank}'s replacement",
             )
-        rejoin_check(
+        self.check(
             admission_pause_s < ADMISSION_PAUSE_TARGET_S,
             f"cycle {index}: admission pause {admission_pause_s:.2f} s, target < {ADMISSION_PAUSE_TARGET_S} s",
         )
         return record
-
-    @staticmethod
-    def _pending_check(record: dict) -> Callable[[bool, str], None]:
-        """A check recorded under ``pending_node_restart``.
-
-        The run is an expected failure while one of them fails, and fails once they all pass (Run.__exit__).
-        """
-        pending = record.setdefault("pending_node_restart", [])
-        return lambda ok, message: pending.append({"check": message, "ok": bool(ok)})
 
     @contextlib.contextmanager
     def connect(self, rank: int, replacement: bool):
