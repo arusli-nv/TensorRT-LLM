@@ -346,6 +346,10 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
     function exec_without_mpi_environment {
         local var prefix
+        # A rank the node supervisor started is a one-process MPI world, and so
+        # is each child here: keep the supervisor's transport selection, which
+        # leaves no /dev/shm segment behind.
+        local supervisor_btl=${TLLM_FAULT_TOLERANCE_RANK:+$OMPI_MCA_btl}
         for var in $(compgen -e); do
             for prefix in "${mpi_blacklist[@]}"; do
                 if [[ "$var" == "$prefix"* ]]; then
@@ -354,6 +358,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
                 fi
             done
         done
+        if [ -n "$supervisor_btl" ]; then
+            export OMPI_MCA_btl="$supervisor_btl"
+        fi
         exec_child_command "$@"
     }
 

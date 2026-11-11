@@ -38,6 +38,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.distributed.startup_record import startup_record
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
@@ -530,7 +531,7 @@ class HostMemoryLimits(NamedTuple):
     """The host memory a rank may plan pinned allocations against.
 
     Attributes:
-        local_ranks: Ranks sharing this node.
+        local_ranks: Ranks sharing this node's available memory.
         mem_available: The node's available memory in bytes; ``inf`` when unknown.
         memlock_limit: The RLIMIT_MEMLOCK soft limit in bytes; ``inf`` when unlimited.
     """
@@ -570,7 +571,9 @@ def get_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
         effective_available_host_memory,
     )
 
-    local_ranks = max(1, Distributed.get(mapping).local_world_size)
+    local_ranks = startup_record.ranks_sharing_free_memory(
+        max(1, Distributed.get(mapping).local_world_size)
+    )
     mem_available = effective_available_host_memory()
     try:
         soft_limit, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)

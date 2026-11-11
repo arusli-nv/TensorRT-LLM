@@ -72,7 +72,8 @@ class StartupRecord:
     """The startup collectives' results as rank 0 got them, which a replacement rank replays.
 
     A replacement must make the same collectives in the same order from the same callers. Its payload must equal its
-    predecessor's, except for :data:`RANK_VARYING_CALLERS` and for min or max reductions that the result still bounds.
+    predecessor's, except for :data:`RANK_VARYING_CALLERS` and for min or max reductions. A reduction of a measured
+    capacity takes the original ranks' result, which the replacement's own capacity must still cover.
     """
 
     def __init__(self) -> None:
@@ -111,6 +112,13 @@ class StartupRecord:
 
     def resume(self) -> None:
         self._pauses -= 1
+
+    def ranks_sharing_free_memory(self, local_ranks: int) -> int:
+        """Return how many of the ``local_ranks`` ranks on this node split the memory free on it now.
+
+        The other ranks on a replacement's node hold their memory already, so what is free is the replacement's own.
+        """
+        return 1 if self._replacement else local_ranks
 
     def close(self) -> None:
         """Stop recording or replaying at the end of this rank's startup.
@@ -211,12 +219,13 @@ class StartupRecord:
             predecessor is not None
             and predecessor != payload
             and (caller.file, caller.function) not in RANK_VARYING_CALLERS
-            and not self._bounded(bound, payload, recorded.payloads)
         ):
-            raise ReplacementCannotStart(
-                f"The payload of this replacement rank to host collective {index} of its startup, {caller}, differs "
-                "from the original rank's"
-            )
+            if bound is None:
+                raise ReplacementCannotStart(
+                    f"The payload of this replacement rank to host collective {index} of its startup, {caller}, "
+                    "differs from the original rank's"
+                )
+            self._check_bound(index, caller, bound, payload, recorded.payloads)
         readers = range(len(recorded.payloads)) if readers is None else readers
         unread = [r for r in readers if recorded.payloads[r] is None]
         if unread:
@@ -228,17 +237,24 @@ class StartupRecord:
         return [p if r in readers else None for r, p in enumerate(recorded.payloads)]
 
     @staticmethod
-    def _bounded(
-        bound: Optional[Callable[[Any, Any], Any]], payload: bytes, payloads: List[Optional[bytes]]
-    ) -> bool:
-        if bound is None:
-            return False
+    def _check_bound(
+        index: int,
+        caller: Caller,
+        bound: Callable[[Any, Any], Any],
+        payload: bytes,
+        payloads: List[Optional[bytes]],
+    ) -> None:
         # Only processes with the shared secret write the rendezvous store the record comes from.
         values = [pickle.loads(p) for p in payloads if p is not None]  # nosec B301
         result = values[0]
         for value in values[1:]:
             result = bound(result, value)
-        return bound(pickle.loads(payload), result) == result  # nosec B301
+        own = pickle.loads(payload)  # nosec B301
+        if bound(own, result) != result:
+            raise ReplacementCannotStart(
+                f"The own value of this replacement rank to host collective {index} of its startup, {caller}, is "
+                f"{own}, beyond the original ranks' {bound.__name__} {result}"
+            )
 
 
 startup_record = StartupRecord()

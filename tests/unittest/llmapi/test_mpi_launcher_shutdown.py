@@ -83,6 +83,7 @@ except OSError:
     "pid": os.getpid(),
     "pgid": os.getpgrp(),
     "pmi_rank": os.environ.get("PMI_RANK"),
+    "btl": os.environ.get("OMPI_MCA_btl"),
     "lock_fd_open": lock_fd_open,
     "workspace": os.environ.get("FLASHINFER_WORKSPACE_BASE"),
 }))
@@ -427,6 +428,23 @@ def test_launcher_preserves_task_status_and_child_environment(
         assert not record["lock_fd_open"]
         assert record["workspace"].endswith("/rank-0")
         assert record["pid"] == record["pgid"]
+    _assert_exited(tmp_path)
+
+
+@pytest.mark.parametrize("supervised", [False, True])
+def test_launcher_keeps_the_node_supervisors_transport_selection(
+    tmp_path: Path, supervised: bool
+) -> None:
+    env = _launcher_env(tmp_path, "clean")
+    env["OMPI_MCA_btl"] = "^sm"
+    if supervised:
+        env["TLLM_FAULT_TOLERANCE_RANK"] = "0,1,1,0"
+    result = _run_launcher(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    records = _process_records(tmp_path)
+    assert records["server"]["btl"] == "^sm"
+    for role in ("task", "stop"):
+        assert records[role]["btl"] == ("^sm" if supervised else None)
     _assert_exited(tmp_path)
 
 

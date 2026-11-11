@@ -18,6 +18,7 @@ replacement of rank 2, whose own exchange reaches only itself, replays them."""
 
 import contextlib
 import pickle
+import resource
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -31,12 +32,17 @@ from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
+from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
     DecoderWarmup,
     WarmupAgreement,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import _sync_host_tier_quota
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _compute_auto_host_tier_quota,
+    _sync_host_tier_quota,
+    get_host_memory_limits,
+)
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 pytestmark = pytest.mark.cpu_only
@@ -160,7 +166,9 @@ def test_a_minimum_that_does_not_bound_the_replacement_s_own_value_stops_it():
     # A larger capacity than its predecessor's (4096 - 200) takes the minimum.
     assert _startup(_replacement(published), 8192)[2] == 4096 - 300
     replacement = _replacement(published)
-    with pytest.raises(SystemExit, match="allreduce in _startup .* differs") as exited:
+    with pytest.raises(
+        SystemExit, match=f"allreduce in _startup .* is {4096 - 400}, beyond .* min {4096 - 300}"
+    ) as exited:
         _startup(replacement, 4096 - 400)
     assert exited.value.code == REPLACEMENT_CANNOT_START
 
@@ -280,6 +288,44 @@ def test_main_s_startup_agreements_take_the_original_ranks_results_on_a_replacem
         SystemExit, match="allgather in modeling_v2_resolve_on_all_ranks .* differs"
     ):
         _main_startup(monkeypatch, 48 * GIB, target=AutoTuner)  # builds another implementation
+
+
+def _auto_host_tier_quota(monkeypatch, mem_available):
+    """Main's automatic host tier quota beside an 80 GiB device quota, with ``mem_available`` free on the node."""
+    monkeypatch.setattr(MnnvlDist, "local_world_size", WORLD)
+    monkeypatch.setattr(
+        rank_striped_read_ahead, "effective_available_host_memory", lambda: mem_available
+    )
+    monkeypatch.setattr(
+        resource, "getrlimit", lambda limit: (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+    )
+    mapping = SimpleNamespace(world_size=WORLD)
+    limits = get_host_memory_limits(mapping)
+    host_quota = _compute_auto_host_tier_quota(
+        80 * GIB, limits.local_ranks, limits.mem_available, limits.memlock_limit
+    )
+    return _sync_host_tier_quota(host_quota, mapping)
+
+
+def test_replacement_takes_the_recorded_host_tier(distributed, monkeypatch):
+    """The survivors' 80 GiB host tiers are pinned, so the replacement finds less memory free than its predecessor."""
+    distributed.dist = _rank_0()
+    assert _auto_host_tier_quota(monkeypatch, 720 * GIB) == 80 * GIB
+    distributed.dist = _replacement(_publish())
+    assert _auto_host_tier_quota(monkeypatch, 720 * GIB - 3 * 80 * GIB) == 80 * GIB
+    startup_record.close()
+
+
+def test_replacement_without_host_tier_room_cannot_start(distributed, monkeypatch):
+    distributed.dist = _rank_0()
+    _auto_host_tier_quota(monkeypatch, 720 * GIB)
+    distributed.dist = _replacement(_publish())
+    with pytest.raises(
+        SystemExit,
+        match=f"_sync_host_tier_quota .* is {60 * GIB}, beyond the original ranks' min {80 * GIB}",
+    ) as exited:
+        _auto_host_tier_quota(monkeypatch, 120 * GIB)
+    assert exited.value.code == REPLACEMENT_CANNOT_START
 
 
 def test_main_s_warmup_agreement_on_a_replacement_decides_as_the_original_ranks():
