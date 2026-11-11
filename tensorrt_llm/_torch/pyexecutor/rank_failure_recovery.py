@@ -137,18 +137,6 @@ def ensure_rendezvous() -> None:
         os.environ[RENDEZVOUS_ENV] = f"{socket.gethostbyname(socket.gethostname())}:{port}"
 
 
-def _host_collectives_requirements(mapping: Mapping) -> List[str]:
-    from tensorrt_llm._utils import mpi_disabled
-
-    from ..distributed.host_exchange import MnnvlDist
-
-    if mpi_disabled():
-        return ["the MPI orchestrator (TLLM_DISABLE_MPI unset)"]
-    return MnnvlDist.unmet_requirements(mapping) or [
-        "host collectives over MNNVL memory (MnnvlDist)"
-    ]
-
-
 def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed) -> None:
     """Check the Wide-EP fault tolerance requirements that the LLM argument validation cannot check.
 
@@ -157,6 +145,8 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
     Raises:
         ValueError: The configuration is not supported with fault tolerance.
     """
+    from tensorrt_llm._utils import mpi_disabled
+
     from ..distributed.host_exchange import MnnvlDist
     from ..moe.fused_moe.communication.nvlink_one_sided import FORCE_CFT_ENV, get_force_cft
     from ..moe.fused_moe.moe_comm_timeout_guard import (
@@ -169,7 +159,14 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
     kernel_timeout_s = resolve_moe_comm_timeout_budgets(os.environ).serving_seconds
     if kernel_timeout_s is None:
         kernel_timeout_s = torch.ops.trtllm.moe_a2a_get_timeout()
-    missing = [] if isinstance(dist, MnnvlDist) else _host_collectives_requirements(mapping)
+    if isinstance(dist, MnnvlDist):
+        missing = []
+    elif mpi_disabled():
+        missing = ["the MPI orchestrator (TLLM_DISABLE_MPI unset)"]
+    else:
+        missing = MnnvlDist.unmet_requirements(mapping) or [
+            "host collectives over MNNVL memory (MnnvlDist)"
+        ]
     checks = [
         (not missing, ", ".join(missing)),
         (
@@ -285,8 +282,6 @@ AGREED_STARTUP_KEY = "agreed_startup"
 WORKER_ARGS_KEY = "worker_args"
 
 _startup_fingerprint: Optional[str] = None
-
-
 _deployment_nonce: Optional[str] = None
 
 
@@ -302,10 +297,6 @@ def deployment_nonce() -> str:
             lambda: mpi_broadcast(secrets.token_hex(8) if mpi_rank() == 0 else None),
         )
     return _deployment_nonce
-
-
-def _agreed_startup_record() -> bytes:
-    return pickle.dumps({**startup_record.published(), "fingerprint": _startup_fingerprint})
 
 
 def startup_fingerprint(worker_main_args: dict) -> str:
@@ -494,12 +485,6 @@ def _moe_load_balancer_of(executor: PyExecutor):
     return balancer if isinstance(balancer, MoeLoadBalancer) else None
 
 
-def _moe_execution_state_of(executor: PyExecutor) -> MoeExecutionState:
-    from ..moe.fused_moe.communication.execution_state import MoeExecutionState
-
-    return MoeExecutionState.model_comms(executor.model_engine.model)[0].execution_state
-
-
 def _admission_keys(generation: int) -> Tuple[str, str]:
     return f"host_exchange_epoch/{generation}", f"waiting_queue/{generation}"
 
@@ -533,14 +518,7 @@ class StartupMemory(NamedTuple):
 
     def shortfall(self, kv_cache_manager, held: int, free_to_keep: int = 0) -> int:
         """Return how much of its quota the pool neither holds nor can take from memory free beyond ``free_to_keep``."""
-        return max(
-            0,
-            self.kv_cache_quota
-            - held
-            - kv_cache_manager.gpu_quota
-            - torch.cuda.mem_get_info()[0]
-            + free_to_keep,
-        )
+        return max(0, free_to_keep - self.free_to_keep(kv_cache_manager, held))
 
 
 @dataclass
@@ -555,6 +533,12 @@ class _GiveBackRetry:
     free_seen: int
     check_after_s: float
     ended: bool = False
+
+
+def _moe_execution_state_of(executor: PyExecutor) -> MoeExecutionState:
+    from ..moe.fused_moe.communication.execution_state import MoeExecutionState
+
+    return MoeExecutionState.model_comms(executor.model_engine.model)[0].execution_state
 
 
 def _check_largest_failure_fits(
@@ -586,8 +570,12 @@ def _check_largest_failure_fits(
         )
 
 
-def _helper_process_env() -> Dict[str, str]:
-    """Return the environment of the membership authority, which runs without MPI, launcher variables or a GPU."""
+def _start_authority(world_size: int, timeout_s: float) -> Tuple[subprocess.Popen, str]:
+    """Start the membership authority and return it with the ``host:port`` its store listens on.
+
+    The authority ends with this process, which holds the writing end of its standard input. It runs without MPI,
+    launcher variables or a GPU.
+    """
     env = {
         name: value
         for name, value in os.environ.items()
@@ -599,15 +587,6 @@ def _helper_process_env() -> Dict[str, str]:
         CUDA_VISIBLE_DEVICES="",
         TLLM_LOG_LEVEL=logger.level,
     )
-    return env
-
-
-def _start_authority(world_size: int, timeout_s: float) -> Tuple[subprocess.Popen, str]:
-    """Start the membership authority and return it with the ``host:port`` its store listens on.
-
-    The authority ends with this process, which holds the writing end of its standard input.
-    """
-    env = _helper_process_env()
     read_fd, write_fd = os.pipe()
     try:
         process = subprocess.Popen(
@@ -772,7 +751,8 @@ class RankFailureRecovery:
         if dist.rank == 0:
             if host_weights_prefix is not None:
                 store.set(HOST_WEIGHTS_PREFIX_KEY, host_weights_prefix.encode())
-            store.set(AGREED_STARTUP_KEY, _agreed_startup_record())
+            agreed_startup = {**startup_record.published(), "fingerprint": _startup_fingerprint}
+            store.set(AGREED_STARTUP_KEY, pickle.dumps(agreed_startup))
         recovery = cls(
             executor,
             dist.host_exchange,
@@ -1276,12 +1256,6 @@ class RankFailureRecovery:
         workspace_bytes = self._moe.workspace_bytes() if self.rank in fresh_rows else 0
         needed = workspace_bytes + (0 if plan is None else plan.device_bytes)
 
-        def remap() -> None:
-            start_s = time.perf_counter()
-            self._moe.remap_workspaces(gather, fresh_rows)
-            times["remap"] = (time.perf_counter() - start_s) * 1e3
-            self._install_step_done()
-
         kv_cache_quota = "unchanged"
         # Each rank decides on its own because suspending the pools runs a collective only with disaggregated serving,
         # which fault tolerance rejects.
@@ -1304,7 +1278,10 @@ class RankFailureRecovery:
             if plan is not None:
                 balancer.expert_restore.restore_lost_experts(plan, times)
                 self._install_step_done()
-            remap()
+            start_s = time.perf_counter()
+            self._moe.remap_workspaces(gather, fresh_rows)
+            times["remap"] = (time.perf_counter() - start_s) * 1e3
+            self._install_step_done()
         # The client thread updates the record under this lock before it requests the abort of a newer change. Once
         # this check passes, that abort comes after the rearm and stays in effect.
         start_s = time.perf_counter()
@@ -1470,16 +1447,8 @@ class RankFailureRecovery:
         from .llm_request import LlmResponse
 
         if self.rank == 0:
-            self._executor._pending_transfer_responses.append(
-                (
-                    request_id,
-                    LlmResponse(
-                        request_id=request_id,
-                        error_msg=error,
-                        client_id=client_id,
-                    ),
-                )
-            )
+            response = LlmResponse(request_id=request_id, error_msg=error, client_id=client_id)
+            self._executor._pending_transfer_responses.append((request_id, response))
 
 
 class FaultToleranceHealth:

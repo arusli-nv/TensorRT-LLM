@@ -14,6 +14,7 @@
 # limitations under the License.
 """Record of the startup collectives that a replacement rank replays, since it starts alone."""
 
+import functools
 import pickle  # nosec B403
 import sys
 from pathlib import Path
@@ -257,9 +258,7 @@ class StartupRecord:
     ) -> None:
         # Only processes with the shared secret write the rendezvous store the record comes from.
         values = [pickle.loads(p) for p in payloads if p is not None]  # nosec B301
-        result = values[0]
-        for value in values[1:]:
-            result = bound(result, value)
+        result = functools.reduce(bound, values)
         own = pickle.loads(payload)  # nosec B301
         if bound(own, result) != result:
             raise ReplacementCannotStart(

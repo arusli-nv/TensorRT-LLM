@@ -560,10 +560,7 @@ class NodeSupervisor:
             self._selector.register(os.pidfd_open(process.pid), selectors.EVENT_READ, _RELAUNCHED)
 
     def _stop(self, status: int, terminate: bool = True, forward: Optional[int] = None) -> int:
-        """Stop the node's ranks and return ``status``.
-
-        Processes that are still running die with the supervisor.
-        """
+        """Stop the node's ranks and return ``status``. Processes that are still running die with the supervisor."""
         self._unlink_host_weights()
         rank_0 = self._processes.get(0)
         if forward is not None and rank_0 is not None and rank_0.status is None:
@@ -652,17 +649,8 @@ def _prrte_job_control(
             "the end of rank 0 does not end the job."
         )
         return None, None
-    relaunch_command = [
-        prun,
-        "--dvm-uri",
-        uri,
-        "-n",
-        "1",
-        "--map-by",
-        "ppr:1:node:OVERSUBSCRIBE",
-        "--bind-to",
-        "none",
-    ]
+    relaunch_command = [prun, "--dvm-uri", uri, "-n", "1"]
+    relaunch_command += ["--map-by", "ppr:1:node:OVERSUBSCRIBE", "--bind-to", "none"]
     return relaunch_command, functools.partial(_end_prrte_job, uri, pterm)
 
 

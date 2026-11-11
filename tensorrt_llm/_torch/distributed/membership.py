@@ -579,27 +579,6 @@ HOST_WEIGHTS_PREFIX_KEY = "host_weights_prefix"
 _RANKS_PER_COUNTER = 63
 
 
-def mark_arrived(store: RendezvousStore, prefix: str, rank: int) -> None:
-    """Mark that ``rank`` set its value under ``prefix``. The counters are not signed, as values are."""
-    store.store.add(
-        f"{prefix}/arrived/{rank // _RANKS_PER_COUNTER}", 1 << rank % _RANKS_PER_COUNTER
-    )
-
-
-def _arrival_counters(prefix: str, world_size: int) -> List[str]:
-    return [
-        f"{prefix}/arrived/{counter}" for counter in range(-(-world_size // _RANKS_PER_COUNTER))
-    ]
-
-
-def arrived_ranks(store: RendezvousStore, prefix: str, world_size: int) -> int:
-    """Return the mask of the ranks that marked their arrival under ``prefix``."""
-    return sum(
-        store.store.add(key, 0) << counter * _RANKS_PER_COUNTER
-        for counter, key in enumerate(_arrival_counters(prefix, world_size))
-    )
-
-
 def authority_ports(address: str) -> Tuple[str, int, int]:
     """Return the host, store port and liveness port of the authority at ``address``."""
     host, port = address.rsplit(":", 1)
@@ -612,10 +591,10 @@ def open_store(address: str, secret: bytes, timeout_s: float) -> RendezvousStore
 
     from torch.distributed import TCPStore
 
-    host, port = address.rsplit(":", 1)
+    host, port, _ = authority_ports(address)
     store = TCPStore(
         host,
-        int(port),
+        port,
         is_master=False,
         timeout=timedelta(seconds=timeout_s),
         wait_for_workers=False,
@@ -846,14 +825,10 @@ class StoreGroup:
         return f"{prefix}/arrived/{rank // _RANKS_PER_COUNTER}"
 
 
-def shared_secret_digest() -> str:
-    """Return a digest of the shared secret that names this deployment without revealing the secret."""
-    return hashlib.sha256(bytes.fromhex(os.environ[SHARED_SECRET_ENV])).hexdigest()[:32]
-
-
 def node_supervisor_address() -> bytes:
     """Return the abstract Unix socket that keeps a second node supervisor of the deployment off the node."""
-    return f"\0tllm-wide-ep-ft-{shared_secret_digest()}".encode()
+    digest = hashlib.sha256(bytes.fromhex(os.environ[SHARED_SECRET_ENV])).hexdigest()[:32]
+    return f"\0tllm-wide-ep-ft-{digest}".encode()
 
 
 # The exit status of a replacement whose startup failure any other replacement would repeat.

@@ -96,11 +96,6 @@ def _outlive_this_process(shm: shared_memory.SharedMemory) -> None:
     resource_tracker.unregister(shm._name, "shared_memory")
 
 
-def host_weights_prefix(shared_memory_base_name: str) -> str:
-    """Return the name prefix of the host-weight segments under ``shared_memory_base_name``."""
-    return f"{shared_memory_base_name}_"
-
-
 _FINGERPRINT_BYTES = 32
 SHARED_MEMORY_DIR = "/dev/shm"
 _HOST_WEIGHTS_CHECK_S = 1.0
@@ -208,7 +203,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
         ):
             return shm
         shm.close()
-        resource_tracker.unregister(shm._name, "shared_memory")
+        _outlive_this_process(shm)
         return None
 
     def holds_host_weights(self, rank: int) -> bool:
@@ -218,7 +213,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
             return False
         shm.close()
         if all(owned._name != shm._name for owned in self.process_owned_shms):
-            resource_tracker.unregister(shm._name, "shared_memory")
+            _outlive_this_process(shm)
         return True
 
     def keep_for_the_deployment(self):
@@ -233,7 +228,9 @@ class EplbExpertRestore:
 
     def __init__(self, balancer: "MoeLoadBalancer"):
         self.balancer = balancer
-        self.largest_failure = self._largest_failure_size(self._rank_nodes())
+        self.largest_failure = max(
+            map(len, self._recoverable_failures(self._rank_nodes())), default=0
+        )
         if (
             self.largest_failure
             and balancer.layer_updates_per_iter > 0
@@ -257,10 +254,6 @@ class EplbExpertRestore:
     def _rank_nodes(self) -> List[int]:
         return [self.balancer.mapping.get_node_rank(rank) for rank in range(self.balancer.ep_size)]
 
-    def _node_ranks(self) -> List[int]:
-        nodes = self._rank_nodes()
-        return [rank for rank, node in enumerate(nodes) if node == nodes[self.balancer.ep_rank]]
-
     @staticmethod
     def _recoverable_failures(nodes: List[int]) -> List[List[int]]:
         """Return the ranks of each recoverable failure.
@@ -272,10 +265,6 @@ class EplbExpertRestore:
             node_ranks.setdefault(node, []).append(rank)
         rank_0_node = node_ranks.pop(nodes[0], [])
         return list(node_ranks.values()) + [[rank] for rank in rank_0_node[1:]]
-
-    @staticmethod
-    def _largest_failure_size(nodes: List[int]) -> int:
-        return max(map(len, EplbExpertRestore._recoverable_failures(nodes)), default=0)
 
     def largest_failure_restore_bytes(self) -> int:
         """Return the most device memory this rank backs to restore the experts of any recoverable failure."""
@@ -330,11 +319,13 @@ class EplbExpertRestore:
         store = rendezvous_store()
         store.set(host_weights_key(ep_rank), b"")
         sharers = self._host_tensor_sharers()
+        nodes = self._rank_nodes()
+        node_ranks = [rank for rank, node in enumerate(nodes) if node == nodes[ep_rank]]
 
         def missing() -> List[int]:
             return [
                 rank
-                for local_rank, rank in enumerate(self._node_ranks())
+                for local_rank, rank in enumerate(node_ranks)
                 if rank != ep_rank
                 and not all(sharer.holds_host_weights(local_rank) for sharer in sharers)
             ]
@@ -374,7 +365,7 @@ class EplbExpertRestore:
         """Let the node's host weights outlive this process and return their name prefix."""
         for sharer in self._host_tensor_sharers():
             sharer.keep_for_the_deployment()
-        return host_weights_prefix(self.balancer.shared_memory_base_name)
+        return f"{self.balancer.shared_memory_base_name}_"
 
     def plan_expert_restore(
         self,

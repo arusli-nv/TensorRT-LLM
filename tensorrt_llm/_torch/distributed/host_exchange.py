@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import pickle  # nosec B403
 import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -145,9 +146,7 @@ class TPHostExchange:
     def __init__(
         self, rank: int, nranks: int, rows: HostExchangeMnnvlMemory, slot_payload_bytes: int
     ):
-        from .mnnvl_memory import _check_cu_result, cuda
-
-        self._cuda = cuda
+        self._cuda = mnnvl_memory.cuda
         self._check_cu = _check_cu_result
         self.rank = rank
         self.nranks = nranks
@@ -675,14 +674,14 @@ class MnnvlDist(MPIDist):
     def _exchange(self, obj, readers=None, recipients=None, idle=False, bound=None) -> list:
         host_exchange = self.host_exchange
         payload = pickle.dumps(obj)
-        if not startup_record.active:
-            payloads = host_exchange.exchange(payload, readers, recipients, idle)
-        else:
 
-            def run():
-                return host_exchange.exchange(payload, readers, recipients, idle)
+        def run():
+            return host_exchange.exchange(payload, readers, recipients, idle)
 
+        if startup_record.active:
             payloads = startup_record.exchange(self.mapping.tp_rank, payload, readers, run, bound)
+        else:
+            payloads = run()
         return [
             None if payload is None else pickle.loads(payload)  # nosec B301
             for payload in payloads
@@ -723,10 +722,7 @@ class MnnvlDist(MPIDist):
         _check_reduce_op(op)
         bound = self._REDUCE[op] if op in (ReduceOp.MIN, ReduceOp.MAX) else None
         values = [value for value in self._exchange(obj, bound=bound) if value is not None]
-        result = values[0]
-        for value in values[1:]:
-            result = self._REDUCE[op](result, value)
-        return result
+        return functools.reduce(self._REDUCE[op], values)
 
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         return self.allreduce(obj, op)
@@ -736,11 +732,12 @@ class MnnvlDist(MPIDist):
         values = np.asarray(values, dtype=np.int64)
         if not startup_record.active:
             return host_exchange.allgather_array(values)
-
-        def run():
-            return [row.tobytes() for row in host_exchange.allgather_array(values)]
-
-        rows = startup_record.exchange(self.mapping.tp_rank, values.tobytes(), None, run)
+        rows = startup_record.exchange(
+            self.mapping.tp_rank,
+            values.tobytes(),
+            None,
+            lambda: [row.tobytes() for row in host_exchange.allgather_array(values)],
+        )
         return np.stack([np.frombuffer(row, dtype=np.int64) for row in rows])
 
     def tp_active_rows(self, rows: np.ndarray) -> np.ndarray:
