@@ -166,7 +166,7 @@ def _bound_state(
     comm.can_use_cft_counted_writes = False
     comm.ep_group_health = health
     comm._rank_mask_enabled = True
-    comm._execution_state = None
+    comm.execution_state = None
     comm._bound = False
     comm._dispatch_state = {"phase": "idle"}
     comm.workspace = workspace

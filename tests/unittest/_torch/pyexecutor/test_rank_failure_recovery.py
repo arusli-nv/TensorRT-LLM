@@ -23,14 +23,12 @@ import os
 import pickle
 import queue
 import re
-import runpy
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
-import warnings
 from concurrent.futures import Future
 from datetime import timedelta
 from functools import partial
@@ -71,6 +69,7 @@ from tensorrt_llm._torch.distributed.mnnvl_active_group import (
     MnnvlPeerHandleError,
 )
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     SHARED_MEMORY_DIR,
     DeploymentHostWeights,
@@ -561,11 +560,8 @@ def test_the_host_weights_already_in_dev_shm_need_no_more_room(shm_free):
 
 def _supported_model(monkeypatch, state=None):
     """A model the model check accepts, whose MoE layers it binds to ``state``; returns the model and the binding."""
-    from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
-
     for_model = Mock(return_value=state)
     monkeypatch.setattr(MoeExecutionState, "for_model", for_model)
-    monkeypatch.setattr(recovery_module, "_moe_execution_state", None)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.config_utils.is_hybrid_linear", lambda config: False
     )
@@ -589,7 +585,6 @@ def test_the_model_check_binds_the_moe_layers(monkeypatch):
     monkeypatch.setattr(recovery_module, "_check_host_weights_fit", Mock())
     prepare_model(model)
     for_model.assert_called_once_with(model)
-    assert recovery_module._moe_execution_state is state
 
 
 # The flag reaches every process, and requests it does not support are rejected.
@@ -3023,12 +3018,7 @@ def agreed_startup(monkeypatch):
     """Fault tolerance on, an original rank, nothing recorded yet."""
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    for name, value in (
-        ("_startup_fingerprint", None),
-        ("_worker_main_args", None),
-        ("_published_record", None),
-    ):
-        monkeypatch.setattr(recovery_module, name, value)
+    monkeypatch.setattr(recovery_module, "_startup_fingerprint", None)
     for name, value in vars(StartupRecord()).items():
         monkeypatch.setattr(startup_record, name, value)
 
@@ -3068,8 +3058,7 @@ def _replacement_of(monkeypatch, published: bytes) -> None:
     for name, value in vars(StartupRecord()).items():
         setattr(startup_record, name, value)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
-    monkeypatch.setattr(recovery_module, "_published_record", pickle.loads(published))
-    startup_record.replay(recovery_module._agreed_startup())
+    startup_record.replay(pickle.loads(published))
 
 
 def test_a_replacement_takes_the_startup_values_rank_0_recorded(agreed_startup, monkeypatch):
@@ -3139,8 +3128,8 @@ def test_a_replacement_that_does_not_match_the_deployment_refuses_to_start(
     (tmp_path / "config.json").write_text('{"num_hidden_layers": 3}')
     assert recovery_module.startup_fingerprint(args) != fingerprint
 
-    monkeypatch.setattr(recovery_module, "_published_record", {"fingerprint": fingerprint})
-    _published(monkeypatch, args)
+    store = _published(monkeypatch, args)
+    store.set(AGREED_STARTUP_KEY, pickle.dumps({"fingerprint": fingerprint}))
     with pytest.raises(SystemExit, match="does not match") as exited:
         recovery_module.worker_node_main()
     # Another replacement would not match either: its supervisor starts none.
@@ -3168,17 +3157,6 @@ def test_the_deployment_nonce_is_rank_0_s_on_every_rank(agreed_startup, monkeypa
     assert recovery_module.deployment_nonce() == nonce
 
 
-def test_module_entry_runs_the_imported_module(monkeypatch):
-    """``python -m`` runs the module as ``__main__``: the rank joins in the module the executor imports."""
-    worker_node_main = Mock()
-    monkeypatch.setattr(recovery_module, "worker_node_main", worker_node_main)
-    with warnings.catch_warnings():
-        # runpy warns that the module it runs is imported already.
-        warnings.simplefilter("ignore", RuntimeWarning)
-        runpy.run_module(recovery_module.__name__, run_name="__main__")
-    worker_node_main.assert_called_once_with()
-
-
 @pytest.mark.parametrize("identity", ["2,4,4,0", "2,4,4,1"])
 def test_every_rank_but_0_joins_then_starts_with_the_arguments_rank_0_published(
     agreed_startup, monkeypatch, identity
@@ -3194,8 +3172,8 @@ def test_every_rank_but_0_joins_then_starts_with_the_arguments_rank_0_published(
         "exchanges": [],
         "fingerprint": recovery_module.startup_fingerprint(args),
     }
-    monkeypatch.setattr(recovery_module, "_published_record", published)
-    _published(monkeypatch, args, identity)
+    store = _published(monkeypatch, args, identity)
+    store.set(AGREED_STARTUP_KEY, pickle.dumps(published))
     monkeypatch.setattr(
         recovery_module, "_join_at_entry", lambda store, rank: events.append(("join", rank))
     )
@@ -3328,8 +3306,13 @@ def test_an_original_rank_takes_over_its_membership_once_every_rank_has_started(
 
     executor._kv_pools_suspended = kv_pools_suspended
     executor.dist.allgather.side_effect = lambda value: [value] * WORLD
+    # The state that the model check bound the MoE layers to.
+    moe_state = Mock(workspace_bytes=Mock(return_value=4 * MIB))
+    executor.model_engine.model = model = object()
     monkeypatch.setattr(
-        recovery_module, "_moe_execution_state", Mock(workspace_bytes=Mock(return_value=4 * MIB))
+        MoeExecutionState,
+        "model_comms",
+        lambda bound: [SimpleNamespace(execution_state=moe_state)] if bound is model else [],
     )
     executor.model_engine.moe_load_balancer = MagicMock(spec=MoeLoadBalancer)
     expert_restore = MagicMock(spec=EplbExpertRestore)
@@ -3353,6 +3336,7 @@ def test_an_original_rank_takes_over_its_membership_once_every_rank_has_started(
         "bind",
     ]
     assert recovery.address == "head-node:29600"
+    assert recovery._moe is moe_state
     assert recovery._startup_memory == STARTUP_MEMORY
     # The check shrank the KV cache pool for the largest failure's restore, then took its quota back.
     assert _resizes(device) == [54 * MIB, STARTUP_MEMORY.kv_cache_quota]
@@ -3379,12 +3363,19 @@ def test_the_executor_s_hang_detection_must_outlast_twice_the_hang_timeout(
         RankFailureRecovery.create(executor)
 
 
-def test_a_rank_the_launcher_started_for_fault_tolerance_needs_it_on(monkeypatch):
-    from tensorrt_llm.executor.worker import worker_main
+def test_a_worker_sets_the_flag_first(monkeypatch):
+    """Every later reader of fault tolerance in the worker, the rank identity included, follows its arguments."""
+    from tensorrt_llm.executor import worker as worker_module
 
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
-    with pytest.raises(ValueError, match="enable_wide_ep_fault_tolerance is off"):
-        worker_main(worker_queues=None, log_level="info", llm_args=None)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,1")
+    monkeypatch.setattr(
+        worker_module, "mpi_comm", Mock(side_effect=RuntimeError("first collective"))
+    )
+    with pytest.raises(RuntimeError, match="first collective"):
+        worker_module.worker_main(worker_queues=None, log_level="info", llm_args=None)
+    assert not wide_ep_fault_tolerance_enabled()
+    assert _wide_ep_fault_tolerance.wide_ep_fault_tolerance_rank() is None
 
 
 @pytest.mark.parametrize(
@@ -3437,9 +3428,7 @@ def test_the_startup_rejects_a_largest_failure_no_kv_cache_pool_can_restore(
         suspended.append(True)
         yield device
 
-    monkeypatch.setattr(
-        recovery_module, "_moe_execution_state", Mock(workspace_bytes=Mock(return_value=4 * MIB))
-    )
+    moe_state = Mock(workspace_bytes=Mock(return_value=4 * MIB))
     executor = SimpleNamespace(
         dist=Mock(rank=0, allgather=lambda fits: [fits, peer_fits, True, True]),
         _kv_pools_suspended=kv_pools_suspended,
@@ -3448,10 +3437,12 @@ def test_the_startup_rejects_a_largest_failure_no_kv_cache_pool_can_restore(
         expert_restore=Mock(largest_failure_restore_bytes=Mock(return_value=restore_bytes))
     )
     if short is None:
-        recovery_module._check_largest_failure_fits(executor, balancer, STARTUP_MEMORY)
+        recovery_module._check_largest_failure_fits(executor, balancer, STARTUP_MEMORY, moe_state)
     else:
         with pytest.raises(ValueError, match=re.escape(f"on ranks {short}")) as error:
-            recovery_module._check_largest_failure_fits(executor, balancer, STARTUP_MEMORY)
+            recovery_module._check_largest_failure_fits(
+                executor, balancer, STARTUP_MEMORY, moe_state
+            )
         assert "more ranks, fewer EPLB slots per rank" in str(error.value)
     assert suspended == [True]
     # The pool tried the largest failure's quota, then took its startup quota back.
@@ -3914,10 +3905,13 @@ def test_every_rank_takes_its_identity_from_its_node_supervisor(monkeypatch, rep
     """The rank, the world size and whether it is a replacement come from the node supervisor."""
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,4,4,{int(replacement)}")
-    assert _wide_ep_fault_tolerance.wide_ep_fault_tolerance_rank() == (2, 4, 4, replacement)
+    identity = _wide_ep_fault_tolerance.wide_ep_fault_tolerance_rank()
+    assert identity == (2, 4, 4, replacement)
+    assert identity.env_value() == f"2,4,4,{int(replacement)}"
     expected = (2, 4, 4, True) if replacement else None
     assert _wide_ep_fault_tolerance.fault_tolerance_replacement() == expected
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
+    assert _wide_ep_fault_tolerance.wide_ep_fault_tolerance_rank() is None
     assert _wide_ep_fault_tolerance.fault_tolerance_replacement() is None
 
 

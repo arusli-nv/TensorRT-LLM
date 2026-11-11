@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Wide-EP fault tolerance starts every rank as its own process: the ranks that start together meet in the rendezvous
-store (StoreGroup), the loss of the store ends their waits, and a replacement's groups answer alone. Threads stand
+store (StoreGroup), the loss of the store ends their waits, and a replacement replays its startup group's exchanges
+from the startup record while its other groups answer alone. Threads stand
 for ranks; the store is a real TCPStore."""
 
 import socket
@@ -34,6 +35,7 @@ from tensorrt_llm._torch.distributed.membership import (
     MembershipRecord,
     MembershipState,
     RendezvousStore,
+    ReplacementCannotStart,
     StoreGroup,
 )
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory, TpMnnvlMemory
@@ -242,6 +244,34 @@ def test_a_split_groups_the_members_of_a_color_in_key_order(store, monkeypatch):
     assert (split.membership, split.Get_rank()) == ((2, 0), 0)
 
 
+def _startup_collectives(group, value):
+    return group.allgather(value), group.allreduce(value, op=MPI.MAX)
+
+
+def test_a_replacement_replays_the_startup_group(store, monkeypatch):
+    """Rank 0 records the startup group's exchanges, and a replacement of rank 1 gets the original ranks' results, or
+    fails naming the collective when its value differs. Fails without the change: its group answered alone."""
+    startup_record.record()  # in rank 0's process only
+
+    def rank(r):
+        return _startup_collectives(
+            StoreGroup(_client(store), "w", r, range(2), startup=r == 0), 10 * r
+        )
+
+    assert _on_ranks(range(2), rank) == {0: ([0, 10], 10), 1: ([0, 10], 10)}
+    published = startup_record.published()
+    _replay(monkeypatch, None)
+    startup_record.replay(published)
+    replacement = StoreGroup(None, "w", 1, range(2), active=[1], startup=True)
+    assert _startup_collectives(replacement, 10) == ([0, 10], 10)
+    _replay(monkeypatch, None)
+    startup_record.replay(published)
+    with pytest.raises(
+        ReplacementCannotStart, match="allgather in _startup_collectives .* differs"
+    ):
+        _startup_collectives(replacement, 20)
+
+
 def _mirror(store_port, rank, steps):
     """A peer of rank 1's process in test_an_original_rank_starts_without_mpi: the same collectives on its groups."""
     world = StoreGroup(
@@ -272,9 +302,9 @@ class _RecordingComm:
 
 def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     """Rank 1 of 4, its own MPI world: after join_startup_group, main's startup collectives reach its peers through
-    the store, and none goes to mpi4py. It joins before its worker turns fault tolerance on."""
+    the store, and none goes to mpi4py."""
     calls = []
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
     monkeypatch.setenv("TLLM_RANK", "-")
     monkeypatch.setattr(_utils, "comm", _RecordingComm(_utils.comm, calls))

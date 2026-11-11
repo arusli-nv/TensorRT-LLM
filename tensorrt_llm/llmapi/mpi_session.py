@@ -27,7 +27,7 @@ from tensorrt_llm.logger import logger
 
 from .. import _utils
 from .._utils import global_mpi_rank, mpi_rank
-from .._wide_ep_fault_tolerance import (FAULT_TOLERANCE_RANK_ENV,
+from .._wide_ep_fault_tolerance import (FAULT_TOLERANCE_RANK_ENV, RankIdentity,
                                         wide_ep_fault_tolerance_enabled)
 from .utils import logger_debug, print_colored
 
@@ -744,8 +744,8 @@ class MpiPoolSession(MpiSession):
         if wide_ep_fault_tolerance_enabled():
             self._start_node_supervisor({**os.environ, **env})
             # One node of n_workers ranks, as the node supervisor's.
-            env[FAULT_TOLERANCE_RANK_ENV] = (
-                f"0,{self.n_workers},{self.n_workers},0")
+            env[FAULT_TOLERANCE_RANK_ENV] = RankIdentity(
+                0, self.n_workers, self.n_workers, False).env_value()
         self.mpi_pool = MPIPoolExecutor(max_workers=_pool_workers(
             self.n_workers),
                                         path=sys.path,

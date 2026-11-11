@@ -26,22 +26,30 @@ _COLLECTIVE_MODULES = frozenset(
         __name__,
         "tensorrt_llm._torch.distributed.communicator",
         "tensorrt_llm._torch.distributed.host_exchange",
+        "tensorrt_llm._torch.distributed.membership",
+        "tensorrt_llm._utils",
     }
 )
+# Agreement helpers, whose callers name the startup collective.
+_COLLECTIVE_FUNCTIONS = frozenset(
+    {("tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup", "agree_flag")}
+)
 
-# Callers whose payload is a per-rank measurement, or a warmup vote that a replacement casts without the KV cache
-# estimation's warmup, so a replacement's payload may differ from its predecessor's.
+# Collectives, by file, function and collective of their caller, whose payload is a per-rank measurement or process
+# identity, or the autotuner warmup's skip vote, which a replacement casts without the KV cache estimation's warmup.
+# A replacement's payload to them may differ from its predecessor's.
 RANK_VARYING_CALLERS = frozenset(
     {
-        ("autotuner.py", "_merge_cache_data"),
-        ("autotuner.py", "post_tune_merge_tactics"),
-        ("warmup.py", "agree_flag"),
+        ("autotuner.py", "_merge_cache_data", "tp_cp_allgather"),
+        ("autotuner.py", "post_tune_merge_tactics", "tp_cp_allgather"),
+        ("warmup.py", "_run_autotuner_warmup", "agree_flag"),
+        ("worker.py", "worker_main", "allgather"),
     }
 )
 
 
 class Caller(NamedTuple):
-    """The ``Distributed`` method of a startup collective and the location of its caller."""
+    """The method of a startup collective and the location of its caller."""
 
     collective: str
     file: str
@@ -61,7 +69,10 @@ class RecordedExchange(NamedTuple):
 
 def _caller() -> Caller:
     frame, collective = sys._getframe(1), ""
-    while frame.f_globals.get("__name__") in _COLLECTIVE_MODULES:
+    while (
+        frame.f_globals.get("__name__") in _COLLECTIVE_MODULES
+        or (frame.f_globals.get("__name__"), frame.f_code.co_name) in _COLLECTIVE_FUNCTIONS
+    ):
         collective, frame = frame.f_code.co_name, frame.f_back
     return Caller(
         collective, Path(frame.f_code.co_filename).name, frame.f_lineno, frame.f_code.co_name
@@ -218,7 +229,7 @@ class StartupRecord:
         if (
             predecessor is not None
             and predecessor != payload
-            and (caller.file, caller.function) not in RANK_VARYING_CALLERS
+            and (caller.file, caller.function, caller.collective) not in RANK_VARYING_CALLERS
         ):
             if bound is None:
                 raise ReplacementCannotStart(

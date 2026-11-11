@@ -689,13 +689,13 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
-        self._execution_state: "MoeExecutionState | None" = None
+        self.execution_state: "MoeExecutionState | None" = None
         self._bound = False
         self._abort_state_kwargs: Dict[str, torch.Tensor] = {}
         if self._rank_mask_enabled:
             from .execution_state import MoeExecutionState  # imports this module
 
-            self._execution_state = MoeExecutionState.for_health(
+            self.execution_state = MoeExecutionState.for_health(
                 ep_group_health, self.workspace.device
             )
         if (
@@ -776,7 +776,7 @@ class NVLinkOneSided(Communication):
             )
         state.track_layer(self.ep_rank, self.reset_state)
         state.retain(self._require_workspace_lifecycle(), self._reset_local_workspace)
-        self._execution_state = state
+        self.execution_state = state
         self._abort_state_kwargs = {"abort_state": state.abort}
         self._bound = True
 
@@ -1024,7 +1024,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        state = self._execution_state
+        state = self.execution_state
         if self._rank_mask_enabled and not self._bound and torch.cuda.is_current_stream_capturing():
             # A replay would bypass the mask publication and the watchdog, and nothing could abort it.
             raise RuntimeError(
@@ -1178,7 +1178,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        state = self._execution_state
+        state = self.execution_state
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")

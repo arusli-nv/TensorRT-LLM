@@ -54,15 +54,19 @@ class RankIdentity(NamedTuple):
     gpus_per_node: int
     replacement: bool
 
+    def env_value(self) -> str:
+        """Return the value of ``FAULT_TOLERANCE_RANK_ENV`` that gives a process this identity."""
+        return ",".join(str(int(field)) for field in self)
+
 
 def wide_ep_fault_tolerance_rank() -> Optional[RankIdentity]:
-    """Return the rank identity the launcher gave this process, or None."""
-    return _parse_rank_identity(os.environ.get(FAULT_TOLERANCE_RANK_ENV))
+    """Return the rank identity the launcher gave this process, or None without fault tolerance."""
+    return _parse_rank_identity(os.environ.get(FAULT_TOLERANCE_RANK_ENV)) if _enabled else None
 
 
 def fault_tolerance_replacement() -> Optional[RankIdentity]:
     """Return the rank this process replaces, or None for an original rank."""
-    identity = wide_ep_fault_tolerance_rank() if _enabled else None
+    identity = wide_ep_fault_tolerance_rank()
     return identity if identity is not None and identity.replacement else None
 
 

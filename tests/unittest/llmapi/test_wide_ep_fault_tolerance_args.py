@@ -61,8 +61,7 @@ def _args(**fields) -> TorchLlmArgs:
         # The default (modeling_v2="auto") above included: under fault tolerance no modeling_v2 target is
         # resolved, which require rejects as the model loads.
         {"modeling_v2": "require"},
-        # Userbuffers, which torch.compile enables by default, stay off under fault tolerance.
-        {"torch_compile_config": TorchCompileConfig()},
+        {"torch_compile_config": TorchCompileConfig(enable_userbuffers=False)},
         {"prefill_cuda_graph_backend": "piecewise"},
     ],
 )
@@ -118,6 +117,11 @@ def test_a_supported_configuration_is_accepted(fields):
             "speculative_config: none, or another decoding_type such as MTP",
         ),
         ({"enable_lm_head_tp_in_adp": True}, "enable_lm_head_tp_in_adp=False"),
+        # torch.compile enables userbuffers by default.
+        (
+            {"torch_compile_config": TorchCompileConfig()},
+            "torch_compile_config.enable_userbuffers=False",
+        ),
         ({"sleep_config": SleepConfig()}, "sleep_config=None"),
         ({"num_serve_frontends": 2}, "num_serve_frontends=1"),
         ({"orchestrator_type": "rpc"}, "orchestrator_type unset"),

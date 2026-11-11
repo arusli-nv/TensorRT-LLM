@@ -3,17 +3,18 @@
 #
 # The startup collectives of a Wide-EP fault-tolerance deployment by the names of mpi_comm()'s collectives that do not
 # go through startup_record.agree, checked by test_startup_collectives_are_agreed_or_listed. A replacement rank starts
-# alone: its collectives reach only itself. Through Distributed (MnnvlDist) they return the original ranks' results
-# from the startup record; the others return None or nothing for every other rank. A result of mpi_comm() that must
-# match the original ranks' goes through startup_record.agree; every other such collective of the modules below is
-# listed under its function with a reason.
+# alone: its collectives reach only itself. Through Distributed (MnnvlDist) or the startup group (mpi_comm()) they
+# return the original ranks' results from the startup record; on the startup group's node and MNNVL subgroups they
+# return None or nothing for every other rank. A result of mpi_comm() that a replacement rank must take from the
+# original ranks goes through startup_record.agree; every other such collective of the modules below is listed under
+# its function with a reason.
 
 reasons:
-  replayed: a host collective of Distributed, which a replacement rank replays from the startup record
+  replayed: a host collective of Distributed or of the startup group, which a replacement rank replays from the startup
+    record
   agreed_elsewhere: a replacement rank skips it, or holds the original ranks' result from another call (the note names
     it)
   barrier: a barrier or a hold of the group whose result nobody reads; a replacement rank passes it at once
-  rank0_only: only rank 0 reads the result, and rank 0 is never replaced
   serving: runs only once the deployment serves, where the membership keeps the active ranks in step
   shutdown: runs at shutdown
   transport: implements a collective of the startup group or of MNNVL memory that takes absent ranks
@@ -25,8 +26,8 @@ reasons:
 # The modules the startup of a fault-tolerance deployment runs, from process start to the first served request.
 modules:
   tensorrt_llm/executor/worker.py:
-    worker_main: {collectives: [allgather, barrier, barrier], reason: rank0_only,
-                  note: the barriers wait for nobody on a replacement; only the leader reads the process identities}
+    worker_main: {collectives: [allgather, barrier, barrier], reason: replayed,
+                  note: the process identities differ per process (RANK_VARYING_CALLERS); only the leader reads them}
     GenerationExecutorWorker.shutdown: {collectives: [allgather, allgather], reason: shutdown}
   tensorrt_llm/_torch/pyexecutor/py_executor_creator.py: {}
   tensorrt_llm/_torch/pyexecutor/model_loader.py: {}

@@ -347,6 +347,18 @@ def test_main_s_warmup_agreement_on_a_replacement_decides_as_the_original_ranks(
     startup_record.close()
 
 
+def _vote(dist, flag):
+    return WarmupAgreement(dist, dist.mapping).agree_flag(flag)
+
+
+def test_a_replacement_s_other_warmup_votes_must_match():
+    """Only the autotuner warmup's skip vote may differ from the predecessor's. Fails without the change: every
+    warmup vote of a replacement was exempt."""
+    _vote(_rank_0(), True)
+    with pytest.raises(SystemExit, match="agree_flag in _vote .* differs"):
+        _vote(_replacement(_publish()), False)
+
+
 def test_votes_on_a_replacement_count_every_original_rank_during_the_replay():
     _rows(_rank_0())
     replacement = _replacement(_publish())

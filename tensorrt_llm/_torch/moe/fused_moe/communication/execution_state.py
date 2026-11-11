@@ -45,6 +45,7 @@ class BindableCommunication(Protocol):
 
     ep_group_health: EPGroupHealth | None
     workspace: torch.Tensor
+    execution_state: MoeExecutionState | None
 
     def bind_execution_state(self, state: MoeExecutionState) -> None:
         """Run every later collective with ``state``'s records."""

@@ -43,14 +43,18 @@ import os, sys, time
 from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery
-from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_rank
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    set_wide_ep_fault_tolerance_enabled,
+    wide_ep_fault_tolerance_rank,
+)
 from tensorrt_llm.executor import worker
 
 load_s, recovery.RENDEZVOUS_TIMEOUT_S = float(sys.argv[1]), float(sys.argv[2])
 
 
 def worker_main(**args):
-    recovery.start_worker(args)  # as worker_main does first
+    set_wide_ep_fault_tolerance_enabled(True)  # as worker_main does first
+    recovery.start_worker(args)
     rank = wide_ep_fault_tolerance_rank().rank
     print(f"STARTED {rank} {args['marker']}", flush=True)
     if rank == 0:

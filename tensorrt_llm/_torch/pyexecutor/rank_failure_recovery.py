@@ -51,6 +51,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     RankIdentity,
     check_fault_tolerance_requirements,
     fault_tolerance_replacement,
+    set_wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_rank,
 )
@@ -109,7 +110,6 @@ class _MembershipRestarted(Exception):
 _rendezvous_ports: List[socket.socket] = []
 _client: Optional[MembershipClient] = None
 _authority: Optional[subprocess.Popen] = None
-_moe_execution_state: Optional[MoeExecutionState] = None
 
 
 def ensure_rendezvous() -> None:
@@ -239,7 +239,6 @@ def prepare_model(model: torch.nn.Module) -> None:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from .config_utils import is_hybrid_linear
 
-    global _moe_execution_state
     if is_hybrid_linear(model.model_config.pretrained_config):
         raise ValueError(
             "Wide-EP fault tolerance does not support hybrid linear-attention models: their KV cache manager "
@@ -247,7 +246,7 @@ def prepare_model(model: torch.nn.Module) -> None:
             "request is freed, so it cannot hold a step's reuse commits until the step is accepted; turn it off "
             "(enable_wide_ep_fault_tolerance=False)"
         )
-    _moe_execution_state = MoeExecutionState.for_model(model)
+    MoeExecutionState.for_model(model)
     _check_host_weights_fit(model)
 
 
@@ -283,8 +282,6 @@ AGREED_STARTUP_KEY = "agreed_startup"
 WORKER_ARGS_KEY = "worker_args"
 
 _startup_fingerprint: Optional[str] = None
-_worker_main_args: Optional[dict] = None
-_published_record: Optional[dict] = None
 
 
 _deployment_nonce: Optional[str] = None
@@ -305,14 +302,6 @@ def _agreed_startup_record() -> bytes:
     return pickle.dumps({**startup_record.published(), "fingerprint": _startup_fingerprint})
 
 
-def _agreed_startup() -> dict:
-    global _published_record
-    if _published_record is None:
-        # Only processes with the shared secret write the store's values (RendezvousStore).
-        _published_record = pickle.loads(_startup_store().get(AGREED_STARTUP_KEY))  # nosec B301
-    return _published_record
-
-
 def startup_fingerprint(worker_main_args: dict) -> str:
     """Return a digest of the TensorRT-LLM version and the checkpoint's ``config.json``."""
     from tensorrt_llm.version import __version__
@@ -326,30 +315,29 @@ def startup_fingerprint(worker_main_args: dict) -> str:
 
 def start_worker(worker_main_args: dict) -> None:
     """Start the authority on rank 0, publish its worker arguments, join the membership and record the startup."""
-    global _startup_fingerprint, _worker_main_args, _authority
+    global _startup_fingerprint, _authority
     _startup_fingerprint = startup_fingerprint(worker_main_args)
-    _worker_main_args = worker_main_args
     identity = _launched_rank()
     if identity.rank == 0:
         _authority, _ = _start_authority(identity.world_size, RENDEZVOUS_TIMEOUT_S)
         store = _startup_store()
-        store.set(WORKER_ARGS_KEY, _worker_args_for_other_ranks())
+        store.set(WORKER_ARGS_KEY, _worker_args_for_other_ranks(worker_main_args))
         _join_at_entry(store, identity)
         startup_record.record()
     elif _client is None:
         raise ValueError(
             f"Wide-EP fault tolerance starts rank {identity.rank} as its own process, which takes rank 0's worker "
-            "arguments from the rendezvous store: run `python -m tensorrt_llm._torch.pyexecutor.rank_failure_recovery`"
+            "arguments from the rendezvous store: start it with worker_node_main, as trtllm-llmapi-launch does"
         )
 
 
-def _worker_args_for_other_ranks() -> bytes:
+def _worker_args_for_other_ranks(worker_main_args: dict) -> bytes:
     """Return rank 0's worker arguments without its IPC addresses and keys, which the store does not encrypt."""
     from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
 
     return pickle.dumps(
         {
-            **_worker_main_args,
+            **worker_main_args,
             "worker_queues": WorkerCommIpcAddrs(None, None, None),
             "rpc_addr": None,
             "hmac_key": b"",
@@ -358,12 +346,13 @@ def _worker_args_for_other_ranks() -> bytes:
 
 
 def worker_node_main() -> None:
-    """Run a rank other than 0 with fault tolerance (this module's ``python -m`` entry).
+    """Run a rank other than 0 with fault tolerance, as trtllm-llmapi-launch does.
 
     Raises:
         ReplacementCannotStart: A replacement does not match the deployment, or its startup failed in a way that a
             restart would repeat.
     """
+    set_wide_ep_fault_tolerance_enabled(True)
     identity = _launched_rank()
     from tensorrt_llm.executor.worker import worker_main
 
@@ -378,12 +367,13 @@ def worker_node_main() -> None:
         # Only processes with the shared secret can write the store's values (RendezvousStore).
         worker_main_args = pickle.loads(store.get(WORKER_ARGS_KEY))  # nosec B301
         if identity.replacement:
-            if startup_fingerprint(worker_main_args) != _agreed_startup()["fingerprint"]:
+            agreed_startup = pickle.loads(store.get(AGREED_STARTUP_KEY))  # nosec B301
+            if startup_fingerprint(worker_main_args) != agreed_startup["fingerprint"]:
                 raise ReplacementCannotStart(
                     "The replacement rank does not match the deployment it replaces a rank of (TensorRT-LLM "
                     "version or checkpoint)"
                 )
-            startup_record.replay(_agreed_startup())
+            startup_record.replay(agreed_startup)
         worker_main(**worker_main_args)
     except ReplacementCannotStart as error:
         logger.error(f"No replacement of this rank can start: {error}")
@@ -432,6 +422,7 @@ def join_startup_group(mapping: Mapping) -> None:
         _report_startup_wait,
         active=[identity.rank] if identity.replacement else None,
         gpus_per_node=identity.gpus_per_node,
+        startup=True,
     )
     set_mpi_comm(startup_group)
     set_mpi_world_comm(startup_group)
@@ -491,6 +482,12 @@ def _moe_load_balancer_of(executor: PyExecutor):
     return balancer if isinstance(balancer, MoeLoadBalancer) else None
 
 
+def _moe_execution_state_of(executor: PyExecutor) -> MoeExecutionState:
+    from ..moe.fused_moe.communication.execution_state import MoeExecutionState
+
+    return MoeExecutionState.model_comms(executor.model_engine.model)[0].execution_state
+
+
 def _admission_keys(generation: int) -> Tuple[str, str]:
     return f"host_exchange_epoch/{generation}", f"waiting_queue/{generation}"
 
@@ -543,12 +540,15 @@ class _GiveBackRetry:
 
 
 def _check_largest_failure_fits(
-    executor: PyExecutor, balancer, startup_memory: StartupMemory
+    executor: PyExecutor,
+    balancer,
+    startup_memory: StartupMemory,
+    moe_execution_state: MoeExecutionState,
 ) -> None:
     """Check on every original rank that the KV cache pool can give up the memory to restore the largest failure."""
     needed = (
         balancer.expert_restore.largest_failure_restore_bytes()
-        + _moe_execution_state.workspace_bytes()
+        + moe_execution_state.workspace_bytes()
     )
     fits = True
     with executor._kv_pools_suspended() as kv_cache_manager:
@@ -736,8 +736,9 @@ class RankFailureRecovery:
             )
         balancer = _moe_load_balancer_of(executor)
         startup_memory = StartupMemory(executor.kv_cache_manager.gpu_quota)
+        moe_execution_state = _moe_execution_state_of(executor)
         if replacement is None and balancer is not None:
-            _check_largest_failure_fits(executor, balancer, startup_memory)
+            _check_largest_failure_fits(executor, balancer, startup_memory, moe_execution_state)
         host_weights_prefix = (
             None
             if balancer is None
@@ -751,7 +752,7 @@ class RankFailureRecovery:
         recovery = cls(
             executor,
             dist.host_exchange,
-            _moe_execution_state,
+            moe_execution_state,
             store,
             os.environ[RENDEZVOUS_ENV],
             startup_memory,
@@ -1518,10 +1519,3 @@ class FaultToleranceHealth:
                 incarnations=list(record.incarnations),
             )
         return status
-
-
-if __name__ == "__main__":
-    # Run in the imported module, whose state the executor shares.
-    from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
-
-    rank_failure_recovery.worker_node_main()

@@ -25,7 +25,7 @@ def _frontend(health: EPGroupHealth | None, *, cft: bool = False) -> NVLinkOneSi
     comm.can_use_cft_counted_writes = cft
     comm.ep_group_health = health
     comm._rank_mask_enabled = health is not None
-    comm._execution_state = None
+    comm.execution_state = None
     comm._bound = False
     comm._abort_state_kwargs = {}
     comm.ep_rank = 0
@@ -270,7 +270,7 @@ def test_rearm_resets_bound_layers_and_install_refuses_a_membership_without_this
     excluded.ep_rank = 1
     with pytest.raises(RuntimeError, match="excludes this rank"):
         excluded.bind_execution_state(state)
-    assert excluded._execution_state is None
+    assert excluded.execution_state is None
 
     # A rank whose own bit the committed membership clears must not run masked collectives.
     health = EPGroupHealth(2)
@@ -337,7 +337,7 @@ def test_published_mask_is_rewritten_only_for_a_new_generation() -> None:
 def test_an_unbound_rank_mask_dispatch_refuses_cuda_graph_capture(monkeypatch) -> None:
     """A layer that reads the shared state but is not bound to one: nothing could abort a replayed collective."""
     comm = _frontend(EPGroupHealth(2))
-    comm._execution_state = MoeExecutionState.for_health(comm.ep_group_health, torch.device("cuda"))
+    comm.execution_state = MoeExecutionState.for_health(comm.ep_group_health, torch.device("cuda"))
     comm.mnnvl_mem.mapped = True
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="only once bound to an execution state"):

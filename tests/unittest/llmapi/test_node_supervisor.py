@@ -292,8 +292,11 @@ def _push_and_wait_for_step(running, authority, record, nodes=((NODE, "host-1", 
     _until(lambda: running.supervisor._view.record == following)
 
 
-def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deployment):
+@pytest.mark.parametrize("btl", [None, "self,tcp"], ids=["default", "user-set"])
+def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deployment, btl):
     authority, environ = deployment
+    if btl is not None:
+        environ = {**environ, "OMPI_MCA_btl": btl}
     running = _serving(tmp_path, authority, environ)
     for rank in RANKS:
         started = _read(tmp_path, rank, 0)
@@ -303,7 +306,8 @@ def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deplo
             for key in started["environ"]
             if key != "OMPI_MCA_btl"
         )
-        assert started["environ"]["OMPI_MCA_btl"] == "^sm"  # no /dev/shm segment to leave behind
+        # Without the user's setting, no /dev/shm segment to leave behind.
+        assert started["environ"]["OMPI_MCA_btl"] == (btl or "^sm")
         assert started["environ"][SHARED_SECRET_ENV] == os.environ[SHARED_SECRET_ENV]
         assert os.environ[SHARED_SECRET_ENV] not in " ".join(started["argv"])
     assert authority.hellos == [["node", "1", "2,3", socket.gethostname()]]
@@ -856,7 +860,8 @@ def _run_launcher(tmp_path, procid, task, **extra):
     fake_python = bin_dir / "python3"
     fake_python.write_text(
         "#!/bin/bash\n"
-        'if [ "$1" = "-m" ] || [[ "$1" == *_llmapi_node_supervisor.py ]]; then\n'
+        'if [ "$1" = "-m" ] || [[ "$1" == *_llmapi_node_supervisor.py ]] '
+        '|| [[ "$1 $2" == "-c "*worker_node_main* ]]; then\n'
         f'    printf "%s\\n" "$@" > "{record}"\n'
         "    exit 0\n"
         "fi\n"
@@ -939,8 +944,12 @@ def test_a_rank_the_node_supervisor_starts_takes_its_rank_from_its_identity(tmp_
     assert result.returncode == 0, result.stderr
     assert "mpi_rank: 3" in result.stderr
     assert "with mpi_world_size: 4" in result.stderr
-    args = (tmp_path / "python3-args").read_text().split()
-    assert args == ["-m", "tensorrt_llm._torch.pyexecutor.rank_failure_recovery"]
+    args = (tmp_path / "python3-args").read_text().splitlines()
+    assert args == [
+        "-c",
+        "from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import worker_node_main; "
+        "worker_node_main()",
+    ]
     assert "MGMN worker node exit code" not in result.stderr  # exec'd
 
 

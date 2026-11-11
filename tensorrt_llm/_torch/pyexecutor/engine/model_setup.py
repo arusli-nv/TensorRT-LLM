@@ -215,12 +215,6 @@ def _init_userbuffers(
             "disabled under this orchestrator."
         )
         return False
-    if llm_args.enable_wide_ep_fault_tolerance:
-        logger.info(
-            "Disabling userbuffers: its bootstrap requires an MPI world of all "
-            "ranks, and Wide-EP fault tolerance runs each rank in its own."
-        )
-        return False
 
     # Disable UB for unsupported platforms
     if not ub.ub_supported():

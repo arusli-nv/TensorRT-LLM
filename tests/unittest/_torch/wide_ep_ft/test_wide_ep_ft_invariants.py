@@ -465,7 +465,7 @@ def test_previous_batch_is_read_after_acceptance():
 STARTUP_COLLECTIVES = HERE / "wide_ep_ft_startup_collectives.yaml"
 ENTRY_KEYS = frozenset({"collectives", "reason", "note"})
 # Collectives the startup calls on mpi_comm() (a StoreGroup under fault tolerance) and its subgroups. A replacement
-# rank does not replay these from the startup record.
+# rank replays those of mpi_comm() from the startup record, not those of its subgroups.
 STARTUP_COLLECTIVE_NAMES = frozenset(
     {"allgather", "allreduce", "bcast", "barrier", "Barrier", "Allgather", "Allreduce", "Bcast"}
     | {"Split", "Split_type", "Create_group", "Dup", "subgroup"}
@@ -502,8 +502,8 @@ def _agreed_nodes(function: ast.AST) -> set:
 def test_startup_collectives_are_agreed_or_listed():
     """A startup collective outside ``Distributed`` goes through ``startup_record.agree`` or is listed with a reason.
 
-    A replacement rank starts alone, so a collective on ``mpi_comm()`` (a ``StoreGroup``) reaches only itself. The
-    check is static and covers only the modules wide_ep_ft_startup_collectives.yaml lists.
+    A replacement rank starts alone, so a collective on a subgroup of ``mpi_comm()`` (a ``StoreGroup``) reaches only
+    itself. The check is static and covers only the modules wide_ep_ft_startup_collectives.yaml lists.
     """
     table = _load_table(STARTUP_COLLECTIVES)
     reasons, modules = table["reasons"], table["modules"]

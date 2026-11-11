@@ -8007,6 +8007,11 @@ class TorchLlmArgs(BaseLlmArgs):
              "no LM head TP in attention DP (enable_lm_head_tp_in_adp=False), "
              "because a failed rank would take its share of the vocabulary "
              "with it"),
+            (self.torch_compile_config is None
+             or not self.torch_compile_config.enable_userbuffers,
+             "no userbuffers (torch_compile_config.enable_userbuffers=False), "
+             "because their setup exchanges memory handles over an MPI world "
+             "of every rank, and each rank is its own MPI world"),
             (self.sleep_config is None,
              "no sleep mode (sleep_config=None), because sleep releases and "
              "restores the GPU memory of the weights, whose spare slots fault "

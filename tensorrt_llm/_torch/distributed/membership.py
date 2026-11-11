@@ -640,7 +640,8 @@ class StoreGroup:
 
     Only the members in ``active`` take part, and the others' values are None. While a call waits, ``on_wait`` gets the
     mask of the active members whose values are missing, and may raise to stop waiting. Given ``gather``, the group
-    exchanges through it instead of the store.
+    exchanges through it instead of the store. The exchanges of a ``startup`` group are startup collectives, which
+    rank 0 records and a replacement replays.
     """
 
     def __init__(
@@ -653,6 +654,7 @@ class StoreGroup:
         active: Optional[Sequence[int]] = None,
         gpus_per_node: int = 1,
         gather: Optional[Callable[[Any], Sequence[Any]]] = None,
+        startup: bool = False,
     ):
         self.membership = tuple(ranks)
         self.rank = rank
@@ -663,6 +665,7 @@ class StoreGroup:
         self._active = tuple(r for r in self.membership if active is None or r in active)
         self._gpus_per_node = gpus_per_node
         self._gather = gather
+        self._startup = startup
         self._calls = 0
         self._subgroups = 0
 
@@ -672,14 +675,16 @@ class StoreGroup:
     def Get_size(self) -> int:
         return len(self.membership)
 
-    def allgather(self, value: Any) -> List[Any]:
-        """Return every member's value by communicator rank, with None for a member that is not active."""
+    def allgather(self, value: Any, bound: Optional[Callable[[Any, Any], Any]] = None) -> List[Any]:
+        """Return every member's value by communicator rank, with None for a member that is not active.
+
+        ``bound`` is ``min`` or ``max`` for a reduction by it, else None.
+        """
         try:
-            by_rank = self._exchange(value)
+            return self._exchange(value, bound)
         except BaseException:
             self.exchange_failed = True
             raise
-        return [by_rank.get(r) for r in self.membership]
 
     def barrier(self) -> None:
         self.allgather(None)
@@ -695,10 +700,10 @@ class StoreGroup:
         from mpi4py import MPI
 
         op = MPI.SUM if op is None else op
-        values = [value for value in self.allgather(obj) if value is not None]
         for mpi_op, reduce in ((MPI.SUM, sum), (MPI.MIN, min), (MPI.MAX, max)):
             if op == mpi_op:
-                return reduce(values)
+                values = self.allgather(obj, None if reduce is sum else reduce)
+                return reduce(value for value in values if value is not None)
         raise NotImplementedError(f"StoreGroup reduces by MPI.SUM, MPI.MIN or MPI.MAX, not {op}")
 
     def Free(self) -> None:
@@ -744,19 +749,33 @@ class StoreGroup:
         node = self.rank // self._gpus_per_node
         return self.subgroup(r for r in self.membership if r // self._gpus_per_node == node)
 
-    def _exchange(self, value: Any) -> Dict[int, Any]:
+    def _exchange(self, value: Any, bound: Optional[Callable[[Any, Any], Any]]) -> List[Any]:
         if self._gather is not None:
             values = self._gather(value)
-            return {r: values[r] for r in self.membership}
+            return [values[r] for r in self.membership]
+        from .startup_record import startup_record
+
         if self._active == (self.rank,):
             self._on_wait(0)
-            return {self.rank: value}
+        payload = pickle.dumps(value)
+        if self._startup and startup_record.active:
+            payloads = startup_record.exchange(
+                self.Get_rank(), payload, None, lambda: self._store_exchange(payload), bound
+            )
+        else:
+            payloads = self._store_exchange(payload)
+        # Only processes with the shared secret write the store's values (RendezvousStore).
+        return [None if p is None else pickle.loads(p) for p in payloads]  # nosec B301
+
+    def _store_exchange(self, payload: bytes) -> List[Optional[bytes]]:
+        if self._active == (self.rank,):
+            return [payload if r == self.rank else None for r in self.membership]
         from torch.distributed import DistError
 
         prefix = f"{self._name}/{self._calls}"
         self._calls += 1
         try:
-            self._store.set(f"{prefix}/{self.rank}", pickle.dumps(value))
+            self._store.set(f"{prefix}/{self.rank}", payload)
             self._store.store.add(
                 self._counter(prefix, self.rank), 1 << self.rank % _RANKS_PER_COUNTER
             )
@@ -774,8 +793,8 @@ class StoreGroup:
             raise RuntimeError(
                 f"Rank {self.rank} lost the rendezvous store, which the membership authority hosts"
             ) from error
-        # Only processes with the shared secret write the store's values (RendezvousStore).
-        return {r: pickle.loads(v) for r, v in zip(self._active, values)}  # nosec B301
+        by_rank = dict(zip(self._active, values))
+        return [by_rank.get(r) for r in self.membership]
 
     def _wait(self, prefix: str) -> List[bytes]:
         keys = [f"{prefix}/{r}" for r in self._active]

@@ -30,7 +30,8 @@ from tensorrt_llm.logger import logger
 
 from .._startup_errors import classify_startup_error, wrap_worker_startup_error
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
-from .._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
+from .._wide_ep_fault_tolerance import (set_wide_ep_fault_tolerance_enabled,
+                                        wide_ep_fault_tolerance_enabled)
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -394,18 +395,15 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
-    if getattr(llm_args, "enable_wide_ep_fault_tolerance", False):
+    set_wide_ep_fault_tolerance_enabled(
+        getattr(llm_args, "enable_wide_ep_fault_tolerance", False))
+    if wide_ep_fault_tolerance_enabled():
         # Before any other local, since every other rank starts with these.
         worker_main_args = dict(locals())
         from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
             join_startup_group, start_worker)
         start_worker(worker_main_args)
         join_startup_group(llm_args.parallel_config.to_mapping())
-    elif FAULT_TOLERANCE_RANK_ENV in os.environ:
-        raise ValueError(
-            "The launcher started this rank as its own process for Wide-EP "
-            f"fault tolerance ({FAULT_TOLERANCE_RANK_ENV} is set), but "
-            "enable_wide_ep_fault_tolerance is off")
 
     launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
     if llm_args is not None and llm_args.env_overrides:
@@ -473,7 +471,7 @@ def worker_main(
             register_external_model_modules
         register_external_model_modules(_torch_external_model_modules or {})
 
-    if not getattr(llm_args, "enable_wide_ep_fault_tolerance", False):
+    if not wide_ep_fault_tolerance_enabled():
         set_mpi_session_cpp(mpi_comm())
 
     if is_leader:

@@ -128,7 +128,7 @@ class NodeSupervisor:
         }
         # Each rank started here is a one-process MPI world, which has no shared-memory peer: without the sm transport
         # it creates no /dev/shm segment that its exit (os._exit, or a kill) would leave behind.
-        self._environ["OMPI_MCA_btl"] = "^sm"
+        self._environ["OMPI_MCA_btl"] = environ.get("OMPI_MCA_btl", "^sm")
         self._relaunch_command = relaunch_command
         self._end_job_through_launcher = end_job
         self._parent = os.getppid()
@@ -337,8 +337,10 @@ class NodeSupervisor:
             self._logger.error(f"Cannot end the job: {error!r}")
 
     def _start(self, rank: int, replacement: bool) -> None:
-        identity = f"{rank},{self._world_size},{self._gpus_per_node},{int(replacement)}"
-        environ = {**self._environ, self._rank_env: identity}
+        from tensorrt_llm._wide_ep_fault_tolerance import RankIdentity
+
+        identity = RankIdentity(rank, self._world_size, self._gpus_per_node, replacement)
+        environ = {**self._environ, self._rank_env: identity.env_value()}
         child = subprocess.Popen(  # nosec B603
             self._command,
             env=environ,

@@ -7,7 +7,7 @@ set -Eeo pipefail
 task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
-# "<rank>,<world size>,<GPUs per node>,<incarnation>"
+# "<rank>,<world size>,<GPUs per node>,<replacement>" (RankIdentity.env_value)
 fault_tolerance_world_size=
 if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
     IFS=, read -r mpi_rank fault_tolerance_world_size _ <<< "$TLLM_FAULT_TOLERANCE_RANK"
@@ -528,7 +528,7 @@ else
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
     if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
         # The worker must be a direct child of the node supervisor to exit with it.
-        exec python3 -m tensorrt_llm._torch.pyexecutor.rank_failure_recovery
+        exec python3 -c "from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import worker_node_main; worker_node_main()"
     fi
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?
