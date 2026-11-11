@@ -56,6 +56,7 @@ from tensorrt_llm._torch.distributed.membership import (
     ResumeState,
     SignedStore,
     TransactionSummary,
+    incarnation_key,
 )
 from tensorrt_llm._torch.distributed.mnnvl_live_group import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
@@ -114,7 +115,8 @@ FAILED = 2
 SURVIVORS = 0b1011
 MIB = 1 << 20
 # A rank's KV cache pool and free device memory once the deployment serves.
-STARTUP_MEMORY = StartupMemory(kv_cache_quota=64 * MIB, free_bytes=1 << 30)
+STARTUP_MEMORY = StartupMemory(kv_cache_quota=64 * MIB)
+FREE_BYTES = 1 << 30
 
 
 # Attention-DP routing over the ranks that serve.
@@ -766,9 +768,9 @@ def test_an_admission_does_not_abort_the_steps_in_flight_a_removal_does(
     assert recovery._membership_changing() == aborts
 
 
-def _vote(recovery, batch_size=4, peers=((3, 0), (5, 0), (2, 0))):
-    """``recovery``'s forward vote, with the other ranks' rows ``peers`` ([batch size, holds for a pending change]);
-    returns the row it sent and the batch sizes."""
+def _vote(recovery, batch_size=4, peers=((3, 0, 0), (5, 0, 0), (2, 0, 0))):
+    """``recovery``'s forward vote, with the other ranks' rows ``peers`` ([batch size, holds for a pending change,
+    retries a give-back]); returns the row it sent and the batch sizes."""
     sent = []
 
     def gather(row):
@@ -786,10 +788,13 @@ def test_an_admission_does_not_stop_the_host_exchange_after_an_idle_vote():
     rank stops at the start of the next round, without sending, so no rank completes it."""
     recovery = _recovery(rank=1)
     recovery._on_record(_record(MembershipState.COMMITTED))  # rank 2 was lost earlier
-    assert _vote(recovery, batch_size=0, peers=((0, 0), (0, 0), (0, 0))) == ([0, 0], [0, 0, 0, 0])
+    assert _vote(recovery, batch_size=0, peers=((0, 0, 0), (0, 0, 0), (0, 0, 0))) == (
+        [0, 0, 0],
+        [0, 0, 0, 0],
+    )
     recovery._on_record(_joining_record(MembershipState.PROPOSE))
     assert recovery.holds_steps() and not recovery._membership_changing()
-    assert _vote(recovery) == ([0, 1], [0, 3, 5, 2])  # it holds its steps for the change
+    assert _vote(recovery) == ([0, 1, 0], [0, 3, 5, 2])  # it holds its steps for the change
     assert recovery._membership_changing()
 
 
@@ -800,7 +805,10 @@ def test_an_admission_stops_the_host_exchange_once_a_rank_held_for_it_in_a_vote(
     recovery = _recovery()
     recovery._on_record(_record(MembershipState.COMMITTED))  # rank 2 was lost earlier
     wake = recovery._executor.executor_request_queue.wake
-    assert _vote(recovery, peers=((0, 1), (5, 0), (2, 0))) == ([4, 0], [4, 0, 5, 2])
+    assert _vote(recovery, peers=((0, 1, 0), (5, 0, 0), (2, 0, 0))) == (
+        [4, 0, 0],
+        [4, 0, 5, 2],
+    )
     wake.assert_not_called()
     assert not recovery._membership_changing()  # it has not seen the change yet
     recovery._on_record(_joining_record(MembershipState.PROPOSE))
@@ -1453,22 +1461,24 @@ def test_a_request_the_scheduler_paused_for_recompute_is_not_freed_again():
 
 
 class _Device:
-    """A rank's device memory since the deployment started serving: its free memory and its KV cache pool (this is
-    also the KV cache manager), whose quota changes in whole MiB above an 8 MiB minimum. ``calls`` records the
-    resizes."""
+    """A rank's device memory since the deployment started serving: its free memory, the spare slots its EPLB backs
+    (``backed``) and its KV cache pool (this is also the KV cache manager), whose quota changes in whole ``unit``s
+    above an 8 MiB minimum and within the free memory. ``calls`` records the resizes."""
 
-    def __init__(self, extra_free=0, gpu_quota=STARTUP_MEMORY.kv_cache_quota):
+    def __init__(self, extra_free=0, gpu_quota=STARTUP_MEMORY.kv_cache_quota, backed=0, unit=MIB):
         self.calls = []
-        self.free = STARTUP_MEMORY.free_bytes + extra_free
+        self.free = FREE_BYTES + extra_free
         self.gpu_quota = gpu_quota
+        self.backed = backed
+        self.unit = unit
 
     def take(self, num_bytes):
         self.free -= num_bytes
 
     def resize_gpu_quota(self, quota):
         self.calls.append(("resize", quota))
-        quota = max(0, quota) // MIB * MIB
-        if quota < 8 * MIB:
+        quota = max(0, quota) // self.unit * self.unit
+        if quota < 8 * MIB or quota - self.gpu_quota > self.free:
             raise RuntimeError(f"The GPU KV cache pool cannot be resized to {quota} bytes")
         self.take(quota - self.gpu_quota)
         self.gpu_quota = quota
@@ -1488,15 +1498,20 @@ def _eplb(monkeypatch, recovery, restored=6 * MIB, workspace=4 * MIB, device=Non
     plan = SimpleNamespace(device_bytes=restored, digest="restored", placements=planned)
     calls = device.calls
 
+    def back(num_bytes):
+        device.take(num_bytes)
+        device.backed += num_bytes
+        balancer.expert_restore.backed_spare_slot_bytes = device.backed
+
     def restore_lost_experts(restore, times):
         calls.append(("restore", restore))
-        device.take(restored)
+        back(restored)
         times.update({"back": 1.0, "load": 2.0, "placement install": 3.0})
         return restored
 
     def release_empty_spare_slots():
         calls.append("release")
-        device.take(-released)
+        back(-released)
         return released
 
     balancer.expert_restore = SimpleNamespace(
@@ -1505,6 +1520,7 @@ def _eplb(monkeypatch, recovery, restored=6 * MIB, workspace=4 * MIB, device=Non
         ),
         restore_lost_experts=restore_lost_experts,
         release_empty_spare_slots=release_empty_spare_slots,
+        backed_spare_slot_bytes=device.backed,
     )
     balancer.abandon_iterations = lambda: calls.append("abandon")
 
@@ -1540,7 +1556,7 @@ def test_the_install_restores_the_lost_experts_from_the_agreed_placement(monkeyp
     assert "1 experts loaded (6291456 bytes)" in restored
     assert (
         f"KV cache quota {64 * MIB} -> {54 * MIB} bytes ({10 * MIB - 4096} bytes needed, "
-        f"{STARTUP_MEMORY.free_bytes} bytes free); phases: "
+        f"{FREE_BYTES} bytes free); phases: "
     ) in restored
     phases = restored.split("; phases: ")[1].split(", ")
     assert [phase.rsplit(" ", 2)[0] for phase in phases] == [
@@ -1590,28 +1606,132 @@ def test_each_completed_install_step_is_reported_as_progress(monkeypatch):
     assert steps == [1, 2, 3, 4, 5, Reply.INSTALLED]
 
 
-@pytest.mark.parametrize(
-    "extra_free, resizes",
-    [
-        (0, [54 * MIB, 58 * MIB]),
-        # Free memory beyond the startup's backs the restore first: the pool gives up only the shortfall.
-        (7 * MIB, [61 * MIB, 64 * MIB]),
-        (20 * MIB, [64 * MIB, 64 * MIB]),
-        # Less free memory than at the startup (allocations since used main's margin): the pool still gives up
-        # only what the change needs.
-        (-3 * MIB, [54 * MIB, 55 * MIB]),
-    ],
-)
-def test_the_kv_cache_pool_gives_up_only_what_the_free_memory_lacks(
-    monkeypatch, extra_free, resizes
-):
+@pytest.mark.parametrize("extra_free", [0, 7 * MIB, 20 * MIB, -3 * MIB])
+def test_the_kv_cache_pool_gives_up_exactly_what_the_change_takes(monkeypatch, extra_free):
+    """The 6 MiB spare slot and the 4 MiB workspace come out of the KV cache pool, whatever serving allocated or
+    freed since the startup (``extra_free``); once committed, the pool takes back the workspace's part."""
     recovery = _resuming_recovery(placement=_PLACEMENT)
     _, _, device = _eplb(monkeypatch, recovery, device=_Device(extra_free=extra_free))
     recovery._restore(recovery._installed)
     recovery._give_back_kv_cache()  # once committed
-    assert _resizes(device) == resizes and device.gpu_quota == resizes[-1]
-    # The memory free at the startup stays free for the allocations that rely on it.
-    assert device.free >= STARTUP_MEMORY.free_bytes + min(extra_free, 0)
+    assert _resizes(device) == [54 * MIB, 58 * MIB] and device.gpu_quota == 58 * MIB
+    # Serving keeps the memory it had free.
+    assert device.free == FREE_BYTES + extra_free
+
+
+def test_the_kv_cache_pool_takes_back_its_startup_quota_after_serving_allocated_memory(monkeypatch):
+    """Serving allocates 160 MiB after the startup (the caching allocator grows): a failover and the rejoin after
+    it charge none of it to the KV cache pool, which resizes in units of 32 MiB, and it is back at its startup
+    quota."""
+    unit = 32 * MIB
+    startup = StartupMemory(kv_cache_quota=64 * unit)
+    device = _Device(gpu_quota=startup.kv_cache_quota, unit=unit)
+    device.take(5 * unit)  # serving
+    loss = _resuming_recovery(placement=_PLACEMENT)
+    loss._startup_memory = startup
+    _eplb(monkeypatch, loss, restored=3 * unit, workspace=2 * unit, device=device)
+    loss._restore(loss._installed)
+    loss._give_back_kv_cache()  # once committed
+    assert device.gpu_quota == startup.kv_cache_quota - 3 * unit
+    rejoin = _resuming_recovery(
+        record=_INSTALL.model_copy(update=dict(live_mask=0b1111, joining_mask=1 << FAILED)),
+        placement=_PLACEMENT,
+    )
+    rejoin._startup_memory = startup
+    _eplb(monkeypatch, rejoin, restored=0, workspace=2 * unit, released=3 * unit, device=device)
+    rejoin._restore(rejoin._installed)
+    rejoin._give_back_kv_cache()  # once committed
+    assert device.gpu_quota == startup.kv_cache_quota
+    assert device.free == FREE_BYTES - 5 * unit
+
+
+def test_the_kv_cache_pool_leaves_out_the_pages_a_process_that_is_ending_maps(monkeypatch):
+    """At the commit, an excluded process that has not ended yet still maps the pages the remap replaced: the pool
+    takes back only memory freed since the change started, so serving keeps the memory it had free, and takes the
+    rest back at the next change."""
+    device = _Device()
+    loss = _resuming_recovery(placement=_PLACEMENT)
+    _eplb(monkeypatch, loss, device=device)
+    loss._moe.remap_workspaces.side_effect = lambda gather: device.take(4 * MIB)
+    loss._restore(loss._installed)
+    loss._give_back_kv_cache()  # once committed
+    assert device.gpu_quota == 54 * MIB and device.free == FREE_BYTES
+    device.take(-4 * MIB)  # the excluded process ended
+    rejoin = _resuming_recovery(
+        record=_INSTALL.model_copy(update=dict(live_mask=0b1111, joining_mask=1 << FAILED)),
+        placement=_PLACEMENT,
+    )
+    _eplb(monkeypatch, rejoin, restored=0, released=6 * MIB, device=device)
+    rejoin._restore(rejoin._installed)
+    rejoin._give_back_kv_cache()  # once committed
+    assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota and device.free == FREE_BYTES
+
+
+def _short_give_back(monkeypatch):
+    """Rank 0 after a failover whose commit found the pages the remap replaced still mapped by the process of the
+    excluded rank 2: its give-back fell 4 MiB short. A second passed since."""
+    monkeypatch.setattr(recovery_module.torch.cuda, "synchronize", lambda: None)
+    recovery = _resuming_recovery(placement=_PLACEMENT)
+    _, _, device = _eplb(monkeypatch, recovery)
+    recovery._moe.remap_workspaces.side_effect = lambda gather: device.take(4 * MIB)
+    recovery.before_iteration()  # the install, then the commit
+    assert device.gpu_quota == 54 * MIB and device.free == FREE_BYTES
+    recovery._give_back_retry.check_after_s = 0.0
+    recovery._executor._retire_inflight_batch_for_control.reset_mock()
+    return recovery, device
+
+
+def test_a_rank_whose_give_back_fell_short_asks_for_a_retry_once_memory_is_freed(monkeypatch):
+    """No retry while no device memory was freed since the commit, and at most one request a second; every rank takes
+    part in a retry another rank asked for, unless a rank held its steps for a pending change."""
+    recovery, device = _short_give_back(monkeypatch)
+    assert _vote(recovery)[0] == [4, 0, 0] and not recovery._give_back_agreed
+    recovery._give_back_retry.check_after_s = 0.0
+    device.take(-4 * MIB)  # the excluded process ended
+    assert _vote(recovery)[0] == [4, 0, 1] and recovery._give_back_agreed
+    assert _vote(recovery)[0] == [4, 0, 0]  # within the second
+    other = _recovery(rank=1)
+    _vote(other, peers=((4, 0, 1), (5, 0, 0), (2, 0, 0)))
+    assert other._give_back_agreed and not other._give_back_due
+    _vote(other, peers=((4, 0, 1), (5, 1, 0), (2, 0, 0)))
+    assert not other._give_back_agreed
+
+
+def test_a_retried_give_back_takes_back_the_memory_freed_since_the_commit(monkeypatch):
+    """At the iteration after the vote, the step in flight is retired, then the pool takes back what the ended process
+    freed: it holds its quota for the backed spare slot again, and the retries end."""
+    recovery, device = _short_give_back(monkeypatch)
+    retire = recovery._executor._retire_inflight_batch_for_control
+    device.take(-4 * MIB)  # the excluded process ended
+    _vote(recovery)
+    recovery.before_iteration()
+    retire.assert_called_once()
+    assert device.gpu_quota == 58 * MIB and device.free == FREE_BYTES
+    assert recovery._give_back_retry is None
+    _vote(recovery)
+    recovery.before_iteration()
+    retire.assert_called_once()
+
+
+def test_the_give_back_retries_end_once_the_excluded_process_ended(monkeypatch):
+    """Once the replacement of rank 2 claimed its incarnation, its excluded process has ended: with no memory freed
+    since the last give-back, the retries end without another one."""
+    recovery, device = _short_give_back(monkeypatch)
+    recovery._store.set(incarnation_key(FAILED), b"1 claim")
+    assert _vote(recovery)[0] == [4, 0, 0]
+    assert recovery._give_back_retry is None and device.gpu_quota == 54 * MIB
+
+
+def test_a_healthy_step_checks_no_device_memory(monkeypatch):
+    """Without a give-back that fell short, the vote asks for no retry, reads no free device memory, and the next
+    iteration retires no step."""
+    recovery = _recovery()
+    mem_get_info = Mock()
+    monkeypatch.setattr(recovery_module.torch.cuda, "mem_get_info", mem_get_info)
+    assert _vote(recovery)[0] == [4, 0, 0] and not recovery._give_back_agreed
+    recovery.before_iteration()
+    mem_get_info.assert_not_called()
+    recovery._executor._retire_inflight_batch_for_control.assert_not_called()
 
 
 def test_a_rejoin_releases_the_emptied_spare_slots_once_committed(monkeypatch):
@@ -1623,7 +1743,11 @@ def test_a_rejoin_releases_the_emptied_spare_slots_once_committed(monkeypatch):
         placement=((4, ((0, -1), (1, -1), (3, -1), (2, -1))),),
     )
     calls, plan, device = _eplb(
-        monkeypatch, recovery, restored=0, released=6 * MIB, device=_Device(gpu_quota=58 * MIB)
+        monkeypatch,
+        recovery,
+        restored=0,
+        released=6 * MIB,
+        device=_Device(gpu_quota=58 * MIB, backed=6 * MIB),
     )
     report = recovery._agent.report
 
@@ -1671,7 +1795,11 @@ def test_an_admission_that_needs_no_memory_leaves_the_kv_cache_pool_alone(monkey
         placement=((4, ((0, -1), (1, -1), (3, -1), (2, -1))),),
     )
     calls, plan, device = _eplb(
-        monkeypatch, recovery, restored=0, released=released, device=_Device(gpu_quota=58 * MIB)
+        monkeypatch,
+        recovery,
+        restored=0,
+        released=released,
+        device=_Device(gpu_quota=58 * MIB, backed=released),
     )
     recovery._moe.workspaces_need_fresh_pages.return_value = False
     recovery._moe.admit_to_workspaces.side_effect = lambda gather: calls.append("admit")

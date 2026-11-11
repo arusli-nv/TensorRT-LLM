@@ -282,6 +282,8 @@ class EplbExpertRestore:
             )
         # Per EP rank, whether it is live in the placement restore_lost_experts installed last.
         self.live_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
+        # The device bytes the spare slots backed with memory of their own take (set_spare_slots_backed).
+        self.backed_spare_slot_bytes = 0
 
     def spare_slot_count(self, expert_count: int, eplb_slot_count: int) -> int:
         """The spare slots per rank of a layer of ``expert_count`` experts in ``eplb_slot_count`` EPLB slots per
@@ -497,7 +499,11 @@ class EplbExpertRestore:
                 slot_counts.append(len(spare_slots))
         if not tensors:
             return 0
-        return torch.ops.trtllm.moe_unbacked_slots_set_backed(tensors, slots, slot_counts, backed)
+        changed = torch.ops.trtllm.moe_unbacked_slots_set_backed(
+            tensors, slots, slot_counts, backed
+        )
+        self.backed_spare_slot_bytes += changed if backed else -changed
+        return changed
 
     def release_empty_spare_slots(self) -> int:
         """Maps the spare slots that the installed placement leaves empty, which routing does not reach, to the

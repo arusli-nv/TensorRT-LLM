@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -92,6 +93,7 @@ from ..distributed.membership import (
     ResumeState,
     SignedStore,
     TransactionSummary,
+    claimed_incarnation,
     open_store,
     rendezvous_store,
     startup_gather,
@@ -120,6 +122,8 @@ if TYPE_CHECKING:
 _AUTHORITY_TIMEOUT_S = 10.0
 # How long a read of the server's fault-tolerance status waits for the membership store to answer.
 _STATUS_READ_TIMEOUT_S = 1.0
+# How often a rank whose KV cache pool fell short of its quota at a commit checks whether device memory was freed.
+_GIVE_BACK_RETRY_S = 1.0
 # The least length of the join secret, which keys the signatures of the membership store's values.
 _JOIN_SECRET_BYTES = 32
 
@@ -660,27 +664,63 @@ def _admission_keys(generation: int) -> Tuple[str, str]:
 
 
 class StartupMemory(NamedTuple):
-    """This rank's device memory once the deployment serves, from which every change resizes the KV cache pool."""
+    """This rank's GPU KV cache pool once the deployment serves, which every membership change resizes."""
 
-    # The GPU KV cache pool's quota: the most the pool takes back.
+    # The pool's quota: it keeps this quota less the device memory fault tolerance holds.
     kv_cache_quota: int
-    # The free device memory: kept free, as the allocations after the KV cache sizing (main's
-    # free_gpu_memory_fraction margin) may need it.
-    free_bytes: int
 
-    def fit_kv_cache(self, kv_cache_manager, needed: int) -> int:
-        """Resize the KV cache pool so that ``needed`` bytes are free beyond those free when the deployment started
-        serving, to at most its quota then, and return its quota. Derived afresh at every change, so repeated failures
-        do not ratchet it down. Every KV cache must be suspended.
+    def free_to_keep(self, kv_cache_manager, held: int) -> int:
+        """The device memory serving keeps free at the start of a change: the free memory less what the pool lacks of
+        its quota for ``held`` (:meth:`fit_kv_cache`), which is free as well."""
+        return torch.cuda.mem_get_info()[0] - (
+            self.kv_cache_quota - held - kv_cache_manager.gpu_quota
+        )
+
+    def fit_kv_cache(self, kv_cache_manager, held: int, needed: int, free_to_keep: int = 0) -> int:
+        """Resize the KV cache pool to its quota once the deployment served less ``held`` (the device memory fault
+        tolerance holds, ``EplbExpertRestore.backed_spare_slot_bytes``) and ``needed`` (the memory it allocates next),
+        growing only into memory free beyond ``free_to_keep``, and return its quota. Derived afresh at every change, so
+        repeated failures do not ratchet it down. Every KV cache must be suspended.
 
         Raises:
             RuntimeError: The pool cannot take that quota (``KVCacheManagerV2.resize_gpu_quota``), e.g. below its
                 minimum.
         """
-        spare_bytes = max(0, torch.cuda.mem_get_info()[0] - self.free_bytes)
         return kv_cache_manager.resize_gpu_quota(
-            min(self.kv_cache_quota, kv_cache_manager.gpu_quota + spare_bytes - needed)
+            self.kv_cache_quota
+            - held
+            - self.shortfall(kv_cache_manager, held, free_to_keep)
+            - needed
         )
+
+    def shortfall(self, kv_cache_manager, held: int, free_to_keep: int = 0) -> int:
+        """How much of its quota for ``held`` (:meth:`fit_kv_cache`) the pool neither holds nor can take from the
+        device memory free beyond ``free_to_keep``."""
+        return max(
+            0,
+            self.kv_cache_quota
+            - held
+            - kv_cache_manager.gpu_quota
+            - torch.cuda.mem_get_info()[0]
+            + free_to_keep,
+        )
+
+
+@dataclass
+class _GiveBackRetry:
+    """A give-back at a commit that fell short (:meth:`RankFailureRecovery._give_back_kv_cache`): pages an excluded
+    process still maps come free once it ended."""
+
+    # The device memory serving keeps free (StartupMemory.free_to_keep at the start of the change).
+    free_to_keep: int
+    # Per rank the committed record excludes, the incarnation of its last process.
+    excluded: Dict[int, int]
+    # The free device memory after the last give-back.
+    free_seen: int
+    # The time.monotonic() from which the next check is due.
+    check_after_s: float
+    # Whether every excluded process ended: the next give-back is the last.
+    ended: bool = False
 
 
 def _check_largest_failure_fits(
@@ -699,10 +739,10 @@ def _check_largest_failure_fits(
     fits = True
     with executor._kv_pools_suspended() as kv_cache_manager:
         try:
-            startup_memory.fit_kv_cache(kv_cache_manager, needed)
+            startup_memory.fit_kv_cache(kv_cache_manager, 0, needed)
         except RuntimeError:
             fits = False
-        startup_memory.fit_kv_cache(kv_cache_manager, 0)
+        startup_memory.fit_kv_cache(kv_cache_manager, 0, 0)
     short = [rank for rank, rank_fits in enumerate(executor.dist.allgather(fits)) if not rank_fits]
     if short:
         raise ValueError(
@@ -855,8 +895,14 @@ class RankFailureRecovery:
         self._published_admissions: List[int] = []
         # The requests of the discarded steps; they continue by recompute once the survivors resume.
         self._interrupted: List[LlmRequest] = []
-        # Whether the KV cache pool gave up memory for a change not committed yet (_give_back_kv_cache).
-        self._kv_cache_shrunk = False
+        # Once the KV cache pool gave up memory for a change not committed yet, the device memory serving keeps free
+        # (StartupMemory.free_to_keep, _give_back_kv_cache).
+        self._kv_cache_free_to_keep: Optional[int] = None
+        # A give-back at a commit that fell short, retried while device memory is freed (_retry_give_back).
+        self._give_back_retry: Optional[_GiveBackRetry] = None
+        # Whether this rank, and whether some rank, asked to retry its give-back in the last forward vote.
+        self._give_back_due = False
+        self._give_back_agreed = False
         # Whether the current record is a change this rank has not installed yet, under _record_changed.
         self._pending = False
         # Whether some rank held its steps for a pending change in the last forward vote (forward_vote).
@@ -896,9 +942,7 @@ class RankFailureRecovery:
                 "during its startup: every rank is its own process, and a rank's replacement could never join it"
             )
         balancer = _moe_load_balancer_of(executor)
-        startup_memory = StartupMemory(
-            executor.kv_cache_manager.gpu_quota, torch.cuda.mem_get_info()[0]
-        )
+        startup_memory = StartupMemory(executor.kv_cache_manager.gpu_quota)
         if replacement is None and balancer is not None:
             _check_largest_failure_fits(executor, balancer, startup_memory)
         # The deployment serves from here: a lost rank's replacement reattaches the node's host copies, which the
@@ -1223,7 +1267,10 @@ class RankFailureRecovery:
     def before_iteration(self) -> None:
         """Finish installing the membership change once, at the first iteration past the resume point, where no forward
         or EPLB iteration is active. A joining rank follows a newer change that still adds it, then finishes its
-        admission from that change's install."""
+        admission from that change's install. First, it retries a give-back if the last forward vote asked for it
+        (:meth:`_retry_give_back`)."""
+        if self._give_back_agreed:
+            self._retry_give_back()
         record = self._installed
         if (
             self._resume_after is None
@@ -1330,7 +1377,7 @@ class RankFailureRecovery:
 
     def _give_back_kv_cache(self) -> str:
         """Once a change is committed: release the spare slots the placement leaves empty, and let the KV cache pool
-        take back what is free again.
+        take back all but what fault tolerance still holds, as far as the memory freed since the change started allows.
 
         Returns:
             What it gave back, for the log ("" if nothing).
@@ -1338,14 +1385,75 @@ class RankFailureRecovery:
         start_s = time.perf_counter()
         balancer = _moe_load_balancer_of(self._executor)
         released = 0 if balancer is None else balancer.expert_restore.release_empty_spare_slots()
-        if not (released or self._kv_cache_shrunk):
+        kept, self._kv_cache_free_to_keep = self._kv_cache_free_to_keep, None
+        if not (released or kept is not None):
             return ""
-        self._kv_cache_shrunk = False
+        free_to_keep = kept or 0
+        held = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
         with self._executor._kv_pools_suspended() as kv_cache_manager:
-            quota = self._startup_memory.fit_kv_cache(kv_cache_manager, 0)
+            quota = self._startup_memory.fit_kv_cache(kv_cache_manager, held, 0, free_to_keep)
+            short = self._startup_memory.shortfall(kv_cache_manager, held, free_to_keep)
+        self._give_back_retry = None
+        if short:
+            record = self._installed
+            self._give_back_retry = _GiveBackRetry(
+                free_to_keep,
+                {
+                    r: record.incarnations[r] if r < len(record.incarnations) else 0
+                    for r in range(self.world_size)
+                    if not record.is_live(r)
+                },
+                torch.cuda.mem_get_info()[0],
+                time.monotonic() + _GIVE_BACK_RETRY_S,
+            )
         return (
-            f"; {released} bytes of empty spare slots released, KV cache quota {quota} bytes, in "
-            f"{(time.perf_counter() - start_s) * 1e3:.0f} ms"
+            f"; {released} bytes of empty spare slots released, KV cache quota {quota} bytes"
+            + (f" ({short} bytes short until device memory is freed)" if short else "")
+            + f", in {(time.perf_counter() - start_s) * 1e3:.0f} ms"
+        )
+
+    def _give_back_retry_due(self) -> bool:
+        """Whether to retry the give-back that fell short (:meth:`_retry_give_back`): checked at most once a second,
+        when device memory was freed since the last give-back. Once every excluded process ended (its replacement's
+        incarnation is claimed), that retry is the last; without memory freed, the retries end at once."""
+        retry = self._give_back_retry
+        now_s = time.monotonic()
+        if now_s < retry.check_after_s:
+            return False
+        retry.check_after_s = now_s + _GIVE_BACK_RETRY_S
+        if not retry.ended:
+            retry.ended = all(
+                claimed_incarnation(self._store, rank) > incarnation
+                for rank, incarnation in retry.excluded.items()
+            )
+        freed = torch.cuda.mem_get_info()[0] > retry.free_seen
+        if retry.ended and not freed:
+            self._give_back_retry = None
+        return freed
+
+    def _retry_give_back(self) -> None:
+        """At the iteration after a forward vote in which a rank asked to retry its give-back: every rank retires its
+        step in flight together (doing so runs collectives), then the ranks that asked let the KV cache pool take back
+        the device memory freed since (:meth:`StartupMemory.fit_kv_cache`). The retries end once the pool holds its
+        quota, or after the first one once every excluded process ended."""
+        self._give_back_agreed = False
+        torch.cuda.synchronize()
+        self._executor._retire_inflight_batch_for_control()
+        if not self._give_back_due:
+            return
+        self._give_back_due = False
+        retry = self._give_back_retry
+        balancer = _moe_load_balancer_of(self._executor)
+        held = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
+        with self._executor._kv_pools_suspended() as kv_cache_manager:
+            quota = self._startup_memory.fit_kv_cache(kv_cache_manager, held, 0, retry.free_to_keep)
+            short = self._startup_memory.shortfall(kv_cache_manager, held, retry.free_to_keep)
+        retry.free_seen = torch.cuda.mem_get_info()[0]
+        if not short or retry.ended:
+            self._give_back_retry = None
+        logger.info(
+            f"Rank {self.rank} took back device memory freed since the commit: KV cache quota {quota} bytes"
+            + (f", {short} bytes short" if short else "")
         )
 
     def _restore(self, record: MembershipRecord, times: Optional[Dict[str, float]] = None) -> str:
@@ -1414,8 +1522,11 @@ class RankFailureRecovery:
             if needed:
                 start_s = time.perf_counter()
                 before, free = kv_cache_manager.gpu_quota, torch.cuda.mem_get_info()[0]
-                fitted = self._startup_memory.fit_kv_cache(kv_cache_manager, needed)
-                self._kv_cache_shrunk = True
+                backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
+                self._kv_cache_free_to_keep = self._startup_memory.free_to_keep(
+                    kv_cache_manager, backed
+                )
+                fitted = self._startup_memory.fit_kv_cache(kv_cache_manager, backed, needed)
                 times["KV cache shrink"] = (time.perf_counter() - start_s) * 1e3
                 kv_cache_quota = (
                     f"{before} -> {fitted} bytes ({needed} bytes needed, {free} bytes free)"
@@ -1495,11 +1606,17 @@ class RankFailureRecovery:
         self, batch_size: int, gather: Callable[[List[int]], np.ndarray]
     ) -> np.ndarray:
         """The executor's attention-DP forward vote: ``gather`` collects every rank's batch size (0 while it holds its
-        steps) and whether it holds for a pending change; returns the batch sizes."""
+        steps), whether it holds for a pending change and whether it retries a give-back that fell short
+        (:meth:`_give_back_retry_due`); returns the batch sizes. Unless a rank held for a pending change, every rank
+        takes part in a retry at the next iteration (:meth:`_retry_give_back`)."""
         pending = self._pending
         held = pending or self._resume_after is not None
-        votes = gather([0 if held else batch_size, int(pending)])
+        self._give_back_due = (
+            not held and self._give_back_retry is not None and self._give_back_retry_due()
+        )
+        votes = gather([0 if held else batch_size, int(pending), int(self._give_back_due)])
         self._steps_quiet = bool(votes[:, 1].any())
+        self._give_back_agreed = bool(votes[:, 2].any()) and not self._steps_quiet
         if held and self.rank == 0:
             self._executor.executor_request_queue.wake()
         return votes[:, 0]

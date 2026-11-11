@@ -731,6 +731,7 @@ def test_restore_backs_then_restores_and_the_release_empties_spare_slots_later(m
     assert load_balancer.expert_restore.restore_lost_experts(rejoin) == 0
     assert events == [("restore", [], [_INITIAL.tolist()])]
     assert backed == {2}
+    assert load_balancer.expert_restore.backed_spare_slot_bytes == 4 << 20
 
     # Routing no longer reads it: the release maps it to the scratch again.
     events.clear()
@@ -738,6 +739,7 @@ def test_restore_backs_then_restores_and_the_release_empties_spare_slots_later(m
     assert load_balancer.expert_restore.release_empty_spare_slots() == 4 << 20
     assert events == [("backed", [2, 3], False)]
     assert backed == set()
+    assert load_balancer.expert_restore.backed_spare_slot_bytes == 0
 
 
 def test_a_plan_the_load_balancer_rejects_keeps_the_live_ranks(monkeypatch):
