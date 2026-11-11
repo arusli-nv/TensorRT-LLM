@@ -179,21 +179,25 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
         (not missing, ", ".join(missing)),
         (
             mapping.moe_ep_size == mapping.world_size,
-            "expert parallelism over every rank (moe_expert_parallel_size equal to the world size)",
+            "expert parallelism over every rank (moe_expert_parallel_size equal to the world size), so that a "
+            "failed rank holds whole experts, which the survivors restore into their spare slots",
         ),
         # Resolved from "auto" as the model loads, after the arguments' validation: checked only here.
         (
             llm_args.kv_cache_config.use_kv_cache_manager_v2 is True,
-            "KV cache manager V2 (kv_cache_config.use_kv_cache_manager_v2=True)",
+            "KV cache manager V2 (kv_cache_config.use_kv_cache_manager_v2=True), the only KV cache manager "
+            "that holds the KV reuse commits of a step until the step is accepted",
         ),
         # Bound execution (NVLinkOneSided.bind_execution_state) runs on the fence path.
         (
             get_force_cft() is not True,
-            f"the fence path of the NVLink one-sided all-to-all ({FORCE_CFT_ENV} unset or 0)",
+            f"the fence path of the NVLink one-sided all-to-all ({FORCE_CFT_ENV} unset or 0), the only path "
+            "that follows a membership change on the same CUDA graphs",
         ),
         (
             kernel_timeout_s >= 2 * PROGRESS_TIMEOUT_S,
-            f"{SERVING_TIMEOUT_ENV} of at least {2 * PROGRESS_TIMEOUT_S:.0f} s (twice the hang timeout)",
+            f"{SERVING_TIMEOUT_ENV} of at least {2 * PROGRESS_TIMEOUT_S:.0f} s (twice the hang timeout), so "
+            "that an all-to-all waiting on a hung rank lasts until the rank is dropped",
         ),
     ]
     check_fault_tolerance_requirements(checks)
@@ -245,8 +249,8 @@ def _rank_identity() -> RankIdentity:
 
 
 def check_supported_model(model: torch.nn.Module) -> None:
-    """Check the built model before any weight loads: its implementation, architecture, MoE communication and the room
-    for its host weights.
+    """Check the built model before any weight loads: its architecture, MoE communication and the room for its host
+    weights.
 
     Raises:
         ValueError: The model is not supported with fault tolerance.
@@ -254,12 +258,6 @@ def check_supported_model(model: torch.nn.Module) -> None:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from .config_utils import is_hybrid_linear
 
-    target = model.model_config.modeling_v2_target
-    if target is not None:
-        raise ValueError(
-            f"WideEP fault tolerance does not support a model built from a modeling_v2 target ({target.__name__}); "
-            "set modeling_v2='off' or turn it off (enable_wide_ep_fault_tolerance=False)"
-        )
     if is_hybrid_linear(model.model_config.pretrained_config):
         raise ValueError(
             "WideEP fault tolerance does not support hybrid linear-attention models: their KV cache manager "

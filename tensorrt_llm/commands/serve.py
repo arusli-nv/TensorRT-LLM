@@ -648,7 +648,15 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     elif enable_sleep_mode:
         reason = "--enable_sleep_mode"
     elif _bool_setting(llm_args.get("enable_wide_ep_fault_tolerance")):
-        reason = "enable_wide_ep_fault_tolerance"
+        # An explicit count above one is rejected, so this one has no override.
+        logger.warning(
+            f"num_serve_frontends defaults to {num_frontends} for the OpenAI "
+            "HTTP server only; running 1 frontend because WideEP fault "
+            "tolerance (enable_wide_ep_fault_tolerance) does not support more "
+            "yet: the frontends that attach to the executor do not follow its "
+            "membership.")
+        llm_args["num_serve_frontends"] = 1
+        return
     else:
         return
     logger.info(

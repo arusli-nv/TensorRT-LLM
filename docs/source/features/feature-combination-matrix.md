@@ -22,11 +22,12 @@ apply; the startup check rejects the rest:
 
 | Feature | With Wide-EP fault tolerance |
 |---|---|
-| Expert Parallelism / Attention Data Parallelism | Required: attention DP over all ranks within one NVLink domain with the default router and admission, `NVLinkOneSided` MoE communication, EPLB (fault tolerance adds the spare slots) |
+| Expert Parallelism / Attention Data Parallelism | Required: attention DP over all ranks within one NVLink domain with the default router and admission, `NVLinkOneSided` MoE communication, EPLB (fault tolerance adds the spare slots); the Cutlass or CuteDSL NVFP4 MoE backend |
 | Tensor Parallelism (attention) / Pipeline Parallelism | Unsupported |
 | Overlap Scheduler / CUDA Graph / KV Cache Reuse | Supported; the overlap scheduler and KV cache manager V2 are required |
+| `torch.compile` (`torch_compile_config`, piecewise CUDA graphs) | Supported without userbuffers |
 | Speculative Decoding | MTP supported; NGram and user-provided drafters and DSpark unsupported |
-| Disaggregated Serving / KV cache connectors / KV cache events / Sleep mode / several serving frontends / `torch_compile_config` / Ray and RPC executors | Unsupported |
+| Disaggregated Serving / KV cache connectors / KV cache events / Sleep mode / several serving frontends / Ray and RPC executors | Unsupported |
 | Sampling | `n > 1`, `best_of > 1` and beam search unsupported |
 
 See [Wide-EP Fault Tolerance](wide-ep-fault-tolerance.md).

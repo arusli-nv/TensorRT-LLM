@@ -58,9 +58,12 @@ def _args(**fields) -> TorchLlmArgs:
             )
         },
         {"speculative_config": MTPDecodingConfig(num_nextn_predict_layers=1)},
-        # The default (modeling_v2="auto") above included: a modeling_v2 target that claims the deployment is
-        # refused once the model is built (check_supported_model).
+        # The default (modeling_v2="auto") above included: under fault tolerance no modeling_v2 target is
+        # resolved, which require rejects as the model loads.
         {"modeling_v2": "require"},
+        # Userbuffers, which torch.compile enables by default, stay off under fault tolerance.
+        {"torch_compile_config": TorchCompileConfig()},
+        {"prefill_cuda_graph_backend": "piecewise"},
     ],
 )
 def test_a_supported_configuration_is_accepted(fields):
@@ -116,7 +119,6 @@ def test_a_supported_configuration_is_accepted(fields):
         ),
         ({"enable_lm_head_tp_in_adp": True}, "enable_lm_head_tp_in_adp=False"),
         ({"sleep_config": SleepConfig()}, "sleep_config=None"),
-        ({"torch_compile_config": TorchCompileConfig()}, "torch_compile_config=None"),
         ({"num_serve_frontends": 2}, "num_serve_frontends=1"),
         ({"orchestrator_type": "rpc"}, "orchestrator_type unset"),
         ({"orchestrator_type": "ray"}, "orchestrator_type unset"),
@@ -147,5 +149,5 @@ def test_fault_tolerance_off_leaves_the_configuration_alone():
         enable_wide_ep_fault_tolerance=False,
         disable_overlap_scheduler=True,
         num_serve_frontends=2,
-        torch_compile_config=TorchCompileConfig(),
+        sleep_config=SleepConfig(),
     ).enable_wide_ep_fault_tolerance

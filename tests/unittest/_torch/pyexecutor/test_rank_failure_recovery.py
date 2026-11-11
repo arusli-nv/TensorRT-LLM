@@ -552,9 +552,7 @@ def test_the_model_check_checks_the_room_for_the_host_weights(monkeypatch):
     monkeypatch.setattr(MoeExecutionState, "model_comms", Mock())
     fit = Mock(side_effect=ValueError("/dev/shm"))
     monkeypatch.setattr(recovery_module, "_check_host_weights_fit", fit)
-    model = SimpleNamespace(
-        model_config=SimpleNamespace(modeling_v2_target=None, pretrained_config=SimpleNamespace())
-    )
+    model = SimpleNamespace(model_config=SimpleNamespace(pretrained_config=SimpleNamespace()))
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.config_utils.is_hybrid_linear", lambda config: False
     )
@@ -2240,51 +2238,48 @@ def test_deepseek_v4_cache_manager_keeps_the_reuse_commits_for_step_acceptance(m
     update.assert_called_once_with(batch, commit_ends)
 
 
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_userbuffers_off_under_fault_tolerance(monkeypatch, fault_tolerance):
+    """The userbuffers bootstrap runs MPI_COMM_WORLD collectives, and under fault tolerance every rank is its own
+    MPI world: torch.compile runs without userbuffers there."""
+    from tensorrt_llm._torch.pyexecutor.engine import model_setup
+
+    initialize = Mock()
+    monkeypatch.setattr(model_setup, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(model_setup.ub, "ub_supported", lambda: True)
+    monkeypatch.setattr(model_setup.ub, "initialize_userbuffers_manager", initialize)
+    llm_args = SimpleNamespace(
+        enable_wide_ep_fault_tolerance=fault_tolerance, allreduce_strategy="AUTO"
+    )
+    mapping = SimpleNamespace(tp_size=WORLD, pp_size=1, cp_size=1, rank=0, gpus_per_node=WORLD)
+
+    enabled = model_setup._init_userbuffers(mapping, llm_args, hidden_size=8, max_num_tokens=8)
+
+    assert enabled is not fault_tolerance
+    assert initialize.called is not fault_tolerance
+
+
 class _PastModelBuild(Exception):
     """Raised by the step of the model load that follows the checks of the built model."""
 
 
 @pytest.mark.parametrize(
-    "fault_tolerance, checkpoint_architecture, built_architecture, moe_layer, modeling_v2, refused",
+    "fault_tolerance, checkpoint_architecture, built_architecture, moe_layer, refused",
     [
-        (True, "DeepseekV3ForCausalLM", "DeepseekV3ForCausalLM", True, False, None),
-        (
-            True,
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5MoeForCausalLM",
-            True,
-            False,
-            "hybrid linear-attention",
-        ),
+        (True, "DeepseekV3ForCausalLM", "DeepseekV3ForCausalLM", True, None),
+        (True, "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForCausalLM", True, "hybrid linear-attention"),
         # The built multimodal model keeps its language model's configuration.
         (
             True,
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5MoeForCausalLM",
             True,
-            False,
             "hybrid linear-attention",
         ),
-        (
-            True,
-            "DeepseekV3ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            False,
-            False,
-            "a model with MoE layers",
-        ),
-        # A modeling_v2 target claimed the deployment (modeling_v2="auto", the default).
-        (True, "DeepseekV3ForCausalLM", "DeepseekV3ForCausalLM", True, True, "modeling_v2 target"),
-        (False, "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForCausalLM", False, True, None),
+        (True, "DeepseekV3ForCausalLM", "DeepseekV3ForCausalLM", False, "a model with MoE layers"),
+        (False, "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForCausalLM", False, None),
     ],
-    ids=[
-        "supported",
-        "hybrid",
-        "hybrid_multimodal",
-        "no_moe_layers",
-        "modeling_v2_target",
-        "without_fault_tolerance",
-    ],
+    ids=["supported", "hybrid", "hybrid_multimodal", "no_moe_layers", "without_fault_tolerance"],
 )
 def test_unsupported_models_are_refused_once_built_before_any_weight_loads(
     tmp_path,
@@ -2293,7 +2288,6 @@ def test_unsupported_models_are_refused_once_built_before_any_weight_loads(
     checkpoint_architecture,
     built_architecture,
     moe_layer,
-    modeling_v2,
     refused,
 ):
     from contextlib import nullcontext
@@ -2304,8 +2298,7 @@ def test_unsupported_models_are_refused_once_built_before_any_weight_loads(
 
     model = torch.nn.Module()
     model.model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(architectures=[built_architecture]),
-        modeling_v2_target=type("DeepseekV3DefaultModelingV2", (), {}) if modeling_v2 else None,
+        pretrained_config=SimpleNamespace(architectures=[built_architecture])
     )
     if moe_layer:
         layer = ConfigurableMoE.__new__(ConfigurableMoE)

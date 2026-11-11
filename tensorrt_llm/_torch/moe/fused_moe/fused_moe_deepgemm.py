@@ -797,6 +797,9 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
         limit=ActivationParamShape.UNIFORM_SCALAR,
     )
 
+    # DeepGEMM runs no MoE autotuner.
+    autotunes_only_active_slots = True
+
     def supports_moe_output_in_alltoall_workspace(self):
         # ``run_moe`` emits into its own workspace buffers and never writes a
         # caller-supplied output tensor, so nothing would fill a workspace-backed
@@ -908,6 +911,15 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
 
     def _supports_load_balancer(self) -> bool:
         return True
+
+    def validate_configurable_moe(self, moe: torch.nn.Module) -> None:
+        del moe
+        if self._using_spare_slot_storage():
+            raise ValueError(
+                "WideEP fault tolerance does not support the DeepGEMM MoE backend yet: its workspace "
+                "holds rows for every received token in every local slot, so each unused spare EPLB "
+                "slot would take device memory. Turn it off (enable_wide_ep_fault_tolerance=False) or "
+                "use the Cutlass or the CuteDSL NVFP4 MoE backend.")
 
     def _check_configs(self):
         assert self._weights_created

@@ -537,11 +537,11 @@ def check_fault_tolerance_requirements(
         checks: Sequence[Tuple[bool, str]]) -> None:
     """Raise ValueError naming every requirement of WideEP fault tolerance
     that ``checks`` (per requirement: whether it is met, its description)
-    finds not met."""
+    finds not met. A description states the requirement and its reason."""
     missing = [requirement for met, requirement in checks if not met]
     if missing:
         raise ValueError("WideEP fault tolerance requires " +
-                         ", ".join(missing) + "; turn it off "
+                         "; ".join(missing) + "; turn it off "
                          "(enable_wide_ep_fault_tolerance=False) or change "
                          "the configuration")
 

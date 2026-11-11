@@ -38,15 +38,6 @@ pytestmark = pytest.mark.cpu_only
         pytest.param({"orchestrator_type": "rpc"}, {}, "orchestrator_type='rpc'", id="rpc"),
         pytest.param({"enable_resource_governor": True}, {}, "enable_resource_governor", id="rg"),
         pytest.param({}, {"enable_sleep_mode": True}, "--enable_sleep_mode", id="sleep_mode"),
-        *(
-            pytest.param(
-                {"enable_wide_ep_fault_tolerance": value},
-                {},
-                "enable_wide_ep_fault_tolerance",
-                id=f"wide_ep_fault_tolerance_{value}",
-            )
-            for value in (True, "true")
-        ),
     ],
 )
 def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, reason) -> None:
@@ -65,6 +56,21 @@ def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, rea
 
     assert llm_args["num_serve_frontends"] == 1
     assert len(messages) == 1 and reason in messages[0] and "--num_serve_frontends" in messages[0]
+
+
+@pytest.mark.parametrize("value", [True, "true"])
+def test_fault_tolerance_warns_with_the_reason(monkeypatch, value) -> None:
+    warnings = []
+    monkeypatch.setattr(serve_cmd.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    llm_args = {"num_serve_frontends": 8, "enable_wide_ep_fault_tolerance": value}
+
+    _resolve_default_num_serve_frontends(
+        llm_args, requested=False, port=8000, grpc=False, report_addr=None, enable_sleep_mode=False
+    )
+
+    assert llm_args["num_serve_frontends"] == 1
+    assert len(warnings) == 1
+    assert "do not follow its membership" in warnings[0]
 
 
 @pytest.mark.parametrize(

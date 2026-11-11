@@ -215,8 +215,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     """Decide which modeling_v2 target, if any, this deployment builds.
 
     Returns the target class, or None for the built-in implementation:
-    when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, or when that ``route`` raises ``NoTarget``.
+    when ``llm_args.modeling_v2`` is ``off``, when WideEP fault tolerance is
+    on, when no ``route`` is registered for the architecture, or when that
+    ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
     It also returns None for a ``@disable_v2_by_default`` target when
     ``modeling_v2`` was left at its default.
@@ -232,6 +233,12 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     arch = pretrained_config.architectures[0]
 
     try:
+        if llm_args.enable_wide_ep_fault_tolerance:
+            raise NoTarget(
+                "WideEP fault tolerance (enable_wide_ep_fault_tolerance) is not supported by any target "
+                "yet: a target's MoE layers would need EPLB spare slots and the NVLink one-sided "
+                "all-to-all, which take over a failed rank's experts and stop waiting on it"
+            )
         route = registered_routes().get(arch)
         if route is None:
             known = ", ".join(sorted(registered_routes())) or "(none)"

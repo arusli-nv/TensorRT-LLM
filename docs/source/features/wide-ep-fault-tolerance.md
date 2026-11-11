@@ -52,12 +52,16 @@ unsupported is rejected with the reason.
 | One NVLink domain (for example GB200 NVL72); attention DP and expert parallelism over all ranks; no pipeline parallelism | Collectives run over NVLink memory that can drop a rank |
 | `NVLinkOneSided` MoE communication on its fence path | The all-to-all that can skip a failed rank |
 | Standard EPLB (`moe_config.load_balancer`, static or online, not `per_layer_dynamic`); online EPLB also needs GDRCopy for its slots | Fault tolerance adds spare slots that receive a failed rank's experts; they use no GPU memory until a failure |
+| The Cutlass MoE backend, or the CuteDSL NVFP4 one without locality domains or the SM107 (Rubin) kernels; not TRTLLM-Gen or DeepGEMM | Unused spare slots must cost nothing: the TRTLLM-Gen autotuner profiles every local slot, and the DeepGEMM workspace holds rows for every local slot |
 | Room in `/dev/shm` on every node for the host weights of every expert (DeepSeek-R1 FP4: about 364 GB) | A failed rank's experts are restored from them |
-| KV cache manager V2, the overlap scheduler | Interrupted requests continue by recompute |
+| KV cache manager V2 | Interrupted requests continue by recompute, and a step's KV cache reuse commits wait until the step is accepted |
+| The overlap scheduler | Only its executor loop accepts or discards each step when the next one starts |
 | The default attention-DP routing and admission, with or without `enable_balance` | Other policies keep per-rank state a replacement would not share |
-| One serving frontend (`num_serve_frontends: 1`); the MPI executor (no `orchestrator_type`) | The server follows the membership |
+| One serving frontend (`num_serve_frontends: 1`); the MPI executor (no `orchestrator_type`) | The server follows the membership; the frontends that attach to the executor do not yet |
 | `TRTLLM_MOE_COMM_TIMEOUT_SEC`, if set, at least 60 s | An all-to-all waiting on a hung rank must last until the rank is dropped |
-| Not supported: disaggregated serving, KV cache connectors, KV cache events, sleep mode, `enable_lm_head_tp_in_adp`, `modeling_v2` targets, `torch_compile_config`, NGram and user-provided drafters and DSpark (MTP is supported), hybrid linear-attention models | |
+| `torch.compile` (`torch_compile_config`, piecewise CUDA graphs) runs without userbuffers | Userbuffers start up with collectives over one MPI world of all ranks, and here each rank is its own MPI world |
+| `modeling_v2`: `auto` builds the built-in model; `require` is rejected | No `modeling_v2` target has the spare slots and the all-to-all that fault tolerance needs |
+| Not supported: disaggregated serving, KV cache connectors, KV cache events, sleep mode, `enable_lm_head_tp_in_adp`, NGram and user-provided drafters and DSpark (MTP is supported), hybrid linear-attention models | The startup error names the reason |
 | Requests: `n > 1`, `best_of > 1` and beam search are rejected | |
 
 ## Requests during a failure
