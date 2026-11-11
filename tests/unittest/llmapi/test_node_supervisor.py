@@ -279,6 +279,19 @@ def _serving(tmp_path, authority, environ, node=NODE, **options):
     return running
 
 
+def _push_and_wait_for_step(running, authority, record, nodes=((NODE, "host-1", True),)):
+    """Push a view the supervisor does not have yet, and wait until it stepped on it and on every earlier event.
+
+    The supervisor steps between two waits for events, so once it took a view pushed after it took this one, it has
+    stepped on this one.
+    """
+    authority.push(record, nodes)
+    _until(lambda: running.supervisor._view == NodeView(record=record, nodes=nodes))
+    following = record.model_copy(update={"generation": record.generation + 1})
+    authority.push(following, nodes)
+    _until(lambda: running.supervisor._view.record == following)
+
+
 def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deployment):
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
@@ -304,10 +317,10 @@ def test_a_crashed_rank_is_replaced_on_its_gpu_once_the_record_lists_it_as_faile
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
-    time.sleep(0.5)
-    assert (
-        _read(tmp_path, 3, 1) is None
-    )  # the record still lists it: the authority has not decided yet
+    _until(lambda: running.supervisor._processes[3].status is not None)
+    # The record still lists it: the authority has not decided yet.
+    _push_and_wait_for_step(running, authority, _record(generation=2))
+    assert not running.supervisor._processes[3].replacement
     authority.push(_record(MembershipState.PROPOSE, live_mask=0b0111))
     _until(lambda: _read(tmp_path, 3, 1))
     replacement = _read(tmp_path, 3, 1)
@@ -342,8 +355,11 @@ def test_a_replacement_that_ends_before_its_admission_is_started_again_unless_it
     authority.push(_record(MembershipState.COMMITTED, live_mask=0b0111))
     _until(lambda: _read(tmp_path, 3, 2))
     _until(lambda: running.supervisor._given_up == {3})
-    time.sleep(1.5)
-    assert _read(tmp_path, 3, 3) is None  # another one would fail alike
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, live_mask=0b0111, generation=2)
+    )
+    # No replacement runs, as another one would fail alike.
+    assert running.supervisor._processes[3].status is not None
     assert running.supervisor._given_up == {3}
     authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0111))
     assert running.wait() == 0
@@ -523,10 +539,14 @@ def test_a_supervisor_that_connects_while_the_deployment_starts_starts_its_ranks
     authority.start(_record(MembershipState.STARTING), ((0, "host-0", True),))
     running = Running(tmp_path, environ, node=0, relaunch_command=[str(prun), "--dvm-uri", "uri"])
     _until(lambda: _read(tmp_path, 0, 0) and _read(tmp_path, 1, 0))
-    authority.push(_record(MembershipState.STARTING), ((0, "host-0", True), (1, "host-1", False)))
-    time.sleep(0.5)
-    assert not _pruns(tmp_path)
-    assert _read(tmp_path, 1, 1) is None
+    _push_and_wait_for_step(
+        running,
+        authority,
+        _record(MembershipState.STARTING),
+        ((0, "host-0", True), (1, "host-1", False)),
+    )
+    assert not running.supervisor._relaunched
+    assert not running.supervisor._processes[1].replacement
     authority.push(_record(MembershipState.SHUTDOWN))
     assert running.wait() == 0
 
@@ -727,12 +747,14 @@ def test_a_signal_for_the_supervisor_goes_to_rank_0_alone(tmp_path, deployment):
         supervisor.kill()
 
 
-# A fake prun: records its arguments and standard input, then runs until ROOT/prun-exit appears.
+# A fake prun: records its process ID, arguments and standard input, then runs until ROOT/prun-exit appears.
 _FAKE_PRUN = r"""#!/usr/bin/env python3
 import os, sys, time
 
 root = %(root)r
 calls = len([name for name in os.listdir(root) if name.startswith("prun-") and name.endswith(".args")])
+with open(os.path.join(root, f"prun-{calls}.pid"), "w") as pid:
+    pid.write(str(os.getpid()))
 with open(os.path.join(root, f"prun-{calls}.args"), "w") as args:
     args.write("\n".join(sys.argv[1:]))
 with open(os.path.join(root, f"prun-{calls}.stdin"), "w") as stdin:
@@ -740,10 +762,6 @@ with open(os.path.join(root, f"prun-{calls}.stdin"), "w") as stdin:
 while not os.path.exists(os.path.join(root, "prun-exit")):
     time.sleep(0.05)
 """
-
-
-def _pruns(tmp_path):
-    return sorted(tmp_path.glob("prun-*.args"))
 
 
 def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
@@ -761,9 +779,8 @@ def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
     running = _serving(
         tmp_path, authority, environ, node=0, relaunch_command=[str(prun), "--dvm-uri", "uri"]
     )
-    authority.push(_record(), nodes)
-    time.sleep(0.5)
-    assert not _pruns(tmp_path)
+    _push_and_wait_for_step(running, authority, _record(), nodes)
+    assert not running.supervisor._relaunched
     for _ in range(10):  # the record comes again, also changed
         authority.push(_record(MembershipState.PROPOSE, live_mask=0b0011), lost)
         time.sleep(0.05)
@@ -795,9 +812,10 @@ def test_node_0_relaunches_a_lost_node_once_through_prun(tmp_path, deployment):
         key.startswith(("OMPI_", "PMIX_")) for key in relaunched_environ if key != "OMPI_MCA_btl"
     )
     assert relaunched_environ["OMPI_MCA_btl"] == "^sm"
-    authority.push(_record(MembershipState.COMMITTED, live_mask=0b0011), nodes)  # it connected
-    time.sleep(0.5)
-    assert len(_pruns(tmp_path)) == 1
+    connected = _record(MembershipState.COMMITTED, live_mask=0b0011)
+    _push_and_wait_for_step(running, authority, connected, nodes)
+    # Still the first relaunch, which a later one would have replaced.
+    assert running.supervisor._relaunched[1].pid == int((tmp_path / "prun-0.pid").read_text())
     authority.push(_record(MembershipState.SHUTDOWN, live_mask=0b0011), nodes)
     assert running.wait() == 0
 
