@@ -437,13 +437,19 @@ class _DecoderEngine(SimpleNamespace):
             _agreement=WarmupAgreement(dist, dist.mapping),
             _warmup_timer=_WarmupTimer(rank=dist.mapping.rank),
             _completed_autotuner_warmup_num_tokens=None,
+            tactics_at_general_warmup=None,
             _release_megamoe_profiling_scratch=Mock(),
             _forward_warmup=Mock(side_effect=forward),
             profiling_cache=profiling_cache,
         )
 
+    def _warmup_scheduled(self, resource_manager, kv_cache_manager):
+        """Main's warmup phases, of which only the autotuner's runs here, after the general warmup's forwards."""
+        self.tactics_at_general_warmup = dict(self.profiling_cache.cache)
+        DecoderWarmup._run_autotuner_warmup(self, resource_manager)
+
     def autotuner_warmup(self, num_tokens):
-        """Main's autotuner warmup with KV cache room for ``num_tokens`` tokens."""
+        """Main's warmup, up to its autotuner phase, with KV cache room for ``num_tokens`` tokens."""
         kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: num_tokens)
         resource_manager = SimpleNamespace(get_resource_manager=lambda key: kv_cache_manager)
         with (
@@ -451,11 +457,12 @@ class _DecoderEngine(SimpleNamespace):
                 warmup.AutoTuner, "get", return_value=Mock(profiling_cache=self.profiling_cache)
             ),
             patch.object(warmup, "autotune", lambda **kwargs: contextlib.nullcontext()),
+            patch.object(warmup, "warmup_named_allreduce_topologies"),
             patch.object(warmup, "clear_memory_buffers"),
             patch("torch.cuda.empty_cache"),
             patch("torch.cuda.synchronize"),
         ):
-            DecoderWarmup._run_autotuner_warmup(self, resource_manager)
+            DecoderWarmup.run(self, resource_manager)
 
 
 def _original_rank_0(estimation_num_tokens, final_num_tokens):
@@ -495,3 +502,12 @@ def test_a_replacement_runs_the_autotuner_warmup_the_original_ranks_run_and_tune
     assert replacement.profiling_cache.cache[_gemm(16)] == (0, 3, 0.1)
     assert replacement.dist.host_exchange.calls == 0
     startup_record.close()  # it made every collective of the original ranks
+
+
+def test_a_replacement_warms_up_with_rank_0_s_tactics():
+    """A replacement's general warmup forwards and CUDA graph captures run the tactics rank 0 serves with."""
+    rank_0, published = _original_rank_0(16, 16)
+    replacement = _DecoderEngine(_replacement(published), measured_ms=0.05)
+    replacement.autotuner_warmup(16)
+    assert replacement.tactics_at_general_warmup == rank_0.profiling_cache.cache
+    startup_record.close()

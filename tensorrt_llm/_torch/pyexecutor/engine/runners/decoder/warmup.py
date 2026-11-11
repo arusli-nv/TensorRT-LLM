@@ -294,6 +294,8 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
+        # A replacement rank skips the KV cache estimation, so it adopts rank 0's tactics before any forward.
+        startup_record.adopt_tuned_tactics()
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
@@ -1234,7 +1236,6 @@ class DecoderWarmup:
                 token_num_upper_bound=token_num_upper_bound,
                 max_num_draft_tokens=self._config.original_max_draft_len,
             )
-        startup_record.adopt_tuned_tactics()
 
         # The warmup runs again after the KV cache is rebuilt; when the token
         # shape is unchanged and no MXFP8 tuning is pending, the profiling
