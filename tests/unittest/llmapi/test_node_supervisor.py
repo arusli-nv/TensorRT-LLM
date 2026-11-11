@@ -297,16 +297,16 @@ def _push_and_wait_for_step(running, authority, record, nodes=((NODE, "host-1", 
 @pytest.mark.parametrize("btl", [None, "self,tcp"], ids=["default", "user-set"])
 def test_ranks_start_outside_launcher_job(tmp_path, deployment, btl):
     authority, environ = deployment
+    environ.pop("OMPI_MCA_btl", None)
     if btl is not None:
-        environ = {**environ, "OMPI_MCA_btl": btl}
+        environ["OMPI_MCA_btl"] = btl
     running = _serving(tmp_path, authority, environ)
+    kept = ("OMPI_MCA_btl", *supervisor_module._RUN_AS_ROOT_VARS)
     for rank in RANKS:
         started = _read(tmp_path, rank, 0)
         assert started["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == f"{rank},4,2,0"  # on GPU rank % 2
         assert not any(
-            key.startswith(("OMPI_", "PMIX_"))
-            for key in started["environ"]
-            if key != "OMPI_MCA_btl"
+            key.startswith(("OMPI_", "PMIX_")) for key in started["environ"] if key not in kept
         )
         # Without the user's setting, no /dev/shm segment to leave behind.
         assert started["environ"]["OMPI_MCA_btl"] == (btl or "^sm")
@@ -721,7 +721,7 @@ def test_the_ranks_die_with_their_supervisor(tmp_path, deployment):
         supervisor.kill()
 
 
-@pytest.mark.parametrize("end", ["SIGINT", "SIGTERM", "ABORT", "SHUTDOWN"])
+@pytest.mark.parametrize("end", ["SIGINT", "SIGTERM", "ABORTED", "SHUTDOWN"])
 def test_host_weights_unlinked_at_end(tmp_path, deployment, end):
     """Unlink the node's host weights however the deployment ends, and keep another deployment's."""
     authority, environ = deployment
@@ -743,7 +743,7 @@ def test_host_weights_unlinked_at_end(tmp_path, deployment, end):
         else:
             authority.push(_record(MembershipState[end]))
         status = supervisor.wait(30)
-        assert status == {"SIGINT": 130, "SIGTERM": 143, "ABORT": 1, "SHUTDOWN": 0}[end]
+        assert status == {"SIGINT": 130, "SIGTERM": 143, "ABORTED": 1, "SHUTDOWN": 0}[end]
         assert not any(segment.exists() for segment in segments)
         assert other.exists()
         assert not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in RANKS)

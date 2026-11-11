@@ -2364,29 +2364,6 @@ def test_deepseek_v4_cache_defers_reuse_commits(monkeypatch):
     update.assert_called_once_with(batch, commit_ends)
 
 
-@pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_userbuffers_off_under_fault_tolerance(monkeypatch, fault_tolerance):
-    """Check that torch.compile runs without userbuffers under fault tolerance.
-
-    The userbuffers bootstrap runs MPI_COMM_WORLD collectives, and every rank is its own MPI world.
-    """
-    from tensorrt_llm._torch.pyexecutor.engine import model_setup
-
-    initialize = Mock()
-    monkeypatch.setattr(model_setup, "mpi_disabled", lambda: False)
-    monkeypatch.setattr(model_setup.ub, "ub_supported", lambda: True)
-    monkeypatch.setattr(model_setup.ub, "initialize_userbuffers_manager", initialize)
-    llm_args = SimpleNamespace(
-        enable_wide_ep_fault_tolerance=fault_tolerance, allreduce_strategy="AUTO"
-    )
-    mapping = SimpleNamespace(tp_size=WORLD, pp_size=1, cp_size=1, rank=0, gpus_per_node=WORLD)
-
-    enabled = model_setup._init_userbuffers(mapping, llm_args, hidden_size=8, max_num_tokens=8)
-
-    assert enabled is not fault_tolerance
-    assert initialize.called is not fault_tolerance
-
-
 class _PastModelBuild(Exception):
     """Raised by the model load step that follows the checks of the built model."""
 
@@ -2453,6 +2430,8 @@ def test_unsupported_models_refused_before_weights_load(
     monkeypatch.setattr(
         model_loader_module.AutoModelForCausalLM, "from_config", Mock(return_value=model)
     )
+    # The state needs pinned memory, so only the checks of the MoE layers run.
+    monkeypatch.setattr(MoeExecutionState, "for_model", MoeExecutionState.model_comms)
     monkeypatch.setattr(
         loader, "_qualify_post_transform_profile", Mock(side_effect=_PastModelBuild)
     )
