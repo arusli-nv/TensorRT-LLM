@@ -581,7 +581,8 @@ void SingleLayerMoeLoadBalancer::setGpuStage()
 void SingleLayerMoeLoadBalancer::waitCpuStage()
 {
     // An abandoned iteration may never hand the layer back, so no update starts.
-    if (!tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal, &mMoeLoadBalancer->mAbandoning))
+    auto const* stop = mMoeLoadBalancer->mRankFailureRecovery ? &mMoeLoadBalancer->mAbandoning : nullptr;
+    if (!tensorrt_llm::kernels::moeWaitSignalForCpuStageHost(mSingleLayerSignal, stop))
     {
         mUpdateWeightsEnabled = false;
     }

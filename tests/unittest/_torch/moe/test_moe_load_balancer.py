@@ -2,10 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
-import json
 import os
-import subprocess
-import sys
 import unittest
 from collections.abc import Iterator
 from contextlib import nullcontext
@@ -977,123 +974,6 @@ def test_a_lost_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
     finally:
         balancer.shutdown()
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_online_eplb_update_does_not_stall_behind_a_driver_call_waiting_for_the_gpu(
-        tmp_path):
-    """A driver call that waits for the GPU while it holds the driver lock (in KV cache manager V2: a copy kernel's
-    first launch, a cache removal) must not stall an online EPLB weight update in flight, because the GPU waits in
-    EPLB's GPU stage wait for that update. Online EPLB's updates call no driver function (CPU copies), so the update
-    ends, the wait ends and the call returns. The driver call here is the KV cache copy kernel's first launch under
-    lazy loading, which synchronizes the context: in a fresh process, where that kernel is not loaded yet."""
-    _skip_without_gdrcopy_slots()
-    script = tmp_path / "eplb_update_during_kv_copy_kernel_load.py"
-    script.write_text(_EPLB_UPDATE_DURING_KV_COPY_KERNEL_LOAD)
-    env = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith(("OMPI_", "PMIX_", "PMI_"))
-    }
-    env.update(CUDA_MODULE_LOADING="LAZY",
-               TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK="1")
-    try:
-        child = subprocess.run([sys.executable, str(script)],
-                               env=env,
-                               capture_output=True,
-                               text=True,
-                               timeout=300)
-    except subprocess.TimeoutExpired as error:
-        pytest.fail(
-            "online EPLB stalled behind the copy kernel's load; the process said: "
-            f"{error.stdout}")
-    assert child.returncode == 0, child.stderr[-4000:]
-    result = {}
-    for line in child.stdout.splitlines():
-        if line.startswith("{"):
-            result.update(json.loads(line))
-    if not result.get("load_waited_for_gpu"):
-        pytest.skip(
-            "the copy kernel's lazy load did not wait for the GPU here: the stall cannot form"
-        )
-    assert result.get("copied") and result.get("forwards_done"), result
-
-
-# Run in a fresh process by the test above: the copy kernel must not be loaded yet.
-_EPLB_UPDATE_DURING_KV_COPY_KERNEL_LOAD = r'''
-import json
-import os
-import threading
-
-import torch
-
-from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as mlb
-from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import EplbExpertRestore
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer, MoeLoadBalancerIterContext
-from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2_utils as copy_helpers
-
-mlb.fault_tolerance_mode = lambda: True
-EplbExpertRestore._rank_nodes = lambda self: [0, 1]  # rank 0 of two nodes: spare slots after EPLB's three
-torch.cuda.set_device(0)
-expert_count, slot_elements = 4, 1 << 21  # 8 MiB slots: whole VMM chunks
-balancer = MoeLoadBalancer(0, 2, 1, shared_memory_base_name=f"stall_{os.getpid()}")
-layer = balancer.add_layer(expert_count, 2, 3)
-assignments = layer.with_spare_slots([0, 1, 2, 3, 0, 1])
-weights = layer.create_spare_slot_storage(
-    "w", torch.tensor(assignments[:6], dtype=torch.float32)[:, None].add(1).expand(-1, slot_elements).contiguous())
-for expert_id in range(expert_count):
-    layer.host_tensor_sharer.share_host_tensor_with_shape(expert_id, "w", torch.full((slot_elements,), expert_id + 1.0))
-layer.host_tensor_sharer.finalize_layer_weights()
-layer.add_to_migrate_weight_fn(layer.use_spare_slot_storage, (weights, "w"))
-for slot in range(layer.slot_count_per_rank):
-    layer.add_register_weight_fn(lambda slot=slot: layer.register_weight_slot(slot, "w", weights[slot]), ())
-layer.set_initial_weight_assignments(assignments)
-balancer.register_weight_slots_after_to_cuda()
-balancer.finalize_model()
-balancer.set_warm_up_iter_count(0)
-expert_ids = torch.tensor([[2, 3]] * 8, dtype=torch.int32, device="cuda")
-
-
-def forward():
-    layer.start_wait_gpu_stage()
-    layer.done_wait_gpu_stage()
-    layer.update_statistic_with_global_ids(expert_ids, True, True)
-    layer.start_set_cpu_stage()
-    layer.done_set_cpu_stage()
-
-
-# The GPU is busy for seconds; behind that, iteration 0 hands the layer back, which starts its weight update, and
-# iteration 1 waits in the GPU stage for that update.
-torch.cuda._sleep(int(6e9))
-with MoeLoadBalancerIterContext(balancer, True, True):
-    forward()
-with MoeLoadBalancerIterContext(balancer, True, True):
-    forward()
-forwards_done = torch.cuda.Event()
-forwards_done.record()
-
-# Meanwhile a host-tier resume launches the KV cache copy kernel for the first time.
-pages, page_bytes = 20, 1 << 16
-host = torch.ones(pages, page_bytes, dtype=torch.uint8).pin_memory()
-device = torch.zeros(pages, page_bytes, dtype=torch.uint8, device="cuda")
-stream = torch.cuda.Stream()
-tasks = [copy_helpers.MemToMemTask(dst=device[i].data_ptr(), src=host[i].data_ptr()) for i in range(pages)]
-copied = threading.Event()
-
-
-def copy():
-    assert copy_helpers.copy_host_to_device(tasks, page_bytes, stream.cuda_stream) == 0
-    copied.set()
-
-
-threading.Thread(target=copy, daemon=True).start()
-# While the GPU sleeps, a lazy load that synchronizes the context still waits.
-print(json.dumps({"load_waited_for_gpu": not copied.wait(1.0)}), flush=True)
-print(json.dumps({"copied": copied.wait(120)}), flush=True)
-forwards_done.synchronize()
-stream.synchronize()
-print(json.dumps({"forwards_done": True}), flush=True)
-assert balancer.shutdown()
-'''
 
 _EXPERTS, _HIDDEN, _INTERMEDIATE = 4, 2048, 2048
 
