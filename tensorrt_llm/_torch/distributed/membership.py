@@ -694,7 +694,7 @@ class StoreGroup:
 
     def bcast(self, obj: Any, root: int = 0) -> Any:
         """Return the ``obj`` of communicator rank ``root``, or None if it is not active."""
-        return self.allgather(obj)[root]
+        return self.allgather(obj if self.Get_rank() == root else None)[root]
 
     def allreduce(self, obj: Any, op: Any = None) -> Any:
         """Reduce the active members' ``obj`` by ``MPI.SUM`` (the default), ``MPI.MIN`` or ``MPI.MAX``."""

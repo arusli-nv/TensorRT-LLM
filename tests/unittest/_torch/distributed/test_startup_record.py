@@ -23,7 +23,7 @@ import contextlib
 import os
 import pickle
 import resource
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -37,6 +37,7 @@ from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExcha
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
 from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
+from tensorrt_llm._torch.pyexecutor import model_loader
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
     DecoderWarmup,
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _compute_auto_host_tier_quota,
+    _raise_on_every_rank,
     _sync_host_tier_quota,
     get_host_memory_limits,
 )
@@ -194,7 +196,9 @@ def test_paused_collectives_are_not_recorded():
     rank_0 = _rank_0()
     startup_record.pause()
     assert rank_0.allgather("estimation") == ["estimation"] * WORLD
+    assert startup_record.agree("estimation", lambda: 1) == 1
     startup_record.resume()
+    assert startup_record.values == {}
     _barrier(rank_0)
     replacement = _replacement(_publish())
     # This replays rank 0's barrier, not its paused gather.
@@ -233,6 +237,93 @@ def test_divergent_replacement_cannot_start():
     _barrier(replacement)
     with pytest.raises(SystemExit, match="one more than the original ranks made"):
         _barrier(replacement)
+    startup_record.close()
+
+
+def test_equal_payloads_pickled_differently_match():
+    repeated = "payload"
+    _gather(_rank_0(), [repeated, repeated])
+    replacement = _replacement(_publish())
+    # Two equal strings pickle differently from one string twice.
+    assert _gather(replacement, ["payload", "".join(["pay", "load"])]) == [["payload"] * 2] * WORLD
+    startup_record.close()
+
+
+def test_bounded_status_reports_replacement_error(distributed):
+    """Check that a replacement whose KV cache allocation failed raises that error."""
+    mapping = SimpleNamespace(world_size=WORLD)
+    distributed.dist = _rank_0()
+    _raise_on_every_rank(None, mapping, "KV cache allocation")
+    distributed.dist = _replacement(_publish())
+    with pytest.raises(MemoryError, match="pool"):
+        _raise_on_every_rank(MemoryError("pool"), mapping, "KV cache allocation")
+
+
+def _quota(dist, quota):
+    return startup_record.agree_rank_capacity(
+        "kv_cache_device_quota", dist.mapping.rank, quota, lambda: dist.allgather(quota)
+    )
+
+
+def test_replacement_takes_predecessor_quota():
+    """Check that a replacement of a rank with a smaller quota than rank 0 takes that quota."""
+
+    def smaller(r, obj):
+        return obj - r
+
+    assert _quota(_rank_0(smaller), 100) == 100
+    published = _publish()
+    assert _quota(_replacement(published), 110) == 100 - REPLACED
+    startup_record.close()
+    replacement = _replacement(published)
+    with pytest.raises(
+        SystemExit, match=f"is {100 - REPLACED - 1}, below its predecessor's {100 - REPLACED}"
+    ):
+        _quota(replacement, 100 - REPLACED - 1)
+
+
+class _ReadAheadLoader:
+    """A checkpoint loader whose session setup and finalization gather across ranks, as rank-striped read-ahead does."""
+
+    def __init__(self, dist):
+        self.dist = dist
+
+    @contextlib.contextmanager
+    def open_weight_session(self, checkpoint_dir, **kwargs):
+        self.dist.allgather("setup")
+        yield {}
+        self.dist.allgather("finalization")
+
+
+def test_checkpoint_session_is_not_recorded():
+    rank_0 = _rank_0()
+    with model_loader._timed_checkpoint_weight_session(
+        _ReadAheadLoader(rank_0), "checkpoint", {}, "preparation", "finalization"
+    ):
+        _barrier(rank_0)
+    replacement = _replacement(_publish())
+    _barrier(replacement)
+    startup_record.close()
+
+
+def _kv_load_sample(dist, sample):
+    return dist.tp_allgather(sample)
+
+
+# The allgather of the KV load sample, as PyExecutor._initialize_execution makes it.
+_initialize_execution = FunctionType(
+    _kv_load_sample.__code__.replace(co_filename="py_executor.py", co_name="_initialize_execution"),
+    globals(),
+)
+
+
+def test_replacement_sends_own_kv_load_sample():
+    _initialize_execution(_rank_0(), {"timestampUnixNanos": 1})
+    replacement = _replacement(_publish())
+    assert (
+        _initialize_execution(replacement, {"timestampUnixNanos": 2})
+        == [{"timestampUnixNanos": 1}] * WORLD
+    )
     startup_record.close()
 
 

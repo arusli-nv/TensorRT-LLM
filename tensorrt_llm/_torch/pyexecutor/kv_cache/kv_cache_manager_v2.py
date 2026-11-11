@@ -53,6 +53,7 @@ from tensorrt_llm._utils import (
     str_dtype_to_binding,
     str_dtype_to_torch,
 )
+from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
@@ -705,7 +706,10 @@ def _sync_kv_cache_manager_init_status(
     local_status: _KVCacheManagerInitStatus, mapping: Mapping
 ) -> _KVCacheManagerInitStatus:
     """Return the most severe initialization status across all ranks."""
-    if mapping.world_size > 1:
+    # The original ranks all started, so a replacement rank that failed raises its own error.
+    if mapping.world_size > 1 and (
+        local_status == _KVCacheManagerInitStatus.OK or not startup_record.replaying
+    ):
         local_status = _KVCacheManagerInitStatus(
             Distributed.get(mapping).allreduce(int(local_status), op=ReduceOp.MAX)
         )
@@ -2681,6 +2685,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     math.ceil(self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume)
                 )
                 quota = min(quota, synced_quota)
+            if wide_ep_fault_tolerance_enabled():
+                # Warmup shapes follow the KV cache capacity, so a replacement rank takes its predecessor's quota.
+                quota = startup_record.agree_rank_capacity(
+                    "kv_cache_device_quota", mapping.rank, quota, lambda: dist.allgather(quota)
+                )
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 

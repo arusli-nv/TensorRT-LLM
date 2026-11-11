@@ -286,6 +286,21 @@ def test_replacement_replays_startup_group(store, monkeypatch):
         _startup_collectives(replacement, 20)
 
 
+def test_replacement_bcast_ignores_own_value(store, monkeypatch):
+    """Check that a replacement's value to a broadcast from rank 0 need not match its predecessor's."""
+    startup_record.record()  # in rank 0's process only
+
+    def rank(r):
+        return StoreGroup(_client(store), "w", r, range(2), startup=r == 0).bcast(f"rank {r}")
+
+    assert _on_ranks(range(2), rank) == {0: "rank 0", 1: "rank 0"}
+    published = startup_record.published()
+    _replay(monkeypatch, None)
+    startup_record.replay(published)
+    replacement = StoreGroup(None, "w", 1, range(2), active=[1], startup=True)
+    assert replacement.bcast("replacement") == "rank 0"
+
+
 def _mirror(store_port, rank, steps):
     """Run the collectives of rank 1's peers in test_an_original_rank_starts_without_mpi."""
     world = StoreGroup(

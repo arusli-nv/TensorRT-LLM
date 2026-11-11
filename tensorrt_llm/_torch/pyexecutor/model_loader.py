@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterator, Optional, Tuple
 import torch
 
 from tensorrt_llm._errors import ConfigInputError, UnsupportedError
+from tensorrt_llm._torch.distributed.startup_record import startup_record
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -731,17 +732,22 @@ def _timed_checkpoint_weight_session(
     """Time session setup and finalization around materialization."""
     session = _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir,
                                               **kwargs)
-    with timing_metric(checkpoint_preparation_metric_name, metrics):
+    # A replacement rank loads its checkpoint alone, without the collectives
+    # of the other ranks' session setup and finalization.
+    with timing_metric(checkpoint_preparation_metric_name,
+                       metrics), startup_record.paused():
         weights = session.__enter__()
     try:
         yield weights
     except BaseException:
-        with timing_metric(checkpoint_finalization_metric_name, metrics):
+        with timing_metric(checkpoint_finalization_metric_name,
+                           metrics), startup_record.paused():
             suppress = session.__exit__(*sys.exc_info())
         if not suppress:
             raise
     else:
-        with timing_metric(checkpoint_finalization_metric_name, metrics):
+        with timing_metric(checkpoint_finalization_metric_name,
+                           metrics), startup_record.paused():
             session.__exit__(None, None, None)
 
 

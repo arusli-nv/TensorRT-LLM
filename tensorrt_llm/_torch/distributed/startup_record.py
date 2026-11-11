@@ -17,8 +17,9 @@
 import functools
 import pickle  # nosec B403
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Sequence
 
 from .membership import ReplacementCannotStart
 
@@ -43,6 +44,7 @@ RANK_VARYING_CALLERS = frozenset(
     {
         ("autotuner.py", "_merge_cache_data", "tp_cp_allgather"),
         ("autotuner.py", "post_tune_merge_tactics", "tp_cp_allgather"),
+        ("py_executor.py", "_initialize_execution", "tp_allgather"),
         ("warmup.py", "_run_autotuner_warmup", "agree_flag"),
         ("worker.py", "worker_main", "allgather"),
     }
@@ -119,11 +121,20 @@ class StartupRecord:
         return {"values": self.values, "exchanges": self.exchanges}
 
     def pause(self) -> None:
-        """Neither record nor replay the host collectives until the matching :meth:`resume`."""
+        """Neither record nor replay the startup collectives until the matching :meth:`resume`."""
         self._pauses += 1
 
     def resume(self) -> None:
         self._pauses -= 1
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Pause the record for the scope of the ``with`` statement."""
+        self.pause()
+        try:
+            yield
+        finally:
+            self.resume()
 
     def ranks_sharing_free_memory(self, local_ranks: int) -> int:
         """Return how many of the ``local_ranks`` ranks on this node split the memory free on it now.
@@ -156,7 +167,7 @@ class StartupRecord:
 
     def agree(self, name: str, gather: Callable[[], Any]) -> Any:
         """Return the result of ``gather``, or rank 0's recorded result of the same call on a replacement rank."""
-        if self._replacement:
+        if self._replacement and not self._pauses:
             recorded = self.values.get(name, [])
             index = self._taken.get(name, 0)
             if index == len(recorded):
@@ -166,15 +177,29 @@ class StartupRecord:
                 )
             self._taken[name] = index + 1
             return recorded[index]
-        if not self._recording:
+        if not self._recording or self._pauses:
             return gather()
-        self.pause()
-        try:
+        with self.paused():
             value = gather()
-        finally:
-            self.resume()
         self.values.setdefault(name, []).append(value)
         return value
+
+    def agree_rank_capacity(
+        self, name: str, rank: int, capacity: int, gather: Callable[[], Sequence[int]]
+    ) -> int:
+        """Return the ``capacity`` of rank ``rank``, or its predecessor's on a replacement rank.
+
+        ``gather`` returns every rank's ``capacity``.
+
+        Raises:
+            ReplacementCannotStart: The replacement rank's own ``capacity`` is below its predecessor's.
+        """
+        recorded = self.agree(name, gather)[rank]
+        if recorded > capacity:
+            raise ReplacementCannotStart(
+                f"The {name} of this replacement rank is {capacity}, below its predecessor's {recorded}"
+            )
+        return recorded
 
     def adopt_tuned_tactics(self) -> None:
         """Share rank 0's tuned tactics with a replacement, which skips the KV cache estimation warmup."""
@@ -199,10 +224,12 @@ class StartupRecord:
         readers: Optional[Sequence[int]],
         run: Callable[[], List[Optional[bytes]]],
         bound: Optional[Callable[[Any, Any], Any]] = None,
+        decode: Callable[[bytes], Any] = pickle.loads,
     ) -> List[Optional[bytes]]:
         """Return every rank's pickled payload, from ``run()`` on rank 0 or from the record on a replacement rank.
 
-        ``bound`` is ``min`` or ``max`` for a reduction by it, else None.
+        ``bound`` is ``min`` or ``max`` for a reduction by it, else None. ``decode`` turns a payload into the value
+        that the replay compares, since equal values can pickle differently.
 
         Raises:
             ReplacementCannotStart: The collective or its payload differs from the original ranks' at that call.
@@ -227,17 +254,18 @@ class StartupRecord:
                 f"{recorded.caller}"
             )
         predecessor = recorded.payloads[rank]
+        # Only processes with the shared secret write the rendezvous store the record comes from.
         if (
             predecessor is not None
-            and predecessor != payload
             and (caller.file, caller.function, caller.collective) not in RANK_VARYING_CALLERS
+            and decode(predecessor) != decode(payload)
         ):
             if bound is None:
                 raise ReplacementCannotStart(
                     f"The payload of this replacement rank to host collective {index} of its startup, {caller}, "
                     "differs from the original rank's"
                 )
-            self._check_bound(index, caller, bound, payload, recorded.payloads)
+            self._check_bound(index, caller, bound, decode(payload), recorded.payloads, decode)
         readers = range(len(recorded.payloads)) if readers is None else readers
         unread = [r for r in readers if recorded.payloads[r] is None]
         if unread:
@@ -253,13 +281,12 @@ class StartupRecord:
         index: int,
         caller: Caller,
         bound: Callable[[Any, Any], Any],
-        payload: bytes,
+        own: Any,
         payloads: List[Optional[bytes]],
+        decode: Callable[[bytes], Any],
     ) -> None:
-        # Only processes with the shared secret write the rendezvous store the record comes from.
-        values = [pickle.loads(p) for p in payloads if p is not None]  # nosec B301
+        values = [decode(p) for p in payloads if p is not None]
         result = functools.reduce(bound, values)
-        own = pickle.loads(payload)  # nosec B301
         if bound(own, result) != result:
             raise ReplacementCannotStart(
                 f"The own value of this replacement rank to host collective {index} of its startup, {caller}, is "

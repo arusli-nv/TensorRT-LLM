@@ -737,6 +737,7 @@ class MnnvlDist(MPIDist):
             values.tobytes(),
             None,
             lambda: [row.tobytes() for row in host_exchange.allgather_array(values)],
+            decode=lambda row: np.frombuffer(row, dtype=np.int64).tolist(),
         )
         return np.stack([np.frombuffer(row, dtype=np.int64) for row in rows])
 
