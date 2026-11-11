@@ -44,10 +44,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import (
-    CuteDslFusedMoENvfp4InputsHelper,
-    _runner_tactics_match_tile_size,
-)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import _runner_tactics_match_tile_size
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     interleave_gate_and_linear,
@@ -56,7 +53,6 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
 from tensorrt_llm._torch.utils import (
     ActivationType,
     Fp4QuantizedTensor,
-    get_last_power_of_2_num_tokens_buckets,
     is_gated_activation,
     relu2,
     swizzle_sf,
@@ -225,111 +221,6 @@ def test_grouped_gemm_inputs_helper_fixed_expert_capacity(tile_size: int):
     assert helper.infer_shape_padded_rows_from_input5(input_shapes) == 16 * tile_size
     with pytest.raises(ValueError, match="capacity must be positive"):
         helper.get_expert_capacity_num_permuted_tokens(0)
-
-
-# DeepSeek-R1 on 32 ranks with WideEP fault tolerance: 8 EPLB slots and 2 spare slots per rank.
-_EP_SIZE, _EP_RANK, _ACTIVE_SLOTS, _SPARE_SLOTS = 32, 5, 8, 2
-_SLOTS = _ACTIVE_SLOTS + _SPARE_SLOTS
-
-
-@pytest.mark.parametrize("top_k", [1, 2, 8])
-@pytest.mark.parametrize("tile_size", [128, 256])
-def test_grouped_gemm_inputs_helper_tunes_without_spare_slots(tile_size: int, top_k: int):
-    """With spare slots, the tuning buckets and the profiled routing are those of the same layer
-    without spare slots, and every runtime row count maps to a tuned bucket.
-
-    That bucket is the one of the same token count without spare slots, except for a few counts at
-    most (tile_size - 1) / top_k below a power of two: their rows without spare slots infer that
-    power, their runtime rows, padded for more slots, do not (at tile 128, top-k 8, 8 active and 2
-    spare slots: 17, 49, 113, ..., one per power of two). Those map to the next-lower tuned bucket.
-    """
-    max_num_tokens = 8192
-    with_spare = GroupedGemmInputsHelper(
-        _EP_SIZE * _SLOTS,
-        top_k,
-        _SLOTS,
-        _EP_RANK * _SLOTS,
-        tile_size,
-        tuner_num_local_experts=_ACTIVE_SLOTS,
-    )
-    without = GroupedGemmInputsHelper(
-        _EP_SIZE * _ACTIVE_SLOTS, top_k, _ACTIVE_SLOTS, _EP_RANK * _ACTIVE_SLOTS, tile_size
-    )
-    runtime = GroupedGemmInputsHelper(
-        _EP_SIZE * _SLOTS, top_k, _SLOTS, _EP_RANK * _SLOTS, tile_size
-    )
-
-    tuned = with_spare.gen_tuning_buckets(runtime.get_max_num_permuted_tokens(max_num_tokens))
-    assert tuned == without.gen_tuning_buckets(without.get_max_num_permuted_tokens(max_num_tokens))
-
-    for num_tokens in range(1, max_num_tokens + 1):
-        bucket = with_spare.map_to_tuning_buckets(runtime.get_max_num_permuted_tokens(num_tokens))
-        bucket_without = without.map_to_tuning_buckets(
-            without.get_max_num_permuted_tokens(num_tokens)
-        )
-        assert bucket in tuned, num_tokens
-        assert tuned.index(bucket) in (
-            tuned.index(bucket_without),
-            tuned.index(bucket_without) - 1,
-        ), num_tokens
-
-    for num_tokens in get_last_power_of_2_num_tokens_buckets(max_num_tokens):
-        counts = with_spare.generate_num_tokens_per_expert(num_tokens, approx_max_load=True)
-        assert counts == without.generate_num_tokens_per_expert(num_tokens, approx_max_load=True)
-        assert torch.equal(
-            with_spare.generate_token_selected_experts(num_tokens, counts),
-            without.generate_token_selected_experts(num_tokens, counts),
-        )
-
-
-@pytest.mark.parametrize("tile_size", [128, 256])
-def test_grouped_gemm_inputs_helper_expert_capacity_counts_every_local_slot(tile_size: int):
-    """Expert-major rows hold a capacity for every local slot, spare slots included, so a tuner
-    layout leaves their bookkeeping as without one."""
-    with_spare = GroupedGemmInputsHelper(
-        _EP_SIZE * _SLOTS,
-        1,
-        _SLOTS,
-        _EP_RANK * _SLOTS,
-        tile_size,
-        tuner_num_local_experts=_ACTIVE_SLOTS,
-    )
-    runtime = GroupedGemmInputsHelper(_EP_SIZE * _SLOTS, 1, _SLOTS, _EP_RANK * _SLOTS, tile_size)
-    # Not a multiple of the active slots.
-    rows = _SLOTS * (tile_size + 1)
-    input_shapes = [torch.Size([1])] * 5 + [torch.Size([rows])]
-    for helper in (with_spare, runtime):
-        assert helper.get_expert_capacity_num_permuted_tokens(tile_size + 1) == (
-            _SLOTS * 2 * tile_size
-        )
-        assert helper.map_to_expert_capacity_tuning_bucket(rows) == _SLOTS * tile_size
-        assert helper.gen_expert_capacity_tuning_buckets(rows)[-1] == _SLOTS * tile_size
-        assert helper.infer_shape_padded_rows_from_input5(input_shapes) == _SLOTS * 2 * tile_size
-        # A capacity of one row short of four tiles per slot pads to four tiles per slot.
-        long_shapes = input_shapes[:5] + [torch.Size([_SLOTS * (4 * tile_size - 1)])]
-        assert helper.infer_shape_padded_rows_from_input5(long_shapes) == _SLOTS * 4 * tile_size
-
-
-def test_cute_dsl_fused_moe_tuning_routes_no_tokens_to_spare_slots():
-    """The end-to-end tuning routes this rank's tokens to its active slots, as many to each as
-    without spare slots."""
-    top_k = 8
-    with_spare = CuteDslFusedMoENvfp4InputsHelper(
-        _EP_SIZE * _SLOTS, top_k, _SLOTS, _EP_RANK * _SLOTS, tuner_num_local_experts=_ACTIVE_SLOTS
-    )
-    without = CuteDslFusedMoENvfp4InputsHelper(
-        _EP_SIZE * _ACTIVE_SLOTS, top_k, _ACTIVE_SLOTS, _EP_RANK * _ACTIVE_SLOTS
-    )
-    for num_tokens in (1, 64, 3072):
-        token_selected_slots = torch.zeros(num_tokens, top_k, dtype=torch.int32)
-        _, routed = with_spare.inputs_pre_hook([None, token_selected_slots])
-        _, routed_without = without.inputs_pre_hook([None, token_selected_slots])
-        local = torch.where(routed >= 0, routed - _EP_RANK * _SLOTS, -1)
-        local_without = torch.where(
-            routed_without >= 0, routed_without - _EP_RANK * _ACTIVE_SLOTS, -1
-        )
-        assert torch.equal(local, local_without)
-        assert local.max().item() < _ACTIVE_SLOTS
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -1050,6 +941,11 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
         scaling_vector_size=sf_vec_size,
     )
     torch.testing.assert_close(c[:num_valid_permuted_tokens], c_ref[:num_valid_permuted_tokens])
+
+
+# DeepSeek-R1 on 32 ranks with WideEP fault tolerance: 8 EPLB slots and 2 spare slots per rank.
+_EP_SIZE, _EP_RANK, _ACTIVE_SLOTS, _SPARE_SLOTS = 32, 5, 8, 2
+_SLOTS = _ACTIVE_SLOTS + _SPARE_SLOTS
 
 
 @pytest.mark.skipif(

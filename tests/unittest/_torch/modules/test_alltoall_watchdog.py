@@ -201,34 +201,6 @@ def test_wide_ep_ft_options_create_shared_health_when_enabled(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("env_enabled", [False, True], ids=["flag", "flag_and_env"])
-def test_wide_ep_ft_options_under_fault_tolerance_run_no_watchdog(
-    monkeypatch: pytest.MonkeyPatch, env_enabled: bool
-) -> None:
-    """enable_wide_ep_fault_tolerance creates the shared membership whether or not
-    TLLM_FAULT_TOLERANCE_MODE is set, and no watchdog: the membership authority reads the
-    kernels' wait evidence."""
-    monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", True)
-    if env_enabled:
-        monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
-    else:
-        monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
-    model_config = SimpleNamespace(
-        extra_attrs={},
-        mapping=SimpleNamespace(moe_ep_size=4),
-    )
-
-    health, timeout_s, poll_interval_s = get_wide_ep_ft_options(model_config)
-    health_again, timeout_again_s, poll_again_s = get_wide_ep_ft_options(model_config)
-
-    assert isinstance(health, EPGroupHealth)
-    assert health_again is health
-    assert timeout_s is None and timeout_again_s is None
-    assert poll_interval_s == DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S
-    assert poll_again_s == poll_interval_s
-
-
-@pytest.mark.cpu_only
 def test_wide_ep_ft_options_reject_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -251,10 +223,13 @@ def test_wide_ep_ft_options_allow_cuda_graphs_only_in_fault_tolerance_mode(
     monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
 ) -> None:
     """The kernels read the rank mask at execution time, so rank-mask mode works with CUDA graphs once fault
-    tolerance mode binds the communicators; an injected membership without it is refused before the model loads."""
+    tolerance mode binds the communicators; an injected membership without it is refused before the model loads.
+    Fault tolerance mode alone creates the shared membership, and no watchdog: the membership authority reads the
+    kernels' wait evidence."""
     import tensorrt_llm._torch.moe.fused_moe.wide_ep_ft as wide_ep_ft
 
     monkeypatch.setattr(wide_ep_ft, "fault_tolerance_mode", lambda: fault_tolerance)
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
     model_config = SimpleNamespace(
         extra_attrs={} if fault_tolerance else {"ep_group_health": EPGroupHealth(4)},
         mapping=SimpleNamespace(moe_ep_size=4),
@@ -265,8 +240,9 @@ def test_wide_ep_ft_options_allow_cuda_graphs_only_in_fault_tolerance_mode(
             get_wide_ep_ft_options(model_config)
         return
 
-    health, _, _ = get_wide_ep_ft_options(model_config)
+    health, timeout_s, _ = get_wide_ep_ft_options(model_config)
     assert isinstance(health, EPGroupHealth)
+    assert timeout_s is None
     assert health.moe_world_size == 4
     assert list(model_config.extra_attrs.values()) == [health]
 

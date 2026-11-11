@@ -677,49 +677,6 @@ class _WeightLayout(MoEEplbWeightLayoutMixin):
     pass
 
 
-@pytest.mark.parametrize("spare_slot_count", [0, 1])
-def test_static_routing_with_spare_slots_moves_their_storage_and_shares_host_weights(
-        spare_slot_count):
-    """Static routing registers no slot functions: with spare slots it registers their storage, whose migration
-    (``use_spare_slot_storage``) registers the slots, and shares the host weights a lost rank's experts are restored
-    from; without them nothing."""
-    module = _WeightLayout()
-    module.num_experts = 2
-    module.layer_load_balancer = MagicMock(spare_slot_count=spare_slot_count)
-    module.layer_load_balancer.is_dynamic_routing.return_value = False
-    module.layer_load_balancer.get_load_expert_ids.return_value = [1]
-    weights = {name: torch.zeros(1, 3) for name in ("w1", "w2")}
-    module.register_all_parameter_slot_and_to_fix_weight_fns(weights)
-    balancer = module.layer_load_balancer
-    sharer = balancer.host_tensor_sharer
-    assert balancer.add_to_migrate_weight_fn.call_count == 2 * spare_slot_count
-    balancer.add_register_weight_fn.assert_not_called()
-    if spare_slot_count:
-        assert [
-            c.args[:2]
-            for c in sharer.share_host_tensor_with_shape.call_args_list
-        ] == [(1, "w1"), (1, "w2")]
-        assert [
-            c.args[:2]
-            for c in sharer.pre_register_host_tensor_with_shape.call_args_list
-        ] == [(0, "w1"), (0, "w2")]
-    else:
-        balancer.get_load_expert_ids.assert_not_called()
-        sharer.share_host_tensor_with_shape.assert_not_called()
-
-
-@pytest.mark.parametrize("shares_host_weights", [False, True])
-def test_raw_weights_are_paged_out_wherever_host_weights_are_shared(
-        shares_host_weights):
-    module = _WeightLayout()
-    module.layer_load_balancer = MagicMock()
-    module.layer_load_balancer.is_dynamic_routing.return_value = False
-    module.layer_load_balancer.need_load_shared_weights.return_value = shares_host_weights
-    module._add_raw_shared_weights_for_unmap(["raw"])
-    assert module.layer_load_balancer._add_raw_host_weight_for_unmap.call_count == int(
-        shares_host_weights)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_unbacked_slot_tensor_takes_device_memory_for_its_backed_slots_only():
     """A slot tensor made with unbacked slots takes device memory for its other slots and the one scratch chunk

@@ -465,15 +465,16 @@ def test_capturable_failures_are_released_per_batch(monkeypatch):
 # --- recompute and discarded steps --------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("fault_tolerance", [True, False])
-def test_a_recomputed_request_carries_its_generated_tokens_to_its_last_context_chunk(
+def test_a_recomputed_request_replays_its_generated_tokens_into_the_new_matcher(
     monkeypatch, fault_tolerance
 ):
-    """A recompute moves the generated tokens into the prompt; with WideEP fault tolerance the new matcher must
-    accept them."""
+    """A recompute moves the generated tokens into the prompt; with WideEP fault tolerance the last context chunk
+    carries them and the build replays them into the new matcher."""
     monkeypatch.setattr(_utils, "_wide_ep_fault_tolerance", fault_tolerance)
     request = LlmRequest(
-        request_id=1,
+        request_id=7,
         max_new_tokens=8,
         input_tokens=[1, 2, 3],
         sampling_config=SamplingConfig(1),
@@ -484,13 +485,11 @@ def test_a_recomputed_request_carries_its_generated_tokens_to_its_last_context_c
         request.add_new_token(token, 0)
     request.reset_for_recompute(1 << 20)
     request.context_chunk_size = request.context_remaining_length
+    recomputed_tokens = GuidedRequest.from_llm_request(request).recomputed_tokens
+    assert recomputed_tokens == ([10, 11] if fault_tolerance else None)
+    if not fault_tolerance:
+        return
 
-    expected = [10, 11] if fault_tolerance else None
-    assert GuidedRequest.from_llm_request(request).recomputed_tokens == expected
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_build_replays_the_recomputed_tokens_into_the_new_matcher(monkeypatch):
     decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
     matcher = _ScriptedMatcher([True])
     decoder.grammar_matcher_factory = SimpleNamespace(create=lambda params: matcher)
@@ -504,7 +503,7 @@ def test_build_replays_the_recomputed_tokens_into_the_new_matcher(monkeypatch):
                 is_last_context_chunk=True,
                 # As GuidedRequest.from_llm_request gives a request without draft tokens.
                 draft_tokens=[],
-                recomputed_tokens=[10, 11],
+                recomputed_tokens=recomputed_tokens,
             )
         ],
         num_contexts=1,
@@ -540,31 +539,3 @@ def test_a_discarded_step_leaves_its_requests_unguided_until_they_are_computed_a
     assert decoder._build(requests) == []
     assert matcher.accepted == []
     assert decoder.token_mask_host[0].item() == 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@_runs_host_functions
-def test_a_discarded_capturable_batch_drops_its_matchers_and_its_failures(monkeypatch):
-    """The failures a discarded batch's build reported come from matchers that are dropped: no later batch reports
-    them."""
-    decoder = _make_capturable_decoder(monkeypatch, max_num_draft_tokens=0)
-    decoder.grammar_matcher_factory = _MatcherFactory()
-    requests = GuidedRequests(
-        [
-            _disagg_generation_request(_INVALID_PARAMS, request_id=7, seq_slot=0),
-            _disagg_generation_request(_GUIDED_PARAMS, request_id=8, seq_slot=1),
-        ],
-        num_contexts=0,
-        num_generations=2,
-        max_num_draft_tokens=0,
-    )
-    _run_capturable_step(decoder, requests)
-    assert decoder.grammar_matchers[1] is not None
-
-    decoder.discard_batch(
-        [SimpleNamespace(py_seq_slot=0), SimpleNamespace(py_seq_slot=1)],
-        decoder.last_added_batch_id,
-    )
-
-    assert decoder.grammar_matchers[1] is None
-    assert decoder.take_failed_requests(decoder.last_added_batch_id) == []

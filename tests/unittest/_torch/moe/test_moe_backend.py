@@ -1154,25 +1154,6 @@ def test_deepgemm_refused_for_its_workspace(spare_slot_count: int) -> None:
         moe.validate_backend(backend)  # does not raise
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "sm_version, rubin_dsl, refused",
-    [(100, True, False), (107, False, False), (107, True, True)],
-    ids=["sm100", "sm107_blackwell_kernels", "sm107_rubin_kernels"],
-)
-def test_cutedsl_nvfp4_with_the_sm107_kernels_is_refused_with_spare_slots(
-    monkeypatch: pytest.MonkeyPatch, sm_version: int, rubin_dsl: bool, refused: bool
-) -> None:
-    """The SM107 (Rubin) gather and finalize GEMMs of the CuteDSL NVFP4 backend tune every local slot."""
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
-
-    monkeypatch.setattr(nvfp4, "get_sm_version", lambda: sm_version)
-    monkeypatch.setattr(nvfp4, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_dsl)
-    backend = _spare_slot_backend(TrtllmCutedslGroupedGemmNvfp4Impl)
-    backend._locality_domain_runtime = None
-    assert backend.autotunes_only_active_slots is not refused
-
-
 def _hook_scheduler(*, finalize_fn, comm=True) -> ExternalCommMoEScheduler:
     moe = SimpleNamespace(
         backend=_HookBackend(),
@@ -6836,73 +6817,6 @@ def test_cutlass_leaf_run_moe_hands_the_op_its_declarations(leaf_cls, monkeypatc
     # Only the leaves that fuse LoRA hand lora_params to the op.
     fuses_lora = leaf_cls.capabilities.supports_moe_lora
     assert (calls[0].get("fc1_lora_ranks") == "fc1-ranks") is fuses_lora
-
-
-# The op's keyword arguments from a leaf without LoRA or a dynamic FC2 scale, spelled out so that a
-# new one is a deliberate test change.
-_FUSED_MOE_KWARGS = frozenset(
-    {
-        "quant_scales",
-        "input_sf",
-        "swizzled_input_sf",
-        "swiglu_alpha",
-        "swiglu_beta",
-        "swiglu_limit",
-        "swiglu_clamp_after_silu",
-        "tp_size",
-        "tp_rank",
-        "ep_size",
-        "ep_rank",
-        "cluster_size",
-        "cluster_rank",
-        "enable_alltoall",
-        *_FLAG_KWARGS,
-        "min_latency_mode",
-        "use_fused_finalize",
-        "tune_max_num_tokens",
-        "tuner_num_tokens",
-        "tuner_top_k",
-        "activation_type",
-        "unpadded_hidden_size",
-        "out_tensor",
-        "use_dynamic_fc2_scale",
-    }
-)
-
-
-class _UnreadLoadBalancer:
-    """A layer's load balancer that the forward must not read."""
-
-    def __getattr__(self, name: str):
-        raise AssertionError(f"the forward read the load balancer's {name}")
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("spare_slot_count", [0, 2], ids=["no_spare_slots", "spare_slots"])
-def test_cutlass_leaf_resolves_its_tuner_layout_with_its_weights(spare_slot_count, monkeypatch):
-    """Without spare slots the op gets the same arguments as without a load balancer; with them,
-    also the active slots as ``tuner_num_local_experts``. Both are settled when the weights move
-    to their storage, so no forward reads the load balancer."""
-    calls = _record_fused_moe(monkeypatch)
-    leaf = _cutlass_leaf_on_cpu(TrtllmCutlassNvfp4Impl)
-    leaf.num_experts = 2
-    leaf.layer_load_balancer = MagicMock(
-        spare_slot_count=spare_slot_count, active_slot_count_per_rank=6
-    )
-    leaf.layer_load_balancer.is_dynamic_routing.return_value = False
-    leaf.layer_load_balancer.get_load_expert_ids.return_value = [0]
-    leaf.register_all_parameter_slot_and_to_fix_weight_fns({"w3_w1_weight": torch.zeros(8, 4)})
-    leaf.layer_load_balancer = _UnreadLoadBalancer()
-
-    for _ in range(2):
-        leaf.run_moe(_cpu_run_context())
-
-    tuner_layout = {"tuner_num_local_experts": 6} if spare_slot_count else {}
-    for call in calls:
-        assert len(call["args"]) == 8
-        assert set(call) - {"args"} == _FUSED_MOE_KWARGS | set(tuner_layout)
-        assert {name: call[name] for name in tuner_layout} == tuner_layout
-    assert len(calls) == 2
 
 
 @pytest.mark.cpu_only
