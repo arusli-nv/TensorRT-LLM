@@ -716,7 +716,7 @@ class MnnvlMemory:
                 if kept[rank] is not None:
                     if exported_by_rank[rank] is None:
                         raise RuntimeError(
-                            f"Rank {rank} left while this rank maps its pages: its row needs fresh pages"
+                            f"Rank {rank} left while this rank maps its pages, so its row needs fresh pages"
                         )
                     mem_handles[rank] = kept[rank]
                     continue
@@ -940,8 +940,8 @@ class MnnvlMemory:
     def stale_rows(self, gather: Callable[[Any], Sequence[Any]]) -> frozenset[int]:
         """Return the rows that need fresh pages because a former member may still write into them.
 
-        The pages are kept only if every rank that mapped them is active and mapped them with the same ranks. Collective
-        over the ranks ``gather`` reaches.
+        The pages stay only if every rank that mapped them is active and mapped them with the same ranks. This call is
+        collective over the ranks ``gather`` reaches.
         """
         record = type(self).allocated_map[self.ptr]
         mapped_with = frozenset()
@@ -962,10 +962,10 @@ class MnnvlMemory:
         return frozenset(record.comm_membership) if stale else frozenset()
 
     def remap(self, gather: Callable[[Any], Sequence[Any]], fresh_rows: frozenset[int]) -> None:
-        """Map the allocation among the active ranks at the same addresses, the rows in ``fresh_rows`` on fresh pages.
+        """Map the allocation among the active ranks at the same addresses, with ``fresh_rows`` on fresh pages.
 
-        A former member's late writes then land in pages no active rank maps. Collective over the ranks ``gather``
-        reaches. Every active rank either maps or raises the same error type.
+        Late writes of a former member land in pages that no active rank maps. This call is collective over the ranks
+        ``gather`` reaches, and every active rank either maps the allocation or raises the same error type.
 
         Raises:
             MnnvlPeerHandleError: Some active rank could not import a peer's handle.

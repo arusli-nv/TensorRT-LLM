@@ -18,7 +18,7 @@ import os
 from functools import lru_cache
 from typing import NamedTuple, Optional, Sequence, Tuple
 
-# "<rank>,<world size>,<GPUs per node>,<replacement>", set for every rank under Wide-EP fault tolerance.
+# Set for every rank under Wide-EP fault tolerance to "<rank>,<world size>,<GPUs per node>,<replacement>".
 FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 
 _enabled = False

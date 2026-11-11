@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Source checks of what Wide-EP fault tolerance relies on in shared code.
+"""Source checks for the shared code that Wide-EP fault tolerance relies on.
 
-A change to shared code can break fault tolerance (``enable_wide_ep_fault_tolerance``) without failing any test of
-its own: a host collective that ``MnnvlDist`` does not take over, a vote over a gather that counts failed ranks, a
-read of the previous batch before it is accepted, or a startup collective that a replacement rank cannot join. These
-tests read the sources with ``ast`` (no import of TensorRT-LLM, no GPU) and fail on such a change with what to do. The
-tables here and in the YAML file next to this module list the reviewed exceptions; an entry that no longer matches
-the code fails too, so the tables stay current.
+A change to shared code can break ``enable_wide_ep_fault_tolerance`` without failing any test of its own. Examples
+are a host collective that ``MnnvlDist`` does not override, a vote over a gather that counts failed ranks, a read of
+the previous batch before it is accepted, and a startup collective that a replacement rank cannot join. These tests
+parse the sources with ``ast``, without importing TensorRT-LLM or using a GPU, and report how to fix each finding.
+The tables here and in the YAML file next to this module list the reviewed exceptions. An entry that no longer
+matches the code also fails, so the tables stay current.
 """
 
 import ast
@@ -34,8 +34,8 @@ TORCH = "tensorrt_llm/_torch"
 COMMUNICATOR = f"{TORCH}/distributed/communicator.py"
 HOST_EXCHANGE = f"{TORCH}/distributed/host_exchange.py"
 PY_EXECUTOR = f"{TORCH}/pyexecutor/py_executor.py"
-# Code no fault-tolerance deployment runs: modeling_v2 targets, kernels, image and video generation, and what
-# fault tolerance rejects at startup (disaggregated serving, per-layer dynamic EPLB).
+# Code that a fault-tolerant deployment never runs. This covers modeling_v2 targets, kernels, image and video
+# generation, and the features that fault tolerance rejects at startup.
 SCAN_EXCLUDE = (
     "/_experimental/modeling_v2/models/",
     "/kernels/",
@@ -52,7 +52,7 @@ def _tree(path: str) -> ast.Module:
 
 
 def _sources(*roots: str) -> list:
-    """The Python files under ``roots`` (repository-relative), without those of ``SCAN_EXCLUDE``."""
+    """Return the repository-relative Python files under ``roots`` that ``SCAN_EXCLUDE`` does not exclude."""
     paths = []
     for root in roots:
         for path in sorted((REPO / root).rglob("*.py")):
@@ -63,7 +63,7 @@ def _sources(*roots: str) -> list:
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """A YAML loader that rejects a key given twice (``yaml.safe_load`` keeps the last one)."""
+    """YAML loader that rejects duplicate keys, which ``yaml.safe_load`` silently overwrites."""
 
     def construct_mapping(self, node, deep=False):
         keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
@@ -80,7 +80,7 @@ def _load_table(path: Path) -> dict:
 
 
 def _functions(tree: ast.AST, prefix: str = ""):
-    """Every function of ``tree`` with its qualified name (``Class.method.inner``), also one defined in a branch."""
+    """Yield every function of ``tree`` with its qualified name, including functions defined in a branch."""
     for node in sorted(_own_nodes(tree), key=lambda node: getattr(node, "lineno", 0)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             yield prefix + node.name, node
@@ -90,8 +90,7 @@ def _functions(tree: ast.AST, prefix: str = ""):
 
 
 def _own_nodes(function: ast.AST):
-    """The nodes of ``function``'s body, its lambdas' included, without those of the functions and classes nested in
-    it."""
+    """Yield the nodes of ``function``'s body, including lambdas but not nested functions or classes."""
     stack = list(ast.iter_child_nodes(function))
     while stack:
         node = stack.pop()
@@ -110,7 +109,7 @@ def _call_name(call: ast.Call):
 
 
 def _assignments(function: ast.AST):
-    """(names assigned, value) of every assignment in ``function``'s own body."""
+    """Yield the assigned names and the value of every assignment in ``function``'s own body."""
     for node in _own_nodes(function):
         if isinstance(node, ast.Assign):
             targets = node.targets
@@ -123,7 +122,7 @@ def _assignments(function: ast.AST):
 
 
 def _check_inventory(found: dict, allowed: dict, table: str, fix: str) -> list:
-    """The differences between ``found`` (site -> count) and ``allowed`` (site -> (count, reason))."""
+    """Return the differences between the ``found`` counts and the ``allowed`` (count, reason) entries."""
     problems = [
         f"{site}: {count} found, {allowed.get(site, (0,))[0]} in {table}; {fix}"
         for site, count in sorted(found.items())
@@ -195,10 +194,10 @@ def _communicator_classes() -> dict:
 
 
 def test_mnnvl_dist_overrides_every_host_collective():
-    """Every public collective of ``Distributed`` and ``MPIDist`` runs over MNNVL memory in ``MnnvlDist``.
+    """Check that ``MnnvlDist`` runs every public collective of ``Distributed`` and ``MPIDist`` over MNNVL memory.
 
-    Under fault tolerance ``Distributed.get`` returns ``MnnvlDist``: a method left on MPI there hangs on a failed
-    rank, and a replacement rank, alone in its MPI world, cannot join it.
+    Under fault tolerance ``Distributed.get`` returns ``MnnvlDist``. A method left on MPI hangs on a failed rank, and
+    a replacement rank cannot join it because it is alone in its MPI world.
     """
     classes = _communicator_classes()
     base, mpi, mnnvl = classes["Distributed"], classes["MPIDist"], classes["MnnvlDist"]
@@ -212,7 +211,7 @@ def test_mnnvl_dist_overrides_every_host_collective():
                 "to COLLECTIVES_LEFT_ON_MPI with why fault tolerance never calls it with a peer"
             )
             continue
-        # Defined on Distributed only: it must compose collectives that MnnvlDist overrides.
+        # A method defined only on Distributed must be built from collectives that MnnvlDist overrides.
         for node in ast.walk(base[name]):
             if isinstance(node, ast.Name) and node.id in DIRECT_TRANSPORT:
                 problems.append(f"Distributed.{name} uses {node.id}: override it in MnnvlDist")
@@ -234,9 +233,9 @@ def test_mnnvl_dist_overrides_every_host_collective():
 
 
 def test_no_caller_bypasses_distributed_collectives():
-    """No caller reaches the MPI communicators under ``MPIDist`` (``tp_comm``, ``pp_comm``, ``cp_comm``).
+    """Check that no caller uses the MPI communicators of ``MPIDist`` (``tp_comm``, ``pp_comm``, ``cp_comm``).
 
-    ``MnnvlDist`` overrides the collectives, not the communicators: a caller using them bypasses fault tolerance.
+    ``MnnvlDist`` overrides the collectives but not the communicators, so such a caller bypasses fault tolerance.
     """
     uses = [
         f"{path}:{node.lineno}: .{node.attr}"
@@ -250,8 +249,8 @@ def test_no_caller_bypasses_distributed_collectives():
 
 # --- 2. Votes over a TP gather take the rows of the active ranks --------------------------------------------------
 
-# Gathers with a row or an entry per rank: under fault tolerance a failed rank's is None (object gathers) or zeros
-# (tp_allgather_int64).
+# Gathers with one row or entry per rank. Under fault tolerance a failed rank's entry is None for object gathers
+# and zeros for tp_allgather_int64.
 GATHERS = frozenset(
     {"allgather", "tp_allgather", "tp_gather", "tp_allgather_int64", "tp_cp_allgather"}
     | {"tp_cp_allgather_int64", "mpi_allgather"}
@@ -266,7 +265,7 @@ _REMOTE_TAIL = (
 _DSPARK = "DSpark, rejected with fault tolerance"
 _KV_CONNECTOR = "KV cache connectors, rejected with fault tolerance"
 _WARMUP = f"{TORCH}/pyexecutor/engine/runners/decoder/warmup.py"
-# The functions that vote over such a gather without Distributed.tp_active_rows: (votes, why that is right).
+# Functions that vote over such a gather without Distributed.tp_active_rows, with the vote count and the reason.
 RAW_GATHER_VOTES = {
     f"{TORCH}/distributed/ll_exchange.py::_PeerBuffers.create": (
         1,
@@ -306,9 +305,9 @@ RAW_GATHER_VOTES = {
 
 
 def _vote_operand(call: ast.Call):
-    """The operand of an all-ranks vote (``all(x)``, ``np.all(x)``, ``x.all()``), or None.
+    """Return the operand of an all-ranks vote (``all(x)``, ``np.all(x)``, ``x.all()``), or None.
 
-    An ``any`` vote is none: a failed rank's None or zero row is a "no", which leaves it unchanged.
+    An ``any`` vote is not checked because a failed rank's None or zero row counts as "no" and leaves it unchanged.
     """
     func = call.func
     if isinstance(func, ast.Name) and func.id == "all" and call.args:
@@ -321,7 +320,7 @@ def _vote_operand(call: ast.Call):
 
 
 def _uses_raw_gather(expr: ast.AST, names: set) -> bool:
-    """Whether ``expr`` reads a gather, or one of ``names``, outside a ``tp_active_rows`` call."""
+    """Return whether ``expr`` reads a gather or one of ``names`` outside a ``tp_active_rows`` call."""
     stack = [expr]
     while stack:
         node = stack.pop()
@@ -353,11 +352,11 @@ def _raw_gather_votes(function: ast.AST) -> int:
     )
 
 
-def test_votes_over_gathers_take_active_rank_rows():
-    """An ``all`` vote over a TP gather reduces over ``Distributed.tp_active_rows(rows)``.
+def test_gather_votes_use_active_rows():
+    """Check that an ``all`` vote over a TP gather reduces over ``Distributed.tp_active_rows(rows)``.
 
-    Under fault tolerance a failed rank's None or zero row is a "no" in a vote over the raw gather;
-    ``tp_active_rows`` keeps the rows of the active ranks (every row without fault tolerance).
+    Under fault tolerance a failed rank's None or zero row counts as "no" in a vote over the raw gather.
+    ``tp_active_rows`` keeps only the active ranks' rows, which is every row without fault tolerance.
     """
     found = {}
     for path in _sources(TORCH, "tensorrt_llm/executor"):
@@ -375,7 +374,7 @@ def test_votes_over_gathers_take_active_rank_rows():
 
 # --- 3. The previous batch is read once it is accepted ------------------------------------------------------------
 
-# The functions that read previous_batch before _accepted_previous_batch (or without it): (reads, why that is right).
+# Functions that read previous_batch before or without _accepted_previous_batch, with the read count and the reason.
 UNACCEPTED_PREVIOUS_BATCH_READS = {
     f"{PY_EXECUTOR}::PyExecutor._accepted_previous_batch": (2, "the accessor itself"),
     f"{TORCH}/pyexecutor/rank_failure_recovery.py::RankFailureRecovery.drop_invalid_step": (
@@ -440,10 +439,10 @@ def _unaccepted_reads(function: ast.AST) -> int:
 
 
 def test_previous_batch_is_read_after_acceptance():
-    """A function reading ``previous_batch`` calls ``_accepted_previous_batch`` first.
+    """Check that a function reading ``previous_batch`` calls ``_accepted_previous_batch`` first.
 
     With rank failure recovery the previous batch is accepted, or discarded after a membership change, before its
-    results apply: a discarded batch must not be consumed.
+    results apply. A discarded batch must not be consumed.
     """
     found = {}
     for path in _sources(f"{TORCH}/pyexecutor"):
@@ -474,7 +473,7 @@ STARTUP_COLLECTIVE_NAMES = frozenset(
 
 
 def _agreed_nodes(function: ast.AST) -> set:
-    """The ids of the nodes of ``function`` whose value reaches a ``startup_record.agree`` call in it."""
+    """Return the ids of the nodes of ``function`` whose value reaches a ``startup_record.agree`` call."""
     calls = [
         node
         for node in _own_nodes(function)
@@ -500,7 +499,7 @@ def _agreed_nodes(function: ast.AST) -> set:
 
 
 def test_startup_collectives_are_agreed_or_listed():
-    """A startup collective outside ``Distributed`` goes through ``startup_record.agree`` or is listed with a reason.
+    """Check that each startup collective outside ``Distributed`` goes through ``startup_record.agree`` or is listed.
 
     A replacement rank starts alone, so a collective on a subgroup of ``mpi_comm()`` (a ``StoreGroup``) reaches only
     itself. The check is static and covers only the modules wide_ep_ft_startup_collectives.yaml lists.

@@ -6,13 +6,12 @@ import pytest
 import torch
 from torch._subclasses import FakeTensorMode
 
-import tensorrt_llm  # noqa: F401 - loads the trtllm ops and registers their fakes
+import tensorrt_llm  # noqa: F401
 
 pytestmark = pytest.mark.cpu_only
 
 
-def test_moe_a2a_fakes_take_every_argument_of_the_ops():
-    """torch.compile traces the all-to-all through the fakes, with the arguments a real call passes."""
+def test_moe_a2a_fake_ops_accept_arguments():
     ep_size, max_tokens, top_k, hidden = 2, 4, 2, 16
     with FakeTensorMode():
         experts = torch.empty(max_tokens, top_k, dtype=torch.int32)

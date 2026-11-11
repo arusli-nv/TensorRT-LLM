@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The start of a Wide-EP fault-tolerant deployment, with every rank its own process (CPU processes, fake workers).
+"""Tests for the startup of a Wide-EP fault-tolerant deployment that runs each rank in its own CPU process.
 
 Each process runs the real worker start (``start_worker`` on rank 0, ``worker_node_main`` on the others) and the real
-membership authority, around a fake ``worker_main`` that "loads a model" for a while, then reports that its startup is
-done (``wait_for_every_rank``) and serves until it is ended.
+membership authority. A fake ``worker_main`` sleeps to stand in for the model load, calls ``wait_for_every_rank``,
+and serves until it is ended.
 """
 
 import os
@@ -34,7 +34,7 @@ pytestmark = pytest.mark.cpu_only
 
 STARTUP_S = 300  # each process imports tensorrt_llm
 RENDEZVOUS_TIMEOUT_S = 20.0  # the deployment's, scaled down for the test
-# A loss during the startup ends every process within this, far below a model's load (LOAD_S).
+# A rank failure during startup ends every process within this bound, far below the model load time (LOAD_S).
 PROMPT_EXIT_S = 15.0
 LOAD_S = 3600.0
 
@@ -61,7 +61,7 @@ def worker_main(**args):
         print(f"AUTHORITY {recovery._authority.pid}", flush=True)
     time.sleep(load_s)  # the model load
     recovery.wait_for_every_rank()
-    # As the executor takes the membership over: the real handler of a failed authority.
+    # Bind the client as the executor does, with the real handler for a failed authority.
     executor = SimpleNamespace(rank=rank, _exit=lambda status, reason: recovery._end_process(rank, status, reason))
     recovery._client.bind(
         recovery._on_record_at_startup,
@@ -88,8 +88,7 @@ def _free_port():
 
 
 class Deployment:
-    """The processes of one deployment of ``world`` ranks; every line they print goes to :attr:`lines` with the
-    rank."""
+    """Run the processes of a deployment of ``world`` ranks and queue each printed line in :attr:`lines`."""
 
     def __init__(self, world, rendezvous_timeout_s=RENDEZVOUS_TIMEOUT_S):
         self.world = world
@@ -127,7 +126,7 @@ class Deployment:
             self.lines.put((rank, line.strip()))
 
     def wait_for(self, predicate, timeout_s):
-        """The first printed (rank, line) for which ``predicate`` holds."""
+        """Return the first printed (rank, line) pair for which ``predicate`` holds."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
@@ -152,7 +151,7 @@ class Deployment:
         return int(next(line for _, line in self.seen if line.startswith("AUTHORITY")).split()[1])
 
     def statuses_within(self, ranks, timeout_s):
-        """The exit status of each of ``ranks``, which must all end within ``timeout_s``."""
+        """Return the exit status of each of ``ranks`` and fail unless all end within ``timeout_s``."""
         deadline = time.monotonic() + timeout_s
         statuses = {}
         for rank in ranks:
@@ -191,9 +190,11 @@ def _process_ended(pid, timeout_s):
 
 
 @pytest.mark.timeout(900)
-def test_every_rank_starts_from_rank_0_s_arguments_and_rank_0_may_start_last():
-    """Ranks other than 0 wait at the rendezvous for rank 0, which starts after them; they run worker_main with the
-    arguments rank 0 published, and the deployment serves once every rank has started."""
+def test_ranks_wait_for_late_rank_0():
+    """Run worker_main on every rank with rank 0's arguments, even when rank 0 starts last.
+
+    The other ranks wait for rank 0 at the rendezvous. The deployment serves once every rank has started.
+    """
     with Deployment(3) as ranks:
         ranks.start(1, load_s=1)
         ranks.start(2, load_s=1)
@@ -208,8 +209,8 @@ def test_every_rank_starts_from_rank_0_s_arguments_and_rank_0_may_start_last():
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("failed_rank", [0, 1])
-def test_a_rank_failure_during_the_startup_ends_every_process_at_once(failed_rank):
-    """Not at a timeout: the authority aborts as soon as the failed rank's connection closes."""
+def test_startup_failure_ends_every_process(failed_rank):
+    """Abort as soon as the failed rank's connection closes, without waiting for a timeout."""
     with Deployment(3) as ranks:
         for rank in range(3):
             ranks.start(rank)
@@ -222,9 +223,11 @@ def test_a_rank_failure_during_the_startup_ends_every_process_at_once(failed_ran
 
 
 @pytest.mark.timeout(900)
-def test_ranks_that_do_not_all_reach_the_rendezvous_in_time_end_within_the_bound():
-    """Ranks started 0 s, a few seconds and past the rendezvous timeout apart: the deployment aborts at the timeout,
-    and the late rank, which finds no store, ends at its own."""
+def test_late_rendezvous_ends_within_bound():
+    """Abort at the rendezvous timeout when a rank starts too late.
+
+    The late rank finds no store and ends at its own timeout.
+    """
     with Deployment(3) as ranks:
         ranks.start(0)
         ranks.wait_for(lambda rank, line: line.startswith("STARTED"), STARTUP_S)
@@ -236,16 +239,18 @@ def test_ranks_that_do_not_all_reach_the_rendezvous_in_time_end_within_the_bound
 
 
 @pytest.mark.timeout(900)
-def test_a_rank_without_rank_0_ends_at_the_rendezvous_timeout():
+def test_rank_without_rank_0_times_out():
     with Deployment(2) as ranks:
         ranks.start(1)
         assert ranks.statuses_within([1], STARTUP_S + RENDEZVOUS_TIMEOUT_S)[1] != 0
 
 
 @pytest.mark.timeout(900)
-def test_the_ranks_serve_on_without_the_authority():
-    """No lease: every rank serves on unprotected. Once rank 0 is gone too, node 0's supervisor ends the job
-    (test_node_supervisor.py)."""
+def test_ranks_serve_without_authority():
+    """Keep serving without fault tolerance when the authority dies, since ranks hold no lease.
+
+    If rank 0 also ends, node 0's supervisor ends the job, as test_node_supervisor.py checks.
+    """
     with Deployment(3) as ranks:
         for rank in range(3):
             ranks.start(rank, load_s=1)

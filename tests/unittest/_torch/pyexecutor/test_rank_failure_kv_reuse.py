@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""With rank failure recovery, a context chunk's KV becomes reusable once its step is accepted, up to the end the
-chunk had at its launch (real KV cache manager V2 with block reuse, chunked prefill, in the overlap executor's order).
+"""Tests that a context chunk's KV becomes reusable only after its step is accepted under rank failure recovery.
+
+The tests use the real KV cache manager V2 with block reuse and chunked prefill, in the overlap executor's order.
 """
 
 from functools import partial
@@ -63,7 +64,7 @@ def manager(request):
 
 
 def _executor(manager, fault_tolerance):
-    """The executor's context-update paths over ``manager``."""
+    """Return the executor's context update and commit paths over ``manager``."""
     executor = SimpleNamespace(
         rank_failure_recovery=object() if fault_tolerance else None,
         kv_cache_manager=manager,
@@ -87,7 +88,7 @@ def _request(request_id, first_token):
 
 
 def _schedule_chunk(manager, request, chunk_size=CHUNK):
-    """Allocate the request's next context chunk as the V2 scheduler does, up to the forward."""
+    """Allocate the request's next context chunk as the V2 scheduler does before the forward."""
     batch = ScheduledRequests()
     batch.append_context_request(request)
     if request.context_current_position == 0:
@@ -99,7 +100,7 @@ def _schedule_chunk(manager, request, chunk_size=CHUNK):
 
 
 def _launch(executor, batch):
-    """The forward is launched, then the executor updates the caches; returns the step."""
+    """Launch the forward, update the caches as the executor does, and return the step."""
     for request in batch.context_requests:
         request.move_to_next_context_chunk()
     context_commits = [] if executor.rank_failure_recovery is not None else None
@@ -108,7 +109,7 @@ def _launch(executor, batch):
 
 
 def _reused_prefix(manager, request_id, first_token):
-    """How much of the prompt starting at ``first_token`` a new request finds committed for reuse."""
+    """Return how much of the prompt starting at ``first_token`` a new request can reuse."""
     probe = _request(request_id, first_token)
     _schedule_chunk(manager, probe, PROMPT_LEN)
     manager.free_resources(probe)
@@ -117,20 +118,20 @@ def _reused_prefix(manager, request_id, first_token):
 
 @pytest.mark.parametrize("fault_tolerance", [False, True], ids=["off", "on"])
 @pytest.mark.parametrize("accepted", [False, True], ids=["discarded", "accepted"])
-def test_a_context_chunk_is_reusable_once_its_step_is_accepted(manager, fault_tolerance, accepted):
+def test_chunk_reusable_after_step_accepted(manager, fault_tolerance, accepted):
     executor = _executor(manager, fault_tolerance)
     request = _request(1, first_token=1000)
     step = _launch(executor, _schedule_chunk(manager, request))
-    if accepted and fault_tolerance:  # only then the executor accepts a step's commits
+    if accepted and fault_tolerance:  # the executor accepts a step's commits only in this case
         executor.accept(step)
-    # Otherwise a rank failure discards the step, and the request is freed for recompute.
+    # A discarded step stands for a rank failure, which frees the request for recompute.
     manager.free_resources(request)
     # Without fault tolerance the chunk is committed at its launch.
     reusable = accepted or not fault_tolerance
     assert _reused_prefix(manager, 2, first_token=1000) == (CHUNK if reusable else 0)
 
 
-def test_accepting_a_chunk_does_not_commit_the_next_chunk_in_flight(manager):
+def test_accept_skips_next_chunk_in_flight(manager):
     executor = _executor(manager, fault_tolerance=True)
     request = _request(1, first_token=1000)
     first = _launch(executor, _schedule_chunk(manager, request))
@@ -146,9 +147,11 @@ def test_accepting_a_chunk_does_not_commit_the_next_chunk_in_flight(manager):
 
 @pytest.mark.parametrize("manager", ["per_conversation"], indirect=True)
 @pytest.mark.parametrize("fault_tolerance", [False, True], ids=["off", "on"])
-def test_a_conversation_drop_plan_covers_the_whole_committed_prompt(manager, fault_tolerance):
-    """A conversation's drop plan covers the blocks its finished context committed: with fault tolerance the plan
-    is saved once the step's commit is accepted, not at the launch when nothing is committed yet."""
+def test_drop_plan_covers_committed_prompt(manager, fault_tolerance):
+    """Save a conversation's drop plan over every block its finished context committed.
+
+    With fault tolerance the plan is saved when the step is accepted, because nothing is committed at the launch.
+    """
     executor = _executor(manager, fault_tolerance)
     request = _request(1, first_token=1000)
     request.py_conversation_params = ConversationParams(conversation_id="conversation")

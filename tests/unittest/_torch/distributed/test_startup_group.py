@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wide-EP fault tolerance starts every rank as its own process: the ranks that start together meet in the rendezvous
-store (StoreGroup), the loss of the store ends their waits, and a replacement replays its startup group's exchanges
-from the startup record while its other groups answer alone. Threads stand
-for ranks; the store is a real TCPStore."""
+"""Tests for the startup groups of Wide-EP fault tolerance, where every rank starts as its own process.
+
+The ranks that start together meet in the rendezvous store through ``StoreGroup``. Losing the store ends their
+waits. A replacement replays its startup group's exchanges from the startup record, and its other groups answer
+alone. Threads stand in for ranks, and the store is a real TCPStore.
+"""
 
 import socket
 import subprocess  # nosec B404
@@ -60,8 +62,10 @@ def _client(port):
 
 @pytest.fixture
 def store(monkeypatch):
-    """The rendezvous store, as the authority hosts it; each thread (a rank) gets its own client. The ranks share one
-    membership client, which takes their startup reports."""
+    """Host the rendezvous store as the authority does and return its port.
+
+    Each thread gets its own store client. The threads share one mock membership client for their startup reports.
+    """
     server = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
     clients = threading.local()
 
@@ -77,7 +81,7 @@ def store(monkeypatch):
 
 
 def _replay(monkeypatch, values):
-    """A fresh startup record of this process, which replays ``values`` (startup values by name) unless None."""
+    """Reset this process's startup record and replay ``values``, the startup values by name, unless None."""
     for name, value in vars(StartupRecord()).items():
         monkeypatch.setattr(startup_record, name, value)
     if values is not None:
@@ -85,19 +89,19 @@ def _replay(monkeypatch, values):
 
 
 def _on_ranks(ranks, fn):
-    """``fn(rank)`` on one thread per rank; the results (or raised errors) by rank."""
+    """Run ``fn(rank)`` on one thread per rank and return the results or raised errors by rank."""
 
     def run(rank):
         try:
             return fn(rank)
-        except Exception as error:  # noqa: BLE001 - returned to the test
+        except Exception as error:  # surface thread failures in the test
             return error
 
     with ThreadPoolExecutor(len(ranks)) as pool:
         return dict(zip(ranks, pool.map(run, ranks)))
 
 
-def test_the_ranks_that_start_together_gather_through_the_store(store):
+def test_starting_ranks_gather_through_store(store):
     def rank(r):
         world = StoreGroup(_client(store), "g", r, range(WORLD))
         pairs = StoreGroup(_client(store), "pair", r, range(WORLD), active=[1, 3])
@@ -106,13 +110,15 @@ def test_the_ranks_that_start_together_gather_through_the_store(store):
     results = _on_ranks(range(WORLD), rank)
     for r in range(WORLD):
         assert results[r][:2] == ([0, 10, 20, 30], ["x0", "x1", "x2", "x3"])
-    assert results[1][2] == results[3][2] == [None, 1, None, 3]
+    assert results[1][2] == [None, 1, None, 3]
+    assert results[3][2] == results[1][2]
 
 
-def test_a_startup_collective_reports_each_change_of_the_peers_it_waits_for_and_then_a_step_done(
-    store, monkeypatch
-):
-    """The authority's startup hang rule reads these reports; a wait that polls on reports no more."""
+def test_startup_collective_reports_waits_and_steps(store, monkeypatch):
+    """Check that a startup collective reports each change of the peers it waits for, then a finished step.
+
+    The authority's startup hang rule reads these reports. A wait that keeps polling reports nothing new.
+    """
     client = recovery_module._client
     monkeypatch.setattr(recovery_module, "_startup_steps", 0)
     monkeypatch.setattr(recovery_module, "_startup_waiting_for", 0)
@@ -134,8 +140,8 @@ def test_a_startup_collective_reports_each_change_of_the_peers_it_waits_for_and_
     ]
 
 
-def test_a_group_keeps_only_its_last_call_s_keys(store):
-    """Repeated calls do not grow the store."""
+def test_group_keeps_last_call_keys(store):
+    """Check that repeated calls do not grow the store."""
     counter = TCPStore("127.0.0.1", store, is_master=False, timeout=timedelta(seconds=30))
     before = counter.num_keys()
 
@@ -144,13 +150,14 @@ def test_a_group_keeps_only_its_last_call_s_keys(store):
         return [group.allgather(call) for call in range(20)]
 
     results = _on_ranks(range(2), rank)
-    assert results[0] == results[1] == [[call, call] for call in range(20)]
-    # The last call's two values and its arrival counter.
+    assert results[0] == [[call, call] for call in range(20)]
+    assert results[1] == results[0]
+    # The store keeps the last call's two values and its arrival counter.
     assert counter.num_keys() - before <= 3
 
 
-def test_the_startup_ends_when_the_authority_fails(monkeypatch):
-    """The store lives in the authority's process: once that process is gone, a wait for a peer ends at once."""
+def test_startup_ends_when_authority_fails(monkeypatch):
+    """Check that a wait for a peer ends at once when the authority process, which hosts the store, is gone."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -178,8 +185,11 @@ def test_the_startup_ends_when_the_authority_fails(monkeypatch):
 
 
 def test_a_replacement_starts_alone(monkeypatch):
-    """Its groups have the deployment's layout with only itself active, and never reach the store; each exchange is a
-    step of startup progress it reports, which the authority bounds a joiner by."""
+    """Check that a replacement's groups have the deployment's layout with only the replacement active.
+
+    The groups never reach the store. Each exchange reports a step of startup progress, which the authority uses to
+    bound a joining rank.
+    """
     client = Mock()
     monkeypatch.setattr(recovery_module, "_client", client)
     monkeypatch.setattr(recovery_module, "_startup_steps", 0)
@@ -196,7 +206,7 @@ def test_a_replacement_starts_alone(monkeypatch):
     assert [call.kwargs["progress"] for call in client.report.call_args_list] == [1, 2, 3, 4]
 
 
-def test_original_ranks_split_and_reduce_through_the_store(store):
+def test_original_ranks_split_through_store(store):
     def rank(r):
         world = StoreGroup(_client(store), "w", r, range(WORLD), gpus_per_node=2)
         node = world.Split_type(OMPI_COMM_TYPE_HOST)
@@ -217,13 +227,15 @@ def test_original_ranks_split_and_reduce_through_the_store(store):
         assert results[r] == (node, node[0], 6, 3, 3 - r, [3, 2, 1, 0])
 
 
-# Per rank, its split color and key: the even ranks and the odd ones, each in reverse rank order.
+# The split color and key of each rank. Even and odd ranks form two groups, each in reverse rank order.
 _SPLITS = [[0, 3], [1, 2], [0, 1], [1, 0]]
 
 
-def test_a_split_groups_the_members_of_a_color_in_key_order(store, monkeypatch):
-    """As ``MPI_Comm_split``; a replacement takes every member's color and key from the agreed startup and never
-    reaches the store."""
+def test_split_orders_color_members_by_key(store, monkeypatch):
+    """Check that ``Split`` behaves as ``MPI_Comm_split``.
+
+    A replacement takes every member's color and key from the recorded startup and never reaches the store.
+    """
 
     def rank(r):
         world = StoreGroup(_client(store), "w", r, range(WORLD))
@@ -248,9 +260,11 @@ def _startup_collectives(group, value):
     return group.allgather(value), group.allreduce(value, op=MPI.MAX)
 
 
-def test_a_replacement_replays_the_startup_group(store, monkeypatch):
-    """Rank 0 records the startup group's exchanges, and a replacement of rank 1 gets the original ranks' results, or
-    fails naming the collective when its value differs. Fails without the change: its group answered alone."""
+def test_replacement_replays_startup_group(store, monkeypatch):
+    """Check that a replacement of rank 1 gets the results rank 0 recorded for the startup group.
+
+    The replacement fails and names the collective when its value differs.
+    """
     startup_record.record()  # in rank 0's process only
 
     def rank(r):
@@ -273,12 +287,13 @@ def test_a_replacement_replays_the_startup_group(store, monkeypatch):
 
 
 def _mirror(store_port, rank, steps):
-    """A peer of rank 1's process in test_an_original_rank_starts_without_mpi: the same collectives on its groups."""
+    """Run the collectives of rank 1's peers in test_an_original_rank_starts_without_mpi."""
     world = StoreGroup(
         recovery_module._startup_store(), "startup/world", rank, range(WORLD), gpus_per_node=WORLD
     )
-    node = world.Split_type(OMPI_COMM_TYPE_HOST)  # local_mpi_comm()
-    tp = world.subgroup(range(WORLD))  # TpMnnvlMemory.get_comm()
+    # The groups of local_mpi_comm() and TpMnnvlMemory.get_comm().
+    node = world.Split_type(OMPI_COMM_TYPE_HOST)
+    tp = world.subgroup(range(WORLD))
     for step in steps:
         {
             "barrier": world.barrier,
@@ -290,7 +305,7 @@ def _mirror(store_port, rank, steps):
 
 
 class _RecordingComm:
-    """Records every attribute an MPI communicator is asked for."""
+    """Record every attribute that an MPI communicator is asked for."""
 
     def __init__(self, comm, calls):
         self._comm, self._calls = comm, calls
@@ -301,8 +316,10 @@ class _RecordingComm:
 
 
 def test_an_original_rank_starts_without_mpi(store, monkeypatch):
-    """Rank 1 of 4, its own MPI world: after join_startup_group, main's startup collectives reach its peers through
-    the store, and none goes to mpi4py."""
+    """Check that rank 1 of 4, alone in its MPI world, reaches its peers through the store.
+
+    After join_startup_group, no startup collective goes to mpi4py.
+    """
     calls = []
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,4,4,0")
@@ -332,7 +349,8 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     peers.shutdown()
 
     assert calls == []
-    assert gathered == tp_values == [0, 1, 2, 3]
+    assert gathered == [0, 1, 2, 3]
+    assert tp_values == gathered
     assert least == 0
     assert (_utils.mpi_rank(), _utils.mpi_world_size()) == (1, 4)
     assert (_utils.global_mpi_rank(), _utils.global_mpi_size()) == (1, 4)
@@ -341,9 +359,11 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
 
 
 @pytest.mark.parametrize("replacement", [0, 1], ids=["original", "replacement"])
-def test_the_node_of_every_rank_comes_from_its_identity(monkeypatch, replacement):
-    """Rank 2 of two nodes of two GPUs, original or replacement: a split by node gives ranks 2 and 3, and joining
-    the startup group exchanges and records nothing."""
+def test_rank_node_comes_from_identity(monkeypatch, replacement):
+    """Check rank 2 on two nodes of two GPUs, as an original rank or a replacement.
+
+    A split by node gives ranks 2 and 3, and joining the startup group exchanges and records nothing.
+    """
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,{WORLD},2,{replacement}")
     monkeypatch.setenv("TLLM_RANK", "-")
@@ -364,12 +384,13 @@ def test_the_node_of_every_rank_comes_from_its_identity(monkeypatch, replacement
 @pytest.mark.parametrize(
     "supervisor_gpus, mapping_gpus", [(2, 4), (4, 2), (1, 8)], ids=["fewer", "more", "one-per-node"]
 )
-def test_a_rank_whose_mapping_places_the_ranks_on_other_nodes_does_not_start(
-    monkeypatch, supervisor_gpus, mapping_gpus
-):
-    """The node supervisor runs ``supervisor_gpus`` ranks per node, the mapping says ``mapping_gpus`` (one node of
-    every rank under both is accepted, as in test_an_original_rank_starts_without_mpi). Fails without the change: the
-    rank joined, and its splits by node grouped ranks of different nodes."""
+def test_mismatched_gpus_per_node_stops_rank(monkeypatch, supervisor_gpus, mapping_gpus):
+    """Check that a rank does not start when its mapping places the ranks on other nodes.
+
+    The node supervisor runs ``supervisor_gpus`` ranks per node and the mapping says ``mapping_gpus``. Otherwise its
+    splits by node would group ranks of different nodes. One node holding every rank under both is accepted, as in
+    test_an_original_rank_starts_without_mpi.
+    """
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"2,{WORLD},{supervisor_gpus},0")
     monkeypatch.setenv("TLLM_RANK", "-")
@@ -383,9 +404,11 @@ def test_a_rank_whose_mapping_places_the_ranks_on_other_nodes_does_not_start(
     assert recovery_module.os.environ["TLLM_RANK"] == "-"
 
 
-def test_an_original_rank_waits_for_every_rank_to_start(monkeypatch):
-    """It returns once a record past STARTING arrives, on the client's thread. Fails without the change: the wait
-    polled the client's record, which this client never updates."""
+def test_original_rank_waits_for_every_rank(monkeypatch):
+    """Check that the wait returns once a record past STARTING arrives on the client's thread.
+
+    The client's own ``record`` attribute never changes, so a wait that polls it would not return.
+    """
     starting = MembershipRecord(generation=0, state=MembershipState.STARTING, active_mask=0b1111)
     client = Mock(record=starting)
     monkeypatch.setattr(recovery_module, "_client", client)
@@ -409,7 +432,7 @@ def test_an_original_rank_waits_for_every_rank_to_start(monkeypatch):
     client.report.assert_called_once_with(started=True)
 
 
-def test_a_rank_without_its_identity_does_not_start(monkeypatch):
+def test_rank_without_identity_does_not_start(monkeypatch):
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     with pytest.raises(ValueError, match=FAULT_TOLERANCE_RANK_ENV):
@@ -424,10 +447,8 @@ def test_a_rank_without_its_identity_does_not_start(monkeypatch):
         (TpMnnvlMemory, dict(tp_size=2, pp_size=2), 3, [2, 3]),
     ],
 )
-def test_an_mnnvl_group_has_the_ranks_split_would_give(
-    memory_cls, kwargs, rank, ranks, monkeypatch
-):
-    """Under fault tolerance the group comes from the mapping, as a subgroup of the startup group."""
+def test_mnnvl_group_matches_split_ranks(memory_cls, kwargs, rank, ranks, monkeypatch):
+    """Check that under fault tolerance the group is a subgroup of the startup group built from the mapping."""
     mapping = Mapping(world_size=4, rank=rank, **kwargs)
     assert memory_cls.comm_split_ranks(mapping) == ranks
     world = StoreGroup(None, "startup/world", rank, range(4), active=[rank])

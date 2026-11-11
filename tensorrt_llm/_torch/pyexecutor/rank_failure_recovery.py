@@ -115,7 +115,8 @@ _authority: Optional[subprocess.Popen] = None
 def ensure_rendezvous() -> None:
     """Export the shared secret and the rendezvous address when unset.
 
-    The two ports stay reserved by SO_REUSEADDR sockets that never listen, so the authority can still bind them."""
+    SO_REUSEADDR sockets that never listen reserve the two ports, so the authority can still bind them.
+    """
     global _rendezvous_ports
     if not os.environ.get(SHARED_SECRET_ENV):
         os.environ[SHARED_SECRET_ENV] = secrets.token_hex(_SHARED_SECRET_BYTES)
@@ -149,7 +150,9 @@ def _host_collectives_requirements(mapping: Mapping) -> List[str]:
 
 
 def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed) -> None:
-    """Check, before the model loads, what Wide-EP fault tolerance needs beyond the LLM arguments' validation.
+    """Check the Wide-EP fault tolerance requirements that the LLM argument validation cannot check.
+
+    This runs before the model loads.
 
     Raises:
         ValueError: The configuration is not supported with fault tolerance.
@@ -161,8 +164,8 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
         resolve_moe_comm_timeout_budgets,
     )
 
-    # All-to-all kernels waiting on a hung rank are released up to 1.5 hang timeouts after their wait began, when the
-    # authority excludes the rank, so they must not time out first.
+    # The authority excludes a hung rank up to 1.5 hang timeouts after a wait on it began. The all-to-all kernels
+    # that wait on the rank must not time out before that.
     kernel_timeout_s = resolve_moe_comm_timeout_budgets(os.environ).serving_seconds
     if kernel_timeout_s is None:
         kernel_timeout_s = torch.ops.trtllm.moe_a2a_get_timeout()
@@ -231,7 +234,7 @@ def _rank_identity() -> RankIdentity:
 
 
 def prepare_model(model: torch.nn.Module) -> None:
-    """Check, before any weight loads, that the built model supports fault tolerance, and bind its MoE layers.
+    """Check that the built model supports fault tolerance and bind its MoE layers before any weight loads.
 
     Raises:
         ValueError: The model is not supported with fault tolerance.
@@ -288,7 +291,10 @@ _deployment_nonce: Optional[str] = None
 
 
 def deployment_nonce() -> str:
-    """Return a random deployment name, the same on every rank, that keeps its shared-memory segments apart."""
+    """Return a random deployment name that is the same on every rank.
+
+    The name keeps the shared-memory segments of different deployments apart.
+    """
     global _deployment_nonce
     if _deployment_nonce is None:
         _deployment_nonce = startup_record.agree(
@@ -332,7 +338,10 @@ def start_worker(worker_main_args: dict) -> None:
 
 
 def _worker_args_for_other_ranks(worker_main_args: dict) -> bytes:
-    """Return rank 0's worker arguments without its IPC addresses and keys, which the store does not encrypt."""
+    """Return rank 0's worker arguments without its IPC addresses and keys.
+
+    The rendezvous store does not encrypt its values.
+    """
     from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
 
     return pickle.dumps(
@@ -390,7 +399,10 @@ _startup_waiting_for = 0
 
 
 def _report_startup_wait(waiting_for: int) -> None:
-    """Report each change of the peers a startup collective waits for, where 0 completes a collective."""
+    """Report each change in the peers that a startup collective waits for.
+
+    A ``waiting_for`` of 0 means that the collective completed.
+    """
     global _startup_steps, _startup_waiting_for
     if waiting_for and waiting_for == _startup_waiting_for:
         return
@@ -493,7 +505,10 @@ def _admission_keys(generation: int) -> Tuple[str, str]:
 
 
 class StartupMemory(NamedTuple):
-    """This rank's GPU KV cache quota once the deployment serves, which every membership change resizes from."""
+    """The GPU KV cache quota of this rank once the deployment serves.
+
+    Every membership change resizes the KV cache pool from this quota.
+    """
 
     kv_cache_quota: int
 
@@ -530,7 +545,10 @@ class StartupMemory(NamedTuple):
 
 @dataclass
 class _GiveBackRetry:
-    """A KV cache give-back that fell short at a commit, retried as excluded processes end and free their pages."""
+    """A KV cache give-back that fell short at a commit.
+
+    The give-back is retried as the excluded processes end and free their pages.
+    """
 
     free_to_keep: int
     excluded: Dict[int, int]
@@ -621,12 +639,15 @@ def _start_authority(world_size: int, timeout_s: float) -> Tuple[subprocess.Pope
     return process, address
 
 
-# Per MoE layer, its expert count and per rank the expert in each of its slots (-1: an empty spare slot).
+# For each MoE layer, the expert count and, for each rank, the expert in each slot. An empty spare slot holds -1.
 Placement = Tuple[Tuple[int, Tuple[Tuple[int, ...], ...]], ...]
 
 
 def ready_payload(record: MembershipRecord, rank: int, view: Placement) -> Optional[str]:
-    """Return ``rank``'s READY payload: the whole placement from the lowest survivor, own slots from a joining rank."""
+    """Return the READY payload of ``rank``.
+
+    The lowest survivor sends the whole placement, and a joining rank sends its own slots.
+    """
     if rank == record.lowest_survivor():
         return json.dumps(view)
     if record.joining_mask >> rank & 1:
@@ -678,8 +699,8 @@ class RankFailureRecovery:
         self.rank = executor.dist.rank
         self.world_size = executor.dist.world_size
         self.incarnation = incarnation
-        # Rank 0: request id -> client id of every request without a final response; None (no request) until the
-        # executor worker attaches it, before it reports READY and so before the proxy sends any request.
+        # On rank 0, returns the client id of every request without a final response, by request id. The executor
+        # worker attaches it before it reports READY, so before the proxy sends any request.
         self._outstanding_requests: Optional[Callable[[], Dict[int, int]]] = None
         self._client: Optional[MembershipClient] = None
         self._record = MembershipRecord(
@@ -690,7 +711,7 @@ class RankFailureRecovery:
         self._committed_mask = self._record.active_mask
         self._installed: Optional[MembershipRecord] = None
         self._attempted: Optional[MembershipRecord] = None
-        # The last iteration any survivor reached, from INSTALL until the commit. No forward runs meanwhile.
+        # The last iteration that any survivor reached. It is set from INSTALL until the commit, while no forward runs.
         self._resume_after: Optional[int] = None
         self._waiting_in_store = 0
         self._install_steps = 0
@@ -714,8 +735,8 @@ class RankFailureRecovery:
         """
         if not wide_ep_fault_tolerance_enabled():
             return None
-        # A rank waits on a hung peer until the authority excludes it, up to 1.5 hang timeouts after its wait began,
-        # so the executor's hang detector must not end the rank first.
+        # A rank waits on a hung peer for up to 1.5 hang timeouts, until the authority excludes the peer. The
+        # executor's hang detector must not end the rank before that.
         hang_detection_s = executor.hang_detector.timeout
         check_fault_tolerance_requirements(
             [
@@ -768,8 +789,10 @@ class RankFailureRecovery:
         return recovery
 
     def set_outstanding_requests(self, outstanding_requests: Callable[[], Dict[int, int]]) -> None:
-        """Attach the executor worker's request id -> client id of every request without a final response; rank 0
-        fails those no active rank holds when it resumes after a membership change."""
+        """Attach the executor worker's map from request id to client id of the requests without a final response.
+
+        When it resumes after a membership change, rank 0 fails the requests that no active rank holds.
+        """
         self._outstanding_requests = outstanding_requests
 
     def _join(self) -> None:
@@ -875,8 +898,8 @@ class RankFailureRecovery:
     def _membership_changing(self) -> bool:
         """Return whether the host exchange must stop for a change this rank has not installed yet.
 
-        A change that does not interrupt the steps waits for a forward vote that launched no forward, so that every
-        active rank stops in the same round, after the same forwards.
+        A change that does not interrupt the steps waits for a forward vote that launched no forward. This way every
+        active rank stops in the same round and after the same forwards.
         """
         if not self._pending:
             return False
@@ -888,7 +911,7 @@ class RankFailureRecovery:
 
     @contextlib.contextmanager
     def _hang_detection_paused(self):
-        """Pause the hang detector during a membership change, which the authority bounds instead."""
+        """Pause the hang detector during a membership change, whose duration the authority bounds instead."""
         detector = self._executor.hang_detector
         armed = not detector.paused()
         detector.disarm()
@@ -945,7 +968,7 @@ class RankFailureRecovery:
                             f"Rank {self.rank} waits for the next membership record: {error!r}"
                         )
                         continue
-                    except Exception as error:  # noqa: BLE001 - a failure here must reach the authority
+                    except Exception as error:
                         self._fail_install(record, error)
                         continue
                     return
@@ -967,7 +990,7 @@ class RankFailureRecovery:
             return self._record
 
     def _end_eplb_iterations(self) -> None:
-        """End the online EPLB work so far, so that the placement no longer changes until the resume point."""
+        """Abandon the online EPLB iterations in progress so that the placement stays fixed until the resume point."""
         balancer = _moe_load_balancer_of(self._executor)
         if balancer is not None:
             balancer.abandon_iterations()
@@ -983,7 +1006,10 @@ class RankFailureRecovery:
         return {"ready_payload": ready_payload(record, self.rank, view)}
 
     def _install(self, record: MembershipRecord) -> None:
-        """Map the host exchange's rows among the active ranks, on fresh pages if a process mapping them may be gone."""
+        """Map the host exchange rows among the active ranks.
+
+        The rows move to fresh pages if a process that maps them may be gone.
+        """
         gather = self._active_group(record, "host_exchange_rows").allgather
         fresh_rows = self._exchange.rows.stale_rows(gather)
         self._exchange.install(
@@ -1057,7 +1083,7 @@ class RankFailureRecovery:
             # A rank may have run one more EPLB iteration since READY, in the step it stopped in.
             self._end_eplb_iterations()
             if not record.joining_mask >> self.rank & 1:
-                # Collective over the host exchange, which the joining ranks enter only below.
+                # The retire runs host exchange collectives. The joining ranks enter the host exchange only below.
                 executor._retire_inflight_batch_for_control()
             recomputed = self._recompute_interrupted_requests()
             if record.joining_mask:
@@ -1066,7 +1092,8 @@ class RankFailureRecovery:
                 if self._installed is record:
                     self._admit_joining_ranks(record)
                 self._install_step_done()
-            # Taken before the held requests, so that a request enqueued in between is not taken for a lost one.
+            # Read the outstanding requests before the held ones so that a request enqueued in between does not count
+            # as lost.
             outstanding = (
                 self._outstanding_requests() if self._outstanding_requests is not None else {}
             )
@@ -1083,7 +1110,7 @@ class RankFailureRecovery:
                 f"Rank {self.rank} stopped installing membership generation {record.generation}: {error!r}"
             )
             return False
-        except Exception as error:  # noqa: BLE001 - a failure here must reach the authority
+        except Exception as error:
             self._fail_install(record, error)
             self._next_record(record)
             return False
@@ -1122,7 +1149,7 @@ class RankFailureRecovery:
         return True
 
     def _give_back_kv_cache(self) -> str:
-        """Release the empty spare slots and give the KV cache pool back its memory, returning a log suffix."""
+        """Release the empty spare slots, return their memory to the KV cache pool and return a log suffix."""
         start_s = time.perf_counter()
         balancer = _moe_load_balancer_of(self._executor)
         released = 0 if balancer is None else balancer.expert_restore.release_empty_spare_slots()
@@ -1200,7 +1227,9 @@ class RankFailureRecovery:
         )
 
     def _restore(self, record: MembershipRecord, times: Optional[Dict[str, float]] = None) -> str:
-        """Restore the lost experts and the all-to-all workspaces, collective over the active ranks of ``record``.
+        """Restore the lost experts and the all-to-all workspaces.
+
+        This is collective over the active ranks of ``record``.
 
         Returns:
             The digest of the restored EPLB placement, or "" without EPLB.
@@ -1264,8 +1293,8 @@ class RankFailureRecovery:
                 balancer.expert_restore.restore_lost_experts(plan, times)
                 self._install_step_done()
             remap()
-        # The client thread updates the record under this lock before it requests the abort of a newer change, so once
-        # this check passes, that abort comes after the rearm and stays.
+        # The client thread updates the record under this lock before it requests the abort of a newer change. Once
+        # this check passes, that abort comes after the rearm and stays in effect.
         start_s = time.perf_counter()
         with self._record_changed:
             if self._record != record:
@@ -1344,7 +1373,10 @@ class RankFailureRecovery:
         return votes[:, 0]
 
     def drop_invalid_step(self) -> None:
-        """Discard the previous step if the all-to-all was aborted, which may have cut its rounds short."""
+        """Discard the previous step if its all-to-all was aborted.
+
+        An abort may have cut the rounds of the step short.
+        """
         batch = self._executor.previous_batch
         event = batch.sample_state.sampler_event if batch.sample_state is not None else None
         if event is not None:
@@ -1364,7 +1396,11 @@ class RankFailureRecovery:
         executor.previous_batch = None
 
     def discard_failed_forward(self, scheduled_requests) -> bool:
-        """Discard a forward that raised because the all-to-all was aborted, and return False if it failed by itself."""
+        """Discard a forward that raised because its all-to-all was aborted.
+
+        Returns:
+            Whether the forward was discarded. False means that the forward failed for another reason.
+        """
         if not self._moe.aborted():
             return False
         self._interrupted.extend(scheduled_requests.all_requests())

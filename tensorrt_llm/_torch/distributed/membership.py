@@ -553,7 +553,7 @@ DISCONNECTED_KEY = "disconnected"
 HOST_WEIGHTS_PREFIX_KEY = "host_weights_prefix"
 
 
-# Ranks per store counter of an arrival mask: the store's counters are signed 64-bit integers.
+# Ranks per store counter of an arrival mask. The store's counters are signed 64-bit integers.
 _RANKS_PER_COUNTER = 63
 
 
@@ -839,7 +839,7 @@ REPLACEMENT_CANNOT_START = 78
 
 
 class ReplacementCannotStart(SystemExit):
-    """Ends a replacement rank with :data:`REPLACEMENT_CANNOT_START`; ``str()`` gives the reason."""
+    """A ``SystemExit`` that ends a replacement rank with :data:`REPLACEMENT_CANNOT_START` and a reason."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -895,7 +895,7 @@ def _read_line(sock: socket.socket) -> bytes:
 
 @dataclass
 class LivenessConnection:
-    """A process's liveness connection to the authority; closed at the end of a ``with`` block."""
+    """A process's liveness connection to the authority, closed at the end of a ``with`` block."""
 
     sock: socket.socket
     lines: _Lines
@@ -1020,7 +1020,7 @@ class MembershipClient:
                 on_record(self.record)
 
     def report(self, **changes) -> None:
-        """Update fields of the report, which the client then sends."""
+        """Update fields of the report and wake the thread to send it."""
         with self._lock:
             self._report = self._report.model_copy(update=changes)
         self._wake()
@@ -1077,7 +1077,7 @@ class MembershipClient:
                     except BlockingIOError:
                         pass
                     self._send_report()
-        except Exception as error:  # noqa: BLE001 - any failure here must end this rank's membership visibly
+        except Exception as error:
             logger.error(f"Membership client of rank {self.rank} failed: {error!r}")
             self.connected = False
             self._sock.close()

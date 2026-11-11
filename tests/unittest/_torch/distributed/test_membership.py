@@ -47,14 +47,19 @@ WORLD = 4
 ALL = (1 << WORLD) - 1
 
 
+def _without(*ranks):
+    """Return the mask of every rank except ``ranks``."""
+    return ALL & ~sum(1 << rank for rank in ranks)
+
+
 @pytest.fixture(autouse=True)
 def _report_interval(monkeypatch):
-    """The clients' report interval and the authority process's decision interval, short for the tests."""
+    """Shorten the report and decision interval for the tests."""
     monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 0.05)
 
 
 def _formed(authority):
-    """``authority`` once every rank has started: generation 0 is COMMITTED."""
+    """Start every rank and return ``authority`` with generation 0 committed."""
     world = authority.world_size
     reports = {r: RankReport(started=True) for r in range(world)}
     assert authority.tick(0.0, reports, (1 << world) - 1).state == MembershipState.COMMITTED
@@ -62,15 +67,14 @@ def _formed(authority):
 
 
 class Cluster:
-    """Simulated ranks: each connected process advances its progress and answers the authority's record."""
+    """Simulate ranks that report their progress and reply to the authority's records."""
 
     def __init__(self, world=WORLD, **timeouts):
         self.authority = _formed(Authority(world, **timeouts))
         self.now = 0.0
         self.alive = set(range(world))  # processes that hold their connection
         self.hung = set()  # connected but making no progress
-        # Stopped processes (as by SIGSTOP): connected, but their client thread stops too, so their reports do.
-        self.stopped = set()
+        self.stopped = set()  # stopped by SIGSTOP, still connected, but no longer reporting
         self.idle = set()  # main's hang detector paused, as while waiting for requests
         self.shutdown = set()  # ranks whose report says that the deployment ends normally
         self.report_every = {}  # rank -> steps between its reports (a client thread starved of the GIL)
@@ -148,17 +152,19 @@ def test_healthy_ranks_change_nothing():
     )
 
 
-def test_a_closed_connection_removes_the_rank_through_one_transaction():
+def test_closed_connection_removes_the_rank():
     cluster = Cluster()
     cluster.alive.discard(2)
     record = cluster.run(1.0)
     assert states(cluster) == TRANSACTION
-    assert record.generation == 1 and record.active_mask == ALL & ~(1 << 2)
+    assert record.generation == 1
+    assert record.active_mask == _without(2)
     # Resume from the furthest survivor, with the next epoch.
-    assert record.resume.iteration == 13 and record.resume.epoch == 104
+    assert record.resume.iteration == 13
+    assert record.resume.epoch == 104
 
 
-def test_the_next_epoch_follows_the_latest_survivor_across_the_epoch_wrap():
+def test_next_epoch_follows_across_epoch_wrap():
     cluster = Cluster()
     for r, epoch in {0: 0xFFFFFFFE, 1: 1, 3: 1}.items():  # ranks 1 and 3 went on past the wrap
         cluster.paused_at[r] = ResumeState(epoch=epoch)
@@ -166,10 +172,8 @@ def test_the_next_epoch_follows_the_latest_survivor_across_the_epoch_wrap():
     assert cluster.run(1.0).resume.epoch == 2
 
 
-def test_install_carries_every_active_rank_s_ready_payload_unread():
-    """The restore's input goes from the READY replies to every active rank in the INSTALL record, as each rank sent
-    it; a joining rank's comes with its readiness. No other record carries any, and the record's log line leaves
-    them out."""
+def test_install_carries_ready_payloads():
+    """Pass each active rank's READY payload unchanged in the INSTALL record only, and keep it out of the log."""
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -188,21 +192,20 @@ def test_install_carries_every_active_rank_s_ready_payload_unread():
     assert lowest.model_copy(update=dict(active_mask=0b0101)).lowest_survivor() is None
 
 
-def test_a_slow_rank_is_kept_and_a_hung_one_is_removed():
+def test_slow_rank_kept_hung_rank_removed():
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.hung.add(1)
-    cluster.run(3.0)  # nobody waits for rank 1: slow, not hung
+    cluster.run(3.0)  # nobody waits for rank 1, so it is slow, not hung
     assert cluster.authority.record.active_mask == ALL
     cluster.waiting_for[0] = 1 << 1
     record = cluster.run(3.0)
-    assert record.state == MembershipState.COMMITTED and not record.is_active(1)
+    assert record.state == MembershipState.COMMITTED
+    assert not record.is_active(1)
 
 
 @pytest.mark.parametrize("waits_in", ["all-to-all", "host exchange"])
-def test_a_rank_that_delivers_the_rounds_its_peers_wait_for_is_not_hung(waits_in):
-    """In a step longer than the hang timeout, rank 3's iteration does not advance, but every round its peers
-    wait for it in (an all-to-all kernel's round flag, a host-exchange epoch) arrives: only a round that does not is a
-    hang."""
+def test_delivered_rounds_are_not_a_hang(waits_in):
+    """Keep a rank whose iteration stalls while every round its peers wait for still arrives."""
     cluster = Cluster(hang_timeout_s=1.0)
     rounds = cluster.waited_rounds if waits_in == "all-to-all" else cluster.waited_epochs
     cluster.hung.add(3)  # its iteration does not advance
@@ -212,30 +215,30 @@ def test_a_rank_that_delivers_the_rounds_its_peers_wait_for_is_not_hung(waits_in
         cluster.run(0.25)
     assert cluster.published == []
     record = cluster.run(1.5)  # the same round for longer than the hang timeout
-    assert record.state == MembershipState.COMMITTED and not record.is_active(3)
+    assert record.state == MembershipState.COMMITTED
+    assert not record.is_active(3)
 
 
-def test_an_idle_rank_others_wait_for_is_not_hung():
+def test_idle_rank_waited_on_not_hung():
     cluster = Cluster(hang_timeout_s=1.0)
-    cluster.idle.update(
-        range(WORLD)
-    )  # an idle server: rank 0 waits for requests, the others wait for rank 0
+    # An idle server. Rank 0 waits for requests and the others wait for rank 0.
+    cluster.idle.update(range(WORLD))
     cluster.waiting_for.update({r: 1 for r in range(1, WORLD)})
     cluster.run(5.0)
     assert cluster.published == []
 
 
-def test_a_rank_that_hangs_while_idle_is_hung():
+def test_rank_hung_while_idle():
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.idle.update(range(WORLD))
     cluster.waiting_for.update({r: 1 for r in range(1, WORLD)})
     cluster.run(0.5)
-    cluster.stopped.add(0)  # rank 0's process stops in its idle wait: its reports stop
+    cluster.stopped.add(0)  # rank 0's process stops in its idle wait and stops reporting
     record = cluster.run(3.0)
     assert record.state == MembershipState.ABORTED  # rank 0 failed
 
 
-def test_a_hung_rank_is_logged_with_what_every_active_rank_waits_on(monkeypatch):
+def test_hung_rank_log_lists_waits(monkeypatch):
     warnings = []
     monkeypatch.setattr(membership.logger, "warning", warnings.append)
     cluster = Cluster(hang_timeout_s=1.0)
@@ -245,21 +248,24 @@ def test_a_hung_rank_is_logged_with_what_every_active_rank_waits_on(monkeypatch)
     cluster.run(3.0)
     [hung] = [w for w in warnings if "is hung" in w]
     assert hung.startswith("Rank 3 is hung")
-    assert "rank 0: iteration" in hung and "waits for [3], all-to-all rounds [(3, 7)]" in hung
-    assert "rank 3: iteration" in hung and "waits for []" in hung
+    assert "rank 0: iteration" in hung
+    assert "waits for [3], all-to-all rounds [(3, 7)]" in hung
+    assert "rank 3: iteration" in hung
+    assert "waits for []" in hung
 
 
-def test_an_idle_rank_behind_its_peers_is_hung():
+def test_idle_rank_behind_peers_is_hung():
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.run(0.5)
     cluster.idle.add(3)  # rank 3 claims to be idle, but the others moved on and wait for it
     cluster.waiting_for.update({r: 1 << 3 for r in range(3)})
     record = cluster.run(3.0)
-    assert record.state == MembershipState.COMMITTED and not record.is_active(3)
+    assert record.state == MembershipState.COMMITTED
+    assert not record.is_active(3)
 
 
-def test_a_hung_rank_s_last_report_does_not_remove_the_peers_it_waited_for():
-    """Rank 2's process stops while it briefly waits for rank 1, which then waits for rank 2: only rank 2 is hung."""
+def test_hung_rank_report_keeps_its_peers():
+    """Remove only rank 2 when it stops while waiting for rank 1, which then waits for rank 2."""
     authority = _formed(Authority(WORLD, hang_timeout_s=30.0))
     frozen = RankReport(progress=5, waiting_for=1 << 1, sequence=1)
     for tick in range(1, 1000):  # 0.05 s apart
@@ -271,14 +277,15 @@ def test_a_hung_rank_s_last_report_does_not_remove_the_peers_it_waited_for():
         record = authority.tick(tick * 0.05, reports, ALL)
         if record is not None:
             break
-    assert record.state == MembershipState.PROPOSE and record.active_mask == ALL & ~(1 << 2)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
 
 
-# The hang rule, case by case: only the end of a wait-for chain that does not move for the hang timeout is hung.
+# The hang rule. Only the end of a wait-for chain that does not move for the hang timeout is hung.
 
 
 def _first_change(cluster, seconds):
-    """The first record the authority publishes within ``seconds``, or None."""
+    """Return the first record the authority publishes within ``seconds``, or None."""
     for _ in range(round(seconds / 0.05)):
         if cluster.step() is not None:
             return cluster.published[-1]
@@ -286,7 +293,7 @@ def _first_change(cluster, seconds):
 
 
 def _release(cluster):
-    """The active ranks resume once the authority removed the hung ranks: no rank waits or hangs any longer."""
+    """Resume the active ranks after the authority removed the hung ones."""
     cluster.hung.clear()
     cluster.waiting_for.clear()
     cluster.waited_rounds.clear()
@@ -294,10 +301,11 @@ def _release(cluster):
 
 
 @pytest.mark.parametrize("stopped", [False, True])
-def test_only_the_end_of_a_wait_for_chain_is_hung(stopped):
-    """Rank 2 hangs: its process stops (SIGSTOP) or only its main thread does. Rank 3's host is blocked on its GPU,
-    whose all-to-all waits on rank 2, and ranks 0 and 1 wait in the host exchange for both: rank 3 is waited on and
-    makes no progress too, but it waits on rank 2, so only rank 2 is hung."""
+def test_only_wait_chain_end_is_hung(stopped):
+    """Remove only rank 2 when rank 3 waits on it and ranks 0 and 1 wait on both.
+
+    Rank 2's process stops (SIGSTOP), or only its main thread hangs.
+    """
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.run(0.5)
     (cluster.stopped if stopped else cluster.hung).add(2)
@@ -306,19 +314,20 @@ def test_only_the_end_of_a_wait_for_chain_is_hung(stopped):
     cluster.waited_rounds[3] = ((2, 7),)
     hung_s = cluster.now
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == ALL & ~(1 << 2)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
     assert 1.0 < cluster.now - hung_s <= 1.2
     _release(cluster)
-    assert cluster.run(1.0).active_mask == ALL & ~(1 << 2)
+    assert cluster.run(1.0).active_mask == _without(2)
     assert states(cluster) == TRANSACTION
 
 
 @pytest.mark.parametrize("stopped_in", ["all-to-all", "host exchange", "paused wait"])
-def test_a_stopped_process_is_hung_wherever_it_stopped(stopped_in):
-    """Rank 2's process stops (SIGSTOP), and its client thread with it, while it waits on a peer: in an all-to-all
-    kernel or the host exchange on rank 3, or on rank 0 in the request broadcast, which pauses main's hang detector.
-    Its last report keeps naming that peer, which now waits on rank 2 (a cycle, one end): rank 2 is hung one hang
-    timeout after its stop, not half a hang timeout later once its report expires, and the peer is kept."""
+def test_stopped_process_is_hung_anywhere(stopped_in):
+    """Remove a stopped rank one hang timeout after it stops, and keep the peer its last report names.
+
+    Rank 2 stops while it waits on a peer, which then waits on rank 2.
+    """
     cluster = Cluster(hang_timeout_s=1.0)
     peer = 0 if stopped_in == "paused wait" else 3
     cluster.waiting_for[2] = 1 << peer
@@ -334,7 +343,8 @@ def test_a_stopped_process_is_hung_wherever_it_stopped(stopped_in):
     cluster.waiting_for.update({r: 1 << 2 for r in (0, 1, 3)})
     stopped_s = cluster.now
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == ALL & ~(1 << 2)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
     assert 1.0 < cluster.now - stopped_s <= 1.2
     _release(cluster)
     assert cluster.run(1.0).state == MembershipState.COMMITTED
@@ -342,22 +352,23 @@ def test_a_stopped_process_is_hung_wherever_it_stopped(stopped_in):
 
 
 @pytest.mark.parametrize("peers_paused", [False, True])
-def test_a_rank_whose_main_thread_hangs_in_a_paused_wait_is_hung(peers_paused):
-    """Rank 2's main thread hangs inside a wait that pauses main's hang detector (the request broadcast), while its
-    client thread reports it idle; the others wait on it, in that broadcast too or not. Only rank 0 waiting for client
-    requests may stay idle while others wait on it."""
+def test_main_thread_hang_in_paused_wait(peers_paused):
+    """Remove rank 2 when its main thread hangs in the request broadcast while it reports idle.
+
+    Only rank 0, which waits for client requests, may stay idle while others wait on it.
+    """
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.run(0.5)
     cluster.idle.add(2)
     (cluster.idle if peers_paused else cluster.hung).update({0, 1, 3})
     cluster.waiting_for.update({r: 1 << 2 for r in (0, 1, 3)})
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == ALL & ~(1 << 2)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
 
 
-def test_a_rank_starved_of_the_gil_is_not_hung():
-    """Rank 2's client thread reports only every 0.4 s and its iteration advances as slowly, while the others wait on
-    it: its reports stay fresh and it advances within the hang timeout."""
+def test_gil_starved_rank_is_not_hung():
+    """Keep rank 2 when it reports and advances only every 0.4 s while the others wait on it."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.report_every[2] = 8
     cluster.hung.update({0, 1, 3})
@@ -367,7 +378,7 @@ def test_a_rank_starved_of_the_gil_is_not_hung():
 
 
 def _idle_deployment():
-    """Rank 0 waits for client requests; the others wait on it in the request broadcast."""
+    """Return a cluster whose rank 0 waits for requests while the others wait on rank 0."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.idle.update(range(WORLD))
     cluster.waiting_for.update({r: 1 for r in range(1, WORLD)})
@@ -375,9 +386,9 @@ def _idle_deployment():
     return cluster
 
 
-def test_a_rank_late_once_after_a_long_idle_wait_is_not_hung():
+def test_late_rank_after_idle_not_hung():
     cluster = _idle_deployment()
-    cluster.idle.clear()  # a request arrives; rank 2 is late to the next collective
+    cluster.idle.clear()  # a request arrives, and rank 2 is late to the next collective
     cluster.hung.update(range(WORLD))
     cluster.waiting_for.update({r: 1 << 2 for r in (0, 1, 3)})
     cluster.run(0.3)
@@ -386,8 +397,8 @@ def test_a_rank_late_once_after_a_long_idle_wait_is_not_hung():
     assert cluster.published == []
 
 
-def test_a_rank_stopped_in_an_idle_deployment_is_hung_once_waited_on_for_the_hang_timeout():
-    """Nobody waits on rank 2 while the deployment is idle; the first request makes the others wait on it."""
+def test_stopped_rank_in_idle_deployment():
+    """Remove a stopped rank one hang timeout after the first request makes the others wait on it."""
     cluster = _idle_deployment()
     cluster.stopped.add(2)
     cluster.run(5.0)
@@ -397,20 +408,23 @@ def test_a_rank_stopped_in_an_idle_deployment_is_hung_once_waited_on_for_the_han
     cluster.waiting_for.update({r: 1 << 2 for r in (0, 1, 3)})
     request_s = cluster.now
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == ALL & ~(1 << 2)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
     assert 1.0 < cluster.now - request_s <= 1.2
 
 
-def test_ranks_that_wait_only_on_each_other_are_one_end():
-    """Ranks 2 and 3 wait on each other with their clients running, and the others wait on rank 2. Collectives that
-    send before they wait form no such cycle among active processes (a stopped one's report expires first); a fault
-    beyond process failures may. No report singles one out: both are hung, and serving goes on without them."""
+def test_mutually_waiting_ranks_are_one_end():
+    """Remove both ranks 2 and 3 when they wait on each other and the others wait on rank 2.
+
+    No report singles one of them out, so serving goes on without both.
+    """
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.run(0.5)
     cluster.hung.update(range(WORLD))
     cluster.waiting_for.update({0: 1 << 2, 1: 1 << 2, 2: 1 << 3, 3: 1 << 2})
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == 0b0011
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == 0b0011
     _release(cluster)
     assert cluster.run(1.0).state == MembershipState.COMMITTED
     assert MembershipState.ABORTED not in states(cluster)
@@ -418,9 +432,8 @@ def test_ranks_that_wait_only_on_each_other_are_one_end():
 
 @pytest.mark.parametrize("how", ["hung", "stopped"])
 @pytest.mark.parametrize("phase", [MembershipState.PROPOSE, MembershipState.INSTALL])
-def test_a_rank_that_hangs_during_a_transaction_restarts_it_after_the_hang_timeout(phase, how):
-    """The authority waits on every active rank for the phase's reply: a rank that hangs in the phase is failed like
-    one that crashes, once it has not moved for the hang timeout."""
+def test_hang_during_transaction_restarts_it(phase, how):
+    """Fail a rank that hangs in a phase like a crashed one, after the hang timeout."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(1)  # a crash starts the transaction
     while cluster.authority.record.state != phase:
@@ -428,18 +441,21 @@ def test_a_rank_that_hangs_during_a_transaction_restarts_it_after_the_hang_timeo
     getattr(cluster, how).add(3)
     phase_s = cluster.now
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == 0b0101
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == 0b0101
     assert 1.0 < cluster.now - phase_s <= 1.2
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == 0b0101
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == 0b0101
     assert MembershipState.ABORTED not in states(cluster)
 
 
 @pytest.mark.parametrize("phase", [MembershipState.PROPOSE, MembershipState.INSTALL])
-def test_an_idle_rank_0_that_hangs_during_a_transaction_is_hung(phase):
-    """Main's hang detector stays paused while a rank takes part in a membership change, so a rank 0 whose main thread
-    hangs there reports idle ticks that advance. Only a committed membership exempts an idle rank 0: in a phase the
-    authority waits on it for the reply, and the deployment aborts once it has not moved for the hang timeout."""
+def test_idle_rank_0_hang_in_transaction(phase):
+    """Abort when rank 0 reports idle but does not reply in a phase for the hang timeout.
+
+    Only a committed membership exempts an idle rank 0.
+    """
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(1)  # a crash starts the transaction
     while cluster.authority.record.state != phase:
@@ -447,12 +463,12 @@ def test_an_idle_rank_0_that_hangs_during_a_transaction_is_hung(phase):
     cluster.idle.add(0)
     cluster.not_replying.add(0)
     record = _first_change(cluster, 2.0)
-    assert record is not None and record.state == MembershipState.ABORTED
+    assert record is not None
+    assert record.state == MembershipState.ABORTED
 
 
-def test_a_wait_on_a_rank_that_is_no_longer_active_exempts_no_rank():
-    """Rank 3's all-to-all waited on rank 1 when rank 1's process ended, and rank 3 then hangs in the change, its
-    reports still naming rank 1: a wait on a rank outside the active membership does not keep it from being hung."""
+def test_wait_on_inactive_rank_exempts_none():
+    """Remove rank 3 when it hangs while its reports still name rank 1, which is no longer active."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.waiting_for[3] = 1 << 1
     cluster.waited_rounds[3] = ((1, 7),)
@@ -461,17 +477,18 @@ def test_a_wait_on_a_rank_that_is_no_longer_active_exempts_no_rank():
         cluster.step()
     cluster.hung.add(3)
     record = _first_change(cluster, 2.0)
-    assert record is not None and record.state == MembershipState.PROPOSE
+    assert record is not None
+    assert record.state == MembershipState.PROPOSE
     assert record.active_mask == 0b0101
     cluster.waiting_for.clear()
     cluster.waited_rounds.clear()
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == 0b0101
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == 0b0101
 
 
-def test_a_phase_waits_for_a_rank_as_long_as_it_advances():
-    """No fixed deadline: rank 3 takes longer than any timeout to reply READY, finishing a step whose progress
-    shows, and the transaction goes on with it once it replies."""
+def test_phase_waits_while_rank_advances():
+    """Wait for a READY reply past any timeout while the rank's progress advances."""
     cluster = Cluster()
     cluster.alive.discard(1)
     cluster.not_replying.add(3)
@@ -480,10 +497,11 @@ def test_a_phase_waits_for_a_rank_as_long_as_it_advances():
     assert cluster.authority.record.is_active(3)
     cluster.not_replying.clear()
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == ALL & ~(1 << 1)
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == _without(1)
 
 
-def test_a_failure_during_the_transaction_restarts_it():
+def test_failure_during_transaction_restarts_it():
     cluster = Cluster()
     cluster.alive.discard(3)
     cluster.hung.add(2)  # 2 cannot reply, so the first transaction waits ...
@@ -492,10 +510,11 @@ def test_a_failure_during_the_transaction_restarts_it():
     cluster.alive.discard(2)  # ... and then 2 dies too
     record = cluster.run(2.0)
     assert record.state == MembershipState.COMMITTED
-    assert record.active_mask == 0b0011 and record.generation == 2
+    assert record.active_mask == 0b0011
+    assert record.generation == 2
 
 
-def test_installed_replies_that_restored_different_placements_abort():
+def test_different_restored_placements_abort():
     cluster = Cluster()
     cluster.digest[1] = "placement-b"
     cluster.alive.discard(3)
@@ -503,8 +522,8 @@ def test_installed_replies_that_restored_different_placements_abort():
     assert MembershipState.COMMITTED not in states(cluster)
 
 
-def test_a_replacement_that_restored_another_placement_than_the_survivors_is_not_added():
-    """The survivors agree with each other: they commit without the replacement, which never ends the deployment."""
+def test_replacement_with_other_placement_excluded():
+    """Commit without a replacement whose placement differs from the survivors' placement."""
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -512,15 +531,16 @@ def test_a_replacement_that_restored_another_placement_than_the_survivors_is_not
     cluster.digest[2] = "placement-b"
     _join(cluster, 2)
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == ALL & ~(1 << 2)
-    assert record.joining_mask == 0 and MembershipState.ABORTED not in states(cluster)
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == _without(2)
+    assert record.joining_mask == 0
+    assert MembershipState.ABORTED not in states(cluster)
     assert states(cluster) == [MembershipState.PROPOSE, MembershipState.INSTALL] + TRANSACTION
 
 
 @pytest.mark.parametrize("slots", ["spare", "none spare"])
-def test_a_rank_that_fails_to_install_aborts(slots):
-    """Also when no rank holds an expert the failed rank alone held: the active ranks' plan of the restore is the one
-    rule for whether they keep every expert, and it fails the install on every active rank."""
+def test_failed_install_aborts(slots):
+    """Abort also when every active rank fails the install because an expert has no spare slot."""
     cluster = Cluster()
     if slots == "none spare":  # rank 3 alone held an expert
         cluster.install_reply = {r: Reply.FAILED for r in range(WORLD)}
@@ -535,44 +555,45 @@ def test_a_rank_that_fails_to_install_aborts(slots):
     ]
 
 
-def test_a_survivor_failing_during_an_admission_leaves_the_others_serving():
-    """Ranks 2 and 3 failed and their experts were restored into the spare slots of ranks 0 and 1; rank 2's
-    replacement joins, and rank 1 fails before the admission installs. Only one spare slot of the active ranks is
-    empty for the two lost experts, but the joining rank holds expert 2 again, so the plan empties rank 0's spare
-    slot too: the authority leaves that to the active ranks' plan instead of counting empty slots, and the change
-    commits."""
+def test_survivor_failure_during_admission_commits():
+    """Commit when rank 1 fails while rank 2's replacement is admitted after ranks 2 and 3 failed.
+
+    The authority leaves the spare slot count to the active ranks' restore plan.
+    """
     cluster = Cluster()
     cluster.alive -= {2, 3}
     assert cluster.run(1.0).state == MembershipState.COMMITTED
-    _join(cluster, 2)  # rank 3's replacement did not ask to join: rank 2's does not wait for it
+    _join(cluster, 2)  # rank 3's replacement did not ask to join, so rank 2's does not wait for it
     while cluster.authority.record.state != MembershipState.PROPOSE:
         cluster.step()
     cluster.alive.discard(1)
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == 0b0101
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == 0b0101
     assert MembershipState.ABORTED not in states(cluster)
 
 
-def test_a_generation_commits_only_once_every_active_rank_installed_it():
+def test_commit_needs_every_install():
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
-    cluster.run(1.0)  # generation 1: every survivor's last reply is INSTALLED
+    cluster.run(1.0)  # in generation 1, every survivor's last reply is INSTALLED
     cluster.alive.discard(2)
     while cluster.authority.record.state != MembershipState.INSTALL:
         cluster.step()
     cluster.hung.add(1)  # replied READY to generation 2, never INSTALLED
     record = cluster.run(3.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == 0b0001
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == 0b0001
     committed = [r.generation for r in cluster.published if r.state == MembershipState.COMMITTED]
     assert committed == [1, 3]  # never generation 2, which rank 1 did not install
 
 
-def test_survivors_that_made_no_progress_during_the_transaction_are_not_hung_at_its_commit():
+def test_no_progress_in_transaction_not_hung():
     authority = _formed(Authority(WORLD, hang_timeout_s=1.0))
     calls = itertools.count(1)
 
     def reports(reply=Reply.NONE, generation=0, waiting_for=0):
-        # Every rank is stuck at iteration 5 from the start; the survivors' replies follow the record.
+        # Every rank stays at iteration 5 from the start, and the survivors' replies follow the record.
         sequence = next(calls)
         return {
             r: RankReport(
@@ -595,10 +616,8 @@ def test_survivors_that_made_no_progress_during_the_transaction_are_not_hung_at_
     assert authority.record.is_active(1)
 
 
-def test_a_rank_waited_on_through_a_transaction_has_a_full_hang_timeout_after_its_commit():
-    """Rank 2 waits on rank 1 during the install (as in a gather through the store), and rank 1 replies late in the
-    phase, then takes half the hang timeout for its first step after the commit while rank 2 still waits on it.
-    Its wait during the transaction does not count: the hang clocks restart at the commit."""
+def test_hang_clock_restarts_at_commit():
+    """Give a rank waited on during the install a full hang timeout after the commit."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
     while cluster.authority.record.state != MembershipState.INSTALL:
@@ -615,7 +634,8 @@ def test_a_rank_waited_on_through_a_transaction_has_a_full_hang_timeout_after_it
     cluster.run(0.5)
     _release(cluster)
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == 0b0111
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == 0b0111
     assert states(cluster) == TRANSACTION
 
 
@@ -626,23 +646,22 @@ def test_losing_rank_0_aborts():
 
 
 @pytest.mark.parametrize("silent_rank, survives", [(1, True), (0, False)])
-def test_a_rank_that_does_not_reply_in_a_phase_for_the_hang_timeout_counts_as_failed(
-    silent_rank, survives
-):
-    """The transaction restarts without it, unless it is rank 0: the deployment then aborts."""
+def test_silent_rank_in_phase_counts_failed(silent_rank, survives):
+    """Restart the transaction without a silent rank, or abort if it is rank 0."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
-    cluster.hung.add(silent_rank)  # connected but never replies; only the authority waits on it
+    cluster.hung.add(silent_rank)  # connected but never replies, and only the authority waits on it
     record = cluster.run(3.0)
     if survives:
-        assert record.state == MembershipState.COMMITTED and record.active_mask == 0b0101
+        assert record.state == MembershipState.COMMITTED
+        assert record.active_mask == 0b0101
         assert MembershipState.ABORTED not in states(cluster)
     else:
         assert record.state == MembershipState.ABORTED
 
 
-def test_during_a_transaction_only_the_end_of_a_wait_for_chain_counts_as_failed():
-    """Rank 2 cannot reply INSTALLED while it waits for rank 1 (a gather of the install): only rank 1 failed."""
+def test_transaction_fails_only_wait_chain_end():
+    """Fail only rank 1 when rank 2 cannot reply INSTALLED because it waits for rank 1."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
     while cluster.authority.record.state != MembershipState.INSTALL:
@@ -655,7 +674,7 @@ def test_during_a_transaction_only_the_end_of_a_wait_for_chain_counts_as_failed(
     assert cluster.authority.record.active_mask == 0b0101
 
 
-def test_each_phase_has_its_own_hang_timeout():
+def test_each_phase_has_own_hang_timeout():
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
     cluster.hung.add(1)  # replies late in each phase
@@ -672,9 +691,8 @@ def test_each_phase_has_its_own_hang_timeout():
     assert cluster.run(0.5).state == MembershipState.COMMITTED
 
 
-def test_an_install_that_keeps_completing_steps_is_not_hung():
-    """Installing can take long (a large expert restore, the memory of many peers to map): every step a rank
-    completes is progress, so only an install that stops advancing for the hang timeout is a hang."""
+def test_progressing_install_is_not_hung():
+    """Count each completed install step as progress, so only a stalled install is a hang."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(1)
     while cluster.authority.record.state != MembershipState.INSTALL:
@@ -686,11 +704,12 @@ def test_an_install_that_keeps_completing_steps_is_not_hung():
     cluster.installing.discard(3)
     stalled_s = cluster.now
     record = _first_change(cluster, 2.0)
-    assert record.state == MembershipState.PROPOSE and record.active_mask == 0b0101
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == 0b0101
     assert 1.0 < cluster.now - stalled_s <= 1.2
 
 
-def test_a_replacement_joins_and_one_that_dies_while_joining_is_dropped():
+def test_replacement_joins_dead_joiner_dropped():
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -698,18 +717,17 @@ def test_a_replacement_joins_and_one_that_dies_while_joining_is_dropped():
     cluster.reports[2] = RankReport()
     cluster.authority.request_join(2)
     record = cluster.run(1.0)
-    assert (
-        record.state == MembershipState.COMMITTED
-        and record.active_mask == ALL
-        and record.generation == 2
-    )
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == ALL
+    assert record.generation == 2
 
     cluster.alive.discard(3)
     cluster.run(1.0)
     cluster.reports[3] = RankReport()
     cluster.authority.request_join(3)  # the replacement never connects
     record = cluster.run(1.0)
-    assert record.state == MembershipState.COMMITTED and not record.is_active(3)
+    assert record.state == MembershipState.COMMITTED
+    assert not record.is_active(3)
 
 
 def _join(cluster, rank):
@@ -718,8 +736,8 @@ def _join(cluster, rank):
     cluster.authority.request_join(rank)
 
 
-def test_the_replacements_of_ranks_failing_together_are_added_in_one_transaction():
-    """A node's ranks fail in one transaction; their replacements are ready to join a little apart."""
+def test_replacements_added_in_one_transaction():
+    """Add the replacements of a node's ranks together, although they become ready a little apart."""
     cluster = Cluster()
     cluster.alive -= {2, 3}
     cluster.run(1.0)
@@ -731,15 +749,16 @@ def test_the_replacements_of_ranks_failing_together_are_added_in_one_transaction
     assert cluster.published == []  # waits for rank 3's replacement
     cluster.unprepared.discard(3)
     record = cluster.run(1.0)
-    assert states(cluster) == TRANSACTION and record.active_mask == ALL
+    assert states(cluster) == TRANSACTION
+    assert record.active_mask == ALL
     assert cluster.authority.last_transaction.added_ranks == (2, 3)
-    # Detected at rank 2's readiness: the wait for rank 3's is part of the transaction.
+    # The transaction is detected at rank 2's readiness and includes the wait for rank 3's.
     summary = cluster.authority.last_transaction
     assert summary.began_unix_ms - summary.detected_unix_ms >= 2000
 
 
-def test_the_proposal_that_adds_replacements_logs_them(monkeypatch):
-    """One line per admission, none for the failure."""
+def test_admission_proposal_logs_joining_ranks(monkeypatch):
+    """Log one line per admission and none for the failure."""
     infos = []
     monkeypatch.setattr(membership.logger, "info", infos.append)
     cluster = Cluster()
@@ -755,8 +774,8 @@ def test_the_proposal_that_adds_replacements_logs_them(monkeypatch):
     assert line == "Adding joining ranks [2, 3] to the membership"
 
 
-def test_a_transaction_s_phases_end_at_ordered_wall_clock_times_in_milliseconds():
-    """Detected at rank 2's readiness, proposed once rank 3's replacement is ready too, then READY and INSTALLED."""
+def test_transaction_phase_times_are_ordered():
+    """Record the detection, proposal, READY and commit times in milliseconds of wall-clock time."""
     cluster = Cluster()
     cluster.alive -= {2, 3}
     cluster.run(1.0)
@@ -771,7 +790,8 @@ def test_a_transaction_s_phases_end_at_ordered_wall_clock_times_in_milliseconds(
     before_s = time.time()
     record = cluster.run(1.0)
     after_s = time.time()
-    assert states(cluster) == TRANSACTION and record.active_mask == ALL
+    assert states(cluster) == TRANSACTION
+    assert record.active_mask == ALL
     summary = cluster.authority.last_transaction
     times = {
         "detected": summary.detected_unix_ms,
@@ -780,22 +800,20 @@ def test_a_transaction_s_phases_end_at_ordered_wall_clock_times_in_milliseconds(
         "committed": summary.ended_unix_ms,
     }
     assert times["detected"] < times["proposed"] < times["ready"] < times["committed"]
-    # The authority's clock at the detection and at each record it published (PROPOSE, then INSTALL once every READY
-    # was in, then COMMITTED once every INSTALLED was in), in milliseconds.
+    # The authority's clock at the detection and at each record it published, in milliseconds.
     ticks_ms = [t * 1e3 for t in (detected, *cluster.published_at)]
     phases_ms = [later - earlier for earlier, later in itertools.pairwise(times.values())]
     assert phases_ms == pytest.approx([b - a for a, b in itertools.pairwise(ticks_ms)], abs=1)
-    # Milliseconds since the Unix epoch: the tick that committed ran between the two wall-clock reads.
+    # The committing tick ran between the two wall-clock reads.
     assert before_s * 1e3 - 1 <= times["committed"] <= after_s * 1e3 + 1
 
 
 @pytest.mark.parametrize("how", ["stops", "ends"])
-def test_a_ready_join_waits_for_a_replacement_failed_with_its_rank_only_while_its_reports_advance(
-    how,
-):
-    """Rank 3's replacement asked to join and is still starting: rank 2's, ready, waits for it as long as it takes,
-    but no longer once its reports stop advancing (half the hang timeout after a SIGSTOP), nor once its process
-    ended. Rank 2's is then added alone."""
+def test_ready_join_waits_while_peer_advances(how):
+    """Wait for the replacement failed with the same rank only while its reports advance.
+
+    Rank 2's replacement is added alone once rank 3's stops reporting or its process ends.
+    """
     cluster = Cluster(hang_timeout_s=2.0)
     cluster.alive -= {2, 3}
     cluster.run(1.0)
@@ -807,16 +825,17 @@ def test_a_ready_join_waits_for_a_replacement_failed_with_its_rank_only_while_it
     assert cluster.published == []
     if how == "stops":
         cluster.stopped.add(3)
-        assert cluster.run(0.9).state == MembershipState.COMMITTED and cluster.published == []
+        assert cluster.run(0.9).state == MembershipState.COMMITTED
+        assert cluster.published == []
     else:
         cluster.alive.discard(3)
     record = cluster.run(0.5)
-    assert states(cluster) == TRANSACTION and record.active_mask == ALL & ~(1 << 3)
+    assert states(cluster) == TRANSACTION
+    assert record.active_mask == _without(3)
 
 
-def test_a_ready_join_stops_waiting_for_a_replacement_whose_startup_makes_no_progress():
-    """Rank 3's replacement reports on but its startup stalls: rank 2's, ready, waits for it only until its startup
-    made no progress for the rendezvous timeout, then is added alone. Fails without the change: it waited forever."""
+def test_ready_join_stops_on_stalled_startup():
+    """Add rank 2's replacement alone once rank 3's startup makes no progress for the rendezvous timeout."""
     cluster = Cluster(rendezvous_timeout_s=5.0)
     cluster.alive -= {2, 3}
     cluster.run(1.0)
@@ -824,17 +843,18 @@ def test_a_ready_join_stops_waiting_for_a_replacement_whose_startup_makes_no_pro
     _join(cluster, 2)
     _join(cluster, 3)
     cluster.unprepared.add(3)
-    cluster.run(8.0)  # its startup progresses: rank 2's waits past the bound
+    cluster.run(8.0)  # rank 3's startup progresses, so rank 2's waits past the timeout
     assert cluster.published == []
     cluster.hung.add(3)  # its startup stalls while its client reports on
-    assert cluster.run(4.5).state == MembershipState.COMMITTED and cluster.published == []
+    assert cluster.run(4.5).state == MembershipState.COMMITTED
+    assert cluster.published == []
     record = cluster.run(1.0)
-    assert states(cluster) == TRANSACTION and record.active_mask == ALL & ~(1 << 3)
+    assert states(cluster) == TRANSACTION
+    assert record.active_mask == _without(3)
 
 
-def test_a_join_that_ends_before_it_is_proposed_leaves_no_detection_time_behind():
-    """Rank 2's replacement is ready and waits for rank 3's, which failed with it, then dies: nothing is due any
-    longer. A later failure is detected when it happens, not at that join."""
+def test_ended_join_leaves_no_detection_time():
+    """Detect a later failure when it happens, not at a ready join whose replacement died before its proposal."""
     cluster = Cluster(world=8)
     cluster.alive -= {2, 3}
     cluster.run(1.0)
@@ -848,14 +868,14 @@ def test_a_join_that_ends_before_it_is_proposed_leaves_no_detection_time_behind(
     cluster.published.clear()
     cluster.alive.discard(5)
     record = cluster.run(1.0)
-    assert states(cluster) == TRANSACTION and not record.is_active(5)
+    assert states(cluster) == TRANSACTION
+    assert not record.is_active(5)
     summary = cluster.authority.last_transaction
     assert summary.began_unix_ms == summary.detected_unix_ms
 
 
-def test_a_ready_join_waits_for_the_replacements_failed_with_its_rank_to_be_ready_too():
-    """Rank 3's replacement asked to join but is still starting: rank 2's, ready, waits for it, and both are added in
-    one transaction."""
+def test_ready_join_waits_for_failed_peers():
+    """Wait for the replacement of a rank that failed together with this one, then add both at once."""
     cluster = Cluster()
     cluster.alive -= {2, 3}
     cluster.run(1.0)
@@ -867,13 +887,13 @@ def test_a_ready_join_waits_for_the_replacements_failed_with_its_rank_to_be_read
     assert cluster.published == []
     cluster.unprepared.discard(3)
     record = cluster.run(1.0)
-    assert states(cluster) == TRANSACTION and record.active_mask == ALL
+    assert states(cluster) == TRANSACTION
+    assert record.active_mask == ALL
     assert cluster.authority.last_transaction.added_ranks == (2, 3)
 
 
-def test_a_ready_join_does_not_wait_for_the_ranks_failed_with_one_that_is_not_ready():
-    """Ranks 5 and 6 failed together, rank 2 later and alone. Rank 5's replacement asked to join but is still
-    starting: rank 2's, ready, is proposed at once, without waiting for rank 6's."""
+def test_ready_join_skips_unrelated_failures():
+    """Propose rank 2's replacement at once while rank 5's, from an earlier failure, is still starting."""
     cluster = Cluster(world=8)
     cluster.alive -= {5, 6}
     cluster.run(1.0)
@@ -888,8 +908,8 @@ def test_a_ready_join_does_not_wait_for_the_ranks_failed_with_one_that_is_not_re
     assert cluster.published[0].joining_mask == 1 << 2
 
 
-def test_a_replacement_is_proposed_only_once_it_is_ready_to_join():
-    """One that asked to join and then went silent never stops the active ranks: they serve on without it."""
+def test_replacement_proposed_once_ready():
+    """Keep serving without a replacement that asked to join and then went silent."""
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -900,30 +920,32 @@ def test_a_replacement_is_proposed_only_once_it_is_ready_to_join():
     assert cluster.published == []
     cluster.unprepared.discard(2)
     record = cluster.run(1.0)
-    assert states(cluster) == TRANSACTION and record.active_mask == ALL
+    assert states(cluster) == TRANSACTION
+    assert record.active_mask == ALL
 
 
-def test_the_active_ranks_wait_for_a_silent_joining_rank_for_the_hang_timeout():
-    """Its readiness stands for its READY: INSTALL follows the survivors' READY at once. A joining rank that goes
-    silent once it reported ready is left out by the hang rule, as any active rank: the survivors commit without it,
-    and its supervisor starts another replacement."""
+def test_silent_joining_rank_left_out():
+    """Commit without a joining rank that goes silent after it reported ready, after the hang timeout.
+
+    Its readiness stands for its READY reply, so INSTALL follows the survivors' READY at once.
+    """
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(2)
     cluster.run(1.0)
     cluster.published.clear()
     cluster.published_at.clear()
     _join(cluster, 2)
-    cluster.hung.add(2)  # ready, then silent: replies neither READY nor INSTALLED
+    cluster.hung.add(2)  # ready, then replies neither READY nor INSTALLED
     record = cluster.run(3.0)
-    assert record.state == MembershipState.COMMITTED and record.active_mask == ALL & ~(1 << 2)
+    assert record.state == MembershipState.COMMITTED
+    assert record.active_mask == _without(2)
     assert states(cluster) == [MembershipState.PROPOSE, MembershipState.INSTALL] + TRANSACTION
     proposed, installed, restarted = cluster.published_at[:3]
     assert installed - proposed == pytest.approx(0.05)
     assert 1.0 < restarted - proposed <= 1.2
 
 
-def test_the_transaction_that_adds_a_replacement_marks_it_joining():
-    """The active ranks keep the host exchange to themselves until they resume; the record says who joins."""
+def test_admission_marks_replacement_joining():
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -937,30 +959,32 @@ def test_the_transaction_that_adds_a_replacement_marks_it_joining():
     assert [record.joining_mask for record in cluster.published] == [1 << 2, 1 << 2, 0]
 
 
-def test_a_replacement_resumes_where_the_survivors_do():
-    """Where a joining rank stopped moves neither the iteration nor the epoch every active rank resumes at."""
+def test_replacement_resumes_with_survivors():
+    """Resume at the survivors' iteration and epoch, whatever the joining rank reports."""
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
     cluster.paused_at[2] = ResumeState(iteration=50, epoch=150)
     _join(cluster, 2)
     record = cluster.run(1.0)
-    assert record.active_mask == ALL and record.generation == 2
+    assert record.active_mask == ALL
+    assert record.generation == 2
     assert record.resume == ResumeState(iteration=13, epoch=104)
 
 
-def test_a_replacement_for_a_rank_still_active_takes_it_over():
+def test_replacement_takes_over_active_rank():
     cluster = Cluster()
     cluster.reports[1] = RankReport()  # the replacement's reports replace the old process's
     cluster.authority.request_join(1)
     record = cluster.run(1.0)
     assert states(cluster) == TRANSACTION
-    assert record.active_mask == ALL and record.generation == 1
+    assert record.active_mask == ALL
+    assert record.generation == 1
 
 
 @pytest.mark.parametrize("failure", ["failed_reply", "hang"])
 @pytest.mark.parametrize("phase", [MembershipState.PROPOSE, MembershipState.INSTALL])
-def test_a_replacement_that_cannot_join_is_left_out_and_the_others_commit(phase, failure):
+def test_failed_replacement_left_out(phase, failure):
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -981,13 +1005,14 @@ def test_a_replacement_that_cannot_join_is_left_out_and_the_others_commit(phase,
             )
     record = cluster.run(3.0)
     assert record.state == MembershipState.COMMITTED
-    assert record.active_mask == ALL & ~(1 << 2) and record.joining_mask == 0
+    assert record.active_mask == _without(2)
+    assert record.joining_mask == 0
     assert MembershipState.ABORTED not in states(cluster)
 
 
 @pytest.mark.parametrize("phase", [MembershipState.PROPOSE, MembershipState.INSTALL])
 @pytest.mark.parametrize("victim", [1, 2, 3])
-def test_a_second_failure_at_each_phase_still_commits_without_both(phase, victim):
+def test_second_failure_in_each_phase_commits(phase, victim):
     cluster = Cluster()
     first = 1 if victim != 1 else 2
     cluster.alive.discard(first)
@@ -999,7 +1024,8 @@ def test_a_second_failure_at_each_phase_still_commits_without_both(phase, victim
     cluster.alive.discard(victim)
     record = cluster.run(3.0)
     assert record.state == MembershipState.COMMITTED
-    assert not record.is_active(first) and not record.is_active(victim)
+    assert not record.is_active(first)
+    assert not record.is_active(victim)
 
 
 def test_record_and_report_serialization_round_trip():
@@ -1015,7 +1041,9 @@ def test_record_and_report_serialization_round_trip():
     assert MembershipRecord.model_validate_json(record.model_dump_json()) == record
     aborted = record.model_copy(update=dict(state=MembershipState.ABORTED, reason="rank 0 failed"))
     assert MembershipRecord.model_validate_json(aborted.model_dump_json()) == aborted
-    assert record.is_member(1, 2) and not record.is_member(1, 0) and not record.is_member(2, 0)
+    assert record.is_member(1, 2)
+    assert not record.is_member(1, 0)
+    assert not record.is_member(2, 0)
     report = RankReport(
         progress=9,
         idle=True,
@@ -1030,14 +1058,14 @@ def test_record_and_report_serialization_round_trip():
     ready = RankReport(reply=Reply.READY, ready_payload="[[4, [[0, -1], [3, 1]]]]")
     for sent in (report, ready):
         assert RankReport.model_validate_json(sent.model_dump_json()) == sent
-    # A line that is not a report, or whose field has another type, raises a ValueError: the connection closes.
+    # A line that is not a valid report raises a ValueError, which closes the connection.
     for line in (b"not json", b'{"progress": "nine"}', b'{"reply": 9}'):
         with pytest.raises(ValueError):
             RankReport.model_validate_json(line)
 
 
-def test_rank_0_s_report_ends_the_deployment_normally():
-    """Only rank 0's: then the ranks that leave are not failures."""
+def test_rank_0_shutdown_report_ends_deployment():
+    """End the deployment normally on rank 0's shutdown report only, so the ranks that leave are not failures."""
     cluster = Cluster()
     cluster.shutdown.add(1)
     cluster.run(1.0)
@@ -1050,14 +1078,14 @@ def test_rank_0_s_report_ends_the_deployment_normally():
     assert [record.state for record in cluster.published] == [MembershipState.SHUTDOWN]
 
 
-# The startup: STARTING until every rank has started; any loss before then aborts at once.
+# The startup stays STARTING until every rank has started. Any loss before then aborts at once.
 
 
 def _starting_reports(started=(), sequence=1):
     return {r: RankReport(started=r in started, sequence=sequence) for r in range(WORLD)}
 
 
-def test_the_deployment_serves_once_every_rank_has_started():
+def test_deployment_serves_once_all_started():
     authority = Authority(WORLD)
     assert authority.record.state == MembershipState.STARTING
     assert authority.tick(0.0, _starting_reports(), ALL) is None
@@ -1072,24 +1100,25 @@ def test_the_deployment_serves_once_every_rank_has_started():
 
 
 @pytest.mark.parametrize("failed_rank", [0, 2])
-def test_a_rank_failure_during_the_startup_aborts_at_once(failed_rank):
-    """Not at the rendezvous timeout: a deployment whose rank failed before it served cannot serve. The record says
-    why, for the startup error."""
+def test_startup_rank_failure_aborts_at_once(failed_rank):
+    """Abort without waiting for the rendezvous timeout, and give the reason in the record."""
     authority = Authority(WORLD)
     authority.tick(0.0, _starting_reports(), ALL)
-    record = authority.tick(0.05, _starting_reports(started={1}), ALL & ~(1 << failed_rank))
+    record = authority.tick(0.05, _starting_reports(started={1}), _without(failed_rank))
     assert record.state == MembershipState.ABORTED
     assert record.reason == f"ranks [{failed_rank}] failed during the startup"
 
 
-def test_the_startup_waits_for_the_ranks_not_connected_yet_until_the_rendezvous_timeout():
-    """A rank that never connects aborts the startup at the rendezvous timeout; a model load does not count, as every
-    rank connects at the start of its worker."""
+def test_startup_waits_until_rendezvous_timeout():
+    """Abort the startup only if a rank does not connect within the rendezvous timeout.
+
+    A long model load does not count, because every rank connects at the start of its worker.
+    """
     authority = Authority(WORLD, rendezvous_timeout_s=600.0)
-    late = ALL & ~(1 << 3)
+    late = _without(3)
     for second in range(0, 600, 10):
         assert authority.tick(float(second), _starting_reports(sequence=second), late) is None
-    # Connected at 590 s, the last rank starts 3000 s later: the deployment serves.
+    # The last rank connects at 590 s and starts 3000 s later, and the deployment serves.
     for second in range(590, 3600, 10):
         assert authority.tick(float(second), _starting_reports(sequence=second), ALL) is None
     record = authority.tick(3600.0, _starting_reports(started=range(WORLD), sequence=3600), ALL)
@@ -1101,9 +1130,8 @@ def test_the_startup_waits_for_the_ranks_not_connected_yet_until_the_rendezvous_
     assert never.tick(601.0, _starting_reports(sequence=3), late).state == MembershipState.ABORTED
 
 
-def test_a_rank_whose_reports_stop_during_the_startup_aborts_it_once_waited_on_for_the_rendezvous_timeout():
-    """A stopped process (SIGSTOP) keeps its connection open but its client stops reporting too: once its peers wait
-    for it in a startup collective, it is the end of their wait-for chain."""
+def test_stopped_reports_abort_the_startup():
+    """Abort when peers wait in a startup collective on a stopped rank for the rendezvous timeout."""
     authority = Authority(WORLD, rendezvous_timeout_s=60.0)
     for second in range(0, 91):
         reports = {
@@ -1118,10 +1146,11 @@ def test_a_rank_whose_reports_stop_during_the_startup_aborts_it_once_waited_on_f
 
 
 @pytest.mark.parametrize("peer", ["hangs", "progresses"])
-def test_a_rank_others_wait_for_in_a_startup_collective_is_hung_after_the_rendezvous_timeout(peer):
-    """Its main thread hangs while its client reports on: the ranks waiting for it in a startup collective name it, and
-    the startup aborts once it made no progress (startup collectives completed) for the rendezvous timeout. A rank
-    whose startup collectives go on is not hung however long the startup takes."""
+def test_startup_collective_hang_aborts(peer):
+    """Abort when a rank others wait on completes no startup collective for the rendezvous timeout.
+
+    A rank whose startup collectives go on is not hung, however long the startup takes.
+    """
     authority = Authority(WORLD, rendezvous_timeout_s=600.0)
     for second in range(0, 1300, 10):
         reports = {
@@ -1138,7 +1167,7 @@ def test_a_rank_others_wait_for_in_a_startup_collective_is_hung_after_the_rendez
         assert authority.record.reason == "ranks [2] failed during the startup"
 
 
-def test_no_replacement_joins_before_the_deployment_has_started():
+def test_no_join_before_deployment_started():
     process = AuthorityProcess(
         WORLD, RendezvousStore(DictStore(), b"shared-secret"), Authority(WORLD)
     )
@@ -1147,9 +1176,8 @@ def test_no_replacement_joins_before_the_deployment_has_started():
     assert process._refusal(2, 1) is None  # rank 2's process is not connected
 
 
-def test_the_authority_listens_at_the_port_after_the_rendezvous_port():
-    """Two ports a firewall opens: the store's, and the next one for the liveness listener, bound to the rendezvous
-    address. Fails without the change: the listener took an ephemeral port on every address."""
+def test_liveness_port_follows_rendezvous_port():
+    """Bind the liveness listener to the rendezvous address at the port after the store's."""
     assert membership.authority_ports("10.0.0.7:29600") == ("10.0.0.7", 29600, 29601)
     with socket.socket() as free:
         free.bind(("127.0.0.1", 0))
@@ -1169,10 +1197,11 @@ def test_the_authority_listens_at_the_port_after_the_rendezvous_port():
     assert not thread.is_alive()
 
 
-def test_the_authority_aborts_once_the_process_that_started_it_has_ended():
-    """Rank 0's process started it and holds the writing end of the pipe whose reading end is ``parent``: once that
-    end closes, the deployment aborts, starting or not, and the authority waits for an active rank to leave for at most
-    the hang timeout."""
+def test_authority_aborts_when_parent_ends():
+    """Abort once rank 0's end of the ``parent`` pipe closes.
+
+    The authority waits at most the hang timeout for an active rank to leave.
+    """
     store = RendezvousStore(DictStore(), b"shared-secret")
     read_fd, write_fd = os.pipe()
     process = AuthorityProcess(1, store, Authority(1, hang_timeout_s=2.0), parent=read_fd)
@@ -1199,8 +1228,8 @@ def test_the_authority_aborts_once_the_process_that_started_it_has_ended():
         os.close(read_fd)
 
 
-def test_a_client_hands_the_newest_record_to_the_callbacks_it_is_bound_to():
-    """The executor takes over the membership its process joined at the start of its worker."""
+def test_bind_hands_newest_record():
+    """Hand the executor the membership its process joined at the start of its worker."""
     client = MembershipClient(1, RendezvousStore(None, b"secret"), lambda record: None)
     client.record = MembershipRecord(generation=0, state=MembershipState.COMMITTED, active_mask=ALL)
     records = []
@@ -1216,7 +1245,7 @@ def _socket_pair():
     return client, server
 
 
-def test_lines_are_taken_whole_across_reads_and_a_line_too_long_closes_the_connection():
+def test_lines_decoded_whole_and_bounded():
     lines = membership._Lines()
     assert lines.decode(b'{"progress"') == []
     assert lines.decode(b': 1}\n{"progress": 2}\n{') == [b'{"progress": 1}', b'{"progress": 2}']
@@ -1224,8 +1253,8 @@ def test_lines_are_taken_whole_across_reads_and_a_line_too_long_closes_the_conne
         lines.decode(b"x" * (membership._MAX_LINE_BYTES + 1))
 
 
-def test_a_client_whose_connection_ends_closes_it_and_reports_the_error():
-    """The authority is gone: the rank serves unprotected, and its connection no longer counts as open."""
+def test_client_closes_ended_connection():
+    """Close the connection and report the error when the authority is gone."""
     errors = []
     client = MembershipClient(
         1, RendezvousStore(None, b"secret"), lambda record: None, on_error=errors.append
@@ -1236,12 +1265,13 @@ def test_a_client_whose_connection_ends_closes_it_and_reports_the_error():
     authority_side.close()
     client._run()
     assert client._sock.fileno() == -1
-    assert len(errors) == 1 and isinstance(errors[0], ConnectionError)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ConnectionError)
     assert not client.connected
 
 
-def test_a_client_follows_every_record_and_reports_at_once(monkeypatch):
-    """The records and reports are JSON lines over the connection its hello authenticated."""
+def test_client_follows_records_and_reports(monkeypatch):
+    """Exchange records and reports as JSON lines over the authenticated connection."""
     monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 60.0)
     records = []
     client = MembershipClient(1, RendezvousStore(None, b"secret"), records.append)
@@ -1269,7 +1299,7 @@ def test_a_client_follows_every_record_and_reports_at_once(monkeypatch):
 
 
 class DictStore:
-    """The TCPStore calls of the authority and its ranks, in memory."""
+    """In-memory store with the TCPStore calls that the authority and its ranks use."""
 
     def __init__(self):
         self.values = {}
@@ -1289,8 +1319,10 @@ class DictStore:
         return [self.values[key] for key in keys]
 
     def compare_set(self, key, expected, desired):
-        """As TCPStore's: sets ``desired`` if the value is ``expected`` (or unset and ``expected`` is empty), and
-        returns the value after."""
+        """Set ``desired`` if the value is ``expected`` and return the value after, as TCPStore does.
+
+        An unset value matches an empty ``expected``.
+        """
         with self._lock:
             current = self.values.get(key)
             if current == expected.encode() or (current is None and not expected):
@@ -1300,9 +1332,10 @@ class DictStore:
 
 @contextlib.contextmanager
 def _deployment(world, **authority_options):
-    """An authority process's loop on a thread and, per rank, a client that answers every record (``_member``);
-    yields the store and the clients. Ends as a deployment's normal exit does: rank 0 reports ``shutdown``, the clients
-    stop once the authority has published the SHUTDOWN record, and the authority then returns that record."""
+    """Run an authority process on a thread with one client per rank, and yield the store and the clients.
+
+    On exit, rank 0 reports ``shutdown`` and the authority returns the SHUTDOWN record, as in a normal exit.
+    """
     store = RendezvousStore(DictStore(), b"shared-secret")
     process = AuthorityProcess(world, store, Authority(world, **authority_options))
     returned = []
@@ -1326,8 +1359,7 @@ def _deployment(world, **authority_options):
             lambda: MembershipRecord.model_validate_json(store.get(RECORD_KEY)).state
             == MembershipState.SHUTDOWN
         )
-        # The store lives in the authority's process: it serves on until every active rank has read the record and
-        # left.
+        # The store lives in the authority's process, which serves until every active rank has read the record.
         thread.join(0.2)
         assert thread.is_alive()
     finally:
@@ -1344,8 +1376,7 @@ def _until(condition, timeout_s=10.0):
 
 
 def _member(store, rank, world, replacement=False):
-    """A rank's client that replies to every record like an executor. A replacement reports that it is ready to join
-    once it started, as its executor does."""
+    """Start a rank's client that replies to every record as an executor does."""
     client = None
 
     def on_record(record):
@@ -1366,8 +1397,7 @@ def _member(store, rank, world, replacement=False):
 
 
 def _refused(store, rank, replacement):
-    """Whether the authority closes the connection a hello for ``rank``, of a ``replacement`` or of its first process,
-    opens."""
+    """Return whether the authority closes a liveness connection for ``rank``."""
     with open_liveness_connection(store, rank, replacement) as connection:
         connection.sock.settimeout(10)
         return connection.sock.recv(1 << 16) == b""
@@ -1379,9 +1409,8 @@ def _leave(clients):
             client.stop()
 
 
-def test_a_stopped_client_releases_every_file_descriptor_it_opened():
-    """A process that starts and stops clients again and again (as replacements of one rank do) keeps its open file
-    descriptors constant."""
+def test_stopped_client_releases_file_descriptors():
+    """Keep the open file descriptors constant while clients of one rank start and stop again and again."""
     with _deployment(2) as (store, clients):
         clients[1].stop()
         open_fds = len(os.listdir("/proc/self/fd"))
@@ -1390,14 +1419,13 @@ def test_a_stopped_client_releases_every_file_descriptor_it_opened():
             assert client.incarnation == incarnation
             _until(lambda: client.record is not None and client.record.is_member(1, incarnation))
             client.stop()
-        # The authority's thread closes its end of a client's connection once it sees the connection end, and the
-        # count above may include the end of clients[1]'s that it had not closed yet.
+        # The count above may include the authority's end of clients[1]'s connection, which it closes later.
         _until(lambda: len(os.listdir("/proc/self/fd")) <= open_fds)
         clients[1] = _member(store, 1, 2, replacement=True)
         _until(lambda: clients[1].record is not None and clients[1].record.is_member(1, 21))
 
 
-def test_a_rank_whose_process_ends_is_removed_and_every_rank_hears_it_at_once():
+def test_ended_process_is_removed_at_once():
     with _deployment(3) as (_, clients):
         clients[2]._sock.shutdown(socket.SHUT_RDWR)  # as when its process ends
         ended_s = time.monotonic()
@@ -1415,10 +1443,12 @@ def _committed_without_rank_1(client):
     return client.record.state == MembershipState.COMMITTED and client.record.active_mask == 0b01
 
 
-def test_only_a_valid_hello_of_a_process_not_connected_yet_opens_a_connection(monkeypatch):
-    """Rank 1's process is gone, so a replacement's hello for it opens a connection, but only signed with the join
-    secret for this connection: an unsigned hello, one tagged for another connection (a recorded one), a second
-    connection of a connected process, or none at all are closed."""
+def test_only_valid_hello_opens_connection(monkeypatch):
+    """Accept a replacement's hello for rank 1 only when it is signed for this connection.
+
+    The authority closes an unsigned hello, a replayed one, a second connection of a connected process, and a
+    connection that sends no hello.
+    """
     monkeypatch.setattr(membership, "HELLO_TIMEOUT_S", 0.5)
     with _deployment(2) as (store, clients):
         clients[1]._sock.shutdown(socket.SHUT_RDWR)
@@ -1435,27 +1465,25 @@ def test_only_a_valid_hello_of_a_process_not_connected_yet_opens_a_connection(mo
             membership._read_line(silent)
             assert silent.recv(1) == b""  # after HELLO_TIMEOUT_S
         assert clients[0].record.active_mask == 0b01
-        clients[1] = _member(
-            store, 1, 2, replacement=True
-        )  # the same hello, signed for its connection
+        # The same hello, signed for its own connection.
+        clients[1] = _member(store, 1, 2, replacement=True)
         _until(lambda: clients[0].record.active_mask == 0b11)
 
 
-def test_a_line_that_is_not_a_report_closes_the_connection():
+def test_invalid_report_line_closes_connection():
     with _deployment(2) as (_, clients):
         clients[1]._sock.sendall(b'{"progress": "nine"}\n')
         _until(lambda: clients[0].record.active_mask == 0b01)
 
 
-def test_a_deployment_at_rest_sends_and_writes_nothing():
-    """While nothing changes, the authority sends no record and writes nothing to the store: the open connections
-    are the liveness of the ranks and of the authority alike."""
+def test_deployment_at_rest_is_quiet():
+    """Send no record and write nothing to the store while the membership does not change."""
     with _deployment(2) as (store, clients):
         clients[1].stop()
         _until(lambda: _committed_without_rank_1(clients[0]))
         writes = Mock(wraps=store.store.set)
         store.store.set = writes
-        # A replacement that has not reported that it is ready to join: no transaction starts for it.
+        # No transaction starts for a replacement that has not reported that it is ready to join.
         with open_liveness_connection(store, 1, replacement=True) as connection:
             connection.sock.settimeout(1.5)
             received = b""
@@ -1464,19 +1492,21 @@ def test_a_deployment_at_rest_sends_and_writes_nothing():
                     data = connection.sock.recv(1 << 16)
                     assert data, "the authority closed the connection"
                     received += data
-            assert (
-                len(connection.lines.decode(received)) == 1
-            )  # the record that gives it its incarnation
+            # Only the record that gives it its incarnation arrives.
+            assert len(connection.lines.decode(received)) == 1
             writes.assert_not_called()  # until the connection closes
 
 
-def test_a_replacement_joins_only_once_the_process_it_replaces_is_gone():
-    """Never for rank 0; a join for a rank whose process still serves would evict it. The authority assigns the
-    replacement the rank's next incarnation at its hello, and no longer admits the process it replaced."""
+def test_replacement_joins_after_process_gone():
+    """Refuse a replacement for rank 0 or for a rank whose process still serves.
+
+    The replacement gets the rank's next incarnation, and the process it replaced is no longer admitted.
+    """
     with _deployment(3) as (store, clients):
         assert _refused(store, 2, True)
         assert _refused(store, 0, True)
-        assert clients[0].record.active_mask == 0b111 and clients[2]._thread.is_alive()
+        assert clients[0].record.active_mask == 0b111
+        assert clients[2]._thread.is_alive()
         clients[2]._sock.shutdown(socket.SHUT_RDWR)
         _until(lambda: clients[0].record.active_mask == 0b011)
         clients.append(_member(store, 2, 3, replacement=True))
@@ -1489,9 +1519,8 @@ def test_a_replacement_joins_only_once_the_process_it_replaces_is_gone():
         assert _refused(store, 2, False)
 
 
-def test_the_authority_publishes_the_incarnations_whose_connections_closed():
-    """Per rank, the newest incarnation that ended with every older one: a replacement that ends while the process
-    it replaces is still connected does not advance it."""
+def test_authority_publishes_closed_incarnations():
+    """Publish per rank the newest incarnation whose connection closed after every older one."""
     with _deployment(2) as (store, clients):
         assert store.get_if_set(membership.DISCONNECTED_KEY) is None
         clients[1].stop()
@@ -1521,8 +1550,8 @@ class FailingAuthority(Authority):
         return super().tick(now_s, reports, connected)
 
 
-def test_an_authority_that_fails_ends_without_a_verdict():
-    """No lease: its connections close and the ranks serve on unprotected; nothing tells them to abort."""
+def test_failed_authority_ends_without_verdict():
+    """Close the connections of a failed authority and let the ranks serve on unprotected."""
     store = RendezvousStore(DictStore(), b"shared-secret")
     authority = FailingAuthority(2)
     raised = []
@@ -1563,7 +1592,7 @@ def test_an_authority_that_fails_ends_without_a_verdict():
         _leave(clients)
 
 
-def test_a_transaction_is_summarized_from_its_first_propose_to_its_commit():
+def test_transaction_summary_spans_propose_to_commit():
     cluster = Cluster()
     cluster.run(1.0)
     assert cluster.authority.last_transaction is None
@@ -1582,12 +1611,12 @@ def test_a_transaction_is_summarized_from_its_first_propose_to_its_commit():
     assert (summary.removed_ranks, summary.added_ranks) == ((2, 3), ())
     assert summary.ended_unix_ms - summary.began_unix_ms == pytest.approx((ended - began) * 1e3)
     assert ended - began > 0
-    # A closed connection is proposed in the tick that sees it; the simulated ranks install in one step.
+    # A closed connection is proposed in the tick that sees it, and the simulated ranks install in one step.
     assert summary.detected_unix_ms == summary.began_unix_ms
     assert summary.ended_unix_ms - summary.ready_unix_ms == pytest.approx(50.0)
 
 
-def test_an_abort_and_a_rejoin_are_summarized():
+def test_abort_and_rejoin_are_summarized():
     cluster = Cluster()
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -1602,7 +1631,7 @@ def test_an_abort_and_a_rejoin_are_summarized():
     cluster.alive.discard(0)
     assert cluster.run(1.0).state == MembershipState.ABORTED
     summary = cluster.authority.last_transaction
-    assert (summary.generation, summary.outcome) == (record.generation, "ABORT")
+    assert (summary.generation, summary.outcome) == (record.generation, "ABORTED")
     assert (summary.removed_ranks, summary.added_ranks) == ((0,), ())
     # An ABORT ends the transaction before any READY, in the tick that detected it.
     assert summary.ready_unix_ms is None
@@ -1623,9 +1652,8 @@ def test_transaction_summary_round_trip():
     assert TransactionSummary.model_validate_json(summary.model_dump_json()) == summary
 
 
-def test_a_client_stops_once_a_record_no_longer_lists_its_process_after_one_did(monkeypatch):
-    """A replacement is listed by the PROPOSE that adds it; the change that restarts without it ends its membership,
-    before any COMMITTED record admitted it."""
+def test_client_stops_once_no_longer_listed(monkeypatch):
+    """Stop a replacement's client when the restarted change leaves it out, even before any commit."""
     monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 60.0)
     records = []
     client = MembershipClient(1, RendezvousStore(None, b"secret"), records.append, replacement=True)
@@ -1670,9 +1698,8 @@ class CountingAuthority(Authority):
         return super().tick(now_s, reports, connected)
 
 
-def test_the_authority_decides_once_per_interval_and_at_once_on_a_reply(monkeypatch):
-    """A report that only advances progress waits for the next decision; the start of the deployment and its shutdown
-    are decided at once."""
+def test_authority_decides_per_interval_or_reply(monkeypatch):
+    """Decide on a progress-only report at the next interval, and on the startup and shutdown at once."""
     monkeypatch.setattr(membership, "REPORT_INTERVAL_S", 1.0)
     store = RendezvousStore(DictStore(), b"shared-secret")
     authority = CountingAuthority(1)
@@ -1703,9 +1730,8 @@ def test_the_authority_decides_once_per_interval_and_at_once_on_a_reply(monkeypa
         thread.join(10)
 
 
-def test_connections_that_send_no_hello_are_capped(monkeypatch):
-    """The oldest of the connections that wait for their hello is closed for a new one, so that connections that
-    never send one cannot take every descriptor of the authority."""
+def test_connections_without_hello_are_capped(monkeypatch):
+    """Close the oldest connection that waits for its hello when a new one arrives over the cap."""
     store = RendezvousStore(DictStore(), b"shared-secret")
     process = AuthorityProcess(1, store, Authority(1))
     monkeypatch.setattr(membership, "MAX_RANKS", 2)

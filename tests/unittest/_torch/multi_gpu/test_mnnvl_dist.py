@@ -12,9 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MnnvlDist's host collectives (over TPHostExchange) against MPIDist's on the same inputs, including payloads
-that take several exchange rounds and absent ranks, and a stress loop of random payload sizes checked by content."""
+"""Tests that compare MnnvlDist's host collectives over TPHostExchange with MPIDist's on the same inputs.
 
+The cases cover payloads that take several exchange rounds, absent ranks, and a stress loop of random payload sizes.
+"""
+
+import math
 import pickle
 import sys
 import threading
@@ -45,6 +48,11 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+def _in_mask(mask, rank):
+    """Return whether the bit of ``rank`` is set in ``mask``."""
+    return bool(mask & (1 << rank))
+
+
 def _dists(tp):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -60,7 +68,7 @@ def _collectives(tp):
     assert MnnvlDist.supports(mnnvl.mapping)
     assert mnnvl.supports_single_round_broadcast
     small = {"rank": rank, "load": [rank, 2 * rank]}
-    # Larger than one exchange slot, so it takes several rounds; ranks differ in length.
+    # Larger than one exchange slot, so it takes several rounds. Its length differs across ranks.
     large = bytes(range(256)) * (3000 + 500 * rank)
     for obj in (small, large, None, b""):
         assert mnnvl.allgather(obj) == mpi.allgather(obj)
@@ -84,7 +92,7 @@ def _collectives(tp):
         mnnvl.broadcast_int64(values, root=1), mpi.broadcast_int64(values, root=1)
     )
     gathered = mnnvl.tp_allgather_int64(values)
-    # With every rank active, the gather itself (no copy).
+    # With every rank active, the gather itself is returned without a copy.
     assert mnnvl.tp_active_rows(gathered) is gathered
     mnnvl.barrier()
 
@@ -101,7 +109,7 @@ def _collectives(tp):
         del exchange._wait
     assert len(waits) == 3, len(waits)
 
-    # The rounds reuse their copy descriptors: none is built once both slot sets have been used.
+    # The rounds reuse their copy descriptors, so none is built once both slot sets have been used.
     cuda = exchange._cuda
     built = []
     exchange._cuda = SimpleNamespace(
@@ -119,8 +127,11 @@ def _collectives(tp):
 
 
 def _absent(tp):
-    """Every collective with the last rank absent: object gathers return None in its place, reductions skip it,
-    int64 gathers give it a zero row that ``tp_active_rows`` drops. MPI stands in for the membership transaction."""
+    """Run every collective with the last rank absent.
+
+    Object gathers return None in its place, and reductions skip it. Int64 gathers give it a zero row that
+    ``tp_active_rows`` drops. MPI stands in for the membership transaction.
+    """
     mnnvl, mpi, rank = _dists(tp)
     leaver = tp - 1
     exchange = mnnvl.host_exchange
@@ -138,7 +149,7 @@ def _absent(tp):
         _rebuild(exchange, gather_handles, survivors, epoch)
     mpi.barrier()
     if rank != leaver:
-        # Fresh pages at the same addresses: the copies built for them are kept.
+        # The fresh pages are mapped at the same addresses, so the copies built for them are kept.
         assert exchange.rows.ptr == ptr
         assert all(exchange._copies[key] is copy for key, copy in copies.items())
         slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
@@ -180,12 +191,13 @@ def _stress(tp):
     rng = np.random.default_rng(1234)
     slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
     for step in range(2000):
-        sizes = rng.integers(0, 3 * slot, size=tp)  # the same draw on every rank
+        # Every rank draws the same sizes.
+        sizes = rng.integers(0, 3 * slot, size=tp)
         mine = np.random.default_rng(step * tp + rank).bytes(int(sizes[rank]))
         gathered = mnnvl.allgather(mine)
         for r, payload in enumerate(gathered):
             assert payload == np.random.default_rng(step * tp + r).bytes(int(sizes[r])), (step, r)
-        # int64 rows of one size per step, up to three rounds.
+        # The int64 rows have one size per step and take up to three rounds.
         n = int(sizes[0]) // 8
         rows = mnnvl.tp_allgather_int64(
             np.random.default_rng(step * tp + rank).integers(-(2**62), 2**62, n)
@@ -199,38 +211,46 @@ def _stress(tp):
 def _epoch_wrap(tp):
     mnnvl, _, rank = _dists(tp)
     exchange = mnnvl.host_exchange
-    exchange._epoch = 0xFFFFFFFE - 4  # a few exchanges before the epoch wraps to 1
+    # Start a few exchanges before the epoch wraps to 1.
+    exchange._epoch = 0xFFFFFFFE - 4
     epochs = []
-    for _ in range(8):  # single-round exchanges: consecutive rounds use alternate slot sets
+    # Consecutive single-round exchanges use alternate slot sets.
+    for _ in range(8):
         mnnvl.allgather(rank)
         epochs.append(exchange._epoch)
-    assert 1 in epochs and all((a ^ b) & 1 for a, b in zip(epochs, epochs[1:])), epochs
+    assert 1 in epochs, epochs
+    assert all((a ^ b) & 1 for a, b in zip(epochs, epochs[1:])), epochs
     exchange._epoch = 0xFFFFFFFE - 4
     half_slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 2
     for step in range(16):
-        large = bytes([step, rank]) * (half_slot + 100 * rank)  # two rounds each
+        # Each payload takes two rounds.
+        large = bytes([step, rank]) * (half_slot + 100 * rank)
         assert mnnvl.allgather(large) == [
             bytes([step, r]) * (half_slot + 100 * r) for r in range(tp)
         ]
 
 
 def _membership(tp):
-    """The last rank leaves: the others' wait is interrupted, they finish the exchange on fresh rows without it, then
-    it is admitted again. MPI stands in for the membership transaction that tells every rank the new mask and epoch."""
+    """Let the last rank leave and then admit it again.
+
+    The others' wait is interrupted, and they finish the exchange on fresh rows without it. MPI stands in for the
+    membership transaction that tells every rank the new mask and epoch.
+    """
     mnnvl, mpi, rank = _dists(tp)
     leaver = tp - 1
     survivors = ((1 << tp) - 1) & ~(1 << leaver)
     exchange = mnnvl.host_exchange
     mnnvl.barrier()
 
-    # Every process takes part once per rebuild; the leaver contributes None.
+    # Every process takes part once per rebuild, and the leaver contributes None.
     def gather_handles(handle):
         return mpi.allgather(handle)
 
     if rank == leaver:
-        mpi.allgather(None)  # the epochs the survivors stopped at
+        # Match the gather of the epochs the survivors stopped at, the rebuild, and the commit.
+        mpi.allgather(None)
         _skip_rebuild(gather_handles)
-        mpi.barrier()  # the commit
+        mpi.barrier()
     else:
         stop_at = time.monotonic() + 0.5
         exchange.interrupted = lambda: time.monotonic() > stop_at
@@ -244,46 +264,53 @@ def _membership(tp):
                 exchange.rows.stale_rows(gather_handles),
             )
             exchange.interrupted = lambda: False
-            mpi.barrier()  # the commit
+            # Commit the change.
+            mpi.barrier()
 
         exchange.on_interrupt = change
-        # The leaver never sends: the round runs again without it.
-        assert mnnvl.allgather(rank) == [r if survivors >> r & 1 else None for r in range(tp)]
+        # The leaver never sends, so the round runs again without it.
+        assert mnnvl.allgather(rank) == [r if _in_mask(survivors, r) else None for r in range(tp)]
         assert mnnvl.allreduce(rank + 1, ReduceOp.SUM) == sum(
             r + 1 for r in range(tp) if r != leaver
         )
 
-    # The admission: every active rank maps fresh rows at INSTALL (the rank that left still maps the rows it mapped
-    # before), the joining rank's included, which the others keep writing into until it enters the exchange where
-    # they resume.
+    # At the admission every active rank maps fresh rows at INSTALL, including the joining rank's row. The rank that
+    # left still maps its old rows. The others keep writing into the joining rank's row until it enters the
+    # exchange where they resume.
     all_ranks = (1 << tp) - 1
     epoch = next_epoch(max(mpi.allgather(exchange.epoch)))
     _rebuild(exchange, gather_handles, survivors, epoch)
     if rank != leaver:
-        assert mnnvl.allgather(rank) == [r if survivors >> r & 1 else None for r in range(tp)]
+        assert mnnvl.allgather(rank) == [r if _in_mask(survivors, r) else None for r in range(tp)]
     exchange.admit(all_ranks, next_epoch(mpi.broadcast(exchange.epoch, root=0)))
     assert mnnvl.allgather(rank) == list(range(tp))
 
 
 def _rebuild(exchange, gather, active_mask, epoch):
-    """Map the host exchange's rows among the ranks ``gather`` reaches, as an INSTALL does, then continue with the
-    ranks in ``active_mask`` from ``epoch``, outside any round."""
+    """Map the host exchange's rows among the ranks that ``gather`` reaches, as an INSTALL does.
+
+    The exchange then continues outside any round with the ranks in ``active_mask`` from ``epoch``.
+    """
     exchange.rows.remap(gather, exchange.rows.stale_rows(gather))
     exchange.admit(active_mask, epoch)
 
 
 def _skip_rebuild(gather_handles):
-    """Take part, as a rank that left, in the survivors' rebuild of the host exchange: their choice of fresh rows,
-    their new rows' handles, and their mapping outcomes."""
+    """Take part in the survivors' rebuild of the host exchange as a rank that left.
+
+    The rebuild gathers the choice of fresh rows, the new rows' handles, and the mapping outcomes.
+    """
     for _ in range(3):
         gather_handles(None)
 
 
 def _admission(tp):
-    """The last rank leaves, then its replacement joins: a new exchange of that rank whose rows map only its own, as at
-    an isolated startup. No process that maps the survivors' rows is gone, so every rank keeps the pages it maps and
-    imports only the rows it does not map yet; then every rank exchanges with every other. MPI stands in for the
-    membership transaction."""
+    """Let the last rank leave and its replacement join with a new exchange that maps only its own row.
+
+    The replacement starts as at an isolated startup. No process that maps the survivors' rows is gone, so every rank
+    keeps the pages it maps and imports only the rows it does not map yet. Afterwards every rank exchanges with every
+    other. MPI stands in for the membership transaction.
+    """
     from tensorrt_llm._torch.distributed.membership import StoreGroup
 
     mnnvl, mpi, rank = _dists(tp)
@@ -303,7 +330,7 @@ def _admission(tp):
         exchange = mnnvl._host_exchange = TPHostExchange(rank, tp, rows, slot)
     else:
         _rebuild(exchange, mpi.allgather, survivors, epoch)
-        assert mnnvl.allgather(rank) == [r if survivors >> r & 1 else None for r in range(tp)]
+        assert mnnvl.allgather(rank) == [r if _in_mask(survivors, r) else None for r in range(tp)]
     mpi.barrier()
 
     own = np.zeros((2 * tp, 1 + exchange._words), dtype=np.uint64)
@@ -312,17 +339,22 @@ def _admission(tp):
     _rebuild(exchange, mpi.allgather, (1 << tp) - 1, epoch)
     kept = np.zeros_like(own)
     exchange._copy_to_host(exchange.rows.row(rank), kept)
-    mpi.barrier()  # no rank writes into a row before its owner has read it
-    # The admission kept every row's pages: the packets of the survivors' last exchanges are still there.
-    assert np.array_equal(kept, own) and (rank == leaver or own.any())
+    # No rank writes into a row before its owner has read it.
+    mpi.barrier()
+    # The admission kept every row's pages, so the packets of the survivors' last exchanges are still there.
+    assert np.array_equal(kept, own)
+    assert rank == leaver or own.any()
     assert exchange.rows.stale_rows(mpi.allgather) == frozenset()
     assert mnnvl.allgather(rank) == list(range(tp))
     assert mnnvl.allreduce(rank + 1, ReduceOp.SUM) == sum(r + 1 for r in range(tp))
 
 
 def _arrived(tp):
-    """A collective whose payloads no rank reads (the barrier before warmup) on a rank that every peer has already
-    sent into: its first poll finds every header, and it returns without waiting for any payload."""
+    """Run a barrier on a rank that every peer has already sent into.
+
+    No rank reads the barrier's payloads, as in the barrier before warmup. Its first poll finds every header, and it
+    returns without waiting for any payload.
+    """
     mnnvl, mpi, rank = _dists(tp)
     exchange = mnnvl.host_exchange
     mnnvl.barrier()
@@ -331,7 +363,8 @@ def _arrived(tp):
     exchange._wait = lambda *args: waits.append(args) or wait(*args)
     try:
         if rank == 0:
-            time.sleep(0.2)  # the others' headers arrive meanwhile
+            # Let the other ranks' headers arrive first.
+            time.sleep(0.2)
         mnnvl.barrier()
     finally:
         del exchange._wait
@@ -340,8 +373,7 @@ def _arrived(tp):
 
 
 def _send_round_to(exchange, payload, dest):
-    """Send this rank's packets of the next exchange round into rank ``dest``'s row only, as a rank that fails while
-    it sends would."""
+    """Send this rank's packets of the next round into rank ``dest``'s row only, as a rank failing mid-send would."""
     from tensorrt_llm._torch.distributed.mnnvl_memory import _check_cu_result, cuda
 
     epoch = next_epoch(exchange.epoch)
@@ -358,10 +390,13 @@ def _send_round_to(exchange, payload, dest):
 
 
 def _membership_change(tp):
-    """The last rank fails after sending its packets of a round to rank 0 only. Rank 0 finishes that round and stops
-    in the next; the others stop in that round. The change finishes the round for them with the packets rank 0
-    received and runs the next round again without the failed rank, so every survivor gets the same results. The
-    failed round is the last before the epoch wraps. MPI stands in for the membership transaction."""
+    """Fail the last rank after it sent its packets of a round to rank 0 only.
+
+    Rank 0 finishes that round and stops in the next. The others stop in that round. The change finishes the round
+    for them with the packets rank 0 received, and the next round runs again without the failed rank. Every survivor
+    gets the same results. The failed round is the last before the epoch wraps. MPI stands in for the membership
+    transaction.
+    """
     mnnvl, mpi, rank = _dists(tp)
     failed = tp - 1
     survivors = ((1 << tp) - 1) & ~(1 << failed)
@@ -374,9 +409,10 @@ def _membership_change(tp):
 
     if rank == failed:
         _send_round_to(exchange, pickle.dumps(rank), dest=0)
-        mpi.allgather(None)  # the epochs the survivors stopped at
+        # Match the gather of the epochs the survivors stopped at, the rebuild, and the commit.
+        mpi.allgather(None)
         _skip_rebuild(gather_handles)
-        mpi.barrier()  # the commit
+        mpi.barrier()
         return
 
     stop_at = time.monotonic() + 1.0
@@ -385,15 +421,19 @@ def _membership_change(tp):
 
     def change():
         stopped = [epoch for epoch in mpi.allgather(exchange.stopped_epoch) if epoch is not None]
-        epoch = next_epoch(latest_epoch(stopped))  # the INSTALL record's epoch
+        # This is the epoch of the INSTALL record.
+        epoch = next_epoch(latest_epoch(stopped))
         exchange.install(gather_handles, survivors, epoch, exchange.rows.stale_rows(gather_handles))
         exchange.interrupted = lambda: False
         changes.append((exchange.stopped_epoch, epoch))
         mpi.barrier()
 
     exchange.on_interrupt = change
-    assert mnnvl.allgather(rank) == list(range(tp))  # rank 0 received the failed rank's packets
-    assert mnnvl.allgather(10 + rank) == [10 + r if survivors >> r & 1 else None for r in range(tp)]
+    # Rank 0 received the failed rank's packets, so the first round has every payload.
+    assert mnnvl.allgather(rank) == list(range(tp))
+    assert mnnvl.allgather(10 + rank) == [
+        10 + r if _in_mask(survivors, r) else None for r in range(tp)
+    ]
     assert mnnvl.allreduce(1, ReduceOp.SUM) == tp - 1
     ((stopped, epoch),) = changes
     # Rank 0 stopped after the wrap, in the round that runs again.
@@ -401,16 +441,18 @@ def _membership_change(tp):
 
 
 def _change_without_loss(tp):
-    """A change that loses no process (it only adds a replacement) reaches the other ranks while they wait for rank 0
-    in a round, and rank 0 only once it finished that round and waits in the next. Each stops where the change
-    reaches it, as for a failure: the others in the round rank 0 finished, which the change finishes for them with
-    the packets rank 0 sent, rank 0 in the next round, which runs again. Every rank gets the same results. MPI stands
-    in for the membership transaction."""
+    """Run a change that only adds a replacement and check that every rank gets the same results.
+
+    The change reaches the other ranks while they wait for rank 0, and reaches rank 0 only in the next round. The
+    others stop in the round that rank 0 finished, and the change finishes it with the packets rank 0 sent. Rank 0
+    stops in the next round, which runs again. MPI stands in for the membership transaction.
+    """
     mnnvl, mpi, rank = _dists(tp)
     every = (1 << tp) - 1
     exchange = mnnvl.host_exchange
     mnnvl.barrier()
-    seen = [False]  # whether this rank has the change
+    # Whether this rank has seen the change.
+    seen = [False]
     exchange.interrupted = lambda: seen[0]
     stops = []
 
@@ -424,25 +466,31 @@ def _change_without_loss(tp):
             exchange.rows.stale_rows(mpi.allgather),
         )
         exchange.interrupted = lambda: False
-        mpi.barrier()  # the commit
+        # Commit the change.
+        mpi.barrier()
 
     exchange.on_interrupt = change
     if rank == 0:
-        # Rank 0 has the change only once it waits in the round after the one it is late to.
+        # Rank 0 sees the change only once it waits in the round after the one it is late to.
         threading.Timer(0.4, seen.__setitem__, (0, True)).start()
-        time.sleep(0.3)  # the others wait for rank 0, and have the change meanwhile
+        # The other ranks wait for rank 0 and see the change meanwhile.
+        time.sleep(0.3)
     else:
         threading.Timer(0.1, seen.__setitem__, (0, True)).start()
     assert mnnvl.allgather(rank) == list(range(tp))
     assert mnnvl.allgather(10 + rank) == [10 + r for r in range(tp)]
     (stopped,) = stops
     # Rank 0 stopped one round after the others, in the round that runs again.
-    assert stopped[1:] == [stopped[1]] * (tp - 1) and stopped[0] == next_epoch(stopped[1]), stopped
+    assert stopped[1:] == [stopped[1]] * (tp - 1), stopped
+    assert stopped[0] == next_epoch(stopped[1]), stopped
 
 
 def _backoff(tp):
-    """A wait never sleeps while the executor has work, however late the peer; on the idle path (the request probe
-    with prefer_cpu) it sleeps between polls."""
+    """Check that only a wait on the idle path sleeps between polls.
+
+    A wait never sleeps while the executor has work, however late the peer. The idle path is the request probe with
+    ``prefer_cpu``.
+    """
     mnnvl, _, rank = _dists(tp)
     real_time = host_exchange.time
     sleeps = []
@@ -468,11 +516,13 @@ def _backoff(tp):
 
 
 def _payload_rows(tp):
-    """A payload longer than a header poll copies goes only into the rows of the ranks that read it, which poll only
-    the slots holding payloads for them; every row gets every header."""
+    """Check that a payload longer than a header poll goes only into the rows of the ranks that read it.
+
+    Every row gets every header. The readers poll only the slots that hold payloads for them.
+    """
     mnnvl, mpi, rank = _dists(tp)
     payload = bytes([1 + rank]) * (3000 + rank)
-    # The first exchange: the rows hold nothing else.
+    # This is the first exchange, so the rows hold nothing else.
     assert mnnvl.tp_gather(payload, root=0) == mpi.tp_gather(payload, root=0)
     exchange = mnnvl.host_exchange
     row = np.zeros((tp, 1 + exchange._words), dtype=np.uint64)
@@ -504,7 +554,7 @@ def _payload_rows(tp):
         exchange._cuda = cuda
     if rank != 0:
         own_slots = exchange.rows.row(rank) + (exchange.epoch & 1) * exchange._parity_bytes
-        packets = 1 + -(-len(pickle.dumps(large)) // 4)
+        packets = 1 + math.ceil(len(pickle.dumps(large)) / 4)
         head = 8 * (1 + TPHostExchange._POLL_PACKETS)
         assert {poll for poll in polls if poll[1] > head} == {(own_slots, 8 * packets, 1)}
 

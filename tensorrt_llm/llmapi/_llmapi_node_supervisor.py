@@ -81,7 +81,7 @@ class _Backoff:
         self._delay_s.pop(key, None)
 
 
-# Selector data of the descriptors other than a rank's process, whose data is its rank.
+# Selector data of the descriptors other than the rank processes. A rank process has its rank as its data.
 _WAKE = "wake"
 _PARENT = "parent"
 _AUTHORITY = "authority"
@@ -92,9 +92,11 @@ class NodeSupervisor:
     """Start, supervise and replace the ranks of one node.
 
     Args:
-        command: Starts each rank's process, every rank but 0 with ``rank_0_in_session``.
-        relaunch_command: On node 0 under ``mpirun``, starts a process on the host appended to it.
-        end_job: On node 0 under ``mpirun``, ends the whole job as failed.
+        command: The command that starts the process of each rank. With ``rank_0_in_session``, it starts every
+            rank but 0.
+        relaunch_command: The command that starts a process on the host appended to it. Set on node 0 under
+            ``mpirun``.
+        end_job: The function that ends the whole job as failed. Set on node 0 under ``mpirun``.
     """
 
     def __init__(
@@ -133,8 +135,8 @@ class NodeSupervisor:
             for name, value in environ.items()
             if name in _RUN_AS_ROOT_VARS or not name.startswith(membership.LAUNCHER_ENV_PREFIXES)
         }
-        # Each rank started here is a one-process MPI world, which has no shared-memory peer: without the sm transport
-        # it creates no /dev/shm segment that its exit (os._exit, or a kill) would leave behind.
+        # Each rank started here is a one-process MPI world with no shared-memory peer. Without the sm transport, it
+        # creates no /dev/shm segment that an os._exit or a kill would leave behind.
         self._environ["OMPI_MCA_btl"] = environ.get("OMPI_MCA_btl", "^sm")
         self._relaunch_command = relaunch_command
         self._end_job_through_launcher = end_job
@@ -531,7 +533,10 @@ class NodeSupervisor:
             self._selector.register(os.pidfd_open(process.pid), selectors.EVENT_READ, _RELAUNCHED)
 
     def _stop(self, status: int, terminate: bool = True, forward: Optional[int] = None) -> int:
-        """Stop the node's ranks and return ``status``; processes left die with the supervisor."""
+        """Stop the node's ranks and return ``status``.
+
+        Processes that are still running die with the supervisor.
+        """
         self._unlink_host_weights()
         rank_0 = self._processes.get(0)
         if forward is not None and rank_0 is not None and rank_0.status is None:
@@ -637,7 +642,7 @@ def _prrte_job_control(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="_llmapi_node_supervisor.py",
-        description="Wide-EP fault tolerance: supervise the ranks of one node",
+        description="Supervise the ranks of one node under Wide-EP fault tolerance",
     )
     parser.add_argument("--node-rank", type=int, required=True)
     parser.add_argument("--nodes", type=int, required=True)

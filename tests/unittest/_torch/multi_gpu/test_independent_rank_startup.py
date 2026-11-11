@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""With Wide-EP fault tolerance every rank is its own process (a one-process MPI world). Four such processes, started
-independently on four GPUs, meet in the rendezvous store: they build MnnvlDist's host collectives and an
-NVLinkOneSided workspace and round-trip a dispatch and combine. A replacement rank alone builds both with only its
-own rank active. Run directly, this file is one such rank."""
+"""Tests for ranks that start as independent processes under Wide-EP fault tolerance.
+
+Each rank is a one-process MPI world. Four ranks started on four GPUs meet in the rendezvous store, build
+MnnvlDist's host collectives and an NVLinkOneSided workspace, and round-trip a dispatch and combine. A replacement
+rank builds both alone with only its own rank active. Run directly, this file runs one rank.
+"""
 
 import json
 import os
@@ -51,10 +53,10 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     check(MPI.COMM_WORLD.Get_size() == 1, "the rank is not its own MPI world")
     set_wide_ep_fault_tolerance_enabled(True)
     torch.cuda.set_device(rank)
-    # Stands for the membership client the worker's entry starts, which takes the startup collectives' reports.
+    # Stand in for the membership client that takes the startup collectives' reports.
     recovery._client = Mock()
     if incarnation:
-        # The startup record rank 0 published: its ranks agreed on nothing before this point.
+        # Replay an empty startup record, since the original ranks agreed on nothing before this point.
         startup_record.replay({"values": {}, "exchanges": []})
     mapping = Mapping(
         world_size=world_size,
@@ -65,7 +67,7 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
         gpus_per_node=WORLD,
     )
     recovery.join_startup_group(mapping)
-    # Past the startup record (a replacement's host collectives reach only itself).
+    # After the startup record closes, a replacement's host collectives reach only itself.
     startup_record.close()
     active = [rank] if incarnation else list(range(world_size))
     dist = MnnvlDist(mapping)
@@ -128,7 +130,7 @@ def _results(processes, timeout_s=900):
 
 @pytest.fixture
 def rendezvous():
-    """The rendezvous store, as the authority hosts it: its port and the shared secret."""
+    """Host the rendezvous store as the authority does and return its port and the shared secret."""
     from torch.distributed import TCPStore
 
     store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
@@ -142,7 +144,7 @@ def _require_mnnvl(gpus: int) -> None:
         pytest.skip(f"needs {gpus} GPUs with MNNVL")
 
 
-def test_independent_ranks_build_host_collectives_and_the_all_to_all(rendezvous):
+def test_independent_ranks_build_collectives(rendezvous):
     _require_mnnvl(WORLD)
     port, secret = rendezvous
     processes = [_spawn(rank, f"{rank},{WORLD},{WORLD},0", port, secret) for rank in range(WORLD)]
@@ -150,7 +152,7 @@ def test_independent_ranks_build_host_collectives_and_the_all_to_all(rendezvous)
         assert result["errors"] == []
 
 
-def test_a_replacement_builds_its_groups_alone(rendezvous):
+def test_replacement_builds_groups_alone(rendezvous):
     _require_mnnvl(WORLD)
     port, secret = rendezvous
     (result,) = _results([_spawn(2, f"2,{WORLD},{WORLD},1", port, secret)])
@@ -160,4 +162,5 @@ def test_a_replacement_builds_its_groups_alone(rendezvous):
 if __name__ == "__main__":
     rank, world_size, _, incarnation = (int(field) for field in sys.argv[1].split(","))
     print(json.dumps(_rank_main(rank, world_size, incarnation)), flush=True)
-    os._exit(0)  # no MPI_Finalize: nothing ran over MPI
+    # Skip MPI_Finalize because nothing ran over MPI.
+    os._exit(0)

@@ -17,10 +17,11 @@ from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeE
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm.bindings import internal
+from tensorrt_llm.mapping import Mapping
 
 
 def _frontend(health: EPGroupHealth | None, *, cft: bool = False) -> NVLinkOneSided:
-    """Build only the state that execution binding reads; no workspace is mapped."""
+    """Build an NVLinkOneSided with only the state that execution binding reads."""
     comm = NVLinkOneSided.__new__(NVLinkOneSided)
     comm.can_use_cft_counted_writes = cft
     comm.ep_group_health = health
@@ -41,7 +42,7 @@ _EVIDENCE = int(internal.thop.MOE_A2A_ABORT_WAIT_EVIDENCE_INDEX)
 
 
 def _collective_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Both logical peers live in one allocation; logical rank 1 never issues an op."""
+    """Return one workspace allocation for both logical peers. Logical rank 1 never issues an op."""
     meta = NVLinkOneSided._make_workspace_layout(
         _EP_SIZE, 1, _TOKENS, _HIDDEN, torch.bfloat16, None, 32, False, False, rank_mask=True
     )
@@ -60,8 +61,11 @@ def _collective_round(
     experts: torch.Tensor,
     payload: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run dispatch and combine as rank 0 under ``state``; return the received hidden states, [ep_size, tokens,
-    hidden] (source s's rows at [s]), and the output."""
+    """Run dispatch and combine as rank 0 under ``state``.
+
+    Returns:
+        The received hidden states of shape [ep_size, tokens, hidden] and the combined output.
+    """
     controls = {
         "enable_rank_mask": True,
         "active_rank_mask": state.active_rank_mask,
@@ -98,15 +102,13 @@ def _collective_round(
 def _workspace_word(
     workspace: torch.Tensor, meta: torch.Tensor, row: int, region: str, word: int
 ) -> int:
-    """The ``word``-th int32 of a workspace region of ``row``."""
+    """Return the ``word``-th int32 of a workspace region of ``row``."""
     offset = int(meta[int(getattr(internal.thop, f"MOE_A2A_{region}_OFFSET_INDEX"))]) + 4 * word
     return int(workspace[row, offset : offset + 4].view(torch.int32).item())
 
 
-def test_abort_rearm_and_exclusion_resume_after_rank_failure_mid_collective() -> None:
-    """Can a dispatch stuck on a failed peer be aborted from another thread, and the next round
-    run on the same workspace after rearming and excluding that peer?"""
-    # The dispatch waits for logical rank 1's completion flag until the abort arrives.
+def test_abort_and_rearm_after_peer_failure() -> None:
+    """A dispatch stuck on a failed peer aborts from another thread, and the next round runs after rearming."""
     workspace, meta, experts, payload = _collective_inputs()
     health = EPGroupHealth(_EP_SIZE)
     state = MoeExecutionState(health, workspace.device)
@@ -130,8 +132,7 @@ def test_abort_rearm_and_exclusion_resume_after_rank_failure_mid_collective() ->
     done.record()
     time.sleep(0.2)
     assert not done.query(), "collective completed without its peer"
-    # The dispatch of round 0 has been waiting on rank 1 for far longer than a healthy wait: the record
-    # names the flag value it expects from rank 1, and nothing from rank 0. Wait evidence alone is no abort.
+    # The wait evidence names the flag value expected from rank 1 and nothing from rank 0. It is not an abort.
     waiting_evidence = state.abort[_EVIDENCE : _EVIDENCE + _EP_SIZE].tolist()
     aborted_while_waiting = state.aborted()
 
@@ -148,14 +149,12 @@ def test_abort_rearm_and_exclusion_resume_after_rank_failure_mid_collective() ->
     assert state.abort[:2].tolist() == [1, 1]
     assert state.aborted()
     assert torch.count_nonzero(state.abort[_EVIDENCE:]) == 0
-    # This rank's own rows arrived before it waited for the failed peer: every token goes to expert 0 on
-    # rank 0, so they are the payload's rows in an order the dispatch assigns.
+    # Every token goes to expert 0 on rank 0, so this rank's own rows hold the payload in dispatch order.
     own_rows = received[0].float()
     torch.testing.assert_close(own_rows[own_rows[:, 0].argsort()], payload.float(), rtol=0, atol=0)
-    # The combine of the cancelled round takes this rank's own rows only, never a peer's.
+    # The combine of the aborted round takes only this rank's own rows.
     torch.testing.assert_close(output, payload, rtol=0, atol=0)
-    # The aborted dispatch marks the round incomplete, so the combine published no readiness: a peer that
-    # did not abort cannot combine outputs computed without the failed peer's rows.
+    # The aborted dispatch marks the round incomplete, so the combine publishes no readiness to peers.
     assert _workspace_word(workspace, meta, 0, "FLAG_VAL", 1) == 1
     assert _workspace_word(workspace, meta, 1, "COMBINE_COMPLETION_FLAGS", 0) == 0
 
@@ -164,7 +163,8 @@ def test_abort_rearm_and_exclusion_resume_after_rank_failure_mid_collective() ->
         state.install_mask()
     assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
     state.rearm()
-    assert resets == [1] and state.abort[:2].tolist() == [0, 0]
+    assert resets == [1]
+    assert state.abort[:2].tolist() == [0, 0]
     assert _workspace_word(workspace, meta, 0, "FLAG_VAL", 1) == 0
     state.install_mask()
     for _ in range(2):
@@ -173,7 +173,7 @@ def test_abort_rearm_and_exclusion_resume_after_rank_failure_mid_collective() ->
     assert state.abort[:2].tolist() == [0, 0]
 
 
-def test_bind_execution_state_registers_a_shared_workspace_once() -> None:
+def test_bind_registers_shared_workspace_once() -> None:
     health = EPGroupHealth(2)
     state = MoeExecutionState(health, torch.device("cuda"))
     comms = [_frontend(health), _frontend(health)]
@@ -193,8 +193,8 @@ def test_bind_execution_state_registers_a_shared_workspace_once() -> None:
         _frontend(None).bind_execution_state(state)
 
 
-def test_remap_workspaces_remaps_each_workspace_in_binding_order_without_a_reset() -> None:
-    """Every rank remaps the workspaces in the same order; their reset is :meth:`MoeExecutionState.rearm`'s."""
+def test_remap_workspaces_in_binding_order() -> None:
+    """Every rank remaps the workspaces in the same order. Only :meth:`MoeExecutionState.rearm` resets them."""
     health = EPGroupHealth(2)
     state = MoeExecutionState(health, torch.device("cuda"))
     calls = Mock()
@@ -213,8 +213,8 @@ def test_remap_workspaces_remaps_each_workspace_in_binding_order_without_a_reset
     gather.assert_not_called()
 
 
-def test_workspace_bytes_count_each_bound_workspace_once() -> None:
-    """The device memory a remap allocates: layers sharing one workspace count it once."""
+def test_workspace_bytes_count_shared_once() -> None:
+    """Layers sharing one workspace count the device memory of its remap once."""
     health = EPGroupHealth(2)
     state = MoeExecutionState(health, torch.device("cuda"))
     shared = Mock(device_bytes=6 << 20)
@@ -227,7 +227,7 @@ def test_workspace_bytes_count_each_bound_workspace_once() -> None:
 
 
 @pytest.mark.parametrize("stale", [(set(), set()), (set(), {0, 1, 2, 3})])
-def test_the_workspaces_need_fresh_pages_for_the_stale_rows_of_any_of_them(stale) -> None:
+def test_stale_rows_union_over_workspaces(stale) -> None:
     """Each workspace answers alike on every rank of the change (``MnnvlMemory.stale_rows``)."""
     health = EPGroupHealth(4)
     state = MoeExecutionState(health, torch.device("cuda"))
@@ -242,7 +242,7 @@ def test_the_workspaces_need_fresh_pages_for_the_stale_rows_of_any_of_them(stale
         comm._workspace_lifecycle.stale_rows.assert_called_once_with(gather)
 
 
-def test_waited_rounds_name_each_peer_waited_for_with_its_round() -> None:
+def test_waited_rounds_map_peer_to_round() -> None:
     """The membership counts a peer that delivers the round it is waited for in as making progress."""
     state = MoeExecutionState(EPGroupHealth(4), torch.device("cuda"))
     assert state.waited_rounds() == {}
@@ -251,7 +251,7 @@ def test_waited_rounds_name_each_peer_waited_for_with_its_round() -> None:
     assert state.waited_rounds() == {1: 7, 3: 8}
 
 
-def test_rearm_resets_bound_layers_and_install_refuses_a_membership_without_this_rank() -> None:
+def test_rearm_and_install_without_this_rank() -> None:
     health = EPGroupHealth(2)
     state = MoeExecutionState(health, torch.device("cuda"))
     comm = _frontend(health)
@@ -284,9 +284,9 @@ def test_rearm_resets_bound_layers_and_install_refuses_a_membership_without_this
     assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
 
 
-def test_layers_of_one_membership_share_one_mask_record() -> None:
-    """Unbound rank-mask layers read the device record of their membership's shared state, which has no abort
-    record: they never pass one, so the state binds no layer."""
+def test_layers_share_one_mask_record() -> None:
+    """Unbound rank-mask layers read the shared state of their membership. It has no abort record and binds no
+    layer."""
     health = EPGroupHealth(2)
     state = MoeExecutionState.for_health(health, torch.device("cuda"))
     assert MoeExecutionState.for_health(health, torch.device("cuda")) is state
@@ -296,8 +296,8 @@ def test_layers_of_one_membership_share_one_mask_record() -> None:
         _frontend(health).bind_execution_state(state)
 
 
-def test_a_published_mask_is_copied_without_waiting_for_the_gpu() -> None:
-    """Publishing a new mask before a dispatch queues its copy behind the GPU's work instead of waiting for it."""
+def test_publish_mask_without_gpu_sync() -> None:
+    """Publishing a new mask queues its copy behind the GPU's work instead of waiting for it."""
     state = MoeExecutionState(EPGroupHealth(4), torch.device("cuda"))
     for words, generation in (([3, 0, 0, 0], 1), ([1, 0, 0, 0], 2)):
         torch.cuda._sleep(1 << 31)  # about a second of GPU work ahead of the copy
@@ -309,9 +309,11 @@ def test_a_published_mask_is_copied_without_waiting_for_the_gpu() -> None:
         assert state.active_rank_mask.cpu().tolist() == words
 
 
-def test_published_mask_is_rewritten_only_for_a_new_generation() -> None:
-    """The device record of the rank mask is rewritten only when the committed generation (or, without one, the
-    caller's mask) changes."""
+def test_mask_rewritten_only_on_new_generation() -> None:
+    """The device record of the rank mask changes only with the committed generation.
+
+    A caller's mask has no generation and is compared by its words.
+    """
     state = MoeExecutionState(EPGroupHealth(4), torch.device("cuda"))
     record = state.active_rank_mask.data_ptr()
 
@@ -321,21 +323,20 @@ def test_published_mask_is_rewritten_only_for_a_new_generation() -> None:
         return state.active_rank_mask.cpu().tolist()
 
     assert publish([3, 0, 0, 0], 0) == [3, 0, 0, 0]
-    # The generation alone decides: an unchanged generation never reads the mask.
+    # An unchanged generation never reads the mask.
     assert publish([1, 0, 0, 0], 0) == [3, 0, 0, 0]
     assert publish([1, 0, 0, 0], 1) == [1, 0, 0, 0]
-    # A caller's mask carries no generation and is compared by its words.
     assert publish([3, 0, 0, 0], None) == [3, 0, 0, 0]
     assert publish([1, 0, 0, 0], 1) == [1, 0, 0, 0]
-    # The kernels do not check the local rank's bit; the record keeps its address and last mask.
+    # The kernels do not check the local rank's bit, so publishing refuses a mask without it.
     with pytest.raises(RuntimeError, match="excludes this rank"):
         publish([2, 0, 0, 0], 2)
     assert state.active_rank_mask.data_ptr() == record
     assert state.active_rank_mask.cpu().tolist() == [1, 0, 0, 0]
 
 
-def test_an_unbound_rank_mask_dispatch_refuses_cuda_graph_capture(monkeypatch) -> None:
-    """A layer that reads the shared state but is not bound to one: nothing could abort a replayed collective."""
+def test_unbound_dispatch_refuses_graph_capture(monkeypatch) -> None:
+    """Nothing could abort a replayed collective of a layer that reads the shared state without being bound."""
     comm = _frontend(EPGroupHealth(2))
     comm.execution_state = MoeExecutionState.for_health(comm.ep_group_health, torch.device("cuda"))
     comm.mnnvl_mem.mapped = True
@@ -345,7 +346,7 @@ def test_an_unbound_rank_mask_dispatch_refuses_cuda_graph_capture(monkeypatch) -
 
 
 def _collective_frontend(health: EPGroupHealth | None) -> NVLinkOneSided:
-    """``_frontend`` with the state its dispatch and combine read; the ops are the caller's to replace."""
+    """Build a ``_frontend`` with the state its dispatch and combine read. The caller replaces the ops."""
     comm = _frontend(health)
     comm.mnnvl_mem.mapped = True
     comm._force_cft = None
@@ -363,9 +364,9 @@ def _collective_frontend(health: EPGroupHealth | None) -> NVLinkOneSided:
 
 
 @pytest.mark.cpu_only
-def test_only_a_bound_layer_hands_the_ops_an_abort_record(monkeypatch) -> None:
-    """Without rank-mask mode, dispatch and combine call the all-to-all ops with their positional
-    arguments only; a bound layer adds its state's abort state, settled when it binds."""
+def test_only_bound_layer_passes_abort_state(monkeypatch) -> None:
+    """An unbound layer calls the all-to-all ops with positional arguments only. A bound layer adds its abort
+    state."""
     calls = []
     received = [
         torch.zeros(_EP_SIZE, _TOKENS, _HIDDEN),
@@ -397,18 +398,24 @@ def test_only_a_bound_layer_hands_the_ops_an_abort_record(monkeypatch) -> None:
         comm.dispatch(torch.zeros(_TOKENS, _HIDDEN), None, experts, None, [_TOKENS] * _EP_SIZE)
         comm.combine(torch.zeros(_EP_SIZE, _TOKENS, _HIDDEN))
 
-    # Dispatch takes 15 positional arguments and combine 14; the last two are the rank-mask switch and mask.
-    (dispatch, dispatch_kwargs), (combine, combine_kwargs) = calls[:2]
-    assert (len(dispatch), dispatch[-2:], dispatch_kwargs) == (15, (False, None), {})
-    assert (len(combine), combine[-2:], combine_kwargs) == (14, (False, None), {})
-    for args, kwargs in calls[2:]:
-        assert args[-2] is True and args[-1] is state.active_rank_mask
-        assert kwargs.keys() == {"abort_state"} and kwargs["abort_state"] is state.abort
+    # The last two positional arguments are the rank-mask switch and the mask.
     assert len(calls) == 4
+    (dispatch, dispatch_kwargs), (combine, combine_kwargs) = calls[:2]
+    assert len(dispatch) == 15
+    assert dispatch[-2:] == (False, None)
+    assert dispatch_kwargs == {}
+    assert len(combine) == 14
+    assert combine[-2:] == (False, None)
+    assert combine_kwargs == {}
+    for args, kwargs in calls[2:]:
+        assert args[-2] is True
+        assert args[-1] is state.active_rank_mask
+        assert kwargs.keys() == {"abort_state"}
+        assert kwargs["abort_state"] is state.abort
 
 
 def _moe_layer(cls: type, **attributes) -> torch.nn.Module:
-    """A MoE layer of class ``cls``, built without ``__init__``, with ``attributes`` set."""
+    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it."""
     layer = cls.__new__(cls)
     torch.nn.Module.__init__(layer)
     for name, value in attributes.items():
@@ -426,15 +433,13 @@ def _moe_layer(cls: type, **attributes) -> torch.nn.Module:
         ("vanilla", "(VanillaMoE) uses no communication strategy"),
     ],
 )
-def test_a_moe_layer_whose_communication_cannot_bind_is_refused(kind, uses) -> None:
-    """Every MoE layer must take part, whatever its class, next to one that binds."""
+def test_unbindable_moe_layer_is_refused(kind, uses) -> None:
+    """Every MoE layer must bind, whatever its class."""
     from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
     from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter
 
     layer = {
-        "all_gather": lambda: _moe_layer(
-            ConfigurableMoE, comm=AllGatherReduceScatter.__new__(AllGatherReduceScatter)
-        ),
+        "all_gather": lambda: _moe_layer(ConfigurableMoE, comm=AllGatherReduceScatter(Mapping())),
         "no_communication": lambda: _moe_layer(ConfigurableMoE, comm=None),
         "triton": lambda: _moe_layer(TritonFusedMoE),
         "vanilla": lambda: _moe_layer(VanillaMoE),
@@ -446,14 +451,14 @@ def test_a_moe_layer_whose_communication_cannot_bind_is_refused(kind, uses) -> N
 
 
 @pytest.mark.cpu_only
-def test_a_model_without_moe_layers_is_refused() -> None:
+def test_model_without_moe_layers_refused() -> None:
     with pytest.raises(ValueError, match="requires a model with MoE layers"):
         MoeExecutionState.model_comms(torch.nn.Linear(1, 1))
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("separate", [True, False], ids=["separate_healths", "no_rank_mask"])
-def test_the_moe_layers_must_share_one_ep_group_health(separate) -> None:
+def test_layers_need_one_ep_group_health(separate) -> None:
     """Bound layers run in rank-mask mode on the one membership (``bind_execution_state``)."""
     from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
 
@@ -465,14 +470,15 @@ def test_the_moe_layers_must_share_one_ep_group_health(separate) -> None:
     assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
-def test_for_model_binds_a_layer_with_an_unfinalized_combine(monkeypatch) -> None:
-    """Bound layers hand every backend packed rows, so a registered unfinalized combine binds like any layer."""
+def test_for_model_binds_unfinalized_combine(monkeypatch) -> None:
+    """Bound layers hand every backend packed rows, so a layer with an unfinalized combine binds too."""
     from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 
-    moe = ConfigurableMoE.__new__(ConfigurableMoE)
-    torch.nn.Module.__init__(moe)
-    moe.comm = _frontend(EPGroupHealth(2))
-    moe.unfinalized_combine_fn = lambda **kwargs: None
+    moe = _moe_layer(
+        ConfigurableMoE,
+        comm=_frontend(EPGroupHealth(2)),
+        unfinalized_combine_fn=lambda **kwargs: None,
+    )
     moe.comm.workspace = torch.empty(0)
     bind = Mock()
     monkeypatch.setattr(NVLinkOneSided, "bind_execution_state", bind)

@@ -5244,7 +5244,7 @@ class PyExecutor:
                 context_commits.append((manager, commit_ends))
 
     def _commit_v2_context_blocks(self, batch_state: BatchState) -> None:
-        """Commit for reuse the context chunks of an accepted step."""
+        """Commit the context chunks of an accepted step for reuse."""
         if not any(commit_ends
                    for _, commit_ends in batch_state.context_commits):
             return

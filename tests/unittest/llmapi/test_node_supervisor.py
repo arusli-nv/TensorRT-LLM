@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Wide-EP fault-tolerance node supervisor, with fake ranks and a fake membership authority.
+"""Tests for the Wide-EP fault-tolerance node supervisor with fake ranks and a fake membership authority.
 
-The authority is a real rendezvous store with a listener that speaks the authority's side of a node supervisor's
-connection and sends the views a test gives it. The supervisor runs in a thread, or as a process where a test sends
-it signals, kills it or restarts it.
+The fake authority is a real rendezvous store plus a listener that sends the supervisor the views a test gives it.
+The supervisor runs in a thread, or in a process when a test signals, kills or restarts it.
 """
 
 import contextlib
@@ -35,7 +34,7 @@ from tensorrt_llm._torch.distributed.membership import (
     RendezvousStore,
 )
 
-# The tests run supervisors, ranks and launchers as processes: one that hangs fails its test, not the job.
+# The tests run supervisors, ranks and launchers as processes. A hung process fails its test, not the job.
 pytestmark = [pytest.mark.cpu_only, pytest.mark.timeout(120)]
 
 _LLMAPI = Path(__file__).parents[3] / "tensorrt_llm" / "llmapi"
@@ -51,14 +50,14 @@ _TIMINGS = dict(_CONNECT_TIMEOUT_S=0.5, _STOP_GRACE_S=2.0, _MIN_BACKOFF_S=0.05)
 
 @pytest.fixture(autouse=True)
 def _timings(monkeypatch):
-    """The supervisor's timings, short for the tests."""
+    """Shorten the supervisor's timings for the tests."""
     for name, value in _TIMINGS.items():
         monkeypatch.setattr(supervisor_module, name, value)
 
 
-# A rank: records itself in SUPERVISOR_TEST_ROOT as the rank's n-th process (0 for its first, then its replacements
-# in turn), then behaves as SUPERVISOR_TEST_MODES says for "<rank>:<n>" ("serves" by default; "records-signals":
-# records the first SIGINT or SIGTERM it gets, and exits).
+# A fake rank. It records itself in SUPERVISOR_TEST_ROOT as the rank's n-th process, where 0 is the original and
+# each replacement counts up. SUPERVISOR_TEST_MODES maps "<rank>:<n>" to its behavior, "serves" by default. In
+# "records-signals" mode it records the first SIGINT or SIGTERM it gets and exits.
 _RANK = r"""
 import json, os, signal, sys, time
 from pathlib import Path
@@ -85,8 +84,8 @@ if mode in statuses:
 time.sleep(600)
 """
 
-# Runs the supervisor as its script does, with the test's timings; its own path stands for the script's, so that a
-# restart runs it again.
+# Run the supervisor as its script does, with the test's timings. The wrapper's path replaces the script's path so
+# that a restart runs the wrapper again.
 _SUPERVISOR_SCRIPT = r"""
 import importlib.util, sys
 
@@ -109,11 +108,11 @@ def _record(
 
 
 class FakeAuthority:
-    """The membership authority's side of node supervisors' connections.
+    """Fake membership authority that node supervisors connect to.
 
-    The rendezvous address, and once :meth:`start` ran a store there that publishes a listener, which accepts node
-    supervisors and sends them the views of :meth:`push`; with ``refuse``, it closes every connection after the hello.
-    The listener's thread runs from the construction to :meth:`close`: the fixture's, not a test's.
+    :meth:`start` opens a rendezvous store that publishes the listener's address. The listener accepts node
+    supervisors and sends them the views given to :meth:`push`. With ``refuse``, it closes every connection after
+    the hello. The listener thread runs until :meth:`close`.
     """
 
     def __init__(self, secret: str, refuse: bool = False):
@@ -189,7 +188,10 @@ class FakeAuthority:
                     sock.sendall(self._view.model_dump_json().encode() + b"\n")
 
     def close(self):
-        """Close every socket and join the threads: a shutdown, not a close, wakes a thread blocked on a socket."""
+        """Close every socket and join the threads.
+
+        Only a shutdown, not a close, wakes a thread blocked on a socket.
+        """
         self._reserved.close()
         with self._lock:
             sockets = [*self._connections, self._listener]
@@ -204,9 +206,9 @@ class FakeAuthority:
 
 @pytest.fixture
 def deployment(tmp_path, monkeypatch):
-    """The deployment's shared secret and authority (not started), and this test's fake rank.
+    """Set up a shared secret, an authority that is not started yet, and the fake rank script.
 
-    Returns the authority and the environment the node's launcher would give the supervisor.
+    Yields the authority and the environment the node's launcher would give the supervisor.
     """
     secret = secrets.token_hex(32)
     monkeypatch.setenv(SHARED_SECRET_ENV, secret)
@@ -244,7 +246,7 @@ def _alive(pid):
 
 
 class Running:
-    """A node supervisor running in a thread; :attr:`status` once it returned."""
+    """Run a node supervisor in a thread and keep its exit status in :attr:`status`."""
 
     def __init__(self, tmp_path, environ, node=NODE, **options):
         self.supervisor = supervisor_module.NodeSupervisor(
@@ -269,7 +271,7 @@ class Running:
 
 
 def _serving(tmp_path, authority, environ, node=NODE, **options):
-    """A supervisor whose ranks started before the authority, as the original ranks do, and that follows it."""
+    """Start a supervisor whose ranks start before the authority, as the original ranks do."""
     running = Running(tmp_path, environ, node=node, **options)
     ranks = range(node * GPUS, (node + 1) * GPUS)
     started = [rank for rank in ranks if rank != 0 or not options.get("rank_0_in_session")]
@@ -280,10 +282,10 @@ def _serving(tmp_path, authority, environ, node=NODE, **options):
 
 
 def _push_and_wait_for_step(running, authority, record, nodes=((NODE, "host-1", True),)):
-    """Push a view the supervisor does not have yet, and wait until it stepped on it and on every earlier event.
+    """Push a new view and wait until the supervisor has acted on it and on every earlier event.
 
-    The supervisor steps between two waits for events, so once it took a view pushed after it took this one, it has
-    stepped on this one.
+    The supervisor acts on each view before it waits for the next event. Once it has taken a later view, it has
+    acted on this one.
     """
     authority.push(record, nodes)
     _until(lambda: running.supervisor._view == NodeView(record=record, nodes=nodes))
@@ -293,7 +295,7 @@ def _push_and_wait_for_step(running, authority, record, nodes=((NODE, "host-1", 
 
 
 @pytest.mark.parametrize("btl", [None, "self,tcp"], ids=["default", "user-set"])
-def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deployment, btl):
+def test_ranks_start_outside_launcher_job(tmp_path, deployment, btl):
     authority, environ = deployment
     if btl is not None:
         environ = {**environ, "OMPI_MCA_btl": btl}
@@ -315,14 +317,12 @@ def test_the_ranks_start_on_their_gpus_outside_the_launchers_job(tmp_path, deplo
     assert running.wait() == 0
 
 
-def test_a_crashed_rank_is_replaced_on_its_gpu_once_the_record_lists_it_as_failed(
-    tmp_path, deployment
-):
+def test_crashed_rank_replaced_once_failed(tmp_path, deployment):
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
     _until(lambda: running.supervisor._processes[3].status is not None)
-    # The record still lists it: the authority has not decided yet.
+    # The authority has not removed the rank from the record yet.
     _push_and_wait_for_step(running, authority, _record(generation=2))
     assert not running.supervisor._processes[3].replacement
     authority.push(_record(MembershipState.PROPOSE, active_mask=0b0111))
@@ -335,8 +335,8 @@ def test_a_crashed_rank_is_replaced_on_its_gpu_once_the_record_lists_it_as_faile
     assert not _alive(replacement["pid"])
 
 
-def test_a_rank_the_authority_excludes_while_it_runs_is_killed_and_replaced(tmp_path, deployment):
-    """Excluded while hung: the supervisor kills it, then starts its replacement on the same GPU."""
+def test_excluded_running_rank_is_replaced(tmp_path, deployment):
+    """Kill a hung rank that the authority excludes and start its replacement on the same GPU."""
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     hung = _read(tmp_path, 3, 0)["pid"]
@@ -347,10 +347,8 @@ def test_a_rank_the_authority_excludes_while_it_runs_is_killed_and_replaced(tmp_
     assert running.wait() == 1
 
 
-def test_a_replacement_that_ends_before_its_admission_is_started_again_unless_it_cannot_start(
-    tmp_path, deployment, monkeypatch
-):
-    """Retried after a backoff, until one exits with REPLACEMENT_CANNOT_START."""
+def test_failed_replacement_restarts_until_cannot_start(tmp_path, deployment, monkeypatch):
+    """Restart a replacement after a backoff until one exits with REPLACEMENT_CANNOT_START."""
     monkeypatch.setattr(supervisor_module, "_MIN_BACKOFF_S", 1.0)
     authority, environ = deployment
     environ["SUPERVISOR_TEST_MODES"] = "3:1=fails 3:2=cannot-start"
@@ -362,19 +360,17 @@ def test_a_replacement_that_ends_before_its_admission_is_started_again_unless_it
     _push_and_wait_for_step(
         running, authority, _record(MembershipState.COMMITTED, active_mask=0b0111, generation=2)
     )
-    # No replacement runs, as another one would fail alike.
+    # No new replacement starts because it would fail the same way.
     assert running.supervisor._processes[3].status is not None
     assert running.supervisor._given_up == {3}
     authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0111))
     assert running.wait() == 0
 
 
-def test_a_replacement_the_change_that_would_add_it_leaves_out_is_killed_and_started_again(
-    tmp_path, deployment
-):
-    """Listed by a PROPOSE, then left out by the next one: never admitted, yet killed and started again.
+def test_dropped_joining_replacement_is_restarted(tmp_path, deployment):
+    """Kill and restart a replacement that one PROPOSE lists and the next one leaves out.
 
-    Fails if only an admitted process were killed.
+    The replacement was never admitted, so this fails if only admitted processes were killed.
     """
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
@@ -393,8 +389,8 @@ def test_a_replacement_the_change_that_would_add_it_leaves_out_is_killed_and_sta
     assert running.wait() == 0
 
 
-def test_each_rank_runs_in_its_own_session(tmp_path, deployment):
-    """A signal for the terminal reaches the supervisor alone (fails without start_new_session)."""
+def test_each_rank_has_own_session(tmp_path, deployment):
+    """Check that a terminal signal reaches only the supervisor, which needs start_new_session."""
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     for rank in RANKS:
@@ -404,8 +400,8 @@ def test_each_rank_runs_in_its_own_session(tmp_path, deployment):
     assert running.wait() == 0
 
 
-def test_a_rank_that_fails_before_the_deployment_serves_ends_the_node(tmp_path, deployment):
-    """No authority yet: as without fault tolerance, the node fails with the rank's status."""
+def test_early_rank_failure_ends_node(tmp_path, deployment):
+    """Without an authority, the node fails with the rank's status as it does without fault tolerance."""
     _, environ = deployment
     environ["SUPERVISOR_TEST_MODES"] = "2:0=crashes"
     running = Running(tmp_path, environ)
@@ -415,7 +411,7 @@ def test_a_rank_that_fails_before_the_deployment_serves_ends_the_node(tmp_path, 
 
 
 def _fake_tool(directory, name, root):
-    """A fake launcher tool ``name`` in ``directory``: records its arguments in ROOT/<name>-args and exits 0."""
+    """Create a fake launcher tool that records its arguments in ``root/<name>-args`` and exits 0."""
     directory.mkdir(exist_ok=True)
     tool = directory / name
     tool.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > "{root / f"{name}-args"}"\n')
@@ -424,12 +420,11 @@ def _fake_tool(directory, name, root):
 
 
 @pytest.mark.parametrize("failed, served", [(0, False), (1, False), (0, True)])
-def test_rank_0_s_end_ends_the_job(tmp_path, deployment, failed, served):
-    """Node 0's supervisor ends the job through its launcher at once when rank 0 ends.
+def test_rank_0_exit_ends_job(tmp_path, deployment, failed, served):
+    """Node 0's supervisor ends the job through its launcher as soon as rank 0 ends.
 
-    No authority may be left, or started yet, to end the other nodes' ranks. Another rank's failure before the
-    deployment serves ends its node only; the authority aborts the rest. Fails without the change: the supervisor
-    took no way to end the job.
+    No authority may be left to end the other nodes' ranks. A failure of another rank before the deployment serves
+    ends only its own node, and the authority aborts the rest.
     """
     authority, environ = deployment
     ended = []
@@ -448,7 +443,7 @@ def test_rank_0_s_end_ends_the_job(tmp_path, deployment, failed, served):
     assert ended == ([_TIMINGS["_STOP_GRACE_S"]] if failed == 0 else [])
 
 
-def test_rank_0_is_never_replaced_and_its_end_ends_the_deployment(tmp_path, deployment):
+def test_rank_0_is_never_replaced(tmp_path, deployment):
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ, node=0)
     os.kill(_read(tmp_path, 0, 0)["pid"], signal.SIGKILL)
@@ -457,8 +452,8 @@ def test_rank_0_is_never_replaced_and_its_end_ends_the_deployment(tmp_path, depl
     assert not _alive(_read(tmp_path, 1, 0)["pid"])
 
 
-def test_rank_0_in_the_session_is_started_by_the_session(tmp_path, deployment):
-    """As ``MpiPoolSession`` runs rank 0 in its pool, the supervisor starts only the other ranks."""
+def test_session_starts_rank_0(tmp_path, deployment):
+    """Start only the other ranks because ``MpiPoolSession`` runs rank 0 in its pool."""
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ, node=0, rank_0_in_session=True)
     assert _read(tmp_path, 0, 0) is None
@@ -467,12 +462,10 @@ def test_rank_0_in_the_session_is_started_by_the_session(tmp_path, deployment):
     assert running.wait() == 0
 
 
-def test_a_supervisor_given_another_deployment_s_shared_secret_ends(
-    tmp_path, deployment, monkeypatch
-):
-    """The store's values are not signed with its secret: it ends with status 1 and starts no rank.
+def test_wrong_shared_secret_ends_supervisor(tmp_path, deployment, monkeypatch):
+    """End with status 1 and start no rank when the store's values carry another secret's signature.
 
-    Fails if it tried to connect again and again instead.
+    This fails if the supervisor kept trying to connect instead.
     """
     authority, environ = deployment
     authority.start()
@@ -484,7 +477,7 @@ def test_a_supervisor_given_another_deployment_s_shared_secret_ends(
     assert supervisor._processes == {}
 
 
-def test_a_node_has_one_supervisor_of_a_deployment(tmp_path, deployment):
+def test_one_supervisor_per_node(tmp_path, deployment):
     authority, environ = deployment
     running = _serving(tmp_path, authority, environ)
     second = supervisor_module.NodeSupervisor(
@@ -495,8 +488,8 @@ def test_a_node_has_one_supervisor_of_a_deployment(tmp_path, deployment):
     assert running.wait() == 0
 
 
-def test_a_supervisor_the_authority_refuses_ends(tmp_path, monkeypatch):
-    """Another one supervises its node or one of its ranks."""
+def test_refused_supervisor_ends(tmp_path, monkeypatch):
+    """The authority refuses a supervisor when another one supervises its node or one of its ranks."""
     secret = secrets.token_hex(32)
     monkeypatch.setenv(SHARED_SECRET_ENV, secret)
     authority = FakeAuthority(secret, refuse=True).start()
@@ -515,26 +508,23 @@ def test_a_supervisor_the_authority_refuses_ends(tmp_path, monkeypatch):
         authority.close()
 
 
-def test_a_supervisor_started_while_the_deployment_serves_replaces_its_failed_ranks(
-    tmp_path, deployment
-):
-    """The node's launch started again after the node failed: no original rank, a replacement for each rank."""
+def test_late_supervisor_replaces_failed_ranks(tmp_path, deployment):
+    """Start a replacement for each rank, and no original, when the node is launched again after it failed."""
     authority, environ = deployment
     authority.start(_record(MembershipState.COMMITTED, active_mask=0b0011))
     running = Running(tmp_path, environ)
     _until(lambda: _read(tmp_path, 2, 1) and _read(tmp_path, 3, 1))
-    assert _read(tmp_path, 2, 0) is None and _read(tmp_path, 3, 0) is None
+    assert _read(tmp_path, 2, 0) is None
+    assert _read(tmp_path, 3, 0) is None
     authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0011))
     assert running.wait() == 0
 
 
-def test_a_supervisor_that_connects_while_the_deployment_starts_starts_its_ranks(
-    tmp_path, deployment
-):
-    """A supervisor that first sees the record STARTING starts its ranks as originals.
+def test_supervisor_during_startup_starts_originals(tmp_path, deployment):
+    """Start the original ranks when the first record a supervisor sees is STARTING.
 
-    The authority runs from rank 0's worker entry, so it may answer before every node's supervisor connected: node 0
-    relaunches no node whose supervisor has not connected yet.
+    The authority starts from rank 0's worker, so it may answer before every node's supervisor has connected. Node 0
+    must not relaunch a node whose supervisor has not connected yet.
     """
     authority, environ = deployment
     prun = tmp_path / "prun"
@@ -559,22 +549,20 @@ def test_a_supervisor_that_connects_while_the_deployment_starts_starts_its_ranks
     "environ, options, rejected",
     [
         ({}, [], False),
-        # Started as a Slurm task: Slurm's PMIx plugin cancels the step when one exits.
+        # Slurm's PMIx plugin cancels the whole step when one task exits.
         ({"SLURM_JOB_ID": "1", "SLURM_PROCID": "1"}, [], True),
-        # mpirun inside the allocation; its --enable-recovery is not visible here: nothing to check.
+        # mpirun inside the allocation. Its --enable-recovery is not visible here, so nothing is checked.
         ({"SLURM_JOB_ID": "1", "SLURM_PROCID": "0", "OMPI_COMM_WORLD_RANK": "1"}, [], False),
         # MpiPoolSession's, inside a Slurm task that is not a node's launch.
         ({"SLURM_JOB_ID": "1", "SLURM_PROCID": "0"}, ["--rank-0-in-session"], False),
     ],
 )
-def test_a_supervisor_started_as_a_slurm_task_is_rejected(
-    monkeypatch, capfd, environ, options, rejected
-):
+def test_slurm_task_supervisor_is_rejected(monkeypatch, capfd, environ, options, rejected):
     for name in ("SLURM_JOB_ID", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK"):
         monkeypatch.delenv(name, raising=False)
     for name, value in environ.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")  # past the check, main stops at the GPU count
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")  # main() stops at the GPU count after the check
     with pytest.raises(SystemExit):
         supervisor_module.main(["--node-rank", "1", "--nodes", "2", *options, "--", "true"])
     error = capfd.readouterr().err
@@ -601,13 +589,12 @@ def _rank_command(tmp_path):
 
 
 @pytest.mark.parametrize("launcher", ["prterun", "sleep"])
-def test_under_mpirun_node_0_ends_the_job_through_the_job_s_prrte(tmp_path, deployment, launcher):
-    """Rank 0's end sends SIGTERM to the mpirun whose PID the job's PMIx server URI holds, else runs pterm.
+def test_node_0_ends_job_through_prrte(tmp_path, deployment, launcher):
+    """Send SIGTERM to the mpirun named by the job's PMIx server URI when rank 0 ends, else run pterm.
 
-    SIGTERM makes mpirun (prterun) exit with a failure status; pterm, used only where that PID is no mpirun of this
-    host, makes it exit with status 0. Here a shell that outlives it starts it, as a wrapper script between mpirun
-    and the launch does: the shell is not signalled. Fails if the supervisor ran pterm alone (mpirun then exits with
-    status 0), or signalled a process other than mpirun.
+    SIGTERM makes mpirun (prterun) exit with a failure status. pterm makes it exit with status 0, so it is used only
+    when that PID is not an mpirun on this host. A shell starts the supervisor here, as a wrapper script between
+    mpirun and the launch would, and the shell must not be signaled.
     """
     _, environ = deployment
     bin_dir = tmp_path / "bin"
@@ -653,11 +640,10 @@ def test_under_mpirun_node_0_ends_the_job_through_the_job_s_prrte(tmp_path, depl
 
 
 @pytest.mark.parametrize("opt_in", [True, False])
-def test_prrte_tools_get_run_as_root_opt_in(tmp_path, deployment, opt_in):
-    """PRRTE's tools run with the deployment's opt-in to running as root, and never gain one.
+def test_prrte_tools_keep_run_as_root(tmp_path, deployment, opt_in):
+    """Check that PRRTE's tools keep the deployment's opt-in to running as root and never gain one.
 
-    Under a root deployment prun and pterm refuse to run without it. Fails without the change: the supervisor
-    dropped it with the launcher's variables.
+    Under a root deployment, prun and pterm refuse to run without it.
     """
     _, environ = deployment
     for name in supervisor_module._RUN_AS_ROOT_VARS:
@@ -690,7 +676,7 @@ def test_prrte_tools_get_run_as_root_opt_in(tmp_path, deployment, opt_in):
 
 
 def test_the_ranks_die_with_their_supervisor(tmp_path, deployment):
-    """Kill -9 of the supervisor is the loss of its node: its ranks end, and its authority connection closes."""
+    """Check that killing the supervisor ends its ranks and closes its authority connection."""
     authority, environ = deployment
     supervisor = _supervisor_process(tmp_path, environ, *_NODE_OPTIONS, *_rank_command(tmp_path))
     try:
@@ -706,8 +692,8 @@ def test_the_ranks_die_with_their_supervisor(tmp_path, deployment):
 
 
 @pytest.mark.parametrize("end", ["SIGINT", "SIGTERM", "ABORT", "SHUTDOWN"])
-def test_the_node_s_host_weights_are_unlinked_when_the_deployment_ends(tmp_path, deployment, end):
-    """However the ranks end, also when the supervisor itself is signalled; another deployment's stay."""
+def test_host_weights_unlinked_at_end(tmp_path, deployment, end):
+    """Unlink the node's host weights however the deployment ends, and keep another deployment's."""
     authority, environ = deployment
     prefix = f"moe_shared_test{os.getpid()}{secrets.token_hex(4)}_"
     segments = [Path("/dev/shm", f"{prefix}l0_lr{rank}_all") for rank in RANKS]
@@ -738,10 +724,10 @@ def test_the_node_s_host_weights_are_unlinked_when_the_deployment_ends(tmp_path,
                 segment.unlink()
 
 
-def test_the_host_weights_are_unlinked_before_the_ranks_end(tmp_path, deployment, monkeypatch):
-    """After SHUTDOWN the segments go first, while the ranks get the grace to end by themselves.
+def test_host_weights_unlinked_before_ranks_end(tmp_path, deployment, monkeypatch):
+    """Unlink the segments on SHUTDOWN before the ranks' grace period ends.
 
-    So a supervisor killed during the grace leaves none behind; fails if they were unlinked once the ranks ended.
+    A supervisor killed during the grace period then leaves no segment behind.
     """
     authority, environ = deployment
     prefix = f"moe_shared_test{os.getpid()}{secrets.token_hex(4)}_"
@@ -764,11 +750,8 @@ def test_the_host_weights_are_unlinked_before_the_ranks_end(tmp_path, deployment
                 segment.unlink()
 
 
-def test_a_signal_for_the_supervisor_goes_to_rank_0_alone(tmp_path, deployment):
-    """Rank 0's process, which runs the deployment's frontend, gets the signal; the others SIGTERM after the grace.
-
-    Fails if the supervisor forwarded the signal to every rank at once.
-    """
+def test_signal_forwarded_to_rank_0_only(tmp_path, deployment):
+    """Forward the signal to rank 0, which runs the frontend, and SIGTERM the other ranks after the grace period."""
     authority, environ = deployment
     environ["SUPERVISOR_TEST_MODES"] = "0:0=records-signals 1:0=records-signals"
     node_0 = ["--node-rank", "0", "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
@@ -788,7 +771,7 @@ def test_a_signal_for_the_supervisor_goes_to_rank_0_alone(tmp_path, deployment):
         supervisor.kill()
 
 
-# A fake prun: records its process ID, arguments and standard input, then runs until ROOT/prun-exit appears.
+# A fake prun. It records its process ID, arguments and standard input, and runs until ROOT/prun-exit exists.
 _FAKE_PRUN = r"""#!/usr/bin/env python3
 import os, sys, time
 
@@ -805,11 +788,10 @@ while not os.path.exists(os.path.join(root, "prun-exit")):
 """
 
 
-def test_node_0_relaunches_a_failed_node_once_through_prun(tmp_path, deployment):
-    """Node 0 relaunches a node whose supervisor left, through the job's PRRTE.
+def test_node_0_relaunches_failed_node_once(tmp_path, deployment):
+    """Relaunch a node whose supervisor left through the job's PRRTE, only once.
 
-    The deployment's environment goes on standard input, never on the command line; once, while that one runs or
-    once it connected.
+    The deployment's environment goes on standard input and never on the command line.
     """
     authority, environ = deployment
     prun = tmp_path / "prun"
@@ -822,7 +804,7 @@ def test_node_0_relaunches_a_failed_node_once_through_prun(tmp_path, deployment)
     )
     _push_and_wait_for_step(running, authority, _record(), nodes)
     assert not running.supervisor._relaunched
-    for _ in range(10):  # the record comes again, also changed
+    for _ in range(10):  # the failed node is reported repeatedly
         authority.push(_record(MembershipState.PROPOSE, active_mask=0b0011), node_1_failed)
         time.sleep(0.05)
     _until(lambda: (tmp_path / "prun-0.stdin").exists() and (tmp_path / "prun-0.stdin").read_text())
@@ -856,14 +838,14 @@ def test_node_0_relaunches_a_failed_node_once_through_prun(tmp_path, deployment)
     assert relaunched_environ["OMPI_MCA_btl"] == "^sm"
     connected = _record(MembershipState.COMMITTED, active_mask=0b0011)
     _push_and_wait_for_step(running, authority, connected, nodes)
-    # Still the first relaunch, which a later one would have replaced.
+    # A second relaunch would have replaced the first one.
     assert running.supervisor._relaunched[1].pid == int((tmp_path / "prun-0.pid").read_text())
     authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0011), nodes)
     assert running.wait() == 0
 
 
-def test_a_relaunched_supervisor_takes_its_environment_from_standard_input(tmp_path, deployment):
-    """Prun forwards no value: the environment, the shared secret included, comes in one JSON line."""
+def test_relaunched_supervisor_reads_environment_stdin(tmp_path, deployment):
+    """Read the environment, including the shared secret, as one JSON line because prun forwards none."""
     authority, environ = deployment
     bare = {"PATH": os.environ["PATH"], "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
     supervisor = _supervisor_process(
@@ -929,10 +911,10 @@ def _run_launcher(tmp_path, procid, task, **extra):
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_under_fault_tolerance_the_launch_of_a_node_runs_its_supervisor(tmp_path, fault_tolerance):
-    """The exported shared secret is all the launcher sees of fault tolerance.
+def test_node_launch_runs_supervisor(tmp_path, fault_tolerance):
+    """Run the node supervisor from the launcher when the shared secret is exported.
 
-    Its launch on node 1 of 2 runs the node supervisor, which runs this launcher for each rank of the node.
+    The supervisor then runs this launcher again for each rank of the node.
     """
     extra = {"TLLM_FAULT_TOLERANCE_SHARED_SECRET": secrets.token_hex(32)} if fault_tolerance else {}
     result = _run_launcher(tmp_path, 1, ["task"], **extra)
@@ -947,11 +929,11 @@ def test_under_fault_tolerance_the_launch_of_a_node_runs_its_supervisor(tmp_path
         assert args == ["-m", "tensorrt_llm.llmapi.mgmn_worker_node"]
 
 
-def test_under_mpirun_in_a_slurm_allocation_a_node_s_launch_takes_mpirun_s_rank(tmp_path):
-    """The node's rank and the node count come from mpirun's variables, not the batch step's SLURM_*.
+def test_node_launch_takes_mpirun_rank(tmp_path):
+    """Take the node rank and node count from mpirun's variables, not from the batch step's SLURM_* variables.
 
-    mpirun leaves the batch step's SLURM_PROCID (0) and SLURM_NTASKS in every process it starts; fails if SLURM_*
-    were read first (every node would be node 0).
+    mpirun leaves the batch step's SLURM_PROCID (0) and SLURM_NTASKS in every process it starts. Reading those
+    first would make every node node 0.
     """
     result = _run_launcher(
         tmp_path,
@@ -967,10 +949,10 @@ def test_under_mpirun_in_a_slurm_allocation_a_node_s_launch_takes_mpirun_s_rank(
     assert args[1:6] == ["--node-rank", "1", "--nodes", "3", "--"]
 
 
-def test_a_rank_the_node_supervisor_starts_takes_its_rank_from_its_identity(tmp_path):
-    """Not from the launcher's variables.
+def test_supervised_rank_takes_identity_rank(tmp_path):
+    """Take a supervised rank's rank from its identity instead of the launcher's variables.
 
-    The worker takes the launcher's place, so that it dies with the supervisor.
+    The worker replaces the launcher process so that it dies with the supervisor.
     """
     result = _run_launcher(
         tmp_path,
@@ -993,19 +975,17 @@ def test_a_rank_the_node_supervisor_starts_takes_its_rank_from_its_identity(tmp_
 
 @contextlib.contextmanager
 def _unanswered_port():
-    """A local port that refuses connections: bound but not listening."""
+    """Yield a local port that is bound but not listening, so it refuses connections."""
     with socket.socket() as held:
         held.bind(("127.0.0.1", 0))
         yield held.getsockname()[1]
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_rank_0_s_server_ending_before_its_task_fails_only_without_fault_tolerance(
-    tmp_path, fault_tolerance
-):
-    """A clean shutdown under fault tolerance exits 0.
+def test_early_mpi_server_exit_status(tmp_path, fault_tolerance):
+    """Exit 0 on a clean shutdown under fault tolerance, and 1 without it.
 
-    Rank 0's worker ends its MPI server once the deployment shut down, before the task (the server's frontend) exits.
+    Rank 0's worker ends its MPI server after the deployment shuts down, before the frontend task exits.
     """
     with _unanswered_port() as port:
         extra = {}

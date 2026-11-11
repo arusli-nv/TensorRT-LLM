@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The configurations enable_wide_ep_fault_tolerance rejects when the LLM arguments are built, before any launch."""
+"""Tests for the configurations that enable_wide_ep_fault_tolerance rejects when the LLM arguments are built."""
 
 import re
 
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _args(**fields) -> TorchLlmArgs:
-    """A supported configuration, changed by ``fields``."""
+    """Return a supported configuration updated with ``fields``."""
     return TorchLlmArgs(
         **{
             "model": "dummy",
@@ -58,8 +58,8 @@ def _args(**fields) -> TorchLlmArgs:
             )
         },
         {"speculative_config": MTPDecodingConfig(num_nextn_predict_layers=1)},
-        # The default (modeling_v2="auto") above included: under fault tolerance no modeling_v2 target is
-        # resolved, which require rejects as the model loads.
+        # Under fault tolerance no modeling_v2 target is resolved, so "require" fails later, when the model loads.
+        # The default "auto" is covered by the empty case above.
         {"modeling_v2": "require"},
         {"torch_compile_config": TorchCompileConfig(enable_userbuffers=False)},
         {"prefill_cuda_graph_backend": "piecewise"},
@@ -128,13 +128,13 @@ def test_a_supported_configuration_is_accepted(fields):
         ({"orchestrator_type": "ray"}, "orchestrator_type unset"),
     ],
 )
-def test_an_unsupported_configuration_is_rejected_with_the_field_to_change(fields, fix):
+def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
-def test_dspark_is_rejected_with_the_field_to_change(tmp_path):
+def test_dspark_is_rejected(tmp_path):
     (tmp_path / "config.json").write_text('{"dspark_block_size": 2}')
     with pytest.raises(
         ValueError, match="no NGram or user-provided drafter and no DSpark"
@@ -148,7 +148,7 @@ def test_dspark_is_rejected_with_the_field_to_change(tmp_path):
     assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
 
 
-def test_fault_tolerance_off_leaves_the_configuration_alone():
+def test_fault_tolerance_off_skips_checks():
     assert not _args(
         enable_wide_ep_fault_tolerance=False,
         disable_overlap_scheduler=True,

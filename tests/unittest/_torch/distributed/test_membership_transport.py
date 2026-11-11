@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The authority process and the ranks' membership clients over the rendezvous store and liveness connections (CPU
-processes): a killed rank is removed within seconds, a hung one is kept, a replacement joins once the process it
-replaces is gone, and connections or values not signed with the shared secret are ignored without disturbing the
-authority."""
+"""Tests for the authority process and the membership clients in separate CPU processes.
+
+They run over the rendezvous store and the liveness connections.
+"""
 
 import multiprocessing as mp
 import os
@@ -56,8 +56,7 @@ def _store(port, secret=SECRET):
 
 
 class _ReportingAuthorityProcess(AuthorityProcess):
-    """The authority process, which also puts ("refused", rank, replacement, reason) on ``results`` for each valid
-    hello it refuses."""
+    """Authority process that puts ``("refused", rank, replacement, reason)`` on ``results`` for each refusal."""
 
     def __init__(self, results, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -76,13 +75,12 @@ def _authority(port, results):
     results.put(("authority", record.state.name))
 
 
-# The test sets it once the cluster is to shut down; rank 0 then reports so, as its executor does when it stops.
+# The test sets this key to shut the cluster down, and rank 0 then reports a shutdown as its executor does.
 _STOP_KEY = "test_stop"
 
 
 def _rank(port, rank, replacement, results):
-    """Follow the records and answer them like an executor would, until shut down or no longer a member. A
-    ``replacement`` asks to join by connecting, and then reports that it is ready to join."""
+    """Answer the records as an executor does until the deployment shuts down or the rank leaves."""
     client = None
 
     def on_record(record):
@@ -198,7 +196,7 @@ def _kill_and_expect_removal(results, proc, rank, generation, mask):
     assert seen[-1][5] - killed_at < 5.0, f"removed {seen[-1][5] - killed_at:.2f} s after the kill"
 
 
-def test_a_killed_rank_is_removed_quickly_and_its_replacement_joins(cluster):
+def test_killed_rank_removed_replacement_joins(cluster):
     _, results, start, start_cluster = cluster
     ranks = start_cluster()
     _kill_and_expect_removal(results, ranks[3], 3, 1, 0b0111)
@@ -206,24 +204,21 @@ def test_a_killed_rank_is_removed_quickly_and_its_replacement_joins(cluster):
     _until(results, _committed(0, 2, 0b1111), timeout_s=STARTUP_S)
 
 
-def test_a_hung_rank_keeps_its_connection_and_stays_active(cluster):
+def test_hung_rank_keeps_connection(cluster):
     _, results, _, start_cluster = cluster
     ranks = start_cluster()
-    os.kill(
-        ranks[2].pid, signal.SIGSTOP
-    )  # no Python runs, like a starved interpreter; nobody waits on it here
+    # No Python runs in the stopped process, as in a starved interpreter. Nobody waits on it here.
+    os.kill(ranks[2].pid, signal.SIGSTOP)
     time.sleep(4.0)
     os.kill(ranks[2].pid, signal.SIGCONT)
     with pytest.raises(AssertionError):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=2)
-    _kill_and_expect_removal(
-        results, ranks[1], 1, 1, 0b1101
-    )  # the authority still handles failures
+    # The authority still handles failures.
+    _kill_and_expect_removal(results, ranks[1], 1, 1, 0b1101)
 
 
-def test_a_replacement_joins_once_the_process_it_replaces_is_gone(cluster):
-    """While rank 2's process serves, a replacement for it is refused: only the authority's verdict removes an active
-    process."""
+def test_replacement_waits_for_old_process(cluster):
+    """Refuse a replacement for rank 2 while its process serves, and admit one after the process is killed."""
     _, results, start, start_cluster = cluster
     ranks = start_cluster()
     start("refused-replacement-2", _rank, 2, True)
@@ -235,16 +230,14 @@ def test_a_replacement_joins_once_the_process_it_replaces_is_gone(cluster):
 
 
 def _refused(store, rank, replacement):
-    """Open a liveness connection for ``rank``, of a ``replacement`` or of its first process; returns whether the
-    authority closed it unread."""
+    """Return whether the authority closes a liveness connection for ``rank`` unread."""
     with open_liveness_connection(store, rank, replacement) as connection:
         connection.sock.settimeout(10)
         return connection.sock.recv(1) == b""
 
 
-def test_a_join_for_an_active_rank_is_refused(cluster):
-    """A replacement's hello for rank 2 while rank 2's process holds its connection is refused, with the reason; the
-    membership does not change."""
+def test_join_for_active_rank_refused(cluster):
+    """Refuse a replacement for rank 2 while its process is connected, and keep the membership."""
     store, results, _, start_cluster = cluster
     start_cluster()
     assert _refused(store, 2, True)
@@ -256,9 +249,8 @@ def test_a_join_for_an_active_rank_is_refused(cluster):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=2)
 
 
-def test_a_second_connection_of_a_first_process_is_refused(cluster):
-    """A second hello of rank 1's connected first process is refused, with the reason; the process's own connection
-    still tells when it ends."""
+def test_second_connection_is_refused(cluster):
+    """Refuse a second connection of rank 1's first process, and keep watching the first one."""
     store, results, _, start_cluster = cluster
     ranks = start_cluster()
     assert _refused(store, 1, False)
@@ -271,7 +263,7 @@ def test_a_second_connection_of_a_first_process_is_refused(cluster):
     _kill_and_expect_removal(results, ranks[1], 1, 1, 0b1101)
 
 
-def test_input_not_signed_with_the_shared_secret_is_ignored(cluster):
+def test_unsigned_input_is_ignored(cluster):
     store, results, _, start_cluster = cluster
     ranks = start_cluster()
     forged = RendezvousStore(store.store, b"another-secret")
@@ -284,9 +276,9 @@ def test_input_not_signed_with_the_shared_secret_is_ignored(cluster):
         hello.sendall(forged.tag(b"hello", nonce + line).hex().encode() + b" " + line + b"\n")
         hello.settimeout(10)
         assert hello.recv(1) == b""  # a forged replacement for rank 3 is closed
-    forged.set(RECORD_KEY, b'{"generation": 9, "state": 3, "active_mask": 0}')  # a forged ABORT
+    forged.set(RECORD_KEY, b'{"generation": 9, "state": 3, "active_mask": 0}')  # a forged ABORTED
     with pytest.raises(AssertionError):
-        _until(results, lambda item: item[3] in ("PROPOSE", "ABORT"), timeout_s=2)
+        _until(results, lambda item: item[3] in ("PROPOSE", "ABORTED"), timeout_s=2)
     assert store.get_if_set(RECORD_KEY) is None  # counts as absent for the watchers and the server
     forged.set("probe", b"value")
     with pytest.raises(PermissionError):
@@ -297,20 +289,19 @@ def test_input_not_signed_with_the_shared_secret_is_ignored(cluster):
     store.store.set("row/12", raw[:32] + raw[33:])
     with pytest.raises(PermissionError):
         store.get("row/12")
-    _kill_and_expect_removal(
-        results, ranks[2], 2, 1, 0b1011
-    )  # the authority still handles failures
+    # The authority still handles failures.
+    _kill_and_expect_removal(results, ranks[2], 2, 1, 0b1011)
 
 
 class _NodeSupervisor:
-    """The authority's side of a node supervisor: its connection, and the views the authority sends over it."""
+    """Node supervisor connection that reads the views the authority sends."""
 
     def __init__(self, store, node, ranks):
         self.connection = open_node_supervisor_connection(store, node, ranks, f"host-{node}")
         self.connection.sock.settimeout(10)
 
     def next_view(self) -> NodeView:
-        """The next view that arrives, None once the authority closed the connection."""
+        """Return the next view, or None once the authority closed the connection."""
         while True:
             data = self.connection.sock.recv(1 << 16)
             if not data:
@@ -328,9 +319,11 @@ class _NodeSupervisor:
         raise AssertionError("no such view")
 
 
-def test_a_node_supervisor_s_loss_fails_its_ranks_at_once(cluster):
-    """The supervisor's death is its node's loss: the authority removes its ranks, whose processes still run, and
-    tells the other node supervisors that the node's supervisor left (node 0's relaunches it)."""
+def test_node_supervisor_loss_fails_its_ranks(cluster):
+    """Remove a lost supervisor's ranks at once and tell the other supervisors that its node left.
+
+    The ranks' processes still run, because the supervisor's loss stands for the loss of its node.
+    """
     store, results, _, start_cluster = cluster
     start_cluster()
     node_0 = _NodeSupervisor(store, 0, [0, 1])
@@ -344,14 +337,13 @@ def test_a_node_supervisor_s_loss_fails_its_ranks_at_once(cluster):
     assert seen[-1][5] - left_at < 5.0
     view = node_0.until(lambda view: view.record.active_mask == 0b0011)
     assert view.nodes == ((0, "host-0", True), (1, "host-1", False))
-    # The deployment shuts down while node 0's supervisor stays: its leaving would be node 0's loss, which aborts.
+    # Shut down while node 0's supervisor stays connected, because its loss would abort the deployment.
     store.set(_STOP_KEY, b"")
     node_0.until(lambda view: view.record.state == MembershipState.SHUTDOWN)
 
 
-def test_a_second_supervisor_of_a_node_or_of_its_ranks_is_refused(cluster):
-    """At most one node supervisor holds a node and each of its ranks; a refused one changes no membership and no
-    view (the authority sends none for it), and the first one keeps its node."""
+def test_second_node_supervisor_is_refused(cluster):
+    """Refuse a second supervisor of a node or of one of its ranks without changing the membership."""
     store, results, _, start_cluster = cluster
     start_cluster()
     first = _NodeSupervisor(store, 1, [2, 3])
@@ -360,11 +352,10 @@ def test_a_second_supervisor_of_a_node_or_of_its_ranks_is_refused(cluster):
     assert _NodeSupervisor(store, 2, [3]).next_view() is None
     with pytest.raises(AssertionError):
         _until(results, lambda item: item[3] == "PROPOSE", timeout_s=2)
-    node_0 = _NodeSupervisor(
-        store, 0, [0, 1]
-    )  # a supervisor that connects: every supervisor's view lists it
+    # Every supervisor's view lists a supervisor that connects.
+    node_0 = _NodeSupervisor(store, 0, [0, 1])
     expected = ((0, "host-0", True), (1, "host-1", True))
     assert first.until(lambda view: view.nodes == expected).record.active_mask == 0b1111
-    # The deployment shuts down while node 0's supervisor stays: its leaving would be node 0's loss, which aborts.
+    # Shut down while node 0's supervisor stays connected, because its loss would abort the deployment.
     store.set(_STOP_KEY, b"")
     node_0.until(lambda view: view.record.state == MembershipState.SHUTDOWN)

@@ -16,6 +16,7 @@ import torch
 import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._wide_ep_fault_tolerance import fault_tolerance_replacement
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import ceil_div
 
 from .moe_load_balancer import HostMoeTensorSharer
 
@@ -72,7 +73,10 @@ def plan_layer_placement(
 
 @dataclass(frozen=True, eq=False)
 class ExpertRestorePlan:
-    """Placement of every MoE layer for a membership, identical on every active rank except ``device_bytes``."""
+    """The placement of every MoE layer for a membership.
+
+    Every field except ``device_bytes`` is the same on every active rank.
+    """
 
     active_ranks: Tuple[bool, ...]
     placements: Tuple[np.ndarray, ...]
@@ -248,7 +252,7 @@ class EplbExpertRestore:
         """Return the spare slots per rank that hold every expert the largest recoverable failure can lose."""
         lost_experts = min(self.largest_failure * eplb_slot_count, expert_count)
         active_ranks = self.balancer.ep_size - self.largest_failure
-        return -(-lost_experts // active_ranks)
+        return ceil_div(lost_experts, active_ranks)
 
     def _rank_nodes(self) -> List[int]:
         return [self.balancer.mapping.get_node_rank(rank) for rank in range(self.balancer.ep_size)]
@@ -259,7 +263,10 @@ class EplbExpertRestore:
 
     @staticmethod
     def _recoverable_failures(nodes: List[int]) -> List[List[int]]:
-        """Return the ranks of each recoverable failure: a node other than rank 0's, or one rank on rank 0's node."""
+        """Return the ranks of each recoverable failure.
+
+        A recoverable failure is the loss of a node other than rank 0's, or of one rank on rank 0's node.
+        """
         node_ranks: Dict[int, List[int]] = {}
         for rank, node in enumerate(nodes):
             node_ranks.setdefault(node, []).append(rank)
@@ -286,7 +293,7 @@ class EplbExpertRestore:
         )
 
     def current_placement(self) -> List[Tuple[int, List[List[int]]]]:
-        """Return, per layer, its expert count and this rank's view of the placement."""
+        """Return the expert count and this rank's view of the placement for each layer."""
         return [
             (
                 layer.expert_count,
@@ -378,9 +385,11 @@ class EplbExpertRestore:
         """Plan every layer's placement for ``active_ranks``.
 
         Args:
-            active_ranks: Per EP rank, whether it is active.
-            current: Per layer, the placement the active ranks agreed on, so every active rank plans the same.
-            rejoining: Per EP rank, whether it rejoins. The active slots then take the initial placement.
+            active_ranks: Whether each EP rank is active.
+            current: The placement of each layer that the active ranks agreed on, so that every active rank plans
+                the same placement.
+            rejoining: Whether each EP rank rejoins. If an active rank rejoins, the active slots take the initial
+                placement.
 
         Raises:
             RuntimeError: An iteration is active.
@@ -426,7 +435,11 @@ class EplbExpertRestore:
         )
 
     def set_spare_slots_backed(self, layer_slots: Sequence[Sequence[int]], backed: bool) -> int:
-        """Back spare slots with device memory or map them back to the shared scratch; return the bytes changed."""
+        """Back spare slots with device memory or map them back to the shared scratch.
+
+        Returns:
+            The number of bytes whose backing changed.
+        """
         tensors, slots, slot_counts = [], [], []
         for layer, spare_slots in zip(
             self.balancer.single_layer_load_balancers, layer_slots, strict=True
@@ -446,7 +459,11 @@ class EplbExpertRestore:
         return changed
 
     def release_empty_spare_slots(self) -> int:
-        """Map the spare slots the installed placement leaves empty back to the shared scratch; return the bytes."""
+        """Map the spare slots that the installed placement leaves empty back to the shared scratch.
+
+        Returns:
+            The number of bytes released.
+        """
         balancer = self.balancer
         if balancer.in_iter:
             raise RuntimeError("Cannot release spare slots while an iteration is active")

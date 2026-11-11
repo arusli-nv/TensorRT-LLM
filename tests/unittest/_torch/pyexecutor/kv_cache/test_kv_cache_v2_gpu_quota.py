@@ -21,7 +21,7 @@ MIB = 1 << 20
 
 @pytest.fixture
 def manager():
-    # 32768 tokens of 8 KiB: a 256 MiB pool, which allocates in 2 MiB units.
+    # 32768 tokens of 8 KiB each make a 256 MiB pool, which allocates in 2 MiB units.
     manager = KVCacheManagerV2(
         KvCacheConfig(max_tokens=32768, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -38,14 +38,14 @@ def manager():
     manager.shutdown()
 
 
-def test_a_resize_releases_device_memory_and_takes_it_back_with_the_kv_kept(manager):
+def test_resize_releases_memory_keeps_kv(manager):
     (request,) = manager.add_dummy_requests([0], [512])
     (pages,) = manager.get_batch_cache_indices([0], 0)
     manager.get_buffers(0)[pages[-1]].fill_(1.5)
     torch.cuda.synchronize()
     quota = manager.gpu_quota
 
-    # The pool may move pages: every KV cache must be suspended first.
+    # The pool may move pages, so every KV cache must be suspended first.
     with pytest.raises(RuntimeError, match="SUSPENDED"):
         manager.resize_gpu_quota(quota - 64 * MIB)
     # A quota that rounds down to the pool's own changes nothing, so it needs no suspension.
@@ -64,16 +64,18 @@ def test_a_resize_releases_device_memory_and_takes_it_back_with_the_kv_kept(mana
     assert manager.get_buffers(0)[pages[-1]].eq(1.5).all()
 
 
-def test_a_pool_cannot_give_up_its_minimum(manager):
+def test_pool_keeps_its_minimum(manager):
     quota = manager.gpu_quota
     with pytest.raises(RuntimeError, match="cannot be resized to 0 bytes"):
         manager.resize_gpu_quota(-1)
     assert manager.gpu_quota == quota
 
 
-def test_the_executor_resumes_every_cache_when_a_resize_fails(manager):
-    """A restore that shrinks the pool, then fails (a peer lost during the remap it includes), leaves every request
-    active with its KV, so the executor keeps serving."""
+def test_failed_resize_resumes_every_cache(manager):
+    """Keep every request active with its KV when a restore shrinks the pool and then fails.
+
+    The failure stands for a peer lost during the remap, after which the executor keeps serving.
+    """
     (request,) = manager.add_dummy_requests([0], [512])
     (pages,) = manager.get_batch_cache_indices([0], 0)
     manager.get_buffers(0)[pages[-1]].fill_(1.5)
