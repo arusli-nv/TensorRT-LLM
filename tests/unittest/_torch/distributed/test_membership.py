@@ -361,6 +361,7 @@ def test_transaction_aborts(cause):
     assert cluster.run(1.0).state == MembershipState.ABORTED
     assert MembershipState.COMMITTED not in states(cluster)
     assert cluster.authority.last_transaction.outcome == "ABORTED"
+    assert cluster.authority.last_transaction.changes == {"abort": 1}
 
 
 def test_replacement_with_other_placement_excluded():
@@ -519,6 +520,7 @@ def test_replacements_added_in_one_transaction():
     assert states(cluster) == TRANSACTION
     assert record.active_mask == ALL
     assert cluster.authority.last_transaction.added_ranks == (2, 3)
+    assert cluster.authority.last_transaction.changes == {"failover": 1, "admission": 1}
     # The transaction is detected at rank 2's readiness and includes the wait for rank 3's.
     summary = cluster.authority.last_transaction
     assert summary.began_unix_ms - summary.detected_unix_ms >= 2000
@@ -783,8 +785,10 @@ def test_shutdown_record_precedes_close():
             )
         )
         _until(
-            lambda: clients[0].record is not None
-            and clients[0].record.state == MembershipState.COMMITTED
+            lambda: (
+                clients[0].record is not None
+                and clients[0].record.state == MembershipState.COMMITTED
+            )
         )
         clients[0].report(shutdown=True)
         _until(lambda: clients[0].record.state == MembershipState.SHUTDOWN)
@@ -797,6 +801,8 @@ def test_shutdown_record_precedes_close():
         _leave(clients)
         os.close(parent_read)
     assert states_at_close == [MembershipState.SHUTDOWN]
+
+
 def test_liveness_connections_keep_alive(monkeypatch):
     """Enable TCP keepalive at both ends of the connections of a rank and of a node supervisor."""
     keep_alive, opened = membership._keep_alive, []

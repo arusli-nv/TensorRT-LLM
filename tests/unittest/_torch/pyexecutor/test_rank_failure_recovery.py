@@ -1845,18 +1845,21 @@ def _server(monkeypatch, store):
     return server
 
 
+FAILOVER = TransactionSummary(
+    generation=1,
+    outcome="COMMITTED",
+    removed_ranks=(FAILED,),
+    added_ranks=(),
+    detected_unix_ms=988,
+    began_unix_ms=1000,
+    ready_unix_ms=1400,
+    ended_unix_ms=2500,
+    changes={"failover": 1},
+)
+
+
 def test_status_endpoint_reports_membership(monkeypatch):
-    transaction = TransactionSummary(
-        generation=1,
-        outcome="COMMITTED",
-        removed_ranks=(FAILED,),
-        added_ranks=(),
-        detected_unix_ms=988,
-        began_unix_ms=1000,
-        ready_unix_ms=1400,
-        ended_unix_ms=2500,
-    )
-    store = FakeRendezvousStore(_record(MembershipState.COMMITTED, active_mask=0b0011), transaction)
+    store = FakeRendezvousStore(_record(MembershipState.COMMITTED, active_mask=0b0011), FAILOVER)
     # Rank 1 serves again, so its earlier mark does not count.
     for rank in (1, 3):
         store.values[f"{membership.REPLACEMENT_GIVEN_UP_KEY}/{rank}"] = b"1"
@@ -1880,8 +1883,38 @@ def test_status_endpoint_reports_membership(monkeypatch):
             "began_unix_ms": 1000,
             "ready_unix_ms": 1400,
             "ended_unix_ms": 2500,
+            "changes": {"failover": 1},
         },
     }
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_prometheus_metrics_follow_flag(monkeypatch, tmp_path, enabled):
+    """Check that the Prometheus endpoint reports the membership only with fault tolerance on."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    server = _server(monkeypatch, FakeRendezvousStore(_record(MembershipState.COMMITTED), FAILOVER))
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", enabled)
+    server.app = FastAPI()
+    server.metrics_collector = SimpleNamespace(labels={"model_name": "m"})
+    server.generator._executor.fault_tolerance_health.status()
+    server.mount_metrics()
+    lines = TestClient(server.app).get("/prometheus/metrics").text.splitlines()
+    expected = [
+        'trtllm_fault_tolerance_state{model_name="m",state="degraded"} 1.0',
+        'trtllm_fault_tolerance_state{model_name="m",state="healthy"} 0.0',
+        'trtllm_fault_tolerance_active_ranks{model_name="m"} 3.0',
+        'trtllm_fault_tolerance_failed_ranks{model_name="m"} 1.0',
+        'trtllm_fault_tolerance_membership_changes_total{model_name="m",kind="failover"} 1.0',
+        'trtllm_fault_tolerance_membership_changes_total{model_name="m",kind="abort"} 0.0',
+        'trtllm_fault_tolerance_last_change_pause_seconds{model_name="m"} 1.5',
+    ]
+    if enabled:
+        assert set(expected) <= set(lines)
+    else:
+        assert not [line for line in lines if "fault_tolerance" in line]
 
 
 @pytest.mark.parametrize(

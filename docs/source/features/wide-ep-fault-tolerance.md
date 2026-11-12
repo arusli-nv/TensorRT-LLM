@@ -81,6 +81,10 @@ no `RecreateGroupOnPodRestart`). Set `PMI_RANK` to the node rank, `PMI_SIZE` to 
 | `unprotected` | The authority does not answer, so a further failure is not recovered |
 | `failed` | The deployment cannot recover |
 
+With `return_perf_metrics`, `/prometheus/metrics` reports the last status read, prefixed `trtllm_fault_tolerance_`:
+`state` (1 for the current state), `active_ranks`, `failed_ranks`, `membership_changes_total` by `kind` (`failover`,
+`admission`, `abort`) and `last_change_pause_seconds`.
+
 ## Limitations
 
 - Supported: one NVLink domain (such as GB200 NVL72), attention DP and expert parallelism over all ranks,

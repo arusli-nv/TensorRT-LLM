@@ -1550,23 +1550,26 @@ class FaultToleranceHealth:
         self._store: Optional[RendezvousStore] = None
         self._record: Optional[MembershipRecord] = None
         self._given_up: List[int] = []
+        self._transaction: Optional[TransactionSummary] = None
         self._next_open = 0.0
         self._authority_ended = False
         self._lock = threading.Lock()
+        self._last_status: Optional[Dict[str, object]] = None
+        self._refreshing = threading.Lock()
 
-    def _read(self) -> Tuple[Optional[TransactionSummary], bool]:
-        """Read the record and the given-up ranks, and return the last transaction and whether the authority answers.
+    def _read(self) -> bool:
+        """Read the record, the given-up ranks and the last transaction, and return whether the authority answers.
 
         After a failed read, a later read opens the store again, at most once per read timeout. Once the store has
         answered, a refused connection means that the authority ended, so later reads return at once.
         """
         with self._lock:
             if self._authority_ended:
-                return None, False
+                return False
             try:
                 if self._store is None:
                     if time.monotonic() < self._next_open:
-                        return None, False
+                        return False
                     self._next_open = time.monotonic() + _STATUS_READ_TIMEOUT_S
                     self._store = open_store(self._address, self._secret, _STATUS_READ_TIMEOUT_S)
                 record, transaction = (
@@ -1584,8 +1587,9 @@ class FaultToleranceHealth:
             except (RuntimeError, OSError):
                 self._store = None
                 self._authority_ended = self._record is not None and self._store_refuses()
-                return None, False
-            return self._parse(TransactionSummary, transaction), True
+                return False
+            self._transaction = self._parse(TransactionSummary, transaction) or self._transaction
+            return True
 
     def _store_refuses(self) -> bool:
         """Return whether the store's port refuses connections, so that no process listens on it."""
@@ -1627,8 +1631,8 @@ class FaultToleranceHealth:
 
     def status(self) -> Dict[str, object]:
         """Return the server's fault-tolerance status from the last membership record and transaction."""
-        transaction, authority_alive = self._read()
-        record = self._record
+        authority_alive = self._read()
+        record, transaction = self._record, self._transaction
         status = {
             "state": self._state(authority_alive),
             "authority_alive": authority_alive,
@@ -1653,4 +1657,66 @@ class FaultToleranceHealth:
                 },
                 incarnations=list(record.incarnations),
             )
+        self._last_status = status
         return status
+
+    def last_status(self) -> Optional[Dict[str, object]]:
+        """Return the last status read without waiting, and read a newer one in a background thread."""
+        if self._refreshing.acquire(blocking=False):
+            threading.Thread(target=self._refresh, daemon=True).start()
+        return self._last_status
+
+    def _refresh(self) -> None:
+        try:
+            self.status()
+        finally:
+            self._refreshing.release()
+
+
+class FaultToleranceMetricsCollector:
+    """Expose the last fault-tolerance status read as Prometheus metrics, without waiting for the store."""
+
+    STATES = ("healthy", "degraded", "recovering", "unprotected", "failed")
+    CHANGE_KINDS = ("failover", "admission", "abort")
+
+    def __init__(self, health: FaultToleranceHealth, labels: Dict[str, str]):
+        self._health = health
+        self._labels = labels
+
+    def collect(self):
+        """Yield the membership state, the rank counts, the membership changes and the last pause."""
+        from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+
+        status = self._health.last_status()
+        if status is None:
+            return
+        values = list(self._labels.values())
+        state = self._family(GaugeMetricFamily, "state", "Membership state", "state")
+        for name in self.STATES:
+            state.add_metric([*values, name], float(status["state"] == name))
+        yield state
+        if status["active_ranks"] is not None:
+            for key in ("active_ranks", "failed_ranks"):
+                ranks = self._family(GaugeMetricFamily, key, key.replace("_", " ").capitalize())
+                ranks.add_metric(values, len(status[key]))
+                yield ranks
+        transaction = status["last_transaction"] or {}
+        changes = self._family(
+            CounterMetricFamily, "membership_changes", "Membership changes", "kind"
+        )
+        for kind in self.CHANGE_KINDS:
+            changes.add_metric([*values, kind], transaction.get("changes", {}).get(kind, 0))
+        yield changes
+        if transaction:
+            pause = self._family(
+                GaugeMetricFamily, "last_change_pause_seconds", "Last change pause"
+            )
+            pause.add_metric(
+                values, (transaction["ended_unix_ms"] - transaction["began_unix_ms"]) / 1e3
+            )
+            yield pause
+
+    def _family(self, family: type, name: str, documentation: str, *labels: str):
+        return family(
+            "trtllm_fault_tolerance_" + name, documentation, labels=[*self._labels, *labels]
+        )

@@ -176,6 +176,8 @@ class TransactionSummary(_Message):
     began_unix_ms: float
     ready_unix_ms: Optional[float] = None
     ended_unix_ms: float
+    # The number of ended transactions by kind (failover, admission or abort), this one included.
+    changes: Dict[str, int] = {}
 
 
 def _bits(mask: int):
@@ -245,6 +247,7 @@ class Authority:
         self._ready_s: Optional[float] = None
         self.last_transaction: Optional[TransactionSummary] = None
         self.stalled_replacements: Tuple[int, ...] = ()
+        self._changes: Dict[str, int] = {}
 
     def request_join(self, rank: int) -> None:
         """Request that a replacement of ``rank`` join, taking ``rank`` over even if it is still active."""
@@ -277,15 +280,22 @@ class Authority:
                 return None if s is None else now_unix_ms + (s - now_s) * 1e3
 
             began_s = self._transaction_began_s
+            removed = tuple(self._ranks(committed & ~record.active_mask))
+            if record.state == MembershipState.ABORTED:
+                kind = "abort"
+            else:
+                kind = "failover" if removed else "admission"
+            self._changes[kind] = self._changes.get(kind, 0) + 1
             self.last_transaction = TransactionSummary(
                 generation=record.generation,
                 outcome=record.state.name,
-                removed_ranks=tuple(self._ranks(committed & ~record.active_mask)),
+                removed_ranks=removed,
                 added_ranks=tuple(self._ranks(record.active_mask & ~committed)),
                 detected_unix_ms=unix_ms(began_s if self._detected_s is None else self._detected_s),
                 began_unix_ms=unix_ms(began_s),
                 ready_unix_ms=unix_ms(self._ready_s),
                 ended_unix_ms=now_unix_ms,
+                changes=dict(self._changes),
             )
             self._detected_s = None
         return record

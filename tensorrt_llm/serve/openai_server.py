@@ -1404,6 +1404,13 @@ class OpenAIServer(_VideoRoutesMixin):
         from prometheus_fastapi_instrumentator import Instrumentator
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
+        if wide_ep_fault_tolerance_enabled():
+            from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
+                FaultToleranceMetricsCollector
+            registry.register(
+                FaultToleranceMetricsCollector(
+                    self.generator._executor.fault_tolerance_health,
+                    self.metrics_collector.labels))
         Instrumentator(
             should_group_status_codes=False,
             should_respect_env_var=True,
