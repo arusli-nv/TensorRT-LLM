@@ -202,15 +202,19 @@ def test_replacement_bcast_ignores_own_value(store, monkeypatch):
     """Check that a replacement's value to a broadcast from rank 0 need not match its predecessor's."""
     startup_record.record()  # in rank 0's process only
 
+    def bcast(group, value):
+        # One call site, since a replacement makes the original ranks' collectives from the same callers.
+        return group.bcast(value)
+
     def rank(r):
-        return StoreGroup(_client(store), "w", r, range(2), startup=r == 0).bcast(f"rank {r}")
+        return bcast(StoreGroup(_client(store), "w", r, range(2), startup=r == 0), f"rank {r}")
 
     assert _on_ranks(range(2), rank) == {0: "rank 0", 1: "rank 0"}
     published = startup_record.published()
     _reset_record(monkeypatch)
     startup_record.replay(published)
     replacement = StoreGroup(None, "w", 1, range(2), active=[1], startup=True)
-    assert replacement.bcast("replacement") == "rank 0"
+    assert bcast(replacement, "replacement") == "rank 0"
 
 
 def _mirror(store_port, rank, steps):
@@ -291,7 +295,7 @@ def test_original_rank_waits_for_every_rank(monkeypatch):
     The client's own ``record`` attribute never changes, so a wait that polls it would not return.
     """
     starting = MembershipRecord(generation=0, state=MembershipState.STARTING, active_mask=0b1111)
-    client = Mock(record=starting)
+    client = Mock(record=starting, rank=1)
     monkeypatch.setattr(recovery_module, "_client", client)
     monkeypatch.setattr(recovery_module, "_every_rank_started", threading.Event())
 
@@ -303,11 +307,14 @@ def test_original_rank_waits_for_every_rank(monkeypatch):
             starting.model_copy(update={"state": MembershipState.COMMITTED})
         )
 
-    threading.Thread(target=records, daemon=True).start()
+    delivery = threading.Thread(target=records, daemon=True)
+    delivery.start()
     began = time.monotonic()
     waiter = threading.Thread(target=recovery_module.wait_for_every_rank, daemon=True)
     waiter.start()
     waiter.join(10)
+    delivery.join(10)
     assert not waiter.is_alive()
+    assert not delivery.is_alive()
     assert time.monotonic() - began >= 0.4
     client.report.assert_called_once_with(started=True)

@@ -721,6 +721,7 @@ def test_change_returns_after_exchange_install():
     recovery = _recovery(rank=1)
     for r in (0, 3):
         recovery._store.set(f"host_exchange_rows/1/0/{r}", pickle.dumps(f"rows-{r}".encode()))
+        _mark_arrived(recovery._store, "host_exchange_rows/1/0", r)
     recovery._on_record(_record(MembershipState.PROPOSE))
     done = threading.Thread(target=recovery._change_membership, daemon=True)
     done.start()
@@ -1998,6 +1999,7 @@ def test_original_rank_binds_client_after_startup(agreed_startup, shared_secret,
     client = Mock(
         record=MembershipRecord(generation=0, state=MembershipState.STARTING, active_mask=0b1111),
         bind=Mock(side_effect=lambda *args, **kwargs: events.append("bind")),
+        rank=rank,
         incarnation=0,
     )
 
@@ -2113,6 +2115,7 @@ def test_replacement_waits_for_admission(monkeypatch):
     recovery._executor.iter_counter = 0
     for r in (0, 1, 3):
         recovery._store.set(f"host_exchange_rows/2/0/{r}", pickle.dumps(f"rows-{r}".encode()))
+        _mark_arrived(recovery._store, "host_exchange_rows/2/0", r)
     errors = []
 
     def join():

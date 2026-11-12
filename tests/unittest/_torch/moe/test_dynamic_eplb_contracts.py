@@ -1181,8 +1181,6 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
     ) == expected + [("llm_args", configured)]
 
     # MPI worker process: MPI is the first runtime initialization.
-    # The launcher did not start this rank as its own process for Wide-EP fault tolerance.
-    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_RANK", raising=False)
     worker_main = _extract_function(
         _ROOT / "tensorrt_llm/executor/worker.py",
         "worker_main",
@@ -1190,7 +1188,8 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
             **common,
             "GenerationExecutorWorker": object,
             "mpi_comm": runtime_init("mpi_comm"),
-            "FAULT_TOLERANCE_RANK_ENV": "TLLM_FAULT_TOLERANCE_RANK",
+            "set_wide_ep_fault_tolerance_enabled": lambda enabled: None,
+            "wide_ep_fault_tolerance_enabled": lambda: False,
         },
     )
     args = worker_args()
