@@ -610,7 +610,8 @@ def rendezvous_store(timeout_s: float = 60.0) -> RendezvousStore:
 
 
 _FIRST_POLL_S = 0.001
-STORE_POLL_S = 0.1
+# A membership change runs several store gathers in a row, and each returns at most this long after its last value.
+STORE_POLL_S = 0.005
 
 
 def wait_for_keys(
@@ -618,15 +619,20 @@ def wait_for_keys(
     keys: List[str],
     poll_s: float,
     check: Callable[[Set[str]], None],
+    count_key: Optional[str] = None,
 ) -> List[bytes]:
     """Return the values of ``keys`` once all are set and signed, calling ``check`` after every poll.
 
     A blocking store wait would log a warning at every timeout, so this polls with a backoff up to ``poll_s``.
+    Given ``count_key``, which every writer increments after it sets its key, a poll reads only that count until it
+    reaches the number of keys.
     """
     backoff_s = _FIRST_POLL_S
     while True:
         unsigned: Set[str] = set()
-        if store.store.check(keys):
+        if (count_key is None or store.store.add(count_key, 0) >= len(keys)) and store.store.check(
+            keys
+        ):
             values = store.multi_get(keys)
             if None not in values:
                 return values
@@ -780,6 +786,7 @@ class StoreGroup:
             self._store.store.add(
                 self._counter(prefix, self.rank), 1 << self.rank % _RANKS_PER_COUNTER
             )
+            self._store.store.add(self._count_key(prefix), 1)
             try:
                 values = self._wait(prefix)
             finally:
@@ -788,7 +795,7 @@ class StoreGroup:
                 previous = f"{self._name}/{self._calls - 2}"
                 self._store.store.delete_key(f"{previous}/{self.rank}")
                 if self.rank == min(self._active):
-                    for key in self._counters(previous):
+                    for key in [*self._counters(previous), self._count_key(previous)]:
                         self._store.store.delete_key(key)
         except DistError as error:
             raise RuntimeError(
@@ -815,10 +822,14 @@ class StoreGroup:
                 missing | sum(1 << r for r, key in zip(self._active, keys) if key in unsigned)
             )
 
-        return wait_for_keys(self._store, keys, STORE_POLL_S, check)
+        return wait_for_keys(self._store, keys, STORE_POLL_S, check, self._count_key(prefix))
 
     def _counters(self, prefix: str) -> List[str]:
         return sorted({self._counter(prefix, r) for r in self._active})
+
+    @staticmethod
+    def _count_key(prefix: str) -> str:
+        return f"{prefix}/count"
 
     @staticmethod
     def _counter(prefix: str, rank: int) -> str:

@@ -1065,6 +1065,7 @@ def test_hang_detector_paused_during_change(paused_before):
 def _mark_arrived(store, prefix, rank):
     """Mark ``rank``'s value of the call under ``prefix`` set, as its StoreGroup does."""
     store.store.add(StoreGroup._counter(prefix, rank), 1 << rank % 63)
+    store.store.add(StoreGroup._count_key(prefix), 1)
 
 
 @pytest.mark.timeout(60)
@@ -1083,6 +1084,7 @@ def test_store_gather_reports_awaited_ranks():
     recovery._on_tick()
     assert recovery._client.reports[-1]["waiting_for"] == 1 << 3
     recovery._store.set("rows/1/0/3", pickle.dumps("rows-3"))
+    _mark_arrived(recovery._store, "rows/1/0", 3)
     gathering.join(10)
     assert gathered == [["rows-0", "rows-1", None, "rows-3"]]
     assert recovery._waiting_in_store == 0
@@ -1100,6 +1102,7 @@ def test_unsigned_value_counts_as_not_set():
     store.set("rows/1/0/0", pickle.dumps("rows-0"))
     _mark_arrived(store, "rows/1/0", 0)
     raw.set("rows/1/0/3", bytes(32) + pickle.dumps("forged"))
+    _mark_arrived(store, "rows/1/0", 3)  # The counters are not signed.
     gathered = []
     gathering = threading.Thread(target=lambda: gathered.append(gather("rows-1")), daemon=True)
     gathering.start()
@@ -1110,50 +1113,85 @@ def test_unsigned_value_counts_as_not_set():
     assert gathered == [["rows-0", "rows-1", None, "rows-3"]]
 
 
-@pytest.mark.timeout(60)
-def test_gather_reads_arrival_counters_per_interval(monkeypatch):
-    """Check that waiting ranks read one arrival counter per 63 ranks, once per report interval.
+@pytest.mark.parametrize("world", [4, 256])
+def test_gather_poll_cost_independent_of_ranks(monkeypatch, world):
+    """Check that each poll of a waiting gather reads one store key, whatever the number of ranks.
 
-    One store call per missing rank would load the authority's store at 256 ranks.
+    The gather reads its values once all ranks counted their arrival. To report the missing ranks, it reads one
+    arrival counter per 63 ranks once per report interval.
     """
-    world = 256
+    now_s = [0.0]
+    polls = []
     recovery = _recovery(rank=1)
     recovery.world_size = world
     record = recovery._record = MembershipRecord(
         generation=1, state=MembershipState.INSTALL, active_mask=(1 << world) - 1
     )
-    adds = []
-    checked = []  # The number of keys of each store check.
-    store = recovery._store
-    add, check = store.add, store.check
-    monkeypatch.setattr(store, "add", lambda *args: (adds.append(args), add(*args))[1])
-    monkeypatch.setattr(store, "check", lambda keys: (checked.append(len(keys)), check(keys))[1])
     gather = recovery._active_group(record, "rows").allgather
+    store = recovery._store
+    last = world - 1
     for r in range(world):
-        if r not in (1, 200):
+        if r not in (1, last):
             store.set(f"rows/1/0/{r}", pickle.dumps(r))
             _mark_arrived(store, "rows/1/0", r)
-    adds.clear()
-    checked.clear()
-    gathered = []
-    gathering = threading.Thread(target=lambda: gathered.append(gather(1)), daemon=True)
-    started_s = time.monotonic()
-    gathering.start()
-    try:
-        _wait_until(lambda: recovery._waiting_in_store == 1 << 200)
-        time.sleep(1.0)
-        waited_s = time.monotonic() - started_s
-        # A poll checks all the values in one store call, never one rank's value alone.
-        assert checked
-        assert set(checked) == {world}
-        assert len(checked) <= 10 + waited_s / membership.STORE_POLL_S
-        # This rank's own arrival, then 5 counters per read at most once per report interval.
-        assert len(adds) <= 1 + 5 * (waited_s / membership.REPORT_INTERVAL_S + 1)
-    finally:
-        store.set("rows/1/0/200", pickle.dumps(200))
-        _mark_arrived(store, "rows/1/0", 200)
-        gathering.join(10)
-    assert gathered == [list(range(world))]
+    calls = []  # Each store call of the gathering rank, with its key or its number of keys.
+    add, check, multi_get = store.add, store.check, store.multi_get
+    monkeypatch.setattr(
+        store, "add", lambda key, amount: (calls.append(("add", key, amount)), add(key, amount))[1]
+    )
+    monkeypatch.setattr(
+        store, "check", lambda keys: (calls.append(("check", len(keys))), check(keys))[1]
+    )
+    monkeypatch.setattr(
+        store,
+        "multi_get",
+        lambda keys: (calls.append(("multi_get", len(keys))), multi_get(keys))[1],
+    )
+
+    def sleep(seconds):
+        polls.append(seconds)
+        now_s[0] += seconds
+        if now_s[0] >= 1.0 and not check([f"rows/1/0/{last}"]):
+            store.set(f"rows/1/0/{last}", pickle.dumps(last))
+            add(StoreGroup._counter("rows/1/0", last), 1 << last % 63)
+            add(StoreGroup._count_key("rows/1/0"), 1)
+
+    monkeypatch.setattr(
+        membership, "time", SimpleNamespace(sleep=sleep, monotonic=lambda: now_s[0])
+    )
+    assert gather(1) == list(range(world))
+    count_reads = calls.count(("add", "rows/1/0/count", 0))
+    assert count_reads == len(polls) + 1
+    counter_reads = [c for c in calls if c[0] == "add" and "/arrived/" in c[1] and c[2] == 0]
+    counters = -(-world // 63)
+    assert len(counter_reads) <= counters * (1 + now_s[0] / membership.REPORT_INTERVAL_S)
+    assert [c for c in calls if c[0] != "add"] == [("check", world), ("multi_get", world)]
+    # Besides these, the rank only marks its own arrival in two adds and reads the values once.
+    assert len(calls) == count_reads + len(counter_reads) + 4
+
+
+def test_gather_returns_soon_after_last_value(monkeypatch):
+    """Check that a gather returns within a few milliseconds of its last value, however long it waited."""
+    now_s = [0.0]
+    last_value_s = 1.0
+    recovery = _recovery(rank=1)
+    store = recovery._store
+    record = recovery._record = _record(MembershipState.INSTALL)
+    gather = recovery._active_group(record, "rows").allgather
+    store.set("rows/1/0/0", pickle.dumps("rows-0"))
+    _mark_arrived(store, "rows/1/0", 0)
+
+    def sleep(seconds):
+        now_s[0] += seconds
+        if now_s[0] >= last_value_s and not store.check(["rows/1/0/3"]):
+            store.set("rows/1/0/3", pickle.dumps("rows-3"))
+            _mark_arrived(store, "rows/1/0", 3)
+
+    monkeypatch.setattr(
+        membership, "time", SimpleNamespace(sleep=sleep, monotonic=lambda: now_s[0])
+    )
+    assert gather("rows-1") == ["rows-0", "rows-1", None, "rows-3"]
+    assert now_s[0] - last_value_s <= 0.005
 
 
 # Dropping steps and continuing requests.
@@ -1669,14 +1707,13 @@ def test_install_restores_lost_experts(monkeypatch):
         ("restore", plan),
         "remap",
         "resume",
-        # Once committed, the pool takes back the workspace memory once per change. No spare slot is released.
-        "release",
-        "suspend",
-        ("resize", 58 * MIB),
-        "resume",
     ]
     assert _replies(recovery) == [Reply.INSTALLED]
     assert recovery._client.reports[-1]["placement_digest"] == "restored"
+    _vote(recovery)
+    recovery.before_iteration()
+    # Once serving resumed, the pool takes back the workspace memory once per change. No spare slot is released.
+    assert calls[7:] == ["release", "suspend", ("resize", 58 * MIB), "resume"]
 
 
 def test_install_steps_reported_as_progress(monkeypatch):
@@ -1772,6 +1809,8 @@ def _short_give_back(monkeypatch, record=_INSTALL):
     _, _, device = _eplb(monkeypatch, recovery)
     recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: device.take(4 * MIB)
     recovery.before_iteration()  # The install and the commit.
+    _vote(recovery)
+    recovery.before_iteration()  # The give-back.
     assert device.gpu_quota == 54 * MIB
     assert device.free == FREE_BYTES
     recovery._give_back_retry.check_after_s = 0.0
@@ -1854,11 +1893,10 @@ def test_healthy_step_checks_no_device_memory(monkeypatch):
     recovery._executor._retire_inflight_batch_for_control.assert_not_called()
 
 
-def test_rejoin_releases_spare_slots_after_commit(monkeypatch):
-    """Check that the emptied spare slots keep their memory until the change is committed.
+def test_rejoin_gives_back_memory_after_resume(monkeypatch):
+    """Check that the emptied spare slots and the KV cache pool wait for a step boundary after serving resumes.
 
-    No active rank waits for their release during the transaction. Their memory then goes back to the KV cache
-    pool.
+    Every active rank gives back at the step boundary after a forward vote in which no rank held for a change.
     """
     monkeypatch.setattr(recovery_module.torch.cuda, "synchronize", lambda: None)
     recovery = _resuming_recovery(
@@ -1894,18 +1932,31 @@ def test_rejoin_releases_spare_slots_after_commit(monkeypatch):
         "remap",
         "resume",
         Reply.INSTALLED,
-        "release",
-        "suspend",
-        ("resize", STARTUP_MEMORY.kv_cache_quota),
-        "resume",
     ]
-    assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
+    assert not recovery.pauses_forward()
     recovery._moe.health.mark_active.assert_any_call(FAILED)
-    (resumed,) = [c.args[0] for c in info.call_args_list if "resumed serving" in c.args[0]]
-    assert (
-        f". Released {6 * MIB} bytes of empty spare slots, KV cache quota "
-        f"{STARTUP_MEMORY.kv_cache_quota} bytes, in "
-    ) in resumed
+    retire = recovery._executor._retire_inflight_batch_for_control
+    retire.reset_mock()
+    # Rank 1 holds its steps for the next change, so no rank gives back at this step boundary.
+    assert _vote(recovery, peers=((3, 1, 0), (5, 0, 0), (2, 0, 0)))[0] == [4, 0, 1]
+    recovery.before_iteration()
+    assert calls[-1] == Reply.INSTALLED
+    retire.assert_not_called()
+    assert _vote(recovery)[0] == [4, 0, 1]
+    recovery.before_iteration()
+    retire.assert_called_once()
+    assert calls[8:] == ["release", "suspend", ("resize", STARTUP_MEMORY.kv_cache_quota), "resume"]
+    assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
+    # A rank with nothing to give back still retires its step in flight at the same step boundary.
+    other = _recovery(rank=1)
+    _vote(other, peers=((4, 0, 1), (5, 0, 0), (2, 0, 0)))
+    other.before_iteration()
+    other._executor._retire_inflight_batch_for_control.assert_called_once()
+    (given_back,) = [c.args[0] for c in info.call_args_list if "gave back" in c.args[0]]
+    assert given_back.startswith(
+        f"Rank 0 gave back the memory of membership generation 1. Released {6 * MIB} bytes of empty spare "
+        f"slots, KV cache quota {STARTUP_MEMORY.kv_cache_quota} bytes, in "
+    )
 
 
 @pytest.mark.parametrize("released", [6 * MIB, 0], ids=["spare slots backed", "none backed"])

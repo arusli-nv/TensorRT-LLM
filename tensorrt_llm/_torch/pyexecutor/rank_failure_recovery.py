@@ -531,7 +531,7 @@ class StartupMemory(NamedTuple):
 
 @dataclass
 class _GiveBackRetry:
-    """A KV cache give-back that fell short at a commit.
+    """A KV cache give-back that fell short after a commit.
 
     The give-back is retried as the excluded processes end and free their pages.
     """
@@ -708,6 +708,7 @@ class RankFailureRecovery:
         self._published_admissions: List[int] = []
         self._interrupted: List[LlmRequest] = []
         self._kv_cache_free_to_keep: Optional[int] = None
+        self._give_back_pending = False
         self._give_back_retry: Optional[_GiveBackRetry] = None
         self._give_back_due = False
         self._give_back_agreed = False
@@ -1053,7 +1054,7 @@ class RankFailureRecovery:
     def before_iteration(self) -> None:
         """Finish installing the membership change at the first iteration past the resume point."""
         if self._give_back_agreed:
-            self._retry_give_back()
+            self._give_back_at_step_boundary()
         record = self._installed
         if (
             self._resume_after is None
@@ -1129,7 +1130,8 @@ class RankFailureRecovery:
             for key in _admission_keys(generation):
                 self._store.store.delete_key(key)
         self._published_admissions.clear()
-        given_back = self._give_back_kv_cache()
+        # Serving resumes first. Every rank gives the memory back at the step boundary of the next forward vote.
+        self._give_back_pending = True
         executor.adp_ctx_waiting_iters_count = executor.adp_ctx_batching_wait_iters_count = 0
         held = set().union(*(request_ids for request_ids in gathered if request_ids is not None))
         lost = {r: c for r, c in outstanding.items() if r not in held}
@@ -1144,7 +1146,6 @@ class RankFailureRecovery:
                 if self.rank == 0
                 else ""
             )
-            + given_back
         )
         return True
 
@@ -1201,10 +1202,10 @@ class RankFailureRecovery:
             self._give_back_retry = None
         return freed
 
-    def _retry_give_back(self) -> None:
-        """Retry a KV cache give-back that fell short.
+    def _give_back_at_step_boundary(self) -> None:
+        """Give back the memory of the last committed change, or retry a give-back that fell short.
 
-        Every rank retires its step in flight, which runs collectives, even if only another rank asked for the retry.
+        Every rank retires its step in flight, which runs collectives, even if only another rank gives memory back.
         """
         self._give_back_agreed = False
         torch.cuda.synchronize()
@@ -1212,6 +1213,15 @@ class RankFailureRecovery:
         if not self._give_back_due:
             return
         self._give_back_due = False
+        if self._give_back_pending:
+            self._give_back_pending = False
+            given_back = self._give_back_kv_cache()
+            if given_back:
+                logger.info(
+                    f"Rank {self.rank} gave back the memory of membership generation "
+                    f"{self._installed.generation}{given_back}"
+                )
+            return
         retry = self._give_back_retry
         balancer = _moe_load_balancer_of(self._executor)
         held = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
@@ -1359,8 +1369,9 @@ class RankFailureRecovery:
         """Run the attention-DP forward vote with the pending change and give-back flags, and return the batch sizes."""
         pending = self._pending
         held = pending or self._resume_after is not None
-        self._give_back_due = (
-            not held and self._give_back_retry is not None and self._give_back_retry_due()
+        self._give_back_due = not held and (
+            self._give_back_pending
+            or (self._give_back_retry is not None and self._give_back_retry_due())
         )
         votes = gather([0 if held else batch_size, int(pending), int(self._give_back_due)])
         self._steps_quiet = bool(votes[:, 1].any())
