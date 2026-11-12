@@ -18,9 +18,9 @@ A replacement process then starts on the same GPU and joins, and the deployment 
 healthy (N ranks) --rank fails--> degraded (N-K ranks, same CUDA graphs) --replacement joins--> healthy (N ranks)
 ```
 
-A rank fails when its process exits (a crash, `kill -9`, or the loss of every process of the deployment on its node)
-or when it makes no progress for 30 s while other ranks wait for it. Serving pauses for a few seconds after a crash,
-and for the hang timeout plus a few seconds after a hang.
+A rank fails when its process exits (a crash, `kill -9`, or the loss of every process of the deployment on its node),
+when its node is cut off from the network for 60 s, or when it makes no progress for 30 s while other ranks wait for it.
+Serving pauses for a few seconds after a crash, and for the hang timeout plus a few seconds after a hang.
 
 ## Enabling it
 

@@ -44,6 +44,9 @@ from .host_exchange_epoch import latest_epoch, next_epoch
 MAX_RANKS = 256
 
 HANG_TIMEOUT_S = 30.0
+# A liveness connection fails once its peer acknowledged nothing for this long, as when the peer's node is cut off.
+# It is longer than a network stall that TCP recovers from and shorter than the hang timeout.
+DEAD_TIMEOUT_S = 60.0
 REPORT_INTERVAL_S = 0.5
 RENDEZVOUS_TIMEOUT_S = 600.0
 
@@ -912,6 +915,7 @@ HELLO_TIMEOUT_S = 10.0
 _NONCE_BYTES = 16
 _MAX_LINE_BYTES = 1 << 20
 _MAX_UNSENT_BYTES = 1 << 22
+_KEEPALIVE_PROBES = 6
 # The selector data of the descriptor whose end of file tells the authority that rank 0's process ended.
 _PARENT = object()
 
@@ -968,11 +972,24 @@ class LivenessConnection:
         self.sock.close()
 
 
+def _keep_alive(sock: socket.socket) -> None:
+    """Have the kernel fail ``sock`` once its peer acknowledged nothing for :data:`DEAD_TIMEOUT_S`."""
+    idle_s = int(DEAD_TIMEOUT_S / 2)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_s)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, idle_s // _KEEPALIVE_PROBES)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_PROBES)
+    # Keepalive probes start only on an idle connection, so this bounds a send the peer never acknowledges.
+    if hasattr(socket, "TCP_USER_TIMEOUT"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(DEAD_TIMEOUT_S * 1000))
+
+
 def _open_connection(
     store: RendezvousStore, announcement: str, timeout_s: float
 ) -> LivenessConnection:
     host, port = store.get(LIVENESS_KEY).decode().rsplit(":", 1)
     sock = socket.create_connection((host, int(port)), timeout=timeout_s)
+    _keep_alive(sock)
     authority_nonce = bytes.fromhex(_read_line(sock).decode())
     hello = announcement.encode()
     sock.sendall(store.tag(b"hello", authority_nonce + hello).hex().encode() + b" " + hello + b"\n")
@@ -1319,6 +1336,7 @@ class AuthorityProcess:
                 self._drop(waiting[0])
             return
         sock.setblocking(False)
+        _keep_alive(sock)
         nonce = os.urandom(_NONCE_BYTES)
         try:
             sock.send(nonce.hex().encode() + b"\n")  # fits the empty send buffer

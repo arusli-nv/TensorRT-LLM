@@ -17,6 +17,7 @@
 import contextlib
 import json
 import os
+import random
 import socket
 import threading
 import time
@@ -762,6 +763,24 @@ def test_shutdown_record_precedes_close():
         _leave(clients)
         os.close(parent_read)
     assert states_at_close == [MembershipState.SHUTDOWN]
+def test_liveness_connections_keep_alive(monkeypatch):
+    """Enable TCP keepalive at both ends of the connections of a rank and of a node supervisor."""
+    keep_alive, opened = membership._keep_alive, []
+    monkeypatch.setattr(
+        membership, "_keep_alive", lambda sock: keep_alive(sock) or opened.append(sock)
+    )
+    with _deployment(1) as (store, clients):
+        _NodeSupervisor(store, 0, [0]).until(lambda view: view.nodes)
+        assert len(opened) == 4
+        assert clients[0]._sock in opened
+        for sock in opened:
+            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+            idle_s = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE)
+            interval_s = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL)
+            probes = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT)
+            assert idle_s + interval_s * probes == membership.DEAD_TIMEOUT_S
+            user_timeout_ms = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT)
+            assert user_timeout_ms == membership.DEAD_TIMEOUT_S * 1000
 
 
 def test_deployment_at_rest_is_quiet():
@@ -906,3 +925,65 @@ def test_transaction_summary_spans_propose_to_commit():
     # A closed connection is proposed in the tick that sees it, and the simulated ranks install in one step.
     assert summary.detected_unix_ms == summary.began_unix_ms
     assert summary.ended_unix_ms - summary.ready_unix_ms == pytest.approx(50.0)
+
+
+def _interleave(cluster, rng):
+    """Apply one random crash, hang, join, join readiness or install outcome, and delay random reports."""
+    record, r = cluster.authority.record, rng.randrange(1, cluster.authority.world_size)
+    event = rng.randrange(5)
+    if event == 0:
+        cluster.alive.discard(r)
+    elif event == 1 and r not in cluster.alive:
+        _join(cluster, r)
+        cluster.unprepared.add(r)
+        cluster.hung.discard(r)
+        cluster.digest[r], cluster.install_reply[r] = "placement-a", Reply.INSTALLED
+    elif event == 2:
+        cluster.unprepared.discard(r)
+    elif event == 3 and rng.random() < 0.1:
+        cluster.hung.add(r)
+    elif event == 4 and (record.is_joining(r) or rng.random() < 0.01):
+        if rng.random() < 0.5:
+            cluster.digest[r] = "placement-b"
+        else:
+            cluster.install_reply[r] = Reply.FAILED
+    cluster.stopped = {q for q in cluster.alive if rng.random() < 0.2}
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_random_interleavings_keep_invariants(seed):
+    """Check the protocol's invariants after every tick of random failures, joins and late replies."""
+    rng, world = random.Random(seed), 4 + seed % 5
+    cluster = Cluster(world, hang_timeout_s=1.0)
+    expected = {MembershipState.PROPOSE: Reply.READY, MembershipState.INSTALL: Reply.INSTALLED}
+    record = cluster.authority.record
+    committed, joining = record.active_mask, 0
+    for step in range(600):
+        if step < 400:
+            _interleave(cluster, rng)
+        else:
+            cluster.stopped, cluster.unprepared = set(), set()
+        previous, new = record, cluster.step()
+        record = cluster.authority.record
+        assert record.generation >= previous.generation
+        if record.state == MembershipState.PROPOSE and new is not None:
+            assert record.generation > previous.generation
+        if record.state == MembershipState.ABORTED:
+            break
+        assert record.active_mask & ~sum(1 << r for r in cluster.alive) == 0
+        active = [r for r in range(world) if record.is_active(r)]
+        replied = [
+            cluster.reports[r].reply_generation == record.generation
+            and cluster.reports[r].reply == expected.get(previous.state)
+            for r in active
+        ]
+        if record.state in expected:
+            joining = record.joining_mask
+            assert record.active_mask & ~committed & ~joining == 0
+            assert new is not None or not all(replied)
+        elif new is not None:
+            assert previous.state == MembershipState.INSTALL
+            assert all(replied)
+            assert record.active_mask & ~committed & ~joining == 0
+            committed = record.active_mask
+    assert record.state in (MembershipState.COMMITTED, MembershipState.ABORTED)
