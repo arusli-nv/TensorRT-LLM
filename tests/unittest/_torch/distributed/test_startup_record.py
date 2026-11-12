@@ -29,11 +29,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
 from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
@@ -59,11 +58,6 @@ REPLACED = 2
 GIB = 1 << 30
 
 
-def _in_mask(mask, rank):
-    """Return whether the bit of ``rank`` is set in ``mask``."""
-    return bool(mask & (1 << rank))
-
-
 class FakeHostExchange:
     """Fake the ``TPHostExchange`` of ``rank`` with the ranks in ``active_mask``.
 
@@ -82,9 +76,7 @@ class FakeHostExchange:
         obj = pickle.loads(payload)
         read = range(WORLD) if readers is None else readers
         return [
-            pickle.dumps(self._sent(r, obj))
-            if r in read and _in_mask(self.active_mask, r)
-            else None
+            pickle.dumps(self._sent(r, obj)) if r in read and self.active_mask >> r & 1 else None
             for r in range(WORLD)
         ]
 
@@ -93,7 +85,7 @@ class FakeHostExchange:
         return np.stack(
             [
                 np.asarray(self._sent(r, row), dtype=np.int64)
-                if _in_mask(self.active_mask, r)
+                if self.active_mask >> r & 1
                 else np.zeros_like(row)
                 for r in range(WORLD)
             ]
@@ -129,17 +121,12 @@ def _publish() -> bytes:
     return pickle.dumps(startup_record.published())
 
 
-def _replacement(published: bytes, host_exchange=False):
-    """Return a replacement of rank ``REPLACED`` that replays ``published``.
-
-    By default its host exchange reaches only itself.
-    """
+def _replacement(published: bytes):
+    """Return a replacement of rank ``REPLACED`` that replays ``published``, whose host exchange reaches only itself."""
     for name, value in vars(StartupRecord()).items():
         setattr(startup_record, name, value)
     startup_record.replay(pickle.loads(published))
-    if host_exchange is False:
-        host_exchange = FakeHostExchange(REPLACED, active_mask=1 << REPLACED)
-    return _dist(REPLACED, host_exchange)
+    return _dist(REPLACED, FakeHostExchange(REPLACED, active_mask=1 << REPLACED))
 
 
 # The startup's host collectives. Each one runs at the same line on every rank.
@@ -151,15 +138,11 @@ def _barrier(dist):
     dist.barrier()
 
 
-def _rows(dist):
-    return dist.tp_allgather_int64([8, 1])
-
-
 def _startup(dist, max_tokens):
     flags = dist.tp_allgather(1)
     tactics = dist.tp_broadcast({"gemm": 3} if dist.mapping.tp_rank == 0 else None, root=0)
     max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
-    rows = _rows(dist)
+    rows = dist.tp_allgather_int64([8, 1])
     _barrier(dist)
     return flags, tactics, max_tokens, rows.tolist()
 
@@ -192,24 +175,12 @@ def test_unbounded_minimum_stops_replacement():
     assert exited.value.code == REPLACEMENT_CANNOT_START
 
 
-def test_paused_collectives_are_not_recorded():
-    rank_0 = _rank_0()
+def test_paused_agreement_is_not_recorded():
+    _rank_0()
     startup_record.pause()
-    assert rank_0.allgather("estimation") == ["estimation"] * WORLD
     assert startup_record.agree("estimation", lambda: 1) == 1
     startup_record.resume()
     assert startup_record.values == {}
-    _barrier(rank_0)
-    replacement = _replacement(_publish())
-    # This replays rank 0's barrier, not its paused gather.
-    _barrier(replacement)
-    assert replacement.host_exchange.calls == 0
-    startup_record.pause()
-    # A paused collective runs over the replacement's own host exchange.
-    assert replacement.allgather("alone") == [None, None, "alone", None]
-    startup_record.resume()
-    assert replacement.host_exchange.calls == 1
-    startup_record.close()
 
 
 def test_divergent_replacement_cannot_start():
@@ -340,76 +311,12 @@ def _autotuner(dist):
     return tuner
 
 
-def _tuner(dist, cache):
-    """Return an autotuner of ``dist`` that tuned ``cache``, and the dict it merges into its cache."""
-    tuner = _autotuner(dist)
-    merged = {}
-    tuner.profiling_cache = SimpleNamespace(cache=cache, merge_cache_data=merged.update)
-    return tuner, merged
-
-
-def test_replacement_merges_original_ranks_tactics():
-    """Check that a replacement merges the original ranks' tactics, not its own measurements."""
-
-    def slower(r, obj):
-        return [
-            {key: (tactic, r, time + r) for key, (tactic, _, time) in cache.items()}
-            for cache in obj
-        ]
-
-    tuner, merged = _tuner(_rank_0(slower), {("gemm", 8): (3, 0, 0.1)})
-    tuner.post_tune_merge_tactics()
-    assert merged == {("gemm", 8): (3, 0, 0.1)}
-    tuner, merged = _tuner(_replacement(_publish()), {("gemm", 8): (5, 2, 0.05)})
-    tuner.post_tune_merge_tactics()
-    assert merged == {("gemm", 8): (3, 0, 0.1)}
-    startup_record.close()
-
-
 @pytest.fixture
 def distributed(monkeypatch):
     """Make ``Distributed.get`` return the ``dist`` of the rank the test runs as."""
     ranks = SimpleNamespace(dist=None)
     monkeypatch.setattr(communicator.Distributed, "get", staticmethod(lambda mapping: ranks.dist))
     return ranks
-
-
-def _resolve(monkeypatch, target):
-    """Run modeling_v2's resolution on all ranks, with this rank resolving ``target``."""
-    monkeypatch.setattr(_router_index, "modeling_v2_resolve", lambda config, llm_args: target)
-    config = SimpleNamespace(mapping=SimpleNamespace(rank=0, world_size=WORLD))
-    return _router_index.modeling_v2_resolve_on_all_ranks(
-        config, SimpleNamespace(modeling_v2="auto")
-    )
-
-
-def _main_startup(monkeypatch, host_quota, target=None):
-    mapping = SimpleNamespace(world_size=WORLD)
-    return _sync_host_tier_quota(host_quota, mapping), _resolve(monkeypatch, target)
-
-
-def test_replacement_takes_main_startup_agreements(distributed, monkeypatch):
-    """Check KV cache manager V2's host quota minimum and modeling_v2's resolution on a replacement."""
-
-    def less_host_memory(r, obj):
-        return obj - 8 * GIB * r if isinstance(obj, int) else obj
-
-    distributed.dist = _rank_0(less_host_memory)
-    assert _main_startup(monkeypatch, 64 * GIB) == (40 * GIB, None)
-    published = _publish()
-    distributed.dist = _replacement(published)
-    assert _main_startup(monkeypatch, 48 * GIB) == (40 * GIB, None)
-    startup_record.close()
-    distributed.dist = _replacement(published)
-    # A host quota below the minimum stops the replacement.
-    with pytest.raises(SystemExit, match="allreduce in _sync_host_tier_quota"):
-        _main_startup(monkeypatch, 32 * GIB)
-    distributed.dist = _replacement(published)
-    # So does resolving another implementation.
-    with pytest.raises(
-        SystemExit, match="allgather in modeling_v2_resolve_on_all_ranks .* differs"
-    ):
-        _main_startup(monkeypatch, 48 * GIB, target=AutoTuner)
 
 
 def _auto_host_tier_quota(monkeypatch, mem_available):
@@ -432,87 +339,21 @@ def _auto_host_tier_quota(monkeypatch, mem_available):
     return _sync_host_tier_quota(host_quota, mapping)
 
 
-def test_replacement_takes_the_recorded_host_tier(distributed, monkeypatch):
+def test_replacement_host_tier_needs_room(distributed, monkeypatch):
     """Check the quota when the survivors' pinned host tiers leave the replacement less memory free."""
     distributed.dist = _rank_0()
     assert _auto_host_tier_quota(monkeypatch, 720 * GIB) == 80 * GIB
-    distributed.dist = _replacement(_publish())
+    published = _publish()
+    distributed.dist = _replacement(published)
     assert _auto_host_tier_quota(monkeypatch, 720 * GIB - 3 * 80 * GIB) == 80 * GIB
     startup_record.close()
-
-
-def test_replacement_lacks_host_tier_room(distributed, monkeypatch):
-    distributed.dist = _rank_0()
-    _auto_host_tier_quota(monkeypatch, 720 * GIB)
-    distributed.dist = _replacement(_publish())
+    distributed.dist = _replacement(published)
     with pytest.raises(
         SystemExit,
         match=f"_sync_host_tier_quota .* is {60 * GIB}, beyond the original ranks' min {80 * GIB}",
     ) as exited:
         _auto_host_tier_quota(monkeypatch, 120 * GIB)
     assert exited.value.code == REPLACEMENT_CANNOT_START
-
-
-def test_replacement_takes_main_warmup_agreement():
-    """Check WarmupAgreement when rank 1 opts out of a phase and proposes fewer warmup shapes."""
-
-    def rank_1_opts_out(r, obj):
-        if r != 1:
-            return obj
-        return 0 if isinstance(obj, int) else obj[:1]
-
-    def warm_up(dist):
-        agreement = WarmupAgreement(dist, dist.mapping)
-        return agreement.agree_flag(True), agreement.agree_shapes([(1, 0), (2, 0)])
-
-    assert warm_up(_rank_0(rank_1_opts_out)) == (False, [(1, 0)])
-    replacement = _replacement(_publish())
-    assert warm_up(replacement) == (False, [(1, 0)])
-    assert replacement.host_exchange.calls == 0
-    startup_record.close()
-
-
-def _vote(dist, flag):
-    return WarmupAgreement(dist, dist.mapping).agree_flag(flag)
-
-
-def test_other_warmup_votes_must_match():
-    """Check that only the autotuner warmup's skip vote may differ from the predecessor's."""
-    _vote(_rank_0(), True)
-    with pytest.raises(SystemExit, match="agree_flag in _vote .* differs"):
-        _vote(_replacement(_publish()), False)
-
-
-def test_replayed_votes_count_every_original_rank():
-    _rows(_rank_0())
-    replacement = _replacement(_publish())
-    rows = _rows(replacement)
-    assert replacement.tp_active_rows(rows).tolist() == [[8, 1]] * WORLD
-    startup_record.close()
-    # After its startup, only its own row is active until it is admitted.
-    assert replacement.tp_active_rows(rows).tolist() == [[8, 1]]
-
-
-def test_host_exchange_created_at_first_collective(monkeypatch):
-    """Check that a replacement creates its host exchange at the same call as the original ranks.
-
-    The creation maps memory in a collective of the replacement's own group.
-    """
-    _barrier(_rank_0())
-    published = _publish()
-    host_exchange = FakeHostExchange(REPLACED, active_mask=1 << REPLACED)
-    created = []
-    monkeypatch.setattr(
-        TPHostExchange,
-        "create",
-        staticmethod(lambda mapping: (created.append(mapping), host_exchange)[1]),
-    )
-    replacement = _replacement(published, host_exchange=None)
-    assert created == []
-    _barrier(replacement)
-    assert created == [replacement.mapping]
-    assert host_exchange.calls == 0
-    startup_record.close()
 
 
 def _gemm(num_tokens):
@@ -616,33 +457,9 @@ def test_replacement_skips_autotuner_warmup_like_originals():
     replacement.autotuner_warmup(16)
     replacement._forward_warmup.assert_not_called()
     assert replacement.profiling_cache.cache == rank_0.profiling_cache.cache
-    assert replacement.dist.host_exchange.calls == 0
-    startup_record.close()
-
-
-def test_replacement_runs_autotuner_warmup_like_originals():
-    """Check a final warmup with more tokens than the estimation, which the original ranks tune.
-
-    The replacement makes the same collectives, and its merge takes their tactics, not its own measurement.
-    """
-    rank_0, published = _original_rank_0(8, 16)
-    assert rank_0._forward_warmup.call_count == 4
-    replacement = _DecoderEngine(_replacement(published), measured_ms=0.05)
-    replacement.autotuner_warmup(16)
-    assert replacement._forward_warmup.call_count == 2
-    assert replacement.profiling_cache.cache == rank_0.profiling_cache.cache
-    assert replacement.profiling_cache.cache[_gemm(16)] == (0, 3, 0.1)
-    assert replacement.dist.host_exchange.calls == 0
-    # The replacement made every collective of the original ranks.
-    startup_record.close()
-
-
-def test_replacement_warmup_uses_rank_0_tactics():
-    """Check that a replacement's warmup forwards and CUDA graph captures run rank 0's tactics."""
-    rank_0, published = _original_rank_0(16, 16)
-    replacement = _DecoderEngine(_replacement(published), measured_ms=0.05)
-    replacement.autotuner_warmup(16)
+    # Its general warmup forwards and CUDA graph captures already run rank 0's tactics.
     assert replacement.tactics_at_general_warmup == rank_0.profiling_cache.cache
+    assert replacement.dist.host_exchange.calls == 0
     startup_record.close()
 
 

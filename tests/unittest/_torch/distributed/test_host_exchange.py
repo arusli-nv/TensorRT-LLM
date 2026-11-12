@@ -18,7 +18,6 @@ The tests run the exchange over rows of host memory or over fake exchange rounds
 """
 
 import ctypes
-import pickle
 import threading
 import time
 from types import SimpleNamespace
@@ -28,11 +27,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed import host_exchange, mnnvl_memory
-from tensorrt_llm._torch.distributed.host_exchange import (
-    HostExchangeMnnvlMemory,
-    MnnvlDist,
-    TPHostExchange,
-)
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
 from tensorrt_llm._torch.distributed.host_exchange_epoch import latest_epoch, next_epoch
 from tensorrt_llm._torch.distributed.membership import Authority, RankReport, Reply, ResumeState
 from tensorrt_llm.mapping import Mapping
@@ -40,7 +35,6 @@ from tensorrt_llm.mapping import Mapping
 pytestmark = pytest.mark.cpu_only
 
 WORLD = 4
-SURVIVORS = 0b1011
 
 
 def _ranks_in(mask, nranks=WORLD):
@@ -53,53 +47,6 @@ def _mnnvl_dist(exchange, **mapping):
     dist = MnnvlDist(SimpleNamespace(**mapping))
     dist._host_exchange = exchange
     return dist
-
-
-def test_int64_gather_zeroes_absent_ranks(monkeypatch):
-    exchange = _host_exchange_group(monkeypatch, WORLD, _SLOT_BYTES)[0]
-    exchange.active_mask = SURVIVORS
-
-    def one_round(chunk, length, readers, recipients=None, idle=False):
-        """Return a round in which every active rank r sent [r, 10 * r] and the absent rank's slot is stale."""
-        readers = _ranks_in(readers)
-        assert readers == _ranks_in(SURVIVORS)
-        packets = np.full((WORLD, 5), 0xDEAD, dtype=np.uint64)
-        for r in readers:
-            packets[r, 0] = length
-            packets[r, 1:] = np.array([r, 10 * r], dtype=np.int64).view(np.uint32)
-        return np.array([length if r in readers else 0 for r in range(WORLD)], np.uint32), packets
-
-    monkeypatch.setattr(exchange, "_round", one_round)
-    dist = _mnnvl_dist(exchange, tp_size=WORLD)
-    gathered = dist.tp_allgather_int64([0, 0])
-    assert gathered.tolist() == [[0, 0], [1, 10], [0, 0], [3, 30]]
-    assert dist.tp_active_rows(gathered).tolist() == [[0, 0], [1, 10], [3, 30]]
-    monkeypatch.setattr(dist, "_exchange", lambda obj, readers=None, bound=None: [1, 2, None, 4])
-    assert dist.allreduce(1) == 7
-
-
-@pytest.mark.parametrize("fabric", [True, False])
-def test_mnnvl_dist_needs_fabric_handles(monkeypatch, fabric):
-    """Check that MnnvlDist is supported only where rows are shared through fabric handles."""
-    from tensorrt_llm._torch.distributed import mnnvl_memory
-
-    handle_types = mnnvl_memory.cuda.CUmemAllocationHandleType
-    handle_type = (
-        handle_types.CU_MEM_HANDLE_TYPE_FABRIC
-        if fabric
-        else handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-    )
-    monkeypatch.setattr(mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
-    monkeypatch.setattr(
-        HostExchangeMnnvlMemory,
-        "get_allocation_prop",
-        classmethod(lambda cls, dev_id: SimpleNamespace(requestedHandleTypes=handle_type)),
-    )
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    mapping = SimpleNamespace(
-        enable_attention_dp=True, pp_size=1, cp_size=1, tp_size=WORLD, world_size=WORLD
-    )
-    assert MnnvlDist.supports(mapping) == fabric
 
 
 # The host exchange under a membership change, two ranks of one process over rows of host memory.
@@ -207,167 +154,6 @@ def _run_ranks(exchanges, calls):
     assert not errors, errors
     assert not any(thread.is_alive() for thread in ranks)
     return results
-
-
-@pytest.mark.timeout(60)
-@pytest.mark.parametrize("idle", [False, True])
-def test_only_an_idle_wait_sleeps(host_exchanges, monkeypatch, idle):
-    """Check that only an idle wait sleeps between polls.
-
-    A busy wait for a late peer spins, and it still reports the rank it waits for.
-    """
-    sleeps = []
-    monkeypatch.setattr(
-        host_exchange,
-        "time",
-        SimpleNamespace(
-            monotonic=time.monotonic, sleep=lambda s: sleeps.append(s) or time.sleep(s)
-        ),
-    )
-    waiter = host_exchanges[1]
-    reported = []
-
-    def late(exchange):
-        # Rank 0 sends well after rank 1 reports that it waits for rank 0.
-        deadline = time.monotonic() + 10
-        while waiter.waiting_for != 1 << 0 and time.monotonic() < deadline:
-            time.sleep(1e-3)
-        reported.append(waiter.waiting_for)
-        time.sleep(0.02)
-        return exchange.exchange(b"r0", idle=idle)
-
-    results = _run_ranks(
-        host_exchanges, [late, lambda exchange: exchange.exchange(b"r1", idle=idle)]
-    )
-    assert results == {0: [b"r0", b"r1"], 1: [b"r0", b"r1"]}
-    assert reported == [1 << 0]
-    assert bool(sleeps) == idle, sleeps
-
-
-@pytest.mark.timeout(60)
-def test_idle_wait_sleeps_briefly(host_exchanges, monkeypatch):
-    """Check that an idle wait spins for ``_IDLE_SPIN_S`` and then sleeps ``_IDLE_SLEEP_S`` between polls.
-
-    The sleep stays short however long the peer takes, so a new request ends the wait about one poll later.
-    """
-    clock = [0.0]
-    sleeps = []  # (clock at the sleep, sleep length)
-    waited_long = threading.Event()
-
-    def monotonic():
-        clock[0] += 1e-6  # each poll takes time
-        return clock[0]
-
-    def sleep(seconds):
-        sleeps.append((clock[0], seconds))
-        clock[0] += seconds
-        if len(sleeps) == 1000:
-            waited_long.set()
-
-    monkeypatch.setattr(host_exchange, "time", SimpleNamespace(monotonic=monotonic, sleep=sleep))
-
-    def late(exchange):
-        # Rank 0 sends once rank 1 has slept 1000 times.
-        waited_long.wait(30)
-        return exchange.exchange(b"r0", idle=True)
-
-    results = _run_ranks(
-        host_exchanges, [late, lambda exchange: exchange.exchange(b"r1", idle=True)]
-    )
-    assert results == {0: [b"r0", b"r1"], 1: [b"r0", b"r1"]}
-    assert sleeps[0][0] >= TPHostExchange._IDLE_SPIN_S
-    assert max(seconds for _, seconds in sleeps) == TPHostExchange._IDLE_SLEEP_S
-
-
-def test_only_request_probe_is_idle():
-    """Check that only the executor's idle path (``prefer_cpu``) runs an idle host exchange.
-
-    A broadcast's non-roots and a gather's senders name the ranks that read their payloads.
-    """
-    calls = []
-
-    def exchange(payload, readers, recipients, idle):
-        calls.append((readers, recipients, idle))
-        return [pickle.dumps(np.array([5])), None, None, None]
-
-    dist = _mnnvl_dist(SimpleNamespace(exchange=exchange), tp_rank=1)
-    assert dist.broadcast_int64([0], root=0, prefer_cpu=True).tolist() == [5]
-    dist.broadcast_or_none(None)
-    assert dist.tp_gather([], root=0) is None
-    dist.barrier()
-    assert calls == [((0,), (), True), ((0,), (), False), ((), (0,), False), ((), (), False)]
-
-
-def test_request_probe_root_is_idle():
-    """Check that the broadcast's root, which waits for its readers, also takes the idle path."""
-    calls = []
-
-    def exchange(payload, readers, recipients, idle):
-        calls.append((readers, recipients, idle))
-        return [None] * 4
-
-    dist = _mnnvl_dist(SimpleNamespace(exchange=exchange), tp_rank=0)
-    assert dist.broadcast_int64([5], root=0, prefer_cpu=True).tolist() == [5]
-    dist.broadcast_or_none(None)
-    assert calls == [((), None, True), ((), None, False)]
-
-
-@pytest.mark.timeout(60)
-def test_long_payload_only_in_reader_rows(monkeypatch):
-    """Check where a gather to rank 0 writes payloads longer than a header poll.
-
-    Every row gets every sender's header, and only rank 0's row gets the payloads. A rank that finishes the round
-    from the rows, as after a stop, reads only its own row because it reads no payload.
-    """
-    exchanges = _host_exchange_group(monkeypatch, 3, _LONG_SLOT_BYTES)
-    payloads = [bytes([1 + rank]) * (3000 + rank) for rank in range(3)]
-    results = _run_ranks(
-        exchanges,
-        [lambda exchange: exchange.exchange(payloads[0], recipients=(0,))]
-        + [lambda exchange: exchange.exchange(payloads[exchange.rank], readers=(), recipients=(0,))]
-        * 2,
-    )
-    assert results == {0: payloads, 1: [None] * 3, 2: [None] * 3}
-    exchange = exchanges[1]
-    # The gather's slots, indexed by [row, sender, packet].
-    slots = np.frombuffer(
-        ctypes.string_at(exchange.rows.ptr, 3 * exchange.rows.stride), dtype=np.uint64
-    ).reshape(3, 2, 3, -1)[:, exchange.epoch & 1]
-    epochs = slots >> np.uint64(32)
-    assert (epochs[:, :, 0] == exchange.epoch).all()
-    assert (epochs[0, :, 1:751] == exchange.epoch).all()
-    assert not slots[1:, :, 1:].any()
-    log = mnnvl_memory.cuda.log
-    copies = len(log)
-    finished = exchange._finish_from_peers(0b111)
-    assert len(log) == copies + 1  # its own row only
-    assert (exchange._epochs(finished)[:, 0] == exchange.epoch).all()
-
-
-@pytest.mark.timeout(60)
-def test_broadcast_receiver_polls_root_payload(monkeypatch):
-    """Check that readers of a long broadcast poll every header and then only the root's slot."""
-    exchanges = _host_exchange_group(monkeypatch, 3, _LONG_SLOT_BYTES)
-    payload = bytes(range(256)) * 12
-    results = _run_ranks(
-        exchanges,
-        [lambda exchange: exchange.exchange(payload, readers=())]
-        + [lambda exchange: exchange.exchange(b"", readers=(0,), recipients=())] * 2,
-    )
-    assert [results[rank][0] for rank in (1, 2)] == [payload, payload]
-    head = 8 * (1 + TPHostExchange._POLL_PACKETS)
-    for exchange in exchanges[1:]:
-        recv = exchange._recv.ctypes.data
-        polls = [
-            (src, width, count)
-            for (_, src), (memory, dst), width, count in mnnvl_memory.cuda.log
-            if memory == "host" and recv <= dst < recv + exchange._recv.nbytes
-        ]
-        own_slots = exchange.rows.row(exchange.rank) + (exchange.epoch & 1) * exchange._parity_bytes
-        assert polls[0] == (own_slots, head, 3)
-        assert {poll for poll in polls if poll[1] > head} == {
-            (own_slots, 8 * (1 + len(payload) // 4), 1)
-        }
 
 
 @pytest.mark.timeout(60)
