@@ -585,14 +585,20 @@ class Authority:
 
 
 class RendezvousStore:
-    """A torch ``TCPStore`` whose values carry an HMAC-SHA256 tag under the shared secret."""
+    """A torch ``TCPStore`` whose values carry an HMAC-SHA256 tag under the shared secret.
 
-    def __init__(self, store, secret: bytes):
+    The tag binds a value to its key and to the deployment nonce, which the authority draws. A value of a membership
+    generation has the generation in its key. So a value moved to another key, or replayed from another deployment
+    with the same secret, fails verification.
+    """
+
+    def __init__(self, store, secret: bytes, deployment_nonce: Optional[bytes] = None):
         self.store = store
+        self.deployment_nonce = deployment_nonce
         self._secret = secret
 
     def set(self, key: str, value: bytes) -> None:
-        self.store.set(key, self.tag(key.encode(), value) + value)
+        self.store.set(key, self._value_tag(key, value) + value)
 
     def get(self, key: str) -> bytes:
         """Return the value of ``key`` once it is set, or raise PermissionError if it is not signed."""
@@ -612,13 +618,19 @@ class RendezvousStore:
             for key, raw in zip(keys, self.store.multi_get(keys) if keys else [])
         ]
 
-    def tag(self, key: bytes, value: bytes) -> bytes:
-        message = len(key).to_bytes(4, "little") + key + value
+    def tag(self, *fields: bytes) -> bytes:
+        """Return the HMAC-SHA256 tag of ``fields`` under the shared secret."""
+        message = b"".join(len(field).to_bytes(4, "little") + field for field in fields)
         return hmac.new(self._secret, message, hashlib.sha256).digest()
+
+    def _value_tag(self, key: str, value: bytes) -> bytes:
+        # A process reads the liveness address before the authority gives it the deployment nonce.
+        nonce = b"" if key == LIVENESS_KEY else self.deployment_nonce
+        return self.tag(b"store", nonce, key.encode(), value)
 
     def _verified(self, key: str, raw: bytes) -> Optional[bytes]:
         tag, value = raw[:32], raw[32:]
-        return value if hmac.compare_digest(tag, self.tag(key.encode(), value)) else None
+        return value if hmac.compare_digest(tag, self._value_tag(key, value)) else None
 
 
 LIVENESS_KEY = "liveness"
@@ -642,7 +654,13 @@ def authority_ports(address: str) -> Tuple[str, int, int]:
 
 
 def open_store(address: str, secret: bytes, timeout_s: float) -> RendezvousStore:
-    """Open a client of the store the authority hosts at ``host:port``."""
+    """Open a client of the store the authority hosts at ``host:port``.
+
+    The client takes the deployment nonce from the authority's first line on a liveness connection.
+
+    Raises:
+        PermissionError: The authority's line is not signed with the shared secret.
+    """
     from datetime import timedelta
 
     from torch.distributed import TCPStore
@@ -655,7 +673,22 @@ def open_store(address: str, secret: bytes, timeout_s: float) -> RendezvousStore
         timeout=timedelta(seconds=timeout_s),
         wait_for_workers=False,
     )
-    return RendezvousStore(store, secret)
+    rendezvous = RendezvousStore(store, secret)
+    with _open_connection(rendezvous, "store", timeout_s) as connection:
+        connection.sock.settimeout(timeout_s)
+        received = []
+        while not received:
+            data = connection.sock.recv(1 << 16)
+            if not data:
+                raise ConnectionError("the membership authority closed the liveness connection")
+            try:
+                received = connection.lines.decode(data)
+            except ValueError as error:
+                raise PermissionError(
+                    f"the membership authority at {address} does not sign with the shared secret"
+                ) from error
+    rendezvous.deployment_nonce = connection.deployment_nonce
+    return rendezvous
 
 
 def rendezvous_store(timeout_s: float = 60.0) -> RendezvousStore:
@@ -910,7 +943,6 @@ class ReplacementCannotStart(SystemExit):
         self.code = REPLACEMENT_CANNOT_START
 
 
-# The hello is tagged under the shared secret and the authority's nonce, so a recorded hello opens no other connection.
 HELLO_TIMEOUT_S = 10.0
 _NONCE_BYTES = 16
 _MAX_LINE_BYTES = 1 << 20
@@ -920,8 +952,8 @@ _KEEPALIVE_PROBES = 6
 _PARENT = object()
 
 
-def _line(message: _Message) -> bytes:
-    return message.model_dump_json().encode() + b"\n"
+def _json(message: _Message) -> bytes:
+    return message.model_dump_json().encode()
 
 
 def _decided_at_once(report: RankReport) -> tuple:
@@ -936,16 +968,51 @@ def _decided_at_once(report: RankReport) -> tuple:
 
 
 class _Lines:
-    """The lines one side of a liveness connection receives after the hello."""
+    """The signed lines of one side of a liveness connection.
 
-    def __init__(self):
+    Each line carries an HMAC-SHA256 tag over the deployment nonce, both sides' connection nonces, the line's
+    direction and its number. So a line that is forged, replayed from another connection or reordered fails
+    verification.
+    """
+
+    def __init__(self, store: RendezvousStore, nonces: Tuple[bytes, bytes, bytes], authority: bool):
+        self._store = store
+        self._nonces = nonces
+        directions = (b"to authority", b"from authority")
+        self._incoming, self._outgoing = directions if authority else directions[::-1]
+        self._sent = 0
+        self._received = 0
         self._buffer = b""
 
+    def encode(self, payload: bytes) -> bytes:
+        """Return the signed line that carries ``payload``."""
+        tag = self._tag(self._outgoing, self._sent, payload)
+        self._sent += 1
+        return tag.hex().encode() + b" " + payload + b"\n"
+
     def decode(self, data: bytes) -> List[bytes]:
+        """Return the payloads of the lines that ``data`` completes.
+
+        Raises:
+            ValueError: A line is too long or not signed with the shared secret.
+        """
         *lines, self._buffer = (self._buffer + data).split(b"\n")
         if len(self._buffer) > _MAX_LINE_BYTES:
             raise ValueError("a liveness line is too long")
-        return lines
+        return [self._verified(line) for line in lines]
+
+    def _verified(self, line: bytes) -> bytes:
+        tag, _, payload = line.partition(b" ")
+        expected = self._tag(self._incoming, self._received, payload)
+        if not hmac.compare_digest(bytes.fromhex(tag.decode()), expected):
+            raise ValueError("a liveness line is not signed with the shared secret")
+        self._received += 1
+        return payload
+
+    def _tag(self, direction: bytes, number: int, payload: bytes) -> bytes:
+        return self._store.tag(
+            b"liveness", *self._nonces, direction, number.to_bytes(8, "little"), payload
+        )
 
 
 def _read_line(sock: socket.socket) -> bytes:
@@ -964,6 +1031,7 @@ class LivenessConnection:
 
     sock: socket.socket
     lines: _Lines
+    deployment_nonce: bytes
 
     def __enter__(self) -> "LivenessConnection":
         return self
@@ -987,14 +1055,16 @@ def _keep_alive(sock: socket.socket) -> None:
 def _open_connection(
     store: RendezvousStore, announcement: str, timeout_s: float
 ) -> LivenessConnection:
+    """Open a connection to the authority and send the hello that carries ``announcement``."""
     host, port = store.get(LIVENESS_KEY).decode().rsplit(":", 1)
     sock = socket.create_connection((host, int(port)), timeout=timeout_s)
     _keep_alive(sock)
-    authority_nonce = bytes.fromhex(_read_line(sock).decode())
-    hello = announcement.encode()
-    sock.sendall(store.tag(b"hello", authority_nonce + hello).hex().encode() + b" " + hello + b"\n")
+    deployment_nonce, authority_nonce = map(bytes.fromhex, _read_line(sock).decode().split())
+    nonce = os.urandom(_NONCE_BYTES)
+    lines = _Lines(store, (deployment_nonce, authority_nonce, nonce), authority=False)
+    sock.sendall(lines.encode(f"{nonce.hex()} {announcement}".encode()))
     sock.settimeout(None)
-    return LivenessConnection(sock, _Lines())
+    return LivenessConnection(sock, lines, deployment_nonce)
 
 
 def open_liveness_connection(
@@ -1114,7 +1184,7 @@ class MembershipClient:
         with self._lock:
             self._report = self._report.model_copy(update={"sequence": self._report.sequence + 1})
             report = self._report
-        self._sock.sendall(_line(report))
+        self._sock.sendall(self._lines.encode(_json(report)))
 
     def _run(self) -> None:
         listed = False
@@ -1259,9 +1329,9 @@ class AuthorityProcess:
         return record
 
     def _send_record(self, ranks: bool = True) -> None:
-        record = _line(self._record)
+        record = _json(self._record)
         connected = {c.node for c in self._connections.values() if c.node is not None}
-        view = _line(
+        view = _json(
             NodeView(
                 record=self._record,
                 nodes=tuple(
@@ -1273,7 +1343,8 @@ class AuthorityProcess:
             # A connection an earlier send in this loop dropped is gone.
             if sock in self._connections and connection.lines is not None:
                 if connection.node is not None or ranks:
-                    connection.unsent += record if connection.node is None else view
+                    payload = record if connection.node is None else view
+                    connection.unsent += connection.lines.encode(payload)
                     self._flush(sock, connection)
 
     def _flush(self, sock: socket.socket, connection: _Connection) -> None:
@@ -1339,7 +1410,8 @@ class AuthorityProcess:
         _keep_alive(sock)
         nonce = os.urandom(_NONCE_BYTES)
         try:
-            sock.send(nonce.hex().encode() + b"\n")  # fits the empty send buffer
+            greeting = f"{self._store.deployment_nonce.hex()} {nonce.hex()}\n"
+            sock.send(greeting.encode())  # fits the empty send buffer
         except OSError:
             sock.close()
             return
@@ -1360,8 +1432,8 @@ class AuthorityProcess:
             if connection.lines is None:
                 data = self._read_hello(sock, connection, data)
             for line in connection.lines.decode(data) if data else ():
-                if connection.node is not None:
-                    raise ValueError(f"the supervisor of node {connection.node} sent a report")
+                if connection.member is None:
+                    raise ValueError("a report arrived on a liveness connection of no rank")
                 report = RankReport.model_validate_json(line).model_copy(
                     update={"incarnation": connection.member[1]}
                 )
@@ -1381,35 +1453,38 @@ class AuthorityProcess:
                 raise ValueError("no hello")
             return b""
         line, rest = connection.received.split(b"\n", 1)
-        tag_hex, hello = line.split(b" ", 1)
-        if not hmac.compare_digest(
-            bytes.fromhex(tag_hex.decode()), self._store.tag(b"hello", connection.nonce + hello)
-        ):
-            raise ValueError("a hello not signed with the shared secret")
-        announcement = hello.decode().split()
+        _, client_nonce, _ = line.split(b" ", 2)
+        lines = _Lines(
+            self._store,
+            (self._store.deployment_nonce, connection.nonce, bytes.fromhex(client_nonce.decode())),
+            authority=True,
+        )
+        announcement = lines.decode(line + b"\n")[0].decode().split()[1:]
         if announcement[:1] == ["node"]:
             _, node, ranks, host = announcement
             node, ranks = int(node), tuple(int(rank) for rank in ranks.split(","))
             refusal = self._node_refusal(node, ranks)
             if refusal is not None:
                 raise ValueError(refusal)
-            connection.node, connection.node_ranks, connection.lines = node, ranks, _Lines()
+            connection.node, connection.node_ranks, connection.lines = node, ranks, lines
             self._hosts[node] = host
             logger.info(f"The supervisor of node {node} ({host}, ranks {list(ranks)}) connected")
             self._send_record(ranks=False)
             return rest
-        rank, replacement = (int(field) for field in announcement)
-        refusal = self._refusal(rank, replacement)
-        if refusal is not None:
-            raise ValueError(refusal)
-        if replacement:
-            self._incarnation[rank] += 1
-            self._authority.request_join(rank)
-        connection.member, connection.lines = (rank, self._incarnation[rank]), _Lines()
-        self._changed = True
-        connection.unsent += _line(
-            self._record.model_copy(update={"incarnations": tuple(self._incarnation)})
-        )
+        # A store client only takes the deployment nonce from the record's signed line.
+        if announcement != ["store"]:
+            rank, replacement = (int(field) for field in announcement)
+            refusal = self._refusal(rank, replacement)
+            if refusal is not None:
+                raise ValueError(refusal)
+            if replacement:
+                self._incarnation[rank] += 1
+                self._authority.request_join(rank)
+            connection.member = (rank, self._incarnation[rank])
+            self._changed = True
+        connection.lines = lines
+        record = self._record.model_copy(update={"incarnations": tuple(self._incarnation)})
+        connection.unsent += lines.encode(_json(record))
         self._flush(sock, connection)
         return rest
 
@@ -1496,7 +1571,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     address = os.environ[RENDEZVOUS_ENV]
     host, store_port, liveness_port = authority_ports(address)
     tcp_store = TCPStore(host, store_port, is_master=True, wait_for_workers=False)
-    store = RendezvousStore(tcp_store, bytes.fromhex(os.environ[SHARED_SECRET_ENV]))
+    store = RendezvousStore(
+        tcp_store, bytes.fromhex(os.environ[SHARED_SECRET_ENV]), os.urandom(_NONCE_BYTES)
+    )
     os.write(args.address_fd, f"{address}\n".encode())
     if args.address_fd != 1:
         os.close(args.address_fd)

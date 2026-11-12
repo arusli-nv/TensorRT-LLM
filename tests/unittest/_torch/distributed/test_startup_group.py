@@ -54,7 +54,9 @@ WORLD = 4
 
 def _client(port):
     return RendezvousStore(
-        TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=30)), SECRET
+        TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=30)),
+        SECRET,
+        b"deployment",
     )
 
 

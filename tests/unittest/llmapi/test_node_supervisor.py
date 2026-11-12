@@ -33,6 +33,7 @@ from tensorrt_llm._torch.distributed.membership import (
     MembershipState,
     NodeView,
     RendezvousStore,
+    _Lines,
 )
 
 # The tests run supervisors, ranks and launchers as processes. A hung process fails its test, not the job.
@@ -137,7 +138,9 @@ class FakeAuthority:
             self._view = NodeView(record=record, nodes=nodes)
         port = self._reserved.getsockname()[1]
         self.store = RendezvousStore(
-            TCPStore("127.0.0.1", port, is_master=True, wait_for_workers=False), self._secret
+            TCPStore("127.0.0.1", port, is_master=True, wait_for_workers=False),
+            self._secret,
+            os.urandom(16),
         )
         self.store.set(LIVENESS_KEY, f"127.0.0.1:{self._listener.getsockname()[1]}".encode())
         return self
@@ -154,7 +157,7 @@ class FakeAuthority:
             except OSError:
                 return
             nonce = os.urandom(16)
-            sock.sendall(nonce.hex().encode() + b"\n")
+            sock.sendall(f"{self.store.deployment_nonce.hex()} {nonce.hex()}\n".encode())
             hello = b""
             while not hello.endswith(b"\n"):
                 data = sock.recv(256)
@@ -164,10 +167,18 @@ class FakeAuthority:
             if not hello.endswith(b"\n"):
                 sock.close()
                 continue
-            self.hellos.append(hello.split(b" ", 1)[1].decode().split())
+            client_nonce = bytes.fromhex(hello.split(b" ")[1].decode())
+            nonces = (self.store.deployment_nonce, nonce, client_nonce)
+            lines = _Lines(self.store, nonces, authority=True)
+            announcement = lines.decode(hello)[0].decode().split()[1:]
+            if announcement == ["store"]:
+                with sock:
+                    sock.sendall(lines.encode(self._view.model_dump_json().encode()))
+                continue
+            self.hellos.append(announcement)
             with self._lock:
-                self._connections.append(sock)
-                sock.sendall(self._view.model_dump_json().encode() + b"\n")
+                self._connections.append((sock, lines))
+                sock.sendall(lines.encode(self._view.model_dump_json().encode()))
             self._thread(self._watch, sock)
 
     def _watch(self, sock):
@@ -179,9 +190,9 @@ class FakeAuthority:
     def push(self, record, nodes=((NODE, "host-1", True),)):
         with self._lock:
             self._view = NodeView(record=record, nodes=nodes)
-            for sock in self._connections:
+            for sock, lines in self._connections:
                 with contextlib.suppress(OSError):
-                    sock.sendall(self._view.model_dump_json().encode() + b"\n")
+                    sock.sendall(lines.encode(self._view.model_dump_json().encode()))
 
     def close(self):
         """Close every socket and join the threads.
@@ -190,7 +201,7 @@ class FakeAuthority:
         """
         self._reserved.close()
         with self._lock:
-            sockets = [*self._connections, self._listener]
+            sockets = [*(sock for sock, _ in self._connections), self._listener]
         for sock in sockets:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)

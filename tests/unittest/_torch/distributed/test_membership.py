@@ -642,7 +642,7 @@ def _deployment(world, **authority_options):
 
     On exit, rank 0 reports ``shutdown`` and the authority returns the SHUTDOWN record, as in a normal exit.
     """
-    store = RendezvousStore(DictStore(), b"shared-secret")
+    store = RendezvousStore(DictStore(), b"shared-secret", b"deployment")
     process = AuthorityProcess(world, store, Authority(world, **authority_options))
     returned = []
     thread = threading.Thread(
@@ -806,17 +806,50 @@ def test_deployment_at_rest_is_quiet():
 
 
 def test_unsigned_store_values_refused():
-    store = RendezvousStore(DictStore(), b"shared-secret")
-    RendezvousStore(store.store, b"another-secret").set(RECORD_KEY, b'{"state": 3}')
+    store = RendezvousStore(DictStore(), b"shared-secret", b"deployment")
+    RendezvousStore(store.store, b"another-secret", b"deployment").set(RECORD_KEY, b'{"state": 3}')
     assert store.get_if_set(RECORD_KEY) is None
     with pytest.raises(PermissionError):
         store.get(RECORD_KEY)
+
+
+def test_store_value_moved_to_another_key_refused():
+    store = RendezvousStore(DictStore(), b"shared-secret", b"deployment")
+    store.set("waiting_queue/2", b"queue")
+    store.store.set("waiting_queue/3", store.store.get("waiting_queue/2"))
+    with pytest.raises(PermissionError):
+        store.get("waiting_queue/3")
     # A signed ("row/1", "2x") does not verify as ("row/12", "x").
     store.set("row/1", b"2x")
     raw = store.store.get("row/1")
     store.store.set("row/12", raw[:32] + raw[33:])
     with pytest.raises(PermissionError):
         store.get("row/12")
+
+
+def test_store_value_of_earlier_deployment_refused():
+    """Refuse a value replayed from an earlier deployment that had the same shared secret."""
+    earlier = RendezvousStore(DictStore(), b"shared-secret", b"earlier deployment")
+    earlier.set(RECORD_KEY, b'{"state": 3}')
+    store = RendezvousStore(DictStore(), b"shared-secret", b"deployment")
+    store.store.set(RECORD_KEY, earlier.store.get(RECORD_KEY))
+    with pytest.raises(PermissionError):
+        store.get(RECORD_KEY)
+
+
+def test_unsigned_liveness_line_refused():
+    """Close a liveness connection on a line without a valid tag, and act on none of it."""
+    with _deployment(2) as (store, clients):
+        clients[1].stop()
+        _until(lambda: clients[0].record.active_mask == 0b01)
+        _until(lambda: clients[0].record.state == MembershipState.COMMITTED)
+        with open_liveness_connection(store, 1, replacement=True) as connection:
+            report = RankReport(joining_ready=True, ready_payload="rank 1")
+            connection.sock.sendall(report.model_dump_json().encode() + b"\n")
+            connection.sock.settimeout(10)
+            while connection.sock.recv(1 << 16):
+                pass
+        assert clients[0].record.active_mask == 0b01
 
 
 class _NodeSupervisor:
