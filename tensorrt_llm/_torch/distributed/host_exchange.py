@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import pickle  # nosec B403
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from tensorrt_llm.math_utils import ceil_div
 from . import mnnvl_memory
 from .communicator import MPIDist, ReduceOp, _check_reduce_op
 from .host_exchange_epoch import next_epoch
+from .membership import all_ranks, has_rank, rank_mask
 from .membership_mnnvl_memory import MembershipMnnvlMemory
 from .mnnvl_memory import (
     MnnvlMemory,
@@ -29,19 +30,6 @@ from .mnnvl_memory import (
     _MnnvlAllocationState,
 )
 from .startup_record import startup_record
-
-
-def _all_ranks(nranks: int) -> int:
-    """Return the rank mask of ranks ``0`` to ``nranks - 1``."""
-    return (1 << nranks) - 1
-
-
-def _has_rank(mask: int, rank: int) -> bool:
-    return bool(mask >> rank & 1)
-
-
-def _rank_mask(ranks: Iterable[int]) -> int:
-    return sum(1 << rank for rank in ranks)
 
 
 class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
@@ -157,7 +145,7 @@ class TPHostExchange:
         self._parity_bytes = nranks * self._slot_bytes
         # Epoch 0 is never sent because the buffers start zeroed.
         self._epoch = 0
-        self.active_mask = _all_ranks(nranks)
+        self.active_mask = all_ranks(nranks)
         self.interrupted: Callable[[], bool] = lambda: False
         self.on_interrupt: Optional[Callable[[], None]] = None
         self.stopped_epoch = 0
@@ -198,7 +186,7 @@ class TPHostExchange:
     def create(cls, mapping) -> "TPHostExchange":
         """Create the exchange of the TP group, collectively over the ranks its communicator reaches."""
         comm = TpMnnvlMemory.get_comm(mapping)
-        active_mask = _rank_mask(rank for rank, active in enumerate(comm.allgather(True)) if active)
+        active_mask = rank_mask(rank for rank, active in enumerate(comm.allgather(True)) if active)
         rows = HostExchangeMnnvlMemory(
             mapping.tp_rank,
             mapping.tp_size,
@@ -234,7 +222,7 @@ class TPHostExchange:
         Raises:
             RuntimeError: This rank stopped more than one round before the latest active rank.
         """
-        if not _has_rank(active_mask, self.rank):
+        if not has_rank(active_mask, self.rank):
             pass
         elif epoch in (self.stopped_epoch, next_epoch(self.stopped_epoch)):
             # An earlier attempt of this change may have finished the round with a since-failed rank's packets.
@@ -262,10 +250,10 @@ class TPHostExchange:
         rows = self._pinned((self.nranks, 1 + self._words))
         self._copy_to_host(self.rows.row(self.rank) + parity_offset, rows)
         epochs = self._epochs(rows)
-        peers = [p for p in range(self.nranks) if p != self.rank and _has_rank(active_mask, p)]
+        peers = [p for p in range(self.nranks) if p != self.rank and has_rank(active_mask, p)]
         for sender in range(self.nranks):
-            reads = _has_rank(self._round_readers, sender)
-            if not _has_rank(self.active_mask, sender) or (
+            reads = has_rank(self._round_readers, sender)
+            if not has_rank(self.active_mask, sender) or (
                 self._slot_complete(rows[sender]) if reads else epochs[sender, 0] == self._epoch
             ):
                 continue
@@ -340,7 +328,7 @@ class TPHostExchange:
         """Return ``(first rank, ranks, with payload)`` per run of consecutive ranks alike in ``recipients``."""
         runs = self._runs.get(recipients)
         if runs is None:
-            full = [_has_rank(recipients, r) for r in range(self.nranks)]
+            full = [has_rank(recipients, r) for r in range(self.nranks)]
             runs, first = [], 0
             for r in range(1, self.nranks + 1):
                 if r == self.nranks or full[r] != full[first]:
@@ -407,9 +395,9 @@ class TPHostExchange:
         """
         reader_mask = self.active_mask
         if readers is not None:
-            reader_mask &= _rank_mask(readers)
+            reader_mask &= rank_mask(readers)
         if recipients is not None:
-            recipients = _rank_mask(recipients)
+            recipients = rank_mask(recipients)
         ranks = self._ranks_of(reader_mask)[1]
         rounds = self._rounds(payload, reader_mask, recipients, idle)
         lengths, rows = next(rounds)
@@ -419,7 +407,7 @@ class TPHostExchange:
             received = [b"".join(parts) for parts in zip(received, *later)]
         payloads = [None] * self.nranks
         for r, received_payload in zip(ranks, received):
-            if not _has_rank(self._failed, r):
+            if not has_rank(self._failed, r):
                 payloads[r] = received_payload
         return payloads
 
@@ -445,7 +433,7 @@ class TPHostExchange:
                     :, 2 : 2 + 2 * words : 2
                 ]
         kept = readers & ~self._failed
-        if kept != _all_ranks(self.nranks):
+        if kept != all_ranks(self.nranks):
             out[~self._ranks_of(kept)[0]] = 0
         return out.view(np.uint8)[:, : data.size].view(row.dtype)
 
@@ -453,13 +441,13 @@ class TPHostExchange:
         """Return a bool array of the ranks in ``mask`` and their sorted list, cached per mask."""
         ranks = self._masks.get(mask)
         if ranks is None:
-            in_mask = np.array([_has_rank(mask, r) for r in range(self.nranks)], dtype=bool)
+            in_mask = np.array([has_rank(mask, r) for r in range(self.nranks)], dtype=bool)
             ranks = self._masks[mask] = (in_mask, np.flatnonzero(in_mask).tolist())
         return ranks
 
     @staticmethod
     def _mask_of(ranks: np.ndarray) -> int:
-        return _rank_mask(int(r) for r in np.flatnonzero(ranks))
+        return rank_mask(int(r) for r in np.flatnonzero(ranks))
 
     def _chunks(
         self, rows: Optional[np.ndarray], lengths: np.ndarray, ranks: List[int]
@@ -749,13 +737,13 @@ class MnnvlDist(MPIDist):
 
     def tp_active_rows(self, rows: np.ndarray) -> np.ndarray:
         active_mask = self.host_exchange.active_mask
-        if active_mask == _all_ranks(self.tp_size) or startup_record.replaying:
+        if active_mask == all_ranks(self.tp_size) or startup_record.replaying:
             return rows
         if self._active_rows_index[0] != active_mask:
             self._active_rows_index = (
                 active_mask,
                 np.array(
-                    [r for r in range(self.tp_size) if _has_rank(active_mask, r)], dtype=np.intp
+                    [r for r in range(self.tp_size) if has_rank(active_mask, r)], dtype=np.intp
                 ),
             )
         return rows[self._active_rows_index[1]]

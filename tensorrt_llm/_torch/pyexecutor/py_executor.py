@@ -7064,7 +7064,7 @@ class PyExecutor:
         self._resume_after_rebalance(mgr, paused, paused_dummies)
 
     @contextmanager
-    def _kv_pools_suspended(self) -> Iterator[KVCacheManagerV2]:
+    def kv_pools_suspended(self) -> Iterator[KVCacheManagerV2]:
         """Suspend the active requests and dummies while the KV pools change."""
         mgr = self.kv_cache_manager
         paused, paused_dummies = self._suspend_for_rebalance(mgr)

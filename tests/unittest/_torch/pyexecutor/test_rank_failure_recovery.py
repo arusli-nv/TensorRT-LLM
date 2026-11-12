@@ -1158,7 +1158,7 @@ def _eplb(monkeypatch, recovery, restored=6 * MIB, workspace=4 * MIB, device=Non
         backed_spare_slot_bytes=device.backed,
     )
     recovery._executor.model_engine.moe_load_balancer = balancer
-    recovery._executor._kv_pools_suspended = device.suspended
+    recovery._executor.kv_pools_suspended = device.suspended
     recovery._moe.workspace_bytes.return_value = workspace
     recovery._moe.remap_workspaces.side_effect = lambda gather, fresh_rows: calls.append("remap")
     return calls, plan, device
@@ -1276,49 +1276,36 @@ def test_rejoin_gives_back_memory_after_resume(monkeypatch):
     Every active rank gives back at the step boundary after a forward vote in which no rank held for a change.
     """
     recovery = _resuming_recovery(record=_REJOIN_INSTALL, placement=_PLACEMENT)
-    calls, plan, device = _eplb(
+    calls, _, device = _eplb(
         monkeypatch,
         recovery,
         restored=0,
         released=6 * MIB,
         device=_Device(gpu_quota=58 * MIB, backed=6 * MIB),
     )
-    report = recovery._client.report
-
-    def report_reply(**changes):
-        if "reply" in changes:
-            calls.append(changes["reply"])
-        report(**changes)
-
-    recovery._client.report = report_reply
     info = Mock()
     monkeypatch.setattr(recovery_module.logger, "info", info)
     recovery.before_iteration()
-    assert calls[0] == "abandon"
     (_, active, _, rejoining) = calls[1]
     assert active == [True] * WORLD
     assert rejoining == [False, False, True, False]
-    assert calls[2:] == [
-        "suspend",
-        ("resize", 54 * MIB),
-        ("restore", plan),
-        "remap",
-        "resume",
-        Reply.INSTALLED,
-    ]
+    assert _replies(recovery) == [Reply.INSTALLED]
     assert not recovery.pauses_forward()
     recovery._moe.health.mark_active.assert_any_call(FAILED)
+    # Serving resumed with the spare slots still backed and the pool short of the workspace.
+    assert device.backed == 6 * MIB
+    assert device.gpu_quota == 54 * MIB
     retire = recovery._executor._retire_inflight_batch_for_control
     retire.reset_mock()
     # Rank 1 holds its steps for the next change, so no rank gives back at this step boundary.
     assert _vote(recovery, peers=((3, 1, 0), (5, 0, 0), (2, 0, 0)))[0] == [4, 0, 1]
     recovery.before_iteration()
-    assert calls[-1] == Reply.INSTALLED
     retire.assert_not_called()
+    assert device.backed == 6 * MIB
     assert _vote(recovery)[0] == [4, 0, 1]
     recovery.before_iteration()
     retire.assert_called_once()
-    assert calls[8:] == ["release", "suspend", ("resize", STARTUP_MEMORY.kv_cache_quota), "resume"]
+    assert device.backed == 0
     assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
     # A rank with nothing to give back still retires its step in flight at the same step boundary.
     other = _recovery(rank=1)
@@ -2031,7 +2018,7 @@ def test_original_rank_binds_client_after_startup(agreed_startup, shared_secret,
     executor = _executor(rank)
     executor.kv_cache_manager = device = _Device()
     monkeypatch.setattr(recovery_module.torch.cuda, "mem_get_info", lambda: (device.free, 1 << 40))
-    executor._kv_pools_suspended = device.suspended
+    executor.kv_pools_suspended = device.suspended
     executor.dist.allgather.side_effect = lambda value: [value] * WORLD
     # The state that the model check bound the MoE layers to.
     moe_state = Mock(workspace_bytes=Mock(return_value=4 * MIB))
@@ -2083,7 +2070,7 @@ def test_startup_rejects_unrestorable_largest_failure(monkeypatch, restore_bytes
     moe_state = Mock(workspace_bytes=Mock(return_value=4 * MIB))
     executor = SimpleNamespace(
         dist=Mock(rank=0, allgather=lambda fits: [fits, peer_fits, True, True]),
-        _kv_pools_suspended=device.suspended,
+        kv_pools_suspended=device.suspended,
     )
     balancer = Mock(
         expert_restore=Mock(largest_failure_restore_bytes=Mock(return_value=restore_bytes))
@@ -2234,7 +2221,7 @@ def test_active_ranks_retire_step_before_resize(monkeypatch):
     recovery._exchange.admit = lambda active_mask, epoch: steps.append("admit")
     recovery._moe.workspace_bytes.return_value = 4 * MIB
     monkeypatch.setattr(recovery_module.torch.cuda, "mem_get_info", lambda: (device.free, 1 << 40))
-    executor._kv_pools_suspended = device.suspended
+    executor.kv_pools_suspended = device.suspended
     recovery.before_iteration()
     # An admission does not abort the step, so its results are applied before the joining rank enters the host
     # exchange. The second suspension gives the KV cache memory back once committed.

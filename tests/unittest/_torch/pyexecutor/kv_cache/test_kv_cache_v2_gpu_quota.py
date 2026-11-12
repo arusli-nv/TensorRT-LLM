@@ -86,7 +86,7 @@ def test_failed_resize_resumes_every_cache(manager):
     )
 
     with pytest.raises(RuntimeError, match="a peer exited"):
-        with PyExecutor._kv_pools_suspended(executor) as kv_cache_manager:
+        with PyExecutor.kv_pools_suspended(executor) as kv_cache_manager:
             kv_cache_manager.resize_gpu_quota(kv_cache_manager.gpu_quota - 64 * MIB)
             raise RuntimeError("a peer exited during the remap")
     assert manager.is_request_active(request.py_request_id)

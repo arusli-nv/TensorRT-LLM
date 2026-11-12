@@ -53,8 +53,11 @@ def _fault_tolerance(monkeypatch, largest_failure):
     """Turn fault tolerance on, with nodes [0, 1] and [2, 3] and a largest failure of ``largest_failure`` ranks."""
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
+    recoverable = EplbExpertRestore._recoverable_failures
     monkeypatch.setattr(
-        EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
+        EplbExpertRestore,
+        "_recoverable_failures",
+        staticmethod(lambda nodes: [f for f in recoverable(nodes) if len(f) <= largest_failure]),
     )
 
 

@@ -13,8 +13,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._wide_ep_fault_tolerance import fault_tolerance_replacement
+from tensorrt_llm.bindings.internal import runtime
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
@@ -232,14 +232,12 @@ class EplbExpertRestore:
         if (
             self.largest_failure
             and balancer.layer_updates_per_iter > 0
-            and not _tbr.host_accessible_device_memory_uses_gdrcopy()
+            and not runtime.host_accessible_device_memory_uses_gdrcopy()
         ):
             raise ValueError(
-                "Wide-EP fault tolerance needs GDRCopy for online EPLB, because online EPLB writes expert weights "
-                "into the slots from the CPU and the spare slots are virtual device memory, which the CPU reaches "
-                "only through GDRCopy. This system does not use GDRCopy for EPLB slots (GPU memory is a NUMA node "
-                "instead of CDMM mode, or GDRCopy is unavailable): enable CDMM mode and GDRCopy, use static EPLB "
-                "(layer_updates_per_iter 0) or turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
+                "Wide-EP fault tolerance writes the spare slots of online EPLB from the CPU through GDRCopy, "
+                "which this system does not use for EPLB slots. Enable CDMM mode and GDRCopy, use static EPLB "
+                "(layer_updates_per_iter=0), or set enable_wide_ep_fault_tolerance=False."
             )
         self.active_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
         self.backed_spare_slot_bytes = 0
@@ -269,16 +267,13 @@ class EplbExpertRestore:
         """Return the most device memory this rank backs to restore the experts of any recoverable failure."""
         ep_rank, ep_size = self.balancer.ep_rank, self.balancer.ep_size
         current = [np.array(ranks, dtype=np.int32) for _, ranks in self.current_placement()]
-        return max(
-            (
-                self.plan_expert_restore(
-                    [rank not in failure for rank in range(ep_size)], current
-                ).device_bytes
-                for failure in self._recoverable_failures(self._rank_nodes())
-                if ep_rank not in failure
-            ),
-            default=0,
-        )
+        largest = 0
+        for failure in self._recoverable_failures(self._rank_nodes()):
+            if ep_rank in failure:
+                continue
+            active_ranks = [rank not in failure for rank in range(ep_size)]
+            largest = max(largest, self.plan_expert_restore(active_ranks, current).device_bytes)
+        return largest
 
     def current_placement(self) -> List[Tuple[int, List[List[int]]]]:
         """Return the expert count and this rank's view of the placement for each layer."""

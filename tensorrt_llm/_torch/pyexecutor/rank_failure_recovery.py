@@ -34,7 +34,18 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -79,6 +90,7 @@ from ..distributed.membership import (
     ResumeState,
     StoreGroup,
     TransactionSummary,
+    has_rank,
     open_store,
     rendezvous_store,
     wait_for_keys,
@@ -92,6 +104,8 @@ if TYPE_CHECKING:
 
     from ..distributed import Distributed
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
+    from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlan
+    from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
     from .llm_request import LlmRequest
     from .py_executor import PyExecutor
     from .scheduler.adp_router import RankState
@@ -578,6 +592,27 @@ class _GiveBackRetry:
     ended: bool = False
 
 
+class _PhaseTimer:
+    """Record how long each phase of a membership change takes, in milliseconds."""
+
+    def __init__(self):
+        self.times_ms: Dict[str, float] = {}
+        self._began_s = time.perf_counter()
+
+    def begin(self) -> None:
+        """Start timing the next phase."""
+        self._began_s = time.perf_counter()
+
+    def end(self, phase: str) -> None:
+        """Record the time since the last ``begin`` or ``end`` as ``phase``."""
+        now_s = time.perf_counter()
+        self.times_ms[phase] = (now_s - self._began_s) * 1e3
+        self._began_s = now_s
+
+    def summary(self) -> str:
+        return ", ".join(f"{phase} {ms:.0f} ms" for phase, ms in self.times_ms.items())
+
+
 def _moe_execution_state_of(executor: PyExecutor) -> MoeExecutionState:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 
@@ -596,7 +631,7 @@ def _check_largest_failure_fits(
         + moe_execution_state.workspace_bytes()
     )
     fits = True
-    with executor._kv_pools_suspended() as kv_cache_manager:
+    with executor.kv_pools_suspended() as kv_cache_manager:
         try:
             startup_memory.fit_kv_cache(kv_cache_manager, 0, needed)
         except RuntimeError:
@@ -672,7 +707,7 @@ def ready_payload(record: MembershipRecord, rank: int, view: Placement) -> Optio
     """
     if rank == record.lowest_survivor():
         return json.dumps(view)
-    if record.joining_mask >> rank & 1:
+    if record.is_joining(rank):
         return json.dumps([ranks[rank] for _, ranks in view])
     return None
 
@@ -684,7 +719,7 @@ def agreed_placement(record: MembershipRecord) -> Optional[list]:
     """
     payloads = dict(record.ready_payloads)
     source = record.lowest_survivor()
-    joining = [r for r in range(record.joining_mask.bit_length()) if record.joining_mask >> r & 1]
+    joining = [r for r in range(record.joining_mask.bit_length()) if record.is_joining(r)]
     if source not in payloads or any(r not in payloads for r in joining):
         return None
     own_slots = {r: json.loads(payloads[r]) for r in joining}
@@ -906,7 +941,7 @@ class RankFailureRecovery:
             | sum(1 << peer for peer in waited_rounds),
             waited_rounds=tuple(sorted(waited_rounds.items())),
             waited_epochs=tuple(
-                (peer, epoch) for peer in range(self.world_size) if host_waits >> peer & 1
+                (peer, epoch) for peer in range(self.world_size) if has_rank(host_waits, peer)
             ),
         )
 
@@ -958,7 +993,7 @@ class RankFailureRecovery:
     def _on_exchange_interrupt(self) -> None:
         """Take part in the membership change the host exchange stopped for."""
         self._change_membership()
-        if self._resume_after is not None and self._installed.joining_mask >> self.rank & 1:
+        if self._resume_after is not None and self._installed.is_joining(self.rank):
             raise _MembershipRestarted
 
     def _change_membership(self) -> None:
@@ -1045,9 +1080,9 @@ class RankFailureRecovery:
         The rows move to fresh pages if a process that maps them may be gone.
         """
         gather = self._active_group(record, "host_exchange_rows").allgather
-        fresh_rows = self._exchange.rows.stale_rows(gather)
+        stale_rows = self._exchange.rows.stale_rows(gather)
         self._exchange.install(
-            gather, record.active_mask & ~record.joining_mask, record.resume.epoch, fresh_rows
+            gather, record.active_mask & ~record.joining_mask, record.resume.epoch, stale_rows
         )
         with self._record_changed:
             self._installed = record
@@ -1112,13 +1147,12 @@ class RankFailureRecovery:
     def _finish_install(self, record: MembershipRecord) -> bool:
         """Restore the active ranks, reply INSTALLED and return whether the change was committed."""
         executor = self._executor
-        times: Dict[str, float] = {}
-        start_s = time.perf_counter()
+        timer = _PhaseTimer()
         torch.cuda.synchronize()
         try:
             # A rank may have run one more EPLB iteration since READY, in the step it stopped in.
             self._end_eplb_iterations()
-            if not record.joining_mask >> self.rank & 1:
+            if not record.is_joining(self.rank):
                 # The retire runs host exchange collectives. The joining ranks enter the host exchange only below.
                 executor._retire_inflight_batch_for_control()
             recomputed = self._recompute_interrupted_requests()
@@ -1133,14 +1167,13 @@ class RankFailureRecovery:
             outstanding = (
                 self._outstanding_requests() if self._outstanding_requests is not None else {}
             )
-            times["prepare"] = (time.perf_counter() - start_s) * 1e3
-            start_s = time.perf_counter()
+            timer.end("prepare")
             # Past this gather no active rank has an all-to-all kernel in flight or runs another host collective before
             # the next iteration.
             gathered = executor.dist.allgather(self._held_request_ids())
-            times["request gather"] = (time.perf_counter() - start_s) * 1e3
+            timer.end("request gather")
             self._install_step_done()
-            digest = self._restore(record, times)
+            digest = self._restore(record, timer)
         except (_MembershipRestarted, MnnvlPeerHandleError) as error:
             logger.warning(
                 f"Rank {self.rank} stopped installing membership generation {record.generation}: {error!r}"
@@ -1194,7 +1227,7 @@ class RankFailureRecovery:
             return ""
         free_to_keep = kept or 0
         held = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
-        with self._executor._kv_pools_suspended() as kv_cache_manager:
+        with self._executor.kv_pools_suspended() as kv_cache_manager:
             quota = self._startup_memory.fit_kv_cache(kv_cache_manager, held, 0, free_to_keep)
             short = self._startup_memory.shortfall(kv_cache_manager, held, free_to_keep)
         self._give_back_retry = None
@@ -1260,7 +1293,7 @@ class RankFailureRecovery:
         retry = self._give_back_retry
         balancer = _moe_load_balancer_of(self._executor)
         held = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
-        with self._executor._kv_pools_suspended() as kv_cache_manager:
+        with self._executor.kv_pools_suspended() as kv_cache_manager:
             quota = self._startup_memory.fit_kv_cache(kv_cache_manager, held, 0, retry.free_to_keep)
             short = self._startup_memory.shortfall(kv_cache_manager, held, retry.free_to_keep)
         retry.free_seen = torch.cuda.mem_get_info()[0]
@@ -1271,7 +1304,7 @@ class RankFailureRecovery:
             + (f", {short} bytes short" if short else "")
         )
 
-    def _restore(self, record: MembershipRecord, times: Optional[Dict[str, float]] = None) -> str:
+    def _restore(self, record: MembershipRecord, timer: Optional[_PhaseTimer] = None) -> str:
         """Restore the lost experts and the all-to-all workspaces.
 
         This is collective over the active ranks of ``record``.
@@ -1281,82 +1314,102 @@ class RankFailureRecovery:
         """
         if self._record != record:
             raise _MembershipRestarted
-        began_s = time.perf_counter()
-        times = {} if times is None else times
-        executor = self._executor
-        balancer = _moe_load_balancer_of(executor)
-        plan = None
-        loaded = 0
+        started_s = time.perf_counter()
+        timer = _PhaseTimer() if timer is None else timer
+        balancer = _moe_load_balancer_of(self._executor)
+        plan, loaded_experts = None, 0
         if balancer is not None:
-            current = [np.array(ranks, dtype=np.int32) for _, ranks in agreed_placement(record)]
-            plan = balancer.expert_restore.plan_expert_restore(
-                [record.is_active(r) for r in range(self.world_size)],
-                current,
-                rejoining=[bool(record.joining_mask >> r & 1) for r in range(self.world_size)],
-            )
-            for planned, held in zip(plan.placements, current):
-                mine, before = planned[balancer.ep_rank], held[balancer.ep_rank]
-                loaded += int(np.count_nonzero((mine != before) & (mine >= 0)))
+            plan, loaded_experts = self._plan_expert_restore(record, balancer)
+        self._mark_rank_health(record)
+        gather = self._active_group(record, "moe_a2a_workspaces").allgather
+        stale_rows = self._moe.stale_workspace_rows(gather)
+        # The remap allocates fresh pages for this rank's rows before the pages they replace are freed.
+        workspace_bytes = self._moe.workspace_bytes() if self.rank in stale_rows else 0
+        restore_bytes = workspace_bytes + (0 if plan is None else plan.device_bytes)
+        with self._kv_cache_shrunk_by(restore_bytes, balancer, timer) as kv_cache_quota:
+            if plan is not None:
+                balancer.expert_restore.restore_lost_experts(plan, timer.times_ms)
+                self._install_step_done()
+            timer.begin()
+            self._moe.remap_workspaces(gather, stale_rows)
+            timer.end("remap")
             self._install_step_done()
+        timer.begin()
+        self._rearm(record)
+        timer.end("rearm")
+        logger.info(
+            f"Rank {self.rank} restored membership generation {record.generation} in "
+            f"{(time.perf_counter() - started_s) * 1e3:.0f} ms. Loaded {loaded_experts} experts "
+            f"({0 if plan is None else plan.device_bytes} bytes), KV cache quota {kv_cache_quota}. "
+            f"Phases: {timer.summary()}"
+        )
+        return "" if plan is None else plan.digest
+
+    def _plan_expert_restore(
+        self, record: MembershipRecord, balancer: MoeLoadBalancer
+    ) -> Tuple[ExpertRestorePlan, int]:
+        """Plan the expert placement of ``record`` and return it with the number of experts this rank loads."""
+        agreed = [np.array(ranks, dtype=np.int32) for _, ranks in agreed_placement(record)]
+        plan = balancer.expert_restore.plan_expert_restore(
+            [record.is_active(r) for r in range(self.world_size)],
+            agreed,
+            rejoining=[record.is_joining(r) for r in range(self.world_size)],
+        )
+        loaded_experts = 0
+        for planned, agreed_layer in zip(plan.placements, agreed):
+            new_slots, old_slots = planned[balancer.ep_rank], agreed_layer[balancer.ep_rank]
+            loaded_experts += int(np.count_nonzero((new_slots != old_slots) & (new_slots >= 0)))
+        self._install_step_done()
+        return plan, loaded_experts
+
+    def _mark_rank_health(self, record: MembershipRecord) -> None:
+        """Mark the active ranks of ``record`` active and every other rank failed."""
         for r in range(self.world_size):
             if record.is_active(r):
                 self._moe.health.mark_active(r)
             else:
                 self._moe.health.mark_failed(r)
-        gather = self._active_group(record, "moe_a2a_workspaces").allgather
-        fresh_rows = self._moe.stale_workspace_rows(gather)
-        # The remap allocates fresh pages for this rank's rows before the pages they replace are freed.
-        workspace_bytes = self._moe.workspace_bytes() if self.rank in fresh_rows else 0
-        needed = workspace_bytes + (0 if plan is None else plan.device_bytes)
 
-        kv_cache_quota = "unchanged"
+    @contextlib.contextmanager
+    def _kv_cache_shrunk_by(
+        self, restore_bytes: int, balancer: Optional[MoeLoadBalancer], timer: _PhaseTimer
+    ) -> Iterator[str]:
+        """Suspend the KV cache pool, shrink it by ``restore_bytes`` and yield the quota change for the log."""
         # Each rank decides on its own because suspending the pools runs a collective only with disaggregated serving,
         # which fault tolerance rejects.
-        with (
-            executor._kv_pools_suspended() if needed else contextlib.nullcontext()
-        ) as kv_cache_manager:
-            if needed:
-                start_s = time.perf_counter()
-                before, free = kv_cache_manager.gpu_quota, torch.cuda.mem_get_info()[0]
-                backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
-                self._kv_cache_free_to_keep = self._startup_memory.free_to_keep(
-                    kv_cache_manager, backed
-                )
-                fitted = self._startup_memory.fit_kv_cache(kv_cache_manager, backed, needed)
-                times["KV cache shrink"] = (time.perf_counter() - start_s) * 1e3
-                kv_cache_quota = (
-                    f"{before} -> {fitted} bytes ({needed} bytes needed, {free} bytes free)"
-                )
-                self._install_step_done()
-            if plan is not None:
-                balancer.expert_restore.restore_lost_experts(plan, times)
-                self._install_step_done()
-            start_s = time.perf_counter()
-            self._moe.remap_workspaces(gather, fresh_rows)
-            times["remap"] = (time.perf_counter() - start_s) * 1e3
+        if not restore_bytes:
+            yield "unchanged"
+            return
+        with self._executor.kv_pools_suspended() as kv_cache_manager:
+            timer.begin()
+            quota_before, free = kv_cache_manager.gpu_quota, torch.cuda.mem_get_info()[0]
+            backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
+            self._kv_cache_free_to_keep = self._startup_memory.free_to_keep(
+                kv_cache_manager, backed
+            )
+            quota_after = self._startup_memory.fit_kv_cache(kv_cache_manager, backed, restore_bytes)
+            timer.end("KV cache shrink")
             self._install_step_done()
+            yield (
+                f"{quota_before} -> {quota_after} bytes "
+                f"({restore_bytes} bytes needed, {free} bytes free)"
+            )
+
+    def _rearm(self, record: MembershipRecord) -> None:
+        """Rearm the all-to-all and install its active rank mask, unless a newer record replaced ``record``."""
         # The client thread updates the record under this lock before it requests the abort of a newer change. Once
         # this check passes, that abort comes after the rearm and stays in effect.
-        start_s = time.perf_counter()
         with self._record_changed:
             if self._record != record:
                 raise _MembershipRestarted
             self._moe.rearm()
             self._moe.install_mask()
-        times["rearm"] = (time.perf_counter() - start_s) * 1e3
-        logger.info(
-            f"Rank {self.rank} restored membership generation {record.generation} in "
-            f"{(time.perf_counter() - began_s) * 1e3:.0f} ms. Loaded {loaded} experts "
-            f"({0 if plan is None else plan.device_bytes} bytes), KV cache quota {kv_cache_quota}. Phases: "
-            + ", ".join(f"{phase} {ms:.0f} ms" for phase, ms in times.items())
-        )
-        return "" if plan is None else plan.digest
 
     def _admit_joining_ranks(self, record: MembershipRecord) -> None:
         """Bring the joining ranks into the host exchange with rank 0's next epoch and waiting queue."""
         epoch_key, queue_key = _admission_keys(record.generation)
         executor = self._executor
-        if record.joining_mask >> self.rank & 1:
+        if record.is_joining(self.rank):
 
             def check(_unsigned: Set[str]) -> None:
                 self._waiting_in_store = 1

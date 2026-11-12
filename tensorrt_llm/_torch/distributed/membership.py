@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -51,6 +51,21 @@ RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
 # The launchers' rank variables, which a process started outside the launcher's job must not inherit.
 LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "PRTE_", "SLURM_")
+
+
+def all_ranks(nranks: int) -> int:
+    """Return the rank mask of ranks ``0`` to ``nranks - 1``."""
+    return (1 << nranks) - 1
+
+
+def has_rank(mask: int, rank: int) -> bool:
+    """Return whether rank mask ``mask`` holds ``rank``."""
+    return bool(mask >> rank & 1)
+
+
+def rank_mask(ranks: Iterable[int]) -> int:
+    """Return the rank mask of ``ranks``."""
+    return sum(1 << rank for rank in ranks)
 
 
 class MembershipState(enum.IntEnum):
@@ -94,7 +109,10 @@ class MembershipRecord(_Message):
     reason: str = ""
 
     def is_active(self, rank: int) -> bool:
-        return bool(self.active_mask >> rank & 1)
+        return has_rank(self.active_mask, rank)
+
+    def is_joining(self, rank: int) -> bool:
+        return has_rank(self.joining_mask, rank)
 
     def lowest_survivor(self) -> Optional[int]:
         """Return the lowest active rank that does not join, or None if every active rank joins."""
@@ -178,7 +196,7 @@ def _chain_end(rank: int, waits: Dict[int, int]) -> bool:
             reached |= frontier
         return reached
 
-    return all(reach(q) >> rank & 1 for q in _bits(reach(rank)))
+    return all(has_rank(reach(q), rank) for q in _bits(reach(rank)))
 
 
 class Authority:
@@ -200,7 +218,7 @@ class Authority:
         self.hang_timeout_s = hang_timeout_s
         self.rendezvous_timeout_s = rendezvous_timeout_s
         self.record = MembershipRecord(
-            generation=0, state=MembershipState.STARTING, active_mask=(1 << world_size) - 1
+            generation=0, state=MembershipState.STARTING, active_mask=all_ranks(world_size)
         )
         self._committed_mask = self.record.active_mask
         self._rendezvous_began_s: Optional[float] = None
@@ -260,6 +278,7 @@ class Authority:
     def _decide(
         self, now_s: float, reports: Dict[int, RankReport], connected: int
     ) -> Optional[MembershipRecord]:
+        """Return the record that follows from the reports, or None if membership does not change."""
         state = self.record.state
         if state in (MembershipState.ABORTED, MembershipState.SHUTDOWN):
             return None
@@ -268,82 +287,118 @@ class Authority:
         if state == MembershipState.STARTING:
             return self._form(now_s, reports, connected)
         failed = self._failed(now_s, reports, connected, self.hang_timeout_s)
-        gone = set(self._ranks(failed | ~connected))
-        self._requested -= gone
-        self._joining -= gone
+        self._forget_joins(failed | ~connected)
         if state == MembershipState.COMMITTED:
-            ready = {r for r in self._requested if r in reports and reports[r].joining_ready}
-            starting = {r for r in self._requested if self._starting(r, reports, now_s)}
-            if not failed and not ready:
-                self._detected_s = None
-                return None
-            if self._detected_s is None:
-                self._detected_s = now_s
-            if not failed and self._awaits_more_joins(now_s, reports, ready, starting):
-                return None
-            self._requested -= ready
-            self._joining |= ready
-            if ready:
-                logger.info(f"Adding joining ranks {sorted(ready)} to the membership")
-            return self._propose((self.record.active_mask & ~failed) | self._mask(ready))
+            return self._start_change(now_s, reports, failed)
         if failed:
             return self._propose(self.record.active_mask & ~failed)
+        return self._advance_change(now_s, reports)
+
+    def _forget_joins(self, gone_mask: int) -> None:
+        """Drop the join requests and the joins of the ranks in ``gone_mask``."""
+        gone = set(self._ranks(gone_mask))
+        self._requested -= gone
+        self._joining -= gone
+
+    def _start_change(
+        self, now_s: float, reports: Dict[int, RankReport], failed: int
+    ) -> Optional[MembershipRecord]:
+        """Propose to remove the ``failed`` ranks and to add the replacements that are ready to join."""
+        ready = {r for r in self._requested if r in reports and reports[r].joining_ready}
+        starting = {r for r in self._requested if self._starting(r, reports, now_s)}
+        if not failed and not ready:
+            self._detected_s = None
+            return None
+        if self._detected_s is None:
+            self._detected_s = now_s
+        if not failed and self._awaits_more_joins(now_s, reports, ready, starting):
+            return None
+        self._requested -= ready
+        self._joining |= ready
+        if ready:
+            logger.info(f"Adding joining ranks {sorted(ready)} to the membership")
+        return self._propose((self.record.active_mask & ~failed) | rank_mask(ready))
+
+    def _advance_change(
+        self, now_s: float, reports: Dict[int, RankReport]
+    ) -> Optional[MembershipRecord]:
+        """Move a PROPOSE to INSTALL, or an INSTALL to COMMITTED, once every active rank replied.
+
+        A survivor that replies FAILED aborts the deployment. A joining rank that replies FAILED is left out.
+        """
+        state = self.record.state
         active = self._ranks(self.record.active_mask)
-        expected = Reply.READY if state == MembershipState.PROPOSE else Reply.INSTALLED
-
-        def replied(r: int, reply: Reply) -> bool:
-            report = reports.get(r)
-            # A joining rank reports its readiness before the PROPOSE, which stands for its READY.
-            ready_to_join = r in self._joining and report is not None and report.joining_ready
-            return (reply == Reply.READY and ready_to_join) or self._replied(report, reply)
-
-        failed_replies = {r for r in active if replied(r, Reply.FAILED)}
-        if failed_replies - self._joining:
-            return self.abort(
-                f"in {state.name}, ranks {sorted(failed_replies - self._joining)} replied FAILED"
-            )
+        failed_replies = {r for r in active if self._rank_replied(r, reports, Reply.FAILED)}
+        failed_survivors = failed_replies - self._joining
+        if failed_survivors:
+            return self.abort(f"in {state.name}, ranks {sorted(failed_survivors)} replied FAILED")
         if failed_replies:
             self._joining -= failed_replies
             return self._propose(
-                self.record.active_mask & ~self._mask(failed_replies),
+                self.record.active_mask & ~rank_mask(failed_replies),
                 reason="a replacement could not install the change that adds it",
             )
-        if not all(replied(r, expected) for r in active):
+        expected = Reply.READY if state == MembershipState.PROPOSE else Reply.INSTALLED
+        if not all(self._rank_replied(r, reports, expected) for r in active):
             return None
         if state == MembershipState.PROPOSE:
-            survivors = [
-                r for r in active if self._committed_mask >> r & 1 and r not in self._joining
-            ]
-            epochs = [reports[r].paused_at.epoch for r in survivors]
-            replaced = self._replaced_install_epoch
-            # Every round waits for every active rank. If a survivor stopped before the epoch of a replaced INSTALL, no
-            # rank ran a round from that epoch, and the ranks that installed it install the same epoch again.
-            if replaced and any(latest_epoch([replaced, epoch]) != epoch for epoch in epochs):
-                epoch = replaced
-            else:
-                # Epochs wrap, so the resume epoch follows the latest one, not the largest.
-                epoch = next_epoch(latest_epoch(epochs))
-            resume = ResumeState(
-                iteration=max(
-                    [self.record.resume.iteration]
-                    + [reports[r].paused_at.iteration for r in survivors]
-                ),
-                epoch=epoch,
-            )
-            self._ready_s = now_s
-            payloads = tuple(
-                (r, reports[r].ready_payload)
-                for r in active
-                if reports[r].ready_payload is not None
-            )
-            return self._set(
-                MembershipState.INSTALL, self.record.active_mask, resume, ready_payloads=payloads
-            )
-        joining = self.record.joining_mask
-        digests = {reports[r].placement_digest for r in active if not joining >> r & 1}
-        if len(digests) > 1:
+            return self._install(now_s, reports, active)
+        return self._commit(reports, active)
+
+    def _rank_replied(self, r: int, reports: Dict[int, RankReport], reply: Reply) -> bool:
+        """Return whether rank ``r`` replied ``reply`` to the current record.
+
+        A joining rank reports its readiness before the PROPOSE, which stands for its READY.
+        """
+        report = reports.get(r)
+        ready_to_join = r in self._joining and report is not None and report.joining_ready
+        return (reply == Reply.READY and ready_to_join) or self._replied(report, reply)
+
+    def _install(
+        self, now_s: float, reports: Dict[int, RankReport], active: List[int]
+    ) -> MembershipRecord:
+        """Publish INSTALL with the point where every active rank resumes and the READY payloads."""
+        survivors = [
+            r for r in active if has_rank(self._committed_mask, r) and r not in self._joining
+        ]
+        resume = ResumeState(
+            iteration=max(
+                [self.record.resume.iteration] + [reports[r].paused_at.iteration for r in survivors]
+            ),
+            epoch=self._resume_epoch([reports[r].paused_at.epoch for r in survivors]),
+        )
+        self._ready_s = now_s
+        payloads = tuple(
+            (r, reports[r].ready_payload) for r in active if reports[r].ready_payload is not None
+        )
+        return self._set(
+            MembershipState.INSTALL, self.record.active_mask, resume, ready_payloads=payloads
+        )
+
+    def _resume_epoch(self, epochs: List[int]) -> int:
+        """Return the host exchange epoch to resume from, given the epochs the survivors paused at."""
+        replaced = self._replaced_install_epoch
+        # Every round waits for every active rank. If a survivor stopped before the epoch of a replaced INSTALL, no
+        # rank ran a round from that epoch, and the ranks that installed it install the same epoch again.
+        if replaced and any(latest_epoch([replaced, epoch]) != epoch for epoch in epochs):
+            return replaced
+        # Epochs wrap, so the resume epoch follows the latest one, not the largest.
+        return next_epoch(latest_epoch(epochs))
+
+    def _commit(self, reports: Dict[int, RankReport], active: List[int]) -> MembershipRecord:
+        """Publish COMMITTED if the active ranks restored the same expert placement.
+
+        Survivors that disagree abort the deployment. Joining ranks that disagree with the survivors are left out.
+        """
+        record = self.record
+        survivor_digests = {reports[r].placement_digest for r in active if not record.is_joining(r)}
+        if len(survivor_digests) > 1:
             return self.abort("the surviving ranks restored different expert placements")
-        mismatched = {r for r in self._ranks(joining) if reports[r].placement_digest not in digests}
+        mismatched = {
+            r
+            for r in self._ranks(record.joining_mask)
+            if reports[r].placement_digest not in survivor_digests
+        }
         if mismatched:
             logger.warning(
                 f"Joining ranks {sorted(mismatched)} restored a different expert placement than the "
@@ -351,20 +406,20 @@ class Authority:
             )
             self._joining -= mismatched
             return self._propose(
-                self.record.active_mask & ~self._mask(mismatched),
+                record.active_mask & ~rank_mask(mismatched),
                 reason="a replacement restored a different expert placement than the surviving ranks",
             )
         self._joining -= set(active)
         self._replaced_install_epoch = 0
-        for r in self._ranks(self._committed_mask & ~self.record.active_mask):
-            self._failed_in[r] = self.record.generation
+        for r in self._ranks(self._committed_mask & ~record.active_mask):
+            self._failed_in[r] = record.generation
         for r in active:
             self._failed_in.pop(r, None)
-        self._committed_mask = self.record.active_mask
+        self._committed_mask = record.active_mask
         # A replacement's progress clock must not continue from the process it replaces.
         self._progress.clear()
         self._hung_since.clear()
-        return self._set(MembershipState.COMMITTED, self.record.active_mask)
+        return self._set(MembershipState.COMMITTED, record.active_mask)
 
     def _form(
         self, now_s: float, reports: Dict[int, RankReport], connected: int
@@ -446,7 +501,7 @@ class Authority:
             state=state,
             active_mask=active_mask,
             resume=self.record.resume if resume is None else resume,
-            joining_mask=self._mask(self._joining) & active_mask,
+            joining_mask=rank_mask(self._joining) & active_mask,
             ready_payloads=ready_payloads,
             reason=reason,
         )
@@ -473,7 +528,7 @@ class Authority:
         expected = {MembershipState.PROPOSE: Reply.READY, MembershipState.INSTALL: Reply.INSTALLED}
         waited_on = 0
         if state in expected:
-            waited_on = self._mask(
+            waited_on = rank_mask(
                 r for r in active if not self._replied(reports.get(r), expected[state])
             )
         # A rank's waits count only while its reports advance.
@@ -497,7 +552,7 @@ class Authority:
                 (report.progress, report.install_steps, frozenset(rounds.get(r, ()))),
             )
             idle = r == 0 and state == MembershipState.COMMITTED and r in waits and report.idle
-            if waited_on >> r & 1 and not idle and _chain_end(r, waits):
+            if has_rank(waited_on, r) and not idle and _chain_end(r, waits):
                 since_s = max(self._hung_since.setdefault(r, now_s), self._progress[r][1])
                 if now_s - since_s > timeout_s:
                     failed |= 1 << r
@@ -523,11 +578,7 @@ class Authority:
         return "; ".join(described)
 
     def _ranks(self, mask: int) -> List[int]:
-        return [r for r in range(self.world_size) if mask >> r & 1]
-
-    @staticmethod
-    def _mask(ranks) -> int:
-        return sum(1 << r for r in ranks)
+        return [r for r in range(self.world_size) if has_rank(mask, r)]
 
 
 class RendezvousStore:
@@ -1366,7 +1417,7 @@ class AuthorityProcess:
             return "rank 0 is never replaced"
         if self._authority.record.state == MembershipState.STARTING:
             return "no replacement joins before the deployment has started"
-        if self._authority.record.is_active(rank) and self._connected() >> rank & 1:
+        if self._authority.record.is_active(rank) and has_rank(self._connected(), rank):
             return f"rank {rank} is active: no replacement joins for it"
         return None
 

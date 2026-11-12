@@ -497,7 +497,7 @@ class NodeSupervisor:
         for rank in self._ranks:
             if committed and record.is_active(rank):
                 self._refusals.pop(rank, None)
-            elif previous.joining_mask >> rank & 1 and not record.is_active(rank) and record.reason:
+            elif previous.is_joining(rank) and not record.is_active(rank) and record.reason:
                 reason, count = self._refusals.get(rank, (record.reason, 0))
                 count = count + 1 if reason == record.reason else 1
                 self._refusals[rank] = (record.reason, count)

@@ -2136,7 +2136,7 @@ def test_kv_pool_resize_runs_with_every_cache_suspended(fails):
     executor._resume_padding_dummies_after_rebalance = Mock()
 
     def shrink():
-        with executor._kv_pools_suspended() as kv_cache_manager:
+        with executor.kv_pools_suspended() as kv_cache_manager:
             assert kv_cache_manager is manager
             assert manager.suspended == executor.active_requests
             manager.total_blocks = 60
@@ -2180,7 +2180,7 @@ def test_kv_pool_resize_error_is_kept_when_the_resume_fails_too():
     resize_error = RuntimeError("a peer exited during the remap")
 
     with pytest.raises(KeyError) as resume_error:
-        with executor._kv_pools_suspended():
+        with executor.kv_pools_suspended():
             raise resize_error
     assert resume_error.value.__context__ is resize_error
 
