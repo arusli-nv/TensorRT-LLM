@@ -444,7 +444,10 @@ def join_startup_group(mapping: Mapping) -> None:
 
 
 def _join_at_entry(store: RendezvousStore, identity: RankIdentity) -> None:
-    """Join the membership, exiting the process if the deployment ends before the executor takes the client over."""
+    """Join the membership, exiting the process if the deployment ends before the executor takes the client over.
+
+    A replacement then waits for the device memory of its predecessor, so that it sizes its KV cache from all of it.
+    """
     global _client
     _client = MembershipClient(
         identity.rank,
@@ -454,9 +457,39 @@ def _join_at_entry(store: RendezvousStore, identity: RankIdentity) -> None:
         on_error=_on_error_at_startup,
     )
     _client.start()
+    if identity.replacement:
+        _wait_for_predecessor_memory(store, identity.rank, _client.incarnation)
+
+
+def _wait_for_predecessor_memory(store: RendezvousStore, rank: int, incarnation: int) -> None:
+    """Wait until the predecessor of this replacement ended and the active ranks released the memory they imported.
+
+    The active ranks release the memory that they imported from a rank before they commit a membership without it.
+
+    Raises:
+        TimeoutError: The predecessor did not end, or no such commit came, within the rendezvous timeout.
+    """
+    deadline_s = time.monotonic() + RENDEZVOUS_TIMEOUT_S
+    while True:
+        disconnected = json.loads(store.get_if_set(DISCONNECTED_KEY) or "[]")
+        ended = rank < len(disconnected) and disconnected[rank] >= incarnation - 1
+        if ended and _predecessor_memory_released.is_set():
+            return
+        if time.monotonic() > deadline_s:
+            awaited = (
+                "the active ranks to release the memory of its predecessor"
+                if ended
+                else f"its predecessor (incarnation {incarnation - 1}) to end"
+            )
+            raise TimeoutError(
+                f"The replacement of rank {rank} waited {RENDEZVOUS_TIMEOUT_S:.0f} s for {awaited}, so it cannot "
+                "size its KV cache from the device memory"
+            )
+        time.sleep(STORE_POLL_S)
 
 
 _every_rank_started = threading.Event()
+_predecessor_memory_released = threading.Event()
 
 
 def _on_record_at_startup(record: MembershipRecord) -> None:
@@ -465,6 +498,8 @@ def _on_record_at_startup(record: MembershipRecord) -> None:
         _end_process(_client.rank, status, f"the membership record is {record} during the startup")
     if record.state != MembershipState.STARTING:
         _every_rank_started.set()
+    if record.state == MembershipState.COMMITTED and not record.is_active(_client.rank):
+        _predecessor_memory_released.set()
 
 
 def _on_error_at_startup(error: Exception) -> None:

@@ -3145,6 +3145,50 @@ def test_starting_rank_exits_when_deployment_ends(monkeypatch, state, status):
     assert exited.value.code == 1
 
 
+@pytest.mark.parametrize("last", ["commit", "predecessor end"])
+def test_replacement_waits_for_predecessor_memory(monkeypatch, last):
+    """Check that a replacement starts only once its predecessor ended and the active ranks committed without it.
+
+    The active ranks release the memory that they imported from the predecessor before that commit, so the
+    replacement measures the free device memory for its KV cache only afterwards.
+    """
+    store = FakeStore()
+    client = Mock(rank=FAILED, incarnation=1)
+    monkeypatch.setattr(recovery_module, "_client", None)
+    monkeypatch.setattr(recovery_module, "MembershipClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(recovery_module, "_predecessor_memory_released", threading.Event())
+    commit = [
+        partial(recovery_module._on_record_at_startup, _record(MembershipState.INSTALL)),
+        partial(recovery_module._on_record_at_startup, _record(MembershipState.COMMITTED)),
+    ]
+    predecessor_end = [partial(store.set, DISCONNECTED_KEY, json.dumps([-1, -1, 0, -1]).encode())]
+    steps = predecessor_end + commit if last == "commit" else commit + predecessor_end
+    monkeypatch.setattr(recovery_module.time, "sleep", lambda _s: steps.pop(0)())
+    identity = _wide_ep_fault_tolerance.RankIdentity(FAILED, WORLD, WORLD, True)
+    recovery_module._join_at_entry(store, identity)
+    assert steps == []
+
+
+@pytest.mark.parametrize(
+    "ended, awaited",
+    [(False, r"predecessor \(incarnation 0\) to end"), (True, "release the memory")],
+)
+def test_replacement_wait_times_out(monkeypatch, ended, awaited):
+    store = FakeStore()
+    if ended:
+        store.set(DISCONNECTED_KEY, json.dumps([-1, -1, 0, -1]).encode())
+    monkeypatch.setattr(recovery_module, "_predecessor_memory_released", threading.Event())
+    clock = SimpleNamespace(now_s=0.0)
+
+    def sleep(seconds):
+        clock.now_s += seconds
+
+    monkeypatch.setattr(recovery_module.time, "monotonic", lambda: clock.now_s)
+    monkeypatch.setattr(recovery_module.time, "sleep", sleep)
+    with pytest.raises(TimeoutError, match=awaited):
+        recovery_module._wait_for_predecessor_memory(store, FAILED, 1)
+
+
 # Rejoin. A replacement rank starts alone and the active ranks admit it.
 
 JOINED = (0, 0, 1, 0)  # The first replacement of rank 2 stands for it.
