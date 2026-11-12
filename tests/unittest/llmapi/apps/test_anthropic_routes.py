@@ -40,7 +40,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ToolCall,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.openai_server import OpenAIServer, _stream_error_events
 from tensorrt_llm.serve.render import chat as render_chat_module
 from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
@@ -612,20 +612,45 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     server_logger.error.assert_not_called()
 
 
-def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
-    """A failure of the generation itself is still logged and raised."""
+def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, server_logger):
+    """A failed generation is logged, and the stream ends with an error event and [DONE].
+
+    A completion stream ends the same way, because HTTP 200 was already sent.
+    """
 
     async def run():
         generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
-        stream, _ = await _chat_stream(monkeypatch, generation)
-        with pytest.raises(RuntimeError, match="engine failed"):
-            async for _ in stream:
-                pass
+        stream, server = await _chat_stream(monkeypatch, generation)
+        return [frame async for frame in stream], server
 
-    asyncio.run(run())
+    frames, server = asyncio.run(run())
 
+    assert frames[0] == "data: one\n\n"
+    # OpenAI clients raise on an event whose data carries an "error" object.
+    error = json.loads(frames[1][len("data: ") :])["error"]
+    assert (error["message"], error["type"]) == ("engine failed", "server_error")
+    assert frames[2:] == ["data: [DONE]\n\n"]
+    server._extract_metrics.assert_not_awaited()
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
+
+
+def test_chat_stream_failure_after_done_adds_no_error_event(monkeypatch, server_logger):
+    """A failure while recording the metrics after [DONE] sends no error event after it."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]])
+        stream, server = await _chat_stream(monkeypatch, generation)
+        server._extract_metrics.side_effect = RuntimeError("metrics failed")
+        frames = []
+        with pytest.raises(RuntimeError, match="metrics failed"):
+            async for frame in stream:
+                frames.append(frame)
+        return frames
+
+    frames = asyncio.run(run())
+
+    assert frames == ["data: one\n\n", "data: [DONE]\n\n"]
 
 
 @pytest.fixture
@@ -645,6 +670,33 @@ def prometheus_multiproc_dir(tmp_path, monkeypatch):
         yield tmp_path
     finally:
         prometheus_client.values.ValueClass = saved_value_class
+
+
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_messages_route_ends_a_failed_stream_with_a_generic_error(server_kind):
+    """A failed chat stream ends the message with an error that hides the failure's text."""
+
+    async def failing_chat_stream():
+        chunk = ChatCompletionStreamResponse(
+            model=MODEL, choices=[{"index": 0, "delta": {"content": "Hello"}}]
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
+        # End the stream the way openai_chat ends a failed request.
+        for event in _stream_error_events(RuntimeError("engine failed: internal detail")):
+            yield event
+
+    openai_response = StreamingResponse(failing_chat_stream(), media_type="text/event-stream")
+    client, _ = _make_route_client(server_kind, openai_response)
+
+    response = client.post("/v1/messages", json=_request(stream=True))
+
+    assert response.status_code == 200
+    assert "event: message_stop\n" not in response.text
+    assert "internal detail" not in response.text
+    assert response.text.rstrip().endswith(
+        'event: error\ndata: {"type":"error","error":'
+        '{"type":"api_error","message":"Internal server error"}}'
+    )
 
 
 def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
