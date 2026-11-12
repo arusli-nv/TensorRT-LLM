@@ -470,14 +470,16 @@ STARTUP_COLLECTIVE_NAMES = frozenset(
     | {"Split", "Split_type", "Create_group", "Dup", "subgroup"}
     | {"mpi_allgather", "mpi_broadcast", "mpi_barrier", "local_mpi_barrier"}
 )
+# The startup record's agreements: a replacement rank takes the original ranks' result of the gather they run.
+AGREEMENTS = frozenset({"agree", "agree_rank_capacity"})
 
 
 def _agreed_nodes(function: ast.AST) -> set:
-    """Return the ids of the nodes of ``function`` whose value reaches a ``startup_record.agree`` call."""
+    """Return the ids of the nodes of ``function`` whose value reaches a ``startup_record.agree*`` call."""
     calls = [
         node
         for node in _own_nodes(function)
-        if isinstance(node, ast.Call) and _call_name(node) == "agree"
+        if isinstance(node, ast.Call) and _call_name(node) in AGREEMENTS
     ]
     agreed = {id(n) for call in calls for n in ast.walk(call)}
     names = {n.id for call in calls for n in ast.walk(call) if isinstance(n, ast.Name)}

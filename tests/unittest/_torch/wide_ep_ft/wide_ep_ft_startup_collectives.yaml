@@ -75,16 +75,11 @@ modules:
     KVCacheManager.calculate_max_num_blocks: {collectives: [allreduce], reason: rejected,
                                               note: KV cache manager V1 (check_supported)}
   tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py:
-    KVCacheManagerV2.__init__: {collectives: [allreduce, allreduce], reason: replayed,
-                                note: the minimums must bound a replacement rank's own host history budget and token
-                                  capacity}
     KVCacheManagerV2._grow_host_tier_into_unpinned_history: {collectives: [allreduce], reason: replayed,
                                                              note: the original ranks' outcome must match a replacement
                                                                rank's own host tier resize}
     KVCacheManagerV2._setup_sparse_kv_offload: {collectives: [allreduce], reason: replayed,
                                                 note: the minimum must bound a replacement rank's own history pools}
-    _sync_host_tier_quota: {collectives: [allreduce], reason: replayed,
-                            note: the minimum must bound a replacement rank's own host quota}
     _sync_kv_cache_manager_init_status: {collectives: [allreduce], reason: replayed,
                                          note: the maximum must bound a replacement rank's own status}
   tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/warmup.py:
