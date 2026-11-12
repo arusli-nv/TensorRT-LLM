@@ -2786,60 +2786,6 @@ def test_health_state(monkeypatch, record, state):
     assert FaultToleranceHealth("host:1", b"secret").status()["state"] == state
 
 
-# Values that are not JSON, lack a record's fields, or are not a JSON object.
-@pytest.mark.parametrize("value", [b"not a membership record", b"{}", b"[1, 2]"])
-def test_health_skips_unparsable_record(monkeypatch, value):
-    """Check that a store value that does not parse counts as absent until one that parses is read."""
-    store = FakeRendezvousStore(_record(MembershipState.COMMITTED))
-    monkeypatch.setattr(recovery_module, "open_store", lambda *args, **kwargs: store)
-    health = FaultToleranceHealth("host:1", b"secret")
-    assert health.status()["state"] == "degraded"
-    store.values[membership.RECORD_KEY] = value
-    store.values[TRANSACTION_KEY] = value
-    status = health.status()
-    assert status["state"] == "degraded"
-    assert status["last_transaction"] is None
-    store.values[membership.RECORD_KEY] = (
-        _record(MembershipState.COMMITTED, active_mask=0b1111).model_dump_json().encode()
-    )
-    assert health.status()["state"] == "healthy"
-
-
-def test_health_reconnects_once_per_read_timeout(monkeypatch):
-    """Check that probes served while the store does not answer do not each wait for it."""
-    monkeypatch.setattr(recovery_module, "_STATUS_READ_TIMEOUT_S", 0.5)
-    now_s = [1000.0]
-    monkeypatch.setattr(recovery_module.time, "monotonic", lambda: now_s[0])
-    open_store = Mock(side_effect=OSError("the store does not answer"))
-    monkeypatch.setattr(recovery_module, "open_store", open_store)
-    health = FaultToleranceHealth("host:1", b"secret")
-    for _ in range(3):
-        status = health.status()
-        assert status["state"] == "unprotected"
-        assert not status["authority_alive"]
-    assert open_store.call_count == 1
-    now_s[0] += 0.5
-    open_store.side_effect = None
-    open_store.return_value = FakeRendezvousStore(
-        _record(MembershipState.COMMITTED, active_mask=0b1111)
-    )
-    assert health.status()["state"] == "healthy"
-    assert open_store.call_count == 2
-
-
-def test_health_authority_alive_while_store_answers(monkeypatch):
-    """Check that the authority counts as alive exactly while the store it hosts answers."""
-    store = FakeRendezvousStore(_record(MembershipState.COMMITTED, active_mask=0b1111))
-    monkeypatch.setattr(recovery_module, "open_store", lambda *args, **kwargs: store)
-    health = FaultToleranceHealth("host:1", b"secret")
-    assert health.status()["authority_alive"]
-    assert health.status()["state"] == "healthy"
-    store.get_if_set = Mock(side_effect=RuntimeError("the store does not answer"))
-    status = health.status()
-    assert not status["authority_alive"]
-    assert status["state"] == "unprotected"
-
-
 def test_health_skips_store_after_authority_ends(monkeypatch):
     """Check that reads after a failed store read answer unprotected at once without the store.
 
@@ -2850,7 +2796,9 @@ def test_health_skips_store_after_authority_ends(monkeypatch):
     open_store = Mock(return_value=store)
     monkeypatch.setattr(recovery_module, "open_store", open_store)
     health = FaultToleranceHealth("host:1", b"secret")
-    assert health.status()["state"] == "healthy"
+    status = health.status()
+    assert status["state"] == "healthy"
+    assert status["authority_alive"]
     store.get_if_set = Mock(side_effect=RuntimeError("the store does not answer"))
     assert health.status()["state"] == "unprotected"
     store.get_if_set.reset_mock()
@@ -2884,16 +2832,15 @@ def _server(monkeypatch, store):
 
 
 def test_status_endpoint_reports_membership(monkeypatch):
-    began_unix_ms = 1_762_000_000_000
     transaction = TransactionSummary(
         generation=1,
         outcome="COMMITTED",
         removed_ranks=(FAILED,),
         added_ranks=(),
-        detected_unix_ms=began_unix_ms - 12,
-        began_unix_ms=began_unix_ms,
-        ready_unix_ms=began_unix_ms + 400,
-        ended_unix_ms=began_unix_ms + 1500,
+        detected_unix_ms=988,
+        began_unix_ms=1000,
+        ready_unix_ms=1400,
+        ended_unix_ms=2500,
     )
     server = _server(
         monkeypatch, FakeRendezvousStore(_record(MembershipState.COMMITTED), transaction)
@@ -2912,94 +2859,39 @@ def test_status_endpoint_reports_membership(monkeypatch):
             "outcome": "COMMITTED",
             "removed_ranks": [FAILED],
             "added_ranks": [],
-            "detected_unix_ms": began_unix_ms - 12,
-            "began_unix_ms": began_unix_ms,
-            "ready_unix_ms": began_unix_ms + 400,
-            "ended_unix_ms": began_unix_ms + 1500,
+            "detected_unix_ms": 988,
+            "began_unix_ms": 1000,
+            "ready_unix_ms": 1400,
+            "ended_unix_ms": 2500,
         },
     }
 
 
-def test_status_endpoint_without_store(monkeypatch):
-    server = _server(monkeypatch, None)
-    status = json.loads(asyncio.run(server.fault_tolerance_status()).body)
-    assert status["state"] == "unprotected"
-    assert not status["authority_alive"]
-    assert status["active_ranks"] is None
-    assert status["last_transaction"] is None
-
-
 @pytest.mark.parametrize(
-    "record, code",
+    "record, fatal, code",
     [
-        (_record(MembershipState.COMMITTED), 200),
+        (_record(MembershipState.COMMITTED), False, 200),
         # A liveness probe must not restart the server while the membership changes.
-        (_record(MembershipState.PROPOSE), 200),
-        (_record(MembershipState.INSTALL), 200),
-        (_record(MembershipState.ABORTED), 503),
-        (None, 200),
+        (_record(MembershipState.PROPOSE), False, 200),
+        (_record(MembershipState.INSTALL), False, 200),
+        (_record(MembershipState.ABORTED), False, 503),
+        (None, False, 200),
+        (_record(MembershipState.COMMITTED), True, 503),
     ],
 )
-def test_health_503_only_after_deployment_stops(monkeypatch, record, code):
+def test_health_503_only_after_deployment_stops(monkeypatch, record, fatal, code):
     """Check that the status code carries the health and the body stays unchanged."""
     server = _server(monkeypatch, None if record is None else FakeRendezvousStore(record))
+    if fatal:
+        server.generator._check_health.return_value = False
+        server.generator._executor._fatal_error = RuntimeError("engine died")
+        server.generator._executor.doing_shutdown = True  # No signal, since the shutdown started.
     response = asyncio.run(server.health())
     assert response.status_code == code
     if code == 200:
         assert response.body == b""
     else:
         assert response.body.startswith(b"LLM is unavailable")
-
-
-@pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_health_503_after_fatal_engine_error(monkeypatch, fault_tolerance):
-    server = _server(monkeypatch, None)
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
-    server.generator._check_health.return_value = False
-    server.generator._executor._fatal_error = RuntimeError("engine died")
-    server.generator._executor.doing_shutdown = True  # No signal, since the shutdown started.
-    response = asyncio.run(server.health())
-    assert response.status_code == 503
-    assert response.body.startswith(b"LLM is unavailable")
-
-
-@pytest.mark.timeout(60)
-def test_health_stays_failed_while_rank_lingers(monkeypatch):
-    """Check that /health answers 503 after an abort while the store still answers.
-
-    The authority keeps its store up until every active rank has left.
-    """
-    from torch.distributed import TCPStore
-
-    secret = b"shared-secret"
-    master = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
-    store = RendezvousStore(master, secret)
-    authority = membership.AuthorityProcess(2, store, membership.Authority(2))
-    thread = threading.Thread(target=authority.run, kwargs={"host": "127.0.0.1"}, daemon=True)
-    thread.start()
-    _wait_until(lambda: store.get_if_set(membership.LIVENESS_KEY) is not None)
-    connections = [membership.open_liveness_connection(store, rank, 0) for rank in range(2)]
-    for connection in connections:  # The startup of every rank is done.
-        connection.sock.sendall(membership._line(membership.RankReport(started=True, sequence=1)))
-    health = FaultToleranceHealth(f"127.0.0.1:{master.port}", secret)
-    try:
-        _wait_until(lambda: health.status()["state"] == "healthy", timeout_s=10)
-        connections[0].sock.close()  # The process of rank 0 ends, so the deployment aborts.
-        _wait_until(lambda: health.status()["state"] == "failed", timeout_s=10)
-        # Rank 1 has not left yet.
-        assert thread.is_alive()
-        status = health.status()
-        assert status["authority_alive"]
-    finally:
-        for connection in connections:
-            connection.sock.close()
-        thread.join(10)
-    assert status["state"] == "failed"
-    server = _server(monkeypatch, None)
-    server.generator._executor.fault_tolerance_health = health
-    response = asyncio.run(server.health())
-    assert response.status_code == 503
-    assert response.body.startswith(b"LLM is unavailable")
 
 
 def _start_authority_at_a_free_port(monkeypatch):

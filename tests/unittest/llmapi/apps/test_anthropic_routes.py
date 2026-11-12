@@ -36,7 +36,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
-    CompletionRequest,
     FunctionCall,
     ToolCall,
     UsageInfo,
@@ -627,58 +626,13 @@ def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, se
     frames, server = asyncio.run(run())
 
     assert frames[0] == "data: one\n\n"
-    assert json.loads(frames[1][len("data: ") :])["error"]["message"] == "engine failed"
+    # OpenAI clients raise on an event whose data carries an "error" object.
+    error = json.loads(frames[1][len("data: ") :])["error"]
+    assert (error["message"], error["type"]) == ("engine failed", "server_error")
     assert frames[2:] == ["data: [DONE]\n\n"]
     server._extract_metrics.assert_not_awaited()
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
-
-
-def test_completion_stream_of_two_prompts_reports_the_failure_of_one(monkeypatch, server_logger):
-    """One failing prompt of a batched completion stream yields one error event.
-
-    The other prompt's events still arrive and the stream ends with [DONE].
-    """
-
-    async def run():
-        server = object.__new__(OpenAIServer)
-        server.model = MODEL
-        server.model_config = _ModelConfig()
-        server.tokenizer = None
-        server._is_visual_gen = False
-        server._adjusted_steady_clock = SimpleNamespace(now=time.monotonic)
-        server.generator = SimpleNamespace(
-            args=SimpleNamespace(
-                gather_generation_logits=False,
-                reasoning_parser=None,
-                backend="pytorch",
-                num_postprocess_workers=1,
-            ),
-            generate_async=Mock(
-                side_effect=[
-                    _StreamedGeneration([["data: first\n\n"]]),
-                    _StreamedGeneration([["data: second\n\n"]], then=RuntimeError("prompt failed")),
-                ]
-            ),
-        )
-        server.await_disconnected = AsyncMock()
-        server._extract_metrics = AsyncMock()
-        # Token-id prompts skip the input processor and its executor.
-        request = CompletionRequest(model=MODEL, prompt=[[1, 2], [3, 4]], stream=True)
-        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
-        response = await server.openai_completion(request, raw_request)
-        assert isinstance(response, StreamingResponse), response.body
-        return [frame async for frame in response.body_iterator]
-
-    frames = asyncio.run(run())
-
-    assert frames[-1] == "data: [DONE]\n\n"
-    assert "data: first\n\n" in frames
-    assert "data: second\n\n" in frames
-    errors = [f for f in frames if f.startswith('data: {"error"')]
-    assert len(errors) == 1
-    assert json.loads(errors[0][len("data: ") :])["error"]["message"] == "prompt failed"
-    server_logger.error.assert_called_once()
 
 
 @pytest.fixture

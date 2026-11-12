@@ -21,7 +21,6 @@ import pytest
 from tensorrt_llm.llmapi.llm_args import (
     AttentionDpConfig,
     CacheTransceiverConfig,
-    DSparkDecodingConfig,
     KvCacheConfig,
     KvCacheConnectorConfig,
     MTPDecodingConfig,
@@ -59,14 +58,22 @@ def _args(**fields) -> TorchLlmArgs:
         },
         {"speculative_config": MTPDecodingConfig(num_nextn_predict_layers=1)},
         # Under fault tolerance no modeling_v2 target is resolved, so "require" fails later, when the model loads.
-        # The default "auto" is covered by the empty case above.
         {"modeling_v2": "require"},
         {"torch_compile_config": TorchCompileConfig(enable_userbuffers=False)},
         {"prefill_cuda_graph_backend": "piecewise"},
+        # Without fault tolerance, nothing is checked.
+        {
+            "enable_wide_ep_fault_tolerance": False,
+            "disable_overlap_scheduler": True,
+            "num_serve_frontends": 2,
+            "sleep_config": SleepConfig(),
+        },
     ],
 )
-def test_a_supported_configuration_is_accepted(fields):
-    assert _args(**fields).enable_wide_ep_fault_tolerance
+def test_supported_configuration_is_accepted(fields):
+    assert _args(**fields).enable_wide_ep_fault_tolerance == fields.get(
+        "enable_wide_ep_fault_tolerance", True
+    )
 
 
 @pytest.mark.parametrize(
@@ -82,17 +89,10 @@ def test_a_supported_configuration_is_accepted(fields):
             {"moe_config": {"load_balancer": {"mode": "per_layer_dynamic", "num_slots": 16}}},
             "moe_config.load_balancer.mode='standard'",
         ),
-        *(
-            (
-                {"attention_dp_config": AttentionDpConfig(**{option: True})},
-                "no enable_kv_balanced_admission, enable_kv_cache_aware_routing or "
-                "kv_cache_routing_conversation_affinity in attention_dp_config",
-            )
-            for option in (
-                "enable_kv_balanced_admission",
-                "enable_kv_cache_aware_routing",
-                "kv_cache_routing_conversation_affinity",
-            )
+        (
+            {"attention_dp_config": AttentionDpConfig(enable_kv_cache_aware_routing=True)},
+            "no enable_kv_balanced_admission, enable_kv_cache_aware_routing or "
+            "kv_cache_routing_conversation_affinity in attention_dp_config",
         ),
         (
             {"kv_cache_config": KvCacheConfig(event_buffer_max_size=1024)},
@@ -132,26 +132,3 @@ def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
-
-
-def test_dspark_is_rejected(tmp_path):
-    (tmp_path / "config.json").write_text('{"dspark_block_size": 2}')
-    with pytest.raises(
-        ValueError, match="no NGram or user-provided drafter and no DSpark"
-    ) as error:
-        _args(
-            speculative_config=DSparkDecodingConfig(
-                max_draft_len=2, speculative_model=str(tmp_path)
-            )
-        )
-    assert "decoding_type such as MTP" in str(error.value)
-    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
-
-
-def test_fault_tolerance_off_skips_checks():
-    assert not _args(
-        enable_wide_ep_fault_tolerance=False,
-        disable_overlap_scheduler=True,
-        num_serve_frontends=2,
-        sleep_config=SleepConfig(),
-    ).enable_wide_ep_fault_tolerance

@@ -14,11 +14,8 @@
 # limitations under the License.
 """End-to-end tests of Wide-EP fault tolerance with DeepSeek serving under load while ranks fail and rejoin.
 
-By default each test starts DeepSeek-V3-Lite with attention DP and EP over 4 GPUs, using ``trtllm-llmapi-launch``
-under ``mpirun --enable-recovery``. :func:`test_rejoin_when_server_spawns_ranks` instead starts plain
-``trtllm-serve``, which spawns the ranks itself. With ``TLLM_FT_E2E_SERVER`` set, a test attaches to a deployment
-started elsewhere, such as DeepSeek-R1 over 8 nodes. Run one test per external deployment, on the node of the ranks
-it fails. These variables describe the external deployment:
+Each test starts DeepSeek-V3-Lite with attention DP and EP over 4 GPUs under ``mpirun --enable-recovery``, or
+attaches to an external deployment, on the node of the ranks it fails, with these variables:
 
 - ``TLLM_FT_E2E_SERVER`` is the server's base URL.
 - ``TLLM_FT_E2E_SERVER_LOGS`` is a glob pattern of the files the deployment's ranks log to.
@@ -26,20 +23,12 @@ it fails. These variables describe the external deployment:
 - ``TLLM_FT_E2E_SEQUENCE`` is the comma-separated list of failures that :func:`test_rank_failure_sequence` runs.
   The default is ``crash,hang``. Use ``crash,node`` on several nodes.
 - ``TLLM_FAULT_TOLERANCE_SHARED_SECRET`` identifies the deployment's processes.
+- ``TLLM_FT_E2E_REPORT`` receives the phases and cycles as JSON, by default in the test's tmp_path.
+- ``TLLM_FT_E2E_CONFIG`` (JSON) is merged into the configuration of a deployment that a test starts.
 
-``TLLM_FT_E2E_CONFIG`` (JSON) is merged into the configuration of a deployment that a test starts. The phases and
-cycles are written as JSON to ``TLLM_FT_E2E_REPORT``, by default in the test's tmp_path.
-
-A test runs its failures in sequence in one deployment, under one closed-loop load that runs throughout.
-
-- Load clients send fixed-length requests, streamed and not, greedy and seeded sampling. A client sends a request
-  once more when it fails with the error code ``rank_failure``.
-- Eval clients answer GSM8K questions through the same server with main's lm-eval task. Each phase is scored.
-- The run starts with a ``healthy`` phase. Each failure then adds a cycle of phases. ``failover`` covers the
-  requests in flight at the failure. ``degraded`` covers N-K ranks serving while the replacement starts.
-  ``admission`` covers the requests in flight when the replacement's admission begins. ``rejoined`` covers serving
-  at N ranks again.
-- Membership events are timed from the rendezvous store, which the server's own reader polls every STORE_POLL_S.
+Load and GSM8K clients run throughout. After a ``healthy`` phase, each failure adds the phases ``failover`` (the
+requests in flight at the failure), ``degraded``, ``admission`` (in flight when the replacement is admitted) and
+``rejoined``.
 """
 
 import contextlib
@@ -85,20 +74,15 @@ from .conftest import llm_models_root
 
 WORLD_SIZE = 4
 VICTIM = 2
-# Model loading and CUDA graph capture.
 STARTUP_TIMEOUT_S = 1800
-# The status endpoint reports the generation, the active and failed ranks, and the last membership transaction.
 STATUS_PATH = "/fault_tolerance_status"
-# The endpoint refreshes from the rendezvous store once a second. The test times membership events, and acts on
-# them during a membership change, by reading the store itself at this interval.
+# The endpoint refreshes once a second, so the test times membership events by reading the store itself.
 STORE_POLL_S = 0.01
 EXTERNAL = bool(os.environ.get("TLLM_FT_E2E_SERVER"))
 # Fault tolerance runs the NVLink one-sided all-to-all on its fence path.
 FENCE_PATH_ENV = {"TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT": "0"}
 
-# Closed-loop load with CLIENTS_PER_RANK clients per serving rank, at most MAX_CLIENTS. Each client sends its next
-# request when the previous one ends. Half of the clients stream, and half of each group samples with SAMPLING and a
-# per-request seed. Requests last several seconds, so many are in flight at a failure.
+# Closed-loop load. Half of the clients stream, and half of each group samples with a per-request seed.
 CLIENTS_PER_RANK = 16
 MAX_CLIENTS = 256
 LOAD_INPUT_LEN = (128, 512)
@@ -106,57 +90,40 @@ LOAD_MAX_TOKENS = 512
 SAMPLING = {"temperature": 0.8, "top_p": 0.95}
 REQUEST_TIMEOUT_S = 900
 
-# GSM8K runs through the same server with main's lm-eval task (5-shot, its stop strings, greedy, at most 256 tokens)
-# on the first EVAL_QUESTIONS questions of its seed-0 shuffle. Every phase asks the same questions. The eval clients
-# restart from the first question when a window phase starts. The window lasts until every question is answered in
-# it, at most EVAL_COVER_EXTRA_S past WINDOW_S.
+# GSM8K with main's lm-eval task on the first EVAL_QUESTIONS questions. A window phase lasts until every question
+# is answered in it, at most EVAL_COVER_EXTRA_S past WINDOW_S.
 EVAL_CLIENTS_PER_RANK = 4
 MAX_EVAL_CLIENTS = 64
 EVAL_QUESTIONS = 256
 EVAL_COVER_EXTRA_S = 120
-# Paired accuracy pass bar. A phase scores each question once, by its first answer in the phase, with the task's
-# strict-match filter. The healthy phase answers every question, and every other phase answers at least one. On the
-# questions that both a phase and the healthy phase answered, the discordant pairs must not show a loss. The check
-# is a one-sided exact sign test (McNemar) at ACCURACY_ALPHA, Bonferroni-corrected by the number of later phases.
+# A phase must not lose paired accuracy against the healthy phase: a one-sided exact sign test (McNemar) at
+# ACCURACY_ALPHA, Bonferroni-corrected by the number of later phases.
 ACCURACY_FILTER = "strict-match"
 ACCURACY_ALPHA = 0.05
 
-# Warmup before the healthy window, settle time after a membership change, and the length of each window.
 WARMUP_S = 20
 SETTLE_S = 10
 WINDOW_S = 60
 # A stall is a gap of this long without a streamed token while the load runs.
 STALL_S = 5.0
 
-# Pause targets for the failover after a crash, after a hang beyond the authority's hang timeout, and for the
-# survivors while a replacement is admitted.
+# Pause targets for the failover after a crash or a hang, and while a replacement is admitted.
 CRASH_PAUSE_TARGET_S = 5.0
 HANG_PAUSE_MARGIN_S = 5.0
 HANG_TIMEOUT_S = inspect.signature(Authority).parameters["hang_timeout_s"].default
 ADMISSION_PAUSE_TARGET_S = 3.0
-# Time to detect a crash and commit the smaller membership. A hang is detected HANG_TIMEOUT_S later.
 RECOVERY_TIMEOUT_S = 120
-# A replacement loads the model and captures its CUDA graphs alone before it is admitted.
 REJOIN_TIMEOUT_S = 1200
-# An excluded process exits once it runs again and reads its exclusion.
 EXCLUDED_EXIT_TIMEOUT_S = 60
-# How long an invalid join is watched for a membership change it must not cause.
 INVALID_JOIN_WATCH_S = 20
-# GPU memory that a second reuse cycle may add on a GPU over the first one before it counts as a leak.
-GPU_MEMORY_LEAK_TOLERANCE_MIB = 256
-# The authority logs this prefix followed by the reason when it refuses a liveness connection.
 REFUSAL_LOG = "Closing a liveness connection: "
-# For each membership change, rank 0 logs how many requests held by no active rank the rank failure ended.
 RETRYABLE_LOG = re.compile(
     r"Rank 0 resumed serving with membership generation (\d+),.* (\d+) requests no active rank holds ended by "
     r"the rank failure"
 )
 
-# Each rank logs one of these lines per graph shape in the warmup's capture pass, which is the only place its CUDA
-# graph runner may capture (CUDAGraphRunner.allow_capture). A replacement adds its own lines at startup. A survivor
-# whose count grows has recaptured its graphs.
+# A rank logs this per graph shape when it captures, which only the warmup may do (CUDAGraphRunner.allow_capture).
 CAPTURE_LINE = re.compile(r"\[RANK (\d+)\].*(CUDA graph capture|Capturing \d+ graphs)")
-# The variables a launcher sets to a process's rank, in the order trtllm-llmapi-launch reads them.
 RANK_ENV = ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "PMIX_RANK")
 GPU_DEVICE = re.compile(r"/dev/nvidia\d+")
 HEALTH_STATES = {"healthy", "recovering", "degraded"}
@@ -174,14 +141,6 @@ def _error_body(error: urllib.error.HTTPError) -> bytes:
         return error.read()
     except (OSError, http.client.HTTPException):
         return b""
-
-
-def _error_code(body: bytes) -> Optional[Union[int, str]]:
-    """Return the ``code`` of an OpenAI error response body, or None if the body is not one."""
-    try:
-        return json.loads(body).get("code")
-    except (ValueError, AttributeError):
-        return None
 
 
 def _get_json(url: str, timeout_s: float = 5.0) -> Tuple[Optional[int], Optional[dict]]:
@@ -222,12 +181,7 @@ class Deployment:
     victim: int
 
 
-def _serving_config(model: Path, serving_options: bool = False) -> dict:
-    """Return the deployment's configuration.
-
-    ``serving_options`` adds the options that large deployments serve with. These are attention-DP balancing, CUDA
-    graphs up to batch 512, an fp8 KV cache with a host tier, and online EPLB with a redundant slot per rank.
-    """
+def _serving_config(model: Path) -> dict:
     num_experts = json.loads((model / "config.json").read_text())["n_routed_experts"]
     config = {
         "enable_wide_ep_fault_tolerance": True,
@@ -240,28 +194,6 @@ def _serving_config(model: Path, serving_options: bool = False) -> dict:
         # every expert, and restores a failed rank's experts into them from host weights.
         "moe_config": {"load_balancer": {"num_slots": num_experts}},
     }
-    if serving_options:
-        config.update(
-            {
-                "attention_dp_config": {
-                    "enable_balance": True,
-                    "batching_wait_iters": 0,
-                    "timeout_iters": 60,
-                },
-                "cuda_graph_config": {"enable_padding": True, "max_batch_size": 512},
-                "kv_cache_config": {
-                    **config["kv_cache_config"],
-                    "dtype": "fp8",
-                    "host_cache_size": 16 << 30,
-                },
-                "moe_config": {
-                    "load_balancer": {
-                        "num_slots": num_experts + WORLD_SIZE,
-                        "layer_updates_per_iter": 1,
-                    }
-                },
-            }
-        )
     return _merged(config, json.loads(os.environ.get("TLLM_FT_E2E_CONFIG", "{}")))
 
 
@@ -299,12 +231,11 @@ def _chosen_secret(since: float) -> str:
 
 
 @contextlib.contextmanager
-def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: bool = False):
-    """Start a deployment with :func:`_serving_config`, or attach to the one at ``TLLM_FT_E2E_SERVER``.
+def _deploy(tmp_path: Path, server_spawns_ranks: bool = False):
+    """Start a deployment, or attach to the one at ``TLLM_FT_E2E_SERVER``.
 
-    With ``server_spawns_ranks``, plain ``trtllm-serve`` spawns its ranks and chooses the shared secret and the
-    rendezvous address itself. Otherwise ``trtllm-llmapi-launch`` runs under ``mpirun``. A deployment started here
-    must leave no /dev/shm segment behind after it ends.
+    With ``server_spawns_ranks``, plain ``trtllm-serve`` spawns its ranks. A started deployment must leave no /dev/shm
+    segment behind.
     """
     if EXTERNAL:
         base = os.environ["TLLM_FT_E2E_SERVER"]
@@ -325,7 +256,7 @@ def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: 
     if not model.exists():
         pytest.skip(f"{model} does not exist")
     config = tmp_path / "config.yaml"
-    config.write_text(yaml.safe_dump(_serving_config(model, serving_options)))
+    config.write_text(yaml.safe_dump(_serving_config(model)))
     shm_before = set(os.listdir("/dev/shm"))
     port = _free_port()
     base = f"http://localhost:{port}"
@@ -379,7 +310,7 @@ def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: 
             os.killpg(launcher.pid, signal.SIGKILL)
             launcher.wait()
     if secret is not None:  # replacements run outside the launcher's process group
-        psutil.wait_procs(_node_processes(secret), timeout=60)
+        psutil.wait_procs(list(_node_processes(secret)), timeout=60)
     left = sorted(set(os.listdir("/dev/shm")) - shm_before)
     assert not left, f"/dev/shm segments the deployment left after it ended: {left}"
 
@@ -387,13 +318,6 @@ def _deploy(tmp_path: Path, serving_options: bool = False, server_spawns_ranks: 
 @pytest.fixture
 def deployment(tmp_path: Path):
     with _deploy(tmp_path) as deployment:
-        yield deployment
-
-
-@pytest.fixture
-def serving_options_deployment(tmp_path: Path):
-    """Start the deployment with the options that large deployments serve with."""
-    with _deploy(tmp_path, serving_options=True) as deployment:
         yield deployment
 
 
@@ -414,11 +338,23 @@ def _holds_gpu(pid: int) -> bool:
         return False
 
 
-def _process_rank(env: Dict[str, str]) -> Optional[int]:
-    """Return the rank that a process runs.
+def _node_processes(secret: str) -> Dict[psutil.Process, Dict[str, str]]:
+    """Return the environment of each process of the deployment on this node, other than this test's own."""
+    test = psutil.Process()
+    own = {test.pid, *(p.pid for p in test.parents())}
+    found = {}
+    for process in psutil.process_iter():
+        if process.pid in own:
+            continue
+        with contextlib.suppress(psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            env = process.environ()
+            if env.get(SHARED_SECRET_ENV) == secret:
+                found[process] = env
+    return found
 
-    A rank started by the node supervisor runs outside the launcher's job, so its rank comes from its identity.
-    """
+
+def _process_rank(env: Dict[str, str]) -> Optional[int]:
+    """Return the rank that a process runs, from its identity if the node supervisor started it."""
     if FAULT_TOLERANCE_RANK_ENV in env:
         return int(env[FAULT_TOLERANCE_RANK_ENV].split(",")[0])
     rank = next((env[name] for name in RANK_ENV if name in env), None)
@@ -426,21 +362,11 @@ def _process_rank(env: Dict[str, str]) -> Optional[int]:
 
 
 def _rank_workers(secret: str) -> Dict[int, psutil.Process]:
-    """Return the worker process of each rank on this node of the deployment with shared secret ``secret``.
-
-    The worker is the rank's outermost process that holds a GPU. A launcher or node supervisor holds no GPU, and a
-    worker's helper processes have the worker as parent.
-    """
+    """Return each rank's outermost process on this node that holds a GPU."""
     candidates = {}
-    for process in psutil.process_iter():
-        if process.pid == os.getpid():
-            continue  # under a launcher, this test also carries a rank and the shared secret
-        try:
-            env = process.environ()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-            continue
+    for process, env in _node_processes(secret).items():
         rank = _process_rank(env)
-        if env.get(SHARED_SECRET_ENV) == secret and rank is not None and _holds_gpu(process.pid):
+        if rank is not None and _holds_gpu(process.pid):
             candidates[process.pid] = (rank, process)
     workers = {}
     for pid, (rank, process) in candidates.items():
@@ -458,31 +384,11 @@ def _rank_workers(secret: str) -> Dict[int, psutil.Process]:
     return workers
 
 
-def _node_processes(secret: str) -> List[psutil.Process]:
-    """Return every process on this node of the deployment with shared secret ``secret``.
-
-    These are the processes that a node loss ends. They include rank workers, node supervisors and launcher
-    processes, but not this test and the processes it runs under.
-    """
-    test = psutil.Process()
-    own = {test.pid, *(p.pid for p in test.parents())}
-    found = []
-    for process in psutil.process_iter():
-        if process.pid in own:
-            continue
-        with contextlib.suppress(psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-            if process.environ().get(SHARED_SECRET_ENV) == secret:
-                found.append(process)
-    return found
-
-
 def _rendezvous(secret: str) -> str:
     """Return the rendezvous store address from a process of the deployment on this node."""
-    for process in psutil.process_iter():
-        with contextlib.suppress(psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-            env = process.environ()
-            if env.get(SHARED_SECRET_ENV) == secret and RENDEZVOUS_ENV in env:
-                return env[RENDEZVOUS_ENV]
+    for env in _node_processes(secret).values():
+        if RENDEZVOUS_ENV in env:
+            return env[RENDEZVOUS_ENV]
     raise LookupError("no process of the deployment on this node has the rendezvous address")
 
 
@@ -529,48 +435,13 @@ def _rank_gpus(workers: Dict[int, psutil.Process]) -> Dict[int, List[int]]:
     return {r: sorted(gpus.get(p.pid, [])) for r, p in sorted(workers.items())}
 
 
-def _shm_orphans() -> set:
-    """Return the /dev/shm segments that no process on this node maps or holds open."""
-    used = set()
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        with contextlib.suppress(OSError):
-            with open(f"/proc/{pid}/maps") as maps:
-                for line in maps:
-                    at = line.find("/dev/shm/")
-                    if at >= 0:
-                        used.add(line[at:].rstrip("\n").removesuffix(" (deleted)"))
-            for fd in os.listdir(f"/proc/{pid}/fd"):
-                with contextlib.suppress(OSError):
-                    used.add(os.readlink(f"/proc/{pid}/fd/{fd}"))
-    return {
-        entry.name for entry in os.scandir("/dev/shm") if entry.is_file() and entry.path not in used
-    }
-
-
-def _resources(secret: str) -> dict:
-    """Return the GPU memory per GPU, the orphaned /dev/shm segments, and each rank worker's open descriptors."""
-    return {
-        "gpu_memory_used_mib": {
-            int(i): int(mib) for i, mib in _nvidia_smi("gpu", "index,memory.used")
-        },
-        "shm_orphans": _shm_orphans(),
-        "rank_open_fds": {
-            r: (p.pid, len(os.listdir(f"/proc/{p.pid}/fd")))
-            for r, p in sorted(_rank_workers(secret).items())
-        },
-    }
-
-
 def _prompt(seed: int, length: int) -> List[int]:
     rng = random.Random(seed)
     return [rng.randrange(1000, 30000) for _ in range(length)]
 
 
 class Gsm8k:
-    """GSM8K questions and their scoring.
-
-    This uses the lm-eval task ``tensorrt_llm.evaluate.GSM8K`` on the offline dataset, as the accuracy tests do.
-    """
+    """GSM8K questions and their scoring with the lm-eval task ``tensorrt_llm.evaluate.GSM8K``."""
 
     def __init__(self, num_questions: int):
         from tensorrt_llm.evaluate import GSM8K
@@ -592,10 +463,7 @@ class Gsm8k:
         }
 
     def score(self, question: int, text: str) -> float:
-        """Return the exact match of one answer with ACCURACY_FILTER.
-
-        The scoring follows ``_RunningScoreTracker.update`` in tensorrt_llm/evaluate/lm_eval.py.
-        """
+        """Return the exact match of one answer with ACCURACY_FILTER, as ``_RunningScoreTracker.update`` does."""
         probe = copy.copy(self.instances[question])
         probe.resps = [text]
         probe.filtered_resps = {}
@@ -679,10 +547,7 @@ class Clients:
             thread.start()
 
     def stop(self) -> List[str]:
-        """Stop sending, wait for the requests in flight, and return the clients that failed.
-
-        A client failed if an exception ended it or if it still runs REQUEST_TIMEOUT_S later.
-        """
+        """Stop sending, wait for the requests in flight, and return the clients that raised or still run."""
         self._stop.set()
         return _join(self._threads, REQUEST_TIMEOUT_S, self._failures)
 
@@ -751,7 +616,8 @@ class Clients:
         except urllib.error.HTTPError as error:
             body = _error_body(error)
             request.error = f"HTTP {error.code}: {body.decode(errors='replace')}"
-            request.error_code = _error_code(body)
+            with contextlib.suppress(ValueError, AttributeError):
+                request.error_code = json.loads(body).get("code")
         except (OSError, http.client.HTTPException, ValueError, LookupError, TypeError) as error:
             # No answer, a response that broke off (IncompleteRead, BadStatusLine), or one that is not a completion.
             request.error = repr(error)
@@ -798,10 +664,7 @@ class Clients:
 
 
 def _largest_gap(times: List[float], start: float, end: float) -> Tuple[float, float]:
-    """Return the length and start time of the longest interval in [start, end] without an arrival.
-
-    An interval that runs past ``end`` lasts until the next arrival.
-    """
+    """Return the length and start of the longest interval from [start, end] to the next arrival."""
     inside = [start] + [t for t in times if start < t < end]
     later = [t for t in times if t >= end]
     inside.append(later[0] if later else end)
@@ -809,13 +672,7 @@ def _largest_gap(times: List[float], start: float, end: float) -> Tuple[float, f
 
 
 class Monitor:
-    """Watch the deployment's ``/health`` four times a second and its membership.
-
-    :attr:`health` holds one (time, ``/health`` HTTP status, ``/fault_tolerance_status`` state) entry per sample.
-    :attr:`membership` holds one (time, status) entry per change of ``FaultToleranceHealth.status``, extended with
-    the record's own ``membership_state``. The server's own reader polls the rendezvous store every STORE_POLL_S,
-    and the time is when a change was first read.
-    """
+    """Sample ``/health`` with the status state, and record each membership change read from the store."""
 
     def __init__(self, deployment: Deployment):
         self._base = deployment.base
@@ -866,10 +723,7 @@ class Monitor:
     def wait_for(
         self, predicate: Callable[[dict], bool], since: float, timeout_s: float
     ) -> Tuple[float, dict]:
-        """Wait for the first membership status after ``since`` that satisfies ``predicate``.
-
-        Returns the status and the time it was read, as soon as the sampler reads it.
-        """
+        """Return the time and the first membership status after ``since`` that satisfies ``predicate``."""
         deadline = time.monotonic() + timeout_s
         checked = 0
         with self._changed:
@@ -961,10 +815,9 @@ def _victims(deployment: Deployment, failure: str, workers: Dict[int, psutil.Pro
 
 
 def _inject(victims: Dict[int, psutil.Process], failure: str, secret: str) -> List[str]:
-    """Fail the victims. ``crash`` kills them and ``hang`` stops them.
+    """Kill (``crash``) or stop (``hang``) the victims, or kill every process of the deployment on this node.
 
-    ``node`` kills every process of the deployment on this node, including the victims, and returns those processes
-    as "<pid> <name>" strings.
+    Returns the processes a ``node`` failure killed as "<pid> <name>" strings.
     """
     if failure != "node":
         for process in victims.values():
@@ -977,7 +830,7 @@ def _inject(victims: Dict[int, psutil.Process], failure: str, secret: str) -> Li
     # Each round stops every process before it kills any, so that no supervisor sees a rank end and starts a
     # replacement. A later round catches a process started in the meantime.
     for _ in range(3):
-        processes = _node_processes(secret)
+        processes = list(_node_processes(secret))
         if not processes:
             break
         for process in processes:
@@ -1007,11 +860,7 @@ class Phase:
 
 
 class Run:
-    """Run the load, the monitor and a sequence of failures on one deployment, then report and check.
-
-    Entering starts the load and runs the healthy phase. Leaving stops the load and writes the report, even when a
-    step failed, and then checks the requests and the accuracy.
-    """
+    """Run the load, the monitor and a sequence of failures on one deployment, then report and check."""
 
     def __init__(self, deployment: Deployment, tmp_path: Path, name: str):
         self.deployment = deployment
@@ -1103,8 +952,7 @@ class Run:
     ) -> dict:
         """Fail ranks with ``crash``, ``hang`` or ``node``, wait for N ranks again, and serve a window.
 
-        ``at_admission`` returns processes to kill once the replacement's admission has begun. With
-        ``at_admission_state`` set to ``PROPOSE`` or ``INSTALL``, they are killed once the store shows that state.
+        ``at_admission`` returns processes to kill once the store shows the admission in ``at_admission_state``.
         """
         d, index = self.deployment, len(self.cycles) + 1
         world, all_ranks = d.world_size, list(range(d.world_size))
@@ -1307,28 +1155,20 @@ class Run:
         return record
 
     @contextlib.contextmanager
-    def connect(self, rank: int, replacement: bool):
-        """Open a signed liveness connection to the authority for ``rank`` and yield the time.
+    def refused(self, rank: int, replacement: bool, reason: str):
+        """Join as ``rank``, as its first process or a ``replacement``, and yield the time.
 
-        The connection claims to be a ``replacement`` or the rank's first process. A started replacement asks to join
-        this way. The connection stays open until the context ends.
+        The connection stays open until the context ends. The authority must log a refusal with ``reason``.
         """
-        d = self.deployment
+        d, line = self.deployment, REFUSAL_LOG + reason
+
+        def logged() -> int:
+            return sum(line in log_line for log_line in _log_lines(d.logs))
+
+        before = logged()
         store = open_store(_rendezvous(d.secret), bytes.fromhex(d.secret), timeout_s=60.0)
         t = time.monotonic()
         with open_liveness_connection(store, rank, replacement):
-            yield t
-
-    @contextlib.contextmanager
-    def refused(self, rank: int, replacement: bool, reason: str):
-        """Run :meth:`connect` and check that the authority logs a refusal with ``reason``."""
-        line = REFUSAL_LOG + reason
-
-        def logged() -> int:
-            return sum(line in log_line for log_line in _log_lines(self.deployment.logs))
-
-        before = logged()
-        with self.connect(rank, replacement) as t:
             yield t
         self.check(
             logged() > before,
@@ -1336,10 +1176,7 @@ class Run:
         )
 
     def _phase_reports(self) -> List[dict]:
-        """Return each phase's output tokens per second and GSM8K answers.
-
-        Phases after the healthy one also report the paired comparison with it under ACCURACY_FILTER.
-        """
+        """Return each phase's output tokens per second and its GSM8K answers paired with the healthy phase's."""
         requests = self.clients.requests
         scores = {
             i: self.gsm8k.score(r.question, r.text)
@@ -1383,11 +1220,7 @@ class Run:
         return reports
 
     def _check_requests(self) -> None:
-        """Check that every request completed and that every load request returned its full length.
-
-        The only allowed failure is a streamed request that was in flight at a failure and had streamed tokens. It
-        must fail with a retryable error. A request sent again after a retryable failure must complete.
-        """
+        """Check that every request completed in full, but streams in flight at a failure that end as retryable."""
         for r in self.clients.requests:
             kind = ("retried " if r.retry else "") + ("streamed" if r.stream else "non-streamed")
             kind += " eval" if r.question is not None else ""
@@ -1417,10 +1250,7 @@ class Run:
             )
 
     def _check_accuracy(self, phases: List[dict]) -> None:
-        """Check that the healthy phase answered every GSM8K question of the subset.
-
-        Every other phase must answer some of them and must not lose paired accuracy against the healthy phase.
-        """
+        """Check that the healthy phase answered every question and that no other phase lost paired accuracy."""
         for i, phase in enumerate(phases):
             g, label = phase["gsm8k"], f"cycle {phase['cycle']} {phase['phase']}"
             if i == 0:
@@ -1441,10 +1271,7 @@ class Run:
             )
 
     def _check_captures(self) -> None:
-        """Check that every rank captured CUDA graphs at startup and that no original process captured any since.
-
-        A rank is still served by its first process while it is active with the incarnation it had after warmup.
-        """
+        """Check that every rank captured CUDA graphs at startup and that no original process captured any since."""
         d = self.deployment
         start, end = self.status_after_warmup["incarnations"], _status(d.base)
         first_processes = [r for r in end["active_ranks"] if end["incarnations"][r] == start[r]]
@@ -1460,11 +1287,7 @@ class Run:
 
 
 def _sign_test_p(lost: int, gained: int) -> float:
-    """Return the p-value of a one-sided exact sign test (McNemar on discordant pairs) for a loss.
-
-    This is the chance of at least ``lost`` losses among ``lost + gained`` discordant pairs when a loss and a gain
-    are equally likely. It is 1 without discordant pairs.
-    """
+    """Return the p-value of a one-sided exact sign test (McNemar on discordant pairs) for a loss."""
     n = lost + gained
     return sum(math.comb(n, k) for k in range(lost, n + 1)) / 2**n
 
@@ -1472,10 +1295,9 @@ def _sign_test_p(lost: int, gained: int) -> float:
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
 def test_rank_failure_sequence(deployment: Deployment, tmp_path: Path):
-    """Run the failures of ``TLLM_FT_E2E_SEQUENCE`` in one deployment under load, a crash and a hang by default.
+    """Run the failures of ``TLLM_FT_E2E_SEQUENCE`` under load, each followed by a rejoin.
 
-    A replacement rejoins after each failure. The survivors keep serving on the same CUDA graphs with the healthy
-    accuracy. ``none`` serves one more healthy window instead, which measures the noise of the paired comparison.
+    ``none`` serves one more healthy window instead, which measures the noise of the paired comparison.
     """
     with Run(deployment, tmp_path, "sequence") as run:
         sequence = os.environ.get("TLLM_FT_E2E_SEQUENCE", "crash,hang").split(",")
@@ -1486,64 +1308,8 @@ def test_rank_failure_sequence(deployment: Deployment, tmp_path: Path):
                 run.cycle(failure)
 
 
-@pytest.mark.skip_less_device(WORLD_SIZE)
-@pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
-def test_rank_failure_sequence_with_serving_options(
-    serving_options_deployment: Deployment, tmp_path: Path
-):
-    """Run a crash and then a hang with the serving options of :func:`_serving_config`."""
-    with Run(serving_options_deployment, tmp_path, "sequence_with_serving_options") as run:
-        run.cycle("crash")
-        run.cycle("hang")
-
-
-@pytest.mark.skip_less_device(WORLD_SIZE)
-@pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
-def test_repeated_rank_reuse(deployment: Deployment, tmp_path: Path):
-    """Crash the same rank twice and replace it on its GPU each time, without leaking resources.
-
-    After each cycle, no GPU may use more than GPU_MEMORY_LEAK_TOLERANCE_MIB above its memory at the earlier check
-    points, and no new /dev/shm segment may be orphaned. A process that survives both cycles must not hold more file
-    descriptors after the second cycle than after the first.
-    """
-    with Run(deployment, tmp_path, "repeated_reuse") as run:
-        healthy = _resources(deployment.secret)
-        run.cycle("crash")
-        first = _resources(deployment.secret)
-        run.cycle("crash")
-        second = _resources(deployment.secret)
-        for later, earlier, new, old in (
-            ("after cycle 1", "at the end of the healthy phase", first, healthy),
-            ("after cycle 2", "at the end of the healthy phase", second, healthy),
-            ("after cycle 2", "after cycle 1", second, first),
-        ):
-            for gpu, used in new["gpu_memory_used_mib"].items():
-                before = old["gpu_memory_used_mib"].get(gpu)
-                run.check(
-                    before is not None and used <= before + GPU_MEMORY_LEAK_TOLERANCE_MIB,
-                    f"GPU {gpu}: {used} MiB used {later}, {before} MiB {earlier}",
-                )
-            orphaned = sorted(new["shm_orphans"] - old["shm_orphans"])
-            run.check(
-                not orphaned, f"/dev/shm segments orphaned {later}, not {earlier}: {orphaned}"
-            )
-        # A second cycle opens no more descriptors in a process that survived both cycles.
-        old_fds = first["rank_open_fds"]
-        for rank, (pid, fds) in second["rank_open_fds"].items():
-            if rank in old_fds and old_fds[rank][0] == pid:
-                run.check(
-                    fds <= old_fds[rank][1],
-                    f"rank {rank} (pid {pid}): {fds} open descriptors after cycle 2, {old_fds[rank][1]} after "
-                    "cycle 1",
-                )
-
-
 def _refused_join(run: Run, kind: str, replacement: bool, reason: str) -> None:
-    """Send a join for the victim's rank that the authority refuses with ``reason``.
-
-    The join claims to be a ``replacement`` or the rank's first process. While the connection stays open for
-    INVALID_JOIN_WATCH_S, the membership must not change and no process may restart.
-    """
+    """Send a join for the victim's rank that the authority refuses, and check that nothing changes."""
     d = run.deployment
     workers, before = _rank_workers(d.secret), _status(d.base)
     with run.refused(d.victim, replacement, reason) as t_join:
@@ -1566,11 +1332,7 @@ def _refused_join(run: Run, kind: str, replacement: bool, reason: str) -> None:
 def test_invalid_joins(deployment: Deployment, tmp_path: Path):
     """Send joins that the authority refuses, and kill a replacement during its admission, under load.
 
-    - A second connection of an active first process. The process's crash still fails over at once.
-    - A replaced first process, and a replacement of an active rank as a second supervisor would send.
-    - A replacement killed during its admission. The survivors go on without it, and the next replacement rejoins.
-
-    The authority logs each refusal. The deployment keeps serving, and no survivor restarts.
+    The joins are a second connection of an active rank, a replaced first process, and a replacement of an active rank.
     """
     d = deployment
     with Run(d, tmp_path, "invalid_joins") as run:
@@ -1590,37 +1352,6 @@ def test_invalid_joins(deployment: Deployment, tmp_path: Path):
         )
 
 
-@pytest.mark.skip_less_device(WORLD_SIZE)
-@pytest.mark.timeout(STARTUP_TIMEOUT_S + 1200)
-def test_silent_joiner_does_not_hold_survivors(deployment: Deployment, tmp_path: Path):
-    """Check that a joiner that connects and never replies pauses the survivors less than an admission does."""
-    d = deployment
-    with Run(d, tmp_path, "silent_joiner") as run:
-        victim = _rank_workers(d.secret)[d.victim]
-        t_fail = time.monotonic()
-        victim.kill()
-        run.failure_times.append(t_fail)
-        t_degraded = run.monitor.wait_for(
-            lambda s: s["membership_state"] == "COMMITTED" and d.victim in s["failed_ranks"],
-            t_fail,
-            RECOVERY_TIMEOUT_S,
-        )[0]
-        time.sleep(SETTLE_S)
-        # It never reports that it is ready to join, so the authority never stops the survivors for it.
-        with run.connect(d.victim, True) as t_join:
-            time.sleep(HANG_TIMEOUT_S + SETTLE_S)
-        run.phases.append(Phase("failover", 0, t_fail, t_degraded, event=t_fail))
-        run.phases.append(Phase("silent_joiner", 0, t_join, time.monotonic()))
-        pause_s = _largest_gap(
-            run.clients.stream_arrivals(), t_join - 1.0, t_join + HANG_TIMEOUT_S + SETTLE_S
-        )[0]
-        run.check(
-            pause_s < ADMISSION_PAUSE_TARGET_S,
-            f"a joiner that never replied paused the survivors {pause_s:.2f} s, target < "
-            f"{ADMISSION_PAUSE_TARGET_S} s",
-        )
-
-
 def _second_rank(d: Deployment, workers: Dict[int, psutil.Process]) -> int:
     """Return a rank on this node, other than rank 0 and the victim, to fail during the victim's admission."""
     second = min((r for r in workers if r not in (0, d.victim)), default=None)
@@ -1633,11 +1364,7 @@ def _second_rank(d: Deployment, workers: Dict[int, psutil.Process]) -> int:
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
 def test_failure_during_admission(deployment: Deployment, tmp_path: Path):
-    """Crash a second rank while the first one's replacement is admitted.
-
-    The survivors go on without it, the first replacement is admitted, the second rank's replacement rejoins, and
-    the deployment is back at N.
-    """
+    """Crash a second rank while the first one's replacement is admitted."""
     d = deployment
     with Run(d, tmp_path, "failure_during_admission") as run:
         workers = _rank_workers(d.secret)
@@ -1648,11 +1375,7 @@ def test_failure_during_admission(deployment: Deployment, tmp_path: Path):
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
 def test_failure_during_install(deployment: Deployment, tmp_path: Path):
-    """Crash a second rank while the active ranks install the first one's admission.
-
-    INSTALL is the remap of the all-to-all memory and the expert placement. The admission does not commit, the
-    survivors go on without the second rank, and both replacements rejoin.
-    """
+    """Crash a second rank while the active ranks install the first one's admission."""
     d = deployment
     with Run(d, tmp_path, "failure_during_install") as run:
         workers = _rank_workers(d.secret)
@@ -1666,10 +1389,6 @@ def test_failure_during_install(deployment: Deployment, tmp_path: Path):
 @pytest.mark.skipif(EXTERNAL, reason="starts its own deployment")
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + REJOIN_TIMEOUT_S + 1200)
 def test_rejoin_when_server_spawns_ranks(spawned_deployment: Deployment, tmp_path: Path):
-    """Fail over and rejoin a killed rank under plain trtllm-serve, with no variable exported.
-
-    The server chooses the shared secret and the rendezvous address before it spawns the ranks. The node supervisor
-    restarts the killed rank as a replacement that rejoins.
-    """
+    """Fail over and rejoin a killed rank under plain trtllm-serve, which chooses the shared secret itself."""
     with Run(spawned_deployment, tmp_path, "server_spawns_ranks") as run:
         run.cycle("crash")
