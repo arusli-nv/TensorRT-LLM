@@ -878,6 +878,7 @@ def _register_fake():
         metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
+        barrier: bool = True,
     ) -> None:
         return None
 

@@ -287,7 +287,10 @@ torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, i
 }
 
 // Initialize control state after allocation; layout construction itself is CPU-only.
-void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
+// With barrier=false, the op resets only the local rank's row and the caller synchronizes the ranks before any
+// peer writes into it.
+void moeA2AInitializeOp(
+    torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize, bool barrier)
 {
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, torch::kUInt8);
@@ -316,7 +319,7 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     // NVLinkOneSided strategy unusable there; fall back to the Torch process
     // group the Ray workers already initialise, as pg_utils does elsewhere.
     cudaDeviceSynchronize();
-    if (!hasIncompleteRoundWord(layout))
+    if (barrier)
     {
         moeA2ABarrier();
     }
@@ -519,6 +522,12 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
 //   - numExperts: Total number of routing slots (tokenSelectedExperts values are in [0, numExperts))
 //   - eplbStatsNumExperts: Number of experts used for EPLB stats (may be <= numExperts)
 //   - eplbLocalStats: [eplbStatsNumExperts] tensor containing local statistics for EPLB.
+//   - enableRankMask: Exchange only with the ranks set in activeRankMask. The workspace layout must be built with
+//   rank_mask=True.
+//   - activeRankMask: [kRankMaskWords] uint64 tensor on the workspace device. The kernels read it at execution time,
+//   so a captured CUDA graph follows later updates. The caller keeps the local rank's bit set.
+//   - abortState: (Optional) pinned int32 host tensor holding a MoeA2AAbortState. Setting its requested word stops
+//   the waits on peers.
 //
 // Return values:
 //   - recvTensors: Vector of receive buffers (one tensor per payload), each [ep_size, runtimeMaxTokensPerRank,
@@ -1141,7 +1150,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
     module.def("moe_a2a_cft_release(Tensor(a!) workspace, int ep_rank) -> ()");
-    module.def("moe_a2a_initialize(Tensor(a!) workspace, Tensor metainfo, int ep_rank, int ep_size) -> ()");
+    module.def(
+        "moe_a2a_initialize(Tensor(a!) workspace, Tensor metainfo, int ep_rank, int ep_size, bool barrier=True) -> ()");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");

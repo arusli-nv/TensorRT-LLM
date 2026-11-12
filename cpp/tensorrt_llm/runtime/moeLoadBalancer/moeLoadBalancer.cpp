@@ -485,9 +485,10 @@ SingleLayerMoeLoadBalancer::~SingleLayerMoeLoadBalancer()
     destroyResources();
 }
 
-void SingleLayerMoeLoadBalancer::addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot)
+void SingleLayerMoeLoadBalancer::addSingleWeightSlot(
+    int localSlotId, std::string const& name, MoeWeight weightSlot, bool spare)
 {
-    mWeightUpdater->addSingleWeightSlot(localSlotId, name, weightSlot);
+    mWeightUpdater->addSingleWeightSlot(localSlotId, name, weightSlot, mMoeLoadBalancer->mUseGpuMemcpy, spare);
 }
 
 void SingleLayerMoeLoadBalancer::addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight)
@@ -732,7 +733,7 @@ void SingleLayerMoeLoadBalancer::installPlacement(
         }
     }
     mCpuPlacementInfo.rankExpertIds = rankExpertIds;
-    mWeightUpdater->updateWeights(&mCpuPlacementInfo, /*useGpu=*/true);
+    mWeightUpdater->updateWeights(&mCpuPlacementInfo, /*rank=*/0, /*size=*/1, /*forceGpuMemcpy=*/true);
     mCpuPlacementInfo.oldRankExpertIds = rankExpertIds;
     reconfigureMaskOnly(deadRankMask);
 }
@@ -788,7 +789,7 @@ void SingleLayerMoeLoadBalancer::updateWeightsRoutine()
     doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask, unusableSlotMask);
     doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask, unusableSlotMask);
     prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
-    mWeightUpdater->updateWeights(&mCpuPlacementInfo, /*useGpu=*/true);
+    mWeightUpdater->updateWeights(&mCpuPlacementInfo);
     copyPlacementInfoToGpu();
     TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
     TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
@@ -804,8 +805,8 @@ void SingleLayerMoeLoadBalancer::updateWeightsRoutineByCpu()
     doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask, unusableSlotMask);
     doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo, &deadRankMask, unusableSlotMask);
     prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
-    mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask([this](int rank, int size)
-        { mWeightUpdater->updateWeights(&mCpuPlacementInfo, /*useGpu=*/false, rank, size); });
+    mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
+        [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
     mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
     mLastUpdateTaskId = -1;
     copyPlacementInfoToGpuByCpu();
@@ -826,7 +827,7 @@ MoeWeightUpdaterBase::MoeWeightUpdaterBase(
 }
 
 void MoeWeightUpdaterBase::addSingleWeightSlot(
-    int localSlotId, std::string const& name, tensorrt_llm::runtime::MoeWeight weightSlot)
+    int localSlotId, std::string const& name, tensorrt_llm::runtime::MoeWeight weightSlot, bool gpuAccess, bool spare)
 {
     TLLM_CHECK_WITH_INFO(mWeightSlotsFinalized == false, "Cannot add slots after finalize");
     TLLM_CHECK_WITH_INFO(localSlotId >= 0 && localSlotId < mMetaInfo.slotCountPerRank,
@@ -838,9 +839,21 @@ void MoeWeightUpdaterBase::addSingleWeightSlot(
     if (mWeightSlots.find(name) == mWeightSlots.end())
     {
         mWeightSlots.emplace(name, std::vector<MoeWeight>(mMetaInfo.slotCountPerRank));
+        mWeightSlotHostPtrs.emplace(name, std::vector<void*>(mMetaInfo.slotCountPerRank, nullptr));
     }
     TLLM_CHECK_WITH_INFO(mWeightSlots[name][localSlotId].mWeightPtr == nullptr,
         "localSlotId=%d, name=%s already added.", localSlotId, name.c_str());
+    if (!gpuAccess && !spare)
+    {
+        // if using cpu copy, keep the host accessible pointer. Without one, the slot counts as not added.
+        void* hostPtr
+            = tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().getHostPtr(weightSlot.mWeightPtr);
+        mWeightSlotHostPtrs[name][localSlotId] = hostPtr;
+        if (hostPtr == nullptr)
+        {
+            weightSlot.mWeightPtr = nullptr;
+        }
+    }
     mWeightSlots[name][localSlotId] = weightSlot;
 }
 
@@ -959,12 +972,25 @@ void HostMemoryMoeWeightUpdater::copyWeights(MoeWeight const& src, MoeWeight con
     }
 }
 
-void HostMemoryMoeWeightUpdater::copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size)
+void HostMemoryMoeWeightUpdater::copyWeightsCpu(
+    MoeWeight const& src, MoeWeight const& dst, void* dstHostPtr, int rank, int size)
 {
     TLLM_CHECK(src.mWeightPtr != nullptr && dst.mWeightPtr != nullptr);
     TLLM_CHECK(src.mHeight == dst.mHeight && src.mWidth == dst.mWidth);
     char* srcPtr = static_cast<char*>(src.mWeightPtr);
-    char* dstPtr = static_cast<char*>(dst.mWeightPtr);
+    char* dstPtr = static_cast<char*>(dstHostPtr != nullptr ? dstHostPtr : dst.mWeightPtr);
+    auto copyRow = [dstHostPtr](char* rowDst, char const* rowSrc, size_t rowSize)
+    {
+        auto& allocator = HostAccessibleDeviceAllocator::getInstance();
+        if (dstHostPtr != nullptr)
+        {
+            allocator.memcpyToDevice(rowDst, rowSrc, rowSize);
+        }
+        else
+        {
+            allocator.memcpyToDeviceAddress(rowDst, rowSrc, rowSize);
+        }
+    };
     size_t singleCopySize, copyCount, srcPitch, dstPitch;
     if (src.mPitch == src.mWidth && dst.mPitch == dst.mWidth)
     {
@@ -984,16 +1010,14 @@ void HostMemoryMoeWeightUpdater::copyWeightsCpu(MoeWeight const& src, MoeWeight 
     size_t threadCopyCount = fullCopyCount / size;
     for (size_t i = rank * threadCopyCount; i < (rank + 1) * threadCopyCount; i++)
     {
-        HostAccessibleDeviceAllocator::getInstance().memcpyToDeviceAddress(
-            dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
+        copyRow(dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
     }
     size_t threadStartOffset = rank * singleCopySize / size;
     size_t threadEndOffset = (rank + 1) * singleCopySize / size;
     size_t threadCopySize = threadEndOffset - threadStartOffset;
     for (size_t i = fullCopyCount; i < copyCount && threadCopySize > 0; i++)
     {
-        HostAccessibleDeviceAllocator::getInstance().memcpyToDeviceAddress(
-            dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
+        copyRow(dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
     }
 }
 
@@ -1012,9 +1036,10 @@ void PrintUpdateInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo,
 }
 
 void HostMemoryMoeWeightUpdater::updateWeights(
-    tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo, bool useGpu, int rank, int size)
+    tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo, int rank, int size, bool forceGpuMemcpy)
 {
     // PrintUpdateInfo(mMetaInfo, placementCpuInfo);
+    bool useGpu = forceGpuMemcpy || mLayerLoadBalancer->mMoeLoadBalancer->mUseGpuMemcpy;
     int const minExpertId = mLayerLoadBalancer->mMoeLoadBalancer->mRankFailureRecovery ? -1 : 0;
     for (int slotId = 0; slotId < mMetaInfo.slotCountPerRank; ++slotId)
     {
@@ -1039,7 +1064,7 @@ void HostMemoryMoeWeightUpdater::updateWeights(
             }
             else
             {
-                copyWeightsCpu(hostWeight, slotWeight, rank, size);
+                copyWeightsCpu(hostWeight, slotWeight, mWeightSlotHostPtrs.at(name)[slotId], rank, size);
             }
         }
     }

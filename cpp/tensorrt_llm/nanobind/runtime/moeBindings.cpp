@@ -82,7 +82,8 @@ void initMoeBindings(nb::module_& m)
     // Bind SingleLayerMoeLoadBalancer class
     nb::class_<tr::SingleLayerMoeLoadBalancer>(m, "SingleLayerMoeLoadBalancer")
         .def("add_single_weight_slot", &tr::SingleLayerMoeLoadBalancer::addSingleWeightSlot, nb::arg("slot_id"),
-            nb::arg("name"), nb::arg("weight_slot"), "Add a single weight slot for a specific slot ID",
+            nb::arg("name"), nb::arg("weight_slot"), nb::arg("spare") = false,
+            "Add a single weight slot for a specific slot ID, a spare slot of Wide-EP fault tolerance if spare",
             nb::call_guard<nb::gil_scoped_release>())
         .def("add_single_host_weight", &tr::SingleLayerMoeLoadBalancer::addSingleHostWeight, nb::arg("expert_id"),
             nb::arg("name"), nb::arg("host_weight"), "Add a single host weight for a specific expert ID",

@@ -643,7 +643,13 @@ class NVLinkOneSided(Communication):
                 )
             mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
+            torch.ops.trtllm.moe_a2a_initialize(
+                workspace,
+                metainfo,
+                self.ep_rank,
+                self.ep_size,
+                barrier=ep_group_health is None,
+            )
             if ep_group_health is not None:
                 # No rank may write into a peer's workspace before the peer has initialized it.
                 memory_cls.get_comm(mapping).barrier()
@@ -786,7 +792,7 @@ class NVLinkOneSided(Communication):
     def _reset_local_workspace(self) -> None:
         """Return this rank's workspace row to its initial state."""
         torch.ops.trtllm.moe_a2a_initialize(
-            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
+            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
         )
 
     @property

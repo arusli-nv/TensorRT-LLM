@@ -54,7 +54,7 @@ def _setup(ep_size: int, tokens: int = _CAPACITY) -> tuple[torch.Tensor, ...]:
     )
     size = int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
     workspace = torch.zeros((ep_size, size), dtype=torch.uint8, device="cuda")
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, ep_size)
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, ep_size, barrier=False)
     experts = torch.zeros((tokens, 1), dtype=torch.int32, device="cuda")
     payload = torch.arange(tokens * _HIDDEN, dtype=torch.bfloat16, device="cuda")
     return workspace, meta, experts, payload.reshape(tokens, _HIDDEN)
@@ -139,7 +139,7 @@ def test_cancel_and_exclusion_on_replay() -> None:
     assert peer_flags() == published
 
     # Rearmed with peer 1 excluded, the same graph completes without it.
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, 2)
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, 2, barrier=False)
     abort.zero_()
     controls["active_rank_mask"].copy_(_mask_words(1))
     for _ in range(2):
@@ -157,7 +157,7 @@ def test_no_peer_writes_after_incomplete_round(ep_size: int, rank: int) -> None:
     Rank 70 of 72 has its own bit in the second mask word.
     """
     workspace, meta, experts, payload = _setup(ep_size)
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size)
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size, barrier=False)
     controls, abort = _rank_mask_controls((1 << ep_size) - 1)
     abort[0] = 1  # No peer signals, so the round stays incomplete.
     _dispatch(workspace, meta, experts, controls, payload, rank=rank)

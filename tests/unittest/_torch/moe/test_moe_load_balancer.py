@@ -214,7 +214,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
         mock_single_layer_impl = MagicMock()
         layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl,
                                            MPI.COMM_WORLD,
-                                           expert_count=4)
+                                           expert_count=4,
+                                           slot_count_per_rank=2)
 
         # Mock out torch.ops.trtllm functions
         with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage') as mock_wait, \
@@ -227,7 +228,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
             mock_weight = MagicMock()
             layer._add_weight_slot(1, "weight1", mock_weight)
             mock_single_layer_impl.add_single_weight_slot.assert_called_once_with(
-                1, "weight1", mock_weight)
+                1, "weight1", mock_weight, spare=False)
 
             # add_host_weight
             mock_host_weight = MagicMock()

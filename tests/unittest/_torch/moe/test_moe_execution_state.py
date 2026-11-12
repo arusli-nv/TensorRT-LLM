@@ -48,7 +48,7 @@ def _collective_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
     )
     size = int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
     workspace = torch.zeros((_EP_SIZE, size), dtype=torch.uint8, device="cuda")
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE)
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE, barrier=False)
     experts = torch.zeros((_TOKENS, 1), dtype=torch.int32, device="cuda")
     payload = torch.arange(_TOKENS * _HIDDEN, dtype=torch.bfloat16, device="cuda")
     return workspace, meta, experts, payload.reshape(_TOKENS, _HIDDEN)

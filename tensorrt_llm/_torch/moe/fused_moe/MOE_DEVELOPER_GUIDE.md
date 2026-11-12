@@ -232,6 +232,8 @@ Timeouts are nominal: NVLinkOneSided, DeepGEMM and DeepEP convert seconds at an 
 
 ### Wide-EP fault tolerance
 
+Given an `ep_group_health`, `NVLinkOneSided` runs in rank-mask mode. The `moe_a2a_dispatch` and `moe_a2a_combine` ops then take the active-rank mask as a uint64 CUDA tensor on the workspace device and read it at execution time. The caller keeps the local rank's bit set and passes `barrier=False` to `moe_a2a_initialize` when it synchronizes the ranks itself.
+
 Under `enable_wide_ep_fault_tolerance`, a communication backend binds to the shared `MoeExecutionState` (`bind_execution_state`). Its kernels read the active-rank mask through that state's fixed device pointer, so captured CUDA graphs follow membership changes, and stop waiting on a peer once the state's abort request is set. `NVLinkOneSided` is the only backend that implements this.
 
 ### Core Design Principles

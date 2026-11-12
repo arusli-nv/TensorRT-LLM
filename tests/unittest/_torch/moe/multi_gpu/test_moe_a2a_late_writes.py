@@ -179,7 +179,7 @@ def _victim(store: TCPStore, workspace: torch.Tensor, meta: torch.Tensor) -> Non
     payload = raw.view(torch.bfloat16)
     store.wait([f"captured/{survivor}" for survivor in range(_VICTIM)])
     for step in itertools.count(1):
-        torch.ops.trtllm.moe_a2a_initialize(workspace, meta, _VICTIM, _EP_SIZE)
+        torch.ops.trtllm.moe_a2a_initialize(workspace, meta, _VICTIM, _EP_SIZE, barrier=False)
         # Alternating bytes, so each write changes every byte it reaches, not only the first after a reset.
         raw.fill_(0xC3 if step % 2 else 0x3C)
         _dispatch(workspace, meta, _VICTIM, experts, [payload], tokens, mask, abort)
@@ -303,7 +303,7 @@ def _worker(rank: int, port: int, mode: str) -> None:
         mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
     )
     workspace = memory.as_torch_strided_tensor(torch.uint8)
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, _EP_SIZE)
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, _EP_SIZE, barrier=False)
     # No peer may write into a row before its owner has initialized it.
     comm.barrier()
     if rank == _VICTIM:

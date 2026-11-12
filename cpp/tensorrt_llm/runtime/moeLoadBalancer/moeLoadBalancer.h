@@ -79,17 +79,22 @@ public:
 
     virtual ~MoeWeightUpdaterBase() {}
 
-    void addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot);
+    // CPU copies write a spare slot at its device address, because remapping the slot changes its host mapping.
+    void addSingleWeightSlot(
+        int localSlotId, std::string const& name, MoeWeight weightSlot, bool gpuAccess, bool spare = false);
     virtual void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) = 0;
     virtual void finalizeWeights();
-    // Load the local slots whose expert changes, with GPU copies or with this thread's share of CPU copies.
-    virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, bool useGpu, int rank = 0, int size = 1)
+    // With forceGpuMemcpy, copy with the GPU even if the load balancer uses CPU copies.
+    virtual void updateWeights(
+        MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1, bool forceGpuMemcpy = false)
         = 0;
 
 protected:
     void finalizeWeightSlot();
     bool mWeightSlotsFinalized = false;
     std::map<std::string, std::vector<MoeWeight>> mWeightSlots;
+    // Host accessible pointers of the slots that CPU copies write, nullptr for spare slots.
+    std::map<std::string, std::vector<void*>> mWeightSlotHostPtrs;
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo mMetaInfo;
     SingleLayerMoeLoadBalancer* mLayerLoadBalancer;
 };
@@ -105,11 +110,12 @@ public:
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) override;
     void finalizeWeights() override;
 
-    void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, bool useGpu, int rank = 0, int size = 1) override;
+    void updateWeights(
+        MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1, bool forceGpuMemcpy = false) override;
 
 private:
     static void copyWeights(MoeWeight const& src, MoeWeight const& dst, cudaStream_t stream);
-    static void copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size);
+    static void copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, void* dstHostPtr, int rank, int size);
     void finalizeHostWeight();
     bool mHostWeightsFinalized = false;
     std::map<std::string, std::vector<MoeWeight>> mHostWeights;
@@ -126,7 +132,7 @@ public:
 
     // interface for weights management
     // should bind to python
-    void addSingleWeightSlot(int slotId, std::string const& name, MoeWeight weightSlot);
+    void addSingleWeightSlot(int slotId, std::string const& name, MoeWeight weightSlot, bool spare = false);
     // should bind to python
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight);
 

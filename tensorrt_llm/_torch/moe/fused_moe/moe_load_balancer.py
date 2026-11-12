@@ -462,7 +462,7 @@ class SingleLayerMoeLoadBalancer:
             weight_slot: The weight object
         """
         self.single_layer_load_balancer_impl.add_single_weight_slot(
-            slot_id, name, weight_slot)
+            slot_id, name, weight_slot, spare=slot_id in self.spare_slots)
 
     def register_weight_slot(self, local_slot_id: int, name: str,
                              t: torch.Tensor):
