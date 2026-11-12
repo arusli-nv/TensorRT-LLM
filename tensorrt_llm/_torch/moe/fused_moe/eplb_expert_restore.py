@@ -237,10 +237,11 @@ class EplbExpertRestore:
             and not _tbr.host_accessible_device_memory_uses_gdrcopy()
         ):
             raise ValueError(
-                "Wide-EP fault tolerance keeps the spare slots of online EPLB host accessible through GDRCopy, "
-                "which this system does not use for EPLB slots (GPU memory is a NUMA node, or GDRCopy is "
-                "unavailable): use static EPLB (layer_updates_per_iter 0) or turn fault tolerance off "
-                "(enable_wide_ep_fault_tolerance=False)"
+                "Wide-EP fault tolerance needs GDRCopy for online EPLB, because online EPLB writes expert weights "
+                "into the slots from the CPU and the spare slots are virtual device memory, which the CPU reaches "
+                "only through GDRCopy. This system does not use GDRCopy for EPLB slots (GPU memory is a NUMA node "
+                "instead of CDMM mode, or GDRCopy is unavailable): enable CDMM mode and GDRCopy, use static EPLB "
+                "(layer_updates_per_iter 0) or turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
             )
         self.active_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
         self.backed_spare_slot_bytes = 0

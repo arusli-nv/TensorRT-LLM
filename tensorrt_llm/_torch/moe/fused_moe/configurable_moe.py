@@ -916,10 +916,12 @@ class ConfigurableMoE(MoE):
             and not backend.autotunes_only_active_slots
         ):
             raise ValueError(
-                "Wide-EP fault tolerance requires a MoE backend that autotunes only the active EPLB slots; "
-                f"{type(backend).__name__} autotunes every local slot, the spare slots included. Turn it off "
-                "(enable_wide_ep_fault_tolerance=False) or use the Cutlass or the CuteDSL NVFP4 MoE backend "
-                "(CuteDSL NVFP4 without locality domains or the SM107 Rubin kernels)."
+                "Wide-EP fault tolerance requires a MoE backend that autotunes only the active EPLB slots, so "
+                "that the unused spare slots leave the chosen tactics unchanged. "
+                f"{type(backend).__name__} autotunes every local slot, the spare slots included, which is not "
+                "supported yet. Turn it off (enable_wide_ep_fault_tolerance=False) or use the Cutlass or the "
+                "CuteDSL NVFP4 MoE backend (CuteDSL NVFP4 without locality domains or the SM107 Rubin kernels). "
+                "The other backends, TRTLLM-Gen included, are not supported yet."
             )
 
         if self.unfinalized_combine_fn is not None:

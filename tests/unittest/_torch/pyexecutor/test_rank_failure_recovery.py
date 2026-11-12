@@ -277,6 +277,7 @@ def _startup_config():
     """Return the arguments the startup check reads beyond the LLM arguments' validation."""
     llm_args = SimpleNamespace(
         attention_dp_config=None,
+        disable_overlap_scheduler=False,
         kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True),
     )
     mapping = SimpleNamespace(rank=0, moe_ep_size=WORLD, world_size=WORLD)
@@ -329,6 +330,14 @@ def test_startup_check_needs_fence_path(shared_secret, monkeypatch, force_cft):
     with pytest.raises(ValueError, match=f"fence path.*{FORCE_CFT_ENV}") as error:
         check_supported(*_startup_config())
     assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
+
+
+def test_startup_check_needs_overlap_scheduler(shared_secret):
+    """Check that an overlap scheduler turned off after the arguments' validation is refused."""
+    llm_args, mapping, dist = _startup_config()
+    llm_args.disable_overlap_scheduler = True
+    with pytest.raises(ValueError, match="the overlap scheduler, which speculative decoding modes"):
+        check_supported(llm_args, mapping, dist)
 
 
 @pytest.mark.parametrize("margin_s, supported", [(-1, False), (0, True)])

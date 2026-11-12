@@ -83,14 +83,18 @@ no `RecreateGroupOnPodRestart`). Set `PMI_RANK` to the node rank, `PMI_SIZE` to 
 
 ## Limitations
 
-- Supported: one NVLink domain (for example GB200 NVL72), attention DP and expert parallelism over all ranks,
-  `NVLinkOneSided` MoE communication, the Cutlass or CuteDSL NVFP4 MoE backend, standard EPLB (online EPLB also needs
-  GDRCopy), KV cache manager V2, the overlap scheduler, the default attention-DP router, one serving frontend, the
-  MPI executor, and `torch_compile_config` without userbuffers. `modeling_v2: auto` builds the built-in model.
-- Rejected at startup: pipeline parallelism, the TRTLLM-Gen and DeepGEMM MoE backends, disaggregated serving, KV
-  cache connectors and events, sleep mode, `enable_lm_head_tp_in_adp`, `modeling_v2: require`, NGram, user-provided
-  and DSpark drafters (MTP is supported), hybrid linear-attention models, `TRTLLM_MOE_COMM_TIMEOUT_SEC` below 60 s,
-  and requests with `n > 1`, `best_of > 1` or beam search.
+- Supported: one NVLink domain (such as GB200 NVL72), attention DP and expert parallelism over all ranks,
+  `NVLinkOneSided` MoE communication, the Cutlass MoE backend, or for NVFP4 an explicit `backend: CUTEDSL` (not with
+  `enable_locality_domains` or on SM107), standard EPLB, KV cache manager V2, the overlap scheduler, the default
+  attention-DP router, one serving frontend and the MPI executor. `modeling_v2: auto` builds the built-in model.
+- Required: `max_beam_width: 1`, `context_parallel_size: 1`, `gpus_per_node` equal to the ranks per node,
+  `enable_userbuffers: false` in `torch_compile_config`, `TRTLLM_MOE_COMM_TIMEOUT_SEC` and the executor hang detector
+  timeout of at least 60 s, and CDMM mode with GDRCopy for online EPLB (else `layer_updates_per_iter: 0`).
+- Rejected: pipeline parallelism, TRTLLM-Gen, DeepGEMM (FP8 DeepSeek-R1) and other MoE backends (not supported yet),
+  two-model speculation (such as Eagle3 or draft-target), NGram, user-provided and DSpark drafters (one-model MTP
+  works), disaggregated serving, KV cache connectors and events, sleep mode, `enable_lm_head_tp_in_adp`,
+  `modeling_v2: require`, hybrid linear-attention models, and requests with `n > 1`, `best_of > 1` or beam search.
+- At a failure, survivors lend part of their KV cache to the restored experts until the replacement joins. Startup
+  fails if they cannot lend enough for a node (add ranks, use fewer EPLB slots or raise `free_gpu_memory_fraction`).
 - Hardware failures and the loss of rank 0 or its node are not covered.
-- At a failure, each surviving rank lends part of its KV cache to the restored experts until the replacement joins.
 - The authority listens on the rendezvous port and the next one on rank 0's node. Run on a trusted network.

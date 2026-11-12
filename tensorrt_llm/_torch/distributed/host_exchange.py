@@ -632,10 +632,15 @@ class MnnvlDist(MPIDist):
             for supported, requirement in (
                 (mapping.enable_attention_dp, "attention DP (enable_attention_dp=True)"),
                 (mapping.pp_size == 1, "pipeline_parallel_size=1"),
-                (mapping.cp_size == 1, "context_parallel_size=1"),
+                (
+                    mapping.cp_size == 1,
+                    "context_parallel_size=1, because the host collectives over MNNVL memory have no "
+                    "context-parallel group",
+                ),
                 (
                     mapping.tp_size == mapping.world_size,
-                    "tensor_parallel_size equal to the world size",
+                    "tensor_parallel_size equal to the world size, because the host collectives over MNNVL "
+                    "memory run over the tensor-parallel group, which must hold every rank",
                 ),
             )
             if not supported

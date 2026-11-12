@@ -169,6 +169,14 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping, dist: Distributed)
         ]
     checks = [
         (not missing, ", ".join(missing)),
+        # The executor creator turns the overlap scheduler off after the arguments' validation in some modes.
+        (
+            not llm_args.disable_overlap_scheduler,
+            "the overlap scheduler, which speculative decoding modes without overlap support (such as two-model "
+            "Eagle3 or draft-target) and multimodal encoder-only mode turn off, because Wide-EP fault tolerance "
+            "accepts or discards each step when the next one starts, which only the overlap scheduler's executor "
+            "loop does yet",
+        ),
         (
             mapping.moe_ep_size == mapping.world_size,
             "expert parallelism over every rank (moe_expert_parallel_size equal to the world size), so that a "
