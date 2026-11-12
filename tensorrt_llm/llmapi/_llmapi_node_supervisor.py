@@ -549,7 +549,9 @@ class NodeSupervisor:
                 *self._command,
             ]
             try:
-                process = subprocess.Popen(command, env=self._environ, stdin=subprocess.PIPE)  # nosec B603
+                process = subprocess.Popen(  # nosec B603
+                    command, env=_prrte_tool_environ(self._environ), stdin=subprocess.PIPE
+                )
                 with contextlib.suppress(BrokenPipeError):
                     process.stdin.write(json.dumps(self._environ).encode() + b"\n")
                     process.stdin.close()
@@ -605,6 +607,14 @@ def _local_gpu_count(environ: Dict[str, str]) -> int:
     return len(glob.glob("/dev/nvidia[0-9]*"))
 
 
+def _prrte_tool_environ(environ: Dict[str, str]) -> Dict[str, str]:
+    """Return ``environ`` for prun or pterm, with PRRTE's opt-in to running as root when this process runs as root."""
+    if os.geteuid() != 0:
+        return environ
+    # mpirun refuses to start as root without this opt-in, so a root process of the job was started with it.
+    return {**dict.fromkeys(_RUN_AS_ROOT_VARS, "1"), **environ}
+
+
 def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: float) -> None:
     """End the PRRTE job at ``uri`` as failed by sending SIGTERM to its ``mpirun``, or with ``pterm`` otherwise."""
     # The URI's namespace ends with the PID of mpirun (``prterun-<host>-<PID>@...``).
@@ -625,7 +635,7 @@ def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: flo
     )
     subprocess.run(  # nosec B603
         [pterm, "--dvm-uri", uri],
-        env=environ,
+        env=_prrte_tool_environ(environ),
         stdin=subprocess.DEVNULL,
         timeout=timeout_s,
         check=True,

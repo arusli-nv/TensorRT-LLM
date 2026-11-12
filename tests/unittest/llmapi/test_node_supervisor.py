@@ -484,40 +484,51 @@ def test_node_0_ends_job_through_prrte(tmp_path, deployment, launcher):
     assert not (tmp_path / "prun-args").exists()
 
 
-@pytest.mark.parametrize("opt_in", [True, False])
-def test_prrte_tools_keep_run_as_root(tmp_path, deployment, opt_in):
-    """Check that PRRTE's tools keep the deployment's opt-in to running as root and never gain one.
+@pytest.mark.parametrize(
+    "opt_in, root",
+    [(True, False), (False, True), (False, False)],
+    ids=["opt-in", "root", "non-root"],
+)
+def test_prrte_tools_keep_run_as_root(tmp_path, deployment, monkeypatch, opt_in, root):
+    """Check that prun and pterm opt in to running as root only with the deployment's opt-in or as root.
 
     Under a root deployment, prun and pterm refuse to run without it.
     """
-    _, environ = deployment
+    authority, environ = deployment
+    monkeypatch.setattr(os, "geteuid", lambda: 0 if root else 1000)
     for name in supervisor_module._RUN_AS_ROOT_VARS:
         environ.pop(name, None)
         if opt_in:
             environ[name] = "1"
     bin_dir = tmp_path / "bin"
-    _fake_tool(bin_dir, "prun", tmp_path)
-    pterm = bin_dir / "pterm"
-    pterm.write_text(
-        f"#!{sys.executable}\nimport json, os\n"
-        f"open({str(tmp_path / 'pterm-environ')!r}, 'w').write(json.dumps(dict(os.environ)))\n"
-    )
-    pterm.chmod(0o755)
+    bin_dir.mkdir()
+    for name in ("prun", "pterm"):
+        tool = bin_dir / name
+        tool.write_text(
+            f"#!{sys.executable}\nimport json, os\n"
+            f"open({str(tmp_path / f'{name}-environ')!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+        )
+        tool.chmod(0o755)
     environ.update(
         PATH=f"{bin_dir}:{environ['PATH']}",
         # The PID in the URI names no mpirun, so the supervisor ends the job with pterm.
         PMIX_SERVER_URI41="prterun-host-0-0@0.0;tcp4://127.0.0.1:1",
-        SUPERVISOR_TEST_MODES="0:0=crashes",
     )
-    node_0 = ["--node-rank", "0", "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
-    supervisor = _supervisor_process(tmp_path, environ, *node_0, *_rank_command(tmp_path))
-    try:
-        assert supervisor.wait(30) == 7
-    finally:
-        supervisor.kill()
-    pterm_environ = json.loads((tmp_path / "pterm-environ").read_text())
-    for name in supervisor_module._RUN_AS_ROOT_VARS:
-        assert (pterm_environ.get(name) == "1") == opt_in
+    relaunch_command, end_job = supervisor_module._prrte_job_control(environ)
+    nodes = ((0, "host-0", True), (1, "host-1", True))
+    node_1_failed = ((0, "host-0", True), (1, "host-1", False))
+    running = _serving(
+        tmp_path, authority, environ, node=0, relaunch_command=relaunch_command, end_job=end_job
+    )
+    _push_and_wait_for_step(running, authority, _record(), nodes)
+    authority.push(_record(MembershipState.PROPOSE, active_mask=0b0011), node_1_failed)
+    _until(lambda: (tmp_path / "prun-environ").exists())
+    os.kill(_read(tmp_path, 0, 0)["pid"], signal.SIGKILL)
+    assert running.wait() == 128 + signal.SIGKILL
+    for name in ("prun", "pterm"):
+        tool_environ = json.loads((tmp_path / f"{name}-environ").read_text())
+        for variable in supervisor_module._RUN_AS_ROOT_VARS:
+            assert (tool_environ.get(variable) == "1") == (opt_in or root)
 
 
 def test_the_ranks_die_with_their_supervisor(tmp_path, deployment):
