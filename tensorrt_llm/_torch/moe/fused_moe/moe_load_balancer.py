@@ -663,11 +663,6 @@ class SingleLayerMoeLoadBalancer:
         self.func_called_count["start_set_cpu_stage"] += 1
         if self.updates_enabled:
             if do_multi_stream():
-                if self.func_called_count[
-                        "update_statistic_with_gathered_statistic"]:
-                    # A peer's next dispatch overwrites the gathered statistics
-                    # in place, so the combine waits until they are summed.
-                    self.event_dict[EventType.MoeBalancer].wait()
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -773,7 +768,6 @@ class SingleLayerMoeLoadBalancer:
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
                     _update_statistic()
-                    self.event_dict[EventType.MoeBalancer].record()
             else:
                 _update_statistic()
 

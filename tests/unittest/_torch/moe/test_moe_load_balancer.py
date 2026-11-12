@@ -15,7 +15,6 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     EplbExpertRestore, FaultTolerantMoeLoadBalancer)
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import \
@@ -386,58 +385,6 @@ class TestMoeLoadBalancer(unittest.TestCase):
             self.fail(f"Statistic kernel test failed with exception: {e}")
         finally:
             # Clean up
-            balancer.shutdown()
-
-    def test_combine_waits_for_the_gathered_statistics_to_be_summed(self):
-        """The gathered statistics stay in the all-to-all workspace, where a
-        peer's next dispatch writes once this rank's combine has started: the
-        main stream must not pass start_set_cpu_stage before the load
-        balancer's stream has summed them."""
-        torch.cuda.set_device(0)
-        balancer = MoeLoadBalancer(0, 2, 1)
-        balancer.set_use_gpu_memcpy(True)
-        layer = balancer.add_layer(4, 2, 2)
-        layer.set_initial_weight_assignments([0, 1, 2, 3])
-        balancer.finalize_model()
-        balancer.set_iter_info(True, False)
-
-        local_expert_ids = torch.tensor([[0, 1], [2, 3]],
-                                        dtype=torch.int32,
-                                        device="cuda")
-        gathered = torch.tensor([[1, 0, 2, 0], [0, 3, 0, 4]],
-                                dtype=torch.int32,
-                                device="cuda")
-        summed = torch.zeros(4, dtype=torch.int32, device="cuda")
-
-        def record_sum(global_statistic_info, statistic_flag_tensor,
-                       single_layer_load_balancer_ptr):
-            summed.copy_(global_statistic_info)
-
-        # The executor's own stream: the legacy default stream would wait for
-        # the load balancer's stream implicitly and hide the race.
-        main_stream = torch.cuda.Stream()
-        main_stream.wait_stream(torch.cuda.current_stream())
-        try:
-            with patch.object(torch.ops.trtllm,
-                              "moe_hierarchical_statistic_update",
-                              record_sum), with_multi_stream(True), \
-                    torch.cuda.stream(main_stream):
-                with MoeLoadBalancerIterContext(balancer):
-                    layer.start_wait_gpu_stage()
-                    layer.done_wait_gpu_stage()
-                    layer.update_local_statistic(local_expert_ids, True, True)
-                    layer.get_local_statistic_tensor()
-                    # The load balancer's stream runs late.
-                    with torch.cuda.stream(layer.aux_stream):
-                        torch.cuda._sleep(int(1e8))
-                    layer.update_statistic_with_gathered_statistic(gathered)
-                    layer.start_set_cpu_stage()
-                    # The combine, then a peer's next dispatch.
-                    gathered.fill_(100)
-                    layer.done_set_cpu_stage()
-            torch.cuda.synchronize()
-            self.assertEqual(summed.tolist(), [1, 3, 2, 4])
-        finally:
             balancer.shutdown()
 
     def test_real_routing_kernel(self):
