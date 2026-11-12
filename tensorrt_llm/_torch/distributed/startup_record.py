@@ -121,7 +121,7 @@ class StartupRecord:
         return {"values": self.values, "exchanges": self.exchanges}
 
     def pause(self) -> None:
-        """Neither record nor replay the startup collectives until the matching :meth:`resume`."""
+        """Neither record nor replay the startup collectives, except per-process agreements, until :meth:`resume`."""
         self._pauses += 1
 
     def resume(self) -> None:
@@ -165,9 +165,17 @@ class StartupRecord:
                 )
         self._recording = self._replaying = False
 
-    def agree(self, name: str, gather: Callable[[], Any]) -> Any:
-        """Return the result of ``gather``, or rank 0's recorded result of the same call on a replacement rank."""
-        if self._replacement and not self._pauses:
+    def agree(self, name: str, gather: Callable[[], Any], per_process: bool = False) -> Any:
+        """Return the result of ``gather``, or rank 0's recorded result of the same call on a replacement rank.
+
+        Args:
+            name: The name of the startup value.
+            gather: The collective that returns the value.
+            per_process: Record and replay the value even while paused. Set it for an agreement that each process
+                makes once, whichever executor it starts first.
+        """
+        recorded_now = not self._pauses or per_process
+        if self._replacement and recorded_now:
             recorded = self.values.get(name, [])
             index = self._taken.get(name, 0)
             if index == len(recorded):
@@ -177,7 +185,7 @@ class StartupRecord:
                 )
             self._taken[name] = index + 1
             return recorded[index]
-        if not self._recording or self._pauses:
+        if not self._recording or not recorded_now:
             return gather()
         with self.paused():
             value = gather()

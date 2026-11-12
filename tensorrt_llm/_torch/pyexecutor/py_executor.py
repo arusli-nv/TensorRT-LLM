@@ -2240,7 +2240,8 @@ class PyExecutor:
 
         # A replacement rank takes the offset of the rank it replaces.
         all_rank_timestamps = startup_record.agree("steady_clock_timestamps",
-                                                   gather_timestamps)
+                                                   gather_timestamps,
+                                                   per_process=True)
         local_timestamp = all_rank_timestamps[self.global_rank]
         if self.global_rank == 0:
             logger.info(

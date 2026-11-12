@@ -36,7 +36,7 @@ from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord, startup_record
 from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
-from tensorrt_llm._torch.pyexecutor import model_loader
+from tensorrt_llm._torch.pyexecutor import model_loader, py_executor
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
     DecoderWarmup,
@@ -181,6 +181,34 @@ def test_paused_agreement_is_not_recorded():
     assert startup_record.agree("estimation", lambda: 1) == 1
     startup_record.resume()
     assert startup_record.values == {}
+
+
+def _calibrate_steady_clock(dist, now, monkeypatch):
+    """Run main's steady clock calibration of an executor of ``dist`` whose clock reads ``now``."""
+    monkeypatch.setattr(py_executor, "get_steady_clock_now_in_seconds", lambda: now)
+    executor = SimpleNamespace(global_rank=dist.mapping.rank, dist=dist)
+    py_executor.PyExecutor._set_global_steady_clock_offset(executor)
+    return py_executor.LlmRequest.global_steady_clock_offset
+
+
+def test_replacement_replays_paused_clock_calibration(monkeypatch):
+    """Check a calibration that the original ranks make in the KV cache estimation and a replacement after it."""
+    monkeypatch.setattr(py_executor, "LlmRequest", SimpleNamespace(global_steady_clock_offset=None))
+
+    def skewed(r, obj):
+        return obj + r if isinstance(obj, float) else obj
+
+    rank_0 = _rank_0(skewed)
+    with startup_record.paused():
+        assert _calibrate_steady_clock(rank_0, 100.0, monkeypatch) == 0.0
+    # The final executor of an original rank keeps the offset of its first one.
+    assert _calibrate_steady_clock(rank_0, 200.0, monkeypatch) == 0.0
+    published = _publish()
+    py_executor.LlmRequest.global_steady_clock_offset = None
+    replacement = _replacement(published)
+    assert _calibrate_steady_clock(replacement, 500.0, monkeypatch) == -REPLACED
+    assert replacement.host_exchange.calls == 0
+    startup_record.close()
 
 
 def test_divergent_replacement_cannot_start():
