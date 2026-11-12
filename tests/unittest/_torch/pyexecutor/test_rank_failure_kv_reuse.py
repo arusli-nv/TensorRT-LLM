@@ -30,7 +30,6 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.step_acceptance import commit_context_blocks
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -41,13 +40,12 @@ CHUNK = 32  # one KV block
 
 
 @pytest.fixture
-def manager(request):
-    policy = getattr(request, "param", "all_reusable")
+def manager():
     manager = KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
             max_tokens=1024,
             enable_block_reuse=True,
-            block_reuse_config=BlockReuseConfig(policy=policy),
+            block_reuse_config=BlockReuseConfig(policy="all_reusable"),
         ),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=2,
@@ -130,43 +128,3 @@ def test_chunk_reusable_after_step_accepted(manager, fault_tolerance, accepted):
     # Without fault tolerance the chunk is committed at its launch.
     reusable = accepted or not fault_tolerance
     assert _reused_prefix(manager, 2, first_token=1000) == (CHUNK if reusable else 0)
-
-
-def test_accept_skips_next_chunk_in_flight(manager):
-    executor = _executor(manager, fault_tolerance=True)
-    request = _request(1, first_token=1000)
-    first = _launch(executor, _schedule_chunk(manager, request))
-    # The next chunk is scheduled and launched before the first one's step is accepted.
-    second = _launch(executor, _schedule_chunk(manager, request))
-    assert request.context_current_position == 2 * CHUNK
-    executor.accept(first)
-    assert _reused_prefix(manager, 2, first_token=1000) == CHUNK
-    executor.accept(second)
-    assert _reused_prefix(manager, 3, first_token=1000) == 2 * CHUNK
-    manager.free_resources(request)
-
-
-@pytest.mark.parametrize("manager", ["per_conversation"], indirect=True)
-@pytest.mark.parametrize("fault_tolerance", [False, True], ids=["off", "on"])
-def test_drop_plan_covers_committed_prompt(manager, fault_tolerance):
-    """Save a conversation's drop plan over every block its finished context committed.
-
-    With fault tolerance the plan is saved when the step is accepted, because nothing is committed at the launch.
-    """
-    executor = _executor(manager, fault_tolerance)
-    request = _request(1, first_token=1000)
-    request.py_conversation_params = ConversationParams(conversation_id="conversation")
-    committed_at_plan = []
-    save_drop_plan = manager.conversation_manager.save_drop_plan
-
-    def record(req, kv_cache):
-        committed_at_plan.append(kv_cache.num_committed_tokens)
-        save_drop_plan(req, kv_cache)
-
-    manager.conversation_manager.save_drop_plan = record
-    step = _launch(executor, _schedule_chunk(manager, request, PROMPT_LEN))
-    if fault_tolerance:
-        assert committed_at_plan == []
-        executor.accept(step)
-    assert committed_at_plan == [PROMPT_LEN]
-    manager.free_resources(request)

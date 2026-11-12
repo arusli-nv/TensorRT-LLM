@@ -1092,66 +1092,42 @@ def test_the_capability_declarations_match_the_kernels():
     assert not DeepEPLowLatency.__new__(DeepEPLowLatency).supports_finalize_before_combine()
 
 
-def _spare_slot_backend(leaf: type, spare_slot_count: int = 2):
-    """A ``leaf`` built without ``__init__`` on a layer with 8 active slots per rank."""
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf, spare_slot_count, refusal",
+    [
+        (TrtllmTrtllmGenNvfp4Impl, 2, "TrtllmTrtllmGenNvfp4Impl autotunes every local slot"),
+        # DeepGEMM runs no MoE autotuner, but spare slots would take device memory.
+        (DeepGemmFusedMoE, 2, "DeepGEMM MoE backend yet: its workspace holds rows"),
+        (TrtllmCutedslGroupedGemmNvfp4Impl, 2, None),
+        (TrtllmCutlassNvfp4Impl, 2, None),
+        (TrtllmTrtllmGenNvfp4Impl, 0, None),
+        (DeepGemmFusedMoE, 0, None),
+    ],
+    ids=["trtllm_gen", "deepgemm", "cutedsl", "cutlass", "trtllm_gen_off", "deepgemm_off"],
+)
+def test_spare_slot_backends_checked_at_construction(
+    monkeypatch: pytest.MonkeyPatch, leaf: type, spare_slot_count: int, refusal: str | None
+) -> None:
+    """Refuse a backend that would autotune or allocate for the spare EPLB slots."""
+    moe = _validating_moe(hook=None)
+    moe._using_load_balancer = lambda: True
     backend = leaf.__new__(leaf)
     backend.layer_load_balancer = SimpleNamespace(
         spare_slot_count=spare_slot_count, active_slot_count_per_rank=8
     )
-    return backend
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "leaf, spare_slot_count, refused",
-    [
-        (TrtllmTrtllmGenNvfp4Impl, 2, True),
-        (TrtllmCutedslGroupedGemmNvfp4Impl, 2, False),
-        (TrtllmCutlassNvfp4Impl, 2, False),
-        # Without spare slots every backend tunes as without fault tolerance.
-        (TrtllmTrtllmGenNvfp4Impl, 0, False),
-    ],
-    ids=["trtllm_gen", "cutedsl", "cutlass", "no_spare_slots"],
-)
-def test_backends_that_autotune_spare_slots_are_refused_at_construction(
-    monkeypatch: pytest.MonkeyPatch, leaf: type, spare_slot_count: int, refused: bool
-) -> None:
-    """With spare EPLB slots, a backend whose MoE autotuner would profile them too is refused."""
-    moe = _validating_moe(hook=None)
-    moe._using_load_balancer = lambda: True
-    backend = _spare_slot_backend(leaf, spare_slot_count)
-    backend._supports_load_balancer = lambda: True
+    if leaf is not DeepGemmFusedMoE:
+        backend._supports_load_balancer = lambda: True
     if leaf is TrtllmCutedslGroupedGemmNvfp4Impl:
         from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
 
         monkeypatch.setattr(nvfp4, "get_sm_version", lambda: 100)
         backend._locality_domain_runtime = None
-
-    if refused:
-        with pytest.raises(
-            ValueError,
-            match=rf"{leaf.__name__} autotunes every local slot.*"
-            r"\(enable_wide_ep_fault_tolerance=False\) or use the Cutlass or the CuteDSL NVFP4",
-        ):
-            moe.validate_backend(backend)
+    if refusal is None:
+        moe.validate_backend(backend)
     else:
-        moe.validate_backend(backend)  # does not raise
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("spare_slot_count", [0, 2])
-def test_deepgemm_refused_for_its_workspace(spare_slot_count: int) -> None:
-    """DeepGEMM runs no MoE autotuner, but its workspace holds rows for every local slot: spare slots would take
-    device memory."""
-    moe = _validating_moe(hook=None)
-    moe._using_load_balancer = lambda: True
-    backend = _spare_slot_backend(DeepGemmFusedMoE, spare_slot_count)
-
-    if spare_slot_count:
-        with pytest.raises(ValueError, match="DeepGEMM MoE backend yet: its workspace holds rows"):
+        with pytest.raises(ValueError, match=refusal):
             moe.validate_backend(backend)
-    else:
-        moe.validate_backend(backend)  # does not raise
 
 
 def _hook_scheduler(*, finalize_fn, comm=True) -> ExternalCommMoEScheduler:

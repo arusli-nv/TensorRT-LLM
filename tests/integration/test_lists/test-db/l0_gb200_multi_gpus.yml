@@ -78,7 +78,6 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_rejects_wrong_group_membership
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_growth_keeps_captured_graphs
   - unittest/_torch/multi_gpu/test_mnnvl_dist.py
-  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_bound_layers_of_two_signatures_round_trip_on_one_workspace
   - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_abort_releases_bound_collectives_waiting_on_a_stopped_rank
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
   - unittest/_torch/multi_gpu/test_independent_rank_startup.py

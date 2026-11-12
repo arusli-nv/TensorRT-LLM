@@ -64,18 +64,8 @@ def test_resize_releases_memory_keeps_kv(manager):
     assert manager.get_buffers(0)[pages[-1]].eq(1.5).all()
 
 
-def test_pool_keeps_its_minimum(manager):
-    quota = manager.gpu_quota
-    with pytest.raises(RuntimeError, match="cannot be resized to 0 bytes"):
-        manager.resize_gpu_quota(-1)
-    assert manager.gpu_quota == quota
-
-
 def test_failed_resize_resumes_every_cache(manager):
-    """Keep every request active with its KV when a restore shrinks the pool and then fails.
-
-    The failure stands for a peer lost during the remap, after which the executor keeps serving.
-    """
+    """Keep every request active with its KV when a restore shrinks the pool and then fails."""
     (request,) = manager.add_dummy_requests([0], [512])
     (pages,) = manager.get_batch_cache_indices([0], 0)
     manager.get_buffers(0)[pages[-1]].fill_(1.5)

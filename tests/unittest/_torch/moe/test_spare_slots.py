@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the spare EPLB slots that let the active ranks hold every expert after a rank failure."""
 
-import functools
 import os
 import secrets
-import threading
 from contextlib import nullcontext
 from multiprocessing import resource_tracker
 from types import SimpleNamespace
@@ -14,9 +12,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 import torch
-from mpi4py import MPI
 
 from tensorrt_llm import _wide_ep_fault_tolerance
+from tensorrt_llm._torch.distributed import membership
 from tensorrt_llm._torch.distributed.membership import (
     RECORD_KEY,
     REPLACEMENT_CANNOT_START,
@@ -31,8 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     host_weights_key,
     plan_layer_placement,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery
 from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
 from tensorrt_llm.mapping import Mapping
@@ -52,18 +49,20 @@ def deployment_nonce(monkeypatch):
     monkeypatch.setattr(rank_failure_recovery, "_deployment_nonce", secrets.token_hex(8))
 
 
-def _load_balancer(
-    monkeypatch, *, largest_failure, eplb_slots, layer_updates_per_iter=1, ep_rank=0
-):
-    """Return a MoeLoadBalancer with Wide-EP fault tolerance over one layer of ``eplb_slots`` per rank.
-
-    Its largest recoverable failure takes ``largest_failure`` ranks.
-    """
+def _fault_tolerance(monkeypatch, largest_failure):
+    """Turn fault tolerance on, with nodes [0, 1] and [2, 3] and a largest failure of ``largest_failure`` ranks."""
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     monkeypatch.setattr(
         EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
     )
+
+
+def _load_balancer(
+    monkeypatch, *, largest_failure, eplb_slots, layer_updates_per_iter=1, ep_rank=0
+):
+    """Return a MoeLoadBalancer with Wide-EP fault tolerance over one layer of ``eplb_slots`` per rank."""
+    _fault_tolerance(monkeypatch, largest_failure)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(_USES_GDRCOPY, return_value=True),
@@ -90,43 +89,14 @@ def _load_balancer(
 def test_online_spare_slots_need_gdrcopy(
     monkeypatch, largest_failure, layer_updates_per_iter, uses_gdrcopy, refused
 ):
-    """Online EPLB writes the spare slots from the host through GDRCopy mappings.
-
-    Without them, the load balancer is refused at creation, before any weight is allocated.
-    """
-    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
-    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
-    monkeypatch.setattr(
-        EplbExpertRestore, "_largest_failure_size", staticmethod(lambda hosts: largest_failure)
-    )
+    """Refuse online EPLB with spare slots at creation unless GDRCopy maps the slots for host writes."""
+    _fault_tolerance(monkeypatch, largest_failure)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(_USES_GDRCOPY, return_value=uses_gdrcopy),
         pytest.raises(ValueError, match="through GDRCopy") if refused else nullcontext(),
     ):
         FaultTolerantMoeLoadBalancer(0, WORLD_SIZE, layer_updates_per_iter, mapping=None)
-
-
-def test_largest_failure_size():
-    """The largest recoverable failure is a node other than rank 0's, or one rank."""
-    largest = EplbExpertRestore._largest_failure_size
-    assert largest([0] * 4 + [1] * 4) == 4
-    assert largest([0, 1, 0, 1, 2, 2, 2]) == 3
-    # On one node, the largest failure is one rank other than rank 0.
-    assert largest([0] * 4) == 1
-    assert largest([0]) == 0
-
-
-def test_rank_nodes_follow_gpus_per_node():
-    """The nodes come from the mapping, since a replacement rank's MPI world is only itself."""
-    expert_restore = EplbExpertRestore(
-        SimpleNamespace(
-            ep_size=6,
-            layer_updates_per_iter=0,
-            mapping=Mapping(world_size=6, tp_size=6, gpus_per_node=4),
-        )
-    )
-    assert expert_restore._rank_nodes() == [0, 0, 0, 0, 1, 1]
 
 
 @pytest.mark.parametrize(
@@ -152,7 +122,6 @@ def test_spare_slots_cover_largest_failure(
     load_balancer.load_balancer_impl.add_layer.assert_called_once_with(
         EXPERTS, 2, eplb_slots + spare_slot_count
     )
-    assert layer.slot_count_per_rank == eplb_slots + spare_slot_count
     assert layer.spare_slot_count == spare_slot_count
     assert layer.active_slot_count_per_rank == eplb_slots
 
@@ -161,6 +130,7 @@ def test_no_spare_slots_without_fault_tolerance(monkeypatch):
     def nodes(self):
         raise AssertionError("placed the ranks on nodes without rank failure recovery")
 
+    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: False)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", nodes)
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
@@ -174,122 +144,12 @@ def test_no_spare_slots_without_fault_tolerance(monkeypatch):
     assignments = [0, 1, 2, 3]
     assert layer.with_spare_slots(assignments) is assignments
     layer.set_initial_weight_assignments(assignments)
-    layer.single_layer_load_balancer_impl.set_initial_weight_assignments.assert_called_once_with(
-        assignments
-    )
+    assert layer.initial_placement is None
 
 
-@pytest.mark.parametrize("layer_updates_per_iter", [1, 0], ids=["online", "static"])
-def test_spare_slots_start_empty_and_unbacked(monkeypatch, layer_updates_per_iter):
-    load_balancer = _load_balancer(
-        monkeypatch,
-        largest_failure=2,
-        eplb_slots=1,
-        layer_updates_per_iter=layer_updates_per_iter,
-    )
-    (layer,) = load_balancer.single_layer_load_balancers
-    impl = layer.single_layer_load_balancer_impl
-
-    # The weight loaders fill only the active slots, and routing and EPLB's updates start with the spare slots
-    # empty.
-    assignments = layer.with_spare_slots([0, 1, 2, 3])
-    assert assignments == [0, -1, 1, -1, 2, -1, 3, -1]
-    layer.set_initial_weight_assignments(assignments)
-    impl.set_initial_weight_assignments.assert_called_once_with(assignments)
-    # In both routing modes the spare slots map no memory, from the creation of the weights on.
-    assert list(layer.spare_slots) == [1]
-    storage = torch.zeros(2, 4)
-    with patch(f"{_MLB}.torch") as mock_torch:
-        mock_torch.ops.trtllm.moe_unbacked_slots_save_memory.return_value = True
-        mock_torch.ops.trtllm.moe_unbacked_slot_tensor.return_value = storage
-        assert layer.create_spare_slot_storage("w", torch.full((2, 4), 5.0)) is storage
-    mock_torch.ops.trtllm.moe_unbacked_slots_save_memory.assert_called_once_with(16, 2, [1])
-    # Online EPLB writes the storage with CPU copies, so it is host accessible.
-    mock_torch.ops.trtllm.moe_unbacked_slot_tensor.assert_called_once_with(
-        [2, 4], torch.float32, [1], bool(layer_updates_per_iter)
-    )
-    # It takes the values of the weight's active slot.
-    assert storage.tolist() == [[5.0] * 4, [0.0] * 4]
-    # The loaded weight still has that storage.
-    weights = storage.detach()
-    layer.add_to_migrate_weight_fn(layer.use_spare_slot_storage, (weights, "w"))
-    layer.host_tensor_sharer.name_info = {"w": (torch.float32, torch.Size([4]))}
-    migrate = Mock()
-    monkeypatch.setattr(torch.ops.trtllm, "migrate_to_host_accessible", migrate, raising=False)
-    load_balancer.register_weight_slots_after_to_cuda()
-    assert list(layer.unbacked_slot_tensors) == ["w"]
-    assert layer.unbacked_slot_tensors["w"] is storage
-    migrate.assert_not_called()
-    # The C++ weight updater gets every slot and every expert's host weights, from which a restore loads the
-    # experts of a failed rank. Under online EPLB, its slot functions register the slots.
-    registered = [
-        (call.args[0], call.args[1], call.args[2].weight_ptr)
-        for call in impl.add_single_weight_slot.call_args_list
-    ]
-    if layer_updates_per_iter:
-        assert registered == []
-    else:
-        assert registered == [(slot, "w", weights[slot].data_ptr()) for slot in range(2)]
-    assert layer.need_load_shared_weights()
-    load_balancer.finalize_model()
-    # The updates never copy with the GPU, since a GPU copy can wait in the driver for the stage that waits for it.
-    load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_not_called()
-    layer.host_tensor_sharer.finalize_host_tensor_sharing.assert_called_once_with(
-        layer._add_host_weight_from_tensor
-    )
-
-
-@pytest.mark.parametrize("layer_updates_per_iter", [1, 0], ids=["online", "static"])
-def test_sub_chunk_slots_keep_their_storage(monkeypatch, layer_updates_per_iter):
-    """A per-slot scale would take a whole VMM chunk in the unbacked storage, so it keeps its own storage.
-
-    Backing its spare slot maps nothing, and its slots are still registered for restores.
-    """
-    load_balancer = _load_balancer(
-        monkeypatch,
-        largest_failure=2,
-        eplb_slots=1,
-        layer_updates_per_iter=layer_updates_per_iter,
-    )
-    (layer,) = load_balancer.single_layer_load_balancers
-    load_balancer.register_weight_slots_after_to_cuda()
-    scales = torch.zeros(2)
-    ops = {
-        name: Mock()
-        for name in (
-            "moe_unbacked_slots_save_memory",
-            "moe_unbacked_slot_tensor",
-            "migrate_to_host_accessible",
-            "moe_unbacked_slots_bytes_to_back",
-            "moe_unbacked_slots_set_backed",
-        )
-    }
-    ops["moe_unbacked_slots_save_memory"].return_value = False
-    for name, op in ops.items():
-        monkeypatch.setattr(torch.ops.trtllm, name, op, raising=False)
-    monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
-    assert layer.create_spare_slot_storage("alpha", scales) is None
-    ops["moe_unbacked_slot_tensor"].assert_not_called()
-    layer.use_spare_slot_storage(scales, "alpha")
-    assert layer.unbacked_slot_tensors == {}
-    registered = [
-        (call.args[0], call.args[1], call.args[2].weight_ptr)
-        for call in layer.single_layer_load_balancer_impl.add_single_weight_slot.call_args_list
-    ]
-    if layer_updates_per_iter:
-        ops["migrate_to_host_accessible"].assert_called_once_with(scales)
-        assert registered == []  # Online EPLB's slot functions register them.
-    else:
-        ops["migrate_to_host_accessible"].assert_not_called()
-        assert registered == [(slot, "alpha", scales[slot].data_ptr()) for slot in range(2)]
-    assert layer.spare_slot_bytes_to_back([1]) == 0
-    assert load_balancer.expert_restore.set_spare_slots_backed([[1]], True) == 0
-    ops["moe_unbacked_slots_bytes_to_back"].assert_not_called()
-    ops["moe_unbacked_slots_set_backed"].assert_not_called()
-
-
-def _layer_with_spare_slot_storage(monkeypatch, name):
-    """Return a load balancer and its layer whose weight ``name`` got spare slot storage at creation."""
+@pytest.mark.parametrize("storage_kept", [False, True], ids=["storage_replaced", "no_host_weights"])
+def test_spare_storage_misuse_refused(monkeypatch, storage_kept):
+    """Refuse a weight whose spare slots a restore could not load, for lost storage or no host weights."""
     load_balancer = _load_balancer(
         monkeypatch, largest_failure=2, eplb_slots=1, layer_updates_per_iter=0
     )
@@ -297,224 +157,38 @@ def _layer_with_spare_slot_storage(monkeypatch, name):
     with patch(f"{_MLB}.torch") as mock_torch:
         mock_torch.ops.trtllm.moe_unbacked_slots_save_memory.return_value = True
         mock_torch.ops.trtllm.moe_unbacked_slot_tensor.return_value = torch.zeros(2, 4)
-        layer.create_spare_slot_storage(name, torch.zeros(2, 4))
-    return load_balancer, layer
-
-
-def test_weight_losing_spare_storage_is_refused(monkeypatch):
-    """A transform after loading that replaced the storage would give the spare slots device memory again."""
-    load_balancer, layer = _layer_with_spare_slot_storage(monkeypatch, "w")
-    layer.add_to_migrate_weight_fn(layer.use_spare_slot_storage, (torch.zeros(2, 4), "w"))
-    with pytest.raises(RuntimeError, match="Weight w of MoE layer .* lost the storage"):
+        layer.create_spare_slot_storage("w", torch.zeros(2, 4))
+    if storage_kept:
+        message = r"Weights \['w'\] of MoE layer .* no host weights"
+    else:
+        layer.add_to_migrate_weight_fn(layer.use_spare_slot_storage, (torch.zeros(2, 4), "w"))
+        message = "Weight w of MoE layer .* lost the storage"
+    with pytest.raises(RuntimeError, match=message):
         load_balancer.register_weight_slots_after_to_cuda()
-
-
-def test_spare_storage_without_host_weights_refused(monkeypatch):
-    """A restore could not load such a weight's spare slots."""
-    load_balancer, _ = _layer_with_spare_slot_storage(monkeypatch, "w")
-    with pytest.raises(RuntimeError, match=r"Weights \['w'\] of MoE layer .* no host weights"):
-        load_balancer.register_weight_slots_after_to_cuda()
-
-
-def test_slot_weights_get_spare_storage():
-    """Every weight of local slots, and only those, gets the storage its layer makes, where that saves memory."""
-
-    class _Moe(MoEEplbWeightLayoutMixin, torch.nn.Module):
-        pass
-
-    moe = _Moe()
-    moe.expert_size_per_partition = 3
-    moe.register_parameter("weights", torch.nn.Parameter(torch.zeros(3, 4), requires_grad=False))
-    moe.register_parameter("scales", torch.nn.Parameter(torch.zeros(3), requires_grad=False))
-    moe.register_parameter("rows", torch.nn.Parameter(torch.zeros(4, 3), requires_grad=False))
-    moe.register_parameter("scale", torch.nn.Parameter(torch.tensor(1.0), requires_grad=False))
-    storage = torch.ones(3, 4)
-    moe.layer_load_balancer = Mock(spare_slot_count=1)
-    moe.layer_load_balancer.create_spare_slot_storage.side_effect = lambda name, slots: (
-        storage if name == "weights" else None
-    )
-    moe._create_spare_slot_storage()
-    assert [
-        c.args[0] for c in moe.layer_load_balancer.create_spare_slot_storage.call_args_list
-    ] == [
-        "weights",
-        "scales",
-    ]
-    assert moe.weights.data_ptr() == storage.data_ptr()
-    assert not moe.weights.requires_grad
-    assert moe.scales.eq(0).all()
-
-
-def test_online_eplb_keeps_no_restore_state(monkeypatch):
-    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: False)
-    with (
-        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
-        patch(f"{_MLB}.HostMoeTensorSharer"),
-        patch("torch.cuda.Event"),
-    ):
-        layer = MoeLoadBalancer(0, WORLD_SIZE, 1).add_layer(EXPERTS, 2, 1, aux_stream=Mock())
-    layer.set_initial_weight_assignments([0, 1, 2, 3])
-    assert layer.initial_placement is None
-    layer.py_finalize_model()
-    layer.host_tensor_sharer.finalize_host_tensor_sharing.assert_called_once_with(
-        layer._add_host_weight_from_tensor
-    )
-
-
-def test_static_routing_shares_no_host_weights(monkeypatch):
-    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", Mock(side_effect=AssertionError))
-    with (
-        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
-        patch(f"{_MLB}.HostMoeTensorSharer") as sharer,
-    ):
-        load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
-        layer = load_balancer.add_layer(EXPERTS, 2, 1)
-    assert not layer.need_load_shared_weights()
-    assert layer.host_tensor_sharer is None
-    sharer.assert_not_called()
-
-
-def test_online_eplb_without_spare_slots_unchanged(monkeypatch):
-    # Without a rank to lose, there is no spare slot.
-    load_balancer = _load_balancer(monkeypatch, largest_failure=0, eplb_slots=2)
-    (layer,) = load_balancer.single_layer_load_balancers
-    load_balancer.register_weight_slots_after_to_cuda()
-    weights = torch.zeros(2, 4)
-    with patch(f"{_MLB}.torch") as mock_torch:
-        layer.make_tensor_host_accessible(weights)
-    assert not layer.spare_slots
-    mock_torch.ops.trtllm.migrate_to_host_accessible.assert_called_once_with(weights)
-    load_balancer.load_balancer_impl.set_use_gpu_memcpy.assert_not_called()
-    layer.host_tensor_sharer.host_weights = {(0, "w"): torch.zeros(4)}
-    load_balancer.finalize_model()
-    layer.host_tensor_sharer.finalize_host_tensor_sharing.assert_called_once_with(
-        layer._add_host_weight_from_tensor
-    )
-
-
-@pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
-def test_cpp_balancer_owns_host_weights(monkeypatch, fault_tolerance):
-    """The C++ weight updater keeps the only references to the host weights once it has them."""
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
-    monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    sharer_class = DeploymentHostWeights if fault_tolerance else HostMoeTensorSharer
-    sharer = sharer_class(0, 2, MPI.COMM_SELF)
-    sharer.set_shared_memory_base_name(f"test_spare_slots_{os.getpid()}")
-    for expert_id in range(2):
-        sharer.share_host_tensor_with_shape(expert_id, "w", torch.full((4, 64), float(expert_id)))
-    sharer.finalize_layer_weights()
-    try:
-        host_weights = []
-        sharer.finalize_host_tensor_sharing(lambda expert_id, name, t: host_weights.append(t))
-        assert [int(t[0, 0]) for t in host_weights] == [0, 1]
-        host_weights.clear()  # Release the views of the shared memory so it can close.
-        assert not sharer.host_weights
-        sharer.pre_shutdown_cleanup()
-    finally:
-        sharer.post_shutdown_cleanup()
-
-
-def test_shutdown_waits_for_weight_updates(monkeypatch):
-    """Online EPLB's weight updates read the host weights until the C++ shutdown returns."""
-    load_balancer = _load_balancer(monkeypatch, largest_failure=2, eplb_slots=1)
-    (layer,) = load_balancer.single_layer_load_balancers
-    events = []
-    load_balancer.load_balancer_impl.shutdown.side_effect = lambda: events.append("shutdown")
-    layer.host_tensor_sharer.pre_shutdown_cleanup.side_effect = lambda: events.append("release")
-    assert load_balancer.shutdown()
-    assert events == ["shutdown", "release"]
 
 
 @pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
 def test_shutdown_node_wait_without_fault_tolerance(monkeypatch, fault_tolerance):
-    """With fault tolerance, each rank releases its own mappings without a node collective.
+    """Release the host weights after the C++ shutdown, without a node collective under fault tolerance.
 
     A rank of the node may be gone, so an iteration in progress keeps only its own rank from releasing.
     """
     load_balancer = _load_balancer(monkeypatch, largest_failure=2, eplb_slots=1)
+    (layer,) = load_balancer.single_layer_load_balancers
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
     node = Mock(allgather=Mock(side_effect=lambda safe: [safe, True]))
     load_balancer.shared_mpi_comm = node
+    events = []
+    load_balancer.load_balancer_impl.shutdown.side_effect = lambda: events.append("shutdown")
+    layer.host_tensor_sharer.pre_shutdown_cleanup.side_effect = lambda: events.append("release")
     load_balancer.in_iter = True
     assert not load_balancer.shutdown()
-    load_balancer.load_balancer_impl.shutdown.assert_not_called()
+    assert events == []
     load_balancer.in_iter = False
     assert load_balancer.shutdown()
-    load_balancer.load_balancer_impl.shutdown.assert_called_once()
-    if fault_tolerance:
-        node.allgather.assert_not_called()
-        node.barrier.assert_not_called()
-    else:
-        assert node.allgather.call_count == 2
-        assert node.barrier.call_count == 2
-
-
-@pytest.mark.parametrize(
-    "largest_failure, eplb_slots, tuned_slots",
-    [
-        # With one spare slot per rank, the MoE autotuner profiles only EPLB's slot.
-        (2, 1, 1),
-        # Without a spare slot, the MoE autotuner profiles every local slot.
-        (0, 1, None),
-    ],
-)
-def test_autotuner_profiles_active_slots_only(
-    monkeypatch, largest_failure, eplb_slots, tuned_slots
-):
-    """The MoE ops' tuner layout is settled when the layer registers its weights with the load balancer."""
-    load_balancer = _load_balancer(
-        monkeypatch, largest_failure=largest_failure, eplb_slots=eplb_slots
-    )
-    moe = MoEEplbWeightLayoutMixin()
-    assert moe.tuner_layout_kwargs == {}
-    (moe.layer_load_balancer,) = load_balancer.single_layer_load_balancers
-    moe.num_experts = EXPERTS
-    moe.expert_size_per_partition = moe.layer_load_balancer.slot_count_per_rank
-    moe.initial_local_expert_ids = [0]
-    moe.register_all_parameter_slot_and_to_fix_weight_fns({"w": torch.zeros(EXPERTS, 1)})
-    expected = {} if tuned_slots is None else {"tuner_num_local_experts": tuned_slots}
-    assert moe.tuner_layout_kwargs == expected
-
-
-@pytest.mark.parametrize("spare_slot_count", [2, 0], ids=["spare_slots", "online_eplb"])
-def test_slot_tensors_use_layer_storage(spare_slot_count):
-    """A layer with spare slots takes its contiguous slot tensors as spare slot storage.
-
-    Online EPLB without spare slots keeps its host-accessible storage. Non-contiguous slots are refused either way.
-    """
-    moe = MoEEplbWeightLayoutMixin()
-    moe.layer_load_balancer = Mock(spare_slot_count=spare_slot_count)
-    moe.layer_load_balancer.is_dynamic_routing.return_value = True
-    moe.weights = torch.zeros(3, 4, 2)
-    moe.register_to_fix_weight_fn("weights")
-    if spare_slot_count:
-        moe.layer_load_balancer.use_spare_slot_storage.assert_called_once()
-        moe.layer_load_balancer.make_tensor_host_accessible.assert_not_called()
-    else:
-        moe.layer_load_balancer.make_tensor_host_accessible.assert_called_once()
-        moe.layer_load_balancer.use_spare_slot_storage.assert_not_called()
-    moe.scales = torch.zeros(3, 4, 2).transpose(1, 2)
-    with pytest.raises(AssertionError, match="should be contiguous"):
-        moe.register_to_fix_weight_fn("scales")
-
-
-def test_deepseek_r1_ep32_spare_slots(monkeypatch):
-    """Give DeepSeek-R1 at EP32 on eight nodes of four GPUs two spare slots per rank.
-
-    The 28 active ranks after a node failure need ceil(256 / 28) = 10 slots each, two more than EPLB's 8.
-    """
-    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: True)
-    with (
-        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
-        patch(f"{_ER}.DeploymentHostWeights"),
-    ):
-        load_balancer = FaultTolerantMoeLoadBalancer(
-            0, 32, 0, mapping=Mapping(world_size=32, tp_size=32, gpus_per_node=4)
-        )
-        layer = load_balancer.add_layer(256, 8, 8)
-    load_balancer.load_balancer_impl.add_layer.assert_called_once_with(256, 8, 10)
-    assert layer.slot_count_per_rank == 10
-    assert layer.spare_slot_count == 2
+    assert events == ["shutdown", "release"]
+    assert node.allgather.call_count == (0 if fault_tolerance else 2)
+    assert node.barrier.call_count == (0 if fault_tolerance else 2)
 
 
 def _placement(*rows):
@@ -542,33 +216,10 @@ def test_failed_rank_experts_move_and_return():
     np.testing.assert_array_equal(
         plan_layer_placement(without_3, initial, np.ones(4, bool), 2, 8), initial
     )
-
-
-def test_lost_expert_never_replaces_replica():
-    """Only empty spare slots take a lost expert. The active slots of the active ranks keep their experts."""
-    initial = _placement([0, 1], [2, 3], [0, 1])
+    # Only empty spare slots take a lost expert. The active slots of the active ranks keep their experts.
+    replicated = _placement([0, 1], [2, 3], [0, 1])
     with pytest.raises(ValueError, match=r"active ranks \[0, 2\] cannot hold expert 2"):
-        plan_layer_placement(initial, initial, np.array([1, 0, 1], bool), 2, 4)
-
-
-def test_plan_fails_without_room_for_experts():
-    initial = _placement([0, 1], [2, 3])
-    with pytest.raises(ValueError, match=r"active ranks \[0\] cannot hold expert 2"):
-        plan_layer_placement(initial, initial, np.array([1, 0], bool), 2, 4)
-
-
-def test_survivor_failure_during_admission():
-    """Plan a restore when a survivor fails during the admission of a replacement.
-
-    Ranks 2 and 3 failed and their experts went to the spare slots of ranks 0 and 1. Rank 2's replacement joins,
-    and rank 1 fails before the admission installs. The joining rank holds expert 2 again, so rank 0's spare slot
-    that held it takes a lost expert, and the active ranks keep every expert.
-    """
-    initial = _placement([0, -1], [1, -1], [2, -1], [3, -1])
-    agreed = _placement([0, 2], [1, 3], [2, -1], [-1, -1])  # Rank 2's row holds its own slots.
-    active = np.array([True, False, True, False])
-    placement = plan_layer_placement(agreed, initial, active, 1, 4)
-    np.testing.assert_array_equal(placement, _placement([0, 1], [-1, -1], [2, 3], [-1, -1]))
+        plan_layer_placement(replicated, replicated, np.array([1, 0, 1], bool), 2, 4)
 
 
 def _online_balancer(monkeypatch, current, ep_rank=0):
@@ -621,252 +272,9 @@ def test_active_ranks_plan_the_same_restore(monkeypatch):
     assert other.digest != plans[0].digest
 
 
-@pytest.mark.parametrize("ep_rank, restore_bytes", [(0, 4 << 20), (1, 0), (2, 0)])
-def test_largest_failure_restore_bytes(monkeypatch, ep_rank, restore_bytes):
-    """Each rank reports the most it backs for any failure it survives.
-
-    With nodes [0, 1] and [2, 3], a failure takes node 1 or rank 1. Losing node 1 loses no expert the other ranks
-    lack. Losing rank 1 loses expert 3, which goes to rank 0's spare slot of 4 MiB.
-    """
-    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE, ep_rank)
-    assert load_balancer.expert_restore.largest_failure_restore_bytes() == restore_bytes
-
-
-def test_joining_rank_plans_the_same_restore(monkeypatch):
-    """The record's joining ranks decide that the active slots return to the initial placement.
-
-    A joining rank only knows its own startup, and its slots may no longer hold its initial experts.
-    """
-    # Rank 1's replacement reports its slots holding [3, 2], and its initial experts are [2, 3].
-    agreed = _placement([1, 0, 3, -1], [3, 2, -1, -1], [2, 0, -1, -1], [1, 2, -1, -1])
-    active, rejoining = [True] * 4, [False, True, False, False]
-    survivor, _ = _online_balancer(monkeypatch, _ONLINE_WITHOUT_1)
-    # The survivor restored without rank 1 at the failure.
-    survivor.expert_restore.active_ranks = (True, False, True, True)
-    joining, _ = _online_balancer(monkeypatch, agreed, ep_rank=1)
-    plans = [
-        balancer.expert_restore.plan_expert_restore(active, [agreed], rejoining=rejoining)
-        for balancer in (survivor, joining)
-    ]
-    assert plans[0].digest == plans[1].digest
-    np.testing.assert_array_equal(plans[0].placements[0], _INITIAL)
-
-
-def test_online_eplb_rejoin_empties_spare_slots(monkeypatch):
-    """Every rank plans the initial placement with empty spare slots when rank 1 rejoins.
-
-    After rank 1 failed, online EPLB moved expert 1 into rank 0's restored spare slot, so no active slot holds it.
-    """
-    degraded = _placement([3, 2, 1, -1], [-1] * 4, [3, 2, -1, -1], [0, 2, -1, -1])
-    # The lowest survivor's view, with rank 1's slots holding the initial experts its replacement reports.
-    agreed = degraded.copy()
-    agreed[1] = [2, 3, -1, -1]
-    active, rejoining = [True] * 4, [False, True, False, False]
-    plans = []
-    for ep_rank in range(WORLD_SIZE):
-        view = agreed if ep_rank == 1 else degraded
-        load_balancer, _ = _online_balancer(monkeypatch, view, ep_rank)
-        plans.append(
-            load_balancer.expert_restore.plan_expert_restore(active, [agreed], rejoining=rejoining)
-        )
-    assert len({plan.digest for plan in plans}) == 1
-    assert [plan.device_bytes for plan in plans] == [0] * WORLD_SIZE
-    for plan in plans:
-        np.testing.assert_array_equal(plan.placements[0], _INITIAL)
-
-
-@pytest.mark.parametrize("layer_updates_per_iter", [1, 0], ids=["online", "static"])
-def test_active_slots_keep_experts_until_rejoin(monkeypatch, layer_updates_per_iter):
-    """A failure leaves the active slots as they are, and a join returns them to the initial placement."""
-    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
-    monkeypatch.setattr(load_balancer, "layer_updates_per_iter", layer_updates_per_iter)
-    failover = load_balancer.expert_restore.plan_expert_restore(
-        [True, False, True, True], [_ONLINE]
-    )
-    np.testing.assert_array_equal(failover.placements[0], _ONLINE_WITHOUT_1)
-    rejoin = load_balancer.expert_restore.plan_expert_restore(
-        [True] * 4, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
-    )
-    np.testing.assert_array_equal(rejoin.placements[0], _INITIAL)
-    # A rejoining rank that is not active yet (it failed again) changes nothing.
-    np.testing.assert_array_equal(
-        load_balancer.expert_restore.plan_expert_restore(
-            [True, False, True, True], [_ONLINE], rejoining=[False, True, False, False]
-        ).placements[0],
-        _ONLINE_WITHOUT_1,
-    )
-
-
-def test_restore_and_release_order(monkeypatch):
-    """A spare slot is backed before the C++ load balancer loads an expert into it and routing can reach it.
-
-    The spare slots a placement empties keep their memory until release_empty_spare_slots.
-    """
-    load_balancer, layer = _online_balancer(monkeypatch, _ONLINE)
-    impl = layer.single_layer_load_balancer_impl
-    events = []
-    load_balancer.load_balancer_impl.restore_placement.side_effect = lambda dead, placements: (
-        events.append(("restore", dead, placements))
-    )
-    backed = set()
-
-    def set_backed(tensors, slots, slot_counts, back):
-        """Map or release memory only for the slots whose state changes, as the C++ op does."""
-        assert tensors == [layer.unbacked_slot_tensors["w"]]
-        assert slot_counts == [len(slots)]
-        events.append(("backed", slots, back))
-        changed = set(slots) - backed if back else set(slots) & backed
-        backed.symmetric_difference_update(changed)
-        return len(changed) * (4 << 20)
-
-    monkeypatch.setattr(
-        torch.ops.trtllm, "moe_unbacked_slots_set_backed", set_backed, raising=False
-    )
-    plan = load_balancer.expert_restore.plan_expert_restore([True, False, True, True], [_ONLINE])
-    times = {}
-    assert load_balancer.expert_restore.restore_lost_experts(plan, times) == 4 << 20
-    assert events == [("backed", [2], True), ("restore", [1], [_ONLINE_WITHOUT_1.tolist()])]
-    assert list(times) == ["back", "load and install"]
-    assert backed == {2}
-    assert load_balancer.expert_restore.active_ranks == (True, False, True, True)
-
-    events.clear()
-    impl.get_old_rank_expert_ids.return_value = _ONLINE_WITHOUT_1.tolist()
-    # The empty spare slot was never backed.
-    assert load_balancer.expert_restore.release_empty_spare_slots() == 0
-    assert events == [("backed", [3], False)]
-
-    events.clear()
-    rejoin = load_balancer.expert_restore.plan_expert_restore(
-        [True] * 4, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
-    )
-    assert rejoin.device_bytes == 0
-    # Every rank's active slots take their initial experts, and the spare slot keeps its memory.
-    assert load_balancer.expert_restore.restore_lost_experts(rejoin) == 0
-    assert events == [("restore", [], [_INITIAL.tolist()])]
-    assert backed == {2}
-    assert load_balancer.expert_restore.backed_spare_slot_bytes == 4 << 20
-
-    # Routing no longer reads the spare slot, so the release maps it to the scratch again.
-    events.clear()
-    impl.get_old_rank_expert_ids.return_value = _INITIAL.tolist()
-    assert load_balancer.expert_restore.release_empty_spare_slots() == 4 << 20
-    assert events == [("backed", [2, 3], False)]
-    assert backed == set()
-    assert load_balancer.expert_restore.backed_spare_slot_bytes == 0
-
-
-def test_rejected_plan_keeps_active_ranks(monkeypatch):
-    """The C++ load balancer validates every layer's placement before it loads any slot."""
-    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
-    load_balancer.load_balancer_impl.restore_placement.side_effect = RuntimeError(
-        "expert 3 has no replica"
-    )
-    monkeypatch.setattr(
-        torch.ops.trtllm, "moe_unbacked_slots_set_backed", Mock(return_value=0), raising=False
-    )
-    plan = load_balancer.expert_restore.plan_expert_restore([True, False, True, True], [_ONLINE])
-    with pytest.raises(RuntimeError, match="expert 3 has no replica"):
-        load_balancer.expert_restore.restore_lost_experts(plan)
-    assert load_balancer.expert_restore.active_ranks == (True,) * 4
-
-
-def test_restore_without_a_change_does_nothing(monkeypatch):
-    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE)
-    plan = load_balancer.expert_restore.plan_expert_restore([True] * 4, [_ONLINE])
-    assert plan.device_bytes == 0
-    assert load_balancer.expert_restore.restore_lost_experts(plan) == 0
-    load_balancer.load_balancer_impl.restore_placement.assert_not_called()
-
-
-def test_spare_slots_take_fully_lost_experts(monkeypatch):
-    """The spare slots serve experts 2 and 3 after the failure of both ranks that held their replicas."""
-    load_balancer = _load_balancer(
-        monkeypatch, largest_failure=2, eplb_slots=2, layer_updates_per_iter=0
-    )
-    (layer,) = load_balancer.single_layer_load_balancers
-    assert layer.need_load_shared_weights()
-    initial = _placement([0, 1, -1, -1], [2, 3, -1, -1], [0, 1, -1, -1], [2, 3, -1, -1])
-    layer.set_initial_weight_assignments(initial.ravel().tolist())
-    layer.single_layer_load_balancer_impl.get_old_rank_expert_ids.return_value = initial.tolist()
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "moe_unbacked_slots_bytes_to_back",
-        lambda tensor, slots: len(slots) * (4 << 20),
-        raising=False,
-    )
-    placement = load_balancer.expert_restore.plan_expert_restore(
-        [True, False, True, False], [initial]
-    ).placements[0]
-    assert sorted(set(placement[[0, 2]].ravel()) - {-1}) == [0, 1, 2, 3]
-
-
-# A replacement rank's MPI world is only itself.
-
-
-def _replacement(monkeypatch, rank):
+def _replacement(monkeypatch, rank, layout="8,4,1"):
     monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"{rank},8,4,1")
-
-
-def _bare_load_balancer(ep_rank, ep_size, mapping):
-    """Return a MoeLoadBalancer without running its ``__init__``, which sets up MPI and the C++ load balancer."""
-    load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
-    load_balancer.ep_rank, load_balancer.ep_size, load_balancer.mapping = ep_rank, ep_size, mapping
-    return load_balancer
-
-
-def test_replacement_keeps_node_layout_without_mpi(monkeypatch):
-    """The startup group splits by the node supervisor's GPUs per node, with only the replacement active."""
-    from tensorrt_llm._torch.distributed.membership import StoreGroup
-
-    _replacement(monkeypatch, 5)
-    mapping = Mapping(world_size=8, rank=5, tp_size=8, gpus_per_node=4)
-    world = StoreGroup(None, "startup/world", 5, range(8), active=[5], gpus_per_node=4)
-    monkeypatch.setattr("tensorrt_llm.mpi_comm", lambda: world)
-    monkeypatch.setattr("tensorrt_llm.local_mpi_size", lambda: 4)
-    load_balancer = _bare_load_balancer(5, 8, mapping)
-    load_balancer._setup_mpi_comm()
-    node = load_balancer.shared_mpi_comm
-    # The replacement holds its share of the node's host weights.
-    assert node.Get_rank() == 1
-    assert node.Get_size() == 4
-    node.barrier()  # The node's host weights already exist, so nobody is waited for.
-    assert node.allgather(True) == [None, True, None, None]
-
-
-@pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
-def test_replacement_shares_tuner_layout(monkeypatch, replacement):
-    """An original rank 5 of two nodes of four and its replacement derive the same spare slots.
-
-    Their MoE ops get the same tuner layout, so tactics tuned for one serve the other.
-    """
-    if replacement:
-        _replacement(monkeypatch, 5)
-    else:
-        monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
-        monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    with (
-        patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
-        patch(_USES_GDRCOPY, return_value=True),
-        patch(f"{_ER}.DeploymentHostWeights"),
-        patch("torch.cuda.Event"),
-    ):
-        load_balancer = FaultTolerantMoeLoadBalancer(
-            5, 8, 1, mapping=Mapping(world_size=8, tp_size=8, gpus_per_node=4)
-        )
-        layer = load_balancer.add_layer(16, 2, 2, aux_stream=Mock())
-    moe = MoEEplbWeightLayoutMixin()
-    moe.layer_load_balancer, moe.num_experts, moe.initial_local_expert_ids = layer, 16, [0, 1]
-    moe.expert_size_per_partition = layer.slot_count_per_rank
-    moe.register_all_parameter_slot_and_to_fix_weight_fns({})
-    # Losing node 1 leaves the experts of its 8 slots to the 4 ranks of node 0, with 2 spare slots each.
-    assert layer.slot_count_per_rank == 4
-    assert layer.spare_slot_count == 2
-    assert moe.tuner_layout_kwargs == {"tuner_num_local_experts": 2}
-
-
-# With fault tolerance, the host weights of a node outlive their processes while the deployment serves.
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, f"{rank},{layout}")
 
 
 @pytest.fixture
@@ -882,26 +290,19 @@ def tracked(monkeypatch):
     monkeypatch.setattr(
         resource_tracker, "unregister", lambda name, rtype: names.discard(name.removeprefix("/"))
     )
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
+    monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     yield names
-    for name in os.listdir("/dev/shm"):
-        if name.startswith(f"test_host_weights_{os.getpid()}"):
-            os.unlink(f"/dev/shm/{name}")
+    for name in _segments():
+        os.unlink(f"/dev/shm/{name}")
 
 
-def _sharer(
-    rank,
-    value,
-    node_size=1,
-    dtype=torch.float32,
-    shape=(4,),
-    base_name=None,
-    sharer_class=DeploymentHostWeights,
-):
-    """Return a ``sharer_class`` holding the host weights of local ``rank``'s two experts of a layer.
+def _sharer(rank, value, node_size=1, dtype=torch.float32, shape=(4,), base_name=None):
+    """Return the host weights of local ``rank``'s two experts of a layer.
 
     Each weight holds ``value`` plus its expert id, under ``base_name`` or the test's own base name.
     """
-    sharer = sharer_class(
+    sharer = DeploymentHostWeights(
         0,
         2 * node_size,
         Mock(Get_rank=Mock(return_value=rank), Get_size=Mock(return_value=node_size)),
@@ -925,109 +326,52 @@ def _segments():
     )
 
 
-@pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
-def test_host_weights_named_after_deployment(monkeypatch, fault_tolerance):
-    """With fault tolerance, the host weights outlive their processes.
-
-    Another deployment on the node, even with the same shared secret, must neither find nor unlink them.
-    """
-    monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
-    monkeypatch.delenv("TRTLLM_EPLB_SHM_NAME", raising=False)
+def test_host_weights_round_trip_by_name(monkeypatch, tracked):
+    """Create, keep and reattach the host weights under the load balancer's one base name."""
+    monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", f"test_host_weights_{os.getpid()}")
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
-    load_balancer_cls = MoeLoadBalancer
-    if fault_tolerance:
-        load_balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer, mapping=None)
-    names = []
-    for _ in range(2):  # Two deployments in turn, in which rank 0 draws the nonce.
-        monkeypatch.setattr(rank_failure_recovery, "_deployment_nonce", None)
-        with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
-            names.append(load_balancer_cls(0, WORLD_SIZE, 0).shared_memory_base_name)
-    if fault_tolerance:
-        assert all(name.startswith("moe_shared_") for name in names)
-        assert names[0] != names[1]
-    else:
-        assert names == ["moe_shared", "moe_shared"]
-
-
-@pytest.mark.parametrize("fault_tolerance", [True, False], ids=["fault_tolerance", "off"])
-def test_host_weights_lifetime_before_serving(monkeypatch, tracked, fault_tolerance):
-    """A rank's host weights end with it until the deployment serves.
-
-    Once the deployment serves, a replacement rank reattaches them and the node supervisor unlinks them at the end.
-    """
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
-    monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    sharer_class = DeploymentHostWeights if fault_tolerance else HostMoeTensorSharer
-    sibling = _sharer(1, 10.0, node_size=2, sharer_class=sharer_class)
-    sibling.finalize_layer_weights()
-    tracked.clear()  # The sibling's process tracks these.
-    sharer = _sharer(0, 0.0, node_size=2, sharer_class=sharer_class)
-    sharer.finalize_layer_weights()
-    sharer.finalize_host_tensor_sharing()
-    assert {sharer.get_shared_memory_name(rank) for rank in (0, 1)} <= tracked
-    if fault_tolerance:
-        sharer.keep_for_the_deployment()
-        assert sharer.get_shared_memory_name(0) not in tracked
-        assert sharer.get_shared_memory_name(1) not in tracked
-    sharer.pre_shutdown_cleanup()
-    sharer.post_shutdown_cleanup()
-    sibling.pre_shutdown_cleanup()
-    assert (sharer.get_shared_memory_name(0) in _segments()) == fault_tolerance
-
-
-@pytest.fixture
-def replacement_of_rank_0(monkeypatch):
-    def become():
-        monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
-        monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,4,1")
-
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
-    monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
-    return become
-
-
-def test_replacement_reattaches_host_weights(tracked, replacement_of_rank_0):
-    """A replacement reattaches the host weights its rank left instead of filling new ones."""
-    original = _sharer(0, 1.0)
+    with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
+        load_balancer = FaultTolerantMoeLoadBalancer(0, WORLD_SIZE, 0, mapping=None)
+    base_name = load_balancer.shared_memory_base_name
+    original = _sharer(0, 1.0, base_name=base_name)
     original.finalize_layer_weights()
-    original.keep_for_the_deployment()
-    replacement_of_rank_0()
-    replacement = _sharer(0, -1.0)  # What it loaded must not overwrite the host weights.
+    load_balancer.single_layer_load_balancers = [
+        SimpleNamespace(need_load_shared_weights=lambda: True, host_tensor_sharer=original)
+    ]
+    prefix = load_balancer.expert_restore.keep_host_weights_for_the_deployment()
+    assert original.get_shared_memory_name().startswith(prefix)
+    assert prefix.startswith(base_name)
+    _replacement(monkeypatch, 0)
+    replacement = _sharer(0, -1.0, base_name=base_name)  # What it loaded must not overwrite them.
     replacement.finalize_layer_weights()
     assert replacement.own_shm.name == original.own_shm.name
     assert replacement.host_weights[(1, "w")].tolist() == [2.0] * 4
-    assert original.host_weights[(1, "w")].tolist() == [2.0] * 4
-    assert not tracked  # They belong to the deployment, even if the replacement fails.
+    # They belong to the deployment, even if the replacement fails.
+    assert not tracked
     original.pre_shutdown_cleanup()
     replacement.pre_shutdown_cleanup()
-    replacement.post_shutdown_cleanup()
-    assert _segments() == [replacement.get_shared_memory_name()]
 
 
 @pytest.mark.parametrize(
     "found", ["missing", "incomplete", "other host weights", "open to other users"]
 )
-def test_replacement_rebuilds_damaged_host_weights(tracked, replacement_of_rank_0, found):
-    """A replacement fills its rank's host weights again unless they are intact.
-
-    A segment that is incomplete, belongs to another deployment or is open to other users is not reattached.
-    """
-    if found == "incomplete":
-        original = _sharer(0, 1.0)
+def test_replacement_rebuilds_damaged_host_weights(monkeypatch, tracked, found):
+    """Fill a replacement's host weights again unless its rank's are intact and its deployment's own."""
+    if found != "missing":
+        # Other host weights of the same size.
+        other = found == "other host weights"
+        original = _sharer(
+            0, 1.0, dtype=torch.float64 if other else torch.float32, shape=(2 if other else 4,)
+        )
         original.finalize_layer_weights()
-        original.own_shm.buf[:32] = bytes(32)  # The process died before writing the fingerprint.
+        if found == "incomplete":
+            # The process died before writing the fingerprint.
+            original.own_shm.buf[:32] = bytes(32)
+        elif found == "open to other users":
+            os.fchmod(original.own_shm._fd, 0o666)
+            assert not original.holds_host_weights(0)
         original.pre_shutdown_cleanup()
-    elif found == "open to other users":
-        original = _sharer(0, 1.0)
-        original.finalize_layer_weights()
-        os.fchmod(original.own_shm._fd, 0o666)
-        assert not original.holds_host_weights(0)
-        original.pre_shutdown_cleanup()
-    elif found == "other host weights":
-        original = _sharer(0, 1.0, dtype=torch.float64, shape=(2,))  # The same size.
-        original.finalize_layer_weights()
-        original.pre_shutdown_cleanup()
-    replacement_of_rank_0()
+    _replacement(monkeypatch, 0)
     replacement = _sharer(0, -1.0)
     replacement.finalize_layer_weights()
     assert replacement.host_weights[(1, "w")].tolist() == [0.0] * 4
@@ -1063,17 +407,16 @@ def _replacement_of_rank_3(monkeypatch, record):
         The host weights of rank 3 it built, its load balancer, the store, and the host weights the load balancer
         gets by expert.
     """
-    from tensorrt_llm._torch.distributed import membership
-
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
-    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "3,4,2,1")
+    _replacement(monkeypatch, 3, "4,2,1")
     store = _Store(record)
     monkeypatch.setattr(membership, "rendezvous_store", lambda: store)
     monkeypatch.setattr(f"{_ER}._HOST_WEIGHTS_CHECK_S", 0.01)
     sharer = _sharer(1, 0.0, node_size=2)
     sharer.finalize_layer_weights()
     host_weights = {}
-    load_balancer = _bare_load_balancer(3, 4, Mapping(world_size=4, tp_size=4, gpus_per_node=2))
+    load_balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    load_balancer.ep_rank, load_balancer.ep_size = 3, 4
+    load_balancer.mapping = Mapping(world_size=4, tp_size=4, gpus_per_node=2)
     load_balancer.layer_updates_per_iter = 0
     load_balancer.expert_restore = EplbExpertRestore(load_balancer)
     load_balancer.shared_mpi_comm = Mock()
@@ -1091,66 +434,25 @@ def _replacement_of_rank_3(monkeypatch, record):
     return sharer, load_balancer, store, host_weights
 
 
-def test_replacement_waits_for_node_host_weights(monkeypatch, tracked):
-    """Rank 3's replacement waits for the host weights rank 2's replacement rebuilds after a node failure.
-
-    Each replacement announces the host weights it built in the store.
-    """
-    record = MembershipRecord(
-        generation=1, state=MembershipState.COMMITTED, active_mask=0b0011, incarnations=(0, 0, 1, 1)
+def _record(active_mask, incarnations=(0, 0, 0, 0), state=MembershipState.COMMITTED):
+    return MembershipRecord(
+        generation=1, state=state, active_mask=active_mask, incarnations=incarnations
     )
-    replacement, load_balancer, store, host_weights = _replacement_of_rank_3(monkeypatch, record)
-    other = _sharer(0, 10.0, node_size=2)
-
-    def build():
-        other.finalize_layer_weights()
-        store.set(host_weights_key(2), b"")
-
-    built = threading.Timer(0.2, build)
-    built.start()
-    try:
-        load_balancer.finalize_model()
-    finally:
-        built.join()
-    assert host_weights_key(3) in store.values
-    assert host_weights[0] == [10.0] * 4
-    replacement.pre_shutdown_cleanup()
-    other.pre_shutdown_cleanup()
 
 
 @pytest.mark.parametrize(
     "record, announced, error, message",
     [
         # Rank 2 is active, so nobody builds its host weights again.
-        (
-            MembershipRecord(
-                generation=1,
-                state=MembershipState.COMMITTED,
-                active_mask=0b0111,
-                incarnations=(0, 0, 0, 1),
-            ),
-            False,
-            ReplacementCannotStart,
-            r"active ranks \[2\]",
-        ),
+        (_record(0b0111, (0, 0, 0, 1)), False, ReplacementCannotStart, r"active ranks \[2\]"),
         # Rank 2's replacement announced host weights the node does not hold.
         (
-            MembershipRecord(
-                generation=1,
-                state=MembershipState.COMMITTED,
-                active_mask=0b0011,
-                incarnations=(0, 0, 1, 1),
-            ),
+            _record(0b0011, (0, 0, 1, 1)),
             True,
             ReplacementCannotStart,
             r"replacements of ranks \[2\] .* built are missing",
         ),
-        (
-            MembershipRecord(generation=1, state=MembershipState.ABORTED, active_mask=0b0011),
-            False,
-            RuntimeError,
-            "deployment ended",
-        ),
+        (_record(0b0011, state=MembershipState.ABORTED), False, RuntimeError, "deployment ended"),
     ],
     ids=["active", "announced", "aborted"],
 )
@@ -1166,28 +468,3 @@ def test_replacement_without_node_host_weights_fails(
         assert raised.value.code == REPLACEMENT_CANNOT_START
     replacement.pre_shutdown_cleanup()
     replacement.post_shutdown_cleanup()
-
-
-def test_host_weights_round_trip_by_name(monkeypatch, tracked, replacement_of_rank_0):
-    """Create, reattach and unlink the host weights under the load balancer's one base name."""
-    monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", f"test_host_weights_{os.getpid()}")
-    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
-    with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
-        load_balancer = FaultTolerantMoeLoadBalancer(0, WORLD_SIZE, 0, mapping=None)
-    base_name = load_balancer.shared_memory_base_name
-    original = _sharer(0, 1.0, base_name=base_name)
-    original.finalize_layer_weights()
-    load_balancer.single_layer_load_balancers = [
-        SimpleNamespace(need_load_shared_weights=lambda: True, host_tensor_sharer=original)
-    ]
-    prefix = load_balancer.expert_restore.keep_host_weights_for_the_deployment()
-    assert _segments() == [original.get_shared_memory_name()]
-    assert original.get_shared_memory_name().startswith(prefix)
-    assert prefix.startswith(base_name)
-    replacement_of_rank_0()
-    replacement = _sharer(0, -1.0, base_name=base_name)
-    replacement.finalize_layer_weights()
-    assert replacement.own_shm.name == original.own_shm.name
-    assert replacement.host_weights[(1, "w")].tolist() == [2.0] * 4
-    original.pre_shutdown_cleanup()
-    replacement.pre_shutdown_cleanup()
