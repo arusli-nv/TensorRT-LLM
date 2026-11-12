@@ -101,7 +101,6 @@ struct DispatchKernelPointers
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
-    uint32_t* incomplete_round;
 
     // LE dispatch counters: HW-incremented byte counters for dispatch data.
     // le_dispatch_counters[target_rank][source_rank] is incremented by fabric engine
@@ -138,6 +137,7 @@ struct DispatchKernelPointers
     int expert_id_payload_index;
     int32_t invalid_expert_id;
 
+    uint32_t* incomplete_round;
     // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
     // Word w covers ranks 64*w..64*w+63 for w in [0, kRankMaskWords). Tokens routed to a masked
     // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
@@ -160,7 +160,6 @@ struct CombineKernelPointers
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
-    uint32_t* incomplete_round;
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int const* topk_target_ranks;   // target rank per k, -1 for invalid or duplicate routes
@@ -172,6 +171,7 @@ struct CombineKernelPointers
     // Cumulative per-slot counter baselines (regular device memory, single-buffer, advanced in place by reduce).
     uint64_t* combine_counter_baseline; // [ep_size * max_tokens_per_rank]
     int combine_counter_ep_stride = 0;  // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
+    uint32_t* incomplete_round;
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
     // completion flag writes/waits to/from inactive peers.
     uint64_t const* active_rank_mask{nullptr};
