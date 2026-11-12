@@ -49,20 +49,12 @@ def commit_context_blocks(executor: "PyExecutor", batch_state: "BatchState") -> 
 
 
 def accept_previous_batch(executor: "PyExecutor") -> Optional["BatchState"]:
-    """Return the executor's previous batch once rank failure recovery accepted it, or None.
-
-    A discarded batch leaves the grammar matchers of its requests unknown, so they are dropped.
-    """
+    """Return the executor's previous batch once rank failure recovery accepted it, or None."""
     batch = executor.previous_batch
     if batch is None:
         return None
     executor.rank_failure_recovery.drop_invalid_step()
-    if executor.previous_batch is not None:
-        commit_context_blocks(executor, batch)
-        return batch
-    requests = batch.scheduled_requests.all_requests()
-    if executor.guided_decoder is not None:
-        executor.guided_decoder.discard_matchers(requests)
-    if executor.capturable_guided_decoder is not None and batch.guided_batch_id is not None:
-        executor.capturable_guided_decoder.discard_batch(requests, batch.guided_batch_id)
-    return None
+    if executor.previous_batch is None:
+        return None
+    commit_context_blocks(executor, batch)
+    return batch

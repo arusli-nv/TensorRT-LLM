@@ -20,7 +20,6 @@ import contextlib
 import json
 import os
 import pickle
-import queue
 import re
 import signal
 import socket
@@ -194,23 +193,28 @@ class FakeClient:
 
 
 def _executor(rank=0):
-    return SimpleNamespace(
+    executor = SimpleNamespace(
         dist=MagicMock(rank=rank, world_size=WORLD, tp_size=WORLD),
         iter_counter=5,
         hang_detector=Mock(paused=Mock(return_value=False), timeout=300),
-        executor_request_queue=MagicMock(request_queue=queue.Queue()),
+        executor_request_queue=Mock(wraps=ExecutorRequestQueue(MagicMock(), 8, False, 0)),
         waiting_queue=[],
         request_accumulated=[],
         active_requests=[],
         previous_batch=None,
         drafter=None,
         use_spec_decode=False,
+        guided_decoder=None,
+        capturable_guided_decoder=None,
         perf_manager=MagicMock(),
         model_engine=SimpleNamespace(moe_load_balancer=None),
-        _pending_transfer_responses=[],
+        fail_requests_by_id=Mock(),
         _free_request_resources=MagicMock(),
         _pause_recompute_request=MagicMock(),
     )
+    for seam in ("discard_previous_batch", "resume_at_iteration", "recompute_requests"):
+        setattr(executor, seam, partial(getattr(PyExecutor, seam), executor))
+    return executor
 
 
 def _recovery(rank=0):
@@ -230,7 +234,7 @@ def _recovery(rank=0):
             recovery.drop_invalid_step()
         executor.previous_batch = None
 
-    executor._retire_inflight_batch_for_control = Mock(side_effect=retire)
+    executor.retire_inflight_batch = Mock(side_effect=retire)
     return recovery
 
 
@@ -804,15 +808,34 @@ def test_change_ends_the_process(monkeypatch, record, status):
     assert exited.value.code == status
 
 
-@pytest.mark.parametrize("rank, completed, status", [(1, True, 0), (1, False, 1), (0, True, 0)])
-def test_stop_exits_without_mpi_teardown(monkeypatch, rank, completed, status):
-    """Check that stop exits with the loop status, and that rank 0 asks the authority for SHUTDOWN."""
+def test_failed_run_stop_exits(monkeypatch):
+    """Check that stop ends the process with status 1 after the executor loop failed."""
+    _exit_raises(monkeypatch)
+    recovery = _recovery(rank=1)
+    with pytest.raises(SystemExit) as exited:
+        recovery.stop(False)
+    assert exited.value.code == 1
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_completed_stop_returns_to_cleanup(monkeypatch, rank):
+    """Check that a completed run leaves the membership and the executor's cleanup runs after it.
+
+    Rank 0 asks the authority for SHUTDOWN.
+    """
     _exit_raises(monkeypatch)
     recovery = _recovery(rank=rank)
-    recovery._record = _record(MembershipState.SHUTDOWN)
-    with pytest.raises(SystemExit) as exited:
-        recovery.stop(completed)
-    assert exited.value.code == status
+    recovery._record = _record(MembershipState.SHUTDOWN, generation=0)
+    executor = SimpleNamespace(
+        response_cv=threading.Condition(),
+        shutdown_event=threading.Event(),
+        rank_failure_recovery=recovery,
+        num_micro_batches=0,
+        _event_loop_completed=True,
+        _executor_events=Mock(),
+    )
+    PyExecutor._executor_loop_cleanup(executor)
+    executor._executor_events.at_shutdown.assert_called_once()
     assert ({"shutdown": True} in recovery._client.reports) == (rank == 0)
 
 
@@ -830,6 +853,23 @@ def test_authority_loss_at_shutdown_is_quiet(monkeypatch):
     recovery = _recovery(rank=1)
     recovery._on_record(_record(MembershipState.SHUTDOWN))
     recovery._on_client_error(ConnectionError("the membership authority closed the connection"))
+
+
+@pytest.mark.parametrize("generation", [0, 1])
+def test_mpi_finalize_skipped_after_failure(monkeypatch, generation):
+    """Check that a completed run ends before MPI_Finalize only after a rank failure, which MPI_Finalize waits on."""
+    _exit_raises(monkeypatch)
+    hooks = []
+    monkeypatch.setattr(recovery_module.atexit, "register", lambda *hook: hooks.append(hook))
+    recovery = _recovery(rank=1)
+    recovery._record = _record(MembershipState.SHUTDOWN, generation=generation)
+    recovery.stop(True)
+    assert len(hooks) == generation
+    if hooks:
+        ((end_process, *args),) = hooks
+        with pytest.raises(SystemExit) as exited:
+            end_process(*args)
+        assert exited.value.code == 0
 
 
 @pytest.mark.parametrize("paused_before", [False, True])
@@ -958,6 +998,7 @@ def _batch(requests):
         scheduled_requests=SimpleNamespace(all_requests=lambda: list(requests)),
         sample_state=SimpleNamespace(sampler_event=MagicMock()),
         gpu_forward_events_from_perf_pool=False,
+        guided_batch_id=None,
         context_rows=[],
     )
 
@@ -968,7 +1009,6 @@ def test_forward_failed_by_abort_is_discarded(aborted):
     recovery = _recovery()
     recovery._moe.aborted.return_value = aborted
     executor = recovery._executor
-    executor._accepted_previous_batch = Mock(side_effect=recovery.drop_invalid_step)
     executor.previous_batch = _batch([_request(10)])
     failed = _request(11)
     scheduled = SimpleNamespace(all_requests=lambda: [failed])
@@ -1092,10 +1132,24 @@ def test_resume_recomputes_interrupted_fails_lost(monkeypatch):
     assert _replies(recovery) == [Reply.INSTALLED]
     assert not recovery.pauses_forward()
     # No survivor holds request 11.
-    ((request_id, response),) = executor._pending_transfer_responses
-    assert request_id == 11
-    assert response.client_id == 111
-    assert isinstance(response.error_msg, RankFailureError)
+    ((lost, error), _) = executor.fail_requests_by_id.call_args
+    assert lost == {11: 111}
+    assert isinstance(error, RankFailureError)
+
+
+def test_fail_requests_by_id_flushes_errors():
+    """Check that requests failed by id reach the next flush of the buffered responses."""
+    executor = object.__new__(PyExecutor)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.enable_attention_dp = True
+    executor._enqueue_responses = Mock()
+    error = RankFailureError()
+    executor.fail_requests_by_id({11: 111}, error)
+    executor._flush_pending_transfer_responses()
+    ((responses,), _) = executor._enqueue_responses.call_args
+    ((request_id, response),) = responses
+    assert (request_id, response.client_id, response.error_msg) == (11, 111, error)
 
 
 @pytest.mark.parametrize(
@@ -1272,14 +1326,14 @@ def _short_give_back(monkeypatch, record=_INSTALL):
     assert device.gpu_quota == 54 * MIB
     assert device.free == FREE_BYTES
     recovery._give_back_retry.check_after_s = 0.0
-    recovery._executor._retire_inflight_batch_for_control.reset_mock()
+    recovery._executor.retire_inflight_batch.reset_mock()
     return recovery, device
 
 
 def test_retried_give_back_regains_freed_memory(monkeypatch):
     """Check that the retry retires the step in flight and takes back what the ended process freed."""
     recovery, device = _short_give_back(monkeypatch)
-    retire = recovery._executor._retire_inflight_batch_for_control
+    retire = recovery._executor.retire_inflight_batch
     device.take(-4 * MIB)  # The excluded process ended.
     _vote(recovery)
     recovery.before_iteration()
@@ -1316,7 +1370,7 @@ def test_healthy_step_checks_no_device_memory(monkeypatch):
     assert not recovery._give_back_agreed
     recovery.before_iteration()
     mem_get_info.assert_not_called()
-    recovery._executor._retire_inflight_batch_for_control.assert_not_called()
+    recovery._executor.retire_inflight_batch.assert_not_called()
 
 
 def test_rejoin_gives_back_memory_after_resume(monkeypatch):
@@ -1344,7 +1398,7 @@ def test_rejoin_gives_back_memory_after_resume(monkeypatch):
     # Serving resumed with the spare slots still backed and the pool short of the workspace.
     assert device.backed == 6 * MIB
     assert device.gpu_quota == 54 * MIB
-    retire = recovery._executor._retire_inflight_batch_for_control
+    retire = recovery._executor.retire_inflight_batch
     retire.reset_mock()
     # Rank 1 holds its steps for the next change, so no rank gives back at this step boundary.
     assert _vote(recovery, peers=((3, 1, 0), (5, 0, 0), (2, 0, 0)))[0] == [4, 0, 1]
@@ -1360,7 +1414,7 @@ def test_rejoin_gives_back_memory_after_resume(monkeypatch):
     other = _recovery(rank=1)
     _vote(other, peers=((4, 0, 1), (5, 0, 0), (2, 0, 0)))
     other.before_iteration()
-    other._executor._retire_inflight_batch_for_control.assert_called_once()
+    other._executor.retire_inflight_batch.assert_called_once()
     (given_back,) = [c.args[0] for c in info.call_args_list if "gave back" in c.args[0]]
     assert given_back.startswith(
         f"Rank 0 gave back the memory of membership generation 1. Released {6 * MIB} bytes of empty spare "
@@ -1399,15 +1453,14 @@ def test_requests_pinned_to_absent_rank_fail(rank):
 
     recovery.fail_unservable_requests(waiting, _survivor_states())
     assert [item.id for item in waiting] == [1, 3]
-    responses = recovery._executor._pending_transfer_responses
+    fail = recovery._executor.fail_requests_by_id
     if rank == 0:
-        ((request_id, response),) = responses
-        assert request_id == 2
-        assert response.client_id == 102
+        ((failed, error), _) = fail.call_args
+        assert failed == {2: 102}
         # The request is not sent again because it would fail the same way.
-        assert not isinstance(response.error_msg, RankFailureError)
+        assert not isinstance(error, RankFailureError)
     else:
-        assert responses == []
+        fail.assert_not_called()
 
 
 # One MoE layer of four experts at startup. Rank r holds expert r and an empty spare slot.
@@ -2265,7 +2318,7 @@ def test_joining_rank_takes_rank0_waiting_queue(monkeypatch):
     assert [item.id for item in executor.waiting_queue] == [7]
     executor.dist.broadcast.assert_not_called()
     # It ran no step and enters the host exchange only at its admission.
-    executor._retire_inflight_batch_for_control.assert_not_called()
+    executor.retire_inflight_batch.assert_not_called()
     recovery._moe.remap_workspaces.assert_called_once()
     recovery._moe.rearm.assert_called_once()
     recovery._moe.install_mask.assert_called_once()
@@ -2285,7 +2338,7 @@ def test_active_ranks_retire_step_before_resize(monkeypatch):
         steps.append(("retire", executor.previous_batch is not None))
         executor.previous_batch = None
 
-    executor._retire_inflight_batch_for_control.side_effect = retire
+    executor.retire_inflight_batch.side_effect = retire
     recovery._exchange.admit = lambda active_mask, epoch: steps.append("admit")
     recovery._moe.workspace_bytes.return_value = 4 * MIB
     monkeypatch.setattr(recovery_module.torch.cuda, "mem_get_info", lambda: (device.free, 1 << 40))
@@ -2349,7 +2402,7 @@ def test_newer_change_during_resume_keeps_collectives(monkeypatch, installed):
             recovery._installed, recovery._resume_after = _NEWER_INSTALL, 30
         recovery._on_record(_NEWER_INSTALL if installed else _NEWER)
 
-    recovery._executor._retire_inflight_batch_for_control.side_effect = retire
+    recovery._executor.retire_inflight_batch.side_effect = retire
     recovery.before_iteration()
     recovery._executor.dist.allgather.assert_called_once()
     epoch = membership.next_epoch(40)

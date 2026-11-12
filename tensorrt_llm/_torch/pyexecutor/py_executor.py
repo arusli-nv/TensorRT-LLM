@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
     from tensorrt_llm.bindings import MpiProgressThread
+    from tensorrt_llm.executor.utils import RequestError
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
     from .rank_failure_recovery import RankFailureRecovery
@@ -1938,6 +1939,23 @@ class PyExecutor:
             self._enqueue_responses(responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+
+    def fail_requests_by_id(self, client_ids: Dict[int, Optional[int]],
+                            error: Union[str, "RequestError"]) -> None:
+        """Fail requests that this rank holds no ``LlmRequest`` for.
+
+        The error responses go out with the next flush of the buffered
+        responses, which every rank runs in lockstep.
+
+        Args:
+            client_ids: The client id of each request to fail, by request id.
+            error: The error that every response carries.
+        """
+        self._pending_transfer_responses.extend(
+            (request_id,
+             LlmResponse(
+                 request_id=request_id, error_msg=error, client_id=client_id))
+            for request_id, client_id in client_ids.items())
 
     def _flush_iter_stats_synced(self):
         """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
@@ -6671,6 +6689,42 @@ class PyExecutor:
             self._enqueue_responses([])
         # The next forward runs on host tokens, like the loop's first iteration.
         self.has_previous_draft_tokens = False
+
+    def retire_inflight_batch(self) -> None:
+        """Retire the overlap loop's in-flight batch at a lockstep point."""
+        self._retire_inflight_batch_for_control()
+
+    def discard_previous_batch(self) -> None:
+        """Drop the overlap loop's in-flight batch without applying its results.
+
+        The grammar matchers of its requests already advanced past the dropped
+        tokens, so they are discarded too.
+        """
+        batch = self.previous_batch
+        if batch.gpu_forward_events_from_perf_pool:
+            self.perf_manager.release_forward_timing_events(
+                batch.gpu_forward_start_event, batch.gpu_forward_end_event)
+        if self.drafter is not None and self.use_spec_decode:
+            self.drafter.cleanup_previous_draft_resources()
+        requests = batch.scheduled_requests.all_requests()
+        if self.guided_decoder is not None:
+            self.guided_decoder.discard_matchers(requests)
+        if (self.capturable_guided_decoder is not None
+                and batch.guided_batch_id is not None):
+            self.capturable_guided_decoder.discard_batch(
+                requests, batch.guided_batch_id)
+        self.previous_batch = None
+
+    def resume_at_iteration(self, iteration: int) -> None:
+        """Continue the executor loop at ``iteration``.
+
+        Every rank of the attention-DP group calls this with the same
+        iteration. The attention-DP balance counters restart, so that the
+        ranks balance context requests alike.
+        """
+        self.iter_counter = iteration
+        self.adp_ctx_waiting_iters_count = 0
+        self.adp_ctx_batching_wait_iters_count = 0
 
     def _handle_control_request(self):
         """Fire the next pending control action at the next step boundary.
@@ -11924,6 +11978,12 @@ class PyExecutor:
         if _request_flag(request, "is_generation_only_request"):
             return True
         return request.state in self._DISAGG_TRANSFER_BOUND_STATES
+
+    def recompute_requests(self, requests: Iterable[LlmRequest]) -> None:
+        """Free the resources of ``requests`` and pause them for recompute."""
+        for request in requests:
+            self._free_request_resources(request)
+            self._pause_recompute_request(request)
 
     def recompute_active_requests(self) -> None:
         """Discard live request caches so they are rebuilt with current weights.

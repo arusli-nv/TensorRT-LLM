@@ -2197,12 +2197,13 @@ def _previous_batch_consumer(consumer, dropped):
         sample_state="sample state",
         context_commits=[(kv_cache_manager, {7: 64})],
         guided_batch_id=3,
+        gpu_forward_events_from_perf_pool=False,
     )
 
     def drop_invalid_step():
         calls.append("drop_invalid_step")
         if dropped:
-            executor.previous_batch = None
+            executor.discard_previous_batch()
 
     executor.rank_failure_recovery = Mock(drop_invalid_step=drop_invalid_step)
     executor.guided_decoder = Mock()

@@ -19,6 +19,7 @@ See ``docs/source/features/wide-ep-fault-tolerance.md``.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import functools
 import hashlib
@@ -34,18 +35,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Dict,
-    Iterator,
-    List,
-    NamedTuple,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -65,7 +55,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_rank,
 )
-from tensorrt_llm.executor.utils import RankFailureError, RequestError, get_spawn_proxy_process_env
+from tensorrt_llm.executor.utils import RankFailureError, get_spawn_proxy_process_env
 from tensorrt_llm.logger import logger
 
 from ..distributed.host_exchange_epoch import next_epoch
@@ -876,7 +866,7 @@ class RankFailureRecovery:
         self._end_eplb_iterations()
         self._client.report(joining_ready=True, **self._expert_placement(adding))
         self._change_membership()
-        self._executor.iter_counter = self._resume_after + 1
+        self._executor.resume_at_iteration(self._resume_after + 1)
 
     def start(self) -> None:
         """Take over the membership client this process started at the entry of its worker."""
@@ -884,9 +874,10 @@ class RankFailureRecovery:
         self._client.bind(self._on_record, on_tick=self._on_tick, on_error=self._on_client_error)
 
     def stop(self, completed: bool) -> None:
-        """Leave the membership after a normal end, then end the process.
+        """Leave the membership after a completed run, or end the process after a failed one.
 
-        The process ends without a teardown, which would wait for ranks that failed.
+        MPI_Finalize waits for every rank, so after a rank failure an atexit handler ends the process before mpi4py
+        finalizes MPI. Handlers registered after this call still run before it.
         """
         if completed:
             if self.rank == 0:
@@ -901,7 +892,10 @@ class RankFailureRecovery:
                     self._authority.wait(_AUTHORITY_TIMEOUT_S)
                 except subprocess.TimeoutExpired:
                     self._authority.kill()
-        _end_process(self.rank, 0 if completed else 1, "the executor stopped")
+            if self._record.generation > 0:
+                atexit.register(_end_process, self.rank, 0, "the executor completed")
+            return
+        _end_process(self.rank, 1, "the executor stopped")
 
     def _on_record(self, record: MembershipRecord) -> None:
         with self._record_changed:
@@ -1139,13 +1133,13 @@ class RankFailureRecovery:
         with self._hang_detection_paused():
             while True:
                 self._attempted = record
+                self._executor.resume_at_iteration(self._resume_after + 1)
                 # A joining rank whose admission was committed stops for a newer change in the host exchange, as the
                 # other active ranks do.
                 if self._finish_install(record) or self._admitted:
                     return
                 if self._installed is record:
                     self._change_membership()
-                self._executor.iter_counter = self._resume_after + 1
                 record = self._installed
 
     def _finish_install(self, record: MembershipRecord) -> bool:
@@ -1158,7 +1152,7 @@ class RankFailureRecovery:
             self._end_eplb_iterations()
             if not record.is_joining(self.rank):
                 # The retire runs host exchange collectives. The joining ranks enter the host exchange only below.
-                executor._retire_inflight_batch_for_control()
+                executor.retire_inflight_batch()
             recomputed = self._recompute_interrupted_requests()
             if record.joining_mask:
                 # A rank that installed a newer change meanwhile skips the admission, but every active rank still runs
@@ -1204,11 +1198,9 @@ class RankFailureRecovery:
         self._published_admissions.clear()
         # Serving resumes first. Every rank gives the memory back at the step boundary of the next forward vote.
         self._give_back_pending = True
-        executor.adp_ctx_waiting_iters_count = executor.adp_ctx_batching_wait_iters_count = 0
         held = set().union(*(request_ids for request_ids in gathered if request_ids is not None))
         lost = {r: c for r, c in outstanding.items() if r not in held}
-        for request_id, client_id in lost.items():
-            self._fail(request_id, client_id, RankFailureError())
+        executor.fail_requests_by_id(lost, RankFailureError())
         active = [r for r in range(self.world_size) if record.is_active(r)]
         logger.info(
             f"Rank {self.rank} resumed serving with membership generation {record.generation}, ranks {active}. "
@@ -1281,7 +1273,7 @@ class RankFailureRecovery:
         """
         self._give_back_agreed = False
         torch.cuda.synchronize()
-        self._executor._retire_inflight_batch_for_control()
+        self._executor.retire_inflight_batch()
         if not self._give_back_due:
             return
         self._give_back_due = False
@@ -1445,10 +1437,7 @@ class RankFailureRecovery:
         }
         held.update(item.id for item in executor.waiting_queue)
         held.update(item.id for item in executor.request_accumulated)
-        request_queue = executor.executor_request_queue.request_queue
-        with request_queue.mutex:
-            # A cancel item carries the id of the request it cancels.
-            held.update(item.id for item in request_queue.queue if item.is_normal_request)
+        held.update(executor.executor_request_queue.queued_request_ids())
         return held
 
     def pauses_forward(self) -> bool:
@@ -1473,11 +1462,13 @@ class RankFailureRecovery:
         return votes[:, 0]
 
     def drop_invalid_step(self) -> None:
-        """Discard the previous step if its all-to-all was aborted.
+        """Discard the previous step, if any, if its all-to-all was aborted.
 
         An abort may have cut the rounds of the step short.
         """
         batch = self._executor.previous_batch
+        if batch is None:
+            return
         event = batch.sample_state.sampler_event if batch.sample_state is not None else None
         if event is not None:
             event.synchronize()
@@ -1486,17 +1477,10 @@ class RankFailureRecovery:
         self._interrupted.extend(batch.scheduled_requests.all_requests())
         for request, mark in batch.context_rows:
             request.py_result.rewind_context_rows(mark)
-        executor = self._executor
-        if batch.gpu_forward_events_from_perf_pool:
-            executor.perf_manager.release_forward_timing_events(
-                batch.gpu_forward_start_event, batch.gpu_forward_end_event
-            )
-        if executor.drafter is not None and executor.use_spec_decode:
-            executor.drafter.cleanup_previous_draft_resources()
-        executor.previous_batch = None
+        self._executor.discard_previous_batch()
 
     def discard_failed_forward(self, scheduled_requests) -> bool:
-        """Discard a forward that raised because its all-to-all was aborted.
+        """Discard a forward that raised because its all-to-all was aborted, and the step before it.
 
         Returns:
             Whether the forward was discarded. False means that the forward failed for another reason.
@@ -1504,25 +1488,22 @@ class RankFailureRecovery:
         if not self._moe.aborted():
             return False
         self._interrupted.extend(scheduled_requests.all_requests())
-        self._executor._accepted_previous_batch()
+        self.drop_invalid_step()
         return True
 
     def _recompute_interrupted_requests(self) -> int:
         """Pause the requests of the discarded steps for recompute, as after a preemption, and return how many."""
         interrupted, self._interrupted = {id(request) for request in self._interrupted}, []
-        executor = self._executor
-        recomputed = 0
-        for request in list(executor.active_requests):
-            if (
-                id(request) in interrupted
-                and not request.is_dummy
-                and not request.is_finished
-                and request.py_seq_slot is not None
-            ):
-                executor._free_request_resources(request)
-                executor._pause_recompute_request(request)
-                recomputed += 1
-        return recomputed
+        requests = [
+            request
+            for request in self._executor.active_requests
+            if id(request) in interrupted
+            and not request.is_dummy
+            and not request.is_finished
+            and request.py_seq_slot is not None
+        ]
+        self._executor.recompute_requests(requests)
+        return len(requests)
 
     def fail_unservable_requests(
         self, waiting_queue: WaitingQueue, rank_states: List[RankState]
@@ -1544,22 +1525,14 @@ class RankFailureRecovery:
         if not unservable:
             return
         waiting_queue.remove_by_ids(set(unservable))
+        if self.rank != 0:
+            return
         for item in unservable.values():
-            self._fail(
-                item.id,
-                getattr(item.request, "client_id", None),
+            self._executor.fail_requests_by_id(
+                {item.id: getattr(item.request, "client_id", None)},
                 f"Attention DP rank {item.request.py_scheduling_params.attention_dp_rank} does not serve; send the "
                 "request without attention_dp_rank or with attention_dp_relax",
             )
-
-    def _fail(
-        self, request_id: int, client_id: Optional[int], error: Union[str, RequestError]
-    ) -> None:
-        from .llm_request import LlmResponse
-
-        if self.rank == 0:
-            response = LlmResponse(request_id=request_id, error_msg=error, client_id=client_id)
-            self._executor._pending_transfer_responses.append((request_id, response))
 
 
 class FaultToleranceHealth:

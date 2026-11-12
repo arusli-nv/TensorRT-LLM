@@ -293,6 +293,14 @@ class ExecutorRequestQueue:
                 for item in self.request_queue.queue if item.is_canceled_request
             }
 
+    def queued_request_ids(self) -> set[int]:
+        """Inspect the ids of queued requests without consuming them."""
+        with self.request_queue.mutex:
+            return {
+                item.id
+                for item in self.request_queue.queue if item.is_normal_request
+            }
+
     def enqueue_control_request(self,
                                 drain: bool = True,
                                 control_id: Optional[str] = None):

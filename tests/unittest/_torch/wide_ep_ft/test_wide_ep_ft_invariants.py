@@ -385,6 +385,10 @@ UNACCEPTED_PREVIOUS_BATCH_READS = {
         1,
         "the acceptance itself, called by accept_previous_batch",
     ),
+    f"{PY_EXECUTOR}::PyExecutor.discard_previous_batch": (
+        1,
+        "the discard itself, called by drop_invalid_step",
+    ),
     f"{PY_EXECUTOR}::PyExecutor._executor_loop_overlap": (
         4,
         "the next step's inputs take the previous batch's device tensors and a dropped batch returns its "
