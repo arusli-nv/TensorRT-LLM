@@ -187,9 +187,11 @@ class FakeAuthority:
                 pass
         self.closed.set()
 
-    def push(self, record, nodes=((NODE, "host-1", True),)):
+    def push(self, record, nodes=((NODE, "host-1", True),), stalled_replacements=()):
         with self._lock:
-            self._view = NodeView(record=record, nodes=nodes)
+            self._view = NodeView(
+                record=record, nodes=nodes, stalled_replacements=stalled_replacements
+            )
             for sock, lines in self._connections:
                 with contextlib.suppress(OSError):
                     sock.sendall(lines.encode(self._view.model_dump_json().encode()))
@@ -440,6 +442,25 @@ def test_ended_replacements_stop_replacements(
         b"1" if given_up else b"0"
     )
     authority.push(_record(MembershipState.SHUTDOWN, 0b0111, joined, generation + 3))
+
+
+def test_stalled_replacement_is_replaced(tmp_path, deployment):
+    """Check that a slow replacement keeps starting until the authority reports its startup stalled."""
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    without_3 = _record(MembershipState.COMMITTED, active_mask=0b0111)
+    authority.push(without_3)
+    _until(lambda: _read(tmp_path, 3, 1))
+    slow = _read(tmp_path, 3, 1)["pid"]
+    _push_and_wait_for_step(running, authority, without_3.model_copy(update=dict(generation=2)))
+    assert _alive(slow)
+    authority.push(without_3.model_copy(update=dict(generation=4)), stalled_replacements=(3,))
+    _until(lambda: _read(tmp_path, 3, 2))
+    assert not _alive(slow)
+    # The view that reported the stalled startup came before the next replacement started.
+    assert _alive(_read(tmp_path, 3, 2)["pid"])
+    authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0111, generation=5))
     assert running.wait() == 0
 
 
@@ -450,6 +471,23 @@ def test_rank_0_is_never_replaced(tmp_path, deployment):
     assert running.wait() == 128 + signal.SIGKILL
     assert _read(tmp_path, 0, 1) is None
     assert not _alive(_read(tmp_path, 1, 0)["pid"])
+
+
+def test_abort_ends_job_through_launcher(tmp_path, deployment):
+    """Check that node 0 ends the whole job as failed when the deployment aborts."""
+    authority, environ = deployment
+    ended = []
+    running = _serving(
+        tmp_path,
+        authority,
+        environ,
+        node=0,
+        end_job=lambda tool_environ, timeout_s: ended.append(timeout_s),
+    )
+    aborted = _record(MembershipState.ABORTED).model_copy(update=dict(reason="rank 0 failed"))
+    authority.push(aborted)
+    assert running.wait() == 1
+    assert ended == [supervisor_module._STOP_GRACE_S]
 
 
 def test_wrong_shared_secret_ends_supervisor(tmp_path, deployment, monkeypatch):
@@ -564,10 +602,11 @@ def test_node_0_ends_job_through_prrte(tmp_path, deployment, launcher):
     [(True, False), (False, True), (False, False)],
     ids=["opt-in", "root", "non-root"],
 )
-def test_prrte_tools_keep_run_as_root(tmp_path, deployment, monkeypatch, opt_in, root):
-    """Check that prun and pterm opt in to running as root only with the deployment's opt-in or as root.
+def test_prrte_tools_get_launcher_environment(tmp_path, deployment, monkeypatch, opt_in, root):
+    """Check that prun and pterm get the launcher's settings but not the supervisor's process identity.
 
-    Under a root deployment, prun and pterm refuse to run without it.
+    They opt in to running as root only with the deployment's opt-in or as root. Under a root deployment, prun and
+    pterm refuse to run without it.
     """
     authority, environ = deployment
     monkeypatch.setattr(os, "geteuid", lambda: 0 if root else 1000)
@@ -588,6 +627,7 @@ def test_prrte_tools_keep_run_as_root(tmp_path, deployment, monkeypatch, opt_in,
         PATH=f"{bin_dir}:{environ['PATH']}",
         # The PID in the URI names no mpirun, so the supervisor ends the job with pterm.
         PMIX_SERVER_URI41="prterun-host-0-0@0.0;tcp4://127.0.0.1:1",
+        PRTE_MCA_oob_tcp_if_include="ib0",
     )
     relaunch_command, end_job = supervisor_module._prrte_job_control(environ, NODES)
     nodes = ((0, "host-0", True), (1, "host-1", True))
@@ -602,6 +642,9 @@ def test_prrte_tools_keep_run_as_root(tmp_path, deployment, monkeypatch, opt_in,
     assert running.wait() == 128 + signal.SIGKILL
     for name in ("prun", "pterm"):
         tool_environ = json.loads((tmp_path / f"{name}-environ").read_text())
+        assert tool_environ["PRTE_MCA_oob_tcp_if_include"] == "ib0"
+        assert "OMPI_COMM_WORLD_RANK" not in tool_environ
+        assert "PMIX_RANK" not in tool_environ
         for variable in supervisor_module._RUN_AS_ROOT_VARS:
             assert (tool_environ.get(variable) == "1") == (opt_in or root)
 

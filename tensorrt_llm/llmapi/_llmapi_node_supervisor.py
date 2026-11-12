@@ -28,6 +28,27 @@ _PMIX_SERVER_URI_VARS = (
     "PMIX_SERVER_URI21",
     "PMIX_SERVER_URI2",
 )
+# The variables that identify this process to its PMIx server, which prun and pterm must not take as their own.
+_PROCESS_IDENTITY_VARS = (
+    *_PMIX_SERVER_URI_VARS,
+    "PMIX_NAMESPACE",
+    "PMIX_RANK",
+    "PMIX_ID",
+    "PMIX_HOSTNAME",
+    "PMIX_VERSION",
+    "PMIX_SECURITY_MODE",
+    "PMIX_PTL_MODULE",
+    "PMIX_GDS_MODULE",
+    "PMIX_BFROP_BUFFER_TYPE",
+    "PMIX_SERVER_TMPDIR",
+    "PMIX_SYSTEM_TMPDIR",
+    "OMPI_UNIVERSE_SIZE",
+    "OMPI_FIRST_RANKS",
+    "OMPI_APP_CTX_NUM_PROCS",
+    "OMPI_NUM_APP_CTX",
+    "OMPI_FILE_LOCATION",
+)
+_PROCESS_IDENTITY_PREFIXES = ("OMPI_COMM_WORLD_", "PMIX_DSTORE_")
 # The deployment's opt-in to running as root, without which prun and pterm refuse to run as root.
 _RUN_AS_ROOT_VARS = (
     "OMPI_ALLOW_RUN_AS_ROOT",
@@ -66,6 +87,7 @@ class _Process:
     left_out_reason: str = ""
     killed: bool = False
     status: Optional[int] = None
+    started_s: float = 0.0
 
 
 class _Backoff:
@@ -144,6 +166,7 @@ class NodeSupervisor:
         # Each rank started here is a one-process MPI world with no shared-memory peer. Without the sm transport, it
         # creates no /dev/shm segment that an os._exit or a kill would leave behind.
         self._environ["OMPI_MCA_btl"] = environ.get("OMPI_MCA_btl", "^sm")
+        self._tool_environ = _prrte_tool_environ(environ)
         self._relaunch_command = relaunch_command
         self._end_job_through_launcher = end_job
         self._parent = os.getppid()
@@ -155,6 +178,7 @@ class NodeSupervisor:
         self._store = None
         self._connection = None
         self._view = None
+        self._view_received_s = 0.0
         self._served = False
         self._refused = False
         self._connect_due_s = 0.0
@@ -280,6 +304,7 @@ class NodeSupervisor:
             return self._stop(0, terminate=False)
         if record is not None and record.state == state.ABORTED:
             self._logger.error(f"Deployment aborted: {record.reason}")
+            self._end_job(f"the deployment aborted: {record.reason}")
             return self._stop(1)
         for rank in self._ranks:
             status = self._supervise(rank, record, now_s)
@@ -338,6 +363,17 @@ class NodeSupervisor:
                 )
                 process.killed = True
                 process.child.kill()
+            elif (
+                rank in self._view.stalled_replacements
+                and self._view_received_s > process.started_s
+                and not process.killed
+            ):
+                self._logger.warning(
+                    f"Killing the replacement of rank {rank}, whose startup made no progress for "
+                    f"{self._membership.RENDEZVOUS_TIMEOUT_S:.0f} s"
+                )
+                process.killed = True
+                process.child.kill()
             return None
         if record.is_active(rank) or rank in self._given_up:
             return None
@@ -353,7 +389,7 @@ class NodeSupervisor:
             return
         self._logger.error(f"Ending the job: {reason}")
         try:
-            self._end_job_through_launcher(self._environ, _STOP_GRACE_S)
+            self._end_job_through_launcher(self._tool_environ, _STOP_GRACE_S)
         except (OSError, subprocess.SubprocessError) as error:
             self._logger.error(f"Cannot end the job: {error!r}")
 
@@ -371,7 +407,9 @@ class NodeSupervisor:
         )
         pidfd = os.pidfd_open(child.pid)
         self._selector.register(pidfd, selectors.EVENT_READ, rank)
-        self._processes[rank] = _Process(child, replacement, pidfd, None if replacement else 0)
+        self._processes[rank] = _Process(
+            child, replacement, pidfd, None if replacement else 0, started_s=time.monotonic()
+        )
 
     def _replace(self, rank: int, now_s: float) -> None:
         self._publish_given_up(rank, False)
@@ -515,6 +553,7 @@ class NodeSupervisor:
         if self._view is not None:
             self._note_left_out(self._view.record, view.record)
         self._view = view
+        self._view_received_s = time.monotonic()
         if view.record.state not in (
             self._membership.MembershipState.STARTING,
             self._membership.MembershipState.SHUTDOWN,
@@ -578,7 +617,7 @@ class NodeSupervisor:
             ]
             try:
                 process = subprocess.Popen(  # nosec B603
-                    command, env=_prrte_tool_environ(self._environ), stdin=subprocess.PIPE
+                    command, env=self._tool_environ, stdin=subprocess.PIPE
                 )
                 with contextlib.suppress(BrokenPipeError):
                     process.stdin.write(json.dumps(self._environ).encode() + b"\n")
@@ -636,11 +675,19 @@ def _local_gpu_count(environ: Dict[str, str]) -> int:
 
 
 def _prrte_tool_environ(environ: Dict[str, str]) -> Dict[str, str]:
-    """Return ``environ`` for prun or pterm, with PRRTE's opt-in to running as root when this process runs as root."""
+    """Return ``environ`` for prun or pterm, which keeps the launcher's settings but not this process's identity.
+
+    It adds PRRTE's opt-in to running as root when this process runs as root.
+    """
+    tool_environ = {
+        name: value
+        for name, value in environ.items()
+        if name not in _PROCESS_IDENTITY_VARS and not name.startswith(_PROCESS_IDENTITY_PREFIXES)
+    }
     if os.geteuid() != 0:
-        return environ
+        return tool_environ
     # mpirun refuses to start as root without this opt-in, so a root process of the job was started with it.
-    return {**dict.fromkeys(_RUN_AS_ROOT_VARS, "1"), **environ}
+    return {**dict.fromkeys(_RUN_AS_ROOT_VARS, "1"), **tool_environ}
 
 
 def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: float) -> None:
@@ -663,7 +710,7 @@ def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: flo
     )
     subprocess.run(  # nosec B603
         [pterm, "--dvm-uri", uri],
-        env=_prrte_tool_environ(environ),
+        env=environ,
         stdin=subprocess.DEVNULL,
         timeout=timeout_s,
         check=True,

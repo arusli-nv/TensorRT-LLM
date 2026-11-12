@@ -1176,6 +1176,35 @@ def test_failed_install_holds_the_steps(error, reply):
     assert recovery.pauses_forward()
 
 
+@pytest.mark.parametrize("together", [False, True])
+def test_commit_with_next_change_resumes(together):
+    """Check that a rank resumes at the commit even if it reads the next change in the same message.
+
+    The ranks that read the commit alone hold their steps for the admission at the next forward vote, so this rank
+    must hold at the same vote.
+    """
+    recovery = _resuming_recovery()
+    committed = _INSTALL.model_copy(update=dict(state=MembershipState.COMMITTED))
+    admission = _joining_record(MembershipState.PROPOSE)
+    reports = recovery._client.reports
+
+    def report(**changes):
+        reports.append(changes)
+        if changes.get("reply") == Reply.INSTALLED:
+            recovery._on_record(committed)
+            if together:
+                recovery._on_record(admission)
+
+    recovery._client.report = report
+    recovery.before_iteration()
+    if not together:
+        recovery._on_record(admission)
+    assert _replies(recovery) == [Reply.INSTALLED]
+    assert not recovery._membership_changing()
+    assert _vote(recovery)[0] == [0, 1, 0]
+    assert recovery._membership_changing()
+
+
 # Device memory: the restore of lost experts, the KV cache pool and its give-back.
 
 
@@ -1420,6 +1449,28 @@ def test_rejoin_gives_back_memory_after_resume(monkeypatch):
         f"Rank 0 gave back the memory of membership generation 1. Released {6 * MIB} bytes of empty spare "
         f"slots, KV cache quota {STARTUP_MEMORY.kv_cache_quota} bytes, in "
     )
+
+
+def test_give_back_waits_for_newer_change(monkeypatch):
+    """Check that a change that arrives after the give-back vote keeps the memory until that change commits."""
+    recovery = _resuming_recovery(record=_REJOIN_INSTALL, placement=_PLACEMENT)
+    _, _, device = _eplb(
+        monkeypatch,
+        recovery,
+        restored=0,
+        released=6 * MIB,
+        device=_Device(gpu_quota=58 * MIB, backed=6 * MIB),
+    )
+    recovery.before_iteration()
+    assert _vote(recovery)[0] == [4, 0, 1]
+    newer = _record(MembershipState.PROPOSE, generation=2, active_mask=0b0011)
+    retire = recovery._executor._retire_inflight_batch_for_control
+    retire.reset_mock()
+    retire.side_effect = lambda: recovery._on_record(newer)
+    recovery.before_iteration()
+    retire.assert_called_once()
+    assert device.backed == 6 * MIB
+    assert recovery._give_back_pending
 
 
 # EPLB and waiting requests across a membership change.

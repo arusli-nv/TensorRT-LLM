@@ -469,6 +469,27 @@ def _join(cluster, rank):
     cluster.authority.request_join(rank)
 
 
+def test_stalled_replacement_startup_reported():
+    """Report a replacement whose startup makes no progress for the rendezvous timeout, but not a slow one.
+
+    The wait for the memory of the process it replaces is not a stall.
+    """
+    cluster = Cluster(rendezvous_timeout_s=1.0)
+    _join(cluster, 3)  # It takes over rank 3 before a commit removes the process it replaces.
+    cluster.hung.add(3)
+    cluster.unprepared.add(3)
+    cluster.run(2.0)
+    assert cluster.authority.stalled_replacements == ()
+    cluster.alive -= {2, 3}
+    cluster.run(1.0)
+    assert not cluster.authority.record.active_mask & 0b1100
+    _join(cluster, 2)
+    _join(cluster, 3)
+    cluster.unprepared.add(2)
+    cluster.run(3.0)
+    assert cluster.authority.stalled_replacements == (3,)
+
+
 def test_replacements_added_in_one_transaction():
     """Add the replacements of a node's ranks together, although they become ready a little apart."""
     cluster = Cluster()

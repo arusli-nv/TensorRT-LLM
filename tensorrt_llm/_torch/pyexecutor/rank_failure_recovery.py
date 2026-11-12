@@ -766,6 +766,7 @@ class RankFailureRecovery:
         self._record_changed = threading.Condition()
         self._admitted = incarnation == 0
         self._committed_mask = self._record.active_mask
+        self._committed_generation = self._record.generation
         # Per rank, the newest process that an INSTALL or COMMITTED record listed as active, which may map its peers'
         # pages until it ends.
         self._listed_incarnations = [0] * self.world_size
@@ -904,6 +905,7 @@ class RankFailureRecovery:
                 self._admitted = True
             if record.state == MembershipState.COMMITTED:
                 self._committed_mask = record.active_mask
+                self._committed_generation = record.generation
             if record.state in (MembershipState.INSTALL, MembershipState.COMMITTED):
                 self._listed_incarnations = [
                     record.incarnations[r]
@@ -1186,8 +1188,9 @@ class RankFailureRecovery:
             reply_generation=record.generation,
             placement_digest=digest,
         )
-        committed = self._next_record(record)
-        if committed.state != MembershipState.COMMITTED:
+        # The next change may replace COMMITTED before this rank reads it.
+        self._next_record(record)
+        if self._committed_generation < record.generation:
             return False
         self._resume_after = None
         self._steps_quiet = False
@@ -1277,6 +1280,9 @@ class RankFailureRecovery:
         if not self._give_back_due:
             return
         self._give_back_due = False
+        # A change that arrived after the vote keeps the memory until it is committed.
+        if self.pauses_forward():
+            return
         if self._give_back_pending:
             self._give_back_pending = False
             given_back = self._give_back_kv_cache()

@@ -131,10 +131,12 @@ class MembershipRecord(_Message):
 
 
 class NodeView(_Message):
-    """The record and, per known node, its host and whether its supervisor is connected."""
+    """The record, per known node its host and whether its supervisor is connected, and the stalled replacements."""
 
     record: MembershipRecord
     nodes: Tuple[Tuple[int, str, bool], ...] = ()
+    # The ranks whose replacement made no startup progress for the rendezvous timeout.
+    stalled_replacements: Tuple[int, ...] = ()
 
 
 class RankReport(_Message):
@@ -240,6 +242,7 @@ class Authority:
         self._transaction_began_s: Optional[float] = None
         self._ready_s: Optional[float] = None
         self.last_transaction: Optional[TransactionSummary] = None
+        self.stalled_replacements: Tuple[int, ...] = ()
 
     def request_join(self, rank: int) -> None:
         """Request that a replacement of ``rank`` join, taking ``rank`` over even if it is still active."""
@@ -251,6 +254,13 @@ class Authority:
         """Return a new record to publish, or None if membership did not change."""
         before, committed = self.record.state, self._committed_mask
         record = self._decide(now_s, reports, connected)
+        if before != MembershipState.STARTING:
+            self.stalled_replacements = tuple(
+                r
+                for r in sorted(self._requested)
+                if not reports.get(r, RankReport()).joining_ready
+                and not self._starting(r, reports, now_s)
+            )
         if record is None:
             return None
         if before == MembershipState.COMMITTED:
@@ -461,7 +471,12 @@ class Authority:
     def _starting(self, r: int, reports: Dict[int, RankReport], now_s: float) -> bool:
         report = reports.get(r, RankReport())
         progress = (report.incarnation, report.progress)
-        if self._startup_progress.get(r, (None,))[0] != progress:
+        # The wait for the memory of the process it replaces, which the active ranks release at the commit without it,
+        # is not a stall.
+        if (
+            has_rank(self._committed_mask, r)
+            or self._startup_progress.get(r, (None,))[0] != progress
+        ):
             self._startup_progress[r] = (progress, now_s)
         return now_s - self._startup_progress[r][1] <= self.rendezvous_timeout_s
 
@@ -1271,6 +1286,7 @@ class AuthorityProcess:
         self._selector = selectors.DefaultSelector()
         self._record: Optional[MembershipRecord] = None
         self._hosts: Dict[int, str] = {}
+        self._sent_stalled_replacements: Tuple[int, ...] = ()
 
     def run(self, host: str = "", port: int = 0) -> MembershipRecord:
         """Serve until the record is ABORT or SHUTDOWN and return the last record."""
@@ -1305,6 +1321,8 @@ class AuthorityProcess:
             else:
                 record = self._authority.tick(time.monotonic(), self._reports(), self._connected())
             if record is None:
+                if self._authority.stalled_replacements != self._sent_stalled_replacements:
+                    self._send_record(ranks=False)
                 continue
             logger.info(f"Membership: {record!r}")
             transaction = self._authority.last_transaction
@@ -1331,12 +1349,14 @@ class AuthorityProcess:
     def _send_record(self, ranks: bool = True) -> None:
         record = _json(self._record)
         connected = {c.node for c in self._connections.values() if c.node is not None}
+        self._sent_stalled_replacements = self._authority.stalled_replacements
         view = _json(
             NodeView(
                 record=self._record,
                 nodes=tuple(
                     (node, host, node in connected) for node, host in sorted(self._hosts.items())
                 ),
+                stalled_replacements=self._sent_stalled_replacements,
             )
         )
         for sock, connection in list(self._connections.items()):
