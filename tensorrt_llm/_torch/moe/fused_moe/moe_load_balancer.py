@@ -280,7 +280,10 @@ class HostMoeTensorSharer:
 
     def pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ load balancer has shut down, so no weight update
+        still reads them, and before the barrier that lets the owner unlink them.
         """
         for shm in self.imported_shms:
             shm.close()
@@ -291,7 +294,9 @@ class HostMoeTensorSharer:
 
     def post_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Unlink the shared host weights this rank owns.
+
+        Call after the barrier that follows every rank's pre_shutdown_cleanup.
         """
         if self.own_shm:
             self.own_shm.unlink()
@@ -752,15 +757,17 @@ class SingleLayerMoeLoadBalancer:
 
     def py_pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ shutdown and before the barrier.
         """
         if self.updates_enabled:
             self.host_tensor_sharer.pre_shutdown_cleanup()
 
     def py_post_shutdown_cleanup(self):
         """
-         Clean up the resources after C++ shutdown and barrier
-         """
+        Unlink the shared host weights. Call after the C++ shutdown and the barrier.
+        """
         if self.updates_enabled:
             self.host_tensor_sharer.post_shutdown_cleanup()
 
@@ -1060,10 +1067,12 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         local_safe = bool(local_safe and not self.in_iter)
         if not all(self.shared_mpi_comm.allgather(local_safe)):
             return False
+        # Stop the C++ weight-update threads first. They read the host weights
+        # that the cleanup below closes.
+        self.load_balancer_impl.shutdown()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
-        self.load_balancer_impl.shutdown()
-        # use this sync to make sure all the shm resources can be cleaned up
+        # Every rank closes its mappings before the owner unlinks the shared memory.
         self.shared_mpi_comm.barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_post_shutdown_cleanup()
