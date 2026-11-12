@@ -83,6 +83,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_independent_rank_startup.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_rank_mask_all_active_matches_no_mask
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_rank_mask_one_rank_masked_completes
+  # WideEP fault tolerance: under load a rank crashes, then a rank hangs, and each replacement rejoins.
+  - test_wide_ep_rank_failure.py::test_rank_failure_sequence TIMEOUT (90)
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
@@ -151,9 +153,10 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
-  # WideEP fault tolerance: ranks fail under load in one deployment (a crash, then a hang), replacements rejoin.
-  - test_wide_ep_rank_failure.py::test_rank_failure_sequence TIMEOUT (90)
+  # WideEP fault tolerance: refused joins, a second failure while a replacement is admitted or installed, and a
+  # rejoin under plain trtllm-serve.
   - test_wide_ep_rank_failure.py::test_invalid_joins TIMEOUT (120)
   - test_wide_ep_rank_failure.py::test_failure_during_admission TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::test_failure_during_install TIMEOUT (90)
   - test_wide_ep_rank_failure.py::test_rejoin_when_server_spawns_ranks TIMEOUT (90)
   - test_wide_ep_rank_failure.py::test_authority_loss_ends_deployment TIMEOUT (60)

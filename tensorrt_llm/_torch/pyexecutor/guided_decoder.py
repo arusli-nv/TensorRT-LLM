@@ -11,7 +11,6 @@ import torch
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 from ..._utils import nvtx_range, prefer_pinned
-from ..._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
@@ -92,7 +91,6 @@ class GuidedRequest:
         recomputed_tokens = None
         if (is_last_context_chunk
                 and request.py_guided_decoding_params is not None
-                and wide_ep_fault_tolerance_enabled()
                 and request.prompt_len > request.orig_prompt_len):
             recomputed_tokens = request.get_tokens(
                 0)[request.orig_prompt_len:request.prompt_len]

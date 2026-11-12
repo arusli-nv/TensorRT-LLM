@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_enabled
 from tensorrt_llm.executor.result import reduce_prompt_logprobs
 from tensorrt_llm.logger import logger
 
@@ -25,9 +24,8 @@ def store_context_logits(
     """Consume context rows from either projection path using one result contract.
 
     Prompt logprobs are reduced on the logits' device; only the reduced rows and
-    the final prompt row's log probabilities reach host memory. With Wide-EP
-    fault tolerance a replayed prefill stores only the positions past its
-    stored rows.
+    the final prompt row's log probabilities reach host memory. A prefill that
+    a recompute replays stores only the prompt positions past the stored rows.
 
     Args:
         request: Context request whose current chunk produced ``logits``.
@@ -40,26 +38,19 @@ def store_context_logits(
     result = request.py_result
     position = request.context_current_position + offset
     chunk_tail = offset + logits.shape[0] == request.context_chunk_size
-    prompt_len = request.py_prompt_len
-    fault_tolerance = wide_ep_fault_tolerance_enabled()
-    if fault_tolerance:
-        rows_missing = position > result.context_rows_end
-    else:
-        rows_missing = offset == 0 and request.prepopulated_prompt_len > 0
-    if rows_missing:
+    if position > result.context_rows_end:
         logger.warning(
             "Because of KV cache reuse, not all context logits could be produced "
             f"for request {request.request_id}."
         )
-    if fault_tolerance:
-        prompt_len = request.orig_prompt_len
-        skip = max(result.context_rows_end - position, 0)
-        end = min(prompt_len, position + logits.shape[0])
-        if position + skip >= end:
-            return
-        logits = logits[skip : end - position]
-        position += skip
-        result.context_rows_end = end
+    prompt_len = request.orig_prompt_len
+    skip = max(result.context_rows_end - position, 0)
+    end = min(prompt_len, position + logits.shape[0])
+    if position + skip >= end:
+        return
+    logits = logits[skip : end - position]
+    position += skip
+    result.context_rows_end = end
     compact = request.py_prompt_logprobs is not None
     if request.py_context_logits_explicit or not compact:
         result.append_context_logits(logits, reusable=reusable)

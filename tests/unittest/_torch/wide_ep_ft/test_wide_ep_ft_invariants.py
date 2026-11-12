@@ -26,7 +26,10 @@ import ast
 import functools
 from pathlib import Path
 
+import pytest
 import yaml
+
+pytestmark = pytest.mark.cpu_only
 
 REPO = Path(__file__).resolve().parents[4]
 HERE = Path(__file__).resolve().parent

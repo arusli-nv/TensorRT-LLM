@@ -19,7 +19,6 @@ from typing import List
 import pytest
 import torch
 
-from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._torch.pyexecutor import guided_decoder as guided_decoder_module
 from tensorrt_llm._torch.pyexecutor.guided_decoder import (
     CapturableGuidedDecoder,
@@ -29,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.guided_decoder import (
     row_has_valid_token,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 
@@ -466,13 +466,8 @@ def test_capturable_failures_are_released_per_batch(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("fault_tolerance", [True, False])
-def test_a_recomputed_request_replays_its_generated_tokens_into_the_new_matcher(
-    monkeypatch, fault_tolerance
-):
-    """A recompute moves the generated tokens into the prompt; with Wide-EP fault tolerance the last context chunk
-    carries them and the build replays them into the new matcher."""
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", fault_tolerance)
+def test_recompute_replays_generated_tokens_into_matcher(monkeypatch):
+    """Replay the tokens that a KV cache pressure recompute moved into the prompt into the new matcher."""
     request = LlmRequest(
         request_id=7,
         max_new_tokens=8,
@@ -483,12 +478,10 @@ def test_a_recomputed_request_replays_its_generated_tokens_into_the_new_matcher(
     request.py_guided_decoding_params = _GUIDED_PARAMS
     for token in (10, 11):
         request.add_new_token(token, 0)
-    request.reset_for_recompute(1 << 20)
+    request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
     request.context_chunk_size = request.context_remaining_length
     recomputed_tokens = GuidedRequest.from_llm_request(request).recomputed_tokens
-    assert recomputed_tokens == ([10, 11] if fault_tolerance else None)
-    if not fault_tolerance:
-        return
+    assert recomputed_tokens == [10, 11]
 
     decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
     matcher = _ScriptedMatcher([True])

@@ -8,13 +8,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
     ContextLogitsPlan,
     store_context_logits,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, PyResult, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN
 from tensorrt_llm.executor.result import compute_prompt_logprobs
 
 
@@ -452,10 +452,10 @@ def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
     assert worker._refused_client_ids == {7}
 
 
-def _recompute_after_prefill(explicit: bool) -> tuple[LlmRequest, torch.Tensor, tuple]:
-    """A request that stored its context rows over three chunks, generated two tokens and was reset for a
-    recompute, which replays the prefill over the prompt and the generated tokens; the logits of the replay and what
-    the prefill stored."""
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("explicit", [True, False], ids=["context_logits", "prompt_logprobs_only"])
+def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
+    """Store no context row again when a KV cache pressure recompute replays the prefill."""
     prompt_len, vocab = 10, 31
     request = LlmRequest(
         request_id=1,
@@ -483,19 +483,9 @@ def _recompute_after_prefill(explicit: bool) -> tuple[LlmRequest, torch.Tensor, 
     for token in (3, 4):
         request.add_new_token(token, 0)
 
-    request.reset_for_recompute(1 << 20)
+    request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
     request.context_chunk_size = request.context_remaining_length
     assert request.context_chunk_size == prompt_len + 2
-    return request, logits, stored
-
-
-@pytest.mark.parametrize("explicit", [True, False], ids=["context_logits", "prompt_logprobs_only"])
-def test_a_recomputed_request_stores_each_prompt_position_once(monkeypatch, explicit: bool) -> None:
-    """With Wide-EP fault tolerance the context rows of the original prompt are already stored, so the replay stores
-    none: none twice, and none past the original prompt."""
-    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", True)
-    request, logits, stored = _recompute_after_prefill(explicit)
-    result = request.py_result
 
     store_context_logits(request, logits)
 
@@ -507,15 +497,3 @@ def test_a_recomputed_request_stores_each_prompt_position_once(monkeypatch, expl
         torch.cat(result.context_prompt_logprob_rows), stored[1], rtol=0, atol=0
     )
     assert result.context_prompt_last_logprobs is stored[2]
-
-
-def test_a_recomputed_request_stores_the_replay_without_fault_tolerance() -> None:
-    """Without Wide-EP fault tolerance the replay stores its rows as every other prefill does."""
-    assert not _wide_ep_fault_tolerance.wide_ep_fault_tolerance_enabled()
-    request, logits, _ = _recompute_after_prefill(explicit=False)
-    result = request.py_result
-
-    store_context_logits(request, logits)
-
-    assert len(result.context_prompt_logprob_rows) == 4
-    assert result.context_rows_end == 0
