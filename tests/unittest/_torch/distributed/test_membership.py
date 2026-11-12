@@ -186,6 +186,19 @@ def test_install_carries_ready_payloads():
     assert lowest.model_copy(update=dict(active_mask=0b0101)).lowest_survivor() is None
 
 
+def test_long_host_stall_not_hung():
+    """Keep a rank whose host step stalls for most of the hang timeout while the others wait for it."""
+    cluster = Cluster()
+    cluster.hung.add(1)
+    cluster.waiting_for[0] = 1 << 1
+    for _ in range(int(membership.HANG_TIMEOUT_S) - 1):
+        cluster.step(1.0)
+    assert cluster.authority.record.active_mask == ALL
+    for _ in range(3):
+        cluster.step(1.0)
+    assert not cluster.authority.record.is_active(1)
+
+
 def test_slow_rank_kept_hung_rank_removed():
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.hung.add(1)

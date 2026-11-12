@@ -43,7 +43,9 @@ from .host_exchange_epoch import latest_epoch, next_epoch
 # The active mask has room for as many ranks as the all-to-all kernels support.
 MAX_RANKS = 256
 
-HANG_TIMEOUT_S = 30.0
+# A rank that keeps other ranks waiting longer than this is hung. It is long enough for a slow host step, and twice
+# it stays within the default 300 s executor hang detector and all-to-all timeouts.
+HANG_TIMEOUT_S = 60.0
 # A liveness connection fails once its peer acknowledged nothing for this long, as when the peer's node is cut off.
 # It is longer than a network stall that TCP recovers from and shorter than the hang timeout.
 DEAD_TIMEOUT_S = 60.0

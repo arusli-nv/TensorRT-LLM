@@ -19,8 +19,8 @@ healthy (N ranks) --rank fails--> degraded (N-K ranks, same CUDA graphs) --repla
 ```
 
 A rank fails when its process exits (a crash, `kill -9`, or the loss of every process of the deployment on its node),
-when its node is cut off from the network for 60 s, or when it makes no progress for 30 s while other ranks wait for it.
-Serving pauses for a few seconds after a crash, and for the hang timeout plus a few seconds after a hang.
+when its node is cut off from the network for 60 s, or when it makes no progress for 60 s while other ranks wait
+for it. Serving pauses for a few seconds after a crash and up to 65 s after a hang.
 
 ## Enabling it
 
@@ -89,7 +89,7 @@ no `RecreateGroupOnPodRestart`). Set `PMI_RANK` to the node rank, `PMI_SIZE` to 
   attention-DP router, one serving frontend and the MPI executor. `modeling_v2: auto` builds the built-in model.
 - Required: `max_beam_width: 1`, `context_parallel_size: 1`, `gpus_per_node` equal to the ranks per node,
   `enable_userbuffers: false` in `torch_compile_config`, `TRTLLM_MOE_COMM_TIMEOUT_SEC` and the executor hang detector
-  timeout of at least 60 s, and CDMM mode with GDRCopy for online EPLB (else `layer_updates_per_iter: 0`).
+  timeout of at least 120 s, and CDMM mode with GDRCopy for online EPLB (else `layer_updates_per_iter: 0`).
 - Rejected: pipeline parallelism, TRTLLM-Gen, DeepGEMM (FP8 DeepSeek-R1) and other MoE backends (not supported yet),
   two-model speculation (such as Eagle3 or draft-target), NGram, user-provided and DSpark drafters (one-model MTP
   works), disaggregated serving, KV cache connectors and events, sleep mode, `enable_lm_head_tp_in_adp`,
