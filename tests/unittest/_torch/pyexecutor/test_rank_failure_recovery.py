@@ -94,6 +94,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._wide_ep_fault_tolerance import (
     FAULT_TOLERANCE_RANK_ENV,
+    set_wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_enabled,
 )
 from tensorrt_llm.executor.base_worker import BaseWorker
@@ -624,6 +625,34 @@ def test_worker_takes_flag_from_args(monkeypatch, enabled):
     worker = BaseWorker(llm_args=llm_args)
     worker.doing_shutdown = True  # Nothing to shut down at exit.
     assert wide_ep_fault_tolerance_enabled() is enabled
+
+
+def test_rank_takes_flag_from_rank0_args(monkeypatch):
+    """Check that a rank other than 0 leaves turning fault tolerance on to rank 0's arguments."""
+    monkeypatch.setattr(_wide_ep_fault_tolerance, "_enabled", False)
+    _published(monkeypatch, {"marker": "rank-0"}, identity="2,4,4,0")
+    started = []
+    monkeypatch.setattr(
+        "tensorrt_llm.executor.worker.worker_main",
+        lambda **args: started.append((args, wide_ep_fault_tolerance_enabled())),
+    )
+    recovery_module.worker_node_main()
+    assert started == [({"marker": "rank-0"}, False)]
+
+
+def test_supervised_rank_requires_flag(monkeypatch):
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,4,4,0")
+    with pytest.raises(ValueError, match="enable_wide_ep_fault_tolerance is false"):
+        set_wide_ep_fault_tolerance_enabled(False)
+
+
+def test_unsupervised_launch_rejected(monkeypatch):
+    monkeypatch.setenv("TLLM_SPAWN_PROXY_PROCESS", "1")
+    monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
+    with pytest.raises(
+        ValueError, match=f"{SHARED_SECRET_ENV} was not set when the ranks were launched"
+    ):
+        recovery_module.ensure_rendezvous()
 
 
 @pytest.mark.parametrize(

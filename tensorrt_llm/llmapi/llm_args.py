@@ -52,7 +52,7 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
-from .._wide_ep_fault_tolerance import check_wide_ep_fault_tolerance_args
+from .._wide_ep_fault_tolerance import check_fault_tolerance_requirements
 
 # yapf: disable
 # isort: off
@@ -7943,8 +7943,87 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
         """Reject what enable_wide_ep_fault_tolerance does not support."""
-        if self.enable_wide_ep_fault_tolerance:
-            check_wide_ep_fault_tolerance_args(self)
+        if not self.enable_wide_ep_fault_tolerance:
+            return self
+        adp_config = self.attention_dp_config
+        spec_config = self.speculative_config
+        spec_mode = None if spec_config is None else spec_config.spec_dec_mode
+        transceiver = self.cache_transceiver_config
+        load_balancer = self.moe_config.load_balancer
+        compile_config = self.torch_compile_config
+        check_fault_tolerance_requirements([
+            (self.enable_attention_dp,
+             "attention DP (enable_attention_dp=True), so that a failed rank "
+             "takes only its own requests with it"),
+            (self.pipeline_parallel_size == 1,
+             "no pipeline parallelism (pipeline_parallel_size=1), because a "
+             "failed pipeline stage leaves its layers on no rank"),
+            (self.max_beam_width in (None, 1),
+             "no beam search (max_beam_width=1), which is not supported yet: "
+             "continuing an interrupted request by recompute would need to "
+             "restore its beams"),
+            (not self.disable_overlap_scheduler,
+             "the overlap scheduler (disable_overlap_scheduler=False), because "
+             "Wide-EP fault tolerance accepts or discards each step when the "
+             "next one starts, which only the overlap scheduler's executor "
+             "loop does yet"),
+            (load_balancer is not None,
+             "EPLB (moe_config.load_balancer with num_slots), whose spare "
+             "slots take a failed rank's experts"),
+            (load_balancer is None or load_balancer.mode == "standard",
+             "standard EPLB (moe_config.load_balancer.mode='standard'), "
+             "because per-layer dynamic EPLB refills its helper slots in every "
+             "forward pass and has no spare slots for a failed rank's experts"),
+            (adp_config is None
+             or not (adp_config.enable_kv_balanced_admission
+                     or adp_config.enable_kv_cache_aware_routing
+                     or adp_config.kv_cache_routing_conversation_affinity),
+             "the default attention-DP routing and admission (no "
+             "enable_kv_balanced_admission, enable_kv_cache_aware_routing or "
+             "kv_cache_routing_conversation_affinity in attention_dp_config), "
+             "because the others keep per-rank state that a replacement would "
+             "not share"),
+            (self.kv_cache_config.event_buffer_max_size == 0,
+             "no KV cache events (kv_cache_config.event_buffer_max_size=0), "
+             "which are not supported yet: a failed rank's KV cache blocks "
+             "would need removal events"),
+            (transceiver is None or transceiver.backend is None,
+             "no disaggregated serving (no cache_transceiver_config.backend), "
+             "because the KV cache transfers between serving instances do not "
+             "follow a membership change"),
+            (self.kv_connector_config is None,
+             "no KV cache connector (kv_connector_config=None), because a "
+             "connector saves the KV cache of a step before the step is "
+             "accepted"),
+            (spec_mode is None
+             or not (spec_mode.has_spec_drafter() or spec_mode.is_dspark()),
+             "no NGram or user-provided drafter and no DSpark "
+             "(speculative_config: none, or another decoding_type such as "
+             "MTP), which are not supported yet: their drafting state outside "
+             "the model forward is not rolled back when a rank failure "
+             "discards a step"),
+            (not self.enable_lm_head_tp_in_adp,
+             "no LM head TP in attention DP (enable_lm_head_tp_in_adp=False), "
+             "because a failed rank would take its share of the vocabulary "
+             "with it"),
+            (compile_config is None or not compile_config.enable_userbuffers,
+             "no userbuffers (torch_compile_config.enable_userbuffers=False), "
+             "because their setup exchanges memory handles over an MPI world "
+             "of every rank, and each rank is its own MPI world"),
+            (self.sleep_config is None,
+             "no sleep mode (sleep_config=None), because sleep releases and "
+             "restores the GPU memory of the weights, whose spare slots fault "
+             "tolerance backs and unbacks itself"),
+            (self.num_serve_frontends == 1,
+             "one serving frontend (num_serve_frontends=1), which is not "
+             "supported yet with more: the frontends that attach to the "
+             "executor do not follow the membership, as /health and the "
+             "re-run of a failed rank's requests need"),
+            (self.orchestrator_type is None,
+             "the MPI executor (orchestrator_type unset, not 'rpc' or 'ray'), "
+             "because the membership, the rank supervisors and the executor "
+             "proxy that follows them come with the MPI executor only"),
+        ])
         return self
 
     def _validate_dspark_confidence_environment(self) -> None:

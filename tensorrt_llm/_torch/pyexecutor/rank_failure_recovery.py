@@ -62,11 +62,10 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     RankIdentity,
     check_fault_tolerance_requirements,
     fault_tolerance_replacement,
-    set_wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_enabled,
     wide_ep_fault_tolerance_rank,
 )
-from tensorrt_llm.executor.utils import RankFailureError, RequestError
+from tensorrt_llm.executor.utils import RankFailureError, RequestError, get_spawn_proxy_process_env
 from tensorrt_llm.logger import logger
 
 from ..distributed.host_exchange_epoch import next_epoch
@@ -132,8 +131,18 @@ def ensure_rendezvous() -> None:
     """Export the shared secret and the rendezvous address when unset.
 
     SO_REUSEADDR sockets that never listen reserve the two ports, so the authority can still bind them.
+
+    Raises:
+        ValueError: A launcher started the ranks without the node supervisor of trtllm-llmapi-launch.
     """
     global _rendezvous_ports
+    if get_spawn_proxy_process_env() and wide_ep_fault_tolerance_rank() is None:
+        raise ValueError(
+            f"enable_wide_ep_fault_tolerance is true, but {SHARED_SECRET_ENV} was not set when the ranks were "
+            "launched, so trtllm-llmapi-launch started them without its node supervisor: export the same "
+            f"{SHARED_SECRET_ENV} and {RENDEZVOUS_ENV} on every node before launching, as "
+            "docs/source/features/wide-ep-fault-tolerance.md describes"
+        )
     if not os.environ.get(SHARED_SECRET_ENV):
         os.environ[SHARED_SECRET_ENV] = secrets.token_hex(_SHARED_SECRET_BYTES)
     if RENDEZVOUS_ENV not in os.environ:
@@ -376,7 +385,6 @@ def worker_node_main() -> None:
         ReplacementCannotStart: A replacement does not match the deployment, or its startup failed in a way that a
             restart would repeat.
     """
-    set_wide_ep_fault_tolerance_enabled(True)
     identity = _launched_rank()
     from tensorrt_llm.executor.worker import worker_main
 

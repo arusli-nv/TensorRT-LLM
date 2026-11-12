@@ -480,6 +480,23 @@ def _rank_command(tmp_path):
     return ["--", sys.executable, str(tmp_path / "rank.py")]
 
 
+@pytest.mark.parametrize("name", [SHARED_SECRET_ENV, RENDEZVOUS_ENV])
+def test_supervisor_names_unset_variable(tmp_path, deployment, name):
+    _, environ = deployment
+    del environ[name]
+    supervisor = _supervisor_process(
+        tmp_path,
+        environ,
+        *_NODE_OPTIONS,
+        *_rank_command(tmp_path),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _, stderr = supervisor.communicate(timeout=60)
+    assert supervisor.returncode == 2
+    assert f"export the same {name} on every node" in stderr
+
+
 @pytest.mark.parametrize("launcher", ["prterun", "sleep"])
 def test_node_0_ends_job_through_prrte(tmp_path, deployment, launcher):
     """Send SIGTERM to the mpirun named by the job's PMIx server URI when rank 0 ends, else run pterm.

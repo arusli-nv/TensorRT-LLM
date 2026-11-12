@@ -790,6 +790,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.environ.update(
         TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""
     )
+    from tensorrt_llm._torch.distributed.membership import RENDEZVOUS_ENV, SHARED_SECRET_ENV
+
+    for name in (SHARED_SECRET_ENV, RENDEZVOUS_ENV):
+        if not environ.get(name):
+            parser.error(
+                f"export the same {name} on every node, as the Wide-EP fault tolerance docs describe"
+            )
     relaunch_command, end_job = None, None
     if args.node_rank == 0:
         try:
