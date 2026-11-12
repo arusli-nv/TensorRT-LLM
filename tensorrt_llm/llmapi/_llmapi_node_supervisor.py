@@ -654,6 +654,46 @@ def _prrte_job_control(
     return relaunch_command, functools.partial(_end_prrte_job, uri, pterm)
 
 
+def start_session_node_supervisor(n_workers: int, env: Dict[str, str]) -> subprocess.Popen:
+    """Start the node supervisor of ranks 1 to ``n_workers - 1`` for a session that runs rank 0.
+
+    Raises:
+        RuntimeError: trtllm-llmapi-launch is not on PATH.
+    """
+    launcher = shutil.which("trtllm-llmapi-launch")
+    if launcher is None:
+        raise RuntimeError(
+            "Wide-EP fault tolerance starts the ranks with trtllm-llmapi-launch, which is not on PATH"
+        )
+    return subprocess.Popen(  # nosec B603
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--node-rank",
+            "0",
+            "--nodes",
+            "1",
+            "--gpus-per-node",
+            str(n_workers),
+            "--rank-0-in-session",
+            "--",
+            launcher,
+        ],
+        env=env,
+    )
+
+
+def stop_session_node_supervisor(supervisor: subprocess.Popen, grace_s: Optional[float]) -> None:
+    """Stop ``supervisor``, after waiting ``grace_s`` seconds for it to exit unless ``grace_s`` is None."""
+    if grace_s is not None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            supervisor.wait(grace_s)
+            return
+    supervisor.terminate()
+    if grace_s is not None:
+        supervisor.wait()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="_llmapi_node_supervisor.py",

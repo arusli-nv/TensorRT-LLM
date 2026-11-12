@@ -228,7 +228,7 @@ def test_workspace_bytes_count_shared_once() -> None:
 
 @pytest.mark.parametrize("stale", [(set(), set()), (set(), {0, 1, 2, 3})])
 def test_stale_rows_union_over_workspaces(stale) -> None:
-    """Each workspace answers alike on every rank of the change (``MnnvlMemory.stale_rows``)."""
+    """Each workspace answers alike on every rank of the change (``MembershipMnnvlMemory.stale_rows``)."""
     health = EPGroupHealth(4)
     state = MoeExecutionState(health, torch.device("cuda"))
     comms = [_frontend(health), _frontend(health)]

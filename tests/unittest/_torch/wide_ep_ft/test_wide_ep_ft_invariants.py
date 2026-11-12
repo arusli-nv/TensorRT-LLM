@@ -376,10 +376,14 @@ def test_gather_votes_use_active_rows():
 
 # Functions that read previous_batch before or without _accepted_previous_batch, with the read count and the reason.
 UNACCEPTED_PREVIOUS_BATCH_READS = {
-    f"{PY_EXECUTOR}::PyExecutor._accepted_previous_batch": (2, "the accessor itself"),
+    f"{PY_EXECUTOR}::PyExecutor._accepted_previous_batch": (1, "the accessor itself"),
+    f"{TORCH}/pyexecutor/step_acceptance.py::accept_previous_batch": (
+        2,
+        "the acceptance itself, called by _accepted_previous_batch",
+    ),
     f"{TORCH}/pyexecutor/rank_failure_recovery.py::RankFailureRecovery.drop_invalid_step": (
         1,
-        "the acceptance itself, called by _accepted_previous_batch",
+        "the acceptance itself, called by accept_previous_batch",
     ),
     f"{PY_EXECUTOR}::PyExecutor._executor_loop_overlap": (
         4,

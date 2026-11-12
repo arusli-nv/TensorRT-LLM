@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the spare EPLB slots that let the active ranks hold every expert after a rank failure."""
 
+import functools
 import os
 import secrets
 import threading
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.distributed.membership import (
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     DeploymentHostWeights,
     EplbExpertRestore,
+    FaultTolerantMoeLoadBalancer,
     host_weights_key,
     plan_layer_placement,
 )
@@ -68,7 +70,9 @@ def _load_balancer(
         patch(f"{_ER}.DeploymentHostWeights"),
         patch("torch.cuda.Event"),
     ):
-        load_balancer = MoeLoadBalancer(ep_rank, WORLD_SIZE, layer_updates_per_iter)
+        load_balancer = FaultTolerantMoeLoadBalancer(
+            ep_rank, WORLD_SIZE, layer_updates_per_iter, mapping=None
+        )
         load_balancer.add_layer(EXPERTS, 2, eplb_slots, aux_stream=Mock())
     return load_balancer
 
@@ -100,7 +104,7 @@ def test_online_spare_slots_need_gdrcopy(
         patch(_USES_GDRCOPY, return_value=uses_gdrcopy),
         pytest.raises(ValueError, match="through GDRCopy") if refused else nullcontext(),
     ):
-        MoeLoadBalancer(0, WORLD_SIZE, layer_updates_per_iter)
+        FaultTolerantMoeLoadBalancer(0, WORLD_SIZE, layer_updates_per_iter, mapping=None)
 
 
 def test_largest_failure_size():
@@ -504,7 +508,7 @@ def test_deepseek_r1_ep32_spare_slots(monkeypatch):
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(f"{_ER}.DeploymentHostWeights"),
     ):
-        load_balancer = MoeLoadBalancer(
+        load_balancer = FaultTolerantMoeLoadBalancer(
             0, 32, 0, mapping=Mapping(world_size=32, tp_size=32, gpus_per_node=4)
         )
         layer = load_balancer.add_layer(256, 8, 8)
@@ -848,7 +852,7 @@ def test_replacement_shares_tuner_layout(monkeypatch, replacement):
         patch(f"{_ER}.DeploymentHostWeights"),
         patch("torch.cuda.Event"),
     ):
-        load_balancer = MoeLoadBalancer(
+        load_balancer = FaultTolerantMoeLoadBalancer(
             5, 8, 1, mapping=Mapping(world_size=8, tp_size=8, gpus_per_node=4)
         )
         layer = load_balancer.add_layer(16, 2, 2, aux_stream=Mock())
@@ -930,11 +934,14 @@ def test_host_weights_named_after_deployment(monkeypatch, fault_tolerance):
     monkeypatch.setattr(f"{_MLB}.wide_ep_fault_tolerance_enabled", lambda: fault_tolerance)
     monkeypatch.delenv("TRTLLM_EPLB_SHM_NAME", raising=False)
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
+    load_balancer_cls = MoeLoadBalancer
+    if fault_tolerance:
+        load_balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer, mapping=None)
     names = []
     for _ in range(2):  # Two deployments in turn, in which rank 0 draws the nonce.
         monkeypatch.setattr(rank_failure_recovery, "_deployment_nonce", None)
         with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
-            names.append(MoeLoadBalancer(0, WORLD_SIZE, 0).shared_memory_base_name)
+            names.append(load_balancer_cls(0, WORLD_SIZE, 0).shared_memory_base_name)
     if fault_tolerance:
         assert all(name.startswith("moe_shared_") for name in names)
         assert names[0] != names[1]
@@ -1166,7 +1173,7 @@ def test_host_weights_round_trip_by_name(monkeypatch, tracked, replacement_of_ra
     monkeypatch.setenv("TRTLLM_EPLB_SHM_NAME", f"test_host_weights_{os.getpid()}")
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 0, 1, 1])
     with patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"):
-        load_balancer = MoeLoadBalancer(0, WORLD_SIZE, 0)
+        load_balancer = FaultTolerantMoeLoadBalancer(0, WORLD_SIZE, 0, mapping=None)
     base_name = load_balancer.shared_memory_base_name
     original = _sharer(0, 1.0, base_name=base_name)
     original.finalize_layer_weights()

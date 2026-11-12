@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for MnnvlMemory.remap and HostExchangeMnnvlMemory against a fake CUDA driver.
+"""Tests for MembershipMnnvlMemory.remap and HostExchangeMnnvlMemory against a fake CUDA driver.
 
 A remap keeps the addresses, maps only the active rows, and puts the requested rows on fresh pages.
 """
@@ -25,9 +25,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import tensorrt_llm._torch.distributed.membership_mnnvl_memory as membership_mnnvl
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 from tensorrt_llm._torch.distributed.host_exchange import HostExchangeMnnvlMemory
 from tensorrt_llm._torch.distributed.membership import StoreGroup
+from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_active_group import (
     MnnvlMappingError,
     MnnvlPeerHandleError,
@@ -111,7 +113,7 @@ class _FakeDriver:
         return 0
 
 
-class _RemapMemory(mnnvl.MnnvlMemory):
+class _RemapMemory(MembershipMnnvlMemory):
     pass
 
 
@@ -216,7 +218,7 @@ def test_release_skips_unmapped_absent_rows(memory, driver):
 
 def test_remap_logs_one_timed_line(memory, driver, monkeypatch):
     clock = iter([10.0, 10.25])
-    monkeypatch.setattr(mnnvl, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
+    monkeypatch.setattr(membership_mnnvl, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
     info = Mock()
     monkeypatch.setattr(mnnvl.logger, "info", info)
     memory.remap(_gather_without({2}), _ALL)

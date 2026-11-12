@@ -112,9 +112,9 @@ from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          MultimodalEncoderRequestError, PyResult,
-                          get_draft_token_length, get_mm_context_chunk_start,
-                          get_mm_items_for_chunk, get_mm_pending_items,
+                          MultimodalEncoderRequestError, get_draft_token_length,
+                          get_mm_context_chunk_start, get_mm_items_for_chunk,
+                          get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
@@ -142,6 +142,8 @@ from .scheduler.gen_admission_queue import (GenAdmissionConfig,
 from .scheduler.gen_preemption import create_gen_preemption
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
+from .step_acceptance import (ContextCommits, ContextRows,
+                              accept_previous_batch, mark_context_rows)
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -567,10 +569,8 @@ class BatchState:
     # None until then.
     guided_failures: Optional[List[Tuple[int, str]]] = None
     # Context reuse commits held until the step is accepted.
-    context_commits: Optional[List[Tuple[KVCacheManagerV2, Dict[int,
-                                                                int]]]] = None
-    context_rows: Optional[List[Tuple[LlmRequest,
-                                      PyResult.ContextRowsMark]]] = None
+    context_commits: Optional[ContextCommits] = None
+    context_rows: Optional[ContextRows] = None
 
 
 @dataclasses.dataclass
@@ -5176,12 +5176,11 @@ class PyExecutor:
             # forward together, but their batch sizes can differ: one CP rank
             # can pad a dummy request that its peer failed to allocate. With
             # cp_size == 1 this is the TP gather.
-            recovery = self.rank_failure_recovery
-            if recovery is None:
+            if self.rank_failure_recovery is None:
                 batch_sizes = self.dist.tp_cp_allgather_int64(
                     [scheduled_batch.batch_size])[:, 0]
             else:
-                batch_sizes = recovery.forward_vote(
+                batch_sizes = self.rank_failure_recovery.forward_vote(
                     scheduled_batch.batch_size, self.dist.tp_cp_allgather_int64)
             can_queue = bool(self.dist.tp_active_rows(batch_sizes).all())
             # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
@@ -5218,11 +5217,9 @@ class PyExecutor:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
     def _update_v2_context_resources(
-        self,
-        scheduled_batch,
-        context_commits: Optional[List[Tuple[KVCacheManagerV2,
-                                             Dict[int, int]]]] = None
-    ) -> None:
+            self,
+            scheduled_batch,
+            context_commits: Optional[ContextCommits] = None) -> None:
         """Update self, draft, and cross caches after a context forward.
 
         With ``context_commits``, the reuse commits wait until the step is
@@ -5243,39 +5240,11 @@ class PyExecutor:
                 manager.update_context_resources(scheduled_batch, commit_ends)
                 context_commits.append((manager, commit_ends))
 
-    def _commit_v2_context_blocks(self, batch_state: BatchState) -> None:
-        """Commit the context chunks of an accepted step for reuse."""
-        if not any(commit_ends
-                   for _, commit_ends in batch_state.context_commits):
-            return
-        # A commit can rewrite host page-index rows that the current step's
-        # input copy may still be reading.
-        self._wait_for_model_engine_input_copy()
-        for manager, commit_ends in batch_state.context_commits:
-            manager.commit_context_blocks(batch_state.scheduled_requests,
-                                          commit_ends)
-
     def _accepted_previous_batch(self) -> Optional[BatchState]:
-        """Return ``previous_batch`` once rank failure recovery accepted it.
-
-        A discarded batch leaves the grammar matchers of its requests unknown,
-        so they are dropped.
-        """
-        batch = self.previous_batch
-        if self.rank_failure_recovery is None or batch is None:
-            return batch
-        self.rank_failure_recovery.drop_invalid_step()
-        if self.previous_batch is not None:
-            self._commit_v2_context_blocks(batch)
-            return batch
-        requests = batch.scheduled_requests.all_requests()
-        if self.guided_decoder is not None:
-            self.guided_decoder.discard_matchers(requests)
-        if (self.capturable_guided_decoder is not None
-                and batch.guided_batch_id is not None):
-            self.capturable_guided_decoder.discard_batch(
-                requests, batch.guided_batch_id)
-        return None
+        """Return ``previous_batch`` unless rank failure recovery discarded it."""
+        if self.rank_failure_recovery is None:
+            return self.previous_batch
+        return accept_previous_batch(self)
 
     def _terminate_attention_dp_dummy_requests(self) -> None:
         """Terminate every local attention-DP dummy without assuming its position.
@@ -7510,11 +7479,8 @@ class PyExecutor:
                         self._submit_encoder_step(
                             scheduled_batch.encoder_requests)
 
-                    context_rows = ([
-                        (request, request.py_result.mark_context_rows())
-                        for request in scheduled_batch.context_requests
-                        if request.py_return_context_logits
-                    ] if self.rank_failure_recovery is not None else None)
+                    context_rows = (None if self.rank_failure_recovery is None
+                                    else mark_context_rows(scheduled_batch))
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:

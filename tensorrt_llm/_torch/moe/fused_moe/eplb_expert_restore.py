@@ -8,7 +8,7 @@ import stat
 import time
 from dataclasses import dataclass
 from multiprocessing import resource_tracker, shared_memory
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -16,12 +16,10 @@ import torch
 import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._wide_ep_fault_tolerance import fault_tolerance_replacement
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
-from .moe_load_balancer import HostMoeTensorSharer
-
-if TYPE_CHECKING:
-    from .moe_load_balancer import MoeLoadBalancer
+from .moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
 
 
 def plan_layer_placement(
@@ -502,3 +500,37 @@ class EplbExpertRestore:
         _phase_done(times, "load and install", start_s)
         self.active_ranks = plan.active_ranks
         return mapped
+
+
+class FaultTolerantMoeLoadBalancer(MoeLoadBalancer):
+    """MoE load balancer whose spare slots take the experts of failed ranks under Wide-EP fault tolerance."""
+
+    def __init__(self, *args, mapping: Mapping, **kwargs):
+        super().__init__(*args, **kwargs)
+        from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import deployment_nonce
+
+        self.mapping = mapping
+        # The host weights outlive their processes, so their names are unique to the deployment.
+        self.shared_memory_base_name += f"_{deployment_nonce()}"
+        self.expert_restore = EplbExpertRestore(self)
+
+    def finalize_model(self):
+        super().finalize_model()
+        spare_slot_count = max(
+            (layer.spare_slot_count for layer in self.single_layer_load_balancers), default=0
+        )
+        if spare_slot_count and self.ep_rank == 0:
+            logger.info(
+                f"Wide-EP fault tolerance adds up to {spare_slot_count} unbacked spare slots per rank"
+            )
+
+    def abandon_iterations(self) -> None:
+        """End the online EPLB work of the iterations a rank failure interrupted.
+
+        Every launched kernel must be able to finish, and no forward may launch until this returns.
+        """
+        if self.in_iter:
+            raise RuntimeError("Cannot abandon iterations while an iteration is active")
+        self.load_balancer_impl.abandon_iterations()
+        for layer in self.single_layer_load_balancers:
+            layer.abandon_forward()

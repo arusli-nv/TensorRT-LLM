@@ -46,7 +46,7 @@ from torch.distributed import TCPStore
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed.membership import StoreGroup
-from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
@@ -63,7 +63,7 @@ _TIMEOUT = timedelta(seconds=300)
 
 
 class _StoreComm:
-    """Implement the communicator subset MnnvlMemory uses over a TCPStore, so a peer can be killed."""
+    """Implement the communicator subset MembershipMnnvlMemory uses over a TCPStore, so a peer can be killed."""
 
     def __init__(self, store: TCPStore, rank: int, size: int) -> None:
         self.store, self.rank, self.size, self.calls = store, rank, size, 0
@@ -160,7 +160,11 @@ def _combine(received, offset, workspace, meta, rank, ep_size, mask, abort):
 
 
 def _bound_state(
-    memory: MnnvlMemory, workspace: torch.Tensor, meta: torch.Tensor, rank: int, ep_size: int
+    memory: MembershipMnnvlMemory,
+    workspace: torch.Tensor,
+    meta: torch.Tensor,
+    rank: int,
+    ep_size: int,
 ) -> MoeExecutionState:
     """Return a survivor's MoeExecutionState, bound by an NVLinkOneSided layer on ``workspace``.
 
@@ -261,7 +265,11 @@ def _check_late_writes(store: TCPStore, row: torch.Tensor, active: torch.Tensor,
 
 
 def _survivor(
-    store: TCPStore, memory: MnnvlMemory, workspace: torch.Tensor, meta: torch.Tensor, mode: str
+    store: TCPStore,
+    memory: MembershipMnnvlMemory,
+    workspace: torch.Tensor,
+    meta: torch.Tensor,
+    mode: str,
 ) -> None:
     """Run rank 0 of two. Abort the combine waiting on the victim, remap alone and replay the graph."""
     rank, ep_size, victim = 0, 2, 1
@@ -347,7 +355,7 @@ def _survivor(
 
 def _survivor_with_peers(
     store: TCPStore,
-    memory: MnnvlMemory,
+    memory: MembershipMnnvlMemory,
     workspace: torch.Tensor,
     meta: torch.Tensor,
     rank: int,
@@ -453,7 +461,11 @@ def _to_every_rank(ep_size: int) -> torch.Tensor:
 
 
 def _admit(
-    store: TCPStore, state: MoeExecutionState, memory: MnnvlMemory, rank: int, ep_size: int
+    store: TCPStore,
+    state: MoeExecutionState,
+    memory: MembershipMnnvlMemory,
+    rank: int,
+    ep_size: int,
 ) -> _StoreGather:
     """Admit the victim's replacement on any rank and return the admission's exchange.
 
@@ -461,7 +473,7 @@ def _admit(
     Every rank rearms and installs the full membership afterwards.
     """
     gather = _admission_gather(store, rank, ep_size)
-    record = MnnvlMemory.allocated_map[memory.ptr]
+    record = MembershipMnnvlMemory.allocated_map[memory.ptr]
     kept = list(record.mem_handles)
     for peer in range(ep_size):
         state.health.mark_active(peer)
@@ -512,15 +524,17 @@ def _replacement(store: TCPStore, rank: int, ep_size: int) -> None:
     """
     torch.cuda.set_device(rank)
     mapping = Mapping(ep_size, rank, ep_size, tp_size=ep_size, moe_ep_size=ep_size)
-    MnnvlMemory.initialize()
+    MembershipMnnvlMemory.initialize()
     # An isolated startup uses the deployment's layout with only this rank active.
-    MnnvlMemory.comm = StoreGroup(None, "workspace", rank, range(ep_size), active=[rank])
-    MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
+    MembershipMnnvlMemory.comm = StoreGroup(None, "workspace", rank, range(ep_size), active=[rank])
+    MembershipMnnvlMemory.comm_signature = MembershipMnnvlMemory.comm_layout_signature(mapping)
     meta = _workspace_layout(ep_size)
-    memory = MnnvlMemory(mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)]))
+    memory = MembershipMnnvlMemory(
+        mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
+    )
     workspace = memory.as_torch_strided_tensor(torch.uint8)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size)
-    handles = MnnvlMemory.allocated_map[memory.ptr].mem_handles
+    handles = MembershipMnnvlMemory.allocated_map[memory.ptr].mem_handles
     assert [handle is not None for handle in handles] == [r == rank for r in range(ep_size)]
     state = _bound_state(memory, workspace, meta, rank, ep_size)
     admission = _admit(store, state, memory, rank, ep_size)
@@ -546,12 +560,14 @@ def _worker(rank: int, port: int, mode: str, ep_size: int) -> None:
         return
     torch.cuda.set_device(rank)
     mapping = Mapping(ep_size, rank, ep_size, tp_size=ep_size, moe_ep_size=ep_size)
-    MnnvlMemory.initialize()
+    MembershipMnnvlMemory.initialize()
     comm = _StoreComm(store, rank, ep_size)
-    MnnvlMemory.comm = comm
-    MnnvlMemory.comm_signature = MnnvlMemory.comm_layout_signature(mapping)
+    MembershipMnnvlMemory.comm = comm
+    MembershipMnnvlMemory.comm_signature = MembershipMnnvlMemory.comm_layout_signature(mapping)
     meta = _workspace_layout(ep_size)
-    memory = MnnvlMemory(mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)]))
+    memory = MembershipMnnvlMemory(
+        mapping, int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
+    )
     workspace = memory.as_torch_strided_tensor(torch.uint8)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size)
     # No peer may write into a row before its owner has initialized it.
@@ -568,8 +584,8 @@ def _run(ep_size: int, mode: str, kill_delay_s: float | None) -> None:
     """Run ``ep_size`` workers with the last one as the victim, and kill it after ``kill_delay_s`` if set."""
     if torch.cuda.device_count() < ep_size:
         pytest.skip(f"Requires {ep_size} local GPUs")
-    MnnvlMemory.initialize()
-    if not MnnvlMemory.supports_mnnvl():
+    MembershipMnnvlMemory.initialize()
+    if not MembershipMnnvlMemory.supports_mnnvl():
         pytest.skip("Requires an NVLink fabric supported by MNNVL")
     store = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, timeout=_TIMEOUT)
     # One worker is killed, so keep the workers off any enclosing launcher's process management.

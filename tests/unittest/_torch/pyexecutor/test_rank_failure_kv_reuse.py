@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.step_acceptance import commit_context_blocks
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.conversation_params import ConversationParams
@@ -73,7 +74,7 @@ def _executor(manager, fault_tolerance):
         _wait_for_model_engine_input_copy=lambda: None,
     )
     executor.update = partial(PyExecutor._update_v2_context_resources, executor)
-    executor.accept = partial(PyExecutor._commit_v2_context_blocks, executor)
+    executor.accept = partial(commit_context_blocks, executor)
     return executor
 
 

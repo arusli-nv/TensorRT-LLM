@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
-import contextlib
 import itertools
 import math
 import os
-import shutil
 import socket
 import subprocess  # nosec B404
 import sys
@@ -29,6 +27,8 @@ from .. import _utils
 from .._utils import global_mpi_rank, mpi_rank
 from .._wide_ep_fault_tolerance import (FAULT_TOLERANCE_RANK_ENV, RankIdentity,
                                         wide_ep_fault_tolerance_enabled)
+from ._llmapi_node_supervisor import (start_session_node_supervisor,
+                                      stop_session_node_supervisor)
 from .utils import logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
@@ -598,8 +598,10 @@ class MpiPoolSession(MpiSession):
             self.mpi_pool = None
             if self._wait_shutdown:
                 self._wait_workers_exit()
-        if wide_ep_fault_tolerance_enabled():
-            self._stop_node_supervisor(wait)
+        if self._node_supervisor is not None:
+            stop_session_node_supervisor(
+                self._node_supervisor,
+                _mgmn_shutdown_grace_seconds() if wait else None)
 
     def _collect_worker_identities(self) -> Tuple:
         """(pid, start_time) of every worker, recorded right after spawn.
@@ -699,8 +701,8 @@ class MpiPoolSession(MpiSession):
         self._pool_dead = True
 
     def abort(self):
-        if wide_ep_fault_tolerance_enabled():
-            self._stop_node_supervisor(wait=False)
+        if self._node_supervisor is not None:
+            stop_session_node_supervisor(self._node_supervisor, None)
         self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
@@ -742,7 +744,11 @@ class MpiPoolSession(MpiSession):
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
         if wide_ep_fault_tolerance_enabled():
-            self._start_node_supervisor({**os.environ, **env})
+            self._node_supervisor = start_session_node_supervisor(
+                self.n_workers, {
+                    **os.environ,
+                    **env
+                })
             # One node of n_workers ranks, as the node supervisor's.
             env[FAULT_TOLERANCE_RANK_ENV] = RankIdentity(
                 0, self.n_workers, self.n_workers, False).env_value()
@@ -751,35 +757,6 @@ class MpiPoolSession(MpiSession):
                                         path=sys.path,
                                         env=env,
                                         python_args=python_args)
-
-    def _start_node_supervisor(self, env: Dict[str, str]) -> None:
-        """Start the node supervisor of ranks 1 to ``n_workers - 1``."""
-        launcher = shutil.which("trtllm-llmapi-launch")
-        if launcher is None:
-            raise RuntimeError("Wide-EP fault tolerance starts the ranks with "
-                               "trtllm-llmapi-launch, which is not on PATH")
-        supervisor = os.path.join(os.path.dirname(__file__),
-                                  "_llmapi_node_supervisor.py")
-        self._node_supervisor = subprocess.Popen(  # nosec B603
-            [
-                sys.executable, supervisor, "--node-rank", "0", "--nodes", "1",
-                "--gpus-per-node",
-                str(self.n_workers), "--rank-0-in-session", "--", launcher
-            ],
-            env=env)
-
-    def _stop_node_supervisor(self, wait: bool) -> None:
-        """Stop the node supervisor, after the shutdown grace if ``wait``."""
-        supervisor, self._node_supervisor = self._node_supervisor, None
-        if supervisor is None:
-            return
-        if wait:
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                supervisor.wait(_mgmn_shutdown_grace_seconds())
-                return
-        supervisor.terminate()
-        if wait:
-            supervisor.wait()
 
     def __del__(self):
         self.shutdown_abort()

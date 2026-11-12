@@ -2190,10 +2190,12 @@ def _previous_batch_consumer(consumer, dropped):
     (``dropped``), and ``consumer``, the path that applies that batch; records the order of the steps."""
     executor = object.__new__(PyExecutor)
     calls = []
+    kv_cache_manager = Mock()
+    kv_cache_manager.commit_context_blocks.side_effect = lambda *args: calls.append("commit")
     executor.previous_batch = types.SimpleNamespace(
         scheduled_requests=Mock(all_requests=Mock(return_value=["request"])),
         sample_state="sample state",
-        context_commits=[],
+        context_commits=[(kv_cache_manager, {7: 64})],
         guided_batch_id=3,
     )
 
@@ -2205,7 +2207,6 @@ def _previous_batch_consumer(consumer, dropped):
     executor.rank_failure_recovery = Mock(drop_invalid_step=drop_invalid_step)
     executor.guided_decoder = Mock()
     executor.capturable_guided_decoder = Mock()
-    executor._commit_v2_context_blocks = Mock(side_effect=lambda batch: calls.append("commit"))
     executor._update_requests = Mock(side_effect=lambda state: calls.append("update"))
     executor.dist = Mock(pp_size=1)
     executor.enable_attention_dp = True

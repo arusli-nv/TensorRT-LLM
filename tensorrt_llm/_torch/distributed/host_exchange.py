@@ -20,6 +20,7 @@ from tensorrt_llm.math_utils import ceil_div
 from . import mnnvl_memory
 from .communicator import MPIDist, ReduceOp, _check_reduce_op
 from .host_exchange_epoch import next_epoch
+from .membership_mnnvl_memory import MembershipMnnvlMemory
 from .mnnvl_memory import (
     MnnvlMemory,
     TpMnnvlMemory,
@@ -43,7 +44,7 @@ def _rank_mask(ranks: Iterable[int]) -> int:
     return sum(1 << rank for rank in ranks)
 
 
-class HostExchangeMnnvlMemory(MnnvlMemory):
+class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
     """MNNVL memory of one row per rank, every row mapped in every process at ``ptr + r * stride``.
 
     The rows sit back to back, so one strided copy reaches every row. The row of an absent rank maps local scratch

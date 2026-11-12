@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import gc
 import os
 import threading
@@ -999,8 +1000,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: Optional[str] = None,
-                 mapping: Optional[Mapping] = None):
+                 shared_memory_base_name: Optional[str] = None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -1009,12 +1009,10 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
-            mapping: The deployment's mapping.
         """
         self.is_shutdown = True
         self.ep_rank = ep_rank
         self.ep_size = ep_size
-        self.mapping = mapping
         self.layer_updates_per_iter = layer_updates_per_iter
         self.load_balancer_impl = _tbr.MoeLoadBalancer(
             ep_rank,
@@ -1025,11 +1023,6 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.single_layer_load_balancers = []
         self.shared_memory_base_name = shared_memory_base_name or os.getenv(
             'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
-        if wide_ep_fault_tolerance_enabled():
-            # The host weights outlive their processes, so their names are unique to the deployment.
-            from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import \
-                deployment_nonce
-            self.shared_memory_base_name += f"_{deployment_nonce()}"
         self._setup_mpi_comm()
         self.is_shutdown = False
 
@@ -1041,9 +1034,6 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
 
         self.next_layer_repeated_count = None
         self.expert_restore = None
-        if wide_ep_fault_tolerance_enabled():
-            from .eplb_expert_restore import EplbExpertRestore
-            self.expert_restore = EplbExpertRestore(self)
 
     # Without per-layer dynamic EPLB, executor teardown is rank-local and this
     # balancer is released by its own finalizer, which unlinks its shared memory.
@@ -1140,16 +1130,9 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         if fault_tolerance_replacement() is not None:
             self.expert_restore.wait_for_node_host_weights()
         # All shared memory mapping after this barrier.
-        spare_slot_count = max((layer.spare_slot_count
-                                for layer in self.single_layer_load_balancers),
-                               default=0)
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
-        if spare_slot_count and self.ep_rank == 0:
-            logger.info(
-                f"Wide-EP fault tolerance adds up to {spare_slot_count} unbacked spare slots per rank"
-            )
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):
@@ -1160,11 +1143,6 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             iter_count: The number of warm-up iterations
         """
         self.load_balancer_impl.set_warm_up_iter_count(iter_count)
-
-    def has_host_weights(self) -> bool:
-        """Return whether this node holds host weights of every expert of every layer."""
-        return all(layer.need_load_shared_weights()
-                   for layer in self.single_layer_load_balancers)
 
     def reconfigure_mask_only(self, dead_ranks: list[int]) -> None:
         """
@@ -1199,18 +1177,6 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.load_balancer_impl.end_iter(self.iter_id)
         self.in_iter = False
         self.iter_id += 1
-
-    def abandon_iterations(self) -> None:
-        """End the online EPLB work of the iterations a rank failure interrupted.
-
-        Every launched kernel must be able to finish, and no forward may launch until this returns.
-        """
-        if self.in_iter:
-            raise RuntimeError(
-                "Cannot abandon iterations while an iteration is active")
-        self.load_balancer_impl.abandon_iterations()
-        for layer in self.single_layer_load_balancers:
-            layer.abandon_forward()
 
     def shutdown(self, local_safe: bool = True) -> bool:
         """Collectively release resources after an all-rank safety preflight."""
@@ -1324,11 +1290,15 @@ def maybe_create_moe_load_balancer(
                 # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
                 pass
 
-            moe_load_balancer = MoeLoadBalancer(
+            moe_load_balancer_cls = MoeLoadBalancer
+            if wide_ep_fault_tolerance_enabled():
+                from .eplb_expert_restore import FaultTolerantMoeLoadBalancer
+                moe_load_balancer_cls = functools.partial(
+                    FaultTolerantMoeLoadBalancer, mapping=model_config.mapping)
+            moe_load_balancer = moe_load_balancer_cls(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
-                layer_updates_per_iter=config.layer_updates_per_iter,
-                mapping=model_config.mapping)
+                layer_updates_per_iter=config.layer_updates_per_iter)
             logger.info(
                 "Created standard MoE LoadBalancer, layer_updates_per_iter=%s...",
                 config.layer_updates_per_iter,

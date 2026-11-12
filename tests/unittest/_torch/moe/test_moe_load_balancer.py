@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import gc
 import os
 import unittest
@@ -15,8 +16,8 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import \
-    EplbExpertRestore
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
+    EplbExpertRestore, FaultTolerantMoeLoadBalancer)
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import \
     MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
@@ -732,8 +733,12 @@ def test_online_eplb_loads_slots_whose_spare_slot_maps_no_memory(monkeypatch):
     monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
     torch.cuda.set_device(0)
     expert_count, slot_elements = 4, 1 << 21  # 8 MiB slots: whole VMM chunks
-    balancer = MoeLoadBalancer(
-        0, 2, 1, shared_memory_base_name=f"test_online_unbacked_{os.getpid()}")
+    balancer = FaultTolerantMoeLoadBalancer(
+        0,
+        2,
+        1,
+        shared_memory_base_name=f"test_online_unbacked_{os.getpid()}",
+        mapping=None)
     try:
         layer = balancer.add_layer(expert_count, 2, 3)
         assert (layer.slot_count_per_rank, layer.spare_slot_count) == (6, 3)
@@ -820,11 +825,12 @@ def test_a_failed_rank_s_expert_is_restored_into_a_spare_slot_until_it_rejoins(
     mib = 1 << 20
     # The one VMM chunk all unbacked pieces of the process map: released once no piece maps it.
     scratch = 2 * mib
-    balancer = MoeLoadBalancer(
+    balancer = FaultTolerantMoeLoadBalancer(
         0,
         2,
         layer_updates_per_iter,
-        shared_memory_base_name=f"test_restore_{os.getpid()}")
+        shared_memory_base_name=f"test_restore_{os.getpid()}",
+        mapping=None)
     try:
         # Top-1: route() selects one expert per token.
         layer = balancer.add_layer(expert_count, 1, 3)
@@ -1043,7 +1049,11 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
     allocated, reserved = torch.cuda.memory_allocated(
     ), torch.cuda.memory_reserved()
     unbacked_before = counters.gpu
-    balancer = MoeLoadBalancer(
+    balancer_cls = MoeLoadBalancer
+    if fault_tolerance:
+        balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer,
+                                         mapping=None)
+    balancer = balancer_cls(
         0, 2, 0, shared_memory_base_name=f"test_load_memory_{os.getpid()}")
     try:
         with balancer, MetaInitMode() if meta_init else nullcontext():

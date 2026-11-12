@@ -41,6 +41,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdogTimeout,
     EPGroupHealthLike,
 )
+from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_memory import (
     CftMnnvlMemory,
     MnnvlCheckpointCommunicator,
@@ -622,6 +623,8 @@ class NVLinkOneSided(Communication):
 
         workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
         memory_cls = CftMnnvlMemory if self.can_use_cft_counted_writes else MnnvlMemory
+        if wide_ep_fault_tolerance_enabled():
+            memory_cls = MembershipMnnvlMemory
         workspace_created = workspace_state is None
         if workspace_state is None:
             tllm_logger.info(
