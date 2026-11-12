@@ -624,6 +624,8 @@ TRANSACTION_KEY = "last_transaction"
 # Per rank, the newest incarnation whose liveness connection closed after those of every older one.
 DISCONNECTED_KEY = "disconnected"
 HOST_WEIGHTS_PREFIX_KEY = "host_weights_prefix"
+# Per rank, under "<key>/<rank>", b"1" once its node supervisor stopped starting replacements of it, else b"0".
+REPLACEMENT_GIVEN_UP_KEY = "replacement_given_up"
 
 
 # Ranks per store counter of an arrival mask. The store's counters are signed 64-bit integers.

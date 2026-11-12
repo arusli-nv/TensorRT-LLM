@@ -40,7 +40,6 @@ LOAD_S = 3600.0
 
 _WORKER = r"""
 import os, sys, time
-from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery
 from tensorrt_llm._wide_ep_fault_tolerance import (
@@ -61,12 +60,6 @@ def worker_main(**args):
         print(f"AUTHORITY {recovery._authority.pid}", flush=True)
     time.sleep(load_s)  # the model load
     recovery.wait_for_every_rank()
-    # Bind the client as the executor does, with the real handler for a failed authority.
-    executor = SimpleNamespace(rank=rank, _exit=lambda status, reason: recovery._end_process(rank, status, reason))
-    recovery._client.bind(
-        recovery._on_record_at_startup,
-        on_error=lambda error: recovery.RankFailureRecovery._on_client_error(executor, error),
-    )
     print(f"SERVING {rank}", flush=True)
     time.sleep(3600)
 
@@ -246,15 +239,11 @@ def test_rank_without_rank_0_times_out():
 
 
 @pytest.mark.timeout(900)
-def test_ranks_serve_without_authority():
-    """Keep serving without fault tolerance when the authority dies, since ranks hold no lease.
-
-    If rank 0 also ends, node 0's supervisor ends the job, as test_node_supervisor.py checks.
-    """
+def test_ranks_end_when_authority_dies():
+    """End every rank with an error when the authority dies, so that the launcher ends the job."""
     with Deployment(3) as ranks:
         for rank in range(3):
             ranks.start(rank, load_s=1)
         ranks.wait_for_all("SERVING", range(3))
         os.kill(ranks.authority_pid(), signal.SIGKILL)
-        time.sleep(5)
-        assert all(process.poll() is None for process in ranks.processes.values())
+        assert set(ranks.statuses_within(range(3), PROMPT_EXIT_S).values()) == {1}

@@ -78,6 +78,7 @@ from ..distributed.membership import (
     RECORD_KEY,
     RENDEZVOUS_ENV,
     RENDEZVOUS_TIMEOUT_S,
+    REPLACEMENT_GIVEN_UP_KEY,
     SHARED_SECRET_ENV,
     STORE_POLL_S,
     TRANSACTION_KEY,
@@ -90,6 +91,7 @@ from ..distributed.membership import (
     ResumeState,
     StoreGroup,
     TransactionSummary,
+    authority_ports,
     has_rank,
     open_store,
     rendezvous_store,
@@ -1560,35 +1562,54 @@ class FaultToleranceHealth:
         self._secret = secret
         self._store: Optional[RendezvousStore] = None
         self._record: Optional[MembershipRecord] = None
+        self._given_up: List[int] = []
         self._next_open = 0.0
         self._authority_ended = False
         self._lock = threading.Lock()
 
-    def _read(self) -> Tuple[Optional[MembershipRecord], Optional[TransactionSummary], bool]:
-        """Return the record, the last transaction and whether the authority answers.
+    def _read(self) -> Tuple[Optional[TransactionSummary], bool]:
+        """Read the record and the given-up ranks, and return the last transaction and whether the authority answers.
 
-        Once the store has answered, a failed read means the authority ended, so later reads return at once.
+        After a failed read, a later read opens the store again, at most once per read timeout. Once the store has
+        answered, a refused connection means that the authority ended, so later reads return at once.
         """
         with self._lock:
             if self._authority_ended:
-                return self._record, None, False
+                return None, False
             try:
                 if self._store is None:
                     if time.monotonic() < self._next_open:
-                        return self._record, None, False
+                        return None, False
                     self._next_open = time.monotonic() + _STATUS_READ_TIMEOUT_S
                     self._store = open_store(self._address, self._secret, _STATUS_READ_TIMEOUT_S)
                 record, transaction = (
                     self._store.get_if_set(key) for key in (RECORD_KEY, TRANSACTION_KEY)
                 )
+                record = self._parse(MembershipRecord, record)
+                if record is not None:
+                    self._record = record
+                    self._given_up = [
+                        rank
+                        for rank in range(len(record.incarnations))
+                        if not record.is_active(rank)
+                        and self._store.get_if_set(f"{REPLACEMENT_GIVEN_UP_KEY}/{rank}") == b"1"
+                    ]
             except (RuntimeError, OSError):
-                self._authority_ended = self._store is not None
                 self._store = None
-                return self._record, None, False
-            record = self._parse(MembershipRecord, record)
-            if record is not None:
-                self._record = record
-            return self._record, self._parse(TransactionSummary, transaction), True
+                self._authority_ended = self._record is not None and self._store_refuses()
+                return None, False
+            return self._parse(TransactionSummary, transaction), True
+
+    def _store_refuses(self) -> bool:
+        """Return whether the store's port refuses connections, so that no process listens on it."""
+        host, port, _ = authority_ports(self._address)
+        try:
+            socket.create_connection((host, port), _STATUS_READ_TIMEOUT_S).close()
+        except ConnectionRefusedError:
+            return True
+        except OSError:
+            pass
+        return False
 
     @staticmethod
     def _parse(model: type, value: Optional[bytes]):
@@ -1600,12 +1621,15 @@ class FaultToleranceHealth:
             logger.error(f"Cannot parse a value of the rendezvous store: {error!r}")
             return None
 
-    @staticmethod
-    def _state(record: Optional[MembershipRecord], authority_alive: bool) -> str:
+    def _state(self, authority_alive: bool) -> str:
+        record = self._record
         if record is None:
             return "unprotected"
         # The authority keeps its store up after the deployment ends until every active rank has left.
-        if record.state in (MembershipState.ABORTED, MembershipState.SHUTDOWN):
+        if self._authority_ended or record.state in (
+            MembershipState.ABORTED,
+            MembershipState.SHUTDOWN,
+        ):
             return "failed"
         if not authority_alive:
             return "unprotected"
@@ -1616,13 +1640,15 @@ class FaultToleranceHealth:
 
     def status(self) -> Dict[str, object]:
         """Return the server's fault-tolerance status from the last membership record and transaction."""
-        record, transaction, authority_alive = self._read()
+        transaction, authority_alive = self._read()
+        record = self._record
         status = {
-            "state": self._state(record, authority_alive),
+            "state": self._state(authority_alive),
             "authority_alive": authority_alive,
             "generation": None,
             "active_ranks": None,
             "failed_ranks": None,
+            "replacements": None,
             "incarnations": None,
             "last_transaction": None
             if transaction is None
@@ -1630,10 +1656,14 @@ class FaultToleranceHealth:
         }
         if record is not None:
             world_size = len(record.incarnations)
+            failed_ranks = [r for r in range(world_size) if not record.is_active(r)]
             status.update(
                 generation=record.generation,
                 active_ranks=[r for r in range(world_size) if record.is_active(r)],
-                failed_ranks=[r for r in range(world_size) if not record.is_active(r)],
+                failed_ranks=failed_ranks,
+                replacements={
+                    r: "given_up" if r in self._given_up else "pending" for r in failed_ranks
+                },
                 incarnations=list(record.incarnations),
             )
         return status

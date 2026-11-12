@@ -1661,29 +1661,35 @@ def test_health_state(monkeypatch, record, state):
     assert FaultToleranceHealth("host:1", b"secret").status()["state"] == state
 
 
-def test_health_skips_store_after_authority_ends(monkeypatch):
-    """Check that reads after a failed store read answer unprotected at once without the store.
+@pytest.mark.parametrize(
+    "probe_error, state, later_state",
+    [(TimeoutError(), "unprotected", "healthy"), (ConnectionRefusedError(), "failed", "failed")],
+    ids=["transient", "authority-ended"],
+)
+def test_health_after_failed_read(monkeypatch, probe_error, state, later_state):
+    """Check that a failed store read is unprotected until the store answers again, or failed if it refuses.
 
-    The authority hosts the store and is not restarted. The status keeps the last membership read.
+    The status keeps the last membership read. It opens the store again at most once per read timeout.
     """
-    monkeypatch.setattr(recovery_module, "_STATUS_READ_TIMEOUT_S", 0.0)
+    now = [0.0]
+    monkeypatch.setattr(recovery_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(recovery_module.socket, "create_connection", Mock(side_effect=probe_error))
     store = FakeRendezvousStore(_record(MembershipState.COMMITTED, active_mask=0b1111))
     open_store = Mock(return_value=store)
     monkeypatch.setattr(recovery_module, "open_store", open_store)
     health = FaultToleranceHealth("host:1", b"secret")
-    status = health.status()
-    assert status["state"] == "healthy"
-    assert status["authority_alive"]
+    assert health.status()["state"] == "healthy"
+    answers = store.get_if_set
     store.get_if_set = Mock(side_effect=RuntimeError("the store does not answer"))
-    assert health.status()["state"] == "unprotected"
-    store.get_if_set.reset_mock()
     for _ in range(3):
         status = health.status()
-        assert status["state"] == "unprotected"
+        assert status["state"] == state
         assert not status["authority_alive"]
         assert status["active_ranks"] == list(range(WORLD))
-    store.get_if_set.assert_not_called()
     assert open_store.call_count == 1
+    store.get_if_set = answers
+    now[0] += recovery_module._STATUS_READ_TIMEOUT_S
+    assert health.status()["state"] == later_state
 
 
 def _server(monkeypatch, store):
@@ -1717,17 +1723,20 @@ def test_status_endpoint_reports_membership(monkeypatch):
         ready_unix_ms=1400,
         ended_unix_ms=2500,
     )
-    server = _server(
-        monkeypatch, FakeRendezvousStore(_record(MembershipState.COMMITTED), transaction)
-    )
+    store = FakeRendezvousStore(_record(MembershipState.COMMITTED, active_mask=0b0011), transaction)
+    # Rank 1 serves again, so its earlier mark does not count.
+    for rank in (1, 3):
+        store.values[f"{membership.REPLACEMENT_GIVEN_UP_KEY}/{rank}"] = b"1"
+    server = _server(monkeypatch, store)
     response = asyncio.run(server.fault_tolerance_status())
     assert response.status_code == 200
     assert json.loads(response.body) == {
         "state": "degraded",
         "authority_alive": True,
         "generation": 1,
-        "active_ranks": [0, 1, 3],
-        "failed_ranks": [FAILED],
+        "active_ranks": [0, 1],
+        "failed_ranks": [FAILED, 3],
+        "replacements": {str(FAILED): "pending", "3": "given_up"},
         "incarnations": [0] * WORLD,
         "last_transaction": {
             "generation": 1,

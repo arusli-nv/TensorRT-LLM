@@ -42,8 +42,10 @@ _CONNECT_TIMEOUT_S = 2.0
 _STOP_GRACE_S = 10.0
 _MIN_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 60.0
-# The replacements of a rank that the membership leaves out in a row for the same reason before no other one starts.
-_MAX_REFUSALS = 3
+# The replacements of a rank that fail in a row for the same reason before no other one starts.
+_MAX_FAILED_REPLACEMENTS = 3
+# A replacement that ends after serving this long is a new failure of its rank, not a failed replacement.
+_SERVED_S = 600.0
 
 
 def _exit_status(returncode: int) -> int:
@@ -58,8 +60,10 @@ class _Process:
     pidfd: Optional[int]
     incarnation: Optional[int] = None
     listed: bool = False
-    # A COMMITTED record listed it as an active member.
-    admitted: bool = False
+    # When a COMMITTED record first listed it as an active member.
+    admitted_s: Optional[float] = None
+    # The reason the membership left it out while it joined.
+    left_out_reason: str = ""
     killed: bool = False
     status: Optional[int] = None
 
@@ -158,8 +162,8 @@ class NodeSupervisor:
         self._processes: Dict[int, _Process] = {}
         self._replacements = _Backoff()
         self._given_up: Set[int] = set()
-        # Per rank, the reason the membership last left out a replacement of it, and how many times in a row.
-        self._refusals: Dict[int, Tuple[str, int]] = {}
+        # Per rank, the reason the last replacement of it failed, and how many failed in a row for that reason.
+        self._failed_replacements: Dict[int, Tuple[str, int]] = {}
         self._relaunched: Dict[int, subprocess.Popen] = {}
         self._relaunches = _Backoff()
         self._host_weights_prefix: Optional[str] = None
@@ -322,7 +326,11 @@ class NodeSupervisor:
             if record.is_active(rank):
                 process.listed = True
                 process.incarnation = record.incarnations[rank]
-                process.admitted |= record.state == self._membership.MembershipState.COMMITTED
+                if (
+                    process.admitted_s is None
+                    and record.state == self._membership.MembershipState.COMMITTED
+                ):
+                    process.admitted_s = now_s
             elif process.listed and not process.killed:
                 self._logger.warning(
                     f"Killing rank {rank} (incarnation {process.incarnation}), which the membership record "
@@ -366,6 +374,7 @@ class NodeSupervisor:
         self._processes[rank] = _Process(child, replacement, pidfd, None if replacement else 0)
 
     def _replace(self, rank: int, now_s: float) -> None:
+        self._publish_given_up(rank, False)
         try:
             self._logger.warning(f"Starting a replacement of rank {rank}")
             self._start(rank, replacement=True)
@@ -373,6 +382,21 @@ class NodeSupervisor:
             self._logger.error(f"Cannot start a replacement of rank {rank}: {error!r}")
             self._replacements.delay(rank, now_s)
             self._wake_at_s.append(self._replacements.due_s(rank))
+
+    def _give_up(self, rank: int) -> None:
+        self._given_up.add(rank)
+        self._publish_given_up(rank, True)
+
+    def _publish_given_up(self, rank: int, given_up: bool) -> None:
+        """Publish whether replacements of ``rank`` stopped, which a relaunched supervisor resets."""
+        if self._store is None:
+            return
+        try:
+            self._store.set(
+                f"{self._membership.REPLACEMENT_GIVEN_UP_KEY}/{rank}", b"1" if given_up else b"0"
+            )
+        except (OSError, RuntimeError) as error:
+            self._logger.warning(f"Cannot publish the replacement state of rank {rank}: {error!r}")
 
     def _reap(self, rank: int, now_s: float) -> None:
         process = self._processes[rank]
@@ -386,14 +410,27 @@ class NodeSupervisor:
         )
         if process.status != 0 and self._first_failure is None:
             self._first_failure = _exit_status(process.status)
-        if not process.replacement or process.admitted:
+        served = process.admitted_s is not None and now_s - process.admitted_s >= _SERVED_S
+        if not process.replacement or served:
             self._replacements.reset(rank)
+            self._failed_replacements.pop(rank, None)
             return
         if process.status == self._membership.REPLACEMENT_CANNOT_START:
             self._logger.error(
                 f"The replacement of rank {rank} cannot start, nor could another one"
             )
-            self._given_up.add(rank)
+            self._give_up(rank)
+            return
+        reason = process.left_out_reason or f"each ended before serving for {_SERVED_S:.0f} s"
+        last_reason, count = self._failed_replacements.get(rank, (reason, 0))
+        count = count + 1 if last_reason == reason else 1
+        self._failed_replacements[rank] = (reason, count)
+        if count == _MAX_FAILED_REPLACEMENTS:
+            self._logger.error(
+                f"{count} replacements of rank {rank} failed in a row because {reason}, so no other one starts "
+                f"and the deployment serves without rank {rank}"
+            )
+            self._give_up(rank)
             return
         self._replacements.delay(rank, now_s)
 
@@ -476,7 +513,7 @@ class NodeSupervisor:
 
     def _on_view(self, view) -> None:
         if self._view is not None:
-            self._count_refusals(self._view.record, view.record)
+            self._note_left_out(self._view.record, view.record)
         self._view = view
         if view.record.state not in (
             self._membership.MembershipState.STARTING,
@@ -487,26 +524,17 @@ class NodeSupervisor:
         if self._host_weights_prefix is None:
             self._read_host_weights_prefix()
 
-    def _count_refusals(self, previous, record) -> None:
-        """Count the replacements joining in ``previous`` that ``record`` leaves out with a reason.
-
-        Once the membership left out ``_MAX_REFUSALS`` replacements of a rank in a row for the same reason, no other
-        replacement of the rank starts.
-        """
-        committed = record.state == self._membership.MembershipState.COMMITTED
+    def _note_left_out(self, previous, record) -> None:
+        """Keep the reason of each replacement joining in ``previous`` that ``record`` leaves out with one."""
         for rank in self._ranks:
-            if committed and record.is_active(rank):
-                self._refusals.pop(rank, None)
-            elif previous.is_joining(rank) and not record.is_active(rank) and record.reason:
-                reason, count = self._refusals.get(rank, (record.reason, 0))
-                count = count + 1 if reason == record.reason else 1
-                self._refusals[rank] = (record.reason, count)
-                if count == _MAX_REFUSALS:
-                    self._logger.error(
-                        f"The membership left out {count} replacements of rank {rank} in a row because "
-                        f"{record.reason}, so no other one starts and the deployment serves without rank {rank}"
-                    )
-                    self._given_up.add(rank)
+            process = self._processes.get(rank)
+            if (
+                process is not None
+                and previous.is_joining(rank)
+                and not record.is_active(rank)
+                and record.reason
+            ):
+                process.left_out_reason = record.reason
 
     def _read_host_weights_prefix(self) -> None:
         with contextlib.suppress(OSError, RuntimeError):
@@ -643,21 +671,30 @@ def _end_prrte_job(uri: str, pterm: str, environ: Dict[str, str], timeout_s: flo
 
 
 def _prrte_job_control(
-    environ: Dict[str, str],
+    environ: Dict[str, str], nodes: int
 ) -> Tuple[Optional[List[str]], Optional[Callable[[Dict[str, str], float], None]]]:
-    """Return the ``prun`` command that starts a process on a host of the job and the function that ends the job."""
+    """Return the ``prun`` command that starts a process on a host of the job and the function that ends the job.
+
+    Raises:
+        ValueError: A job of several nodes started by mpirun lacks the PMIx server URI, prun or pterm.
+    """
     if "OMPI_COMM_WORLD_RANK" not in environ:
         return None, None
     uri = next((environ[name] for name in _PMIX_SERVER_URI_VARS if environ.get(name)), None)
     prun = shutil.which("prun", path=environ.get("PATH"))
     pterm = shutil.which("pterm", path=environ.get("PATH"))
-    if uri is None or prun is None or pterm is None:
-        from tensorrt_llm.logger import logger
-
-        logger.error(
-            "Started by mpirun without a PMIx server URI, prun, or pterm. A failed node is not relaunched, and "
-            "the end of rank 0 does not end the job."
+    missing = [
+        name
+        for name, found in (("a PMIx server URI", uri), ("prun", prun), ("pterm", pterm))
+        if found is None
+    ]
+    if missing and nodes > 1:
+        raise ValueError(
+            "Node 0's supervisor relaunches a failed node and ends the job when rank 0 ends through PRRTE, but it "
+            f"lacks {', '.join(missing)}. Start trtllm-llmapi-launch with `mpirun --enable-recovery` of Open MPI 5, "
+            "with prun and pterm on PATH"
         )
+    if missing:
         return None, None
     relaunch_command = [prun, "--dvm-uri", uri, "-n", "1"]
     relaunch_command += ["--map-by", "ppr:1:node:OVERSUBSCRIBE", "--bind-to", "none"]
@@ -753,7 +790,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.environ.update(
         TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""
     )
-    relaunch_command, end_job = _prrte_job_control(environ) if args.node_rank == 0 else (None, None)
+    relaunch_command, end_job = None, None
+    if args.node_rank == 0:
+        try:
+            relaunch_command, end_job = _prrte_job_control(environ, args.nodes)
+        except ValueError as error:
+            parser.error(str(error))
     supervisor = NodeSupervisor(
         args.node_rank,
         args.nodes,

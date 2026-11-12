@@ -27,6 +27,7 @@ from tensorrt_llm._torch.distributed.membership import (
     HOST_WEIGHTS_PREFIX_KEY,
     LIVENESS_KEY,
     RENDEZVOUS_ENV,
+    REPLACEMENT_GIVEN_UP_KEY,
     SHARED_SECRET_ENV,
     MembershipRecord,
     MembershipState,
@@ -351,6 +352,7 @@ def test_failed_replacement_restarts_until_cannot_start(tmp_path, deployment, mo
     # No new replacement starts because it would fail the same way.
     assert running.supervisor._processes[3].status is not None
     assert running.supervisor._given_up == {3}
+    assert authority.store.get_if_set(f"{REPLACEMENT_GIVEN_UP_KEY}/3") == b"1"
     authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0111))
     assert running.wait() == 0
 
@@ -367,8 +369,9 @@ def test_repeated_refusals_stop_replacements(tmp_path, deployment):
     authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
     reason = "a replacement restored a different expert placement than the surviving ranks"
     generation = 1
-    for incarnation in range(1, supervisor_module._MAX_REFUSALS + 1):
+    for incarnation in range(1, supervisor_module._MAX_FAILED_REPLACEMENTS + 1):
         _until(lambda incarnation=incarnation: _read(tmp_path, 3, incarnation))
+        assert authority.store.get_if_set(f"{REPLACEMENT_GIVEN_UP_KEY}/3") == b"0"
         joined = (0, 0, 0, incarnation)
         adding = _record(MembershipState.INSTALL, 0b1111, joined, generation + 1)
         authority.push(adding.model_copy(update=dict(joining_mask=0b1000)))
@@ -380,8 +383,52 @@ def test_repeated_refusals_stop_replacements(tmp_path, deployment):
     _push_and_wait_for_step(
         running, authority, _record(MembershipState.COMMITTED, 0b0111, joined, generation + 1)
     )
-    assert _read(tmp_path, 3, supervisor_module._MAX_REFUSALS + 1) is None
+    assert _read(tmp_path, 3, supervisor_module._MAX_FAILED_REPLACEMENTS + 1) is None
+    assert authority.store.get_if_set(f"{REPLACEMENT_GIVEN_UP_KEY}/3") == b"1"
     authority.push(_record(MembershipState.SHUTDOWN, 0b0111, joined, generation + 2))
+    assert running.wait() == 0
+
+
+@pytest.mark.parametrize(
+    "admitted, served_s, given_up",
+    [(False, 600.0, True), (True, 600.0, True), (True, 0.0, False)],
+    ids=["before-admission", "after-admission", "after-serving"],
+)
+def test_ended_replacements_stop_replacements(
+    tmp_path, deployment, monkeypatch, admitted, served_s, given_up
+):
+    """Check that no replacement starts once three in a row ended before serving for ``_SERVED_S``.
+
+    A replacement that ends after serving longer is a new failure of its rank, so its replacement starts.
+    """
+    monkeypatch.setattr(supervisor_module, "_SERVED_S", served_s)
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    generation = 1
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111, generation=generation))
+    for incarnation in range(1, supervisor_module._MAX_FAILED_REPLACEMENTS + 1):
+        _until(lambda incarnation=incarnation: _read(tmp_path, 3, incarnation))
+        joined = (0, 0, 0, incarnation)
+        if admitted:
+            serving = _record(MembershipState.COMMITTED, 0b1111, joined, generation + 1)
+            _push_and_wait_for_step(running, authority, serving)
+            generation += 2
+        os.kill(_read(tmp_path, 3, incarnation)["pid"], signal.SIGKILL)
+        generation += 1
+        authority.push(_record(MembershipState.COMMITTED, 0b0111, joined, generation))
+    if given_up:
+        _until(lambda: running.supervisor._given_up == {3})
+    else:
+        _until(lambda: _read(tmp_path, 3, supervisor_module._MAX_FAILED_REPLACEMENTS + 1))
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, 0b0111, joined, generation + 1)
+    )
+    assert (_read(tmp_path, 3, supervisor_module._MAX_FAILED_REPLACEMENTS + 1) is None) == given_up
+    assert authority.store.get_if_set(f"{REPLACEMENT_GIVEN_UP_KEY}/3") == (
+        b"1" if given_up else b"0"
+    )
+    authority.push(_record(MembershipState.SHUTDOWN, 0b0111, joined, generation + 3))
     assert running.wait() == 0
 
 
@@ -514,7 +561,7 @@ def test_prrte_tools_keep_run_as_root(tmp_path, deployment, monkeypatch, opt_in,
         # The PID in the URI names no mpirun, so the supervisor ends the job with pterm.
         PMIX_SERVER_URI41="prterun-host-0-0@0.0;tcp4://127.0.0.1:1",
     )
-    relaunch_command, end_job = supervisor_module._prrte_job_control(environ)
+    relaunch_command, end_job = supervisor_module._prrte_job_control(environ, NODES)
     nodes = ((0, "host-0", True), (1, "host-1", True))
     node_1_failed = ((0, "host-0", True), (1, "host-1", False))
     running = _serving(
@@ -529,6 +576,29 @@ def test_prrte_tools_keep_run_as_root(tmp_path, deployment, monkeypatch, opt_in,
         tool_environ = json.loads((tmp_path / f"{name}-environ").read_text())
         for variable in supervisor_module._RUN_AS_ROOT_VARS:
             assert (tool_environ.get(variable) == "1") == (opt_in or root)
+
+
+def test_node_0_requires_prrte_tools(tmp_path, deployment):
+    """Reject a multi-node job under mpirun whose node 0 cannot relaunch a node or end the job.
+
+    One node needs neither, since the end of its supervisor ends the job.
+    """
+    _, environ = deployment
+    environ["PATH"] = str(tmp_path)
+    for name in supervisor_module._PMIX_SERVER_URI_VARS:
+        environ.pop(name, None)
+    node_0 = ["--node-rank", "0", "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
+    supervisor = _supervisor_process(
+        tmp_path, environ, *node_0, *_rank_command(tmp_path), stderr=subprocess.PIPE, text=True
+    )
+    try:
+        _, stderr = supervisor.communicate(timeout=30)
+    finally:
+        supervisor.kill()
+    assert supervisor.returncode == 2
+    assert "lacks a PMIx server URI, prun, pterm" in stderr
+    assert _read(tmp_path, 0, 0) is None
+    assert supervisor_module._prrte_job_control(environ, 1) == (None, None)
 
 
 def test_the_ranks_die_with_their_supervisor(tmp_path, deployment):
@@ -584,6 +654,12 @@ def test_signal_forwarded_to_rank_0_only(tmp_path, deployment):
     """Forward the signal to rank 0, which runs the frontend, and SIGTERM the other ranks after the grace period."""
     authority, environ = deployment
     environ["SUPERVISOR_TEST_MODES"] = "0:0=records-signals 1:0=records-signals"
+    for tool in ("prun", "pterm"):
+        _fake_tool(tmp_path / "bin", tool, tmp_path)
+    environ.update(
+        PATH=f"{tmp_path / 'bin'}:{environ['PATH']}",
+        PMIX_SERVER_URI41="prterun-host-0-0@0.0;tcp4://127.0.0.1:1",
+    )
     node_0 = ["--node-rank", "0", "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
     supervisor = _supervisor_process(tmp_path, environ, *node_0, *_rank_command(tmp_path))
     try:
