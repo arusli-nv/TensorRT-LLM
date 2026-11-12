@@ -383,10 +383,15 @@ def test_cuda_graph_agreement_skips_absent_ranks():
 
 
 def test_attention_dp_balance_ignores_absent_ranks():
-    """Check that a rank that left the group does not hold the survivors' context requests."""
+    """Hold context requests while a serving rank has none, whatever the absent rank's row says."""
+    # Context, generation, tokens and real generation requests per rank. Rank 1 has no context requests and
+    # rank 2 left the group, so its row is zero.
+    rows = np.array([[1, 4, 5, 4], [0, 4, 4, 4], [0, 0, 0, 0], [1, 4, 5, 4]], dtype=np.int64)
     executor = object.__new__(PyExecutor)
-    # Context, generation, tokens and real generation requests of every serving rank.
-    executor.dist = _mnnvl_dist(_host_exchange(lambda r: [1, 4, 5, 4]))
+    executor.dist = SimpleNamespace(
+        tp_allgather_int64=lambda values: rows,
+        tp_active_rows=lambda gathered: gathered[[r for r in range(WORLD) if SURVIVORS >> r & 1]],
+    )
     executor.max_batch_size = 64
     executor.attention_dp_enable_balance = True
     executor.attention_dp_time_out_iters = 60
@@ -398,8 +403,8 @@ def test_attention_dp_balance_ignores_absent_ranks():
     context = [Mock(get_tokens=Mock(return_value=[0]))]
     generation = [Mock(is_attention_dp_dummy=False) for _ in range(4)]
 
-    assert executor._balance_adp_requests(context, generation) == context
-    assert executor.adp_ctx_waiting_iters_count == 0
+    assert executor._balance_adp_requests(context, generation) == []
+    assert executor.adp_ctx_waiting_iters_count == 1
 
 
 # The startup checks, before the model loads.

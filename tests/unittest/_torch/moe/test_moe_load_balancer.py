@@ -574,6 +574,24 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
     assert get_moe_load_balancer() is None
 
 
+@pytest.mark.cpu_only
+def test_cpp_shutdown_before_host_weights_release(
+        mock_runtime: MagicMock) -> None:
+    """Shut the C++ load balancer down before releasing the host weights its updates read."""
+    balancer = MoeLoadBalancer(0, 4, 2)
+    balancer.shared_mpi_comm.allgather.return_value = [True]
+    layer = MagicMock(spec=SingleLayerMoeLoadBalancer)
+    balancer.single_layer_load_balancers.append(layer)
+    order = []
+    mock_runtime.return_value.shutdown.side_effect = lambda: order.append(
+        "C++ shutdown")
+    layer.py_pre_shutdown_cleanup.side_effect = lambda: order.append(
+        "host weights released")
+
+    assert balancer.shutdown()
+    assert order == ["C++ shutdown", "host weights released"]
+
+
 class _WeightLayout(MoEEplbWeightLayoutMixin):
     pass
 
@@ -787,6 +805,37 @@ def _vmm_granularity() -> int:
         CU_MEM_ALLOC_GRANULARITY_MINIMUM)
     assert error == driver.CUresult.CUDA_SUCCESS
     return granularity
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_unbacked_slots_back_and_unback():
+    """Back a spare slot in place and unback it, taking device memory only while it is backed."""
+    from tensorrt_llm.bindings import MemoryCounters
+
+    torch.cuda.set_device(0)
+    chunk = _vmm_granularity()
+    counters = MemoryCounters.instance()
+    before = counters.gpu
+    # Four slots of one VMM chunk each, of which slots 2 and 3 are spare.
+    slots = torch.ops.trtllm.moe_unbacked_slot_tensor([4, chunk], torch.uint8,
+                                                      [2, 3])
+    address = slots.data_ptr()
+    # The two backed slots and at most the scratch chunk the spare slots share.
+    assert counters.gpu - before <= 3 * chunk
+    assert torch.ops.trtllm.moe_unbacked_slots_bytes_to_back(slots,
+                                                             [2]) == chunk
+    assert torch.ops.trtllm.moe_unbacked_slots_set_backed([slots], [2], [1],
+                                                          True) == chunk
+    assert slots.data_ptr() == address
+    slots[2].fill_(7)
+    slots[3].fill_(1)
+    assert bool(slots[2].eq(7).all())
+    backed = counters.gpu
+    assert torch.ops.trtllm.moe_unbacked_slots_set_backed([slots], [2], [1],
+                                                          False) == chunk
+    assert backed - counters.gpu == chunk
+    del slots
+    assert counters.gpu == before
 
 
 def _load_moe_layer(monkeypatch, fault_tolerance: bool,
