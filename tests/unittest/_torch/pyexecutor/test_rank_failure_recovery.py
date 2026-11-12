@@ -185,8 +185,6 @@ class FakeClient:
     def __init__(self):
         self.reports = []
 
-    connected = True
-
     def report(self, **changes):
         self.reports.append(changes)
 
@@ -787,6 +785,22 @@ def test_stop_exits_without_mpi_teardown(monkeypatch, rank, completed, status):
         recovery.stop(completed)
     assert exited.value.code == status
     assert ({"shutdown": True} in recovery._client.reports) == (rank == 0)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_authority_loss_ends_the_process(monkeypatch, rank):
+    _exit_raises(monkeypatch)
+    recovery = _recovery(rank=rank)
+    with pytest.raises(SystemExit) as exited:
+        recovery._on_client_error(ConnectionError("the membership authority closed the connection"))
+    assert exited.value.code == 1
+
+
+def test_authority_loss_at_shutdown_is_quiet(monkeypatch):
+    _exit_raises(monkeypatch)
+    recovery = _recovery(rank=1)
+    recovery._on_record(_record(MembershipState.SHUTDOWN))
+    recovery._on_client_error(ConnectionError("the membership authority closed the connection"))
 
 
 @pytest.mark.parametrize("paused_before", [False, True])

@@ -96,5 +96,5 @@ no `RecreateGroupOnPodRestart`). Set `PMI_RANK` to the node rank, `PMI_SIZE` to 
   `modeling_v2: require`, hybrid linear-attention models, and requests with `n > 1`, `best_of > 1` or beam search.
 - At a failure, survivors lend part of their KV cache to the restored experts until the replacement joins. Startup
   fails if they cannot lend enough for a node (add ranks, use fewer EPLB slots or raise `free_gpu_memory_fraction`).
-- Hardware failures and the loss of rank 0 or its node are not covered.
+- Hardware failures are not covered. The loss of rank 0, its node or the authority ends the deployment.
 - The authority listens on the rendezvous port and the next one on rank 0's node. Run on a trusted network.

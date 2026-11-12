@@ -925,10 +925,12 @@ class RankFailureRecovery:
                 _end_process(self.rank, 1, f"the membership record is {record!r}")
 
     def _on_client_error(self, error: Exception) -> None:
-        """Keep serving unprotected after the client lost its connection, and end any wait for the next record."""
-        with self._record_changed:
-            self._record_changed.notify_all()
-        logger.warning(f"The membership client stopped ({error!r}). Serving continues unprotected.")
+        """End the process once its liveness connection is lost, unless the deployment is shutting down.
+
+        Without the authority no later failure is recovered, so the deployment ends as at the loss of rank 0.
+        """
+        if self._record.state != MembershipState.SHUTDOWN:
+            _end_process(self.rank, 1, f"the membership authority is gone ({error!r})")
 
     def _on_tick(self) -> None:
         waited_rounds = self._moe.waited_rounds()
@@ -1045,17 +1047,9 @@ class RankFailureRecovery:
                     return
 
     def _next_record(self, seen: Optional[MembershipRecord]) -> MembershipRecord:
-        """Wait for a record other than ``seen``, exiting if the authority closes its connection meanwhile."""
+        """Wait for a record other than ``seen``."""
         with self._record_changed:
-            self._record_changed.wait_for(
-                lambda: self._record != seen or not self._client.connected
-            )
-            if self._record == seen:
-                _end_process(
-                    self.rank,
-                    1,
-                    "the membership authority closed its connection during a membership change",
-                )
+            self._record_changed.wait_for(lambda: self._record != seen)
             return self._record
 
     def _end_eplb_iterations(self) -> None:

@@ -16,6 +16,7 @@
 
 import contextlib
 import json
+import os
 import socket
 import threading
 import time
@@ -681,7 +682,7 @@ def _until(condition, timeout_s=10.0):
         time.sleep(0.01)
 
 
-def _member(store, rank, world, replacement=False):
+def _member(store, rank, world, replacement=False, on_error=None):
     """Start a rank's client that replies to every record as an executor does."""
     client = None
 
@@ -693,7 +694,7 @@ def _member(store, rank, world, replacement=False):
         elif record.state == MembershipState.INSTALL:
             client.report(reply=Reply.INSTALLED, reply_generation=record.generation)
 
-    client = MembershipClient(rank, store, on_record, replacement=replacement)
+    client = MembershipClient(rank, store, on_record, replacement=replacement, on_error=on_error)
     client.start()
     if replacement:
         client.report(joining_ready=True, ready_payload=f"rank {rank}")
@@ -727,6 +728,40 @@ def test_ended_process_is_removed_at_once():
             )
         )
         assert time.monotonic() - ended_s < 1.0
+
+
+def test_shutdown_record_precedes_close():
+    """Check that a rank still connected when the authority ends after rank 0 has read the SHUTDOWN record."""
+    store = RendezvousStore(DictStore(), b"shared-secret")
+    parent_read, parent_write = os.pipe()
+    process = AuthorityProcess(2, store, Authority(2, hang_timeout_s=2.0), parent=parent_read)
+    thread = threading.Thread(target=process.run, kwargs={"host": "127.0.0.1"}, daemon=True)
+    thread.start()
+    states_at_close = []
+    clients = []
+    try:
+        _until(lambda: store.store.check([membership.LIVENESS_KEY]))
+        clients.append(_member(store, 0, 2))
+        clients.append(
+            _member(
+                store, 1, 2, on_error=lambda error: states_at_close.append(clients[1].record.state)
+            )
+        )
+        _until(
+            lambda: clients[0].record is not None
+            and clients[0].record.state == MembershipState.COMMITTED
+        )
+        clients[0].report(shutdown=True)
+        _until(lambda: clients[0].record.state == MembershipState.SHUTDOWN)
+        clients[0].stop()
+        os.close(parent_write)  # as when rank 0's process ends
+        thread.join(10)
+        assert not thread.is_alive()
+        _until(lambda: states_at_close)
+    finally:
+        _leave(clients)
+        os.close(parent_read)
+    assert states_at_close == [MembershipState.SHUTDOWN]
 
 
 def test_deployment_at_rest_is_quiet():

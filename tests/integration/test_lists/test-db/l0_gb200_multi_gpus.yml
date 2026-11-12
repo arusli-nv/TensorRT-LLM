@@ -156,3 +156,4 @@ l0_gb200_multi_gpus:
   - test_wide_ep_rank_failure.py::test_invalid_joins TIMEOUT (120)
   - test_wide_ep_rank_failure.py::test_failure_during_admission TIMEOUT (90)
   - test_wide_ep_rank_failure.py::test_rejoin_when_server_spawns_ranks TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::test_authority_loss_ends_deployment TIMEOUT (60)

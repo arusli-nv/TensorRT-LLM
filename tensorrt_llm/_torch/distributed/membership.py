@@ -1020,7 +1020,6 @@ class MembershipClient:
         self._report = RankReport()
         self.record: Optional[MembershipRecord] = None
         self.incarnation: Optional[int] = None
-        self.connected = False
         self._lock = threading.Lock()
         self._delivery = threading.Lock()
         self._stop = threading.Event()
@@ -1051,7 +1050,6 @@ class MembershipClient:
         self.incarnation = MembershipRecord.model_validate_json(self._received[0]).incarnations[
             self.rank
         ]
-        self.connected = True
         self._send_report()
         self._thread.start()
 
@@ -1138,7 +1136,6 @@ class MembershipClient:
                     self._send_report()
         except Exception as error:
             logger.error(f"Membership client of rank {self.rank} failed: {error!r}")
-            self.connected = False
             self._sock.close()
             if self._on_error is not None:
                 self._on_error(error)

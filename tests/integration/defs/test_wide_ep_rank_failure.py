@@ -115,6 +115,8 @@ ADMISSION_PAUSE_TARGET_S = 3.0
 RECOVERY_TIMEOUT_S = 120
 REJOIN_TIMEOUT_S = 1200
 EXCLUDED_EXIT_TIMEOUT_S = 60
+AUTHORITY_LOSS_END_S = 120
+AUTHORITY_MODULE = "tensorrt_llm._torch.distributed.membership"
 INVALID_JOIN_WATCH_S = 20
 REFUSAL_LOG = "Closing a liveness connection: "
 RETRYABLE_LOG = re.compile(
@@ -1383,6 +1385,22 @@ def test_failure_during_install(deployment: Deployment, tmp_path: Path):
         run.cycle(
             "crash", at_admission=lambda: {second: workers[second]}, at_admission_state="INSTALL"
         )
+
+
+@pytest.mark.skip_less_device(WORLD_SIZE)
+@pytest.mark.skipif(EXTERNAL, reason="ends the deployment")
+@pytest.mark.timeout(STARTUP_TIMEOUT_S + AUTHORITY_LOSS_END_S + 600)
+def test_authority_loss_ends_deployment(deployment: Deployment):
+    """Kill the membership authority and check that the server stops answering /health with 200."""
+    authority = [p for p in _node_processes(deployment.secret) if AUTHORITY_MODULE in p.cmdline()]
+    assert len(authority) == 1, f"authority processes on this node: {authority}"
+    authority[0].kill()
+    deadline = time.monotonic() + AUTHORITY_LOSS_END_S
+    while _get_json(f"{deployment.base}/health")[0] == 200:
+        assert time.monotonic() < deadline, (
+            f"/health still answers 200 {AUTHORITY_LOSS_END_S} s after the authority ended"
+        )
+        time.sleep(1)
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
