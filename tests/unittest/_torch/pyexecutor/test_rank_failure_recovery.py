@@ -1879,7 +1879,8 @@ def test_replacement_takes_recorded_startup_values(agreed_startup, monkeypatch):
     startup_record.adopt_tuned_tactics()  # Rank 0 records its tactics and keeps them.
     assert tuned.cache == {("gemm", 8): (0, 3, 0.1)}
     startup_record.close()
-    _replacement_of(monkeypatch, recovery_module._agreed_startup_record())
+    # What rank 0 publishes under AGREED_STARTUP_KEY once its startup is done.
+    _replacement_of(monkeypatch, pickle.dumps({**startup_record.published(), "fingerprint": None}))
 
     # Its peers are absent, so it runs none of the collectives and takes the results of rank 0.
     gathers.clear()
@@ -2014,7 +2015,7 @@ def test_original_rank_binds_client_after_startup(agreed_startup, shared_secret,
     monkeypatch.setattr(
         recovery_module, "rendezvous_store", lambda: (events.append("store"), store)[1]
     )
-    monkeypatch.setattr(recovery_module, "_agreed_startup_record", lambda: b"agreed")
+    monkeypatch.setattr(recovery_module, "_startup_fingerprint", "rank 0's fingerprint")
     executor = _executor(rank)
     executor.kv_cache_manager = device = _Device()
     monkeypatch.setattr(recovery_module.torch.cuda, "mem_get_info", lambda: (device.free, 1 << 40))
@@ -2055,7 +2056,11 @@ def test_original_rank_binds_client_after_startup(agreed_startup, shared_secret,
     # The check shrank the KV cache pool for the largest failure's restore and took its quota back.
     assert _resizes(device) == [54 * MIB, STARTUP_MEMORY.kv_cache_quota]
     assert recovery._authority == ("rank 0's authority" if rank == 0 else None)
-    expected = {HOST_WEIGHTS_PREFIX_KEY: b"moe_shared_deployment_", AGREED_STARTUP_KEY: b"agreed"}
+    agreed = {**startup_record.published(), "fingerprint": "rank 0's fingerprint"}
+    expected = {
+        HOST_WEIGHTS_PREFIX_KEY: b"moe_shared_deployment_",
+        AGREED_STARTUP_KEY: pickle.dumps(agreed),
+    }
     assert store.values == (expected if rank == 0 else {})
 
 
@@ -2215,18 +2220,23 @@ def test_active_ranks_retire_step_before_resize(monkeypatch):
     executor.previous_batch = _batch([_request(14)])
     device = _Device()
     steps = device.calls
-    executor._retire_inflight_batch_for_control.side_effect = lambda: steps.append(
-        ("retire", executor.previous_batch is not None)
-    )
+
+    def retire():
+        steps.append(("retire", executor.previous_batch is not None))
+        executor.previous_batch = None
+
+    executor._retire_inflight_batch_for_control.side_effect = retire
     recovery._exchange.admit = lambda active_mask, epoch: steps.append("admit")
     recovery._moe.workspace_bytes.return_value = 4 * MIB
     monkeypatch.setattr(recovery_module.torch.cuda, "mem_get_info", lambda: (device.free, 1 << 40))
     executor.kv_pools_suspended = device.suspended
     recovery.before_iteration()
+    _vote(recovery)
+    recovery.before_iteration()
     # An admission does not abort the step, so its results are applied before the joining rank enters the host
-    # exchange. The second suspension gives the KV cache memory back once committed.
+    # exchange. The give-back at the next step boundary retires the step in flight before its resize.
     order = [step for step in steps if step != "resume" and step[0] != "resize"]
-    assert order == [("retire", True), "admit", "suspend", "suspend"]
+    assert order == [("retire", True), "admit", "suspend", ("retire", False), "suspend"]
     assert _replies(recovery) == [Reply.INSTALLED]
 
 
