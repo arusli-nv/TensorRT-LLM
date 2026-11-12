@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -26,6 +27,8 @@ from tensorrt_llm._torch.pyexecutor.guided_decoder import (
     GuidedRequests,
     row_has_valid_token,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 
@@ -457,3 +460,67 @@ def test_capturable_failures_are_released_per_batch(monkeypatch):
     assert decoder.take_failed_requests(1) == []
     assert [req_id for req_id, _ in decoder.take_failed_requests(2)] == [9]
     assert decoder.take_failed_requests(2) == []
+
+
+# --- recompute ----------------------------------------------------------------
+
+
+class _RejectingMatcher(_ScriptedMatcher):
+    """Grammar matcher that rejects every token."""
+
+    def accept_token(self, token_id: int) -> bool:
+        return False
+
+
+def _build_recomputed_request(monkeypatch, matcher):
+    """Build the last context chunk of a guided request after a recompute."""
+    request = LlmRequest(
+        request_id=7,
+        max_new_tokens=8,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.py_guided_decoding_params = _GUIDED_PARAMS
+    for token in (10, 11):
+        request.add_new_token(token, 0)
+    # Pause the request with the input-length cap that PyExecutor uses for a recompute.
+    request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
+    # Prefill the whole replayed prompt in one chunk, so this is the last context chunk.
+    request.context_chunk_size = request.context_remaining_length
+    request.py_seq_slot = _SLOT
+
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+    decoder.grammar_matcher_factory = SimpleNamespace(create=lambda params: matcher)
+    requests = GuidedRequests(
+        [GuidedRequest.from_llm_request(request)],
+        num_contexts=1,
+        num_generations=0,
+        max_num_draft_tokens=0,
+    )
+    return decoder, decoder._build(requests)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_recompute_replays_generated_tokens_into_matcher(monkeypatch):
+    """A recomputed guided request replays its generated tokens into the new matcher."""
+    # One valid bitmask row. accept_token records every token.
+    matcher = _ScriptedMatcher([True])
+
+    decoder, failed_requests = _build_recomputed_request(monkeypatch, matcher)
+
+    assert failed_requests == []
+    assert decoder.grammar_matchers[_SLOT] is matcher
+    assert matcher.accepted == [10, 11]
+    # The request got a next-token mask, so it was not failed.
+    assert decoder.token_mask_host[0].item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_recompute_fails_request_on_rejected_replay(monkeypatch):
+    """A replayed token that the new matcher rejects fails only that request."""
+    decoder, failed_requests = _build_recomputed_request(monkeypatch, _RejectingMatcher([True]))
+
+    assert [req_id for req_id, _ in failed_requests] == [7]
+    assert "rejected token 10" in failed_requests[0][1]
+    assert decoder.token_mask_host[0].item() == 0
