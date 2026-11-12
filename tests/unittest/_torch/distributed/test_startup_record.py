@@ -644,3 +644,18 @@ def test_replacement_warmup_uses_rank_0_tactics():
     replacement.autotuner_warmup(16)
     assert replacement.tactics_at_general_warmup == rank_0.profiling_cache.cache
     startup_record.close()
+
+
+def test_replacement_adopts_independent_op_tactics():
+    """Check that a replacement takes rank 0's tactics of an op that every rank tunes on its own."""
+    rank_0 = _DecoderEngine(_rank_0(), measured_ms=0.1)
+    bmm = ("bmm", "BmmRunner", "0", ((16,),))
+    rank_0.profiling_cache.cache[bmm] = (0, 7, 0.2)
+    startup_record.pause()
+    rank_0.autotuner_warmup(16)
+    startup_record.resume()
+    rank_0.autotuner_warmup(16)
+    replacement = _DecoderEngine(_replacement(_publish()), measured_ms=0.05)
+    replacement.autotuner_warmup(16)
+    assert replacement.profiling_cache.cache.get(bmm) == (0, 7, 0.2)
+    startup_record.close()

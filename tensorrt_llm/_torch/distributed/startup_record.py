@@ -202,20 +202,15 @@ class StartupRecord:
         return recorded
 
     def adopt_tuned_tactics(self) -> None:
-        """Share rank 0's tuned tactics with a replacement, which skips the KV cache estimation warmup."""
+        """Share rank 0's whole profiling cache with a replacement, which skips the KV cache estimation warmup."""
         if not self.active:
             return
         from ..autotuner import AutoTuner
 
         profiling_cache = AutoTuner.get().profiling_cache
-        tactics = self.agree(
-            "tuned_tactics",
-            lambda: profiling_cache._serialize_cache_data(
-                profiling_cache._partition_cache_by_strategy()[0]
-            ),
-        )
+        tactics = self.agree("tuned_tactics", lambda: dict(profiling_cache.cache))
         if self.replaying:
-            profiling_cache.cache.update(profiling_cache._deserialize_cache_data(tactics))
+            profiling_cache.merge_cache_data(tactics)
 
     def exchange(
         self,

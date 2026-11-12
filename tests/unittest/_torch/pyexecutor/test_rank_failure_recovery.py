@@ -3144,19 +3144,13 @@ def _published(monkeypatch, worker_main_args, identity="2,4,4,1"):
 
 
 class FakeProfilingCache:
-    """Tactics by key, serialized with string keys."""
+    """Tactics by profiling cache key."""
 
     def __init__(self, cache):
         self.cache = dict(cache)
 
-    def _partition_cache_by_strategy(self):
-        return dict(self.cache), {}
-
-    def _serialize_cache_data(self, cache):
-        return {json.dumps(key): value for key, value in cache.items()}
-
-    def _deserialize_cache_data(self, data):
-        return {tuple(json.loads(key)): tuple(value) for key, value in data.items()}
+    def merge_cache_data(self, cache_data):
+        self.cache.update(cache_data)
 
 
 def _replacement_of(monkeypatch, published: bytes) -> None:
