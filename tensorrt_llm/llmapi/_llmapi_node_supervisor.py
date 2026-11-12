@@ -65,6 +65,8 @@ _MIN_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 60.0
 # The replacements of a rank that fail in a row for the same reason before no other one starts.
 _MAX_FAILED_REPLACEMENTS = 3
+# The relaunched supervisors of a node that end in a row before connecting, after which node 0 relaunches it no more.
+_MAX_FAILED_RELAUNCHES = 3
 # A replacement that ends after serving this long is a new failure of its rank, not a failed replacement.
 _SERVED_S = 600.0
 
@@ -150,12 +152,10 @@ class NodeSupervisor:
         self._nodes = nodes
         self._gpus_per_node = gpus_per_node
         self._world_size = nodes * gpus_per_node
-        mapping = Mapping(
+        self._mapping = Mapping(
             world_size=self._world_size, tp_size=self._world_size, gpus_per_node=gpus_per_node
         )
-        self._ranks = [
-            rank for rank in range(self._world_size) if mapping.get_node_rank(rank) == node
-        ]
+        self._ranks = self._node_ranks(node)
         self._command = command
         self._rank_0_in_session = rank_0_in_session
         self._environ = {
@@ -190,6 +190,8 @@ class NodeSupervisor:
         self._failed_replacements: Dict[int, Tuple[str, int]] = {}
         self._relaunched: Dict[int, subprocess.Popen] = {}
         self._relaunches = _Backoff()
+        # Per node, the supervisors relaunched since its supervisor last connected.
+        self._unconnected_relaunches: Dict[int, int] = {}
         self._host_weights_prefix: Optional[str] = None
         self._first_failure: Optional[int] = None
         self._signum: Optional[int] = None
@@ -252,6 +254,11 @@ class NodeSupervisor:
                         key.fileobj.close()
                 self._selector.close()
                 self._wake_write.close()
+
+    def _node_ranks(self, node: int) -> List[int]:
+        return [
+            rank for rank in range(self._world_size) if self._mapping.get_node_rank(rank) == node
+        ]
 
     def _watch_parent(self) -> None:
         try:
@@ -473,24 +480,23 @@ class NodeSupervisor:
         self._replacements.delay(rank, now_s)
 
     def _connect(self) -> None:
-        """Connect to the authority, and take the view it sends."""
+        """Connect to the authority, and take the view it sends.
+
+        Only reaching the store is bounded by the connect timeout. Once the store answers, the hello and the first
+        view take up to the protocol's hello timeout.
+        """
         self._connect_due_s = time.monotonic() + _CONNECT_TIMEOUT_S
         membership = self._membership
         address = os.environ[membership.RENDEZVOUS_ENV]
-        deadline_s = time.monotonic() + _CONNECT_TIMEOUT_S
-
-        def left_s() -> float:
-            return max(0.001, deadline_s - time.monotonic())
-
         connection = None
         try:
             store = membership.open_store(
-                address, bytes.fromhex(os.environ[membership.SHARED_SECRET_ENV]), left_s()
+                address, bytes.fromhex(os.environ[membership.SHARED_SECRET_ENV]), _CONNECT_TIMEOUT_S
             )
             connection = membership.open_node_supervisor_connection(
-                store, self._node, self._ranks, socket.gethostname(), left_s()
+                store, self._node, self._ranks, socket.gethostname()
             )
-            connection.sock.settimeout(left_s())
+            connection.sock.settimeout(membership.HELLO_TIMEOUT_S)
             payloads = []
             while not payloads:
                 data = connection.sock.recv(1 << 16)
@@ -515,8 +521,10 @@ class NodeSupervisor:
             RuntimeError,
             ValueError,
         ) as error:
-            # Until the deployment serves, the store may not listen yet.
-            (self._logger.warning if self._served else self._logger.debug)(
+            # Until the deployment serves, the store may not listen yet. After the hello, the authority takes the
+            # closed connection as the failure of the node's ranks.
+            expected = not self._served and connection is None
+            (self._logger.debug if expected else self._logger.warning)(
                 f"Cannot connect to the membership authority at {address}: {error!r}"
             )
             if connection is not None:
@@ -554,6 +562,9 @@ class NodeSupervisor:
             self._note_left_out(self._view.record, view.record)
         self._view = view
         self._view_received_s = time.monotonic()
+        for node, _, connected in view.nodes:
+            if connected:
+                self._unconnected_relaunches.pop(node, None)
         if view.record.state not in (
             self._membership.MembershipState.STARTING,
             self._membership.MembershipState.SHUTDOWN,
@@ -593,6 +604,19 @@ class NodeSupervisor:
                 or (relaunched is not None and relaunched.poll() is None)
             ):
                 continue
+            relaunches = self._unconnected_relaunches.get(node, 0)
+            if relaunches == _MAX_FAILED_RELAUNCHES:
+                if relaunched is not None:
+                    del self._relaunched[node]
+                    ranks = self._node_ranks(node)
+                    self._logger.error(
+                        f"{relaunches} relaunched supervisors of node {node} ({host}) ended before they connected, "
+                        f"the last with status {relaunched.returncode}, so node {node} is not relaunched again "
+                        f"and the deployment serves without ranks {ranks}"
+                    )
+                    for rank in ranks:
+                        self._publish_given_up(rank, True)
+                continue
             if now_s < self._relaunches.due_s(node):
                 self._wake_at_s.append(self._relaunches.due_s(node))
                 continue
@@ -626,6 +650,7 @@ class NodeSupervisor:
                 self._logger.error(f"Cannot relaunch node {node}: {error!r}")
                 continue
             self._relaunched[node] = process
+            self._unconnected_relaunches[node] = relaunches + 1
             self._selector.register(os.pidfd_open(process.pid), selectors.EVENT_READ, _RELAUNCHED)
 
     def _stop(self, status: int, terminate: bool = True, forward: Optional[int] = None) -> int:

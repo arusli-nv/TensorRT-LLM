@@ -19,10 +19,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from torch.distributed import TCPStore
 
+from tensorrt_llm._torch.distributed import membership
 from tensorrt_llm._torch.distributed.membership import (
     HOST_WEIGHTS_PREFIX_KEY,
     LIVENESS_KEY,
@@ -126,6 +128,9 @@ class FakeAuthority:
         self.store = None
         self.hellos = []
         self.closed = threading.Event()  # a supervisor's connection closed
+        # Cleared to hold the view that answers a supervisor's hello.
+        self.answering = threading.Event()
+        self.answering.set()
         self._connections = []
         self._threads = []
         self._lock = threading.Lock()
@@ -176,6 +181,7 @@ class FakeAuthority:
                     sock.sendall(lines.encode(self._view.model_dump_json().encode()))
                 continue
             self.hellos.append(announcement)
+            self.answering.wait()
             with self._lock:
                 self._connections.append((sock, lines))
                 sock.sendall(lines.encode(self._view.model_dump_json().encode()))
@@ -201,6 +207,7 @@ class FakeAuthority:
 
         Only a shutdown, not a close, wakes a thread blocked on a socket.
         """
+        self.answering.set()
         self._reserved.close()
         with self._lock:
             sockets = [*(sock for sock, _ in self._connections), self._listener]
@@ -500,6 +507,36 @@ def test_wrong_shared_secret_ends_supervisor(tmp_path, deployment, monkeypatch):
     )
     assert supervisor.run() == 1
     assert supervisor._processes == {}
+
+
+def test_late_store_keeps_first_connection(tmp_path, deployment, monkeypatch):
+    """Keep the first connection when the store answers only at the end of the connect timeout.
+
+    The authority answers the hello later still, as it may while the deployment starts.
+    """
+    authority, environ = deployment
+    authority.start(_record(MembershipState.STARTING))
+    authority.answering.clear()
+    clock_s = [0.0]
+    open_store = membership.open_store
+
+    def open_late_store(*args):
+        store = open_store(*args)
+        clock_s[0] += supervisor_module._CONNECT_TIMEOUT_S
+        return store
+
+    monkeypatch.setattr(membership, "open_store", open_late_store)
+    monkeypatch.setattr(
+        supervisor_module, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + clock_s[0])
+    )
+    running = Running(tmp_path, environ)
+    _until(lambda: authority.hellos)
+    authority.answering.set()
+    _until(lambda: running.supervisor._view is not None)
+    assert len(authority.hellos) == 1
+    assert not authority.closed.is_set()
+    authority.push(_record(MembershipState.SHUTDOWN))
+    assert running.wait() == 0
 
 
 def _fake_tool(directory, name, root):
@@ -815,6 +852,35 @@ def test_node_0_relaunches_failed_node_once(tmp_path, deployment):
     # A second relaunch would have replaced the first one.
     assert running.supervisor._relaunched[1].pid == int((tmp_path / "prun-0.pid").read_text())
     authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0011), nodes)
+    assert running.wait() == 0
+
+
+def test_failed_relaunches_stop_relaunches(tmp_path, deployment):
+    """Check that node 0 stops relaunching a node whose relaunched supervisors end before they connect.
+
+    The ranks of that node are then given up.
+    """
+    authority, environ = deployment
+    prun = tmp_path / "prun"
+    prun.write_text(_FAKE_PRUN % {"root": str(tmp_path)})
+    prun.chmod(0o755)
+    (tmp_path / "prun-exit").touch()
+    node_1_failed = ((0, "host-0", True), (1, "host-1", False))
+    running = _serving(tmp_path, authority, environ, node=0, relaunch_command=[str(prun)])
+    without_node_1 = _record(MembershipState.COMMITTED, active_mask=0b0011)
+    authority.push(without_node_1, node_1_failed)
+    _until(
+        lambda: all(
+            authority.store.get_if_set(f"{REPLACEMENT_GIVEN_UP_KEY}/{rank}") == b"1"
+            for rank in RANKS
+        )
+    )
+    _push_and_wait_for_step(
+        running, authority, without_node_1.model_copy(update={"generation": 2}), node_1_failed
+    )
+    relaunches = len(list(tmp_path.glob("prun-*.args")))
+    assert relaunches == supervisor_module._MAX_FAILED_RELAUNCHES
+    authority.push(_record(MembershipState.SHUTDOWN, active_mask=0b0011), node_1_failed)
     assert running.wait() == 0
 
 
