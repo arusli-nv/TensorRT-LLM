@@ -23,9 +23,9 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
-from tensorrt_llm._torch.distributed.host_exchange import HostExchangeMnnvlMemory
 from tensorrt_llm._torch.distributed.membership import StoreGroup
 from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_host_exchange import HostExchangeMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm.mapping import Mapping
 

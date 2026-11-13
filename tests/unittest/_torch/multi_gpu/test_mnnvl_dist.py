@@ -31,12 +31,12 @@ from utils.util import skip_no_mnnvl_fabric_handles
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed.communicator import MPIDist, ReduceOp
-from tensorrt_llm._torch.distributed.host_exchange import (
-    HostExchangeMnnvlMemory,
-    MnnvlDist,
-    TPHostExchange,
-)
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
 from tensorrt_llm._torch.distributed.membership import latest_epoch, next_epoch
+from tensorrt_llm._torch.distributed.mnnvl_host_exchange import (
+    HostExchangeMnnvlMemory,
+    MnnvlHostExchangeGroup,
+)
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.mapping import Mapping
 
@@ -104,7 +104,7 @@ def _collectives(tp):
     assert np.array_equal(mnnvl.tp_allgather_int64(values), mpi.tp_allgather_int64(values))
     # Rows that arrive with their headers, that need a second poll, and that take several rounds.
     slot_values = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 8
-    for n in (0, 1, TPHostExchange._HEADER_POLL_PACKETS, slot_values, 2 * slot_values + 3):
+    for n in (0, 1, MnnvlHostExchangeGroup._HEADER_POLL_PACKETS, slot_values, 2 * slot_values + 3):
         row = np.arange(n, dtype=np.int64) * (rank + 1) - 2**40
         assert np.array_equal(mnnvl.tp_allgather_int64(row), mpi.tp_allgather_int64(row)), n
     assert np.array_equal(
@@ -193,9 +193,7 @@ def _install_on_interrupt(exchange, mpi, active_mask, before=None):
             before()
         stopped = mpi.allgather(exchange.stopped_epoch)
         epoch = next_epoch(latest_epoch([e for e in stopped if e is not None]))
-        exchange.install(
-            _MpiGroup(), active_mask, epoch, exchange.rows.rows_needing_fresh_pages(_MpiGroup())
-        )
+        exchange.install(_MpiGroup(), active_mask, epoch)
         exchange.interrupted = lambda: False
         changes.append((stopped, epoch))
         # Commit the change.
@@ -230,13 +228,13 @@ def _membership(tp):
         if rank == leaver:
             _leave(mpi)
         else:
-            ptr = exchange.rows.ptr
+            ptr = exchange.group.rows.ptr
             exchange.interrupted = lambda leaver=leaver: _in_mask(exchange.waiting_for, leaver)
             _install_on_interrupt(exchange, mpi, survivors)
             # The leaver never sends, so the round runs again without it.
             with _woken(exchange):
                 assert mnnvl.allgather(rank) == [r if r in active else None for r in range(tp)]
-            assert exchange.rows.ptr == ptr
+            assert exchange.group.rows.ptr == ptr
             for obj_of in payloads:
                 expected = [obj_of(r) if r in active else None for r in range(tp)]
                 assert mnnvl.allgather(obj_of(rank)) == expected
@@ -271,7 +269,7 @@ def _membership(tp):
 
 def _rebuild(exchange, comm, active_mask, epoch):
     """Map the exchange's rows among the active members of ``comm`` as an INSTALL does."""
-    exchange.rows.remap(comm, exchange.rows.rows_needing_fresh_pages(comm))
+    exchange.group.rows.remap(comm, exchange.group.rows.rows_needing_fresh_pages(comm))
     exchange.admit(active_mask, epoch)
 
 
@@ -293,28 +291,30 @@ def _admission(tp):
     epoch = next_epoch(max(mpi.allgather(exchange.epoch)))
     if rank == leaver:
         _skip_rebuild(mpi)
-        exchange.rows.close()
+        exchange.group.rows.close()
         slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
         isolated = StoreGroup(None, "rows", rank, range(tp), active=[rank])
-        rows = HostExchangeMnnvlMemory(isolated, TPHostExchange.buffer_bytes(tp, slot))
-        exchange = mnnvl._host_exchange = TPHostExchange(rank, tp, rows, slot)
+        rows = HostExchangeMnnvlMemory(isolated, MnnvlHostExchangeGroup.buffer_bytes(tp, slot))
+        exchange = mnnvl._host_exchange = TPHostExchange(
+            MnnvlHostExchangeGroup(rank, tp, rows, slot)
+        )
     else:
         _rebuild(exchange, _MpiGroup(), survivors, epoch)
         assert mnnvl.allgather(rank) == [r if _in_mask(survivors, r) else None for r in range(tp)]
     mpi.barrier()
 
     own = np.zeros((2 * tp, 1 + exchange._words), dtype=np.uint64)
-    exchange._copy_to_host(exchange.rows.row(rank), own)
+    exchange.group._copy_to_host(exchange.group.rows.row(rank), own)
     epoch = next_epoch(max(mpi.allgather(exchange.epoch)))
     _rebuild(exchange, _MpiGroup(), (1 << tp) - 1, epoch)
     kept = np.zeros_like(own)
-    exchange._copy_to_host(exchange.rows.row(rank), kept)
+    exchange.group._copy_to_host(exchange.group.rows.row(rank), kept)
     # No rank writes into a row before its owner has read it.
     mpi.barrier()
     # The admission kept every row's pages, so the survivors' last packets are still there.
     assert np.array_equal(kept, own)
     assert rank == leaver or own.any()
-    assert exchange.rows.rows_needing_fresh_pages(_MpiGroup()) == frozenset()
+    assert exchange.group.rows.rows_needing_fresh_pages(_MpiGroup()) == frozenset()
     assert mnnvl.allgather(rank) == list(range(tp))
     assert mnnvl.allreduce(rank + 1, ReduceOp.SUM) == sum(r + 1 for r in range(tp))
 
@@ -330,9 +330,9 @@ def _write_slot(exchange, payload, dest, sender, epoch, header_only=False):
     packets[1:] = tag | words.astype(np.uint64)
     if header_only:
         packets = packets[:1]
-    slot = (epoch & 1) * exchange._slot_set_bytes + sender * exchange._slot_bytes
+    slot = (epoch & 1) * exchange.group._slot_set_bytes + sender * exchange.group._slot_bytes
     _check_cu_result(
-        cuda.cuMemcpyHtoD(exchange.rows.row(dest) + slot, packets.ctypes.data, packets.nbytes)
+        cuda.cuMemcpyHtoD(exchange.group.rows.row(dest) + slot, packets.ctypes.data, packets.nbytes)
     )
     torch.cuda.synchronize()
 
@@ -430,8 +430,8 @@ def _payload_rows(tp):
     assert mnnvl.tp_gather(payload, root=0) == mpi.tp_gather(payload, root=0)
     exchange = mnnvl.host_exchange
     row = np.zeros((tp, 1 + exchange._words), dtype=np.uint64)
-    exchange._copy_to_host(
-        exchange.rows.row(rank) + (exchange.epoch & 1) * exchange._slot_set_bytes, row
+    exchange.group._copy_to_host(
+        exchange.group.rows.row(rank) + (exchange.epoch & 1) * exchange.group._slot_set_bytes, row
     )
     epochs = row >> np.uint64(32)
     assert (epochs[:, 0] == exchange.epoch).all()
@@ -460,8 +460,8 @@ def _local_exchange(nranks):
     """Return rank 0 of a ``nranks``-rank exchange whose other ranks never send unless told to."""
     torch.cuda.set_device(tensorrt_llm.mpi_rank())
     slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
-    rows = _DeviceRows(nranks, TPHostExchange.buffer_bytes(nranks, slot))
-    return TPHostExchange(0, nranks, rows, slot)
+    rows = _DeviceRows(nranks, MnnvlHostExchangeGroup.buffer_bytes(nranks, slot))
+    return TPHostExchange(MnnvlHostExchangeGroup(0, nranks, rows, slot))
 
 
 def _wait_until(condition, timeout_s=10.0):

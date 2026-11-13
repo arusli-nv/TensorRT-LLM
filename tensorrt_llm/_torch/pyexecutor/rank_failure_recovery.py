@@ -777,9 +777,8 @@ class RankFailureRecovery:
         The rows move to fresh pages if a process that maps them may be gone.
         """
         group = self._active_group(record, "host_exchange_rows")
-        fresh_rows = self._exchange.rows.rows_needing_fresh_pages(group)
         self._exchange.install(
-            group, record.active_mask & ~record.joining_mask, record.resume.epoch, fresh_rows
+            group, record.active_mask & ~record.joining_mask, record.resume.epoch
         )
         with self._record_changed:
             self._installed = record

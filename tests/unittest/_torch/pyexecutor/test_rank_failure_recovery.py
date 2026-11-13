@@ -32,7 +32,7 @@ import torch
 from torch.distributed import DistStoreError
 
 from tensorrt_llm._torch.distributed import Distributed, mnnvl_memory
-from tensorrt_llm._torch.distributed.host_exchange import HostExchangeMnnvlMemory, MnnvlDist
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import (
     HANG_TIMEOUT_S,
     RENDEZVOUS_ENV,
@@ -46,6 +46,7 @@ from tensorrt_llm._torch.distributed.membership import (
     host_weights_prefix,
     next_epoch,
 )
+from tensorrt_llm._torch.distributed.mnnvl_host_exchange import HostExchangeMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import FORCE_CFT_ENV
@@ -122,7 +123,6 @@ class FakeExchange:
         self.waiting_for = 0
         self.stopped_epoch = 6
         self.epoch = 40
-        self.rows = SimpleNamespace(rows_needing_fresh_pages=lambda comm: frozenset(range(WORLD)))
         self.installs = []
         self.admits = []
         self.wakes = 0
@@ -138,8 +138,7 @@ class FakeExchange:
         rank0_payload = pickle.dumps(self.rank0_object)
         return [rank0_payload if r == 0 and r in readers else None for r in range(WORLD)]
 
-    def install(self, comm, active_mask, epoch, fresh_rows):
-        assert fresh_rows == frozenset(range(WORLD))
+    def install(self, comm, active_mask, epoch):
         self.installs.append((comm.allgather(b"row-mine"), active_mask, epoch))
 
     def admit(self, active_mask, epoch):
