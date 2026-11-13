@@ -181,8 +181,8 @@ def _woken(exchange):
         thread.join()
 
 
-def _install_on_interrupt(exchange, mpi, active_mask, before=None):
-    """Install ``active_mask`` when a wake stops the exchange, and return each change's epochs.
+def _install_on_interrupt(exchange, mpi, interrupted, active_mask, before=None):
+    """Install ``active_mask`` when a wake finds ``interrupted``, and return each change's epochs.
 
     MPI stands in for the membership transaction that tells every rank the new mask and epoch.
     """
@@ -194,12 +194,12 @@ def _install_on_interrupt(exchange, mpi, active_mask, before=None):
         stopped = mpi.allgather(exchange.stopped_epoch)
         epoch = next_epoch(latest_epoch([e for e in stopped if e is not None]))
         exchange.install(_MpiGroup(), active_mask, epoch)
-        exchange.interrupted = lambda: False
+        exchange.set_interrupt_handler(lambda: False)
         changes.append((stopped, epoch))
         # Commit the change.
         mpi.barrier()
 
-    exchange.on_interrupt = change
+    exchange.set_interrupt_handler(interrupted, change)
     return changes
 
 
@@ -229,8 +229,12 @@ def _membership(tp):
             _leave(mpi)
         else:
             ptr = exchange.group.rows.ptr
-            exchange.interrupted = lambda leaver=leaver: _in_mask(exchange.waiting_for, leaver)
-            _install_on_interrupt(exchange, mpi, survivors)
+            _install_on_interrupt(
+                exchange,
+                mpi,
+                lambda leaver=leaver: _in_mask(exchange.waiting_for, leaver),
+                survivors,
+            )
             # The leaver never sends, so the round runs again without it.
             with _woken(exchange):
                 assert mnnvl.allgather(rank) == [r if r in active else None for r in range(tp)]
@@ -356,8 +360,9 @@ def _membership_change(tp):
     if rank == 0:
         # Rank 0 sends only once the failed rank's packets reached it.
         MPI.COMM_WORLD.recv(source=failed)
-    exchange.interrupted = lambda: _in_mask(exchange.waiting_for, failed)
-    changes = _install_on_interrupt(exchange, mpi, survivors)
+    changes = _install_on_interrupt(
+        exchange, mpi, lambda: _in_mask(exchange.waiting_for, failed), survivors
+    )
     with _woken(exchange):
         # Rank 0 received the failed rank's packets, so the first round has every payload.
         assert mnnvl.allgather(rank) == list(range(tp))
@@ -379,10 +384,10 @@ def _change_without_loss(tp):
     mnnvl, mpi, rank = _dists(tp)
     exchange = mnnvl.host_exchange
     mnnvl.barrier()
-    exchange.interrupted = lambda: exchange.waiting_for != 0
     changes = _install_on_interrupt(
         exchange,
         mpi,
+        lambda: exchange.waiting_for != 0,
         (1 << tp) - 1,
         before=None if rank == 0 else lambda: MPI.COMM_WORLD.send(None, dest=0),
     )
@@ -538,7 +543,7 @@ def _abort_wait(tp):
         stopped_s.append(time.perf_counter())
         raise _Stopped
 
-    exchange.interrupted, exchange.on_interrupt = interrupted, on_interrupt
+    exchange.set_interrupt_handler(interrupted, on_interrupt)
 
     def membership_client():
         _wait_until(lambda: exchange.waiting_for == 0b010)
@@ -575,7 +580,7 @@ def _stale_slots(tp):
         checks.append(None)
         return False
 
-    exchange.interrupted = interrupted
+    exchange.set_interrupt_handler(interrupted)
     result = []
     waiter = threading.Thread(target=lambda: result.append(exchange.exchange(b"r0")), daemon=True)
     waiter.start()

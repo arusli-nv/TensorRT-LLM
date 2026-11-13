@@ -32,6 +32,8 @@ RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
 # The model architectures that Wide-EP fault tolerance supports, as named in config.json.
 SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM",)
+# The alternative that each error about an unmet fault tolerance requirement offers.
+TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
 
 def check_node_supervisor_launch(enabled: bool) -> None:
@@ -54,8 +56,7 @@ def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> No
         raise ValueError(
             "Wide-EP fault tolerance requires "
             + "; ".join(missing)
-            + "; change the configuration or turn fault tolerance off "
-            "(enable_wide_ep_fault_tolerance=False)"
+            + f"; change the configuration or {TURN_FAULT_TOLERANCE_OFF}"
         )
 
 
@@ -99,7 +100,7 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
         [
             (
                 llm_args.enable_attention_dp,
-                "attention DP (enable_attention_dp=True), so that a failed rank takes only its "
+                "attention DP (enable_attention_dp=True), because a failed rank must take only its "
                 "own requests with it",
             ),
             (

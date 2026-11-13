@@ -24,6 +24,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart
 from .authority import Authority
 from .authority_process import AuthorityProcess
+from .host_weights import host_weights_name, host_weights_prefix
 from .liveness import (
     AUTHORITY_SILENCE_TIMEOUT_S,
     DEAD_TIMEOUT_S,
@@ -61,8 +62,6 @@ from .rendezvous import (
     STALLED_SINCE_KEY,
     TRANSACTION_KEY,
     StoreGroup,
-    host_weights_name,
-    host_weights_prefix,
     rendezvous_host_port,
     wait_for_keys,
 )

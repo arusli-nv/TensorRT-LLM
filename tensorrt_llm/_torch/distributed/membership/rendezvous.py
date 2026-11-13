@@ -15,16 +15,14 @@
 """Rendezvous store communicators for Wide-EP fault tolerance."""
 
 import hashlib
-import hmac
-import os
 import pickle  # nosec B403
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
 
 from tensorrt_llm._torch.modules.dwdp.rendezvous import StoreComm
-from tensorrt_llm._wide_ep_fault_tolerance import SHARED_SECRET_ENV
 
 from .records import MAX_RANKS, REPORT_INTERVAL_S, rank_mask
+from .signed_store import shared_secret_digest
 
 if TYPE_CHECKING:
     from torch.distributed import Store
@@ -271,21 +269,6 @@ class StoreGroup(StoreComm):
         return f"{prefix}/arrived/{rank // _RANKS_PER_COUNTER}"
 
 
-def _secret_digest(label: bytes) -> str:
-    secret = bytes.fromhex(os.environ[SHARED_SECRET_ENV])
-    return hmac.new(secret, label, hashlib.sha256).hexdigest()
-
-
 def hello_token() -> str:
     """Return the token by which the authority admits a process of this deployment."""
-    return _secret_digest(b"liveness hello")
-
-
-def host_weights_prefix() -> str:
-    """Return the /dev/shm name prefix that every deployment's EPLB host weights share."""
-    return f"{os.environ.get('TRTLLM_EPLB_SHM_NAME', 'moe_shared')}_"
-
-
-def host_weights_name() -> str:
-    """Return this deployment's /dev/shm base name for its EPLB host weights."""
-    return f"{host_weights_prefix()}{_secret_digest(b'eplb host weights')[:16]}"
+    return shared_secret_digest(b"liveness hello")

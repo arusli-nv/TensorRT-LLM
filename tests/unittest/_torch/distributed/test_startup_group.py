@@ -64,7 +64,11 @@ from tensorrt_llm._torch.distributed.membership.startup import (
 from tensorrt_llm._torch.distributed.mnnvl_memory import TpMnnvlMemory
 from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
-from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV, RankIdentity
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    TURN_FAULT_TOLERANCE_OFF,
+    RankIdentity,
+)
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.mapping import Mapping
@@ -524,7 +528,7 @@ def test_launch_rejects_bad_rendezvous(launched, monkeypatch, env, fix):
             monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         startup_module.worker_node_main()
-    assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in str(error.value)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 def test_launch_needs_rank_identity(launched, monkeypatch):

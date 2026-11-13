@@ -41,6 +41,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     FAULT_TOLERANCE_RANK_ENV,
     RENDEZVOUS_ENV,
     SHARED_SECRET_ENV,
+    TURN_FAULT_TOLERANCE_OFF,
     RankIdentity,
     check_fault_tolerance_requirements,
     wide_ep_fault_tolerance_rank,
@@ -143,14 +144,13 @@ def _launched_rank() -> RankIdentity:
     except (KeyError, IndexError, ValueError):
         raise ValueError(
             f"Wide-EP fault tolerance requires a hex shared secret in {SHARED_SECRET_ENV} and "
-            f"host:port in {RENDEZVOUS_ENV} on every rank, or turn fault tolerance off "
-            "(enable_wide_ep_fault_tolerance=False)"
+            f"host:port in {RENDEZVOUS_ENV} on every rank, or {TURN_FAULT_TOLERANCE_OFF}"
         ) from None
     if len(secret) < SHARED_SECRET_BYTES:
         raise ValueError(
             "Wide-EP fault tolerance requires a shared secret of at least "
-            f"{SHARED_SECRET_BYTES} bytes in {SHARED_SECRET_ENV}, got {len(secret)}, or turn fault "
-            "tolerance off (enable_wide_ep_fault_tolerance=False)"
+            f"{SHARED_SECRET_BYTES} bytes in {SHARED_SECRET_ENV}, not {len(secret)}. Set a longer "
+            f"one or {TURN_FAULT_TOLERANCE_OFF}"
         )
     identity = _rank_identity()
     if identity.world_size > identity.gpus_per_node:
@@ -174,8 +174,7 @@ def _check_rendezvous_reachable(address: str) -> None:
     if ipaddress.ip_address(resolved).is_loopback:
         raise ValueError(
             f"{RENDEZVOUS_ENV}={address} resolves to the loopback address {resolved} on this "
-            "node. Set a host that every node reaches, or turn fault tolerance off "
-            "(enable_wide_ep_fault_tolerance=False)"
+            f"node. Set a host that every node reaches, or {TURN_FAULT_TOLERANCE_OFF}"
         )
 
 

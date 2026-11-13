@@ -26,6 +26,7 @@ import yaml
 from tensorrt_llm import _wide_ep_fault_tolerance
 from tensorrt_llm._wide_ep_fault_tolerance import (
     FAULT_TOLERANCE_RANK_ENV,
+    TURN_FAULT_TOLERANCE_OFF,
     check_node_supervisor_launch,
 )
 from tensorrt_llm.executor.utils import RequestError
@@ -189,7 +190,7 @@ def test_supported_configuration_is_accepted(fields):
 def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
-    assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in str(error.value)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 @pytest.mark.parametrize("fields", [{}, {"modeling_v2": "auto"}], ids=["default", "explicit"])

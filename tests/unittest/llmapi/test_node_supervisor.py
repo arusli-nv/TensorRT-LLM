@@ -928,6 +928,26 @@ def test_supervisor_started_by_srun_rejected(monkeypatch, capfd):
     assert "requires `mpirun --enable-recovery`, not srun" in capfd.readouterr().err
 
 
+def test_supervisor_imports_no_moe_backend():
+    """Keep the MoE backends out of the supervisor, a long-lived process without a GPU."""
+    code = (
+        "import sys, runpy\n"
+        f"supervisor = runpy.run_path({str(_SUPERVISOR)!r})\n"
+        "from tensorrt_llm._torch.distributed import membership\n"
+        "from tensorrt_llm.llmapi import _llmapi_process_guard\n"
+        "membership.host_weights_name\n"
+        "print('tensorrt_llm._torch.moe.fused_moe' in sys.modules)\n"
+    )
+    environ = dict(
+        os.environ, TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=environ, capture_output=True, text=True, timeout=100
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-1] == "False"
+
+
 def test_node_0_ends_job_through_mpirun(tmp_path, deployment, fake_mpirun):
     """End the job through the mpirun of the PMIx server URI when rank 0 ends.
 

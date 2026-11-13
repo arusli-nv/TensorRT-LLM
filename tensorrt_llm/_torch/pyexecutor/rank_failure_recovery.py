@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._wide_ep_fault_tolerance import (
+    TURN_FAULT_TOLERANCE_OFF,
     check_fault_tolerance_requirements,
     check_model_architectures,
 )
@@ -195,7 +196,7 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
         (
             mapping.moe_ep_size == mapping.world_size,
             f"expert parallelism over every rank (moe_expert_parallel_size={mapping.world_size}, "
-            f"not {mapping.moe_ep_size}), so that a failed rank holds whole experts",
+            f"not {mapping.moe_ep_size}), because a failed rank must take only whole experts with it",
         ),
         # Resolved from "auto" only as the model loads, after argument validation.
         (
@@ -217,8 +218,8 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
         (
             kernel_timeout_s >= 2 * HANG_TIMEOUT_S,
             f"an all-to-all timeout of at least twice the hang timeout ({SERVING_TIMEOUT_ENV}"
-            f">={2 * HANG_TIMEOUT_S:.0f} s, not {kernel_timeout_s:.0f} s), so that a wait on a "
-            "hung rank lasts until the rank is dropped",
+            f">={2 * HANG_TIMEOUT_S:.0f} s, not {kernel_timeout_s:.0f} s), because a wait on a "
+            "hung rank must last until the rank is dropped",
         ),
     ]
     check_fault_tolerance_requirements(checks)
@@ -283,14 +284,12 @@ def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
             raise ValueError(
                 f"MoE layer {name} ({type(layer).__name__}) uses {uses}, but Wide-EP fault "
                 "tolerance requires NVLinkOneSided, the only MoE communication that can leave "
-                "out a failed rank. Select it or turn fault tolerance off "
-                "(enable_wide_ep_fault_tolerance=False)."
+                f"out a failed rank. Select it or {TURN_FAULT_TOLERANCE_OFF}."
             )
         comms[id(comm)] = comm
     if not comms:
         raise ValueError(
-            "Wide-EP fault tolerance requires a model with MoE layers; turn fault tolerance off "
-            "(enable_wide_ep_fault_tolerance=False)"
+            f"Wide-EP fault tolerance requires a model with MoE layers; {TURN_FAULT_TOLERANCE_OFF}"
         )
     return list(comms.values())
 
@@ -341,8 +340,7 @@ def _check_host_weights_fit(model: torch.nn.Module) -> None:
     if needed > free:
         raise ValueError(
             f"{SHARED_MEMORY_DIR} has {free} bytes free, but Wide-EP fault tolerance needs "
-            f"{needed} bytes more. Enlarge it or turn fault tolerance off "
-            f"(enable_wide_ep_fault_tolerance=False).{_leftover_entries()}"
+            f"{needed} bytes more. Enlarge it or {TURN_FAULT_TOLERANCE_OFF}.{_leftover_entries()}"
         )
 
 
@@ -476,8 +474,7 @@ class RankFailureRecovery:
         self._interrupted: List[LlmRequest] = []
         # Per request, the outputs mark at the first step discarded since the last recompute.
         self._discarded_marks: Dict[int, Tuple[LlmRequest, PyResult.OutputsMark]] = {}
-        exchange.interrupted = self._membership_changing
-        exchange.on_interrupt = self._on_exchange_interrupt
+        exchange.set_interrupt_handler(self._membership_changing, self._on_exchange_interrupt)
 
     @classmethod
     def create(cls, executor: PyExecutor) -> RankFailureRecovery:

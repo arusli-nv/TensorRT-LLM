@@ -237,13 +237,15 @@ def test_superseded_install_gives_same_results(monkeypatch):
                 continue
             if generation == 2:
                 committed.wait()
-                exchange.interrupted = lambda: False
+                exchange.set_interrupt_handler(lambda: False)
             return
 
     # Each change reaches a rank while it waits for a failed rank.
     for exchange in exchanges[:3]:
-        exchange.interrupted = lambda exchange=exchange: bool(exchange.waiting_for & 0b1100)
-        exchange.on_interrupt = lambda exchange=exchange: change(exchange)
+        exchange.set_interrupt_handler(
+            lambda exchange=exchange: bool(exchange.waiting_for & 0b1100),
+            lambda exchange=exchange: change(exchange),
+        )
 
     def survivor(exchange):
         return exchange.exchange(b"r%d" % exchange.rank), exchange.exchange(b"s%d" % exchange.rank)
@@ -262,7 +264,7 @@ def test_interrupt_without_handler_reruns_round(monkeypatch):
     """Check that a rank stops and runs the round again when ``on_interrupt`` is unset."""
     exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
     stops = [True]
-    exchanges[0].interrupted = lambda: bool(stops) and stops.pop()
+    exchanges[0].set_interrupt_handler(lambda: bool(stops) and stops.pop())
 
     def exchange_once(exchange):
         return exchange.exchange(b"r%d" % exchange.rank)
@@ -312,7 +314,7 @@ def test_waiting_for_during_flag_rewrites(monkeypatch):
 
     monkeypatch.setattr(mnnvl_host_exchange, "wait_for_slots", rewrite_flags)
     stopping = threading.Event()
-    exchange.interrupted, exchange.on_interrupt = stopping.is_set, stop
+    exchange.set_interrupt_handler(stopping.is_set, stop)
     errors = []
 
     def wait():
@@ -420,8 +422,10 @@ def test_exchange_over_any_group():
     def survivor(exchange):
         first = exchange.exchange(b"r%d" % exchange.rank)
         # Rank 2 sends no second round. A wake finds the survivors waiting for it.
-        exchange.interrupted = lambda: bool(exchange.waiting_for & 0b100)
-        exchange.on_interrupt = lambda: exchange.install(None, 0b011, exchange.stopped_epoch)
+        exchange.set_interrupt_handler(
+            lambda: bool(exchange.waiting_for & 0b100),
+            lambda: exchange.install(None, 0b011, exchange.stopped_epoch),
+        )
         return first, exchange.exchange(b"s%d" % exchange.rank)
 
     def fails(exchange):
@@ -441,15 +445,14 @@ def test_lagging_rank_takes_completed_round():
     """Check that a rank one round behind takes the round that its install completed."""
     slots = {}
     exchange = HostExchange(_LocalGroup(0, 2, slots))
-    exchange.interrupted = lambda: bool(exchange.waiting_for & 0b10)
 
     def change():
         # Rank 1 finished round 1 and moved on to round 2 before the change.
-        exchange.interrupted = lambda: False
+        exchange.set_interrupt_handler(lambda: False)
         slots[1, 1], slots[3, 1] = _slot(1, b"b"), _slot(3, b"d")
         exchange.install(None, 0b11, 3)
 
-    exchange.on_interrupt = change
+    exchange.set_interrupt_handler(lambda: bool(exchange.waiting_for & 0b10), change)
     results = _run_ranks([exchange], [lambda e: (e.exchange(b"a"), e.exchange(b"c"))])
     assert results[0] == ([b"a", b"b"], [b"c", b"d"])
     ((mask, (epoch, readers, active)),) = exchange.group.installs

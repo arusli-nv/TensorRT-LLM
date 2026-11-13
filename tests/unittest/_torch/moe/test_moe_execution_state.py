@@ -33,6 +33,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeE
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import moe_comms, prepare_model
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
@@ -432,7 +433,7 @@ def test_unbindable_moe_layer_is_refused(kind, uses) -> None:
     bound = _moe_layer(ConfigurableMoE, comm=_frontend(), unfinalized_combine_fn=lambda **kw: None)
     with pytest.raises(ValueError, match=re.escape(f"MoE layer 1 {uses}")) as error:
         moe_comms(torch.nn.ModuleList([bound, layer]))
-    assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in str(error.value)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 @pytest.mark.cpu_only

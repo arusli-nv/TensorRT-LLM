@@ -37,6 +37,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.mmap_utils import madvise_range
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.bindings.internal import runtime
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -521,8 +522,7 @@ class EplbExpertRestore:
             raise ValueError(
                 "Wide-EP fault tolerance with online EPLB requires GDRCopy in CDMM mode, "
                 "because online EPLB's CPU copies reach the spare slots only through GDRCopy. Set "
-                "layer_updates_per_iter=0 or turn fault tolerance off "
-                "(enable_wide_ep_fault_tolerance=False)."
+                f"layer_updates_per_iter=0 or {TURN_FAULT_TOLERANCE_OFF}."
             )
         self.active_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
         self.backed_spare_slot_bytes = 0

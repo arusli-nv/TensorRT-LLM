@@ -77,6 +77,7 @@ from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.executor.rank_failure_requests import RankFailureError
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -131,6 +132,9 @@ class FakeExchange:
         self.wakes = 0
         self.rank0_object = None
         self.exchanges = []
+
+    def set_interrupt_handler(self, interrupted, on_interrupt=None):
+        self.interrupted, self.on_interrupt = interrupted, on_interrupt
 
     def wake(self):
         self.wakes += 1
@@ -395,7 +399,7 @@ _SERVING_TIMEOUT_S = int(2 * HANG_TIMEOUT_S)
         (
             {SERVING_TIMEOUT_ENV: str(_SERVING_TIMEOUT_S - 1)},
             None,
-            f"not {_SERVING_TIMEOUT_S - 1} s), so that a wait on a hung rank",
+            f"not {_SERVING_TIMEOUT_S - 1} s), because a wait on a hung rank",
         ),
         ({}, "ep", f"(moe_expert_parallel_size={WORLD}, not {WORLD // 2})"),
         ({}, "kv_v2", "(kv_cache_config.use_kv_cache_manager_v2=True, not False)"),
@@ -463,7 +467,7 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
             if lacks in ("architecture", "health", "no_moe")
             else check
         )()
-    assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in str(error.value)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 def test_model_load_checks_support_before_building_model(monkeypatch):
@@ -541,7 +545,7 @@ def test_startup_check_needs_dev_shm_room(monkeypatch, shortfall):
         os.unlink(os.path.join("/dev/shm", leftover))
     message = str(error.value)
     assert f"{leftover} (0.0 GiB)" in message
-    assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in message
+    assert TURN_FAULT_TOLERANCE_OFF in message
 
 
 # Membership changes on the executor thread.

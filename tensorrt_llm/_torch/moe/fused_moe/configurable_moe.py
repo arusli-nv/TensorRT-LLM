@@ -52,6 +52,7 @@ from tensorrt_llm._torch.moe.fused_moe.interface import (
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -914,8 +915,7 @@ class ConfigurableMoE(MoE):
                 f"Wide-EP fault tolerance does not support the {type(backend).__name__} MoE "
                 f"backend yet: {backend.spare_slots_refusal_reason}. Use an NVFP4 checkpoint with "
                 "moe_config.backend set to CUTEDSL (without locality domains or the SM107 Rubin "
-                "kernels) or CUTLASS, a BF16 checkpoint with CUTLASS, or turn fault tolerance off "
-                "(enable_wide_ep_fault_tolerance=False)."
+                f"kernels) or CUTLASS, a BF16 checkpoint with CUTLASS, or {TURN_FAULT_TOLERANCE_OFF}."
             )
 
         if self.unfinalized_combine_fn is not None:

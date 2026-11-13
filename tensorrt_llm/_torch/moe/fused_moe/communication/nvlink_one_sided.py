@@ -447,13 +447,15 @@ class NVLinkOneSided(Communication):
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
-            alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog, which needs
-                ``ep_group_health`` and watches the fence path. If None, the watchdog is disabled.
+            alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
+                watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
             enable_wide_ep_fault_tolerance: Use a remappable workspace and the rank mask of
                 ``bind_execution_state``, called before the first dispatch, on the fence path.
-                Corresponds to model_config.enable_wide_ep_fault_tolerance.
+                Corresponds to model_config.enable_wide_ep_fault_tolerance. Such a layer starts no
+                AlltoAll watchdog, because its rank reports the published waits to the membership
+                authority.
         """
         super().__init__(mapping)
         if mapping.has_cp_helix():

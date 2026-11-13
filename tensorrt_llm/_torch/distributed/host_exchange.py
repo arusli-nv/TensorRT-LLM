@@ -123,13 +123,8 @@ class HostExchange:
         # The round counter. It wraps and skips 0, because the rows start zeroed.
         self._epoch = 0
         self.active_mask = all_ranks(self.nranks)
-        # interrupted() reports a membership change that needs this rank. The exchange checks it
-        # before each round and, during a wait, after each wake(). When it holds, the exchange sets
-        # stopped_epoch to the current or next round's epoch and calls on_interrupt, which runs the
-        # change and calls install(). The exchange then takes the round that install() completed
-        # from the peers' rows, or runs the round again.
-        self.interrupted: Callable[[], bool] = lambda: False
-        self.on_interrupt: Optional[Callable[[], None]] = None
+        self._interrupted: Callable[[], bool] = lambda: False
+        self._on_interrupt: Optional[Callable[[], None]] = None
         self.stopped_epoch = 0
         # Active ranks still missing from a round that install() completed. The round's result
         # treats them as inactive.
@@ -158,6 +153,20 @@ class HostExchange:
     @property
     def epoch(self) -> int:
         return self._epoch
+
+    def set_interrupt_handler(
+        self, interrupted: Callable[[], bool], on_interrupt: Optional[Callable[[], None]] = None
+    ) -> None:
+        """Set the callbacks that stop the exchange for a membership change that needs this rank.
+
+        ``interrupted`` reports such a change. The exchange checks it before each round and, during
+        a wait, after each ``wake()``. When it holds, the exchange sets ``stopped_epoch`` to the
+        current or next round's epoch and calls ``on_interrupt``, which runs the change and calls
+        ``install()``. The exchange then takes the round that ``install()`` completed from the
+        peers' rows, or runs the round again.
+        """
+        self._interrupted = interrupted
+        self._on_interrupt = on_interrupt
 
     def admit(self, active_mask: int, epoch: int) -> None:
         """Take part with the ranks in ``active_mask``, starting with the round of ``epoch``."""
@@ -321,7 +330,7 @@ class HostExchange:
 
         The packets are None if no reader sent a payload.
         """
-        if self.interrupted():
+        if self._interrupted():
             self._stop(next_epoch(self._epoch))
         self._epoch = next_epoch(self._epoch)
         self._missing = 0
@@ -351,15 +360,15 @@ class HostExchange:
         return self.group.waiting_for
 
     def wake(self) -> None:
-        """Make a running wait return and check ``interrupted``. Safe from any thread."""
+        """Make a running wait return and check for a membership change. Safe from any thread."""
         self.group.cancel()
 
     def _stop(self, epoch: int) -> None:
-        """Record ``epoch`` as ``stopped_epoch`` and call ``on_interrupt``."""
+        """Record ``epoch`` as ``stopped_epoch`` and call the interrupt handler."""
         self.group.end_wait()
         self.stopped_epoch = epoch
-        if self.on_interrupt is not None:
-            self.on_interrupt()
+        if self._on_interrupt is not None:
+            self._on_interrupt()
 
     def _take_finished_round(self, active: int, readers: int) -> np.ndarray:
         """Send the staged slot and return the round that install() finished, noting missing ranks."""
@@ -383,7 +392,7 @@ class HostExchange:
             return self._take_finished_round(active, readers)
         in_active, in_readers = self._ranks_of(active)[0], self._ranks_of(readers)[0]
         while (rows := self.group.wait(self._epoch, in_active, in_readers, idle)) is None:
-            if self.interrupted():
+            if self._interrupted():
                 self._stop(self._epoch)
                 if self._finished_round is not None:
                     return self._take_finished_round(active, readers)
@@ -437,7 +446,7 @@ class MnnvlDist(Distributed):
             ),
             (
                 mapping.enable_attention_dp,
-                "attention DP (enable_attention_dp=True), so that a failed rank takes only its "
+                "attention DP (enable_attention_dp=True), because a failed rank must take only its "
                 "own requests with it",
             ),
             (

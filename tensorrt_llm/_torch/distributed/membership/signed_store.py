@@ -51,6 +51,12 @@ def parse_shared_secret(secret: str) -> bytes:
     return parsed
 
 
+def shared_secret_digest(label: bytes) -> str:
+    """Return the hex HMAC-SHA256 of ``label`` keyed by the shared secret in ``SHARED_SECRET_ENV``."""
+    secret = bytes.fromhex(os.environ[SHARED_SECRET_ENV])
+    return hmac.new(secret, label, hashlib.sha256).hexdigest()
+
+
 class SignedStore:
     """A rendezvous store client that signs the values it sets and verifies those it gets.
 
