@@ -150,7 +150,6 @@
 /tests/unittest/_torch/sampler @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/speculative @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/speculative_hw_agnostic @NVIDIA/trt-llm-runtime-devs
-/tests/unittest/_torch/wide_ep_ft @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/executor @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tests/unittest/inputs @NVIDIA/trt-llm-runtime-devs
