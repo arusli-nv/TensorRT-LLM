@@ -1360,13 +1360,19 @@ class DecoderWarmup:
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         # A replacement rank serves tactics it did not profile, so it runs the
         # cached tactic of every runner once here, not only the JIT ones, and
-        # no kernel launches for the first time while it serves.
+        # no kernel launches for the first time while it serves. It counts each
+        # step of the pass as startup progress, so a long pass is not taken for
+        # a hung startup.
         startup_record = Distributed.startup_record
-        prime_all_runners = startup_record is not None and startup_record.replacement
+        replacement = startup_record is not None and startup_record.replacement
         if prime_alone:
             Distributed.pause_startup_record()
         ran_native_forward = run_autotuner_pass(
-            autotune(cache_path=cache_path, prime_all_runners=prime_all_runners),
+            autotune(
+                cache_path=cache_path,
+                prime_all_runners=replacement,
+                report_progress=startup_record.report_progress if replacement else None,
+            ),
             synchronize_trtllm_cache=True,
         )
         if prime_alone:

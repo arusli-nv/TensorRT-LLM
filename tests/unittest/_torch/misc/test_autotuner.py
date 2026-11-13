@@ -171,6 +171,41 @@ class JitGemmRunner(GemmRunner):
         return super().forward(inputs, tactic=tactic, **kwargs)
 
 
+def test_report_progress_per_profiled_tactic_and_primed_tactic(
+        monkeypatch) -> None:
+    """Report progress once per (runner, tactic) profiled and once per cached tactic primed."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    w = torch.randn(64, 128)
+    x = torch.randn(3, 64)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(input_idx=0,
+                          dim_idx=0,
+                          gen_tuning_buckets=(3, 4, 5),
+                          map_to_tuning_buckets=lambda value: value), ))
+    op = "test_report_progress"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner._primed_cached_tactics.clear()
+    num_profiles = len(tuner._optimization_profiles(tuning_config, [x, w]))
+    steps = []
+    with autotune(report_progress=lambda: steps.append(op)):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    winners = {
+        value[1]
+        for value in tuner.profiling_cache.get_specific_custom_op(op).values()
+    }
+    # Each profile profiles the three tactics of GemmRunner.
+    assert len(steps) == 3 * num_profiles + len(winners)
+
+    # A cache hit profiles nothing and primes each cached winner again.
+    steps.clear()
+    tuner._primed_cached_tactics.clear()
+    with autotune(report_progress=lambda: steps.append(op)):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    assert len(steps) == len(winners)
+    assert tuner.report_progress is None
+
+
 @pytest.mark.parametrize("strategy", [
     DistributedTuningStrategy.PARALLEL,
     DistributedTuningStrategy.MERGE,

@@ -335,9 +335,10 @@ def worker_node_main() -> None:
                     "The replacement's TensorRT-LLM version or checkpoint differs from the "
                     "deployment's"
                 )
-            # A replayed collective is a startup collective that this rank completed.
+            # A replayed collective is a startup collective that this rank completed, and a step
+            # of its autotuner warmup is startup progress too.
             _startup_record.replay(
-                agreed_startup, on_replayed=functools.partial(_report_startup_wait, 0)
+                agreed_startup, report_progress=functools.partial(_report_startup_wait, 0)
             )
             _take_tuned_tactics(store, identity.rank)
             _start_alone(worker_main_args)

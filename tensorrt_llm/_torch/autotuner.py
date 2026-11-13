@@ -311,7 +311,8 @@ def autotune(tune_mode: bool = True,
              cache_path: str = None,
              skip_dynamic_tuning_buckets: bool = False,
              post_tune_merge_dist: Optional[Distributed] = None,
-             prime_all_runners: bool = False):
+             prime_all_runners: bool = False,
+             report_progress: Optional[Callable[[], None]] = None):
     """Context manager for autotuning with distributed support.
 
     Args:
@@ -331,6 +332,10 @@ def autotune(tune_mode: bool = True,
         prime_all_runners: When True, a cache hit runs the cached winners of
             every runner once, not only those of JIT-compiled runners, so
             their first launch happens before serving.
+        report_progress: Optional callable, called after each (runner, tactic)
+            pair profiled, each kernel built ahead of tuning and each cached
+            tactic primed, so that a caller can tell a long tuning pass from a
+            hung one.
     """
     autotuner = AutoTuner.get()
     if post_tune_merge_dist is not None:
@@ -357,9 +362,11 @@ def autotune(tune_mode: bool = True,
     old_mode = autotuner.is_tuning_mode
     old_skip = autotuner.skip_dynamic_tuning_buckets
     old_prime_all_runners = autotuner.prime_all_runners
+    old_report_progress = autotuner.report_progress
     autotuner.is_tuning_mode = tune_required
     autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
     autotuner.prime_all_runners = prime_all_runners
+    autotuner.report_progress = report_progress
     # Avoid making compiled AllReduce paths initialize or inspect AutoTuner.
     from tensorrt_llm._torch.distributed.ops import \
         set_allreduce_autotuner_tuning_mode
@@ -385,6 +392,7 @@ def autotune(tune_mode: bool = True,
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
         autotuner.prime_all_runners = old_prime_all_runners
+        autotuner.report_progress = old_report_progress
         set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
@@ -1027,6 +1035,7 @@ class AutoTuner:
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
         self.prime_all_runners = False
+        self.report_progress: Optional[Callable[[], None]] = None
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
@@ -1478,6 +1487,7 @@ class AutoTuner:
                     busy += jit_share.is_busy(e)
                 finally:
                     sweep.done(k)
+                self._report_progress()
         self._debug_logger(
             f"[Autotuner] {custom_op}: shared JIT builds over {len(items)} (profile, "
             f"runner, tactic) items of {len(pending)} profiles: ran {ran} claimed here and "
@@ -1611,6 +1621,11 @@ class AutoTuner:
                     f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
                     f"runner={type(runner).__name__}, tactic={tactic}, "
                     f"shapes={profile.get_opt_shapes()}. Error: {e}")
+            self._report_progress()
+
+    def _report_progress(self) -> None:
+        if self.report_progress is not None:
+            self.report_progress()
 
     def _profile_runners(
         self,
@@ -1733,6 +1748,7 @@ class AutoTuner:
                 f"shapes={profile.get_opt_shapes()}, "
                 f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
             )
+            self._report_progress()
         else:
             # PARALLEL deals the (runner, tactic) pairs of all runners round
             # robin, so every rank of the group gets an even share even when
@@ -1810,6 +1826,7 @@ class AutoTuner:
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
+                    self._report_progress()
 
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
@@ -1911,7 +1928,8 @@ class AutoTuner:
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=num_threads,
                 thread_name_prefix="autotuner_jit_warmup") as pool:
-            list(pool.map(warm, order))
+            for _ in pool.map(warm, order):
+                self._report_progress()
         logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
                     f"{num_threads} threads to drive their JIT in "
                     f"{time.perf_counter() - start:.1f}s" +

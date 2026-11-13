@@ -98,7 +98,7 @@ class StartupRecord:
         self._replaying = False
         self._taken: Dict[str, int] = {}
         self._replayed_exchanges = 0
-        self._on_replayed: Callable[[], None] = lambda: None
+        self.report_progress: Callable[[], None] = lambda: None
         self._pauses = 0
         self._rank_varying: Optional[str] = None
 
@@ -127,14 +127,15 @@ class StartupRecord:
         self._recording = True
 
     def replay(
-        self, published: Dict[str, Any], on_replayed: Callable[[], None] = lambda: None
+        self, published: Dict[str, Any], report_progress: Callable[[], None] = lambda: None
     ) -> None:
         """Replay the record that rank 0 published until :meth:`close`.
 
-        ``on_replayed`` is called after each replayed startup collective.
+        ``report_progress`` is called after each replayed startup collective, and after each step
+        of this rank's autotuner warmup.
         """
         self.values, self.exchanges = published["values"], published["exchanges"]
-        self._on_replayed = on_replayed
+        self.report_progress = report_progress
         self._replacement = self._replaying = True
 
     def published(self) -> Dict[str, Any]:
@@ -218,7 +219,7 @@ class StartupRecord:
                     f"{index + 1} times, the original ranks {len(recorded)} times"
                 )
             self._taken[name] = index + 1
-            self._on_replayed()
+            self.report_progress()
             return recorded[index]
         if not self._recording or not recorded_now:
             return gather()
@@ -315,7 +316,7 @@ class StartupRecord:
                 f"{unread}, which rank 0 did not receive"
             )
         self._replayed_exchanges += 1
-        self._on_replayed()
+        self.report_progress()
         return [p if r in readers else None for r, p in enumerate(payloads)]
 
     @staticmethod

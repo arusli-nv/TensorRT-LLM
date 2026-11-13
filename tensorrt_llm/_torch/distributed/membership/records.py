@@ -237,7 +237,8 @@ class RankReport(_Message):
 
     Attributes:
         progress: The executor's iteration, or during the startup the number of startup
-            collectives the rank completed.
+            collectives the rank completed. A replacement also counts the steps of its autotuner
+            warmup.
         idle: The rank's hang detector is paused, as while rank 0 waits for requests.
         waiting_for: Rank mask of peers this rank currently waits on in a collective.
         reply_generation: The generation that ``reply`` answers.

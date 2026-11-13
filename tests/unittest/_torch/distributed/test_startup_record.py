@@ -503,6 +503,8 @@ class _DecoderEngine(SimpleNamespace):
     A token count without a tactic is profiled at ``measured_ms``, and the tuning group merges the
     result (PARALLEL). ``tuned_forwards`` lists the token counts of the forwards in tuning mode,
     where a cached tactic is compiled. ``prime_all_runners`` lists that option of each tuning pass.
+    Each of the forwards reports one step of progress to the ``report_progress`` that the tuning
+    pass got.
     """
 
     def __init__(self, dist, measured_ms, tuner=None):
@@ -517,6 +519,8 @@ class _DecoderEngine(SimpleNamespace):
             if _gemm(batch.num_tokens) not in profiling_cache.cache:
                 profiling_cache.cache[_gemm(batch.num_tokens)] = (0, 3, measured_ms)
                 tuner._maybe_sync_cache_data(DistributedTuningStrategy.PARALLEL, "gemm")
+            if self.tuning and self.report_progress is not None:
+                self.report_progress()
 
         super().__init__(
             _config=SimpleNamespace(
@@ -550,6 +554,7 @@ class _DecoderEngine(SimpleNamespace):
             profiling_cache=profiling_cache,
             tuner=tuner,
             tuning=False,
+            report_progress=None,
             tuned_forwards=[],
             prime_all_runners=[],
         )
@@ -560,14 +565,14 @@ class _DecoderEngine(SimpleNamespace):
         DecoderWarmup._run_autotuner_warmup(self, resource_manager)
 
     @contextlib.contextmanager
-    def _autotune(self, prime_all_runners=False, **kwargs):
+    def _autotune(self, prime_all_runners=False, report_progress=None, **kwargs):
         """Run the forwards in the block in tuning mode, as ``autotune`` does."""
         self.prime_all_runners.append(prime_all_runners)
-        self.tuning = True
+        self.tuning, self.report_progress = True, report_progress
         try:
             yield
         finally:
-            self.tuning = False
+            self.tuning, self.report_progress = False, None
 
     def autotuner_warmup(self, num_tokens):
         """Run the warmup up to its autotuner phase, with KV cache room for ``num_tokens``."""
@@ -647,6 +652,26 @@ def test_replacement_tunes_a_missing_shape_alone():
     replacement.autotuner_warmup(16)
     assert replacement.profiling_cache.cache == {**tuned_tactics, _gemm(1): (0, 3, 0.05)}
     assert replacement.dist.host_exchange.calls == 0
+    _record().close()
+
+
+def test_replacement_reports_its_solo_warmup_as_startup_progress():
+    """Check that each step of a replacement's solo autotuner warmup counts as startup progress.
+
+    The steps go through the progress report of its replayed collectives, so a long warmup that
+    keeps making progress is not taken for a hung startup. An original rank reports none.
+    """
+    rank_0_progress = _record().report_progress = Mock()
+    _, published, tuned_tactics = _original_rank_0(16, 16)
+    rank_0_progress.assert_not_called()
+    replacement = _replacement_engine(published, tuned_tactics)
+    in_tuning_pass = []
+    _record().report_progress = lambda: in_tuning_pass.append(replacement.tuning)
+    replacement.autotuner_warmup(16)
+    assert replacement.tuned_forwards == [16, 1]
+    # The replayed skip vote reports outside the pass, each shape of the solo pass inside it.
+    assert False in in_tuning_pass
+    assert in_tuning_pass.count(True) == len(replacement.tuned_forwards)
     _record().close()
 
 
