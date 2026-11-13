@@ -31,7 +31,6 @@ import random
 import re
 import signal
 import socket
-import statistics
 import subprocess
 import threading
 import time
@@ -101,7 +100,7 @@ WARMUP_S = 20
 SETTLE_S = 10
 WINDOW_S = 60
 # Timings are noisy on a shared CI node, so pauses and stalls are checked against a relaxed bound
-# (after the detection of a hang). The report holds the measured ones.
+# (after the detection of a hang). A failed check names the measured one.
 RELAXED_PAUSE_BOUND_S = 30.0
 RECOVERY_TIMEOUT_S = 120
 REJOIN_TIMEOUT_S = 1200
@@ -547,8 +546,8 @@ class Request:
     question: Optional[int] = None  # an eval request's GSM8K question
     retry: bool = False  # sent again after a retryable failure
     end: float = 0.0
-    # (arrival time, token count) per streamed chunk with tokens, or one per non-streamed response.
-    arrivals: List[Tuple[float, int]] = field(default_factory=list)
+    # The arrival time of each streamed chunk with tokens.
+    arrivals: List[float] = field(default_factory=list)
     token_ids: List[int] = field(default_factory=list)
     text: str = ""
     completion_tokens: Optional[int] = None
@@ -687,7 +686,6 @@ class Clients(_Threads):
                     request.token_ids = choice.get("token_ids") or []
                     request.text = choice.get("text") or ""
                     request.completion_tokens = result["usage"]["completion_tokens"]
-                    request.arrivals.append((time.monotonic(), request.completion_tokens))
         except urllib.error.HTTPError as error:
             body = _error_body(error)
             request.error = f"HTTP {error.code}: {body.decode(errors='replace')}"
@@ -721,7 +719,7 @@ class Clients(_Threads):
             for choice in chunk.get("choices") or []:
                 ids = choice.get("token_ids") or []
                 if ids:
-                    request.arrivals.append((now, len(ids)))
+                    request.arrivals.append(now)
                     request.token_ids.extend(ids)
             if chunk.get("usage"):
                 request.completion_tokens = chunk["usage"]["completion_tokens"]
@@ -730,12 +728,7 @@ class Clients(_Threads):
         return [r for r in self.requests if r.question is None]
 
     def stream_arrivals(self) -> List[float]:
-        return sorted(t for r in self.load_requests() if r.stream for t, _ in r.arrivals)
-
-    def throughput(self, start: float, end: float) -> float:
-        """Return the output tokens per second that all clients received in [start, end)."""
-        tokens = sum(n for r in self.requests for t, n in r.arrivals if start <= t < end)
-        return round(tokens / max(end - start, 1e-3), 1)
+        return sorted(t for r in self.load_requests() for t in r.arrivals)
 
 
 def _largest_gap(times: List[float], start: float, end: float) -> float:
@@ -862,17 +855,15 @@ class Phase:
 
 
 class Run:
-    """Run the load, the monitor and failures on one deployment, then report and check."""
+    """Run the load, the monitor and failures on one deployment, then check."""
 
-    def __init__(self, deployment: Deployment, tmp_path: Path, name: str):
+    def __init__(self, deployment: Deployment):
         self.deployment = deployment
-        self.name = name
-        self.report_path = tmp_path / "report.json"
         self.gsm8k = Gsm8k(EVAL_QUESTIONS)
         self.monitor = Monitor(deployment)
         self.clients = Clients(deployment, self.gsm8k)
         self.phases: List[Phase] = []
-        self.cycles: List[dict] = []
+        self.cycles = 0
         # Only requests in flight at a rank failure may fail.
         self.failure_times: List[float] = []
         # From each hang to the commit that removes the hung rank.
@@ -908,9 +899,8 @@ class Run:
     def __exit__(self, *exc) -> None:
         for failure in self.clients.stop() + self.monitor.stop():
             self.check(False, failure)
-        failed = exc[0] is not None
-        phases = self._phase_reports()
-        if not failed:
+        if exc[0] is None:
+            self._check_accuracy()
             self._check_requests()
             self._check_captures()
             # A status may read stalled until one refresh period and one read after a hang ends.
@@ -926,26 +916,16 @@ class Run:
             logged = _retryable_failures_logged(self.deployment.logs)
             # Rank 0 logs the count at every membership change, so this also checks the pattern.
             self.check(
-                len(logged) >= len(self.cycles),
+                len(logged) >= self.cycles,
                 f"rank 0 logged {len(logged)} lines matching {RETRYABLE_LOG.pattern!r} in "
-                f"{len(self.cycles)} failure cycles",
+                f"{self.cycles} failure cycles",
             )
             self.check(
                 retryable <= sum(logged.values()),
                 f"{retryable} requests failed as retryable, but rank 0 logged only "
                 f"{sum(logged.values())}",
             )
-        report = {
-            "test": self.name,
-            "world_size": WORLD_SIZE,
-            "phases": phases,
-            "cycles": self.cycles,
-            "check_failures": self.failures,
-        }
-        self.report_path.write_text(json.dumps(report, indent=2))
-        print(json.dumps(report, indent=2))
-        if not failed:
-            assert not self.failures, "\n".join(self.failures) + f"\nreport: {self.report_path}"
+            assert not self.failures, "\n".join(self.failures)
 
     def window(self, name: str, cycle: int) -> Phase:
         """Serve for WINDOW_S, then until every eval question is answered or EVAL_COVER_EXTRA_S."""
@@ -965,13 +945,14 @@ class Run:
         failure: str,
         at_admission: Optional[Callable[[], Dict[int, psutil.Process]]] = None,
         at_admission_state: Optional[str] = None,
-    ) -> dict:
+    ) -> None:
         """Fail a rank with ``crash`` or ``hang``, wait for N ranks, and serve a window.
 
         ``at_admission`` returns processes to kill once the store shows the admission in
         ``at_admission_state``.
         """
-        d, index = self.deployment, len(self.cycles) + 1
+        self.cycles += 1
+        d, index = self.deployment, self.cycles
         status = d.status()
         assert status["active_ranks"] == list(range(WORLD_SIZE)), status
         assert status["failed_ranks"] == [], status
@@ -980,8 +961,6 @@ class Run:
         captures_before = _capture_lines(d.logs)
         assert VICTIM in workers_before, f"ranks on this node: {sorted(workers_before)}"
         victim = workers_before[VICTIM]
-        record = {"cycle": index, "failure": failure, "failed_ranks": [VICTIM]}
-        self.cycles.append(record)
 
         t_fail = time.monotonic()
         if failure == "hang":
@@ -993,7 +972,6 @@ class Run:
         t_degraded, failover_status = self.monitor.wait_for(
             _committed_after(status["generation"]), t_fail, detection_s + RECOVERY_TIMEOUT_S
         )
-        record["time_to_degraded_s"] = round(t_degraded - t_fail, 3)
         self.monitor.wait_for_health(200, "degraded", t_degraded, RECOVERY_TIMEOUT_S)
         self.phases.append(Phase("failover", index, t_fail, t_degraded, event=t_fail))
         time.sleep(SETTLE_S)
@@ -1045,10 +1023,6 @@ class Run:
             self.phases.append(
                 Phase("admission_failure", index, t_kill, t_after_kill, event=t_kill)
             )
-            record["admission_failure"] = {
-                "killed_ranks": killed_at_admission,
-                "status_at_kill": admitting,
-            }
             committed = {
                 s["last_transaction"]["generation"]
                 for _, s in self.monitor.membership
@@ -1070,9 +1044,7 @@ class Run:
         admission = rejoined_status["last_transaction"]
         # The commit is read within STORE_POLL_S. The authority measures the transaction's duration.
         t_admission = t_rejoined - (admission["ended_unix_ms"] - admission["began_unix_ms"]) / 1e3
-        record["time_to_n_s"] = round(t_rejoined - t_fail, 3)
         changes = _membership_changes_metric(d.base, {"failover": index, "admission": index})
-        record["membership_changes_metric"] = changes
         self.check(
             changes.get("failover", 0) >= index and changes.get("admission", 0) >= index,
             f"cycle {index}: trtllm_fault_tolerance_membership_changes after the rejoin: {changes}",
@@ -1085,7 +1057,6 @@ class Run:
         workers_after = _rank_workers(d.secret)
         gpus_after = _rank_gpus(workers_after)
         captures_after = _capture_lines(d.logs)
-        record["cuda_graph_capture_lines"] = {"before": captures_before, "after": captures_after}
         replaced = sorted({VICTIM, *killed_at_admission})
 
         # The longest time without a streamed token at the failure, at the admission, at a kill
@@ -1115,7 +1086,6 @@ class Run:
         arrivals = self.clients.stream_arrivals()
         for name, (start, end, bound_s, within) in gaps.items():
             gap_s = _largest_gap(arrivals, start, end)
-            record[name] = round(gap_s, 3)
             self.check(
                 within(gap_s, bound_s),
                 f"cycle {index}: no streamed token for {gap_s:.2f} s ({name}), bound {bound_s} s",
@@ -1177,7 +1147,6 @@ class Run:
                 captures_after.get(rank, 0) > captures_before.get(rank, 0),
                 f"cycle {index}: no CUDA graph capture lines of rank {rank}'s replacement",
             )
-        return record
 
     @contextlib.contextmanager
     def refused_join(self, rank: int, replacement: bool, reason: str):
@@ -1200,18 +1169,15 @@ class Run:
             f"(replacement {replacement}): {line!r}",
         )
 
-    def _phase_reports(self) -> List[dict]:
-        """Return each phase's output tokens per second and GSM8K answers paired with healthy's.
-
-        Check that the healthy phase answered every question and no later phase lost accuracy.
-        """
+    def _check_accuracy(self) -> None:
+        """Check that the healthy phase answered every GSM8K question and no later phase lost accuracy."""
         requests = self.clients.requests
         scores = {
             i: self.gsm8k.score(r.question, r.text)
             for i, r in enumerate(requests)
             if r.question is not None and r.error is None
         }
-        reports, healthy = [], None
+        healthy = None
         alpha = ACCURACY_ALPHA / max(1, len(self.phases) - 1)
         for phase in self.phases:
             # Score each question by its first answer in the phase.
@@ -1219,7 +1185,7 @@ class Run:
             for i in sorted(scores, key=lambda i: requests[i].start):
                 if phase.covers(requests[i]):
                     answers.setdefault(requests[i].question, scores[i])
-            gsm8k, label = {"questions": len(answers)}, f"cycle {phase.cycle} {phase.name}"
+            label = f"cycle {phase.cycle} {phase.name}"
             if healthy is None:
                 healthy = answers
                 self.check(
@@ -1231,15 +1197,6 @@ class Run:
                 lost = sum(1 for q in paired if healthy[q] == 1.0 and answers[q] == 0.0)
                 gained = sum(1 for q in paired if healthy[q] == 0.0 and answers[q] == 1.0)
                 p_loss = _sign_test_p(lost, gained)
-                gsm8k.update(
-                    {
-                        "paired": len(paired),
-                        "right_when_healthy_wrong_here": lost,
-                        "wrong_when_healthy_right_here": gained,
-                        "p_loss": p_loss,
-                        "alpha": alpha,
-                    }
-                )
                 self.check(
                     bool(paired),
                     f"{label}: no GSM8K question answered here and in the healthy phase",
@@ -1250,17 +1207,6 @@ class Run:
                     f"questions both answered, {lost} went right -> wrong and {gained} wrong -> "
                     f"right (p {p_loss:.2g} < {alpha:.2g})",
                 )
-            if answers:
-                gsm8k["accuracy"] = round(statistics.mean(answers.values()), 4)
-            reports.append(
-                {
-                    "phase": phase.name,
-                    "cycle": phase.cycle,
-                    "output_tok_s": self.clients.throughput(phase.start, phase.end),
-                    "gsm8k": gsm8k,
-                }
-            )
-        return reports
 
     def _check_requests(self) -> None:
         """Check that every request completed in full, except retryable streams across a failure."""
@@ -1338,15 +1284,13 @@ def _check_refused_join(run: Run, kind: str, replacement: bool, reason: str) -> 
             if (changed := change()) is not None or checked_s >= fresh:
                 break
             time.sleep(0.1)
-    run.phases.append(Phase(f"{kind}_join", len(run.cycles), t_join, time.monotonic()))
+    run.phases.append(Phase(f"{kind}_join", run.cycles, t_join, time.monotonic()))
     run.check(changed is None, f"a {kind} join for rank {VICTIM} {changed}")
 
 
-def _crash_during_admission(
-    deployment: Deployment, tmp_path: Path, name: str, state: Optional[str] = None
-) -> None:
+def _crash_during_admission(deployment: Deployment, state: Optional[str] = None) -> None:
     """Crash the victim, then a second rank on this node during the victim's admission."""
-    with Run(deployment, tmp_path, name) as run:
+    with Run(deployment) as run:
         workers = _rank_workers(deployment.secret)
         second = min((r for r in workers if r not in (0, VICTIM)), default=None)
         assert second is not None, f"no second rank to fail on this node: {sorted(workers)}"
@@ -1358,22 +1302,20 @@ class TestRankFailures:
 
     @pytest.mark.parametrize("sequence", ["crash", "crash-hang"])
     @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
-    def test_rank_failure_sequence(
-        self, shared_deployment: Deployment, tmp_path: Path, sequence: str
-    ):
+    def test_rank_failure_sequence(self, shared_deployment: Deployment, sequence: str):
         """Fail a rank per ``-``-separated step of ``sequence``, each followed by a rejoin."""
-        with Run(shared_deployment, tmp_path, "sequence") as run:
+        with Run(shared_deployment) as run:
             for failure in sequence.split("-"):
                 run.cycle(failure)
 
     @pytest.mark.timeout(STARTUP_TIMEOUT_S + 3 * REJOIN_TIMEOUT_S + 1200)
-    def test_refused_joins_and_admission_kill(self, shared_deployment: Deployment, tmp_path: Path):
+    def test_refused_joins_and_admission_kill(self, shared_deployment: Deployment):
         """Send joins the authority refuses, and kill a replacement during its admission."""
         d = shared_deployment
         first_process_refusal = (
             f"rank {VICTIM} joins only as a replacement once the deployment has started"
         )
-        with Run(d, tmp_path, "refused_joins") as run:
+        with Run(d) as run:
             with run.refused_join(VICTIM, False, first_process_refusal):
                 run.cycle("crash")
             _check_refused_join(run, "stale", False, first_process_refusal)
@@ -1385,14 +1327,14 @@ class TestRankFailures:
             run.cycle("crash", at_admission=lambda: _wait_for_replacement(d.secret, victim_pid))
 
     @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
-    def test_failure_during_admission(self, shared_deployment: Deployment, tmp_path: Path):
+    def test_failure_during_admission(self, shared_deployment: Deployment):
         """Crash a second rank while the first one's replacement is admitted."""
-        _crash_during_admission(shared_deployment, tmp_path, "failure_during_admission")
+        _crash_during_admission(shared_deployment)
 
     @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
-    def test_failure_during_install(self, shared_deployment: Deployment, tmp_path: Path):
+    def test_failure_during_install(self, shared_deployment: Deployment):
         """Crash a second rank while the active ranks install the first one's admission."""
-        _crash_during_admission(shared_deployment, tmp_path, "failure_during_install", "INSTALL")
+        _crash_during_admission(shared_deployment, "INSTALL")
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
@@ -1426,7 +1368,7 @@ def test_shutdown_after_rank_given_up(tmp_path: Path):
     SHUTDOWN, and the launcher ends on its own.
     """
     with _deploy(tmp_path) as deployment:
-        with Run(deployment, tmp_path, "shutdown_after_rank_given_up") as run:
+        with Run(deployment) as run:
             status = deployment.status()
             victim = _rank_workers(deployment.secret)[VICTIM]
             victim.kill()
@@ -1488,7 +1430,7 @@ def test_shutdown_after_rank_given_up(tmp_path: Path):
 def test_rejoin_on_target(tmp_path: Path, target: str):
     """Fail over and rejoin a killed rank on another target's default configuration."""
     with _deploy(tmp_path, target=target) as deployment:
-        with Run(deployment, tmp_path, target) as run:
+        with Run(deployment) as run:
             run.cycle("crash")
 
 
@@ -1497,7 +1439,7 @@ def test_rejoin_on_target(tmp_path: Path, target: str):
 def test_rejoin_when_server_spawns_ranks(tmp_path: Path):
     """Fail over and rejoin a killed rank under plain trtllm-serve, which chooses the secret."""
     with _deploy(tmp_path, server_spawns_ranks=True) as deployment:
-        with Run(deployment, tmp_path, "server_spawns_ranks") as run:
+        with Run(deployment) as run:
             run.cycle("crash")
 
 
@@ -1506,7 +1448,7 @@ def test_rejoin_when_server_spawns_ranks(tmp_path: Path):
 def test_rejoin_through_two_frontends(tmp_path: Path):
     """Fail over and rejoin a killed rank while the clients and the monitor use both frontends."""
     with _deploy(tmp_path, server_spawns_ranks=True, frontends=2) as deployment:
-        with Run(deployment, tmp_path, "two_frontends") as run:
+        with Run(deployment) as run:
             run.cycle("crash")
         (t_fail,) = run.failure_times
         for base in deployment.frontends:
