@@ -223,6 +223,7 @@ def _executor(rank=0):
         executor_request_queue=Mock(wraps=ExecutorRequestQueue(MagicMock(), 8, False, 0)),
         waiting_queue=[],
         canceled_req_ids=[],
+        is_shutdown=False,
         request_accumulated=[],
         active_requests=[],
         previous_batch=None,
@@ -1692,16 +1693,18 @@ def _admitting(monkeypatch, rank):
     r.executor.dist.allgather.side_effect = lambda local: [
         local if i == rank else (set(), None) for i in range(WORLD)
     ]
-    r.exchange.rank0_object = ([RequestQueueItem(7)], [8])
+    r.exchange.rank0_object = ([RequestQueueItem(7)], [8], False)
     r.executor.waiting_queue = FCFSWaitingQueue()
     committed = install.model_copy(update=dict(state=MembershipState.COMMITTED, joining_mask=0))
     r.client.answers[(Reply.INSTALLED, 2)] = [committed]
     return r
 
 
-def test_rank0_admits_joining_rank(monkeypatch):
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_rank0_admits_joining_rank(monkeypatch, shutdown):
     r = _admitting(monkeypatch, rank=0)
     executor = r.executor
+    executor.is_shutdown = shutdown
     prompt = b"a user's prompt"
     executor.waiting_queue.add_requests(
         [RequestQueueItem(7, SimpleNamespace(priority=DEFAULT_REQUEST_PRIORITY, prompt=prompt))]
@@ -1726,10 +1729,12 @@ def test_rank0_admits_joining_rank(monkeypatch):
     assert handed["host_exchange_epoch/2"] == str(epoch).encode()
     assert r.exchange.admits == [(ALL_RANKS, epoch)]
     assert len(r.exchange.installs) == 1  # Only at INSTALL.
-    # Rank 0 hands the waiting queue and the pending cancellations to the joining rank only.
-    (((queued, canceled), readers, recipients),) = r.exchange.exchanges
+    # Rank 0 hands the waiting queue, the pending cancellations and the shutdown flag to the
+    # joining rank only.
+    (((queued, canceled, handed_shutdown), readers, recipients),) = r.exchange.exchanges
     assert [item.id for item in queued] == [7]
     assert canceled == [9]
+    assert handed_shutdown is shutdown
     assert (readers, recipients) == ([], [FAILED])
     # Every rank reads the request gather, which carries only request ids and slots.
     (gathered,) = executor.dist.allgather.call_args.args
@@ -1743,8 +1748,10 @@ def test_rank0_admits_joining_rank(monkeypatch):
     assert not r.recovery.pauses_forward()
 
 
-def test_joining_rank_takes_rank0_waiting_queue(monkeypatch):
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_joining_rank_takes_rank0_waiting_queue(monkeypatch, shutdown):
     r = _admitting(monkeypatch, rank=FAILED)
+    r.exchange.rank0_object = ([RequestQueueItem(7)], [8], shutdown)
     executor = r.executor
     # The queue that an earlier attempt of this admission took.
     executor.waiting_queue.add_requests([RequestQueueItem(5)])
@@ -1756,6 +1763,8 @@ def test_joining_rank_takes_rank0_waiting_queue(monkeypatch):
     assert len(r.exchange.installs) == 1  # Only at INSTALL.
     assert [item.id for item in executor.waiting_queue] == [7]
     assert executor.canceled_req_ids == [8]
+    # A rank admitted after the shutdown request drains and stops with the others.
+    assert executor.is_shutdown is shutdown
     ((_, readers, recipients),) = r.exchange.exchanges
     assert (readers, recipients) == ([0], [])
     executor.dist.broadcast.assert_not_called()

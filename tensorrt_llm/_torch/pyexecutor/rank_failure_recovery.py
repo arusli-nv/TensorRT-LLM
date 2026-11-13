@@ -948,14 +948,19 @@ class RankFailureRecovery:
         return known, [None if payload is None else payload[1] for payload in gathered]
 
     def _hand_over_waiting_queue(self, record: MembershipRecord) -> None:
-        """Hand rank 0's waiting queue and pending cancellations to the joining ranks of ``record``.
+        """Hand rank 0's waiting queue, pending cancellations and shutdown flag to the joining ranks.
 
-        Every active rank then drops the same canceled requests from the queue. The queue goes
+        Every active rank then drops the same canceled requests from the queue, and a joining rank
+        admitted after the shutdown request drains and stops with the others. The queue goes
         through the host exchange, so user prompts stay out of the rendezvous store.
         """
         executor = self._executor
         if self.rank == 0:
-            waiting = (list(executor.waiting_queue), list(executor.canceled_req_ids))
+            waiting = (
+                list(executor.waiting_queue),
+                list(executor.canceled_req_ids),
+                executor.is_shutdown,
+            )
             joining = [r for r in range(self.world_size) if record.is_joining(r)]
             self._exchange.exchange(pickle.dumps(waiting), readers=[], recipients=joining)
             return
@@ -964,7 +969,7 @@ class RankFailureRecovery:
             pickle.dumps(None), readers=[0] if joining else [], recipients=[]
         )
         if joining:
-            queue, canceled = pickle.loads(payloads[0])  # nosec B301
+            queue, canceled, executor.is_shutdown = pickle.loads(payloads[0])  # nosec B301
             # Rank 0's queue replaces the one an earlier attempt of this admission took.
             executor.waiting_queue.remove_by_ids({item.id for item in executor.waiting_queue})
             executor.waiting_queue.add_requests(queue)
