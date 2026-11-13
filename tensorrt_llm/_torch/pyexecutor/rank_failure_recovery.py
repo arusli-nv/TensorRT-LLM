@@ -182,32 +182,29 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     if kernel_timeout_s is None:
         kernel_timeout_s = torch.ops.trtllm.moe_a2a_get_timeout()
     checks = [
-        # In some modes the executor creator turns it off after argument validation.
+        # The executor creator turns it off after argument validation in these modes.
         (
             not llm_args.disable_overlap_scheduler,
-            "the overlap scheduler, which speculative decoding modes without overlap support "
-            "(such as two-model Eagle3 or draft-target) and multimodal encoder-only mode turn "
-            "off, because only its executor loop accepts or discards each step when the next "
-            "one starts",
+            "the overlap scheduler, which speculative decoding without overlap support (such as "
+            "two-model Eagle3 or draft-target) or multimodal encoder-only mode turned off, "
+            "because only its loop accepts or discards each step when the next one starts",
         ),
         (
             mapping.moe_ep_size == mapping.world_size,
-            "expert parallelism over every rank (moe_expert_parallel_size equal to the world "
-            "size, with context_parallel_size=1 and pipeline_parallel_size=1, not "
-            f"moe_expert_parallel_size={mapping.moe_ep_size} with {mapping.world_size} ranks), so "
-            "that a failed rank holds whole experts",
+            f"expert parallelism over every rank (moe_expert_parallel_size={mapping.world_size}, "
+            f"not {mapping.moe_ep_size}), so that a failed rank holds whole experts",
         ),
         # Resolved from "auto" only as the model loads, after argument validation.
         (
             llm_args.kv_cache_config.use_kv_cache_manager_v2 is True,
             "KV cache manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, not "
-            f"{llm_args.kv_cache_config.use_kv_cache_manager_v2!r}), the only KV cache manager "
-            "that holds the KV reuse commits of a step until it is accepted",
+            f"{llm_args.kv_cache_config.use_kv_cache_manager_v2!r}), because only it holds a "
+            "step's KV reuse commits until the step is accepted",
         ),
         (
             get_force_cft() is not True,
-            f"the fence path of the NVLink one-sided all-to-all ({FORCE_CFT_ENV} unset or 0), "
-            "the only path that follows a membership change on the same CUDA graphs",
+            f"the fence path ({FORCE_CFT_ENV} unset or 0), because only it stops "
+            "waiting on a failed rank",
         ),
         (
             os.environ.get("TLLM_FAULT_TOLERANCE_MODE") != "1",
@@ -216,9 +213,9 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
         ),
         (
             kernel_timeout_s >= 2 * HANG_TIMEOUT_S,
-            f"{SERVING_TIMEOUT_ENV} of at least {2 * HANG_TIMEOUT_S:.0f} s (twice the hang "
-            f"timeout, not {kernel_timeout_s:.0f} s), so that an all-to-all waiting on a hung "
-            "rank lasts until it is dropped",
+            f"an all-to-all timeout of at least twice the hang timeout ({SERVING_TIMEOUT_ENV}"
+            f">={2 * HANG_TIMEOUT_S:.0f} s, not {kernel_timeout_s:.0f} s), so that a wait on a "
+            "hung rank lasts until the rank is dropped",
         ),
     ]
     check_fault_tolerance_requirements(checks)
@@ -282,7 +279,8 @@ def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
             uses = "no communication strategy" if comm is None else type(comm).__name__
             raise ValueError(
                 f"MoE layer {name} ({type(layer).__name__}) uses {uses}, but Wide-EP fault "
-                "tolerance requires NVLinkOneSided. Select it or turn fault tolerance off "
+                "tolerance requires NVLinkOneSided, the only MoE communication that can leave "
+                "out a failed rank. Select it or turn fault tolerance off "
                 "(enable_wide_ep_fault_tolerance=False)."
             )
         comms[id(comm)] = comm
@@ -627,7 +625,6 @@ class RankFailureRecovery:
         )
 
     def _set_phase(self, phase: _Phase, reason: str) -> None:
-        """Move this rank to ``phase``, which ``_PHASE_TRANSITIONS`` must allow."""
         with self._record_changed:
             if phase not in _PHASE_TRANSITIONS[self._phase]:
                 raise RuntimeError(
@@ -687,7 +684,6 @@ class RankFailureRecovery:
                 detector.checkpoint()
 
     def _on_exchange_interrupt(self) -> None:
-        """Join the membership change that stopped the host exchange."""
         self._change_membership()
         if self._phase in _INSTALL_IN_PROGRESS and self._installed.is_joining(self.rank):
             raise _MembershipRestarted
@@ -725,7 +721,6 @@ class RankFailureRecovery:
         return _RecordOutcome.INSTALLED
 
     def _on_propose(self, record: MembershipRecord) -> _RecordOutcome:
-        """Reply READY with the iteration and epoch this rank paused at."""
         self._end_eplb_iterations()
         if self._record == record:
             paused_at = ResumeState(

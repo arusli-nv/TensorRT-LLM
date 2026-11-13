@@ -314,7 +314,7 @@ def test_hang_during_transaction_restarts_it(phase, how):
 
 
 @pytest.mark.parametrize("cause", ["install", "rank 0"])
-def test_transaction_aborts(cause):
+def test_transaction_aborts_on_failed_install_or_rank0_loss(cause):
     """Abort on a failed survivor install or the loss of rank 0."""
     cluster = Cluster()
     if cause == "install":
@@ -356,7 +356,7 @@ def test_survivor_failure_during_admission_commits():
     assert MembershipState.ABORTED not in states(cluster)
 
 
-def test_commit_needs_every_install():
+def test_commit_waits_for_every_rank_to_install():
     """Never commit a generation that a rank replied READY to but did not install."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
@@ -426,7 +426,7 @@ def test_stalled_joiner_left_out_early():
     assert cluster.now - stalled_s <= authority.ADMISSION_TIMEOUT_S + 0.2
 
 
-def test_unconnected_replacement_dropped():
+def test_join_request_of_unconnected_replacement_is_dropped():
     """Drop the join request of a replacement that never connects."""
     cluster = Cluster()
     cluster.alive.discard(3)
@@ -504,7 +504,7 @@ def test_replacements_added_in_one_transaction(late):
 
 @pytest.mark.parametrize("failure", ["failed_reply", "hang"])
 @pytest.mark.parametrize("phase", [MembershipState.PROPOSE, MembershipState.INSTALL])
-def test_failed_replacement_left_out(phase, failure):
+def test_failed_replacement_is_left_out_of_the_change(phase, failure):
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -795,7 +795,7 @@ def test_authority_ends_with_rank_connected(end):
 
 
 @pytest.mark.parametrize("shutdown", [False, True], ids=["idle", "shutdown"])
-def test_authority_sends_heartbeats(monkeypatch, shutdown):
+def test_authority_heartbeats_keep_ranks_connected(monkeypatch, shutdown):
     """Keep the ranks of an idle or ending deployment connected with the authority's heartbeats."""
     monkeypatch.setattr(authority_process, "HEARTBEAT_INTERVAL_S", 0.1)
     monkeypatch.setattr(liveness, "AUTHORITY_SILENCE_TIMEOUT_S", 1.0)
@@ -1051,7 +1051,7 @@ def test_replacement_refused_until_rank_removed(monkeypatch):
         assert _refused(store, 2, False)
 
 
-def test_reports_stamped_on_receipt(monkeypatch):
+def test_authority_stamps_reports_on_receipt(monkeypatch):
     """Check that the authority stamps each report with the time it received it."""
     stamps = []
     decide = Authority.tick
@@ -1214,7 +1214,7 @@ def test_callback_error_logged_with_traceback(monkeypatch):
     assert "Traceback" in message
 
 
-def test_client_thread_error_reported(monkeypatch):
+def test_client_thread_error_is_reported_and_closes_connection(monkeypatch):
     """Report any error that ends a client's thread, and close its liveness connection."""
     logged, errors = [], []
     monkeypatch.setattr(liveness.logger, "error", logged.append)

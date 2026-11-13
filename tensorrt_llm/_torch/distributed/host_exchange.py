@@ -665,8 +665,15 @@ class MnnvlDist(Distributed):
                 "the MPI orchestrator (TLLM_DISABLE_MPI unset), because a replacement rank cannot "
                 "join a torch.distributed process group",
             ),
-            (mapping.enable_attention_dp, "attention DP (enable_attention_dp=True)"),
-            (mapping.pp_size == 1, "pipeline_parallel_size=1"),
+            (
+                mapping.enable_attention_dp,
+                "attention DP (enable_attention_dp=True), so that a failed rank takes only its "
+                "own requests with it",
+            ),
+            (
+                mapping.pp_size == 1,
+                "pipeline_parallel_size=1, because MnnvlDist has no pipeline-parallel group",
+            ),
             (
                 mapping.cp_size == 1,
                 "context_parallel_size=1, because MnnvlDist has no context-parallel group",

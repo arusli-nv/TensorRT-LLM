@@ -451,12 +451,8 @@ class NVLinkOneSided(Communication):
                 ``ep_group_health`` and watches the fence path. If None, the watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
-            enable_wide_ep_fault_tolerance: Allocate the workspace as MNNVL memory that a
-                membership change can remap, and run in rank-mask mode without CFT counted writes.
-                The rank mask and the abort state then come from ``bind_execution_state``, which
-                must precede the first dispatch, instead of ``ep_group_health`` and a watchdog.
-                Unlike with ``ep_group_health``, CUDA graphs are allowed, because a membership
-                change keeps them valid.
+            enable_wide_ep_fault_tolerance: Use a remappable workspace and the rank mask of
+                ``bind_execution_state``, called before the first dispatch, on the fence path.
                 Corresponds to model_config.enable_wide_ep_fault_tolerance.
         """
         super().__init__(mapping)

@@ -71,8 +71,10 @@ def get_wide_ep_ft_options(
     rank_mask_enabled = health is not None or _env_enabled()
     if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
         raise ValueError(
-            "WideEP fault tolerance does not support CUDA graphs until generation-scoped "
-            "invalidation and recapture are implemented"
+            "An EP group health in ModelConfig.extra_attrs or TLLM_FAULT_TOLERANCE_MODE=1 does "
+            "not support CUDA graphs, because it writes the rank mask from the host at each "
+            "dispatch, which a graph replay skips. Use enable_wide_ep_fault_tolerance, which "
+            "keeps CUDA graphs valid"
         )
     if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)

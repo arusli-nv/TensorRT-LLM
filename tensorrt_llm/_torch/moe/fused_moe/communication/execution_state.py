@@ -17,17 +17,14 @@
 Every rank-mask MoE layer over one :class:`EPGroupHealth` runs under one :class:`MoeExecutionState`.
 The kernels read the rank mask and the abort state at fixed addresses, so captured CUDA graphs
 follow every change. Long waits on peers publish the round flag they wait for in the abort state, which
-the All-to-All watchdog polls. With Wide-EP fault tolerance, when a peer fails, ``request_abort``
-releases the collectives that wait for it. Then, with the model idle, ``remap_workspaces`` maps the
-workspaces among the active ranks, ``rearm`` returns them to their first round, and
-``install_mask`` writes the new rank mask.
+the All-to-All watchdog polls.
 """
 
 from __future__ import annotations
 
 import weakref
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -78,18 +75,17 @@ class MembershipWorkspace(Protocol):
 class MembershipAlltoAllWorkspaceLifecycle(_MnnvlAlltoAllWorkspaceLifecycle):
     """Lifecycle of an All-to-All workspace in MembershipMnnvlMemory, a :class:`MembershipWorkspace`."""
 
+    _memory: MembershipMnnvlMemory
+
     @property
     def device_bytes(self) -> int:
-        """Return the device bytes that a remap allocates for this rank's row."""
-        return cast("MembershipMnnvlMemory", self._memory).local_device_bytes
+        return self._memory.local_device_bytes
 
     def rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
-        """Return every row if a former member may still write into the workspace, else no row."""
-        return cast("MembershipMnnvlMemory", self._memory).rows_needing_fresh_pages(comm)
+        return self._memory.rows_needing_fresh_pages(comm)
 
     def remap(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
-        """Map the workspace among the active ranks in place, with fresh pages for ``fresh_rows``."""
-        cast("MembershipMnnvlMemory", self._memory).remap(comm, fresh_rows)
+        self._memory.remap(comm, fresh_rows)
 
 
 class BindableCommunication(Protocol):

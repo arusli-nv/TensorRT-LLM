@@ -895,7 +895,8 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
     ):
         parser.error(
             "Wide-EP fault tolerance requires `mpirun --enable-recovery`, not srun, to start "
-            "trtllm-llmapi-launch"
+            "trtllm-llmapi-launch, because Slurm's PMIx plugin cancels the job step when one of its "
+            "tasks exits"
         )
     gpus_per_node = args.gpus_per_node or _local_gpu_count(environ)
     if gpus_per_node <= 0:

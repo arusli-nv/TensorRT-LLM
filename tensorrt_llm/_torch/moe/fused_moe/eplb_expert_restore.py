@@ -519,7 +519,8 @@ class EplbExpertRestore:
             and not runtime.host_accessible_device_memory_uses_gdrcopy()
         ):
             raise ValueError(
-                "Wide-EP fault tolerance with online EPLB requires GDRCopy in CDMM mode. Set "
+                "Wide-EP fault tolerance with online EPLB requires GDRCopy in CDMM mode, "
+                "because online EPLB's CPU copies reach the spare slots only through GDRCopy. Set "
                 "layer_updates_per_iter=0 or turn fault tolerance off "
                 "(enable_wide_ep_fault_tolerance=False)."
             )

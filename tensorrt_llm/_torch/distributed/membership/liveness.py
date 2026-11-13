@@ -23,6 +23,7 @@ import time
 import traceback
 import weakref
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable, List, Optional
 
 from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV
@@ -86,7 +87,7 @@ class LivenessConnection:
 
 
 def keep_alive(sock: socket.socket) -> None:
-    """Have the kernel fail ``sock`` once its peer acknowledges nothing for ``DEAD_TIMEOUT_S``."""
+    """Set TCP keepalive so that ``sock`` fails once its peer is silent for ``DEAD_TIMEOUT_S``."""
     idle_s = int(DEAD_TIMEOUT_S / 2)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_s)
@@ -100,7 +101,6 @@ def keep_alive(sock: socket.socket) -> None:
 
 @functools.lru_cache(maxsize=1)
 def _closed_in_forked_child() -> "weakref.WeakSet[Any]":
-    """Return what forked children close, registering the fork handler once."""
     resources = weakref.WeakSet()
 
     def close_all() -> None:
@@ -112,7 +112,7 @@ def _closed_in_forked_child() -> "weakref.WeakSet[Any]":
 
 
 def close_in_forked_child(resource: Any) -> None:
-    """Have every child that this process forks close ``resource``, without keeping it alive."""
+    """Close ``resource`` in every child that this process forks, without keeping it alive."""
     _closed_in_forked_child().add(resource)
 
 
@@ -121,8 +121,6 @@ def _warn_while_no_authority(store: SignedStore) -> None:
 
     The caller then keeps waiting in the store's blocking get until the store's timeout.
     """
-    from datetime import timedelta
-
     from torch.distributed import DistStoreError
 
     try:
@@ -173,8 +171,6 @@ def open_store(address: str, timeout_s: float, secret: Optional[str] = None) -> 
 
     The client signs and verifies values with ``secret`` (hex), by default ``SHARED_SECRET_ENV``.
     """
-    from datetime import timedelta
-
     from torch.distributed import TCPStore
 
     host, port = rendezvous_host_port(address)

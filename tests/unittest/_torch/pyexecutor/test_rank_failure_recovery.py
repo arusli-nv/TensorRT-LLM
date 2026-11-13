@@ -113,9 +113,6 @@ def fresh_startup_record(monkeypatch):
     monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
 
 
-# One fake per collaborator of RankFailureRecovery.
-
-
 class FakeExchange:
     """Host exchange of one rank, in which rank 0 sends ``rank0_object``."""
 
@@ -392,22 +389,18 @@ _SERVING_TIMEOUT_S = int(2 * HANG_TIMEOUT_S)
         ({FORCE_CFT_ENV: "0"}, None, None),
         ({"TLLM_FAULT_TOLERANCE_MODE": "1"}, None, "TLLM_FAULT_TOLERANCE_MODE unset"),
         ({SERVING_TIMEOUT_ENV: str(_SERVING_TIMEOUT_S)}, None, None),
-        (
-            {FORCE_CFT_ENV: "1"},
-            None,
-            f"fence path of the NVLink one-sided all-to-all ({FORCE_CFT_ENV}",
-        ),
+        ({FORCE_CFT_ENV: "1"}, None, f"the fence path ({FORCE_CFT_ENV} unset or 0)"),
         (
             {SERVING_TIMEOUT_ENV: str(_SERVING_TIMEOUT_S - 1)},
             None,
-            f"(twice the hang timeout, not {_SERVING_TIMEOUT_S - 1} s)",
+            f"not {_SERVING_TIMEOUT_S - 1} s), so that a wait on a hung rank",
         ),
-        ({}, "ep", f"not moe_expert_parallel_size={WORLD // 2} with {WORLD} ranks)"),
+        ({}, "ep", f"(moe_expert_parallel_size={WORLD}, not {WORLD // 2})"),
         ({}, "kv_v2", "(kv_cache_config.use_kv_cache_manager_v2=True, not False)"),
         # "auto" resolves only as the model loads.
         ({}, "kv_auto", "(kv_cache_config.use_kv_cache_manager_v2=True, not 'auto')"),
         # The executor creator turns it off after the arguments' validation in some modes.
-        ({}, "overlap", "the overlap scheduler, which speculative decoding modes"),
+        ({}, "overlap", "the overlap scheduler, which speculative decoding without overlap"),
         ({}, "tp", "tensor_parallel_size equal to the world size"),
         ({}, "cp", "context_parallel_size=1"),
         ({}, "mnnvl", "multi-node NVLink (MNNVL) domain"),
@@ -418,7 +411,7 @@ _SERVING_TIMEOUT_S = int(2 * HANG_TIMEOUT_S)
         ({}, "no_moe", "requires a model with MoE layers"),
     ],
 )
-def test_startup_rejects_unsupported(monkeypatch, env, lacks, fix):
+def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix):
     """Check that each unsupported setup is refused with its reason and how to turn it off."""
     from tensorrt_llm._torch.distributed import communicator
 
@@ -627,7 +620,7 @@ def test_change_returns_after_exchange_install():
         (_record(MembershipState.SHUTDOWN), 0),
     ],
 )
-def test_change_ends_the_process(monkeypatch, record, status):
+def test_abort_exclusion_or_shutdown_ends_the_process(monkeypatch, record, status):
     _exit_raises(monkeypatch)
     r = _rank(rank=1)
     r.client.deliver(record)
@@ -685,7 +678,7 @@ def test_stop_without_shutdown_record_logs_it(monkeypatch):
 
 
 @pytest.mark.parametrize("fatal_error", [None, RuntimeError("Fatal error: a test error")])
-def test_failed_run_stop_exits(monkeypatch, fatal_error):
+def test_failed_run_stop_exits_without_shutdown(monkeypatch, fatal_error):
     """Check that a failed loop, or a completed one after a fatal error, exits with no SHUTDOWN."""
     _exit_raises(monkeypatch)
     r = _rank(rank=0)
@@ -1347,7 +1340,7 @@ def test_unowed_shortfall_is_not_retried(monkeypatch):
     assert _retry_vote(r, device, clock) == 0
 
 
-def test_next_change_replaces_retry(monkeypatch):
+def test_next_change_release_replaces_pending_retry(monkeypatch):
     """Check that the release of the next change replaces the retry of the last one."""
     r, device, clock = _short_release(monkeypatch)
     second = _record(MembershipState.INSTALL, 2, 0b1001, ResumeState(iteration=12, epoch=10))

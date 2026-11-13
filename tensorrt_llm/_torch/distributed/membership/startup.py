@@ -82,11 +82,13 @@ def ensure_rendezvous(
         [
             (
                 orchestrator_type is None,
-                f"the MPI executor (orchestrator_type unset, not {orchestrator_type!r})",
+                f"the MPI executor (orchestrator_type unset, not {orchestrator_type!r}), because "
+                "only its worker starts the membership authority and the membership of each rank",
             ),
             (
                 global_mpi_size() == 1,
-                "one start of the server or script, not one on every rank of an MPI job",
+                "one start of the server or script, not one on every rank of an MPI job, because "
+                "Wide-EP fault tolerance starts each rank as a process of its own",
             ),
         ]
     )
