@@ -784,16 +784,16 @@ class TestDefaultADPRouter:
         )
 
     @pytest.mark.parametrize("iter_stats_enabled", [False, True])
-    def test_gather_all_rank_states_skips_absent_ranks(self, iter_stats_enabled: bool) -> None:
+    def test_gather_all_rank_states_skips_inactive_ranks(self, iter_stats_enabled: bool) -> None:
         dist = _mock_dist(tp_rank=0, tp_size=3, has_cp_helix=False)
-        # The active-only gathers leave out absent rank 1. The full gathers give it as None (object
-        # gather) or as a zero row (int64 gather).
-        present = [[0, 1, 10], [2, 2, 20]]
+        # The active-only gathers leave out inactive rank 1. The full gathers give it as None
+        # (object gather) or as a zero row (int64 gather).
+        active_rows = [[0, 1, 10], [2, 2, 20]]
         dist.tp_allgather.side_effect = lambda payload, active_only: (
-            present if active_only else [present[0], None, present[1]]
+            active_rows if active_only else [active_rows[0], None, active_rows[1]]
         )
         dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray(
-            present if active_only else [present[0], [0, 0, 0], present[1]]
+            active_rows if active_only else [active_rows[0], [0, 0, 0], active_rows[1]]
         )
         states = DefaultADPRouter(dist=dist).gather_all_rank_states(
             [Mock(py_orig_prompt_len=10)], iter_stats_enabled=iter_stats_enabled

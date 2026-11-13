@@ -149,8 +149,9 @@ trtllm-serve <model> --tp_size 4 --ep_size 4 --config config.yaml
   the container (see the [Wide-EP example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep)).
   Unlike online EPLB without fault tolerance, it does not fall back to managed memory or to GPU memory exposed as
   NUMA nodes when CDMM is off or GDRCopy is missing. Startup fails then.
-- The survivors keep the CUDA graphs they captured at startup, and each serves more requests while degraded. Set
-  `cuda_graph_config.max_batch_size` to `max_batch_size`. With `torch_compile_config` or
+- The survivors keep the CUDA graphs they captured at startup. After the loss of K of N ranks, each survivor's batch
+  grows by about N/(N-K), so size `max_batch_size` with that headroom and set `cuda_graph_config.max_batch_size` to
+  the same value. A batch larger than the largest captured graph runs eager. With `torch_compile_config` or
   `prefill_cuda_graph_backend: piecewise`, set `enable_userbuffers: false` in `torch_compile_config`.
 - On one node, `trtllm-serve` and the LLM API start the ranks themselves and need no launcher and no environment
   variable. They generate the shared secret and pick a rendezvous port. The LLM API takes the same option.
@@ -168,7 +169,8 @@ trtllm-serve <model> --tp_size 4 --ep_size 4 --config config.yaml
    with `mpirun -x`, as in the example below. The membership authority accepts only processes that hold the shared
    secret, and the secret also names the deployment's host weights. Set `TLLM_FAULT_TOLERANCE_SHARED_SECRET` to at
    least 32 bytes as hex (64 hex digits), such as the output of `openssl rand -hex 32`, in the environment and never
-   on the command line, where other users of the host can read it (`ps`, `/proc`). Set
+   on the command line, where other users of the host can read it (`ps`, `/proc`). Generate a new secret for every
+   deployment and never reuse one across deployments. Set
    `TLLM_FAULT_TOLERANCE_RENDEZVOUS` to `host:port`: a host name or IP address of node rank 0 that every node reaches,
    and a free port. A host that resolves to a loopback address, such as a host name that `/etc/hosts` maps to
    `127.0.1.1`, fails at startup. Deployments that run at the same time on the same nodes need different secrets
@@ -242,25 +244,14 @@ in that range first. The server warns at startup when the port is in that range.
 
 When the processes run as root outside the TensorRT-LLM containers, add `--allow-run-as-root`. The containers allow
 it already, through `OMPI_ALLOW_RUN_AS_ROOT` and `PRTE_ALLOW_RUN_AS_ROOT`. With containers, start `mpirun` in the
-first node's container and point PRRTE's ssh launcher at a command that runs a command in another node's container.
-On Slurm with pyxis/enroot containers, the
-[fault tolerance example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/fault_tolerance) does
-this. Its `sbatch` script starts one container per node, each running a `remote_exec.py` server, builds `--host` from
-`scontrol show hostnames`, and runs this in node 0's container (an excerpt of its `launch.sh`, where `SCRIPT_DIR` is
-the example's directory):
+first node's container and let PRRTE start its daemons in the other nodes' containers. Either run `sshd` in every
+container for PRRTE's default ssh launcher, or, on Slurm, use PRRTE's own Slurm launcher (`--prtemca plm slurm`),
+which starts the daemons with `srun`. Neither setup is tested with fault tolerance yet.
 
-```bash
-mpirun --enable-recovery \
-    --prtemca plm ssh --prtemca plm_ssh_agent "python3 $SCRIPT_DIR/remote_exec.py" \
-    --prtemca plm_ssh_no_tree_spawn 1 --host "$HOSTS" -np "$NODES" --map-by ppr:1:node --bind-to none ...
-```
-
-The rendezvous store and the example's `remote_exec.py` assume a trusted job network. Every value in the store is
-signed with the shared secret, and a process checks the signature before it uses the value. The store's arrival
-counters are not signed. The store accepts any process that reaches its port, which can read, delete or write back
-values and so disrupt the deployment. Each `remote_exec.py` server listens only on its node's address and runs any
-command signed with the job's key, checked against a fresh nonce on each connection, so a recorded request does not
-run again. Neither encrypts its traffic.
+The rendezvous store assumes a trusted job network. Every value in the store is signed with the shared secret, and a
+process checks the signature before it uses the value. The store's arrival counters are not signed. The store
+accepts any process that reaches its port, which can read, delete or write back values and so disrupt the
+deployment. It does not encrypt its traffic.
 
 To stop the deployment, send SIGINT to the `trtllm-serve` process on node 0. The launcher's output names its PID in
 the line `Rank0 task guard PID: <guard PID>; workload PGID: <server PID>` (not the `Rank0 server guard PID` line of
@@ -282,11 +273,12 @@ pkill -INT -o -u "$(id -u)" -f '^([^ ]*python[^ ]* )?([^ ]*/)?trtllm-serve( |$)'
 ```
 
 Rank 0 then drains the requests in flight, with every rank taking part, and shuts the deployment down, and `mpirun`
-ends on its own. The example's `launch.sh` shows the `pkill` command for a Slurm job. Send the signal to that process
-only: a rank that ends before the shutdown counts as a failure, and a SIGTERM to `mpirun` or to a node supervisor
-does not drain (see [Limitations](#limitations)). Whether Ctrl-C in `mpirun`'s terminal drains is untested. A node
-supervisor that receives SIGINT or SIGTERM ends the ranks of its node that still run 10 s after the signal with their
-process groups, within 20 s of the signal.
+ends on its own. Send the signal to that process only: a rank that ends before the shutdown counts as a failure, and
+a SIGTERM to `mpirun` does not drain (see [Limitations](#limitations)). Whether Ctrl-C in `mpirun`'s terminal drains
+is untested. A node supervisor that receives SIGINT or SIGTERM ends the ranks of its node that still run 10 s after
+the signal with their process groups, within 20 s of the signal. Node 0's supervisor first forwards the signal to
+rank 0, which drains and shuts the deployment down within that time. On another node, the signal is the loss of that node, and the
+deployment serves on without its ranks.
 Whether Slurm's own signals at a cancellation or a time limit also reach the ranks is untested.
 
 The host weights are named `<TRTLLM_EPLB_SHM_NAME>_<hash>_l<layer>_lr<local rank>_all` in `/dev/shm`
@@ -421,7 +413,10 @@ The launcher's output has these log lines:
 - A replacement that makes no progress for 20 s while it rejoins is left out, and one that makes no startup
   progress for 10 min is killed. A rank's replacements stop (`given_up`) after 3 in a row fail for any reason (each
   ended before it served 10 min). A failed GPU leads there. Drain or repair the node and restart the deployment.
-- A SIGTERM to `mpirun` or to a node supervisor ends the deployment without draining the requests in flight.
+- A SIGTERM to `mpirun` ends the deployment without draining, and the requests in flight fail. A SIGTERM to node 0's
+  supervisor drains for at most 10 s, after which it ends node 0's ranks. A SIGTERM to another node's supervisor is
+  the loss of that node, and the deployment serves on without its ranks. To stop the deployment with a drain, send SIGINT to the `trtllm-serve` process on node 0 (see
+  [Launching on several nodes](#launching-on-several-nodes)).
 - The authority listens on the rendezvous port and on a port the system assigns on rank 0's node. It accepts only
   processes that hold the shared secret. Every value in its store is signed with that secret and checked before use,
   but the arrival counters are not, and the store accepts any process that reaches its port. Make the rendezvous

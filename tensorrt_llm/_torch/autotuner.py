@@ -333,9 +333,9 @@ def autotune(tune_mode: bool = True,
             every runner once, not only those of JIT-compiled runners, so
             their first launch happens before serving.
         report_progress: Optional callable, called after each (runner, tactic)
-            pair profiled, each kernel built ahead of tuning and each cached
-            tactic primed, so that a caller can tell a long tuning pass from a
-            hung one.
+            pair profiled, each profile run by the JIT warmup or shared JIT
+            build and each cached tactic primed, so that a caller can tell a
+            long tuning pass from a hung one.
     """
     autotuner = AutoTuner.get()
     if post_tune_merge_dist is not None:

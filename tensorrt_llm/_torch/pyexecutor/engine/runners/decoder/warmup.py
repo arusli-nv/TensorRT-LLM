@@ -1284,9 +1284,9 @@ class DecoderWarmup:
         # predecessor hit every shape, and each tuning-mode hit compiles the
         # cached tactic. Without a communicator, as in a non-SPMD tuning
         # session, a miss tunes every tactic on this rank.
-        prime_alone = skip_completed_warmup
+        tune_alone = skip_completed_warmup
 
-        AutoTuner.get().setup_distributed_state(self.mapping, None if prime_alone else self.dist)
+        AutoTuner.get().setup_distributed_state(self.mapping, None if tune_alone else self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
@@ -1305,7 +1305,7 @@ class DecoderWarmup:
                 # Add generation request to warmup the autotuner cache.
                 warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
         # Alone, a warmup forward has no peers to agree its shapes with.
-        agreement = WarmupAgreement(None, self.mapping) if prime_alone else self._agreement
+        agreement = WarmupAgreement(None, self.mapping) if tune_alone else self._agreement
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
@@ -1365,7 +1365,7 @@ class DecoderWarmup:
         # a hung startup.
         startup_record = Distributed.startup_record
         replacement = startup_record is not None and startup_record.replacement
-        if prime_alone:
+        if tune_alone:
             Distributed.pause_startup_record()
         ran_native_forward = run_autotuner_pass(
             autotune(
@@ -1375,7 +1375,7 @@ class DecoderWarmup:
             ),
             synchronize_trtllm_cache=True,
         )
-        if prime_alone:
+        if tune_alone:
             Distributed.resume_startup_record()
             AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         ran_flashinfer_forward = False
@@ -1385,7 +1385,7 @@ class DecoderWarmup:
             )
         # The model's declared hooks (the all-off default when it declares none): the warmup passes also run on
         # engines built without the runner's constructor. A replacement's pass ran alone, with no peer to merge with.
-        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks and not prime_alone:
+        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks and not tune_alone:
             # Rank-local profiling noise must not leave tensor-parallel peers
             # serving different tactics for one shape: keep the fastest everywhere.
             # Collective; before the native MXFP8 cache below registers the tactics.

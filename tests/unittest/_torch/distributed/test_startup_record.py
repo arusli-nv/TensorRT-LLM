@@ -652,7 +652,7 @@ def test_replacement_compiles_tactics_in_the_warmup_originals_skip():
 
 
 def test_replacement_tunes_a_missing_shape_alone():
-    """Check a shape that its predecessor's tactics lack in the replacement's solo warmup.
+    """Check a shape that its predecessor's tactics lack in the warmup a replacement runs alone.
 
     The replacement tunes every tactic of it on its own, with no host collective.
     """
@@ -665,8 +665,8 @@ def test_replacement_tunes_a_missing_shape_alone():
     _record().close()
 
 
-def test_replacement_reports_its_solo_warmup_as_startup_progress():
-    """Check that each step of a replacement's solo autotuner warmup counts as startup progress.
+def test_replacement_reports_its_warmup_alone_as_startup_progress():
+    """Check that each step of the warmup a replacement runs alone counts as startup progress.
 
     The steps go through the progress report of its replayed collectives, so a long warmup that
     keeps making progress is not taken for a hung startup. An original rank reports none.
@@ -679,7 +679,7 @@ def test_replacement_reports_its_solo_warmup_as_startup_progress():
     _record().report_progress = lambda: in_tuning_pass.append(replacement.tuning)
     replacement.autotuner_warmup(16)
     assert replacement.tuned_forwards == [16, 1]
-    # The replayed skip vote reports outside the pass, each shape of the solo pass inside it.
+    # The replayed skip vote reports outside the pass, and each shape of the pass inside it.
     assert False in in_tuning_pass
     assert in_tuning_pass.count(True) == len(replacement.tuned_forwards)
     _record().close()

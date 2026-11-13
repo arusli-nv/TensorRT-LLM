@@ -294,10 +294,10 @@ class GraphKeyTestCase(unittest.TestCase):
         self.assertEqual(result, (graph_attn_metadata, graph_spec_metadata, key))
 
 
-def test_adp_graph_agreement_skips_absent_ranks() -> None:
-    """Check that the stale row of an absent rank changes neither the graph vote nor the padding."""
-    absent = [False, 8, SampleType.FULL.value]
-    rows = [[True, 3, SampleType.FULL.value], [True, 4, SampleType.FULL.value], absent]
+def test_adp_graph_agreement_skips_inactive_ranks() -> None:
+    """Check that an inactive rank's stale row changes neither the graph vote nor the padding."""
+    inactive = [False, 8, SampleType.FULL.value]
+    rows = [[True, 3, SampleType.FULL.value], [True, 4, SampleType.FULL.value], inactive]
     runner = Mock()
     runner.enabled = True
     runner.config = SimpleNamespace(

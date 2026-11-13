@@ -390,7 +390,7 @@ class FusedMoEMethodBase(ABC):
                        if module.layer_load_balancer.spare_slot_count else
                        'online EPLB')
             raise NotImplementedError(
-                f'{cls.__name__} doesn\'t support {feature} now')
+                f'{cls.__name__} does not support {feature}')
 
     @classmethod
     def _online_eplb_not_verified(cls, module):
