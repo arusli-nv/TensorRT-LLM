@@ -1,0 +1,243 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration checks for Wide-EP fault tolerance, and the rank identity from its launcher."""
+
+import os
+from functools import lru_cache
+from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from .llmapi.llm_args import TorchLlmArgs
+
+# Set for every rank under Wide-EP fault tolerance to
+# "<rank>,<world size>,<GPUs per node>,<replacement>".
+FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
+# The rendezvous store's host:port. The authority hosts the store.
+RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
+# The hex secret that every deployment process holds. It derives the hello token.
+SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
+# The model architectures that Wide-EP fault tolerance supports, as named in config.json.
+SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM",)
+
+
+def check_node_supervisor_launch(enabled: bool) -> None:
+    """Check that only a fault-tolerant deployment starts ranks through a node supervisor.
+
+    Raises:
+        ValueError: A node supervisor started this process, but ``enabled`` is False.
+    """
+    if not enabled and FAULT_TOLERANCE_RANK_ENV in os.environ:
+        raise ValueError(
+            f"A node supervisor started this rank ({FAULT_TOLERANCE_RANK_ENV} is set), but "
+            "enable_wide_ep_fault_tolerance is false"
+        )
+
+
+def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> None:
+    """Raise ValueError naming every unmet ``(met, requirement)`` check."""
+    missing = [requirement for met, requirement in checks if not met]
+    if missing:
+        raise ValueError(
+            "Wide-EP fault tolerance requires "
+            + "; ".join(missing)
+            + "; change the configuration or turn fault tolerance off "
+            "(enable_wide_ep_fault_tolerance=False)"
+        )
+
+
+def check_llm_args(llm_args: "TorchLlmArgs") -> None:
+    """Check the LLM arguments that Wide-EP fault tolerance requires.
+
+    Raises:
+        ValueError: The arguments are not supported with fault tolerance.
+    """
+    adp_config = llm_args.attention_dp_config
+    spec_config = llm_args.speculative_config
+    spec_mode = None if spec_config is None else spec_config.spec_dec_mode
+    decoding_type = None if spec_config is None else spec_config.decoding_type
+    transceiver = llm_args.cache_transceiver_config
+    transceiver_backend = None if transceiver is None else transceiver.backend
+    load_balancer = llm_args.moe_config.load_balancer
+    balancer_mode = None if load_balancer is None else load_balancer.mode
+    adp_routing = [
+        name
+        for name in (
+            "enable_kv_balanced_admission",
+            "enable_kv_cache_aware_routing",
+            "kv_cache_routing_conversation_affinity",
+        )
+        if adp_config is not None and getattr(adp_config, name)
+    ]
+    compile_config = llm_args.torch_compile_config
+    # An unset max_num_tokens means the default token budget.
+    max_num_tokens = llm_args.max_num_tokens
+    if max_num_tokens is None:
+        max_num_tokens = type(llm_args).model_fields["max_num_tokens"].default
+    current_max_seq_len = (
+        "an unset max_seq_len (the model's maximum length)"
+        if llm_args.max_seq_len is None
+        else f"max_seq_len={llm_args.max_seq_len}"
+    )
+    check_fault_tolerance_requirements(
+        [
+            (
+                llm_args.enable_attention_dp,
+                "attention DP (enable_attention_dp=True), so that a failed rank takes only its "
+                "own requests with it",
+            ),
+            (
+                llm_args.pipeline_parallel_size == 1,
+                "no pipeline parallelism (pipeline_parallel_size=1, not "
+                f"{llm_args.pipeline_parallel_size}), because a failed pipeline stage leaves its "
+                "layers on no rank",
+            ),
+            (
+                llm_args.max_beam_width in (None, 1),
+                f"no beam search (max_beam_width=1, not {llm_args.max_beam_width}), which is not "
+                "supported yet: continuing an interrupted request by recompute would need to "
+                "restore its beams",
+            ),
+            (
+                not llm_args.disable_overlap_scheduler,
+                "the overlap scheduler (disable_overlap_scheduler=False), because fault tolerance "
+                "accepts or discards each step when the next one starts, which only the overlap "
+                "scheduler's executor loop does yet",
+            ),
+            (
+                load_balancer is not None,
+                "EPLB (moe_config.load_balancer.num_slots, for example the number of routed "
+                "experts), whose spare slots take a failed rank's experts",
+            ),
+            (
+                balancer_mode in (None, "standard"),
+                "standard EPLB (moe_config.load_balancer.mode='standard', not "
+                f"{balancer_mode!r}), because per-layer dynamic EPLB refills its helper slots in "
+                "every forward pass and has no spare slots for a failed rank's experts",
+            ),
+            (
+                not adp_routing,
+                "the default attention-DP routing and admission (no enable_kv_balanced_admission, "
+                "enable_kv_cache_aware_routing or kv_cache_routing_conversation_affinity in "
+                f"attention_dp_config, which sets {', '.join(adp_routing)}), because the others "
+                "are not supported yet: they keep per-rank state that a replacement would not "
+                "share",
+            ),
+            (
+                llm_args.kv_cache_config.event_buffer_max_size == 0,
+                "no KV cache events (kv_cache_config.event_buffer_max_size=0, not "
+                f"{llm_args.kv_cache_config.event_buffer_max_size}), which are not supported yet: "
+                "a failed rank's KV cache blocks would need removal events",
+            ),
+            (
+                transceiver_backend is None,
+                "no disaggregated serving (no cache_transceiver_config.backend, not "
+                f"{transceiver_backend!r}), because the KV cache transfers between serving "
+                "instances do not follow a membership change",
+            ),
+            (
+                llm_args.kv_connector_config is None,
+                "no KV cache connector (kv_connector_config=None), which is not supported yet: a "
+                "connector saves the KV cache of a step before the step is accepted",
+            ),
+            (
+                llm_args.kv_cache_compression_config is None,
+                "no KV cache compression (kv_cache_compression_config=None), which is not "
+                "supported yet: the KV cache pool that a membership change resizes would also hold "
+                "the compressed pages",
+            ),
+            (
+                spec_mode is None or not (spec_mode.has_spec_drafter() or spec_mode.is_dspark()),
+                "no NGram or user-provided drafter and no DSpark (speculative_config: none, or "
+                f"another decoding_type such as MTP, not {decoding_type!r}), which are not supported "
+                "yet: their drafting state outside the model forward is not rolled back when a "
+                "failure discards a step",
+            ),
+            (
+                llm_args.enable_chunked_prefill
+                or (
+                    llm_args.max_seq_len is not None
+                    and max_num_tokens is not None
+                    and llm_args.max_seq_len <= max_num_tokens
+                ),
+                "chunked prefill (enable_chunked_prefill=True) or a max_seq_len of at most "
+                f"max_num_tokens, not {current_max_seq_len} with max_num_tokens={max_num_tokens}, "
+                "because a request that a failure interrupts continues by recompute, with its "
+                "prompt and output tokens as one context of up to max_seq_len tokens, and without "
+                "chunked prefill the scheduler never schedules a context longer than "
+                "max_num_tokens",
+            ),
+            (
+                not llm_args.enable_lm_head_tp_in_adp,
+                "no LM head TP in attention DP (enable_lm_head_tp_in_adp=False), because a failed "
+                "rank would take its share of the vocabulary with it",
+            ),
+            (
+                compile_config is None or not compile_config.enable_userbuffers,
+                "no userbuffers (torch_compile_config.enable_userbuffers=False), because their "
+                "setup exchanges memory handles over an MPI world of every rank, and each rank is "
+                "its own MPI world",
+            ),
+            (
+                llm_args.sleep_config is None,
+                "no sleep mode (sleep_config=None), which is not supported yet: sleep releases and "
+                "restores the GPU memory of the weights, whose spare slots fault tolerance backs "
+                "and unbacks itself",
+            ),
+        ]
+    )
+
+
+def check_model_architectures(architectures: Optional[Sequence[str]]) -> None:
+    """Check that Wide-EP fault tolerance supports the model's ``architectures``.
+
+    Raises:
+        ValueError: The model architecture is not supported with fault tolerance.
+    """
+    check_fault_tolerance_requirements(
+        [
+            (
+                bool(architectures)
+                and all(name in SUPPORTED_ARCHITECTURES for name in architectures),
+                f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3 and "
+                f"DeepSeek-R1), the only ones tested with it, not {architectures}",
+            )
+        ]
+    )
+
+
+class RankIdentity(NamedTuple):
+    """A rank under Wide-EP fault tolerance, where each rank is its own MPI world."""
+
+    rank: int
+    world_size: int
+    gpus_per_node: int
+    replacement: bool
+
+    def env_value(self) -> str:
+        """Return the ``FAULT_TOLERANCE_RANK_ENV`` value that gives a process this identity."""
+        return ",".join(str(int(field)) for field in self)
+
+
+def wide_ep_fault_tolerance_rank() -> Optional[RankIdentity]:
+    """Return the rank identity the node supervisor gave this process, if one started it."""
+    return _parse_rank_identity(os.environ.get(FAULT_TOLERANCE_RANK_ENV))
+
+
+@lru_cache(maxsize=1)
+def _parse_rank_identity(value: Optional[str]) -> Optional[RankIdentity]:
+    if value is None:
+        return None
+    rank, world_size, gpus_per_node, replacement = (int(field) for field in value.split(","))
+    return RankIdentity(rank, world_size, gpus_per_node, bool(replacement))

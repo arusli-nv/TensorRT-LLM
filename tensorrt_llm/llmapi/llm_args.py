@@ -52,6 +52,7 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
+from .._wide_ep_fault_tolerance import check_llm_args
 
 # yapf: disable
 # isort: off
@@ -7737,6 +7738,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    enable_wide_ep_fault_tolerance: bool = Field(
+        default=False,
+        description=
+        "Keep a wide expert-parallel deployment serving at reduced capacity "
+        "when one of its ranks fails, until a replacement rejoins. "
+        "Requires attention DP, EPLB and KV cache manager V2. "
+        "Unsupported configurations are rejected at startup with the reason. "
+        "See the Wide-EP Fault Tolerance feature docs.",
+        status="prototype")
+
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
         default=None,
         description="The request reordering policy to use.",
@@ -8770,6 +8781,15 @@ class TorchLlmArgs(BaseLlmArgs):
         self.moe_config.load_balancer = _resolve_load_balancer_config(
             self.moe_config.load_balancer)
         self.moe_config.resolve_load_balancer_compatibility()
+        return self
+
+    # Runs after validate_load_balancer, so a load balancer given as a YAML path
+    # is loaded by then.
+    @model_validator(mode="after")
+    def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
+        """Reject what enable_wide_ep_fault_tolerance does not support."""
+        if self.enable_wide_ep_fault_tolerance:
+            check_llm_args(self)
         return self
 
     @model_validator(mode="after")

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -96,8 +97,10 @@ enum MoeA2AMetaInfoIndex : int64_t
     CFT_ENABLED_INDEX = 23,
     // Total required bytes per rank, including all control buffers, payloads and alignment padding.
     WORKSPACE_SIZE_INDEX = 24,
+    // Offset of the incomplete-round word (see moeAlltoAllKernels.h), 0 in layouts without a rank mask.
+    INCOMPLETE_ROUND_OFFSET_INDEX = 25,
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
-    NUM_METAINFO_FIELDS = 25
+    NUM_METAINFO_FIELDS = 26
 };
 
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -132,11 +135,14 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
         {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
         {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
+        {"MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX", INCOMPLETE_ROUND_OFFSET_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},
         {"MOE_A2A_MAX_PAYLOADS", kMaxPayloads},
         {"MOE_A2A_WORKSPACE_ALIGNMENT", kWorkspaceAlignment},
+        {"MOE_A2A_ABORT_STATE_WORDS", sizeof(MoeA2AAbortState) / sizeof(int32_t)},
+        {"MOE_A2A_ABORT_WAITED_FLAG_INDEX", offsetof(MoeA2AAbortState, waited_flag) / sizeof(int32_t)},
     };
 }
 

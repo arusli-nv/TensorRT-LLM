@@ -58,10 +58,12 @@ def get_wide_ep_ft_options(
     option.  Callers can either inject ``wide_ep_ft_ep_group_health`` through
     ``ModelConfig.extra_attrs`` or set ``TLLM_FAULT_TOLERANCE_MODE=1`` to create
     one process-local membership object shared by all MoE communication layers.
-    The AlltoAll watchdog reads this object to determine expected peers and
+    The AlltoAll watchdog finds the peers that the kernels wait on too long and
     reports suspects through its ``on_timeout`` seam; it never mutates the
     committed membership directly. Rank-mask mode rejects CUDA graphs until
     generation-scoped invalidation and recapture are implemented.
+    ``enable_wide_ep_fault_tolerance`` instead binds an EP group health of its
+    own through ``bind_execution_state`` and supports CUDA graphs.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})

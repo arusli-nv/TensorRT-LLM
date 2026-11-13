@@ -42,6 +42,8 @@ from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
+from tensorrt_llm.executor.rank_failure_requests import (RANK_FAILURE_CODE,
+                                                         RankFailureError)
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
@@ -165,6 +167,7 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
+    from tensorrt_llm.serve.fault_tolerance_health import FaultToleranceHealth
     from tensorrt_llm.visual_gen import VisualGen
 
 
@@ -302,6 +305,25 @@ def _configure_parser_special_token_decoding(
         # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
         # changes the protocol and prevents the K3 parsers from matching it.
         sampling_params.spaces_between_special_tokens = False
+
+
+def _stream_error_events(error: Exception) -> List[str]:
+    """Return the SSE events that end a stream whose request failed.
+
+    The client receives an OpenAI error object with the exception's message,
+    then [DONE]. A streaming completion reports a failure the same way once
+    HTTP 200 has been sent. A rank failure carries the rank_failure code.
+    """
+    code = RANK_FAILURE_CODE if isinstance(error, RankFailureError) else None
+    error_data = json.dumps({
+        "error": {
+            "message": str(error),
+            "type": "server_error",
+            "code": code,
+            "param": None,
+        }
+    })
+    return [f"data: {error_data}\n\n", "data: [DONE]\n\n"]
 
 
 def _record_generator_termination(generator) -> None:
@@ -588,6 +610,8 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
 
 class OpenAIServer(_VideoRoutesMixin):
 
+    fault_tolerance_health: Optional["FaultToleranceHealth"] = None
+
     @staticmethod
     def _iteration_stats_buffer_maxlen(
             iter_stats_max_iterations: Optional[int]) -> Optional[int]:
@@ -737,6 +761,16 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model = model
         self.metrics_collector = None
         args = getattr(self.generator, "args", None)
+        # Attached frontends forward the fault-tolerance routes to the launcher.
+        if (getattr(args, "enable_wide_ep_fault_tolerance", False)
+                and (multi_frontend_serving is None
+                     or multi_frontend_serving.is_launcher)):
+            from tensorrt_llm.serve.fault_tolerance_health import \
+                FaultToleranceHealth
+            self.fault_tolerance_health = FaultToleranceHealth.from_environment(
+                self.generator._fault_tolerance_env,
+                MetricsCollector.serving_labels(args, self.model),
+                self._on_deployment_failed)
         perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
                                            None) if args else None)
         perf_metrics = resolve_perf_metrics_config(
@@ -900,6 +934,8 @@ class OpenAIServer(_VideoRoutesMixin):
             await self._deregister_server()
             if self.resource_governor is not None:
                 self.resource_governor.close()
+            if self.fault_tolerance_health is not None:
+                self.fault_tolerance_health.close()
             self.generator.shutdown()
             # A stats read still in flight fails fast now that the executor is
             # down; the /metrics handler already treats that as no stats.
@@ -1175,15 +1211,24 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
     def create_error_response(
-            message: str,
+            message: Union[str, Exception],
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        rank_failure = isinstance(message, RankFailureError)
+        message = str(message)
         # Over-length prompts are detected from the message text because they
         # cross the executor IPC boundary as plain strings (RequestError), so
         # no exception type survives to here.
         code: Union[int, str] = status_code.value
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
+        elif rank_failure:
+            # A RankFailureError keeps its type, since the engine fails the
+            # request with the exception object and the result raises it as
+            # is. It answers 503 rank_failure whatever the caller passed.
+            err_type, status_code = ("ServiceUnavailableError",
+                                     HTTPStatus.SERVICE_UNAVAILABLE)
+            code = RANK_FAILURE_CODE
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=code)
@@ -1376,9 +1421,14 @@ class OpenAIServer(_VideoRoutesMixin):
         # The render and generate routes are a separate exposed surface: off
         # unless TRTLLM_ENABLE_RENDER_ENDPOINTS=1.
         mount_render_endpoints(self.app, self)
-        if self.generator.args.return_perf_metrics:
+        if (self.generator.args.return_perf_metrics
+                or self.fault_tolerance_health is not None):
             # register /prometheus/metrics
             self.mount_metrics()
+        if self.fault_tolerance_health is not None:
+            self.app.add_api_route("/fault_tolerance_status",
+                                   self.fault_tolerance_health.status_response,
+                                   methods=["GET"])
 
     def mount_metrics(self):
         # Lazy import for prometheus multiprocessing.
@@ -1389,7 +1439,10 @@ class OpenAIServer(_VideoRoutesMixin):
                                        multiprocess)
         from prometheus_fastapi_instrumentator import Instrumentator
         registry = CollectorRegistry()
-        multiprocess.MultiProcessCollector(registry)
+        if self.generator.args.return_perf_metrics:
+            multiprocess.MultiProcessCollector(registry)
+        if self.fault_tolerance_health is not None:
+            self.fault_tolerance_health.register_metrics(registry)
         Instrumentator(
             should_group_status_codes=False,
             should_respect_env_var=True,
@@ -1679,7 +1732,11 @@ class OpenAIServer(_VideoRoutesMixin):
         """Attached frontends: forward launcher-owned routes (before register_routes())."""
         if self._launcher_forwarder is None:
             return
-        for method, path in FORWARDED_ROUTES:
+        routes = FORWARDED_ROUTES
+        if self.generator.args.enable_wide_ep_fault_tolerance:
+            from tensorrt_llm.serve import fault_tolerance_health
+            routes += fault_tolerance_health.FORWARDED_ROUTES
+        for method, path in routes:
             self.app.add_api_route(path,
                                    self._launcher_forwarder.forward,
                                    methods=[method],
@@ -1736,6 +1793,17 @@ class OpenAIServer(_VideoRoutesMixin):
         if not executor.doing_shutdown:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+
+    def _on_deployment_failed(self) -> None:
+        """Shut the server down once its Wide-EP deployment cannot recover.
+
+        The executor reaches doing_shutdown when it reaps the ended rank 0,
+        so the fatal-error branch of ``health`` sends no signal then.
+        """
+        logger.error("The Wide-EP deployment failed, initiating server "
+                     "shutdown")
+        _record_generator_termination(self.generator)
+        signal.raise_signal(signal.SIGINT)
 
     async def health(self) -> Response:
         if self._check_health():
@@ -2116,15 +2184,19 @@ class OpenAIServer(_VideoRoutesMixin):
                             res, args)
                     for pp_res in pp_results:
                         yield pp_res
+            except Exception as e:
+                # Only failures are handled here. A consumer that stops reading
+                # closes the stream with GeneratorExit and a client that
+                # disconnects cancels it. Neither is an Exception.
+                logger.error(traceback.format_exc())
+                # StreamingResponse commits HTTP 200 before the first chunk, so
+                # the error ends the stream as an SSE error event.
+                for event in _stream_error_events(e):
+                    yield event
+            else:
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -2572,7 +2644,7 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -2992,7 +3064,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3063,16 +3135,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
                 # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
+                for event in _stream_error_events(e):
+                    yield event
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3220,7 +3284,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3249,13 +3313,17 @@ class OpenAIServer(_VideoRoutesMixin):
                                   post_processor(res, args))
                     for pp_res in pp_results:
                         yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first chunk, so
+                # the error ends the stream as an SSE error event.
+                for event in _stream_error_events(e):
+                    yield event
+            else:
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
 
         try:
             ensure_request_chat_template_allowed(
@@ -3378,7 +3446,7 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
-            return self.create_error_response(message=str(e),
+            return self.create_error_response(message=e,
                                               err_type="internal_error")
 
     def _responses_prompt_tokens_excluded_from_usage(
@@ -3644,7 +3712,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         return JSONResponse(content={"detail": "None"})
 

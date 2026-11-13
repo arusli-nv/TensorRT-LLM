@@ -388,3 +388,24 @@ def test_queue_size_methods(executor_queue):
     # Add some data and test
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     assert executor_queue.get_request_queue_size() == 1
+
+
+def test_wake_returns_a_waiting_fetch(executor_queue):
+    """Test that wake ends a waiting fetch without a request."""
+    fetched = []
+    waiter = threading.Thread(target=lambda: fetched.append(
+        executor_queue.get_from_request_queue(datetime.timedelta(seconds=30))))
+    waiter.start()
+    executor_queue.wake()
+    waiter.join(timeout=5)  # Well before the fetch's own 30 s timeout.
+    assert fetched == [[]]
+
+
+def test_wakes_coalesce_until_fetched(executor_queue):
+    """Test that repeated wakes queue one item until a fetch consumes it."""
+    executor_queue.wake()
+    executor_queue.wake()
+    assert executor_queue.get_request_queue_size() == 1
+    assert executor_queue.get_from_request_queue(None) == []
+    executor_queue.wake()
+    assert executor_queue.get_request_queue_size() == 1

@@ -1,0 +1,479 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the host collectives over MNNVL memory, ``TPHostExchange`` and ``MnnvlDist``.
+
+The ranks run in threads of one process and exchange over rows of host memory.
+"""
+
+import ctypes
+import threading
+import time
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from numpy.lib.stride_tricks import as_strided
+
+from tensorrt_llm._torch.distributed import Distributed, host_exchange, mnnvl_memory
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
+from tensorrt_llm._torch.distributed.membership import Authority, RankReport, Reply, ResumeState
+from tensorrt_llm._torch.distributed.startup_record import StartupRecord
+from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV, RankIdentity
+from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
+
+WORLD = 4
+JOIN_TIMEOUT_S = 30.0
+
+
+# The host exchange under a membership change.
+
+
+class _HostCopies:
+    """Run the copies and the native wait of TPHostExchange between host addresses, each whole."""
+
+    CUresult = SimpleNamespace(CUDA_SUCCESS=0)
+    CUmemorytype = SimpleNamespace(CU_MEMORYTYPE_DEVICE="device", CU_MEMORYTYPE_HOST="host")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def CUDA_MEMCPY2D():
+        return SimpleNamespace()
+
+    def _copy(self, dst, dst_pitch, src, src_pitch, width, height):
+        with self._lock:
+            for row in range(height):
+                ctypes.memmove(dst + row * dst_pitch, src + row * src_pitch, width)
+
+    def cuMemcpy2DAsync(self, copy, stream):
+        src = copy.srcHost if copy.srcMemoryType == "host" else copy.srcDevice
+        dst = copy.dstHost if copy.dstMemoryType == "host" else copy.dstDevice
+        self._copy(dst, copy.dstPitch, src, copy.srcPitch, copy.WidthInBytes, copy.Height)
+        return (0,)
+
+    def wait_for_slots(self, stream, sends, slots, received, active, readers, epoch, *rest):
+        """Wait as ``wait_for_slots`` does, polling every slot whole."""
+        header_packets, stale, wake, spin_s = rest
+        for copy in sends:
+            self._copy(*copy)
+        pitch = received.strides[0]
+        while True:
+            if slots is not None:
+                self._copy(received.ctypes.data, pitch, slots, pitch, pitch, len(received))
+            headers = received[:, 0] >> np.uint64(32) == epoch
+            for rank, slot in enumerate(received):
+                length = int(slot[0]) & 0xFFFFFFFF
+                packets = 1 + min(len(slot) - 1, -(-length // 4)) if readers[rank] else 1
+                epochs = slot[:packets] >> np.uint64(32)
+                stale[rank] = active[rank] and bool((epochs != epoch).any())
+            if slots is not None and not headers[active].all():
+                # While a header is missing, the wait names only the ranks whose header is missing.
+                stale[:] = active & ~headers
+            if slots is None or not stale.any():
+                return not stale.any()
+            if wake[0]:
+                return False
+            time.sleep(1e-4)
+
+
+class _HostRows:
+    """Map HostExchangeMnnvlMemory rows in shared host memory as rank ``rank`` sees them."""
+
+    def __init__(self, memory, stride, rank):
+        self._memory, self.stride, self.rank = memory, stride, rank
+        self.ptr = memory.ctypes.data
+
+    def row(self, rank):
+        return self.ptr + rank * self.stride
+
+    def remap(self, gather, fresh_rows):
+        """Zero this rank's row if it gets fresh pages. The memory is shared, so no gather runs."""
+        if self.rank in fresh_rows:
+            self._memory[self.rank * self.stride : (self.rank + 1) * self.stride] = 0
+
+
+_SLOT_BYTES = 64
+
+
+def _host_exchange_group(monkeypatch, nranks, slot_bytes):
+    """Return a TPHostExchange for each of ``nranks`` ranks over shared host rows."""
+    copies = _HostCopies()
+    monkeypatch.setattr(mnnvl_memory, "cuda", copies)
+    monkeypatch.setattr(host_exchange, "wait_for_slots", copies.wait_for_slots)
+    monkeypatch.setattr(host_exchange, "prefer_pinned", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=0, synchronize=lambda: None)
+    )
+    stride = TPHostExchange.buffer_bytes(nranks, slot_bytes)
+    memory = np.zeros(nranks * stride, dtype=np.uint8)
+    return [
+        TPHostExchange(rank, nranks, _HostRows(memory, stride, rank), slot_bytes)
+        for rank in range(nranks)
+    ]
+
+
+def _run_ranks(exchanges, calls):
+    """Run ``calls[rank](exchanges[rank])`` on a thread per rank, waking the waits every 1 ms."""
+    results, errors = {}, []
+    done = threading.Event()
+
+    def run(rank):
+        try:
+            results[rank] = calls[rank](exchanges[rank])
+        except BaseException as error:  # surface thread failures in the test
+            errors.append(error)
+
+    def wake():
+        while not done.wait(1e-3):
+            for exchange in exchanges:
+                exchange.wake()
+
+    ranks = [threading.Thread(target=run, args=(rank,), daemon=True) for rank in range(len(calls))]
+    waker = threading.Thread(target=wake, daemon=True)
+    for thread in [*ranks, waker]:
+        thread.start()
+    for thread in ranks:
+        thread.join(JOIN_TIMEOUT_S)
+    done.set()
+    waker.join()
+    assert not errors, errors
+    assert not any(thread.is_alive() for thread in ranks)
+    return results
+
+
+class _Replaced(Exception):
+    """Raised where a newer membership change ends a rank's wait."""
+
+
+@pytest.mark.timeout(60)
+def test_superseded_install_gives_same_results(monkeypatch):
+    """Check that every survivor gets the same results when a newer change supersedes an install.
+
+    Rank 2 fails while ranks 0 to 2 remap the rows without rank 3, and rank 0 stops in that remap.
+    """
+    exchanges = _host_exchange_group(monkeypatch, WORLD, _SLOT_BYTES)
+    authority = Authority(WORLD)
+    authority.tick(0.0, {r: RankReport(started=True) for r in range(WORLD)}, (1 << WORLD) - 1)
+    connected = {1: 0b0111, 2: 0b0011}
+    stopped = {1: {}, 2: {}}
+    epochs = {}
+
+    def decide(generation):
+        ranks = [r for r in range(WORLD) if connected[generation] >> r & 1]
+        authority.tick(generation, {r: RankReport() for r in ranks}, connected[generation])
+        ready = {
+            r: RankReport(
+                reply=Reply.READY,
+                reply_generation=generation,
+                paused_at=ResumeState(epoch=stopped[generation][r]),
+            )
+            for r in ranks
+        }
+        epochs[generation] = authority.tick(generation, ready, connected[generation]).resume.epoch
+
+    ready = {1: threading.Barrier(3, action=lambda: decide(1), timeout=20)}
+    ready[2] = threading.Barrier(2, action=lambda: decide(2), timeout=20)
+    committed = threading.Barrier(2, timeout=20)
+    generations = {0: [1, 2], 1: [1, 2], 2: [1]}
+    remaps = []
+
+    def remap_of_rank_0(gather, fresh_rows):
+        remaps.append(fresh_rows)
+        if len(remaps) == 1:
+            raise _Replaced
+        _HostRows.remap(exchanges[0].rows, gather, fresh_rows)
+
+    exchanges[0].rows.remap = remap_of_rank_0
+
+    def change(exchange):
+        # Run the membership changes this rank takes part in, from READY to the commit.
+        while True:
+            generation = generations[exchange.rank].pop(0)
+            stopped[generation][exchange.rank] = exchange.stopped_epoch
+            ready[generation].wait()
+            if exchange.rank == 2:
+                raise _Replaced  # Its process ends.
+            try:
+                exchange.install(
+                    None, connected[generation], epochs[generation], frozenset(range(WORLD))
+                )
+            except _Replaced:
+                continue
+            if generation == 2:
+                committed.wait()
+                exchange.interrupted = lambda: False
+            return
+
+    # Each change reaches a rank while it waits for a failed rank.
+    for exchange in exchanges[:3]:
+        exchange.interrupted = lambda exchange=exchange: bool(exchange.waiting_for & 0b1100)
+        exchange.on_interrupt = lambda exchange=exchange: change(exchange)
+
+    def survivor(exchange):
+        return exchange.exchange(b"r%d" % exchange.rank), exchange.exchange(b"s%d" % exchange.rank)
+
+    def fails(exchange):
+        with pytest.raises(_Replaced):
+            survivor(exchange)
+
+    results = _run_ranks(exchanges[:3], [survivor, survivor, fails])
+    assert epochs == {1: 2, 2: 2}
+    assert results[0] == ([b"r0", b"r1", None, None], [b"s0", b"s1", None, None])
+    assert results[1] == results[0]
+
+
+def test_interrupt_without_handler_reruns_round(monkeypatch):
+    """Check that a rank stops and runs the round again when ``on_interrupt`` is unset."""
+    exchanges = _host_exchange_group(monkeypatch, 2, _SLOT_BYTES)
+    stops = [True]
+    exchanges[0].interrupted = lambda: bool(stops) and stops.pop()
+
+    def exchange_once(exchange):
+        return exchange.exchange(b"r%d" % exchange.rank)
+
+    results = _run_ranks(exchanges, [exchange_once, exchange_once])
+    assert results[0] == [b"r0", b"r1"]
+    assert results[1] == results[0]
+    assert exchanges[0].stopped_epoch == 1
+
+
+@pytest.mark.timeout(60)
+def test_waiting_for_during_flag_rewrites(monkeypatch):
+    """Check that ``waiting_for`` names only real ranks while the wait rewrites its flags.
+
+    The native wait rewrites the flags on every poll without the GIL. Here numpy rewrites them as
+    often, by copying into a view that repeats them, which also runs without the GIL. Before each
+    read the test frees index arrays of -1, which numpy reuses for its next small results. So an
+    index that np.flatnonzero counted but never wrote is out of range instead of a stale rank.
+    """
+    nranks, repeats = 72, 1 << 16
+    exchange = _host_exchange_group(monkeypatch, nranks, _SLOT_BYTES)[0]
+    polls = np.zeros((repeats, nranks), dtype=bool)
+    polls[::2] = True
+    rewriting = threading.Event()
+
+    def rewrite_flags(
+        stream,
+        sends,
+        slots,
+        received,
+        active,
+        readers,
+        epoch,
+        header_packets,
+        waiting_for,
+        wake,
+        spin_s,
+    ):
+        repeated = as_strided(waiting_for, (repeats, nranks), (0, waiting_for.strides[0]))
+        rewriting.set()
+        while not wake[0]:
+            np.copyto(repeated, polls)
+        return False
+
+    def stop():
+        raise _Replaced
+
+    monkeypatch.setattr(host_exchange, "wait_for_slots", rewrite_flags)
+    stopping = threading.Event()
+    exchange.interrupted, exchange.on_interrupt = stopping.is_set, stop
+    errors = []
+
+    def wait():
+        try:
+            exchange.exchange(b"")
+        except _Replaced as error:
+            errors.append(error)
+
+    def read():
+        for size in range(1, nranks + 1):
+            np.full(size, -1, dtype=np.intp)
+        return exchange.waiting_for
+
+    waiter = threading.Thread(target=wait, daemon=True)
+    waiter.start()
+    try:
+        assert rewriting.wait(JOIN_TIMEOUT_S)
+        masks = {read() for _ in range(2000)}
+    finally:
+        stopping.set()
+        exchange.wake()
+        waiter.join(JOIN_TIMEOUT_S)
+    assert not waiter.is_alive()
+    assert len(errors) == 1
+    assert len(masks) > 1
+    assert max(masks) >> nranks == 0
+
+
+def test_joining_rank_installs_rows(monkeypatch):
+    """Check that a joining rank maps the rows at INSTALL without entering the exchange."""
+    joining = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)[2]
+    joining.rows._memory[:] = 1
+    joining.install(None, 0b011, 7, frozenset(range(3)))
+    assert joining.active_mask == 0b011
+    assert joining.epoch == 6
+    row = joining.rows._memory[2 * joining.rows.stride : 3 * joining.rows.stride]
+    assert not row.any()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("seed", range(4))
+def test_long_payloads_reach_only_recipients(monkeypatch, seed):
+    """Check random payloads and readers, and that a long payload skips non-recipients' rows."""
+    nranks, slot_bytes = 4, 4096
+    exchanges = _host_exchange_group(monkeypatch, nranks, slot_bytes)
+    rng = np.random.default_rng(seed)
+    readers = [
+        sorted(rng.choice(nranks, rng.integers(nranks + 1), replace=False).tolist())
+        for _ in range(nranks)
+    ]
+    recipients = [[q for q in range(nranks) if r in readers[q]] for r in range(nranks)]
+    payloads = [rng.bytes(int(rng.integers(3 * slot_bytes))) for _ in range(nranks)]
+
+    def send(exchange):
+        rank = exchange.rank
+        return exchange.exchange(payloads[rank], readers[rank], recipients[rank])
+
+    results = _run_ranks(exchanges, [send] * nranks)
+    for q in range(nranks):
+        assert results[q] == [payloads[r] if r in readers[q] else None for r in range(nranks)]
+    rows = exchanges[0].rows._memory.view(np.uint64).reshape(nranks, 2, nranks, -1)
+    header_poll = 1 + TPHostExchange._HEADER_POLL_PACKETS
+    for r in range(nranks):
+        others = [q for q in range(nranks) if q not in recipients[r]]
+        assert not rows[others, :, r, header_poll:].any()
+
+
+def _row_chunk_by_slicing(rows, size, k):
+    """Return round ``k`` of ``size``-byte rows by slicing the packets' lower halves in numpy."""
+    words = rows.shape[1] - 1
+    out = np.zeros((len(rows), -(-size // 4)), dtype=np.uint32)
+    chunk_words = -(-min(4 * words, size - 4 * words * k) // 4)
+    out[:, words * k : words * k + chunk_words] = rows.view(np.uint32)[
+        :, 2 : 2 + 2 * chunk_words : 2
+    ]
+    return out.view(np.uint8)[:, :size]
+
+
+def test_unpack_payloads_into_matches_slicing():
+    """Check the native unpacking into rows against numpy slicing on random packets."""
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        nranks, words = int(rng.integers(1, 9)), int(rng.integers(1, 40))
+        rows = rng.integers(2**64, size=(nranks, 1 + words), dtype=np.uint64)
+        size = int(rng.integers(1, 12 * words))
+        k = int(rng.integers(-(-size // (4 * words))))
+        ranks = sorted(rng.choice(nranks, rng.integers(1, nranks + 1), replace=False).tolist())
+        # Round 0 carries the whole row size in the header, later rounds their chunk size.
+        length = size if k == 0 else min(4 * words, size - 4 * words * k)
+        lengths = np.full(nranks, length, dtype=np.uint32)
+        out = np.zeros((nranks, size), dtype=np.uint8)
+        host_exchange.unpack_payloads_into(rows, lengths, ranks, out, 4 * words * k)
+        expected = np.zeros_like(out)
+        expected[ranks] = _row_chunk_by_slicing(rows, size, k)[ranks]
+        np.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.timeout(60)
+def test_allgather_array_zeroes_absent_ranks(monkeypatch):
+    """Check rows that span several rounds, and a zero row or none for an absent rank."""
+    exchanges = _host_exchange_group(monkeypatch, 3, _SLOT_BYTES)
+    for exchange in exchanges:
+        exchange.active_mask = 0b011
+    rows = [np.arange(20, dtype=np.int64) * 7 + 50 * r + 1 for r in range(3)]
+
+    def gather(exchange):
+        row = rows[exchange.rank]
+        return exchange.allgather_array(row), exchange.allgather_array(row, active_only=True)
+
+    results = _run_ranks(exchanges[:2], [gather, gather])
+    expected = np.stack([rows[0], rows[1], np.zeros(20, dtype=np.int64)])
+    for rank in range(2):
+        every, active = results[rank]
+        assert every.dtype == active.dtype == np.int64
+        np.testing.assert_array_equal(every, expected)
+        np.testing.assert_array_equal(active, expected[:2])
+
+
+@pytest.mark.parametrize("rank, local", [(0, 4), (3, 4), (5, 2)])
+def test_node_ranks_follow_gpus_per_node(rank, local):
+    dist = MnnvlDist(Mapping(world_size=6, rank=rank, gpus_per_node=4, tp_size=6))
+    assert dist.local_world_size == local
+
+
+@pytest.fixture
+def fresh_distributed(monkeypatch):
+    """Let a test choose the Distributed implementation, with no communicator cached."""
+    monkeypatch.setattr(Distributed, "_create", None)
+    monkeypatch.setattr(Distributed, "startup_record", None)
+    Distributed.get.cache_clear()
+    yield
+    Distributed.get.cache_clear()
+
+
+def test_fault_tolerance_needs_host_collectives(fresh_distributed):
+    """Refuse a mapping that the host collectives do not support, instead of falling back to MPI."""
+    Distributed.set_implementation(MnnvlDist.create, StartupRecord())
+    with pytest.raises(ValueError, match=r"requires attention DP \(enable_attention_dp=True\)"):
+        Distributed.get(Mapping(world_size=2, rank=0, gpus_per_node=2, tp_size=2))
+
+
+def test_rank_identity_alone_keeps_mpi(fresh_distributed, monkeypatch):
+    """Only the startup group of a fault-tolerant deployment selects ``MnnvlDist``, before any get."""
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, RankIdentity(0, 2, 2, False).env_value())
+    assert not isinstance(Distributed.get(Mapping(world_size=2, rank=0, tp_size=2)), MnnvlDist)
+    with pytest.raises(RuntimeError, match="before any communicator is created"):
+        Distributed.set_implementation(MnnvlDist.create, StartupRecord())
+
+
+def test_communicators_share_host_exchange(fresh_distributed, monkeypatch):
+    """Check that every ``MnnvlDist`` of a process uses the host exchange of the first one."""
+    created = []
+
+    def create(cls, mapping):
+        created.append(mapping)
+        return SimpleNamespace(rank=mapping.tp_rank, nranks=mapping.tp_size)
+
+    monkeypatch.setattr(TPHostExchange, "create", classmethod(create))
+    Distributed.set_implementation(MnnvlDist.create, StartupRecord())
+    with monkeypatch.context() as patched:
+        patched.setattr(MnnvlDist, "check_requirements", staticmethod(lambda mapping: None))
+        first = Distributed.get(Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True))
+        second = Distributed.get(
+            Mapping(world_size=2, rank=1, tp_size=2, moe_ep_size=2, enable_attention_dp=True)
+        )
+        other_tp_group = Distributed.get(
+            Mapping(world_size=4, rank=1, tp_size=4, enable_attention_dp=True)
+        )
+    assert second is not first
+    assert second.host_exchange is first.host_exchange
+    assert len(created) == 1
+    with pytest.raises(RuntimeError, match="cannot serve TP rank 1/4"):
+        other_tp_group.host_exchange
+
+
+def test_pp_cp_p2p_collectives_unavailable():
+    """MnnvlDist has no pipeline-parallel, context-parallel or point-to-point communication."""
+    dist = MnnvlDist(Mapping(world_size=2, rank=0, tp_size=2))
+    with pytest.raises(NotImplementedError, match="no context-parallel group"):
+        dist.cp_allgather(0)
+    with pytest.raises(NotImplementedError, match="no context-parallel group"):
+        dist.cp_broadcast(0)
+    for name in ("tp_comm", "pp_allgather", "send_object", "recv_object"):
+        assert not hasattr(dist, name), name

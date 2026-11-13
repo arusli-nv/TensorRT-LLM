@@ -57,6 +57,8 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"max_batch_size": 8}, True),
         (generator.SERVE_SCHEMA, {"max_batch_szie": 8}, False),
         (generator.SERVE_SCHEMA, {"max_batch_size": "eight"}, False),
+        (generator.SERVE_SCHEMA, {"enable_wide_ep_fault_tolerance": True}, True),
+        (generator.SERVE_SCHEMA, {"enable_wide_ep_fault_tolerance": "on"}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),

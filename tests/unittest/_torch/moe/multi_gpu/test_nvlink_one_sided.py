@@ -17,6 +17,7 @@ import pytest
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_no_mnnvl_fabric_handles
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
@@ -946,5 +947,268 @@ def test_cft_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
             assert result["timeouts"] == [], (
                 f"rank {rank}: watchdog reported {result['timeouts']} on a healthy collective"
             )
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ============================================================================
+# Host watchdog of the rank-mask mode (TLLM_FAULT_TOLERANCE_MODE)
+# ============================================================================
+
+
+def _run_late_peer_watchdog_worker(_unused: int) -> dict:
+    """Run fence rounds in the rank-mask mode with a watchdog armed, and report what it saw.
+
+    The first round is healthy. In the second, the last rank dispatches only after every other
+    rank's watchdog reported it missing.
+    """
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import os
+    import time
+
+    import torch
+
+    os.environ[FORCE_CFT_ENV] = "0"
+
+    from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import EPGroupHealth
+
+    rank = MPI.COMM_WORLD.Get_rank()
+    ep_size = MPI.COMM_WORLD.Get_size()
+    torch.cuda.set_device(rank)
+    MnnvlMemory.initialize()
+    if not all(MPI.COMM_WORLD.allgather(MnnvlMemory.supports_mnnvl())):
+        return {"skip": "NVLink one-sided is not supported on every participating GPU"}
+
+    timeouts: list = []
+    num_tokens, hidden = 4, 512
+    mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
+    comm = NVLinkOneSided(
+        mapping=mapping,
+        num_slots=ep_size * 2,
+        top_k=1,
+        max_num_tokens_per_rank=8,
+        hidden_size=hidden,
+        dtype=torch.bfloat16,
+        ep_group_health=EPGroupHealth(ep_size),
+        alltoall_watchdog_timeout_s=1.0,
+        alltoall_watchdog_poll_interval_s=0.02,
+        alltoall_watchdog_on_timeout=timeouts.append,
+    )
+
+    def dispatch() -> torch.Tensor:
+        """Dispatch the tokens round-robin over the ranks, each through the rank's first slot."""
+        token = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+        slots = (token * 2 % (ep_size * 2))[:, None]
+        payload = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
+        scales = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+        return comm.dispatch(payload, None, slots, scales, [num_tokens] * ep_size)[0]
+
+    try:
+        assert not comm.can_use_cft_counted_writes
+        late = ep_size - 1
+
+        MPI.COMM_WORLD.barrier()
+        comm.combine(dispatch(), all_rank_max_num_tokens=num_tokens)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        healthy_timeouts = list(timeouts)
+
+        if rank != late:
+            received = dispatch()
+            deadline = time.monotonic() + 30
+            while not timeouts[len(healthy_timeouts) :] and time.monotonic() < deadline:
+                time.sleep(0.02)
+        # The late rank starts its round only now, which releases the others' waits.
+        MPI.COMM_WORLD.barrier()
+        if rank == late:
+            received = dispatch()
+        comm.combine(received, all_rank_max_num_tokens=num_tokens)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        return {
+            "rank": rank,
+            "healthy": [t.missing_ranks for t in healthy_timeouts],
+            "late": [(t.phase, t.missing_ranks) for t in timeouts[len(healthy_timeouts) :]],
+        }
+    finally:
+        comm.destroy()
+
+
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_rank_mask_mode_watchdog_reports_late_peer(ep_size: int) -> None:
+    """The watchdog reports only a peer that the fence kernels wait on past its timeout."""
+    if torch.cuda.device_count() < ep_size:
+        pytest.skip(f"requires {ep_size} GPUs")
+    executor = MPIPoolExecutor(ep_size)
+    try:
+        results = list(executor.map(_run_late_peer_watchdog_worker, range(ep_size)))
+        skipped = [r["skip"] for r in results if "skip" in r]
+        if skipped:
+            pytest.skip(skipped[0])
+        results.sort(key=lambda r: r["rank"])
+        late = ep_size - 1
+        for result in results:
+            rank = result["rank"]
+            assert result["healthy"] == [], (
+                f"rank {rank}: watchdog reported {result['healthy']} on a healthy collective"
+            )
+            expected = [] if rank == late else [("dispatch", (late,))]
+            assert result["late"] == expected, f"rank {rank}: watchdog reported {result['late']}"
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+# ============================================================================
+# Abort of bound collectives stuck on a rank that stopped
+# ============================================================================
+
+
+def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round_flag: int) -> dict:
+    """Abort a round from ``round_flag`` whose ``failed_rank`` stops before ``stop_before``."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import os
+    import time
+
+    import torch
+
+    from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
+    from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+    from tensorrt_llm.bindings import internal
+
+    # Fault tolerance refuses the CFT that an earlier test in this worker may have forced.
+    os.environ[FORCE_CFT_ENV] = "0"
+    rank = MPI.COMM_WORLD.Get_rank()
+    ep_size = MPI.COMM_WORLD.Get_size()
+    torch.cuda.set_device(rank)
+    MnnvlMemory.initialize()
+    if not all(MPI.COMM_WORLD.allgather(MnnvlMemory.supports_mnnvl())):
+        return {"skip": "NVLink one-sided is not supported on every participating GPU"}
+
+    hidden, capacity, slots_per_rank = 256, 8, 2
+    evidence = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
+    health = EPGroupHealth(ep_size)
+    mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
+    comm = NVLinkOneSided(
+        mapping=mapping,
+        num_slots=ep_size * slots_per_rank,
+        top_k=1,
+        max_num_tokens_per_rank=capacity,
+        hidden_size=hidden,
+        dtype=torch.bfloat16,
+        enable_wide_ep_fault_tolerance=True,
+    )
+    everyone = list(range(ep_size))
+    active = [r for r in everyone if r != failed_rank]
+    errors = []
+
+    def check(ok: bool, what: str) -> None:
+        if not ok:
+            errors.append(f"rank {rank}: {what}")
+
+    def dispatch(senders: list[int], seed: int) -> tuple[torch.Tensor, tuple]:
+        """Dispatch this rank's tokens, each to the first slot of one of ``senders``."""
+        generator = torch.Generator().manual_seed(seed * ep_size + rank)
+        x = torch.randn(capacity, hidden, generator=generator).bfloat16().cuda()
+        owner = torch.tensor(senders)[torch.arange(capacity) % len(senders)]
+        slots = (owner * slots_per_rank)[:, None].int().cuda()
+        weights = torch.ones(capacity, 1, device="cuda")
+        counts = [capacity if r in senders else 0 for r in everyone]
+        return x, comm.dispatch(x, None, slots, weights, counts)
+
+    def round_trip(senders: list[int], seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The experts return their input, so a complete round combines each token to itself."""
+        x, recv = dispatch(senders, seed)
+        return x, comm.combine(recv[0], all_rank_max_num_tokens=capacity)
+
+    try:
+        state = MoeExecutionState(health, rank, torch.device("cuda"))
+        comm.bind_execution_state(state)
+        MPI.COMM_WORLD.Barrier()
+        x, combined = round_trip(everyone, 0)
+        check(torch.equal(combined, x), "healthy round combined wrong")
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+
+        # Round 1: the dispatch waits for flag value round_flag + 1 and the combine for
+        # round_flag + 2, modulo 2**32. A wait publishes 1 for a flag value that wrapped to 0.
+        flag_val_offset = comm.moe_a2a_metainfo[comm.FLAG_VAL_OFFSET_INDEX].item()
+        comm.workspace[comm.ep_rank, flag_val_offset : flag_val_offset + 4].view(torch.int32).fill_(
+            round_flag - 2**32 if round_flag >= 2**31 else round_flag
+        )
+        if rank == failed_rank:
+            if stop_before == "combine":
+                dispatch(everyone, 1)
+                torch.cuda.synchronize()
+                comm.reset_state()
+        else:
+            x, combined = round_trip(everyone, 1)
+            done = torch.cuda.Event()
+            done.record()
+            stuck_on = (round_flag + (1 if stop_before == "dispatch" else 2)) % 2**32 or 1
+            deadline = time.monotonic() + 10
+            while (
+                state.waited_flags().get(failed_rank) != stuck_on
+                and not done.query()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            check(
+                state.waited_flags().get(failed_rank) == stuck_on,
+                f"no wait evidence on rank {failed_rank}: "
+                f"{state.abort[evidence : evidence + ep_size].tolist()}",
+            )
+            check(not done.query(), "the round completed without the stopped rank")
+            check(not state.aborted(), "aborted before the request")
+            state.request_abort()
+            start = time.monotonic()
+            torch.cuda.synchronize()
+            check(time.monotonic() - start < 10, "the abort did not release the waiting collective")
+            check(state.abort[:2].tolist() == [1, 1], f"abort state {state.abort[:2].tolist()}")
+            check(not state.abort[evidence:].any(), "wait evidence left after the abort")
+            # An incomplete combine outputs zeros. After an incomplete dispatch, the combine takes
+            # only the tokens this rank routed to itself.
+            expected = torch.zeros_like(x)
+            if stop_before == "dispatch":
+                own = torch.arange(capacity, device=x.device) % ep_size == rank
+                expected[own] = x[own]
+            check(torch.equal(combined, expected), "the incomplete round combined wrong")
+        MPI.COMM_WORLD.Barrier()
+
+        health.mark_failed(failed_rank)
+        if rank in active:
+            state.rearm()
+        MPI.COMM_WORLD.Barrier()
+        if rank in active:
+            state.install_mask()
+            for seed in (2, 3):
+                x, combined = round_trip(active, seed)
+                check(torch.equal(combined, x), f"round {seed} after the recovery combined wrong")
+            torch.cuda.synchronize()
+            check(not state.aborted(), "a round after the recovery aborted")
+        MPI.COMM_WORLD.Barrier()
+        return {"rank": rank, "errors": errors}
+    finally:
+        comm.destroy()
+
+
+@pytest.mark.parametrize("round_flag", [2, 2**32 - 2], ids=["no_wrap", "flag_wraps"])
+@pytest.mark.parametrize("stop_before", ["dispatch", "combine"])
+def test_abort_releases_bound_collectives_waiting_on_a_stopped_rank(
+    stop_before: str, round_flag: int
+) -> None:
+    """Abort a bound dispatch or combine waiting on a stopped rank, then recover without it.
+
+    With ``flag_wraps`` the combine waits for round flag value 0, which is still published.
+    """
+    ep_size, failed_rank = 4, 2
+    skip_no_mnnvl_fabric_handles(ep_size)
+    executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
+    try:
+        args = [(failed_rank, stop_before, round_flag)] * ep_size
+        results = list(executor.starmap(_run_abort_stuck_collective_worker, args))
+        skipped = [r["skip"] for r in results if "skip" in r]
+        if skipped:
+            pytest.skip(skipped[0])
+        assert [e for r in results for e in r["errors"]] == []
     finally:
         executor.shutdown(wait=True, cancel_futures=True)

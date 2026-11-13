@@ -238,6 +238,53 @@ def test_prime_cached_tactics_on_cache_hit(monkeypatch, strategy) -> None:
         assert JitGemmRunner.calls == []
 
 
+class CountingGemmRunner(GemmRunner):
+    """GemmRunner without a JIT kernel cache, like the C++ runners."""
+    calls: list[int] = []
+
+    def forward(self,
+                /,
+                inputs: list[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        type(self).calls.append(tactic)
+        return super().forward(inputs, tactic=tactic, **kwargs)
+
+
+@pytest.mark.parametrize("prime_all_runners", [False, True])
+def test_prime_all_runners_on_cache_hit(monkeypatch, prime_all_runners) -> None:
+    """Prime the cached winners of a runner without a JIT kernel cache only on request."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    w = torch.randn(64, 128)
+    x = torch.randn(3, 64)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(input_idx=0,
+                          dim_idx=0,
+                          gen_tuning_buckets=(3, 4, 5),
+                          map_to_tuning_buckets=lambda value: value), ))
+    op = "test_prime_all_runners"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        tuner.choose_one(op, [CountingGemmRunner()], tuning_config, [x, w])
+    winners = {
+        value[1]
+        for value in tuner.profiling_cache.get_specific_custom_op(op).values()
+    }
+    assert winners
+
+    # Simulate a fresh process that holds the tactics but launched none of them.
+    tuner._primed_cached_tactics.clear()
+    CountingGemmRunner.calls.clear()
+    for _ in range(2):
+        with autotune(prime_all_runners=prime_all_runners):
+            tuner.choose_one(op, [CountingGemmRunner()], tuning_config, [x, w])
+    expected = sorted(winners) if prime_all_runners else []
+    assert sorted(CountingGemmRunner.calls) == expected
+    assert not tuner.prime_all_runners
+
+
 def test_prime_cached_tactics_after_parallel_cache_merge(monkeypatch) -> None:
     """Prime winners selected by another rank after a cold profile."""
     monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")

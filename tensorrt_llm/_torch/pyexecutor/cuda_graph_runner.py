@@ -422,7 +422,8 @@ class CUDAGraphRunner:
         that resolved different tiers would otherwise replay different graphs.
         """
         gathered = self.config.dist.tp_allgather_int64(
-            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value])
+            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value],
+            active_only=True)
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()

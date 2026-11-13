@@ -1,0 +1,1436 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the Wide-EP fault-tolerance node supervisor with fake ranks and a fake authority.
+
+The fake authority is a real rendezvous store plus a listener that sends the supervisor the views
+a test gives it. The supervisor runs in a thread, or in a process when a test signals or kills it.
+"""
+
+import contextlib
+import importlib.util
+import json
+import os
+import secrets
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+from torch.distributed import TCPStore
+
+from tensorrt_llm._torch.distributed import membership
+from tensorrt_llm._torch.distributed.membership import (
+    LIVENESS_KEY,
+    RENDEZVOUS_ENV,
+    SHARED_SECRET_ENV,
+    MembershipRecord,
+    MembershipState,
+    NodeReport,
+    NodeView,
+    SignedStore,
+    records,
+)
+from tensorrt_llm._torch.distributed.membership.liveness import Lines
+from tensorrt_llm._torch.distributed.membership.rendezvous import hello_token
+from tensorrt_llm.llmapi import _llmapi_process_guard as process_guard
+from tensorrt_llm.llmapi import _mpirun_job as mpirun_job
+from tensorrt_llm.logger import logger
+
+# The tests run supervisors, ranks and launchers as processes. A hang fails its test, not the job.
+pytestmark = [pytest.mark.cpu_only, pytest.mark.timeout(120)]
+
+_LLMAPI = Path(__file__).parents[3] / "tensorrt_llm" / "llmapi"
+_SUPERVISOR = _LLMAPI / "_llmapi_node_supervisor.py"
+_spec = importlib.util.spec_from_file_location("_llmapi_node_supervisor", _SUPERVISOR)
+supervisor_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(supervisor_module)
+
+NODE, NODES, GPUS = 1, 2, 2  # node 1 runs ranks 2 and 3 of 4
+RANKS = (2, 3)
+_JOIN_TIMEOUT_S = 10.0
+_TIMINGS = dict(_CONNECT_TIMEOUT_S=0.5, _STOP_GRACE_S=2.0, _BACKOFF_S=0.05)
+
+
+@pytest.fixture(autouse=True)
+def _timings(monkeypatch):
+    """Shorten the supervisor's timings for the tests."""
+    for name, value in _TIMINGS.items():
+        monkeypatch.setattr(supervisor_module, name, value)
+
+
+# A fake rank. It records itself in SUPERVISOR_TEST_ROOT as the rank's n-th process, 0 for the
+# original, and ends with status 0 once the fake authority sent SHUTDOWN and wrote "shutdown" there.
+# SUPERVISOR_TEST_MODES maps "<rank>:<n>" to a mode, "serves" by default. "records-signals" records
+# the first SIGINT or SIGTERM and exits. "starts-helper" records the PID of a helper it starts.
+# "creates-segment-at-stop" writes SUPERVISOR_TEST_SEGMENT on SIGTERM. "drains" ends once
+# SUPERVISOR_TEST_ROOT/drained exists. "crashes", "fails" and "cannot-start" exit at once.
+_RANK = r"""
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+
+rank, world_size, _, replacement = os.environ["TLLM_FAULT_TOLERANCE_RANK"].split(",")
+root = Path(os.environ["SUPERVISOR_TEST_ROOT"])
+started = [int(path.stem.rsplit("-", 1)[1]) for path in root.glob(f"rank-{rank}-*.json")]
+incarnation = max(started, default=0) + 1 if replacement == "1" else 0
+modes = dict(item.split("=") for item in os.environ.get("SUPERVISOR_TEST_MODES", "").split())
+mode = modes.get(f"{rank}:{incarnation}", "serves")
+
+
+def publish(name, text):
+    # Write a hidden file, then rename it, so the test never reads a partly written record.
+    written = root / f".{name}"
+    written.write_text(text)
+    written.replace(root / name)
+
+
+if mode == "records-signals":
+    def record(signum, frame):
+        publish(f"signals-{rank}-{incarnation}", signal.Signals(signum).name)
+        sys.exit(128 + signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, record)
+if mode == "ignores-sigterm":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if mode == "creates-segment-at-stop":
+    def create_segment(signum, frame):
+        Path(os.environ["SUPERVISOR_TEST_SEGMENT"]).write_bytes(b"host weights")
+        publish(f"signals-{rank}-{incarnation}", signal.Signals(signum).name)
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, create_segment)
+helper = None
+if mode == "starts-helper":
+    helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"]).pid
+publish(
+    f"rank-{rank}-{incarnation}.json",
+    json.dumps(
+        {"pid": os.getpid(), "helper": helper, "argv": sys.argv, "environ": dict(os.environ)}
+    ),
+)
+statuses = {"crashes": 7, "fails": 5, "cannot-start": 78}
+if mode in statuses:
+    sys.exit(statuses[mode])
+end = root / ("drained" if mode == "drains" else "shutdown")
+deadline = time.monotonic() + 600
+while not end.exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+"""
+
+# Run the supervisor as its script does, with the test's timings.
+_SUPERVISOR_SCRIPT = r"""
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("node_supervisor", %(supervisor)r)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+for name, value in %(timings)r.items():
+    setattr(module, name, value)
+module.main()
+"""
+
+
+def _record(
+    state=MembershipState.COMMITTED, active_mask=0b1111, incarnations=(0, 0, 0, 0), generation=1
+):
+    return MembershipRecord(
+        generation=generation, state=state, active_mask=active_mask, incarnations=incarnations
+    )
+
+
+class FakeAuthority:
+    """Fake membership authority that node supervisors connect to.
+
+    :meth:`start` opens a rendezvous store that publishes the listener's address. The listener
+    accepts node supervisors and sends them the views given to :meth:`push`. Once it sent SHUTDOWN,
+    the fake ranks under ``root`` end. The listener thread runs until :meth:`close`.
+    """
+
+    def __init__(self, root):
+        self._root = root
+        self._hello_token = hello_token()
+        # Reserved, as ensure_rendezvous does, until the store listens on it.
+        self._reserved = socket.socket()
+        self._reserved.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved.bind(("127.0.0.1", 0))
+        self.address = f"127.0.0.1:{self._reserved.getsockname()[1]}"
+        self.store = None
+        self.hellos = []
+        # The next hellos to refuse, as the authority refuses a node whose previous connection it
+        # still holds.
+        self.refusals = 0
+        self.closed = threading.Event()  # a supervisor's connection closed
+        # The ranks that the last report of a supervisor gave up, or None before any report.
+        self.given_up = None
+        # Cleared to hold the view that answers a supervisor's hello.
+        self.answering = threading.Event()
+        self.answering.set()
+        self._connections = []
+        self._threads = []
+        self._lock = threading.Lock()
+        self._view = NodeView(record=_record())
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._acceptor = self._thread(self._accept)
+
+    def start(self, record=None):
+        if record is not None:
+            self._view = NodeView(record=record)
+        port = self._reserved.getsockname()[1]
+        self.store = SignedStore(
+            TCPStore("127.0.0.1", port, is_master=True, wait_for_workers=False)
+        )
+        self.store.set(LIVENESS_KEY, f"127.0.0.1:{self._listener.getsockname()[1]}".encode())
+        return self
+
+    def _thread(self, target, *args):
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+        return thread
+
+    def _accept(self):
+        while True:
+            try:
+                sock, _ = self._listener.accept()
+            except OSError:
+                return
+            # Nothing follows the hello before the view, so the buffered read takes nothing more.
+            token, *announcement = sock.makefile("rb").readline().decode().split() or [None]
+            if token != self._hello_token:
+                sock.close()
+                continue
+            if self.refusals:
+                self.refusals -= 1
+                sock.close()
+                continue
+            lines = Lines()
+            self.hellos.append(announcement)
+            self.answering.wait()
+            with self._lock:
+                self._connections.append((sock, lines))
+                sock.sendall(lines.encode(self._view.model_dump_json().encode()))
+            self._thread(self._watch, sock, lines)
+
+    def _watch(self, sock, lines):
+        with contextlib.suppress(OSError):
+            while data := sock.recv(256):
+                for line in lines.decode(data):
+                    self.given_up = NodeReport.model_validate_json(line).given_up
+        self.closed.set()
+
+    def push(self, record, stalled_replacements=()):
+        with self._lock:
+            self._view = NodeView(record=record, stalled_replacements=stalled_replacements)
+            for sock, lines in self._connections:
+                with contextlib.suppress(OSError):
+                    sock.sendall(lines.encode(self._view.model_dump_json().encode()))
+        if record.state == MembershipState.SHUTDOWN:
+            (self._root / "shutdown").touch()
+
+    def close(self):
+        """Close every socket and join the threads.
+
+        Only a shutdown, not a close, wakes a thread blocked on a socket. The listener stops first,
+        so that a connection accepted during the close is shut down too.
+        """
+        self.answering.set()
+        self._reserved.close()
+        with contextlib.suppress(OSError):
+            self._listener.shutdown(socket.SHUT_RDWR)
+        self._acceptor.join(_JOIN_TIMEOUT_S)
+        with self._lock:
+            sockets = [*(sock for sock, _ in self._connections), self._listener]
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        for thread in self._threads:
+            thread.join(_JOIN_TIMEOUT_S)
+        for sock in sockets:
+            sock.close()
+
+
+@pytest.fixture
+def deployment(tmp_path, monkeypatch):
+    """Set up a shared secret, an authority that is not started yet, and the fake rank script.
+
+    Yields the authority and the environment the node's launcher would give the supervisor.
+    """
+    secret = secrets.token_hex(32)
+    monkeypatch.setenv(SHARED_SECRET_ENV, secret)
+    authority = FakeAuthority(tmp_path)
+    monkeypatch.setenv(RENDEZVOUS_ENV, authority.address)
+    (tmp_path / "rank.py").write_text(_RANK)
+    environ = {
+        **os.environ,
+        "SUPERVISOR_TEST_ROOT": str(tmp_path),
+        "OMPI_COMM_WORLD_RANK": "1",
+        "PMIX_RANK": "1",
+    }
+    yield authority, environ
+    authority.close()
+
+
+@pytest.fixture
+def held_connect(monkeypatch):
+    """Hold each connect in its store client, once ``hold`` is set, until ``release`` is set.
+
+    ``finish()`` releases the connects and joins their threads. A test that holds a connect calls
+    it before it ends, since the thread leak check runs before the fixtures' teardown.
+    """
+    connect = SimpleNamespace(
+        hold=threading.Event(), held=threading.Event(), release=threading.Event(), threads=[]
+    )
+    open_store = membership.open_store
+
+    def open_held_store(*args):
+        if connect.hold.is_set():
+            connect.threads.append(threading.current_thread())
+            connect.held.set()
+            connect.release.wait(60)
+        return open_store(*args)
+
+    def finish():
+        connect.release.set()
+        for thread in connect.threads:
+            thread.join(30)
+            assert not thread.is_alive(), f"{thread.name} still connects"
+
+    connect.finish = finish
+
+    monkeypatch.setattr(membership, "open_store", open_held_store)
+    yield connect
+    finish()
+
+
+@pytest.fixture
+def host_weights():
+    """Return the host weights segments of ranks, which are unlinked after the test."""
+    paths = []
+
+    def segments(ranks, name=None):
+        name = name or membership.host_weights_name()
+        paths.extend(Path("/dev/shm", f"{name}_l0_lr{rank}_all") for rank in ranks)
+        return paths[-len(ranks) :]
+
+    yield segments
+    for path in paths:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+
+def _write(segments):
+    for segment in segments:
+        segment.write_bytes(b"host weights")
+
+
+def _read(tmp_path, rank, incarnation):
+    path = tmp_path / f"rank-{rank}-{incarnation}.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _until(predicate, timeout_s=30.0):
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.02)
+
+
+def _alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().split(")")[-1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+class Running:
+    """Run a node supervisor in a thread and keep its exit status in :attr:`status`.
+
+    An error that ends the supervisor is kept in :attr:`error`.
+    """
+
+    def __init__(self, tmp_path, environ, node=NODE, **options):
+        self.supervisor = supervisor_module.NodeSupervisor(
+            node,
+            NODES,
+            GPUS,
+            [sys.executable, str(tmp_path / "rank.py")],
+            environ,
+            **options,
+        )
+        self.status = None
+        self.error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self.status = self.supervisor.run()
+        except Exception as error:
+            self.error = error
+
+    def wait(self, timeout_s=30.0):
+        self._thread.join(timeout_s)
+        assert not self._thread.is_alive(), "the supervisor did not end"
+        return self.status
+
+
+def _serving(tmp_path, authority, environ, node=NODE, **options):
+    """Start a supervisor whose ranks start before the authority, as the original ranks do."""
+    running = Running(tmp_path, environ, node=node, **options)
+    _until(lambda: all(_read(tmp_path, rank, 0) for rank in range(node * GPUS, (node + 1) * GPUS)))
+    authority.start()
+    _until(lambda: authority.hellos and running.supervisor._view is not None)
+    return running
+
+
+def _push_and_wait_for_step(running, authority, record):
+    """Push a new view and wait until the supervisor has acted on it and on every earlier event.
+
+    The supervisor acts on each view before it waits for the next event. Once it has taken a later
+    view, it has acted on this one.
+    """
+    authority.push(record)
+    _until(lambda: running.supervisor._view == NodeView(record=record))
+    following = record.model_copy(update={"generation": record.generation + 1})
+    authority.push(following)
+    _until(lambda: running.supervisor._view.record == following)
+
+
+def _shut_down(running, authority, *args, **fields):
+    """Push SHUTDOWN and check that the supervisor ends with status 0."""
+    authority.push(_record(MembershipState.SHUTDOWN, *args, **fields))
+    assert running.wait() == 0
+
+
+def test_ranks_start_outside_launcher_job(tmp_path, deployment):
+    """Check that ranks start in their own session, without the launcher's variables or btl sm.
+
+    A rank keeps the opt-in to running as root. The shared secret reaches a rank only through its
+    environment.
+    """
+    authority, environ = deployment
+    environ.update(OMPI_ALLOW_RUN_AS_ROOT="1", OMPI_MCA_btl="self,sm,tcp")
+    running = _serving(tmp_path, authority, environ)
+    kept = ("OMPI_MCA_btl", *records._RUN_AS_ROOT_VARS)
+    for rank in RANKS:
+        started = _read(tmp_path, rank, 0)
+        assert started["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == f"{rank},4,2,0"  # on GPU rank % 2
+        assert not any(
+            key.startswith(("OMPI_", "PMIX_")) for key in started["environ"] if key not in kept
+        )
+        # The user's transports but sm, which leaves a /dev/shm segment behind.
+        assert started["environ"]["OMPI_MCA_btl"] == "self,tcp"
+        assert started["environ"]["OMPI_ALLOW_RUN_AS_ROOT"] == "1"
+        assert started["environ"][SHARED_SECRET_ENV] == os.environ[SHARED_SECRET_ENV]
+        assert os.environ[SHARED_SECRET_ENV] not in " ".join(started["argv"])
+        # A terminal signal reaches only the supervisor.
+        assert os.getsid(started["pid"]) == started["pid"]
+    assert authority.hellos == [["node", "1", "2,3", socket.gethostname()]]
+    _shut_down(running, authority)
+
+
+@pytest.mark.parametrize(
+    "btl, rank_btl",
+    [
+        (None, "^sm"),
+        ("self,sm,tcp", "self,tcp"),
+        ("self,vader,tcp", "self,tcp"),
+        ("sm", "^sm"),
+        ("^openib", "^openib,sm"),
+        ("^sm,openib", "^sm,openib"),
+    ],
+)
+def test_rank_btl_excludes_shared_memory(btl, rank_btl):
+    """Check that a rank keeps the user's btl selection without the shared-memory transport."""
+    environ = {"OMPI_ALLOW_RUN_AS_ROOT": "1", "OMPI_COMM_WORLD_RANK": "3", "PATH": "/bin"}
+    if btl is not None:
+        environ["OMPI_MCA_btl"] = btl
+    assert membership.rank_env(environ) == {
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+        "OMPI_MCA_btl": rank_btl,
+        "PATH": "/bin",
+    }
+
+
+@pytest.mark.parametrize("failure", ["crash", "hang"])
+def test_failed_rank_is_replaced(tmp_path, deployment, failure):
+    """Replace a rank the record leaves out, and kill it with its helpers if it still runs."""
+    authority, environ = deployment
+    environ["SUPERVISOR_TEST_MODES"] = "3:0=starts-helper"
+    running = _serving(tmp_path, authority, environ)
+    failed = _read(tmp_path, 3, 0)["pid"]
+    if failure == "crash":
+        os.kill(failed, signal.SIGKILL)
+        _until(lambda: running.supervisor._processes[3].status is not None)
+        # The authority has not removed the rank from the record yet.
+        _push_and_wait_for_step(running, authority, _record(generation=2))
+        assert not running.supervisor._processes[3].replacement
+    authority.push(_record(MembershipState.PROPOSE, active_mask=0b0111, generation=4))
+    _until(lambda: _read(tmp_path, 3, 1))
+    replacement = _read(tmp_path, 3, 1)
+    assert replacement["environ"]["TLLM_FAULT_TOLERANCE_RANK"] == "3,4,2,1"
+    assert not _alive(failed)
+    _until(lambda: not _alive(_read(tmp_path, 3, 0)["helper"]), 10)
+    assert _alive(_read(tmp_path, 2, 0)["pid"])
+    _shut_down(running, authority, incarnations=(0, 0, 0, 1), generation=5)
+    assert not _alive(replacement["pid"])
+
+
+@pytest.mark.parametrize("failure", ["cannot-start", "cannot-spawn"])
+def test_failed_replacement_restarts_until_cannot_start(tmp_path, deployment, monkeypatch, failure):
+    """Restart a replacement after a backoff until one exits with REPLACEMENT_CANNOT_START.
+
+    A replacement whose process cannot be started counts as a failed one.
+    """
+    monkeypatch.setattr(supervisor_module, "_BACKOFF_S", 1.0)
+    authority, environ = deployment
+    environ["SUPERVISOR_TEST_MODES"] = "3:1=fails 3:2=cannot-start"
+    running = _serving(tmp_path, authority, environ)
+    if failure == "cannot-spawn":
+        running.supervisor._exec_rank = [str(tmp_path / "missing")]
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
+    _until(lambda: running.supervisor._given_up == {3})
+    if failure == "cannot-spawn":
+        failed = supervisor_module._MAX_FAILED_REPLACEMENTS
+        assert running.supervisor._failed_replacements[3] == failed
+    else:
+        assert _read(tmp_path, 3, 2)
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, active_mask=0b0111, generation=2)
+    )
+    # No new replacement starts because it would fail the same way.
+    assert running.supervisor._processes[3].status is not None
+    assert running.supervisor._given_up == {3}
+    _until(lambda: authority.given_up == (3,))
+    _shut_down(running, authority, active_mask=0b0111)
+
+
+_INSTALL = "a replacement could not install the change that adds it"
+# The membership gives no reason when it leaves out a hung replacement.
+_HUNG = ""
+
+
+@pytest.mark.parametrize(
+    "reasons", [(_INSTALL,), (_INSTALL, _HUNG)], ids=["same-reason", "other-reasons"]
+)
+def test_left_out_replacements_give_up_rank(tmp_path, deployment, reasons):
+    """Check that no replacement starts once the membership left out three in a row, for any reason.
+
+    Each change that adds a replacement of rank 3 leaves it out. The node serves without rank 3.
+    """
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
+    generation = 1
+    for incarnation in range(1, supervisor_module._MAX_FAILED_REPLACEMENTS + 1):
+        _until(lambda incarnation=incarnation: _read(tmp_path, 3, incarnation))
+        _until(lambda: authority.given_up == ())
+        joined = (0, 0, 0, incarnation)
+        adding = _record(MembershipState.INSTALL, 0b1111, joined, generation + 1)
+        authority.push(adding.model_copy(update=dict(joining_mask=0b1000)))
+        _until(lambda: running.supervisor._processes[3].listed)
+        left_out = _record(MembershipState.PROPOSE, 0b0111, joined, generation + 2)
+        reason = reasons[incarnation % len(reasons)]
+        authority.push(left_out.model_copy(update=dict(reason=reason)))
+        generation += 2
+    _until(lambda: running.supervisor._given_up == {3})
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, 0b0111, joined, generation + 1)
+    )
+    assert _read(tmp_path, 3, supervisor_module._MAX_FAILED_REPLACEMENTS + 1) is None
+    _until(lambda: authority.given_up == (3,))
+    _shut_down(running, authority, 0b0111, joined, generation + 2)
+
+
+@pytest.mark.parametrize(
+    "admitted, served_s, given_up",
+    [(False, 600.0, True), (True, 600.0, True), (True, 0.0, False)],
+    ids=["before-admission", "after-admission", "after-serving"],
+)
+def test_short_lived_replacements_give_up_rank(
+    tmp_path, deployment, monkeypatch, admitted, served_s, given_up
+):
+    """Check that no replacement starts once three in a row ended within ``_HEALTHY_SERVING_S``.
+
+    A replacement that ends after serving longer is a new failure, so its replacement starts.
+    """
+    monkeypatch.setattr(supervisor_module, "_HEALTHY_SERVING_S", served_s)
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    generation = 1
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111, generation=generation))
+    for incarnation in range(1, supervisor_module._MAX_FAILED_REPLACEMENTS + 1):
+        _until(lambda incarnation=incarnation: _read(tmp_path, 3, incarnation))
+        joined = (0, 0, 0, incarnation)
+        if admitted:
+            serving = _record(MembershipState.COMMITTED, 0b1111, joined, generation + 1)
+            _push_and_wait_for_step(running, authority, serving)
+            generation += 2
+        os.kill(_read(tmp_path, 3, incarnation)["pid"], signal.SIGKILL)
+        generation += 1
+        authority.push(_record(MembershipState.COMMITTED, 0b0111, joined, generation))
+    if given_up:
+        _until(lambda: running.supervisor._given_up == {3})
+    else:
+        _until(lambda: _read(tmp_path, 3, supervisor_module._MAX_FAILED_REPLACEMENTS + 1))
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, 0b0111, joined, generation + 1)
+    )
+    assert (_read(tmp_path, 3, supervisor_module._MAX_FAILED_REPLACEMENTS + 1) is None) == given_up
+    _until(lambda: authority.given_up == ((3,) if given_up else ()))
+    _shut_down(running, authority, 0b0111, joined, generation + 3)
+
+
+def test_replacement_killed_once_reported_stalled(tmp_path, deployment):
+    """Check that a slow replacement runs on until the authority reports it stalled."""
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    without_3 = _record(MembershipState.COMMITTED, active_mask=0b0111)
+    authority.push(without_3)
+    _until(lambda: _read(tmp_path, 3, 1))
+    slow = _read(tmp_path, 3, 1)["pid"]
+    _push_and_wait_for_step(running, authority, without_3.model_copy(update=dict(generation=2)))
+    assert _alive(slow)
+    authority.push(without_3.model_copy(update=dict(generation=4)), stalled_replacements=(3,))
+    _until(lambda: _read(tmp_path, 3, 2))
+    assert not _alive(slow)
+    # The view that reported the stalled startup came before the next replacement started.
+    assert _alive(_read(tmp_path, 3, 2)["pid"])
+    _shut_down(running, authority, active_mask=0b0111, generation=5)
+
+
+def test_rank_0_end_stops_node(tmp_path, deployment):
+    """Check that the end of rank 0 stops the node's ranks and starts no replacement of it."""
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ, node=0)
+    os.kill(_read(tmp_path, 0, 0)["pid"], signal.SIGKILL)
+    assert running.wait() == 128 + signal.SIGKILL
+    assert _read(tmp_path, 0, 1) is None
+    assert not _alive(_read(tmp_path, 1, 0)["pid"])
+
+
+def test_stop_kills_groups_before_reaping(tmp_path, deployment, monkeypatch, host_weights):
+    """Check that the stop kills the process group of each rank before it reaps the rank.
+
+    Until a rank is reaped, the ID of its process group cannot be reused by another group. A rank
+    that ignores SIGTERM is killed once the grace period ends. Host weights that a rank creates
+    while it stops are unlinked.
+    """
+    signal_group = process_guard._signal_group
+    unreaped = []
+
+    def kill(pgid, signum):
+        if signum == signal.SIGKILL:
+            with contextlib.suppress(ChildProcessError):
+                os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                unreaped.append(pgid)
+        signal_group(pgid, signum)
+
+    monkeypatch.setattr(process_guard, "_signal_group", kill)
+    authority, environ = deployment
+    (segment,) = host_weights([0])
+    environ["SUPERVISOR_TEST_MODES"] = "2:0=creates-segment-at-stop 3:0=ignores-sigterm"
+    environ["SUPERVISOR_TEST_SEGMENT"] = str(segment)
+    running = _serving(tmp_path, authority, environ)
+    authority.push(_record(MembershipState.ABORTED))
+    assert running.wait() == 1
+    assert sorted(unreaped) == sorted(_read(tmp_path, rank, 0)["pid"] for rank in RANKS)
+    _until(lambda: not _alive(_read(tmp_path, 3, 0)["pid"]), 10)
+    assert (tmp_path / "signals-2-0").read_text() == "SIGTERM"
+    assert not segment.exists()
+
+
+@pytest.fixture
+def held_kills(monkeypatch):
+    """Record the signals that a supervisor sends to the process groups ``pgids``, and send none.
+
+    A killed rank is given up after a rendezvous timeout of 1 s. The held ranks are killed after the
+    test.
+    """
+    held = SimpleNamespace(pgids=set(), signals=[])
+    signal_group = process_guard._signal_group
+
+    def hold(pgid, signum):
+        if pgid in held.pgids:
+            held.signals.append((pgid, signum))
+        else:
+            signal_group(pgid, signum)
+
+    monkeypatch.setattr(process_guard, "_signal_group", hold)
+    monkeypatch.setattr(membership, "RENDEZVOUS_TIMEOUT_S", 1.0)
+    yield held
+    for pgid in held.pgids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pgid, signal.SIGKILL)
+
+
+def test_killed_rank_that_never_ends_is_given_up(tmp_path, deployment, held_kills):
+    """Give up a rank whose killed process did not end within the rendezvous timeout.
+
+    Its GPU memory may not be free, so no replacement of it starts.
+    """
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    pid = _read(tmp_path, 3, 0)["pid"]
+    held_kills.pgids.add(pid)
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
+    _until(lambda: authority.given_up == (3,))
+    assert held_kills.signals == [(pid, signal.SIGKILL)]
+    assert _alive(pid)
+    os.kill(pid, signal.SIGKILL)
+    _push_and_wait_for_step(
+        running, authority, _record(MembershipState.COMMITTED, active_mask=0b0111, generation=2)
+    )
+    assert _read(tmp_path, 3, 1) is None
+    _shut_down(running, authority, active_mask=0b0111, generation=4)
+
+
+def test_unreachable_rendezvous_warns(tmp_path, deployment, monkeypatch):
+    """Warn once per interval about a rendezvous that does not answer, also before serving."""
+    monkeypatch.setattr(supervisor_module, "_CONNECT_WARNING_INTERVAL_S", 1.0)
+    warnings = []
+    monkeypatch.setattr(
+        logger, "warning", lambda message, *args, **kwargs: warnings.append(message)
+    )
+    authority, environ = deployment
+    running = Running(tmp_path, environ)
+    _until(lambda: any("Cannot connect to the membership authority" in w for w in warnings))
+    authority.start()
+    _until(lambda: authority.hellos)
+    _shut_down(running, authority)
+
+
+def test_wrong_shared_secret_ends_supervisor(tmp_path, deployment, monkeypatch):
+    """End with status 1 and start no rank when the store's values carry another shared secret."""
+    authority, environ = deployment
+    authority.start()
+    monkeypatch.setenv(SHARED_SECRET_ENV, secrets.token_hex(32))
+    running = Running(tmp_path, environ)
+    assert running.wait() == 1
+    assert running.supervisor._processes == {}
+    assert authority.hellos == []
+
+
+def test_late_store_keeps_first_connection(tmp_path, deployment, monkeypatch):
+    """Keep the first connection when the store answers only at the end of the connect timeout.
+
+    The authority answers the hello later still, as it may while the deployment starts.
+    """
+    authority, environ = deployment
+    authority.start(_record(MembershipState.STARTING))
+    authority.answering.clear()
+    clock_s = [0.0]
+    open_store = membership.open_store
+
+    def open_late_store(*args):
+        store = open_store(*args)
+        clock_s[0] += supervisor_module._CONNECT_TIMEOUT_S
+        return store
+
+    monkeypatch.setattr(membership, "open_store", open_late_store)
+    monkeypatch.setattr(
+        supervisor_module, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + clock_s[0])
+    )
+    running = Running(tmp_path, environ)
+    _until(lambda: authority.hellos)
+    authority.answering.set()
+    _until(lambda: running.supervisor._view is not None)
+    assert len(authority.hellos) == 1
+    assert not authority.closed.is_set()
+    _shut_down(running, authority)
+
+
+def test_refused_reconnect_retried_after_start(tmp_path, deployment):
+    """Connect again, and keep the ranks, when the authority refuses a reconnect after the start.
+
+    The authority refuses a node's supervisor while it still holds the previous connection. It then
+    holds its answer to the next hello, which may take up to the hello timeout, and a rank that ends
+    meanwhile is reaped.
+    """
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    authority.refusals = 1
+    authority.answering.clear()
+    for sock, _ in authority._connections:
+        sock.shutdown(socket.SHUT_RDWR)
+    _until(lambda: len(authority.hellos) == 2)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    _until(lambda: running.supervisor._processes[3].status is not None, 5)
+    authority.answering.set()
+    _until(lambda: running.supervisor._connection is not None)
+    assert running.status is None
+    assert _alive(_read(tmp_path, 2, 0)["pid"])
+    _shut_down(running, authority, active_mask=0b0111)
+
+
+def test_ranks_ended_while_reconnect_refused_are_replaced(tmp_path, deployment):
+    """Replace the node's ranks that ended while the authority refused the supervisor's reconnects.
+
+    The authority fails a node's ranks once it drops the node's previous connection, so they may end
+    before it admits the reconnect. The node stops only with no authority to reach.
+    """
+    authority, environ = deployment
+    running = _serving(tmp_path, authority, environ)
+    authority.refusals = 1000
+    for sock, _ in authority._connections:
+        sock.shutdown(socket.SHUT_RDWR)
+    _until(lambda: authority.refusals <= 998)
+    for rank in RANKS:
+        os.kill(_read(tmp_path, rank, 0)["pid"], signal.SIGKILL)
+    _until(lambda: all(running.supervisor._processes[rank].status is not None for rank in RANKS))
+    refusals = authority.refusals
+    _until(lambda: authority.refusals <= refusals - 2)
+    assert running.status is None
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0011, generation=2))
+    authority.refusals = 0
+    _until(lambda: all(_read(tmp_path, rank, 1) for rank in RANKS))
+    _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=3)
+
+
+@pytest.fixture
+def fake_mpirun(tmp_path):
+    """Return a starter of a process named prterun, which is killed after the test.
+
+    The starter takes the process's arguments and returns it and its PMIx server URI.
+    """
+    started = []
+
+    def start(*arguments):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "prterun").symlink_to(shutil.which("bash"))
+        mpirun = subprocess.Popen([str(bin_dir / "prterun"), "-c", "sleep 60; :", *arguments])
+        started.append(mpirun)
+        return mpirun, f"prterun-{socket.gethostname()}-{mpirun.pid}@0.0;tcp4://127.0.0.1:1"
+
+    yield start
+    for mpirun in started:
+        mpirun.kill()
+        mpirun.wait()
+
+
+def _supervisor_command(tmp_path, node=NODE):
+    """Return the command that runs the supervisor of ``node`` as its script does, with fake ranks."""
+    script = tmp_path / "supervisor.py"
+    script.write_text(_SUPERVISOR_SCRIPT % {"supervisor": str(_SUPERVISOR), "timings": _TIMINGS})
+    options = ["--node-rank", str(node), "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
+    return [sys.executable, str(script), *options, "--", sys.executable, str(tmp_path / "rank.py")]
+
+
+@pytest.fixture
+def supervisor_process(tmp_path, deployment):
+    """Return a starter of node supervisor processes, which are killed after the test.
+
+    With ``serving``, the starter waits until the node's ranks started, then starts the authority
+    and waits for the supervisor's hello.
+    """
+    authority, _ = deployment
+    started = []
+
+    def start(environ, node=NODE, serving=False, **options):
+        supervisor = subprocess.Popen(_supervisor_command(tmp_path, node), env=environ, **options)
+        started.append(supervisor)
+        if serving:
+            ranks = range(node * GPUS, (node + 1) * GPUS)
+            _until(lambda: all(_read(tmp_path, rank, 0) for rank in ranks))
+            authority.start()
+            _until(lambda: authority.hellos)
+        return supervisor
+
+    yield start
+    for supervisor in started:
+        supervisor.kill()
+        supervisor.wait()
+
+
+def _rejected_start(tmp_path, supervisor_process, environ, node=NODE):
+    """Check that the supervisor exits with status 2 and starts no rank, and return its stderr."""
+    supervisor = supervisor_process(environ, node, stderr=subprocess.PIPE, text=True)
+    _, stderr = supervisor.communicate(timeout=60)
+    assert supervisor.returncode == 2
+    assert not list(tmp_path.glob("rank-*.json"))
+    return stderr
+
+
+@pytest.mark.parametrize(
+    "name, value, message",
+    [
+        (SHARED_SECRET_ENV, None, f"export the same {SHARED_SECRET_ENV} on every node"),
+        (RENDEZVOUS_ENV, None, f"export the same {RENDEZVOUS_ENV} on every node"),
+        (SHARED_SECRET_ENV, "00ff", "requires a shared secret of at least"),
+        (RENDEZVOUS_ENV, "127.0.0.1", f"{RENDEZVOUS_ENV} must be host:port"),
+        # One task per GPU, whose supervisors would each start every rank.
+        (
+            "OMPI_COMM_WORLD_LOCAL_SIZE",
+            str(GPUS),
+            f"mpirun started {GPUS} node supervisors on this node",
+        ),
+    ],
+    ids=[
+        "unset-secret",
+        "unset-rendezvous",
+        "malformed-secret",
+        "malformed-rendezvous",
+        "per-gpu-launch",
+    ],
+)
+def test_supervisor_rejects_bad_variable(
+    tmp_path, deployment, supervisor_process, name, value, message
+):
+    """Exit before connecting or starting a rank when the launch sets a variable wrong."""
+    authority, environ = deployment
+    authority.start()
+    if value is None:
+        del environ[name]
+    else:
+        environ[name] = value
+    stderr = _rejected_start(tmp_path, supervisor_process, environ)
+    assert message in stderr
+    if value is None or name == "OMPI_COMM_WORLD_LOCAL_SIZE":
+        assert membership.NODE_SUPERVISOR_LAUNCH in stderr
+    assert not authority.hellos
+
+
+def test_supervisor_started_by_srun_rejected(monkeypatch, capfd):
+    """Reject a node supervisor that Slurm started as a task instead of mpirun."""
+    monkeypatch.setenv("SLURM_PROCID", "1")
+    monkeypatch.delenv("OMPI_COMM_WORLD_RANK", raising=False)
+    with pytest.raises(SystemExit) as error:
+        supervisor_module.main(
+            ["--node-rank", "1", "--nodes", "2", "--gpus-per-node", "2", "--", "true"]
+        )
+    assert error.value.code == 2
+    assert "requires `mpirun --enable-recovery`, not srun" in capfd.readouterr().err
+
+
+def test_node_0_ends_job_through_mpirun(tmp_path, deployment, fake_mpirun):
+    """End the job through the mpirun of the PMIx server URI when rank 0 ends.
+
+    SIGTERM makes mpirun (prterun) exit with a failure status. A shell starts the supervisor here,
+    as a wrapper script between mpirun and the launch would, and the shell must not be signaled.
+    """
+    _, environ = deployment
+    mpirun, uri = fake_mpirun("--enable-recovery")
+    environ.update(PMIX_SERVER_URI41=uri, SUPERVISOR_TEST_MODES="0:0=crashes")
+    status = tmp_path / "shell-status"
+    shell = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            '"$@"; echo "status $?" > "$0"',
+            str(status),
+            *_supervisor_command(tmp_path, 0),
+        ],
+        env=environ,
+    )
+    try:
+        assert shell.wait(30) == 0
+        assert mpirun.wait(10) == -signal.SIGTERM
+    finally:
+        shell.kill()
+    assert status.read_text() == "status 7\n"
+
+
+@pytest.mark.parametrize("readable", [True, False], ids=["present", "unreadable"])
+def test_enable_recovery_read_from_mpirun(deployment, monkeypatch, fake_mpirun, readable):
+    """Start when mpirun's command line has --enable-recovery, or warn when it cannot be read."""
+    _, environ = deployment
+    warnings = []
+    monkeypatch.setattr(
+        logger, "warning", lambda message, *args, **kwargs: warnings.append(message)
+    )
+    if not readable:
+
+        def open_but_cmdline(path, *args, **kwargs):
+            if str(path).endswith("/cmdline"):
+                raise PermissionError(path)
+            return open(path, *args, **kwargs)
+
+        monkeypatch.setattr(mpirun_job, "open", open_but_cmdline, raising=False)
+    _, environ["PMIX_SERVER_URI41"] = fake_mpirun(*(["--enable-recovery"] if readable else []))
+    assert mpirun_job.end_job_function(environ, NODES) is not None
+    if readable:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert "Cannot read the command line of mpirun" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "mpirun, message",
+    [
+        ("no URI", "names no mpirun of this host"),
+        ("other host", "names no mpirun of this host"),
+        ("no --enable-recovery", "requires mpirun --enable-recovery"),
+    ],
+    ids=["no URI", "other host", "no --enable-recovery"],
+)
+def test_node_0_requires_mpirun_on_its_host(
+    tmp_path, deployment, supervisor_process, fake_mpirun, mpirun, message
+):
+    """Reject a multi-node job under mpirun whose node 0 cannot end the job through its mpirun.
+
+    One node does not need to, since the end of its supervisor ends the job. Without
+    --enable-recovery, the first node loss ends the job.
+    """
+    _, environ = deployment
+    for name in mpirun_job._PMIX_SERVER_URI_VARS:
+        environ.pop(name, None)
+    if mpirun == "other host":
+        environ["PMIX_SERVER_URI41"] = "prterun-otherhost-0@0.0;tcp4://127.0.0.1:1"
+    elif mpirun == "no --enable-recovery":
+        _, environ["PMIX_SERVER_URI41"] = fake_mpirun()
+    assert message in _rejected_start(tmp_path, supervisor_process, environ, node=0)
+    if mpirun != "no --enable-recovery":
+        assert mpirun_job.end_job_function(environ, 1) is None
+
+
+@pytest.mark.parametrize("supervisor_alive", [True, False])
+def test_rank_runs_only_under_supervisor(tmp_path, supervisor_alive):
+    """Check that a rank's command runs only if its supervisor still runs once its signal is armed.
+
+    The supervisor is the test, or a process the rank's process no longer has as its parent.
+    """
+    marker = tmp_path / "ran"
+    supervisor = os.getpid() if supervisor_alive else 1
+    exec_rank = [sys.executable, "-S", str(_SUPERVISOR), "--exec-rank", str(supervisor)]
+    status = subprocess.call([*exec_rank, "touch", str(marker)])
+    assert status == (0 if supervisor_alive else 1)
+    assert marker.exists() == supervisor_alive
+
+
+def test_stop_reaps_session_supervisor():
+    """Reap the session's node supervisor when it stops without a grace period, as on an abort."""
+    supervisor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    supervisor_module.stop_session_node_supervisor(supervisor, None)
+    assert supervisor.returncode == -signal.SIGTERM
+
+
+def test_session_supervisor_runs_in_own_session(monkeypatch):
+    """Start the session's node supervisor outside the session's process group.
+
+    A terminal's Ctrl-C then reaches only rank 0, which shuts the deployment down.
+    """
+    monkeypatch.setattr(supervisor_module.shutil, "which", lambda name: f"/bin/{name}")
+    popen = Mock()
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", popen)
+    supervisor_module.start_session_node_supervisor(2, {})
+    assert popen.call_args.kwargs["start_new_session"]
+
+
+def _session_spawns(monkeypatch):
+    """Fake the pool and the node supervisor of rank 0's session, and return the module and spawns.
+
+    Each spawn is ``(kind, workers or supervisor, env or grace)``.
+    """
+    from tensorrt_llm.llmapi import _node_supervised_mpi_session as session_module
+
+    spawns = []
+
+    def spawn_pool(max_workers, env, **kwargs):
+        spawns.append(("pool", max_workers, env))
+        return SimpleNamespace(shutdown=lambda wait=True: None, submit=lambda *args: "future")
+
+    def start_supervisor(n_workers, env):
+        spawns.append(("supervisor", n_workers, env))
+        return "supervisor"
+
+    def stop_supervisor(supervisor, grace_s):
+        spawns.append(("stop", supervisor, grace_s))
+
+    monkeypatch.setattr(session_module, "MPIPoolExecutor", spawn_pool)
+    monkeypatch.setattr(session_module, "start_session_node_supervisor", start_supervisor)
+    monkeypatch.setattr(session_module, "stop_session_node_supervisor", stop_supervisor)
+    return session_module, spawns
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_session_pools_rank_0_only(monkeypatch, wait):
+    """Check that rank 0's session pools rank 0 alone, and its node supervisor the others.
+
+    A shutdown that waits gives the supervisor the shutdown grace period.
+    """
+    monkeypatch.setenv("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS", "7")
+    session_module, spawns = _session_spawns(monkeypatch)
+    session = session_module.NodeSupervisedMpiPoolSession(n_workers=4)
+    assert session.submit(print) == ["future"]
+    session.shutdown(wait=wait)
+    assert [spawn[:2] for spawn in spawns[:2]] == [("supervisor", 4), ("pool", 1)]
+    assert spawns[1][2]["TLLM_FAULT_TOLERANCE_RANK"] == "0,4,4,0"
+    assert spawns[2:] == [("stop", "supervisor", 7.0 if wait else None)]
+
+
+def test_failed_pool_start_stops_supervisor(monkeypatch):
+    session_module, spawns = _session_spawns(monkeypatch)
+    spawn_fails = Mock(side_effect=RuntimeError("spawn failed"))
+    monkeypatch.setattr(session_module, "MPIPoolExecutor", spawn_fails)
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        session_module.NodeSupervisedMpiPoolSession(n_workers=2)
+    # Stopped at once, not by the shutdown of the session's finalizer.
+    assert spawns[1:] == [("stop", "supervisor", None)]
+
+
+def test_sessions_keep_own_rendezvous(monkeypatch):
+    """Check that two sessions in one process start their ranks with their own rendezvous."""
+    from tensorrt_llm._torch.distributed.membership import startup
+
+    names = (SHARED_SECRET_ENV, RENDEZVOUS_ENV)
+    for name in (*names, "TLLM_SPAWN_PROXY_PROCESS"):
+        monkeypatch.delenv(name, raising=False)
+    session_module, spawns = _session_spawns(monkeypatch)
+    rendezvous = [startup.ensure_rendezvous(None) for _ in range(2)]
+    for env, reserved in rendezvous:
+        session_module.NodeSupervisedMpiPoolSession(n_workers=4, env_overrides=env).shutdown()
+        reserved.close()
+    first, second = (env for env, _ in rendezvous)
+    assert all(first[name] != second[name] for name in names)
+    started = [env for kind, _, env in spawns if kind != "stop"]
+    assert [{name: env[name] for name in names} for env in started] == [first] * 2 + [second] * 2
+    assert not any(name in os.environ for name in names)
+
+
+@pytest.mark.parametrize("end", ["SIGINT", "SIGTERM", "ABORTED", "SHUTDOWN"])
+def test_host_weights_unlinked_at_end(tmp_path, deployment, supervisor_process, host_weights, end):
+    """Unlink the node's host weights however the deployment ends.
+
+    Keep another deployment's host weights.
+    """
+    authority, environ = deployment
+    segments = host_weights(RANKS)
+    (other,) = host_weights([2], name=f"moe_shared_{secrets.token_hex(8)}")
+    _write([*segments, other])
+    supervisor = supervisor_process(environ, serving=True)
+    if end.startswith("SIG"):
+        supervisor.send_signal(getattr(signal, end))
+    else:
+        authority.push(_record(MembershipState[end]))
+    status = supervisor.wait(30)
+    assert status == {"SIGINT": 130, "SIGTERM": 143, "ABORTED": 1, "SHUTDOWN": 0}[end]
+    assert not any(segment.exists() for segment in segments)
+    assert other.exists()
+    assert not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in RANKS)
+
+
+@pytest.mark.parametrize("end", ["ABORTED", "rank 0 ended", "supervisor error"])
+def test_host_weights_unlinked_before_job_ends(tmp_path, deployment, host_weights, end):
+    """Unlink the node's host weights before node 0 ends the job, which ends the supervisor too.
+
+    The node's ranks are stopped. A supervisor that itself fails does so too, then raises.
+    """
+    authority, environ = deployment
+    segments = host_weights(range(GPUS))
+    _write(segments)
+    left_at_job_end = []
+
+    def end_job():
+        left_at_job_end.append([segment.name for segment in segments if segment.exists()])
+
+    running = _serving(tmp_path, authority, environ, node=0, end_job=end_job)
+    _push_and_wait_for_step(running, authority, _record())
+    if end == "ABORTED":
+        authority.push(_record(MembershipState.ABORTED))
+        assert running.wait() == 1
+    elif end == "rank 0 ended":
+        # As after the loss of the authority, which rank 0 does not outlive.
+        authority.close()
+        os.kill(_read(tmp_path, 0, 0)["pid"], signal.SIGKILL)
+        assert running.wait() == 128 + signal.SIGKILL
+    else:
+        running.supervisor._supervise = Mock(side_effect=KeyError("a bug in the supervisor"))
+        running.supervisor._wake()
+        assert running.wait() is None
+        assert isinstance(running.error, KeyError)
+    assert left_at_job_end == [[]]
+    assert not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in range(GPUS))
+
+
+def test_signal_unlinks_while_connect_blocks(tmp_path, deployment, held_connect, host_weights):
+    """Unlink the node's host weights on a signal while a reconnect to the authority blocks.
+
+    The launcher kills the supervisor soon after the signal, before the connect timeout ends.
+    """
+    authority, environ = deployment
+    segments = host_weights(RANKS)
+    _write(segments)
+    running = _serving(tmp_path, authority, environ)
+    _push_and_wait_for_step(running, authority, _record())
+    held_connect.hold.set()
+    for sock, _ in authority._connections:
+        sock.shutdown(socket.SHUT_RDWR)
+    _until(held_connect.held.is_set)
+    running.supervisor.on_signal(signal.SIGTERM)
+    _until(lambda: not any(segment.exists() for segment in segments), timeout_s=10)
+    assert running.wait() == 128 + signal.SIGTERM
+    held_connect.finish()
+
+
+def test_early_signal_starts_no_rank(tmp_path, deployment, held_connect, host_weights):
+    """Stop at once, with no rank started, on a signal during the first connect.
+
+    Unlink the node's host weights too. The connect that reaches the store later sends no hello.
+    """
+    authority, environ = deployment
+    authority.start()
+    segments = host_weights(RANKS)
+    _write(segments)
+    held_connect.hold.set()
+    running = Running(tmp_path, environ)
+    _until(held_connect.held.is_set)
+    connecting = running.supervisor._connecting
+    running.supervisor.on_signal(signal.SIGTERM)
+    assert running.wait(1) == 128 + signal.SIGTERM
+    assert running.supervisor._processes == {}
+    assert not any(segment.exists() for segment in segments)
+    held_connect.finish()
+    assert isinstance(connecting.exception(timeout=10), ConnectionAbortedError)
+    assert authority.hellos == []
+
+
+def test_exit_skips_connect_in_flight(deployment, monkeypatch, supervisor_process):
+    """Exit on a signal without waiting for a connect that blocks in the store client."""
+    _, environ = deployment
+    monkeypatch.setitem(_TIMINGS, "_CONNECT_TIMEOUT_S", 60.0)
+    with socket.create_server(("127.0.0.1", 0)) as silent:
+        environ[RENDEZVOUS_ENV] = f"127.0.0.1:{silent.getsockname()[1]}"
+        supervisor = supervisor_process(environ)
+        # The store client connected, and waits for an answer that never comes.
+        assert select.select([silent], [], [], 30)[0]
+        supervisor.send_signal(signal.SIGTERM)
+        assert supervisor.wait(10) == 128 + signal.SIGTERM
+
+
+def test_signal_forwarded_to_rank_0_only(tmp_path, deployment, supervisor_process, fake_mpirun):
+    """Forward the signal to rank 0, which runs the frontend, and later SIGTERM the other ranks."""
+    _, environ = deployment
+    environ["SUPERVISOR_TEST_MODES"] = "0:0=records-signals 1:0=records-signals"
+    _, environ["PMIX_SERVER_URI41"] = fake_mpirun("--enable-recovery")
+    supervisor = supervisor_process(environ, node=0, serving=True)
+    supervisor.send_signal(signal.SIGINT)
+    _until(lambda: (tmp_path / "signals-0-0").exists())
+    assert (tmp_path / "signals-0-0").read_text() == "SIGINT"
+    assert _alive(_read(tmp_path, 1, 0)["pid"])
+    assert not (tmp_path / "signals-1-0").exists()
+    assert supervisor.wait(30) == 130
+    assert (tmp_path / "signals-1-0").read_text() == "SIGTERM"
+
+
+def test_signal_lets_ranks_end_after_shutdown(tmp_path, deployment, monkeypatch, host_weights):
+    """On a signal, keep the ranks running while rank 0 shuts the deployment down.
+
+    The launcher signals every node supervisor. Rank 0 drains its requests, with every rank taking
+    part, and then records SHUTDOWN. A rank stopped before that would make rank 0 recover from its
+    failure. The supervisor exits with status 0 once its ranks ended after SHUTDOWN. The signal
+    handler unlinks the node's host weights before the loop wakes, since the launcher may kill the
+    supervisor before its grace period ends.
+    """
+    monkeypatch.setattr(supervisor_module, "_STOP_GRACE_S", 30.0)
+    authority, environ = deployment
+    environ["SUPERVISOR_TEST_MODES"] = "2:0=records-signals 3:0=records-signals"
+    segments = host_weights(RANKS)
+    running = _serving(tmp_path, authority, environ)
+    _write(segments)
+    # The handler wakes no loop, so only the handler itself can unlink.
+    running.supervisor._wake = lambda: None
+    running.supervisor.on_signal(signal.SIGTERM)
+    assert not any(segment.exists() for segment in segments)
+    del running.supervisor._wake
+    running.supervisor._wake()
+    _push_and_wait_for_step(running, authority, _record(generation=2))
+    assert all(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in RANKS)
+    _shut_down(running, authority, generation=4)
+    assert not any((tmp_path / f"signals-{rank}-0").exists() for rank in RANKS)
+
+
+@pytest.mark.parametrize("authority_ends", [False, True])
+def test_ranks_end_after_shutdown(tmp_path, deployment, authority_ends):
+    """Wait for the active ranks to end after SHUTDOWN while the authority runs, however long.
+
+    Each rank leaves the membership and ends on its own, and the authority runs until every active
+    rank left. Rank 0 is waited for past the grace period that follows the authority's end too:
+    its end is the deployment's end, which its launcher bounds.
+    """
+    authority, environ = deployment
+    draining = (0,) if authority_ends else (0, 1)
+    environ["SUPERVISOR_TEST_MODES"] = " ".join(f"{rank}:0=drains" for rank in draining)
+    running = _serving(tmp_path, authority, environ, node=0)
+    authority.push(_record(MembershipState.SHUTDOWN))
+    if authority_ends:
+        _until(lambda: not _alive(_read(tmp_path, 1, 0)["pid"]))
+        authority.close()
+        _until(lambda: running.supervisor._connection is None)
+    time.sleep(2 * supervisor_module._STOP_GRACE_S)
+    assert all(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in draining)
+    (tmp_path / "drained").touch()
+    assert running.wait() == 0
+    assert [process.status for process in running.supervisor._processes.values()] == [0, 0]
+
+
+def test_shutdown_skips_given_up_rank(tmp_path, deployment, held_kills):
+    """End after SHUTDOWN while the killed process of a given-up rank still runs.
+
+    The membership no longer lists the rank, so the supervisor does not wait for its process.
+    """
+    authority, environ = deployment
+    environ["SUPERVISOR_TEST_MODES"] = "3:0=drains"
+    running = _serving(tmp_path, authority, environ)
+    pid = _read(tmp_path, 3, 0)["pid"]
+    held_kills.pgids.add(pid)
+    authority.push(_record(MembershipState.COMMITTED, active_mask=0b0111))
+    _until(lambda: authority.given_up == (3,))
+    _shut_down(running, authority, active_mask=0b0111, generation=2)
+    assert _alive(pid)
+
+
+@pytest.mark.parametrize("end, status", [("authority", 1), ("rank", 128 + signal.SIGKILL)])
+def test_shutdown_stops_rank_left_after_authority(tmp_path, deployment, end, status):
+    """Stop an active rank still running a grace period after the authority ended after SHUTDOWN.
+
+    Exit with the status of an active rank that failed after SHUTDOWN.
+    """
+    authority, environ = deployment
+    environ["SUPERVISOR_TEST_MODES"] = "3:0=drains"
+    running = _serving(tmp_path, authority, environ)
+    authority.push(_record(MembershipState.SHUTDOWN))
+    pid = _read(tmp_path, 3, 0)["pid"]
+    if end == "authority":
+        _until(lambda: not _alive(_read(tmp_path, 2, 0)["pid"]))
+        assert _alive(pid)
+        authority.close()
+    else:
+        os.kill(pid, signal.SIGKILL)
+    assert running.wait() == status
+    assert not _alive(pid)
+
+
+def test_job_end_unlinks_before_mpirun_kills(
+    tmp_path, deployment, supervisor_process, host_weights
+):
+    """Unlink the host weights within the time mpirun leaves a supervisor at a job end.
+
+    mpirun (PRRTE 3) sends SIGKILL about 0.45 s after its SIGTERM; the test leaves 0.2 s. The ranks
+    then end through their parent-death signal, and the authority connection closes.
+    """
+    authority, environ = deployment
+    segments = host_weights(RANKS)
+    supervisor = supervisor_process(environ, serving=True)
+    _write(segments)
+    supervisor.send_signal(signal.SIGTERM)
+    time.sleep(0.2)
+    supervisor.kill()
+    supervisor.wait()
+    assert not any(segment.exists() for segment in segments)
+    _until(lambda: not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in RANKS), 10)
+    assert authority.closed.wait(10)
+
+
+def _run_launcher(tmp_path, procid, task, **extra):
+    """Run trtllm-llmapi-launch as task ``procid`` of 2.
+
+    Its python3 records how a node supervisor or a worker is started, in ``python3-args``, instead
+    of starting it.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    record = tmp_path / "python3-args"
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/bash\n"
+        'if [ "$1" = "-m" ] || [[ "$1" == *_llmapi_node_supervisor.py ]] '
+        '|| [[ "$1 $2" == "-c "*worker_node_main* ]]; then\n'
+        f'    printf "%s\\n" "$@" > "{record}"\n'
+        "    exit 0\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n'
+    )
+    fake_python.chmod(0o755)
+    environ = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("OMPI_", "PMI", "SLURM_", "TLLM_FAULT_TOLERANCE_"))
+    }
+    environ.update(
+        PATH=f"{bin_dir}:{environ['PATH']}",
+        HOME=str(tmp_path),
+        SLURM_PROCID=str(procid),
+        SLURM_NTASKS="2",
+        TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS="0",
+        **extra,
+    )
+    return subprocess.run(
+        ["bash", str(_LLMAPI / "trtllm-llmapi-launch"), *task],
+        env=environ,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_node_launch_runs_supervisor(tmp_path, fault_tolerance):
+    """Run the node supervisor from the launcher when the shared secret is exported.
+
+    The node rank and count come from mpirun's variables. mpirun leaves the batch step's
+    SLURM_PROCID (0) and SLURM_NTASKS in every process it starts. The supervisor then runs this
+    launcher again for each rank of the node.
+    """
+    extra = {}
+    if fault_tolerance:
+        extra = {
+            "TLLM_FAULT_TOLERANCE_SHARED_SECRET": secrets.token_hex(32),
+            "OMPI_COMM_WORLD_RANK": "1",
+            "OMPI_COMM_WORLD_SIZE": "3",
+        }
+    result = _run_launcher(tmp_path, 0 if fault_tolerance else 1, ["task"], **extra)
+    assert result.returncode == 0, result.stderr
+    args = (tmp_path / "python3-args").read_text().split()
+    if fault_tolerance:
+        assert Path(args[0]).resolve() == _SUPERVISOR.resolve()
+        assert args[1:6] == ["--node-rank", "1", "--nodes", "3", "--"]
+        assert Path(args[6]).resolve() == (_LLMAPI / "trtllm-llmapi-launch").resolve()
+        assert args[7:] == ["task"]
+    else:
+        assert args == ["-m", "tensorrt_llm.llmapi.mgmn_worker_node"]
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_early_mpi_server_exit_status(tmp_path, fault_tolerance):
+    """Exit 0 on a clean shutdown of a rank that the node supervisor started, and 1 otherwise.
+
+    Rank 0's worker ends its MPI server after the deployment shuts down, before the frontend exits.
+    """
+    with socket.socket() as unanswered:  # bound but not listening, so it refuses connections
+        unanswered.bind(("127.0.0.1", 0))
+        extra = {}
+        if fault_tolerance:
+            extra = {
+                "TLLM_FAULT_TOLERANCE_RENDEZVOUS": f"127.0.0.1:{unanswered.getsockname()[1]}",
+                "TLLM_FAULT_TOLERANCE_RANK": "0,4,2,0",
+            }
+        result = _run_launcher(tmp_path, 0, ["bash", "-c", "sleep 1"], **extra)
+    assert "MPI Comm server exited before the task (status 0)" in result.stderr
+    assert result.returncode == (0 if fault_tolerance else 1), result.stderr

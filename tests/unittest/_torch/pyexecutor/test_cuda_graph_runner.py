@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from _torch.pyexecutor.engine_test_utils import _make_request_stub
@@ -291,6 +292,35 @@ class GraphKeyTestCase(unittest.TestCase):
             batch, None, None, None, promoted_ids, None, False, None
         )
         self.assertEqual(result, (graph_attn_metadata, graph_spec_metadata, key))
+
+
+def test_adp_graph_agreement_skips_absent_ranks() -> None:
+    """Check that the stale row of an absent rank changes neither the graph vote nor the padding."""
+    absent = [False, 8, SampleType.FULL.value]
+    rows = [[True, 3, SampleType.FULL.value], [True, 4, SampleType.FULL.value], absent]
+    runner = Mock()
+    runner.enabled = True
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=4),
+        dist=SimpleNamespace(
+            tp_allgather_int64=lambda row, active_only: np.array(
+                [*rows, row] if not active_only else [rows[0], rows[1], row], dtype=np.int64
+            ),
+        ),
+    )
+    runner._gather_adp_graph_batch_info = CUDAGraphRunner._gather_adp_graph_batch_info.__get__(
+        runner
+    )
+    runner._resolve_sample_type.return_value = SampleType.FULL
+
+    # Every serving rank pads to the widest serving rank's batch.
+    assert CUDAGraphRunner._get_padding_batch_size(runner, Mock(batch_size=2), True) == 4
+    rows[:2] = [[True, 4, SampleType.FULL.value]] * 2
+    assert CUDAGraphRunner._agree_graph_shape(runner, Mock(batch_size=4), True, frozenset()) == (
+        True,
+        SampleType.FULL,
+    )
 
 
 class CaptureStateTestCase(unittest.TestCase):

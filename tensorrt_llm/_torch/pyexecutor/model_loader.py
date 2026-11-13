@@ -1319,9 +1319,14 @@ class ModelLoader:
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
 
+        fault_tolerance = self.llm_args.enable_wide_ep_fault_tolerance
+        if fault_tolerance:
+            from .rank_failure_recovery import create_moe_load_balancer
+        else:
+            create_moe_load_balancer = maybe_create_moe_load_balancer
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
-                self._metrics), maybe_create_moe_load_balancer(
+                self._metrics), create_moe_load_balancer(
                     config, self.mapping) as moe_load_balancer:
             try:
                 # config will be modified in-place for some models, like Qwen2
@@ -1339,6 +1344,9 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
+            if fault_tolerance:
+                from .rank_failure_recovery import prepare_model
+                prepare_model(model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -2362,6 +2370,8 @@ class ModelLoader:
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
+            enable_wide_ep_fault_tolerance=self.llm_args.
+            enable_wide_ep_fault_tolerance,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
             use_cute_dsl_blockscaling_mm=self.llm_args.

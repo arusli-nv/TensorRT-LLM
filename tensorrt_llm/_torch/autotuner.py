@@ -310,7 +310,8 @@ class TunableRunner(ABC):
 def autotune(tune_mode: bool = True,
              cache_path: str = None,
              skip_dynamic_tuning_buckets: bool = False,
-             post_tune_merge_dist: Optional[Distributed] = None):
+             post_tune_merge_dist: Optional[Distributed] = None,
+             prime_all_runners: bool = False):
     """Context manager for autotuning with distributed support.
 
     Args:
@@ -327,6 +328,9 @@ def autotune(tune_mode: bool = True,
             collective at context exit (before the cache is saved) — for
             pipelines whose warmup is not SPMD and so cannot use the per-op
             distributed strategies.
+        prime_all_runners: When True, a cache hit runs the cached winners of
+            every runner once, not only those of JIT-compiled runners, so
+            their first launch happens before serving.
     """
     autotuner = AutoTuner.get()
     if post_tune_merge_dist is not None:
@@ -352,8 +356,10 @@ def autotune(tune_mode: bool = True,
     # record the old tuning mode
     old_mode = autotuner.is_tuning_mode
     old_skip = autotuner.skip_dynamic_tuning_buckets
+    old_prime_all_runners = autotuner.prime_all_runners
     autotuner.is_tuning_mode = tune_required
     autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
+    autotuner.prime_all_runners = prime_all_runners
     # Avoid making compiled AllReduce paths initialize or inspect AutoTuner.
     from tensorrt_llm._torch.distributed.ops import \
         set_allreduce_autotuner_tuning_mode
@@ -378,6 +384,7 @@ def autotune(tune_mode: bool = True,
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
+        autotuner.prime_all_runners = old_prime_all_runners
         set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
@@ -1019,6 +1026,7 @@ class AutoTuner:
         self._keys_profiled_in_process: set[Tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
+        self.prime_all_runners = False
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
@@ -1557,12 +1565,12 @@ class AutoTuner:
         # inside lockstep profiling, including profiling scratch allocation.
         if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
             return
-        jit_classes = {
+        primed_classes = {
             type(r)
-            for r in runners
-            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+            for r in runners if self.prime_all_runners
+            or isinstance(getattr(type(r), "kernel_cache", None), dict)
         }
-        if not jit_classes:
+        if not primed_classes:
             return
         for profile in self._optimization_profiles(tuning_config, inputs):
             hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
@@ -1575,7 +1583,7 @@ class AutoTuner:
             if not hit:
                 continue
             runner = runners[runner_id]
-            if type(runner) not in jit_classes:
+            if type(runner) not in primed_classes:
                 continue
             key = (custom_op, type(runner).__name__, str(runner.unique_id()),
                    str(tactic))
@@ -2609,7 +2617,8 @@ class AutoTuner:
     def _merge_cache_data(self, custom_op: str):
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
         merged_cache_data = dict()
-        all_cache_data = self._dist.tp_cp_allgather(obj=cache_data)
+        with Distributed.rank_varying("measured tactics"):
+            all_cache_data = self._dist.tp_cp_allgather(obj=cache_data)
 
         for data in all_cache_data:
             for key, value in data.items():
@@ -2628,7 +2637,9 @@ class AutoTuner:
         if not self._is_distributed():
             return
         merged = dict()
-        for data in self._dist.tp_cp_allgather(obj=self.profiling_cache.cache):
+        with Distributed.rank_varying("measured tactics"):
+            caches = self._dist.tp_cp_allgather(obj=self.profiling_cache.cache)
+        for data in caches:
             for key, value in data.items():
                 if value[-1] < merged.get(key, [float('inf')])[-1]:
                     merged[key] = value

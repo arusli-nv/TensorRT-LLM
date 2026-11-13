@@ -91,8 +91,17 @@ def _runner_tactics_match_tile_size(
 
 class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
     def __init__(
-        self, num_experts: int, top_k: int, num_local_experts: int, local_expert_offset: int
+        self,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tuner_num_local_experts: int | None = None,
     ) -> None:
+        # Generated routing passes through this rank's runtime moe_sort, so keep the runtime offset.
+        num_experts, num_local_experts, _ = self.tuner_expert_layout(
+            num_experts, num_local_experts, local_expert_offset, tuner_num_local_experts
+        )
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -143,6 +152,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_locality_domain: bool = False,
         workload_identity: tuple | None = None,
         prime_inner_tactics: bool = False,
+        tuner_num_local_experts: int | None = None,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -150,6 +160,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
+        self.tuner_num_local_experts = tuner_num_local_experts
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
@@ -182,6 +193,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             identity += (self.workload_identity,)
         if self.use_direct_expert_metadata:
             identity += ("direct_expert_metadata",)
+        if self.tuner_num_local_experts is not None:
+            identity += ("tuner_num_local_experts", self.tuner_num_local_experts)
         return identity
 
     def get_valid_tactics(
@@ -240,7 +253,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 )
             else:
                 helper = CuteDslFusedMoENvfp4InputsHelper(
-                    self.num_experts, self.top_k, self.num_local_experts, self.local_expert_offset
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tuner_num_local_experts,
                 )
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(

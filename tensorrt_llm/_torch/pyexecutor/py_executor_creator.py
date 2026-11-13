@@ -791,6 +791,9 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
+    if llm_args.enable_wide_ep_fault_tolerance:
+        from .rank_failure_recovery import check_supported
+        check_supported(llm_args, mapping)
 
     vm_pools = {}
     sleep_config = llm_args.sleep_config
@@ -1348,6 +1351,8 @@ def _create_py_executor(
             log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        if estimating_kv_cache:
+            Distributed.pause_startup_record()
 
         # Without the estimation, build_managers sizes the final KV cache from
         # the device memory free now, so DWDP is set up first: the KV cache
@@ -1460,6 +1465,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
+            Distributed.resume_startup_record()
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):
                 # Before estimating KV cache size, a minimal KV cache has been allocated using

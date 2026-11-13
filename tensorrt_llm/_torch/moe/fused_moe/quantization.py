@@ -386,8 +386,11 @@ class FusedMoEMethodBase(ABC):
     @classmethod
     def _online_eplb_not_supported(cls, module):
         if cls.need_load_shared_weights(module):
+            feature = ('the host weights of Wide-EP fault tolerance'
+                       if module.layer_load_balancer.spare_slot_count else
+                       'online EPLB')
             raise NotImplementedError(
-                f'{cls.__name__} doesn\'t support online EPLB now')
+                f'{cls.__name__} doesn\'t support {feature} now')
 
     @classmethod
     def _online_eplb_not_verified(cls, module):

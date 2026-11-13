@@ -604,6 +604,10 @@ class HangDetector:
         finally:
             self.checkpoint()
 
+    def paused(self) -> bool:
+        """Return whether detection is disarmed."""
+        return self._deadline == math.inf
+
     def stop(self):
         """Stop hang detection."""
         self.active = False

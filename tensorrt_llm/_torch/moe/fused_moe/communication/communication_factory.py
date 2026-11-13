@@ -223,10 +223,17 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
         except Exception as e:
+            if model_config.enable_wide_ep_fault_tolerance:
+                raise RuntimeError(
+                    "Wide-EP fault tolerance requires the NVLinkOneSided all-to-all, the only MoE "
+                    "communication that follows a membership change, but it is unavailable: "
+                    f"{e}"
+                ) from e
             logger.info(f"NVLinkOneSided not available: {e}")
 
         # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
@@ -397,6 +404,7 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
             )
         elif method == "DEEPEP":
             return DeepEP(

@@ -59,6 +59,7 @@ def _make_model_config(
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
 
 
@@ -571,6 +572,35 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_fault_tolerance_reports_one_sided_error(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+):
+    """Fault tolerance runs only on NVLinkOneSided, so its construction error is not swallowed."""
+    model_config = _make_model_config(torch.float16)
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+    monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, None, 1))
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+
+    def create_strategy():
+        return communication_factory.CommunicationFactory.create_strategy(
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            hidden_size=4096,
+        )
+
+    if fault_tolerance:
+        with pytest.raises(RuntimeError, match="requires the NVLinkOneSided.*strategy unavailable"):
+            create_strategy()
+    else:
+        assert isinstance(create_strategy(), AllGatherReduceScatter)
 
 
 _NCCL_EP_QUANT_ALGOS = [
