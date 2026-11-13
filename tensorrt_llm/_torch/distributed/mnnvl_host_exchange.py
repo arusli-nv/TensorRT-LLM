@@ -202,14 +202,16 @@ class MnnvlHostExchangeGroup:
                 (
                     False,
                     "GPUs in one multi-node NVLink (MNNVL) domain, such as a GB200 NVL72, "
-                    "because fault tolerance isolates a failed rank by remapping its memory",
+                    "because fault tolerance keeps a failed rank's late writes out by the "
+                    "late-write remap",
                 )
             ]
         return [
             (
                 HostExchangeMnnvlMemory.uses_fabric_handles(torch.cuda.current_device()),
                 "MNNVL memory shared through fabric handles (GB200-class aarch64 nodes "
-                "with IMEX running and an IMEX channel in the container)",
+                "with IMEX running and an IMEX channel in the container), because the "
+                "late-write remap and the host exchange share peer rows through fabric handles",
             )
         ]
 

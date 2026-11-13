@@ -190,7 +190,7 @@ skip_single_gpu = skip_num_gpus_less_than(2)
 def skip_no_mnnvl_fabric_handles(num_gpus: int):
     """Skip unless ``num_gpus`` GPUs share MNNVL memory through fabric handles.
 
-    Wide-EP fault tolerance remaps such memory to isolate a failed rank.
+    Wide-EP fault tolerance needs such memory for the late-write remap.
     """
     from tensorrt_llm._torch.distributed import mnnvl_memory
 
