@@ -2266,6 +2266,69 @@ def test_adp_running_counts_update_without_a_new_block_sample():
         ]
 
 
+def test_adp_ranks_stop_processing_on_the_same_iteration():
+    """An idle attention-DP rank keeps stepping at shutdown while a peer holds a request.
+
+    Stopping alone would leave the peer's next collective without this rank.
+    """
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+
+    ranks = []
+    for rank in range(2):
+        executor = _make_executor_with_kv_cache_manager(None)
+        executor.enable_attention_dp = True
+        executor.enable_iter_perf_stats = False
+        executor._kv_load_tracker = KvLoadTracker(None, rank=rank, enabled=False)
+        executor.dist = types.SimpleNamespace(
+            rank=rank, tp_rank=rank, cp_config={}, cp_rank=0, cp_size=1
+        )
+        executor.kv_cache_transceiver = None
+        executor.canceled_req_ids = []
+        executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
+        executor.max_num_active_requests = 4
+        executor._enable_non_overlap_adp_forward_intent = False
+        executor._should_exclude_last_generation_logits = lambda: False
+        executor._fetch_and_enqueue_requests = Mock()
+        executor._pop_from_waiting_queue = Mock(return_value=([], {}))
+        executor.waiting_queue = FCFSWaitingQueue()
+        executor.active_requests = []
+        executor.is_shutdown = True
+        ranks.append(executor)
+    ranks[1].active_requests.append(_make_adp_request(_STATE_GENERATION_IN_PROGRESS))
+
+    def step(routed: dict[int, list[RequestQueueItem]]) -> list[bool]:
+        # Every rank's routing allgather returns the load of every rank, and
+        # every rank routes the same new requests.
+        states = [
+            RankState(rank=rank, num_active_requests=len(executor.active_requests))
+            for rank, executor in enumerate(ranks)
+        ]
+        expected_num_active_requests = max(
+            state.num_active_requests + len(routed[state.rank]) for state in states
+        )
+        for executor in ranks:
+            executor.adp_router.gather_all_rank_states.return_value = states
+            executor.adp_router.route_requests.return_value = (
+                routed,
+                expected_num_active_requests,
+            )
+            executor.active_requests.extend(
+                executor._fetch_new_requests(executor.waiting_queue, executor.active_requests)
+            )
+        return [executor.should_stop_processing for executor in ranks]
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        side_effect=lambda new_requests, **_: list(new_requests),
+    ):
+        assert step({0: [], 1: []}) == [False, False]
+        ranks[1].active_requests.clear()
+        # A request accepted with the shutdown is routed after the allgather.
+        assert step({0: [RequestQueueItem(2)], 1: []}) == [False, False]
+        ranks[0].active_requests.clear()
+        assert step({0: [], 1: []}) == [True, True]
+
+
 def _classify_termination(
     request, enable_partial_reuse_for_disagg, is_vswa, is_kv_manager_v2, pp_size=1
 ):

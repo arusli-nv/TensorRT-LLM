@@ -1893,6 +1893,7 @@ def test_adp_receive_retirement_snapshot_keeps_empty_peer_live(
         engine._disagg_coordinator = rank.coordinator
         engine.dist = rank.dist
         engine.enable_attention_dp = True
+        engine._fleet_has_live_requests = False
         engine.kv_connector_manager = None
         engine.active_requests = []
         engine.waiting_queue = FCFSWaitingQueue()

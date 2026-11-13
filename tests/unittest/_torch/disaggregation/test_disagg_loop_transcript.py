@@ -131,6 +131,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.enable_iter_perf_stats = False
     executor.enable_kv_cache_events = False
     executor.enable_attention_dp = False
+    executor._fleet_has_live_requests = False
     executor.is_benchmark_disagg = False
     executor.iter_counter = 0
     executor._resource_governor_enabled = False
