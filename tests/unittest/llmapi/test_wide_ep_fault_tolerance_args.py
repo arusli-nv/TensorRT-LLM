@@ -18,6 +18,7 @@ import re
 import subprocess  # nosec B404
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -43,6 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
     UserProvidedDecodingConfig,
 )
+from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.cpu_only
 
@@ -76,8 +78,6 @@ def _args(**fields) -> TorchLlmArgs:
         # An unset max_num_tokens is the default budget of 8192 tokens.
         {"max_num_tokens": None},
         {"max_seq_len": None, "enable_chunked_prefill": True},
-        # Fault tolerance resolves no modeling_v2 target, so "require" fails when the model loads.
-        {"modeling_v2": "require"},
         {
             "prefill_cuda_graph_backend": "piecewise",
             "torch_compile_config": TorchCompileConfig(enable_userbuffers=False),
@@ -183,12 +183,24 @@ def test_supported_configuration_is_accepted(fields):
             "torch_compile_config.enable_userbuffers=False",
         ),
         ({"sleep_config": SleepConfig()}, "sleep_config=None), which is not supported yet"),
+        ({"modeling_v2": "require"}, "modeling_v2='auto' or 'off', not 'require'"),
     ],
 )
 def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in str(error.value)
+
+
+@pytest.mark.parametrize("fields", [{}, {"modeling_v2": "auto"}], ids=["default", "explicit"])
+def test_modeling_v2_auto_falls_back_to_built_in_model(monkeypatch, fields):
+    """Check that fault tolerance turns modeling_v2 'auto' off with one warning."""
+    warning = Mock()
+    monkeypatch.setattr(logger, "warning", warning)
+    assert _args(**fields).modeling_v2 == "off"
+    messages = [call.args[0] for call in warning.call_args_list]
+    assert sum("using the built-in implementation" in message for message in messages) == 1
+    assert _args(enable_wide_ep_fault_tolerance=False, **fields).modeling_v2 == "auto"
 
 
 @pytest.mark.parametrize("mode, rejected", [("standard", False), ("per_layer_dynamic", True)])

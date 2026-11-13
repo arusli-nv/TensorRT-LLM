@@ -1321,7 +1321,9 @@ class ModelLoader:
 
         fault_tolerance = self.llm_args.enable_wide_ep_fault_tolerance
         if fault_tolerance:
-            from .rank_failure_recovery import create_moe_load_balancer
+            from .rank_failure_recovery import (check_supported,
+                                                create_moe_load_balancer)
+            check_supported(self.llm_args, self.mapping)
         else:
             create_moe_load_balancer = maybe_create_moe_load_balancer
         with timing_metric(

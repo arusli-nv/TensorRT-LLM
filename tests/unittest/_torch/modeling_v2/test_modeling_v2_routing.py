@@ -27,7 +27,6 @@ The things worth proving:
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -54,7 +53,6 @@ from tensorrt_llm.llmapi.llm_args import (
     NGramDecodingConfig,
     TorchLlmArgs,
 )
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -369,34 +367,6 @@ def test_r1_default_matches(mapping_kwargs):
     before the mode is read, so `require` alone covers `auto`.)"""
     config = _model_config(_r1_config(), **mapping_kwargs)
     assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_DEFAULT_TARGET
-
-
-def _fault_tolerant_args(mode):
-    """A deployment with Wide-EP fault tolerance on, as its argument validation accepts it."""
-    return _llm_args(
-        mode,
-        enable_wide_ep_fault_tolerance=True,
-        enable_attention_dp=True,
-        max_seq_len=4096,
-        moe_config={"load_balancer": {"num_slots": 8}},
-    )
-
-
-def test_fault_tolerance_falls_back_under_auto(monkeypatch):
-    """Warn and build the built-in model for a fault-tolerant deployment the R1 target would claim."""
-    config = _model_config(_r1_config(), **_R1_DEFAULT_LAYOUTS["dep4"])
-    assert _qualified(modeling_v2_resolve(config, _llm_args("auto"))) == _R1_DEFAULT_TARGET
-    warning = Mock()
-    monkeypatch.setattr(logger, "warning", warning)
-    assert modeling_v2_resolve(config, _fault_tolerant_args("auto")) is None
-    messages = [call.args[0] for call in warning.call_args_list]
-    assert sum("using the built-in implementation" in message for message in messages) == 1
-
-
-def test_fault_tolerance_raises_under_require():
-    config = _model_config(_r1_config(), **_R1_DEFAULT_LAYOUTS["dep4"])
-    with pytest.raises(ValueError, match=r"enable_wide_ep_fault_tolerance\) is not supported"):
-        modeling_v2_resolve(config, _fault_tolerant_args("require"))
 
 
 @pytest.mark.parametrize("layout", _R1_MTP_LAYOUTS)

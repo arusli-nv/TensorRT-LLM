@@ -18,6 +18,8 @@ import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence, Tuple
 
+from .logger import logger
+
 if TYPE_CHECKING:
     from .llmapi.llm_args import TorchLlmArgs
 
@@ -59,6 +61,9 @@ def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> No
 
 def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     """Check the LLM arguments that Wide-EP fault tolerance requires.
+
+    ``modeling_v2='auto'`` falls back to the built-in model, because no modeling_v2 target
+    supports fault tolerance yet.
 
     Raises:
         ValueError: The arguments are not supported with fault tolerance.
@@ -190,6 +195,13 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "its own MPI world",
             ),
             (
+                llm_args.modeling_v2 != "require",
+                "the built-in model (modeling_v2='auto' or 'off', not 'require'), because no "
+                "modeling_v2 target supports it yet: a target's MoE layers would need EPLB spare "
+                "slots and the NVLink one-sided all-to-all, which take over a failed rank's "
+                "experts and stop waiting on it",
+            ),
+            (
                 llm_args.sleep_config is None,
                 "no sleep mode (sleep_config=None), which is not supported yet: sleep releases and "
                 "restores the GPU memory of the weights, whose spare slots fault tolerance backs "
@@ -197,6 +209,12 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
             ),
         ]
     )
+    if llm_args.modeling_v2 == "auto":
+        logger.warning(
+            "modeling_v2: no target supports Wide-EP fault tolerance; using the built-in "
+            "implementation"
+        )
+        llm_args.modeling_v2 = "off"
 
 
 def check_model_architectures(architectures: Optional[Sequence[str]]) -> None:

@@ -2169,7 +2169,6 @@ def _previous_batch_consumer(consumer, dropped):
         return not dropped
 
     executor.rank_failure_recovery = Mock(accept_step=accept_step)
-    executor.guided_decoder = Mock()
     executor.capturable_guided_decoder = Mock()
     executor._update_requests = Mock(side_effect=lambda state: calls.append("update"))
     executor.dist = Mock(pp_size=1)
@@ -2204,18 +2203,16 @@ def _previous_batch_consumer(consumer, dropped):
 def test_previous_batch_accepted_before_use(consumer, dropped):
     """Check that the rebalance and the control drain apply the previous batch only once accepted.
 
-    An accepted batch commits its context chunks first. A dropped batch is not applied, and the
-    grammar matchers of its requests are discarded.
+    An accepted batch commits its context chunks first. A dropped batch is not applied, and its
+    guided decoding build failures are dropped.
     """
     executor, calls, consume = _previous_batch_consumer(consumer, dropped)
     consume()
     if dropped:
         assert calls == ["accept_step"]
-        executor.guided_decoder.discard_matchers.assert_called_once_with(["request"])
-        executor.capturable_guided_decoder.discard_batch.assert_called_once_with(["request"], 3)
+        executor.capturable_guided_decoder.discard_batch.assert_called_once_with(3)
     else:
         assert calls == ["accept_step", "commit", "update"]
-        executor.guided_decoder.discard_matchers.assert_not_called()
         executor.capturable_guided_decoder.discard_batch.assert_not_called()
 
 

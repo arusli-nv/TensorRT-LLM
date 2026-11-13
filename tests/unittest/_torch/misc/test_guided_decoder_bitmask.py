@@ -513,28 +513,3 @@ def test_recompute_replays_generated_tokens_into_matcher(monkeypatch, accepts):
         assert "rejected token 10" in failed_requests[0][1]
     # Only a request that is not failed gets a next-token mask.
     assert decoder.token_mask_host[0].item() == int(accepts)
-
-
-# --- discarded steps ----------------------------------------------------------
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_a_discarded_step_leaves_its_requests_unguided_until_they_are_computed_again(monkeypatch):
-    """Drop the matchers of a discarded step's requests, which then run unguided."""
-    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
-    matcher = _ScriptedMatcher([True])
-    decoder.grammar_matchers[_SLOT] = matcher
-    decoder.discard_matchers(
-        [SimpleNamespace(py_seq_slot=_SLOT), SimpleNamespace(py_seq_slot=None)]
-    )
-    assert decoder.grammar_matchers[_SLOT] is None
-
-    requests = GuidedRequests(
-        [_generation_request(is_draft=False, draft_tokens=[])],
-        num_contexts=0,
-        num_generations=1,
-        max_num_draft_tokens=0,
-    )
-    assert decoder._build(requests) == []
-    assert matcher.accepted == []
-    assert decoder.token_mask_host[0].item() == 0

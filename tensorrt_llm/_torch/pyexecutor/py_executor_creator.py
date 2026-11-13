@@ -791,9 +791,6 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
-    if llm_args.enable_wide_ep_fault_tolerance:
-        from .rank_failure_recovery import check_supported
-        check_supported(llm_args, mapping)
 
     vm_pools = {}
     sleep_config = llm_args.sleep_config

@@ -7092,9 +7092,8 @@ class PyExecutor:
     def _discard_previous_batch(self) -> None:
         """Drop the overlap loop's in-flight batch without applying its results.
 
-        The grammar matchers of its requests already advanced past the dropped
-        tokens, so they are discarded too. Its iteration statistics are not
-        reported.
+        Its iteration statistics are not reported. Its requests continue by
+        recompute, which gives each guided request a new grammar matcher.
         """
         batch = self.previous_batch
         if batch.gpu_forward_events_from_perf_pool:
@@ -7102,13 +7101,9 @@ class PyExecutor:
                 batch.gpu_forward_start_event, batch.gpu_forward_end_event)
         if self.drafter is not None and self.use_spec_decode:
             self.drafter.cleanup_previous_draft_resources()
-        requests = batch.scheduled_requests.all_requests()
-        if self.guided_decoder is not None:
-            self.guided_decoder.discard_matchers(requests)
         if (self.capturable_guided_decoder is not None
                 and batch.guided_batch_id is not None):
-            self.capturable_guided_decoder.discard_batch(
-                requests, batch.guided_batch_id)
+            self.capturable_guided_decoder.discard_batch(batch.guided_batch_id)
         self.previous_batch = None
 
     def resume_at_iteration(self, iteration: int) -> None:

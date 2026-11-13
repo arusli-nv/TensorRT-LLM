@@ -543,12 +543,6 @@ class GuidedDecoder:
     def init_disagg_gen_requests(self) -> None:
         self._init_disagg_gen_requests(self.requests)
 
-    def discard_matchers(self, requests: Iterable[LlmRequest]) -> None:
-        """Drop the grammar matchers of a discarded step's ``requests``."""
-        for request in requests:
-            if request.py_seq_slot is not None:
-                self.grammar_matchers[request.py_seq_slot] = None
-
 
 class CapturableGuidedDecoder(GuidedDecoder):
 
@@ -701,13 +695,11 @@ class CapturableGuidedDecoder(GuidedDecoder):
         ]
         return taken
 
-    def discard_batch(self, requests: Iterable[LlmRequest],
-                      batch_id: int) -> None:
-        """Drop the grammar matchers and build failures of a discarded batch."""
-        # No host function enqueued so far may advance a dropped matcher.
+    def discard_batch(self, batch_id: int) -> None:
+        """Drop the build failures of a discarded batch."""
+        # Its host functions report their failures before they are dropped.
         self._drain_host_functions()
         self.take_failed_requests(batch_id)
-        self.discard_matchers(requests)
 
     def execute(self,
                 logits: torch.Tensor,
