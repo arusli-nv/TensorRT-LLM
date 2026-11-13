@@ -38,7 +38,7 @@ import traceback
 import urllib.error
 import urllib.request
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 from unittest import mock
@@ -118,6 +118,10 @@ MEMBERSHIP_LOG = re.compile(r"Membership: MembershipRecord\(.*?state=<Membership
 # trtllm-llmapi-launch logs the PID of rank 0's trtllm-serve, which a SIGINT stops.
 SERVER_PID_LOG = re.compile(r"Rank0 task guard PID: \d+; workload PGID: (\d+)")
 SHUTDOWN_TIMEOUT_S = 120
+# uvicorn logs this once a frontend's connections closed. The launcher's frontend then stops the engine.
+APP_SHUTDOWN_LOG = "Waiting for application shutdown"
+# Load requests of this length outlast a replacement's CUDA graph capture, and fit max_seq_len.
+DRAIN_MAX_TOKENS = 3500
 
 # A rank logs this per graph shape when it captures.
 CAPTURE_LINE = re.compile(r"\[RANK (\d+)\].*(CUDA graph capture|Capturing \d+ graphs)")
@@ -601,10 +605,11 @@ class _Threads:
 class Clients(_Threads):
     """Closed-loop load and eval clients, as the module docstring describes."""
 
-    def __init__(self, deployment: Deployment, gsm8k: Gsm8k):
+    def __init__(self, deployment: Deployment, gsm8k: Gsm8k, max_tokens: int = LOAD_MAX_TOKENS):
         super().__init__()
         self._deployment = deployment
         self._gsm8k = gsm8k
+        self._max_tokens = max_tokens
         self._lock = threading.Lock()
         self._seed = 0
         self._question = 0
@@ -646,7 +651,7 @@ class Clients(_Threads):
             seed = self._next("_seed")
             body = {
                 "prompt": _prompt(seed, random.Random(seed).randint(*LOAD_INPUT_LEN)),
-                "max_tokens": LOAD_MAX_TOKENS,
+                "max_tokens": self._max_tokens,
                 "ignore_eos": True,
                 "detokenize": False,
                 **({**SAMPLING, "seed": seed} if sampled else {"temperature": 0.0}),
@@ -1421,6 +1426,65 @@ def test_shutdown_after_rank_given_up(tmp_path: Path):
             f"{len(incomplete[0].token_ids)} tokens and the error {incomplete[0].error}"
         )
         states = {m.group(1) for m in map(MEMBERSHIP_LOG.search, _log_lines(deployment.logs)) if m}
+        assert "SHUTDOWN" in states and "ABORTED" not in states, states
+
+
+@pytest.mark.skip_less_device(WORLD_SIZE)
+@pytest.mark.timeout(STARTUP_TIMEOUT_S + REJOIN_TIMEOUT_S + 1200)
+def test_shutdown_during_admission(tmp_path: Path):
+    """Stop the deployment with SIGINT while a replacement starts, so that it is admitted in the drain.
+
+    The replacement is held at its CUDA graph capture until the launcher's frontend stops the engine.
+    Long requests through the attached frontend keep the engine draining until rank 0 admits the
+    replacement, which then stops with the other ranks: the authority publishes SHUTDOWN, the
+    replacement exits 0 on its own, and the launcher ends.
+    """
+    with _deploy(tmp_path, frontends=2) as deployment:
+        captures = _capture_lines(deployment.logs)[VICTIM]
+        victim = _rank_workers(deployment.secret)[VICTIM]
+        victim.kill()
+        replacement = _wait_for_replacement(deployment.secret, victim.pid)[VICTIM]
+        deadline = time.monotonic() + REJOIN_TIMEOUT_S
+        while _capture_lines(deployment.logs)[VICTIM] == captures:
+            assert time.monotonic() < deadline, f"rank {VICTIM}'s replacement captured no graph"
+            time.sleep(0.1)
+        replacement.suspend()
+        attached = replace(deployment, frontends=deployment.frontends[1:])
+        clients = Clients(attached, Gsm8k(EVAL_QUESTIONS), max_tokens=DRAIN_MAX_TOKENS)
+        clients.start()
+        time.sleep(SETTLE_S)
+        (server_pid,) = {
+            int(m.group(1)) for m in map(SERVER_PID_LOG.search, _log_lines(deployment.logs)) if m
+        }
+        clients._stop.set()
+        os.kill(server_pid, signal.SIGINT)
+        t_stop = time.monotonic()
+        while not any(APP_SHUTDOWN_LOG in line for line in _log_lines(deployment.logs)):
+            assert time.monotonic() < t_stop + SHUTDOWN_TIMEOUT_S, "the engine was not stopped"
+            time.sleep(0.1)
+        replacement.resume()
+        assert not clients.stop()
+        try:
+            deployment.launcher.wait(max(0.0, t_stop + SHUTDOWN_TIMEOUT_S - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"the launcher still ran {SHUTDOWN_TIMEOUT_S} s after the SIGINT")
+        # A request completes, or the attached frontend rejects it with an error response.
+        broken = [
+            r
+            for r in clients.requests
+            if r.error and r.error_code is None and not r.error.startswith("HTTP ")
+        ]
+        assert not broken, f"{len(broken)} requests broke off, the first with {broken[0].error}"
+        lines = list(_log_lines(deployment.logs))
+        stop = next(i for i, line in enumerate(lines) if APP_SHUTDOWN_LOG in line)
+        assert any(
+            "outcome='COMMITTED'" in line and f"added_ranks=({VICTIM},)" in line
+            for line in lines[stop:]
+        ), "the replacement was not admitted after the engine was stopped"
+        after_stop = "".join(lines[stop:])
+        assert f"Rank {VICTIM} exits: the executor completed" in after_stop
+        assert "The deployment shut down" in after_stop and "did not end within" not in after_stop
+        states = {m.group(1) for m in map(MEMBERSHIP_LOG.search, lines) if m}
         assert "SHUTDOWN" in states and "ABORTED" not in states, states
 
 

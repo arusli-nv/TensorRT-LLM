@@ -156,8 +156,8 @@ l0_gb200_multi_gpus:
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   # WideEP fault tolerance: a crash and then a hang, refused joins, a second failure while a replacement is admitted
-  # or installed, rejoins under plain trtllm-serve, one through the own ports of two frontends, and a rejoin on each
-  # other target.
+  # or installed, rejoins under plain trtllm-serve, one through the own ports of two frontends, a rejoin on each
+  # other target, the loss of the authority, and a shutdown while a replacement is admitted.
   - test_wide_ep_rank_failure.py::TestRankFailures::test_rank_failure_sequence[crash-hang]
   - test_wide_ep_rank_failure.py::test_rejoin_on_target[nvfp4]
   - test_wide_ep_rank_failure.py::test_rejoin_on_target[nvfp4_cutlass]
@@ -168,3 +168,4 @@ l0_gb200_multi_gpus:
   - test_wide_ep_rank_failure.py::test_rejoin_when_server_spawns_ranks
   - test_wide_ep_rank_failure.py::test_rejoin_through_two_frontends
   - test_wide_ep_rank_failure.py::test_authority_loss_ends_deployment
+  - test_wide_ep_rank_failure.py::test_shutdown_during_admission
