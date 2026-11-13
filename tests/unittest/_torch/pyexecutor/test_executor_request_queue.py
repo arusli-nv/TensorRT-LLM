@@ -11,7 +11,7 @@ import datetime
 import queue
 import threading
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 
@@ -409,3 +409,20 @@ def test_wakes_coalesce_until_fetched(executor_queue):
     assert executor_queue.get_from_request_queue(None) == []
     executor_queue.wake()
     assert executor_queue.get_request_queue_size() == 1
+
+
+def test_fetch_without_pending_wake_reads_no_item_ids(executor_queue):
+    """Test that a fetch looks for a wake item only while a wake is pending."""
+    item = Mock()
+    id_reads = PropertyMock(return_value=1)
+    type(item).id = id_reads
+    executor_queue.request_queue.put(item)
+    assert executor_queue.get_from_request_queue(None) == [item]
+    id_reads.assert_not_called()
+
+
+def test_queued_request_ids_skip_the_wake_item(executor_queue):
+    """Test that a pending wake is not reported as a queued request."""
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+    executor_queue.wake()
+    assert executor_queue.queued_request_ids() == {1}

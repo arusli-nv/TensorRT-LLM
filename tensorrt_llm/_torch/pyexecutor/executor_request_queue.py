@@ -77,8 +77,7 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request
-                    or self.id == WAKE_REQUEST_ID)
+                    or self.is_prefix_load_completion_request)
 
     @property
     def is_prefix_load_completion_request(self):
@@ -299,7 +298,8 @@ class ExecutorRequestQueue:
         with self.request_queue.mutex:
             return {
                 item.id
-                for item in self.request_queue.queue if item.is_normal_request
+                for item in self.request_queue.queue
+                if item.is_normal_request and item.id != WAKE_REQUEST_ID
             }
 
     def enqueue_control_request(self,
@@ -380,7 +380,10 @@ class ExecutorRequestQueue:
                     items.append(queue_item)
         except queue.Empty:
             pass
-        woken = any(item.id == WAKE_REQUEST_ID for item in items)
+        # wake() sets _wake_pending before it queues the wake item, so a
+        # queue without a pending wake is never scanned.
+        woken = self._wake_pending and any(item.id == WAKE_REQUEST_ID
+                                           for item in items)
         if woken:
             self._wake_pending = False
             items = [item for item in items if item.id != WAKE_REQUEST_ID]
@@ -402,7 +405,7 @@ class ExecutorRequestQueue:
                 item = self.request_queue.get(timeout=remaining_timeout)
             except queue.Empty:
                 break
-            if item.id == WAKE_REQUEST_ID:
+            if self._wake_pending and item.id == WAKE_REQUEST_ID:
                 self._wake_pending = False
                 break
             items.append(item)

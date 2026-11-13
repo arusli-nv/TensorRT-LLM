@@ -1053,9 +1053,9 @@ void HostMemoryMoeWeightUpdater::updateWeights(
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
         int newExpertId = placementCpuInfo->rankExpertIds[mMetaInfo.epRank][slotId];
         TLLM_CHECK_WITH_INFO(oldExpertId >= minExpertId && oldExpertId < mMetaInfo.expertCount,
-            "oldExpertId=%d, should be in range [%d, %d)", oldExpertId, minExpertId, mMetaInfo.expertCount);
+            "oldExpertId=%d, should in range [%d, %d)", oldExpertId, minExpertId, mMetaInfo.expertCount);
         TLLM_CHECK_WITH_INFO(newExpertId >= minExpertId && newExpertId < mMetaInfo.expertCount,
-            "newExpertId=%d, should be in range [%d, %d)", newExpertId, minExpertId, mMetaInfo.expertCount);
+            "newExpertId=%d, should in range [%d, %d)", newExpertId, minExpertId, mMetaInfo.expertCount);
         if (oldExpertId == newExpertId || newExpertId == -1)
         {
             continue;

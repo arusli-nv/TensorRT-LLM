@@ -125,8 +125,6 @@ class StoreComm:
 
     def allgather(self, obj: Any) -> List[Any]:
         """Gather one picklable object per rank, ordered by rank in the group."""
-        if self._store is None:
-            raise RuntimeError(f"allgather on a freed {type(self).__name__}")
         prefix = f"{self._name}/{self._seq}"
         self._seq += 1
         self._store.set(f"{prefix}/{self._rank}", pickle.dumps(obj))
@@ -228,6 +226,12 @@ class StoreDwdpGroup(StoreComm):
             timeout_s=int(os.environ.get(DWDP_TIMEOUT_ENV, DEFAULT_TIMEOUT_S)),
             num_groups=num_groups,
         )
+
+    def allgather(self, obj: Any) -> List[Any]:
+        """Gather one picklable object per rank, ordered by rank in the group."""
+        if self._store is None:
+            raise RuntimeError("allgather on a freed DWDP group")
+        return super().allgather(obj)
 
     def mark_setup_done(self) -> None:
         """Record that this worker no longer needs the store for setup. Idempotent."""

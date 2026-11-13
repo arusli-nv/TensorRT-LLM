@@ -45,14 +45,12 @@ class MnnvlPeerHandleError(RuntimeError):
     The caller can exclude those peers and map the memory again.
     """
 
-    def __init__(self, ranks: Sequence[int], details: str = "") -> None:
+    def __init__(self, ranks: Sequence[int], message: str) -> None:
         self.ranks = tuple(sorted(set(ranks)))
-        self.details = details
-        message = f"Cannot import the MNNVL handles of ranks {list(self.ranks)}"
-        super().__init__(f"{message}\n{details}" if details else message)
+        super().__init__(message)
 
     def __reduce__(self):
-        return type(self), (self.ranks, self.details)
+        return type(self), (self.ranks, self.args[0])
 
 
 class MnnvlMappingError(RuntimeError):

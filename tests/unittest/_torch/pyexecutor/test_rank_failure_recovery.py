@@ -1056,7 +1056,7 @@ def test_unexpected_install_error_ends_the_process(error):
 def test_unimportable_peer_is_waited_on():
     """Check that a rank that cannot import a peer's MNNVL handles waits on it for a new record."""
     r = _resuming()
-    r.moe.remap_workspaces.side_effect = MnnvlPeerHandleError([3])
+    r.moe.remap_workspaces.side_effect = MnnvlPeerHandleError([3], "import failed")
 
     def waiting_for():
         r.recovery._on_tick()
