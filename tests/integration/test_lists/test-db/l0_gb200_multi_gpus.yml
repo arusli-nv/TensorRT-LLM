@@ -169,3 +169,4 @@ l0_gb200_multi_gpus:
   - test_wide_ep_rank_failure.py::test_rejoin_through_two_frontends
   - test_wide_ep_rank_failure.py::test_authority_loss_ends_deployment
   - test_wide_ep_rank_failure.py::test_shutdown_during_admission
+  - test_wide_ep_rank_failure.py::test_shutdown_after_rank_given_up
