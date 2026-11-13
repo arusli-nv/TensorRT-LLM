@@ -32,7 +32,7 @@ from unittest.mock import Mock
 
 import pytest
 from mpi4py import MPI
-from test_store_group import _SHORT_SECRET, _Unpickled
+from test_store_group import _Unpickled
 from torch.distributed import DistStoreError, TCPStore
 
 from tensorrt_llm import _utils
@@ -499,6 +499,7 @@ def launched(monkeypatch):
 _SECRET_OR_RENDEZVOUS = (
     f"hex shared secret in {SHARED_SECRET_ENV} and host:port in {RENDEZVOUS_ENV}"
 )
+_SHORT_SECRET = f"shared secret of at least 32 bytes in {SHARED_SECRET_ENV}"
 
 
 @pytest.mark.parametrize(

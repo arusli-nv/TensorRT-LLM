@@ -300,6 +300,7 @@ def test_adp_graph_agreement_skips_inactive_ranks() -> None:
     rows = [[True, 3, SampleType.FULL.value], [True, 4, SampleType.FULL.value], inactive]
     runner = Mock()
     runner.enabled = True
+    runner._adp_graph_batch_hint = None
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
         mapping=SimpleNamespace(tp_size=4),

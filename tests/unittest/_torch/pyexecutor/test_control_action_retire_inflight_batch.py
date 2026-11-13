@@ -46,6 +46,7 @@ class _Rank:
     """Records what the retirement helper does on one rank."""
 
     _retire_inflight_batch_for_control = PyExecutor._retire_inflight_batch_for_control
+    _accept_or_discard_previous_batch = PyExecutor._accept_or_discard_previous_batch
 
     def __init__(
         self,
@@ -60,6 +61,7 @@ class _Rank:
         self.dist = MagicMock(pp_size=pp_size, world_size=8)
         self.disable_overlap_scheduler = not overlap
         self.previous_batch = previous_batch
+        self.rank_failure_recovery = None
         self.speculation_gate = None
         self.enable_early_first_token_response = early_first_token
         self.drafter = drafter

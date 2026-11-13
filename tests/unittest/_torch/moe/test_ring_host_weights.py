@@ -312,7 +312,7 @@ def test_plan_rejects_expert_without_host_weights():
     # Node 0 keeps node 1's experts' host weights, and node 2 keeps node 0's.
     restore.plan_expert_restore(_active([1, 2, 3]), current)
     # Node 1 kept those of node 2, so rank 4's experts 8 and 9 have none left.
-    with pytest.raises(ValueError, match="host weights of expert 8 of MoE layer 0"):
+    with pytest.raises(ValueError, match="keeps host weights for expert 8 in MoE layer 0"):
         restore.plan_expert_restore(_active([2, 3, 4]), current)
 
 
@@ -574,7 +574,7 @@ def test_deepseek_r1_node_then_rank(node):
             continue
         active = _active(failed + [rank], _R1_EP)
         if rank in unprotected:
-            with pytest.raises(ValueError, match="host weights of expert"):
+            with pytest.raises(ValueError, match="keeps host weights for expert"):
                 restore.plan_expert_restore(active, [placement])
         else:
             restore.plan_expert_restore(active, [placement])
@@ -607,6 +607,6 @@ def test_deepseek_r1_rank_then_node(node):
         try:
             (after,) = restore.plan_expert_restore(active, [placement]).placements
         except ValueError as error:
-            assert "host weights of expert" in str(error)
+            assert "keeps host weights for expert" in str(error)
         else:
             assert (np.bincount(after[after >= 0], minlength=_R1_EXPERTS) == 1).all()
