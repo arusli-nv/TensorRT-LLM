@@ -150,8 +150,8 @@ if TYPE_CHECKING:
     from tensorrt_llm.executor.utils import RequestError
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
-    from .llm_request import PyResult
-    from .rank_failure_recovery import RankFailureRecovery
+    from .rank_failure_recovery import (ContextCommits, OutputsMarks,
+                                        RankFailureRecovery)
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -567,12 +567,6 @@ class ScheduledBatchStats:
     num_paused_requests: Optional[int] = None
 
 
-# The context reuse commits of a step, held until the step is accepted.
-ContextCommits = List[Tuple[KVCacheManagerV2, Dict[int, int]]]
-# Where the stored outputs of a step's requests end, rewound if the step is discarded.
-OutputsMarks = List[Tuple[LlmRequest, "PyResult.OutputsMark"]]
-
-
 @dataclasses.dataclass
 class BatchState:
     scheduled_requests: ScheduledRequests
@@ -598,8 +592,8 @@ class BatchState:
     # None until then.
     guided_failures: Optional[List[Tuple[int, str]]] = None
     # Set only under rank failure recovery.
-    context_commits: Optional[ContextCommits] = None
-    outputs_marks: Optional[OutputsMarks] = None
+    context_commits: Optional["ContextCommits"] = None
+    outputs_marks: Optional["OutputsMarks"] = None
 
 
 @dataclasses.dataclass
@@ -722,7 +716,6 @@ class PyExecutor:
     _executor_events: Optional[ExecutorEvents] = None
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
-
     rank_failure_recovery: Optional["RankFailureRecovery"] = None
     worker_thread: Optional[threading.Thread] = None
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
@@ -5391,7 +5384,7 @@ class PyExecutor:
     def _update_v2_context_resources(
             self,
             scheduled_batch,
-            context_commits: Optional[ContextCommits] = None) -> None:
+            context_commits: Optional["ContextCommits"] = None) -> None:
         """Update self, draft, and cross caches after a context forward.
 
         With ``context_commits``, the reuse commits wait until the step is

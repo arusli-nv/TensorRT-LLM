@@ -55,7 +55,7 @@ from tensorrt_llm.math_utils import pad_up
 from ..ep_group_health import EPGroupHealth
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
-from .execution_state import MembershipAlltoAllWorkspaceLifecycle, MoeExecutionState
+from .execution_state import MoeExecutionState
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
@@ -701,11 +701,7 @@ class NVLinkOneSided(Communication):
             )
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
-        lifecycle_cls = _MnnvlAlltoAllWorkspaceLifecycle
-        if self._enable_wide_ep_fault_tolerance:
-            # Only a workspace in MembershipMnnvlMemory follows a membership change.
-            lifecycle_cls = MembershipAlltoAllWorkspaceLifecycle
-        self._workspace_lifecycle = lifecycle_cls.get_or_create(
+        self._workspace_lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
             workspace_state=workspace_state,
             memory=self.mnnvl_mem,
             workspace=self.workspace,
@@ -772,9 +768,7 @@ class NVLinkOneSided(Communication):
                 f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
             )
         state.register_layer(self.reset_state)
-        state.register_workspace(
-            self._require_workspace_lifecycle(), self._reset_local_workspace, self.workspace
-        )
+        state.register_workspace(self.mnnvl_mem, self._reset_local_workspace, self.workspace)
         self.execution_state = state
 
     def _reset_local_workspace(self) -> None:

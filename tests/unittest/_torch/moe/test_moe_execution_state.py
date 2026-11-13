@@ -27,13 +27,9 @@ from test_moe_a2a_abort import _combine, _dispatch, _setup
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
-from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
 from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter, execution_state
-from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import (
-    MembershipAlltoAllWorkspaceLifecycle,
-    MoeExecutionState,
-)
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import moe_comms, prepare_model
@@ -158,32 +154,24 @@ def test_graph_replay_follows_written_mask() -> None:
 
 
 def _workspace(device_bytes: int, fresh_rows: frozenset[int]) -> Mock:
-    """Return a mock membership workspace lifecycle."""
-    return Mock(device_bytes=device_bytes, **{"rows_needing_fresh_pages.return_value": fresh_rows})
-
-
-@pytest.mark.cpu_only
-def test_membership_lifecycle_remaps_its_memory() -> None:
-    """The fault-tolerance lifecycle remaps its MembershipMnnvlMemory. Main's lifecycle has no remap."""
-    memory = Mock(mapped=True, local_device_bytes=6 << 20)
-    memory.rows_needing_fresh_pages.return_value = frozenset({1})
-    lifecycle = MembershipAlltoAllWorkspaceLifecycle.get_or_create(
-        workspace_state={},
-        memory=memory,
-        workspace=torch.zeros(1, dtype=torch.uint8),
-        metainfo=torch.tensor([1]),
-        ep_rank=0,
-        ep_size=2,
-        waited_flags=None,
+    """Return a mock membership workspace."""
+    return Mock(
+        local_device_bytes=device_bytes, **{"rows_needing_fresh_pages.return_value": fresh_rows}
     )
-    comm = Mock()
 
-    assert lifecycle.device_bytes == 6 << 20
-    assert lifecycle.rows_needing_fresh_pages(comm) == frozenset({1})
-    lifecycle.remap(comm, frozenset({1}))
-    memory.rows_needing_fresh_pages.assert_called_once_with(comm)
-    memory.remap.assert_called_once_with(comm, frozenset({1}))
-    assert not hasattr(_MnnvlAlltoAllWorkspaceLifecycle, "remap")
+
+def test_bound_layer_remaps_its_memory() -> None:
+    """Binding a layer registers its MNNVL memory as the workspace that a change remaps."""
+    state = MoeExecutionState(EPGroupHealth(2), 0, torch.device("cuda"))
+    comm = _frontend()
+    comm.mnnvl_mem = _workspace(6 << 20, frozenset({1}))
+    comm.bind_execution_state(state)
+    store_group = Mock()
+
+    assert state.workspace_bytes() == 6 << 20
+    assert state.workspace_rows_needing_fresh_pages(store_group) == frozenset({1})
+    state.remap_workspaces(store_group, frozenset({1}))
+    comm.mnnvl_mem.remap.assert_called_once_with(store_group, frozenset({1}))
 
 
 def test_shared_workspace_counted_once() -> None:

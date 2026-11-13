@@ -30,24 +30,21 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 # The active mask has room for as many ranks as the all-to-all kernels support.
 MAX_RANKS = 256
 
-# A rank that keeps other ranks waiting longer than this is hung. It is long enough for a slow host
-# step. A hang found during a membership change can take a second timeout to remove, and twice it
-# stays within the default 300 s executor hang detector and all-to-all timeouts.
+# Long enough that a slow but healthy host step is not taken as a hang. A hang found during a
+# membership change can take a second timeout to remove, and twice this stays within
+# the default 300 s executor hang detector and all-to-all timeouts.
 HANG_TIMEOUT_S = 60.0
-# How often a rank reports and the authority decides.
 REPORT_INTERVAL_S = 0.5
-# How long the ranks of a startup, or a replacement's startup, may take to connect and progress.
 RENDEZVOUS_TIMEOUT_S = 600.0
 # Node supervisors start with the job and connect within seconds of the authority, so one still
 # missing after this is a launch mistake.
 NODE_SUPERVISOR_TIMEOUT_S = 60.0
 
-# The launch that starts one node supervisor per node.
 NODE_SUPERVISOR_LAUNCH = (
     "mpirun --enable-recovery -np <nodes> --map-by ppr:1:node --bind-to none "
     f"-x {SHARED_SECRET_ENV} -x {RENDEZVOUS_ENV} trtllm-llmapi-launch <command>"
 )
-# The launchers' rank variables. A process started outside the launcher's job must not inherit them.
+# A process started outside the launcher's job must not inherit these.
 _LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "PRTE_", "SLURM_")
 # The deployment's opt-in to running Open MPI as root, which a rank keeps.
 _RUN_AS_ROOT_VARS = (

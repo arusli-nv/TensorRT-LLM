@@ -90,13 +90,19 @@ if TYPE_CHECKING:
     )
     from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlan
     from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer, MoeLoadBalancer
+    from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from .llm_request import LlmRequest, PyResult
-    from .py_executor import BatchState, OutputsMarks, PyExecutor
+    from .py_executor import BatchState, PyExecutor
     from .scheduler import ScheduledRequests
     from .scheduler.adp_router import RankState
     from .scheduler.waiting_queue import WaitingQueue
 
 _AUTHORITY_TIMEOUT_S = 10.0
+
+# The context reuse commits of a step, held until the step is accepted.
+ContextCommits = List[Tuple["KVCacheManagerV2", Dict[int, int]]]
+# Where the stored outputs of a step's requests end, rewound if the step is discarded.
+OutputsMarks = List[Tuple["LlmRequest", "PyResult.OutputsMark"]]
 
 
 class _MembershipRestarted(Exception):
@@ -108,8 +114,6 @@ class _ExpertsNotRestorable(Exception):
 
 
 class _RecordOutcome(enum.Enum):
-    """What a rank does after it takes part in one membership record."""
-
     NEXT_RECORD = enum.auto()
     INSTALLED = enum.auto()
     ABORTED = enum.auto()
@@ -117,7 +121,6 @@ class _RecordOutcome(enum.Enum):
     EXCLUDED = enum.auto()
 
 
-# Exit status and reason for the outcomes that end the process.
 _PROCESS_EXITS = {
     _RecordOutcome.ABORTED: (1, "the deployment cannot recover from the rank failure"),
     _RecordOutcome.SHUTDOWN: (0, "the deployment is shutting down"),
@@ -380,7 +383,6 @@ class _PhaseTimer:
         self._began_s = time.perf_counter()
 
     def begin(self) -> None:
-        """Start timing the next phase."""
         self._began_s = time.perf_counter()
 
     def end(self, phase: str) -> None:

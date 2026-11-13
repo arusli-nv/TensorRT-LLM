@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
@@ -36,10 +35,8 @@ from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.membership import StoreGroup
-    from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 
 _ABORT_REQUESTED = 0
-# The requested and status words.
 _ABORT_FLAGS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX))
 _WAIT_EVIDENCE = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
 _MASK_WORD_BITS = 64
@@ -62,7 +59,7 @@ class MembershipWorkspace(Protocol):
     """Peer-writable memory that a membership change remaps among the active ranks in place."""
 
     @property
-    def device_bytes(self) -> int:
+    def local_device_bytes(self) -> int:
         """Return the device bytes that :meth:`remap` allocates for this rank's row."""
 
     def rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
@@ -70,22 +67,6 @@ class MembershipWorkspace(Protocol):
 
     def remap(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
         """Map the workspace among the active ranks with ``fresh_rows`` on fresh pages."""
-
-
-class MembershipAlltoAllWorkspaceLifecycle(_MnnvlAlltoAllWorkspaceLifecycle):
-    """Lifecycle of an All-to-All workspace in MembershipMnnvlMemory, a :class:`MembershipWorkspace`."""
-
-    _memory: MembershipMnnvlMemory
-
-    @property
-    def device_bytes(self) -> int:
-        return self._memory.local_device_bytes
-
-    def rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
-        return self._memory.rows_needing_fresh_pages(comm)
-
-    def remap(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
-        self._memory.remap(comm, fresh_rows)
 
 
 class BindableCommunication(Protocol):
@@ -193,7 +174,7 @@ class MoeExecutionState:
 
     def workspace_bytes(self) -> int:
         """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
-        return sum(workspace.device_bytes for workspace, _, _ in self._workspaces.values())
+        return sum(workspace.local_device_bytes for workspace, _, _ in self._workspaces.values())
 
     def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
         """Return every row if a former member may still write into any bound workspace."""

@@ -33,19 +33,14 @@ from .records import HANG_TIMEOUT_S, REPORT_INTERVAL_S, MembershipRecord, RankRe
 from .rendezvous import LIVENESS_KEY, hello_token, rendezvous_host_port
 from .signed_store import SignedStore
 
-# A liveness connection fails once its peer acknowledged nothing for this long, as when the peer's
-# node is cut off. It is longer than a network stall that TCP recovers from. It is independent of
-# the hang timeout, which bounds a peer that stays connected but keeps other ranks waiting.
+# Longer than a network stall that TCP recovers from. A peer that stays connected but stops making
+# progress is bounded by the hang timeout instead.
 DEAD_TIMEOUT_S = 60.0
-# A rank takes the authority as hung once it receives nothing for half the hang timeout, the age at
-# which the authority takes a rank's reports as stale.
+# The age at which the authority takes a rank's reports as stale.
 AUTHORITY_SILENCE_TIMEOUT_S = HANG_TIMEOUT_S / 2
-# A connection must connect and send its hello, and a rank must receive its first record, within
-# this time.
 HELLO_TIMEOUT_S = 10.0
 _MAX_LINE_BYTES = 1 << 20
 _KEEPALIVE_PROBES = 6
-# A process still waiting for the authority's liveness address after this long logs that it waits.
 _AUTHORITY_WAIT_WARNING_S = 30.0
 
 
@@ -57,15 +52,10 @@ class Lines:
 
     @staticmethod
     def encode(payload: bytes) -> bytes:
-        """Return the line that carries ``payload``."""
         return payload + b"\n"
 
     def decode(self, data: bytes) -> List[bytes]:
-        """Return the payloads of lines that ``data`` completes.
-
-        Raises:
-            ValueError: A line is too long.
-        """
+        """Return the payloads of the lines that ``data`` completes."""
         *lines, self._buffer = (self._buffer + data).split(b"\n")
         if len(self._buffer) > _MAX_LINE_BYTES:
             raise ValueError("a liveness line is too long")
@@ -117,10 +107,7 @@ def close_in_forked_child(resource: Any) -> None:
 
 
 def _warn_while_no_authority(store: SignedStore) -> None:
-    """Log once if the authority has not published its liveness address within the warning time.
-
-    The caller then keeps waiting in the store's blocking get until the store's timeout.
-    """
+    """Log once if the authority has not published its liveness address within the warning time."""
     from torch.distributed import DistStoreError
 
     try:
@@ -150,7 +137,6 @@ def open_liveness_connection(
 ) -> LivenessConnection:
     """Open this process's liveness connection to the authority for ``rank``."""
     connection = _open_connection(store, f"{rank} {int(replacement)}", timeout_s)
-    # A forked child must not keep the connection open.
     close_in_forked_child(connection.sock)
     return connection
 
@@ -185,11 +171,7 @@ def open_store(address: str, timeout_s: float, secret: Optional[str] = None) -> 
 
 
 def rendezvous_store(timeout_s: float = DEAD_TIMEOUT_S) -> SignedStore:
-    """Open a rendezvous store client from this process's environment.
-
-    By default an operation waits for the store as long as a liveness connection waits for its
-    peer.
-    """
+    """Open a rendezvous store client from this process's environment."""
     return open_store(os.environ[RENDEZVOUS_ENV], timeout_s)
 
 

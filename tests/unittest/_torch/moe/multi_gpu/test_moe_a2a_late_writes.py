@@ -28,6 +28,7 @@ import sys
 import time
 from collections.abc import Iterator
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,10 +37,7 @@ from torch.distributed import TCPStore
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
-from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import (
-    MembershipAlltoAllWorkspaceLifecycle,
-    MoeExecutionState,
-)
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm.bindings import internal
@@ -137,15 +135,8 @@ def _bound_state(
     comm._dispatch_state = {"phase": "idle"}
     comm.workspace = workspace
     comm.ep_rank, comm.ep_size = rank, _EP_SIZE
-    comm._workspace_lifecycle = MembershipAlltoAllWorkspaceLifecycle(
-        workspace_state={},
-        memory=memory,
-        workspace=workspace,
-        metainfo=meta,
-        ep_rank=rank,
-        ep_size=_EP_SIZE,
-        waited_flags=None,
-    )
+    comm.mnnvl_mem = memory
+    comm._workspace_lifecycle = SimpleNamespace(metainfo=meta)
     comm.bind_execution_state(state)
     return state
 
