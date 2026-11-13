@@ -374,12 +374,23 @@ def _start_alone(worker_main_args: dict) -> None:
     """Make a replacement rank load its checkpoint alone and skip the KV cache estimation.
 
     It takes the KV cache capacity from the startup record and the tuned tactics from its
-    predecessor instead.
+    predecessor instead. So it neither loads nor saves the autotuner cache file of the original
+    ranks, whether the environment or ``env_overrides`` sets it: loading the file would replace the
+    tactics it took.
     """
     from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 
     os.environ["TRTLLM_SKIP_KV_CACHE_ESTIMATION"] = "1"
-    requested = worker_main_args["llm_args"].checkpoint_io_policy
+    os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
+    llm_args = worker_main_args["llm_args"]
+    update = {"checkpoint_io_policy": CheckpointIOPolicy.NATIVE}
+    if llm_args.env_overrides and "TLLM_AUTOTUNER_CACHE_PATH" in llm_args.env_overrides:
+        update["env_overrides"] = {
+            name: value
+            for name, value in llm_args.env_overrides.items()
+            if name != "TLLM_AUTOTUNER_CACHE_PATH"
+        }
+    requested = llm_args.checkpoint_io_policy
     if requested != CheckpointIOPolicy.NATIVE:
         log = (
             logger.warning
@@ -393,9 +404,7 @@ def _start_alone(worker_main_args: dict) -> None:
             "reason=a replacement rank loads its checkpoint alone, and rank-striped read-ahead "
             "splits the checkpoint reads among the ranks of a node."
         )
-    worker_main_args["llm_args"] = worker_main_args["llm_args"].model_copy(
-        update={"checkpoint_io_policy": CheckpointIOPolicy.NATIVE}
-    )
+    worker_main_args["llm_args"] = llm_args.model_copy(update=update)
 
 
 @functools.lru_cache(maxsize=1)

@@ -236,7 +236,7 @@ def test_replacement_starts_alone(monkeypatch, requested, logged):
     logs = {level: Mock() for level in ("warning", "info")}
     for level, log in logs.items():
         monkeypatch.setattr(startup_module.logger, level, log)
-    llm_args = Mock(checkpoint_io_policy=requested)
+    llm_args = Mock(checkpoint_io_policy=requested, env_overrides=None)
     worker_main_args = {"llm_args": llm_args}
     startup_module._start_alone(worker_main_args)
     llm_args.model_copy.assert_called_once_with(
@@ -250,6 +250,26 @@ def test_replacement_starts_alone(monkeypatch, requested, logged):
             assert f"requested={requested.value}, selected=native, reason=a replacement" in message
         else:
             log.assert_not_called()
+
+
+def test_replacement_drops_the_autotuner_cache_file_override(monkeypatch):
+    """Check that a replacement's environment overrides do not set the autotuner cache file again."""
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
+    monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", "/cache/autotuner.json")
+    monkeypatch.setenv("TLLM_LOG_LEVEL", "info")
+    llm_args = Mock(
+        checkpoint_io_policy=CheckpointIOPolicy.NATIVE,
+        env_overrides={
+            "TLLM_AUTOTUNER_CACHE_PATH": "/cache/autotuner.json",
+            "TLLM_LOG_LEVEL": "debug",
+        },
+    )
+    startup_module._start_alone({"llm_args": llm_args})
+    env_overrides = llm_args.model_copy.call_args.kwargs["update"]["env_overrides"]
+    # As worker_main applies them.
+    os.environ.update(env_overrides)
+    assert "TLLM_AUTOTUNER_CACHE_PATH" not in os.environ
+    assert os.environ["TLLM_LOG_LEVEL"] == "debug"
 
 
 class _CountingStore:
@@ -716,6 +736,7 @@ class _LlmArgs:
     """Rank 0's LLM arguments, whose copies keep their update."""
 
     checkpoint_io_policy = CheckpointIOPolicy.NATIVE
+    env_overrides = None
 
     def __init__(self, update=None):
         self.update = update

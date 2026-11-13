@@ -49,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     get_host_memory_limits,
 )
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -113,8 +114,12 @@ def _dist(rank, host_exchange):
 
 @pytest.fixture(autouse=True)
 def fresh_record(monkeypatch):
-    """Give each test an empty startup record, which ``Distributed`` replays."""
+    """Give each test an empty startup record, which ``Distributed`` replays.
+
+    A test has an autotuner cache file only if it sets one.
+    """
     monkeypatch.setattr(communicator.Distributed, "startup_record", StartupRecord())
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
 
 
 def _record() -> StartupRecord:
@@ -565,14 +570,19 @@ class _DecoderEngine(SimpleNamespace):
         DecoderWarmup._run_autotuner_warmup(self, resource_manager)
 
     @contextlib.contextmanager
-    def _autotune(self, prime_all_runners=False, report_progress=None, **kwargs):
-        """Run the forwards in the block in tuning mode, as ``autotune`` does."""
+    def _autotune(self, cache_path=None, prime_all_runners=False, report_progress=None, **kwargs):
+        """Run the forwards in the block in tuning mode, as ``autotune`` does, with its cache file."""
+        rank = self.dist.mapping.rank
+        if cache_path is not None and os.path.exists(cache_path):
+            self.profiling_cache.load_cache(cache_path, rank)
         self.prime_all_runners.append(prime_all_runners)
         self.tuning, self.report_progress = True, report_progress
         try:
             yield
         finally:
             self.tuning, self.report_progress = False, None
+            if cache_path is not None:
+                self.profiling_cache.save_cache(cache_path, rank)
 
     def autotuner_warmup(self, num_tokens):
         """Run the warmup up to its autotuner phase, with KV cache room for ``num_tokens``."""
@@ -675,16 +685,28 @@ def test_replacement_reports_its_solo_warmup_as_startup_progress():
     _record().close()
 
 
-def test_replacement_replays_the_final_warmup_of_originals():
+@pytest.mark.parametrize("cache_file", [False, True])
+def test_replacement_replays_the_final_warmup_of_originals(monkeypatch, tmp_path, cache_file):
     """Check a final autotuner warmup that the original ranks run, for a larger token count.
 
     The replacement starts from the tactics its predecessor had before that warmup, so it tunes the
     same shapes and replays the original ranks' merges of them. Unlike them, it runs the cached
-    tactics of every runner once.
+    tactics of every runner once. The autotuner cache file that the original ranks save holds the
+    shapes of that warmup, so the replacement starts without it.
     """
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
+    cache_path = tmp_path / "autotuner.json"
+    if cache_file:
+        monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", str(cache_path))
     rank_0, published, tuned_tactics = _original_rank_0(8, 16)
     assert rank_0.tuned_forwards == [8, 1, 16, 1]
     assert _gemm(16) not in tuned_tactics
+    if cache_file:
+        saved = _new_autotuner().profiling_cache
+        saved.load_cache(cache_path, 0)
+        assert _gemm(16) in saved.cache
+    llm_args = Mock(checkpoint_io_policy=CheckpointIOPolicy.NATIVE, env_overrides=None)
+    startup._start_alone({"llm_args": llm_args})
     replacement = _replacement_engine(published, tuned_tactics)
     replacement.autotuner_warmup(16)
     assert replacement.tuned_forwards == [16, 1]
