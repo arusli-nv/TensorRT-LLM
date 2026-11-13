@@ -60,7 +60,7 @@ def diverged(reason: str) -> ReplacementCannotStart:
 
 
 class RecordedExchange(NamedTuple):
-    """A startup collective's :meth:`StartupRecord.rank_varying` block and rank 0's payloads."""
+    """A startup collective's :meth:`StartupRecord.rank_varying` block and every rank's payload."""
 
     rank_varying: Optional[str]
     payloads: List[Optional[bytes]]

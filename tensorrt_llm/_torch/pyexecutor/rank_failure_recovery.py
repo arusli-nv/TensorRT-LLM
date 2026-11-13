@@ -546,9 +546,10 @@ class RankFailureRecovery:
     def stop(self, completed: bool) -> None:
         """Leave the membership after a completed run, or end the process after a failed one.
 
-        Rank 0 records SHUTDOWN, so that the node supervisors do not take the ranks' exits for
-        failures. MPI_Finalize waits for every rank, so after a rank failure an atexit handler ends
-        the process before mpi4py finalizes MPI. Handlers registered later still run before it.
+        After a completed run, rank 0 records SHUTDOWN, so that the node supervisors do not take
+        the ranks' exits for failures. MPI_Finalize waits for every rank, so after a rank failure
+        an atexit handler ends the process before mpi4py finalizes MPI. Handlers registered later
+        still run before it.
         """
         if completed:
             if self.rank == 0:
@@ -745,9 +746,9 @@ class RankFailureRecovery:
     def _install_attempt(self, record: MembershipRecord) -> Iterator[_InstallAttempt]:
         """Stop installing ``record`` at an expected error and record whether the attempt completed.
 
-        After an expected error other than a newer change, the rank tells the authority which ranks
-        failed and waits for its next record. Any other error ends this rank's process, which the
-        authority then removes like any failed rank.
+        A newer change only stops the attempt. After the other expected errors, the rank tells the
+        authority which ranks failed and waits for its next record. Any other error ends this rank's
+        process, which the authority then removes like any failed rank.
         """
         attempt = _InstallAttempt()
         try:
