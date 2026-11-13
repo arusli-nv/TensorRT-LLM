@@ -104,10 +104,7 @@ class _MembershipRestarted(Exception):
 
 
 class _ExpertsNotRestorable(Exception):
-    """The active ranks cannot hold or load every expert after a membership change.
-
-    A rank whose expert restore plan or staging rows differ from rank 0's raises it too.
-    """
+    """The active ranks cannot hold, load or agree on every expert after a membership change."""
 
 
 class _RecordOutcome(enum.Enum):
@@ -162,18 +159,13 @@ _INSTALL_IN_PROGRESS = frozenset({_Phase.INSTALLING, _Phase.RESUMING, _Phase.JOI
 
 @dataclass
 class _InstallAttempt:
-    """The result of one attempt to install a membership record.
-
-    An attempt that did not complete stopped for the next membership record.
-    """
+    """Whether an attempt to install a membership record completed or stopped for the next one."""
 
     completed: bool = False
 
 
 def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
-    """Check the Wide-EP fault tolerance requirements that the LLM argument validation cannot check.
-
-    This runs before the model loads.
+    """Check, before the model loads, the requirements that LLM argument validation cannot check.
 
     Raises:
         ValueError: The configuration is not supported with fault tolerance.
@@ -233,9 +225,7 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
 
 
 def prepare_model(model: torch.nn.Module) -> None:
-    """Check that the built model supports fault tolerance and bind its MoE layers.
-
-    This runs before any weight loads.
+    """Check that the built model supports fault tolerance and bind its MoE layers before loading.
 
     Raises:
         ValueError: The model is not supported with fault tolerance.
@@ -356,10 +346,7 @@ def _check_host_weights_fit(model: torch.nn.Module) -> None:
 
 
 def _leftover_entries() -> str:
-    """Describe the host weight entries that this user's deployments left in /dev/shm, if any.
-
-    A deployment that was killed, rather than shut down, leaves its host weights there.
-    """
+    """Describe the host weight entries that this user's killed deployments left in /dev/shm."""
     from ..moe.fused_moe.eplb_expert_restore import SHARED_MEMORY_DIR
 
     with os.scandir(SHARED_MEMORY_DIR) as entries:
@@ -537,10 +524,9 @@ class RankFailureRecovery:
         return recovery
 
     def set_outstanding_requests(self, outstanding_requests: Callable[[], Dict[int, int]]) -> None:
-        """Attach the executor worker's view of the requests without a final response.
+        """Attach the executor worker's map from request id to client id of unfinished requests.
 
-        The callable maps request id to client id. When it resumes after a membership change, rank 0
-        fails the requests that no active rank holds.
+        After a membership change, rank 0 fails the ones that no active rank holds.
         """
         self._outstanding_requests = outstanding_requests
 
@@ -560,11 +546,9 @@ class RankFailureRecovery:
     def stop(self, completed: bool) -> None:
         """Leave the membership after a completed run, or end the process after a failed one.
 
-        After a completed run, rank 0 records SHUTDOWN, so that the node supervisors wait for their
-        ranks to end and do not treat those ends as failures.
-
-        MPI_Finalize waits for every rank, so after a rank failure an atexit handler ends the
-        process before mpi4py finalizes MPI. Handlers registered later still run before it.
+        Rank 0 records SHUTDOWN, so that the node supervisors do not take the ranks' exits for
+        failures. MPI_Finalize waits for every rank, so after a rank failure an atexit handler ends
+        the process before mpi4py finalizes MPI. Handlers registered later still run before it.
         """
         if completed:
             if self.rank == 0:
@@ -620,8 +604,7 @@ class RankFailureRecovery:
     def _on_client_error(self, error: Exception) -> None:
         """End the process once its membership client failed, unless the deployment shuts down.
 
-        Without the authority no later failure can be recovered, so the deployment ends as it does
-        when rank 0 is lost.
+        Without the authority no later failure can be recovered, as when rank 0 is lost.
         """
         if self._record.state != MembershipState.SHUTDOWN:
             end_process(self.rank, 1, f"the membership client failed ({error!r})")
@@ -762,9 +745,9 @@ class RankFailureRecovery:
     def _install_attempt(self, record: MembershipRecord) -> Iterator[_InstallAttempt]:
         """Stop installing ``record`` at an expected error and record whether the attempt completed.
 
-        A newer change only stops the attempt. After the other expected errors, the rank tells the
-        authority which ranks failed and waits for its next record. Any other error propagates and
-        ends this rank's process, which the authority then removes like any failed rank.
+        After an expected error other than a newer change, the rank tells the authority which ranks
+        failed and waits for its next record. Any other error ends this rank's process, which the
+        authority then removes like any failed rank.
         """
         attempt = _InstallAttempt()
         try:
@@ -944,7 +927,7 @@ class RankFailureRecovery:
     ) -> Tuple[Set[int], List[Optional[OwnSlots]]]:
         """Return the request ids that the active ranks know and each rank's slots.
 
-        A rank's slots are None without EPLB, or if the rank is inactive. Rank 0 also hands its
+        A rank's slots are None without EPLB or if the rank is inactive. Rank 0 also hands its
         waiting queue to the joining ranks. A joining rank knows no request, because its queue is
         only a copy of rank 0's, possibly from an earlier admission attempt.
         """
@@ -967,9 +950,8 @@ class RankFailureRecovery:
     def _hand_over_waiting_queue(self, record: MembershipRecord) -> None:
         """Hand rank 0's waiting queue and pending cancellations to the joining ranks of ``record``.
 
-        Every active rank then drops the same canceled requests from the queue. Only the joining
-        ranks read the queue, through the host exchange, so user prompts stay out of the
-        rendezvous store.
+        Every active rank then drops the same canceled requests from the queue. The queue goes
+        through the host exchange, so user prompts stay out of the rendezvous store.
         """
         executor = self._executor
         if self.rank == 0:
@@ -997,9 +979,8 @@ class RankFailureRecovery:
     ) -> None:
         """Resume serving after the commit and fail the requests that no active rank holds.
 
-        A request counts as lost only while it is still outstanding at the commit. So a final
-        response that the executor produced before the install, but the worker handled during it,
-        does not make its request count.
+        A request counts as lost only while it is still outstanding at the commit, so a final
+        response that the worker handled during the install does not make it count.
         """
         self._set_phase(_Phase.SERVING, f"generation {record.generation} is committed")
         # The joining ranks read their epoch before they replied INSTALLED.
@@ -1043,10 +1024,10 @@ class RankFailureRecovery:
     def _restore(
         self, record: MembershipRecord, own_slots: List[Optional[OwnSlots]], timer: _PhaseTimer
     ) -> None:
-        """Restore the all-to-all workspaces and the lost experts.
+        """Restore the all-to-all workspaces and the lost experts on every active rank.
 
-        This is collective over the active ranks of ``record``. ``own_slots`` holds each rank's
-        slots, as gathered after the ranks abandoned their EPLB iterations.
+        ``own_slots`` holds each rank's slots, as gathered after the ranks abandoned their EPLB
+        iterations.
         """
         if self._record != record:
             raise _MembershipRestarted

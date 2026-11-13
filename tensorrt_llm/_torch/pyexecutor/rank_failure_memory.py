@@ -44,7 +44,7 @@ _RELEASE_RETRY_S = 1.0
 
 
 def _free_device_memory() -> int:
-    """Return the free device memory once the PyTorch caching allocator released its free blocks.
+    """Return the free device memory after emptying the PyTorch caching allocator.
 
     The KV cache sizing at startup reads free memory the same way. Call it only between steps.
     """
@@ -62,10 +62,7 @@ def _free_plus_reserved_memory() -> int:
 
 
 class StartupMemory(NamedTuple):
-    """This rank's GPU KV cache quota once the deployment serves.
-
-    Every membership change resizes the KV cache pool from this quota.
-    """
+    """This rank's KV cache quota at startup, the base of every membership change's resize."""
 
     kv_cache_quota: int
 
@@ -107,10 +104,7 @@ class StartupMemory(NamedTuple):
 
 @dataclass
 class _ReleaseRetry:
-    """A memory release that fell short while this rank is owed workspace rows.
-
-    It is retried once the free device memory grew by half a row since ``free_seen``.
-    """
+    """A short memory release, retried once free memory grew by half a workspace row."""
 
     free_to_keep: int
     free_seen: int
@@ -163,10 +157,7 @@ def check_largest_failure_fits(
 
 
 def _smallest_kv_cache_quota(kv_cache_manager, low: int, high: int) -> int:
-    """Return the smallest quota the suspended KV cache pool takes, to within 1% of ``high``.
-
-    The pool cannot take ``low`` bytes and takes ``high`` bytes.
-    """
+    """Bisect the smallest quota the suspended pool takes in ``(low, high]``, to within 1%."""
     step = max(1, high // 100)
     while high - low > step:
         middle = (low + high) // 2
@@ -221,9 +212,8 @@ class RecoveryMemory:
     ) -> Iterator[str]:
         """Suspend the KV cache pool, shrink it by ``restore_bytes`` and yield the quota change.
 
-        While the pages in use do not fit the smaller pool, the newest ``recomputable`` requests are
-        preempted for recompute. Each attempt preempts as many requests as all earlier attempts, at
-        least one, so the number preempted so far doubles.
+        While the pages in use do not fit, the newest ``recomputable`` requests are preempted for
+        recompute, doubling the number preempted with each attempt.
         """
         # Each rank decides on its own. Suspending the pools runs a collective only with
         # disaggregated serving, and fault tolerance rejects that.
@@ -316,10 +306,9 @@ class RecoveryMemory:
         )
 
     def _release_retry_due(self) -> bool:
-        """Return whether the device memory grew by half a workspace row since the last attempt.
+        """Return whether free memory grew by half a workspace row, checked at most once a second.
 
-        It checks at most once a second. Half a row still detects a returned row after device memory
-        outside the PyTorch caching allocator was taken in the meantime.
+        Half a row still detects a returned row when other memory was taken in the meantime.
         """
         retry = self._release_retry
         now_s = time.monotonic()
@@ -331,10 +320,7 @@ class RecoveryMemory:
     def _grow_kv_cache_pool(
         self, balancer: Optional[MoeLoadBalancer], free_to_keep: int
     ) -> Tuple[int, int]:
-        """Grow the KV cache pool towards its quota for the backed spare slots.
-
-        While this rank is owed workspace rows, a pool still short of its quota is retried, in place
-        of any earlier retry. Once the pool is not short, nothing is owed.
+        """Grow the KV cache pool towards its quota, retrying later while workspace rows are owed.
 
         Returns:
             The new quota and the bytes the pool lacks of it while ``free_to_keep`` stays free.

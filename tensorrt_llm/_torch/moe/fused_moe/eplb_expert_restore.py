@@ -54,29 +54,22 @@ def plan_layer_placement(
     has_host_weights: np.ndarray,
     layer_idx: int,
 ) -> np.ndarray:
-    """Return a ``[ranks, slots]`` placement that places every expert on the ``active`` ranks.
+    """Return a deterministic ``[ranks, slots]`` placement of every expert on the ``active`` ranks.
 
-    The plan is deterministic, so every rank plans the same placement from the same arguments.
-    Active ranks keep their active slots from ``base`` and their spare slots from ``current``.
-    An active slot that repeats an expert from an earlier active slot, in rank and slot order,
-    holds an extra replica, which an interrupted online EPLB update can leave behind. A lost expert
-    goes to an emptied active slot first. Next it takes an extra replica's slot if routing uses one
-    replica per expert, else an empty spare slot, and an extra replica's slot only when no spare
-    slot is left. For a spare slot, ranks whose node has no host copy of the expert come first, so
-    that a later node loss still leaves a copy on another node.
+    Active ranks keep their active slots from ``base`` and their spare slots from ``current``. An
+    active slot that repeats an expert of an earlier active slot holds an extra replica, which an
+    interrupted online EPLB update can leave behind. A lost expert takes an emptied active slot
+    first. Next it takes an extra replica's slot if routing uses one replica per expert, else an
+    empty spare slot, and an extra replica's slot only when no spare slot is left. For a spare slot,
+    ranks whose node has no host copy of the expert come first, so that a later node loss still
+    leaves a copy on another node.
 
     Args:
-        current: ``[ranks, slots]`` experts, -1 for an empty slot. An active rank's row is what its
-            slots currently hold.
-        base: The placement whose active slots the active ranks keep: ``current``, or the
-            initial placement when a rank rejoins.
-        active: Whether each rank is active.
-        active_slot_count: The number of leading, non-spare slots per rank.
-        expert_count: The layer's expert count.
+        current: ``[ranks, slots]`` experts, -1 for an empty slot.
+        base: ``current``, or the initial placement when a rank rejoins.
         has_host_weights: ``[ranks, experts]`` flags telling whether a rank's node keeps host
             weights for an expert.
-        layer_idx: The layer index. Each layer starts the rank order at a different active rank,
-            so that restored experts spread over the active ranks.
+        layer_idx: The layer index, which rotates the rank order so restored experts spread out.
 
     Raises:
         ValueError: The active ranks' spare slots and extra replicas cannot hold every expert.
@@ -146,10 +139,9 @@ def plan_layer_placement(
 class ExpertRestorePlan:
     """Per-layer placements for one set of active ranks.
 
-    ``placement_before`` holds, per layer, the expert in each slot before the restore. A slot
-    whose expert in ``placements`` differs loads it. ``staged`` has one ``(layer, target rank,
-    slot, expert, source rank)`` row per slot that loads an expert whose host weights only another
-    node keeps. Every field except ``device_bytes`` is the same on every active rank.
+    ``staged`` has one ``(layer, target rank, slot, expert, source rank)`` row per slot that loads
+    an expert whose host weights only another node keeps. Every field except ``device_bytes`` is the
+    same on every active rank.
     """
 
     active_ranks: Tuple[bool, ...]
@@ -165,20 +157,14 @@ class ExpertRestorePlanMismatchError(ValueError):
 
 
 def _next_piece(half: Tuple[int, int], cursor: int, size: int) -> Optional[Tuple[int, int]]:
-    """Return the offset and length of the aligned piece in ``half`` from ``cursor``.
-
-    The piece holds up to ``size`` bytes. Return None if ``half`` has no room left.
-    """
+    """Return the next aligned piece of up to ``size`` bytes in ``half``, or None if it is full."""
     begin, end = half
     start = HostMoeTensorSharer.align_size(max(begin, cursor))
     return (start, min(size, end - start)) if start < end else None
 
 
 class StagingPiece(NamedTuple):
-    """Bytes of one weight of a staged slot that a chunk copies through the target's workspace row.
-
-    ``weight`` indexes the layer's slot weights by sorted name.
-    """
+    """Bytes of one weight, indexed by sorted name, that a chunk copies through a workspace row."""
 
     chunk: int
     layer: int
@@ -207,14 +193,12 @@ def staging_pieces(
 ) -> List[StagingPiece]:
     """Return the pieces that copy the ``staged`` slots through workspace rows of ``row_bytes``.
 
-    The pieces are in chunk order. Per target, chunks alternate between the two halves of the row,
-    so that a chunk's writes miss the previous chunk's reads. A weight that does not fit continues
-    in the next chunk.
+    Per target, chunks alternate between the two halves of the row, so that a chunk's writes miss
+    the previous chunk's reads.
 
     Args:
         staged: The staged slots, as in ``ExpertRestorePlan.staged``.
         weight_bytes: Per layer, a slot's weight sizes in bytes, by sorted weight name.
-        row_bytes: The bytes of a workspace row.
 
     Raises:
         ValueError: A workspace row leaves no aligned room to stage in.
@@ -277,10 +261,10 @@ def create_spare_slot_storage(
 
 
 def slot_parameters(module: torch.nn.Module) -> List[Tuple[str, torch.nn.Parameter]]:
-    """Return the weights of local slots of a MoE ``module`` with their names.
+    """Return the named weights of ``module`` that have one row per local slot.
 
-    A weight of local slots has one row per slot. Restoring an expert into a spare slot needs
-    host weights for each of them. ``register_weight_slots_after_to_cuda`` checks this.
+    Restoring an expert into a spare slot needs host weights for each of them.
+    ``register_weight_slots_after_to_cuda`` checks this.
     """
     return [
         (name, param)
@@ -292,9 +276,8 @@ def slot_parameters(module: torch.nn.Module) -> List[Tuple[str, torch.nn.Paramet
 def create_spare_slot_weights(module: torch.nn.Module) -> None:
     """Move the slot weights of ``module`` to unbacked spare slots.
 
-    Choose the experts whose host weights the node keeps before the slot weights move (see
-    ``DeploymentHostWeights``). A replacement that reattaches the host weights its rank wrote for
-    this layer loads none.
+    The node's host weight experts are chosen before the slot weights move. A replacement that
+    reattaches its rank's host weights for this layer loads none.
     """
     layer = module.layer_load_balancer
     weights = slot_parameters(module)
@@ -359,9 +342,8 @@ SHARED_MEMORY_DIR = "/dev/shm"
 class DeploymentHostWeights(HostMoeTensorSharer):
     """Host tensor sharer whose shared memory a replacement reattaches after its process exits.
 
-    With ``next_node_ranks``, the node keeps the host weights of only the experts with a slot on
-    those ranks, so the nodes form a ring in which each expert has host weights on the node before
-    its own. Without them, every node keeps every expert's host weights.
+    With ``next_node_ranks``, the node keeps host weights only for the experts on those ranks, so
+    each expert has host weights on the node before its own. Otherwise it keeps all of them.
     """
 
     data_offset = HostMoeTensorSharer.align_size(_FINGERPRINT_BYTES)
@@ -384,9 +366,9 @@ class DeploymentHostWeights(HostMoeTensorSharer):
     def reattach_own_shm(self, name_info: Dict[str, Tuple[torch.dtype, torch.Size]]) -> bool:
         """Return whether this replacement reattaches its failed rank's shared memory.
 
-        It reattaches the shared memory if it holds host weights with the dtypes and shapes that
-        ``name_info`` gives by name. It then loads none and keeps the shared memory mapped, whatever
-        later happens to its name. Otherwise it writes its host weights to new shared memory.
+        It reattaches the shared memory if it holds host weights matching ``name_info``. It then
+        loads none and keeps the shared memory mapped, whatever later happens to its name.
+        Otherwise it writes its host weights to new shared memory.
         """
         if self.replacement:
             shm = self._attach(self.local_rank, name_info)
@@ -556,11 +538,7 @@ class EplbExpertRestore:
         return [self.balancer.mapping.get_node_rank(rank) for rank in range(self.balancer.ep_size)]
 
     def next_node_ranks(self) -> Optional[List[int]]:
-        """Return the ranks whose experts this rank's node keeps host weights for.
-
-        These are the next node's ranks. Online EPLB may move any expert to any slot, so every node
-        keeps host weights for all experts, and this returns None.
-        """
+        """Return the next node's ranks, or None with online EPLB, where nodes keep all experts."""
         if self.balancer.layer_updates_per_iter > 0:
             return None
         return self._next_node_ranks[self.balancer.ep_rank]
@@ -581,7 +559,7 @@ class EplbExpertRestore:
 
     @staticmethod
     def _recoverable_failures(nodes: List[int]) -> List[List[int]]:
-        """Return the lost ranks for every recoverable failure.
+        """Return the lost ranks of each recoverable failure.
 
         A recoverable failure loses a node other than rank 0's, or one rank on rank 0's node.
         """
@@ -613,8 +591,7 @@ class EplbExpertRestore:
     def _placement_view(self, layer_idx: int, layer: SingleLayerMoeLoadBalancer) -> np.ndarray:
         """Return ``layer``'s placement as this rank sees it, with no expert in invalid slots.
 
-        A restore that stopped before it installed its placement may have written part of a slot,
-        which then holds no valid expert.
+        A restore that stopped before it installed its placement may have written part of a slot.
         """
         placement = np.array(layer.get_old_rank_expert_ids(), dtype=np.int32)
         placement[self.balancer.ep_rank, sorted(self._invalid_slots.get(layer_idx, ()))] = -1
@@ -651,9 +628,9 @@ class EplbExpertRestore:
         Args:
             active_ranks: Whether each EP rank is active.
             current: The per-layer placement that the active ranks agreed on, so that every
-                active rank plans the same placement. An active rank's row is what its slots hold.
-            rejoining: Whether each EP rank rejoins. If an active rank rejoins, all active ranks'
-                active slots take the initial placement, which the rejoining rank loaded.
+                active rank plans the same placement.
+            rejoining: Whether each EP rank rejoins. If one does, the active slots of all active
+                ranks take the initial placement, which the rejoining rank loaded.
 
         Raises:
             RuntimeError: An iteration is active.
@@ -777,9 +754,7 @@ class EplbExpertRestore:
     ) -> int:
         """Load the slots that ``plan`` changes on this rank, install it and return the bytes mapped.
 
-        Every active rank must restore the same plan before any rank routes with it. A slot loads
-        from host weights on this node, or from host weights on another node through
-        ``workspace``.
+        Every active rank must restore the same plan before any rank routes with it.
 
         Args:
             plan: The plan that every active rank restores.
@@ -877,8 +852,7 @@ class EplbExpertRestore:
     ) -> None:
         """Copy the ``staged`` experts into their slots through ``workspace``, chunk by chunk.
 
-        Per chunk, a source writes its pieces into the targets' rows, every active rank
-        waits in ``allgather``, and a target copies its pieces into its slots.
+        Every active rank meets in ``allgather`` between the sources' writes and the targets' reads.
         """
         if not staged.size:
             return
