@@ -355,11 +355,7 @@ class TPHostExchange:
         self._stream.synchronize()
 
     def _send_runs(self, recipients: int) -> tuple[tuple[int, int, bool], ...]:
-        """Split the ranks into maximal ranges that are all in, or all out of, ``recipients``.
-
-        Each range is one send to every row in it. Return ``(first rank, ranks, with payload)``
-        per range.
-        """
+        """Return ``(first rank, count, with payload)`` per run of ranks in or out of ``recipients``."""
         runs = self._send_runs_by_recipients.get(recipients)
         if runs is None:
             full = [has_rank(recipients, r) for r in range(self.nranks)]
@@ -555,10 +551,7 @@ class TPHostExchange:
         return self._mask_of(self._waiting.copy())
 
     def wake(self) -> None:
-        """Set the wake word, so that a running wait returns and checks ``interrupted``.
-
-        Safe from any thread.
-        """
+        """Make a running wait return and check ``interrupted``. Safe from any thread."""
         self._wake[0] = 1
 
     def _stop(self, epoch: int) -> None:
@@ -707,8 +700,7 @@ class MnnvlDist(Distributed):
     def create(mapping: Mapping) -> MnnvlDist:
         """Return a ``MnnvlDist`` for ``mapping`` after checking its requirements.
 
-        It shares the host exchange of the first ``MnnvlDist`` that ``Distributed.get`` created, so
-        a membership change reaches all host collectives in this process.
+        It shares the process's first host exchange, so a membership change reaches all of them.
         """
         MnnvlDist.check_requirements(mapping)
         dist = MnnvlDist(mapping)

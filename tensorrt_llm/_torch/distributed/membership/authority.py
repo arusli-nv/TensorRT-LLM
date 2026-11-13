@@ -154,14 +154,10 @@ class Authority:
     def tick(
         self, now_s: float, reports: Dict[int, RankReport], connected: int
     ) -> Optional[MembershipRecord]:
-        """Decide membership at ``now_s`` and return a new record to publish, or None.
+        """Decide membership at monotonic ``now_s`` and return a new record to publish, or None.
 
-        Also update ``stalled_replacements`` and, when a change ends, ``last_transaction``.
-
-        Args:
-            now_s: The time on a monotonic clock.
-            reports: Each connected rank's latest report.
-            connected: Mask of ranks whose current process has an open liveness connection.
+        ``connected`` masks the ranks whose current process has an open liveness connection. Also
+        update ``stalled_replacements`` and, when a change ends, ``last_transaction``.
         """
         before, committed = self.record.state, self._committed_mask
         record = self._decide(now_s, reports, connected)
@@ -289,10 +285,7 @@ class Authority:
         return self._commit(active)
 
     def _rank_replied(self, r: int, reports: Dict[int, RankReport], reply: Reply) -> bool:
-        """Check that rank ``r`` replied ``reply`` to the current record.
-
-        A joining rank reports its readiness before the PROPOSE. That report counts as its READY.
-        """
+        """Return whether rank ``r`` replied ``reply``, counting a joiner's readiness as READY."""
         report = reports.get(r)
         ready_to_join = r in self._joining and report is not None and report.joining_ready
         return (reply == Reply.READY and ready_to_join) or self._replied(report, reply)
@@ -470,9 +463,9 @@ class Authority:
         Progress counts its iteration, install steps, and the all-to-all rounds and host
         collective epochs its peers wait on. During a change the ranks that have not replied are
         waited on, and during startup the ranks that have not started. A rank's waits count only
-        while its reports advance. Rank 0 idle while waiting for requests is never hung. A joining rank is hung
-        after at most :data:`ADMISSION_TIMEOUT_S`, so the survivors do not pause a full hang
-        timeout for it.
+        while its reports advance. Rank 0 idle while waiting for requests is never hung. A joining
+        rank is hung after at most :data:`ADMISSION_TIMEOUT_S`, so the survivors do not pause a full
+        hang timeout for it.
 
         Also record the failure causes and since when the active ranks stall.
         """

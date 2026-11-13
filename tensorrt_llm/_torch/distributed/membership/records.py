@@ -71,9 +71,8 @@ def launcher_free_env(environ: Mapping[str, str]) -> Dict[str, str]:
 def rank_env(environ: Mapping[str, str]) -> Dict[str, str]:
     """Return ``environ`` for a rank, a one-process MPI world started outside the launcher's job.
 
-    Keep the opt-in to running as root, and the user's ``btl`` selection without the shared-memory
-    transport, which has no peer in a one-process world and leaves a /dev/shm segment behind after a
-    kill.
+    Keep the opt-in to running as root, and drop the shared-memory ``btl``, which has no peer in a
+    one-process world and leaves a /dev/shm segment behind after a kill.
     """
     env = launcher_free_env(environ)
     env.update((name, environ[name]) for name in _RUN_AS_ROOT_VARS if name in environ)

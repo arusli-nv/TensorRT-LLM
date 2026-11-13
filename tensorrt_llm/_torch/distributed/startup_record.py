@@ -53,21 +53,14 @@ class ReplacementCannotStart(SystemExit):
 
 
 def diverged(reason: str) -> ReplacementCannotStart:
-    """Return the failure of a replacement whose startup diverges from the original ranks' at the caller.
-
-    The message ends with the caller's stack outside this module, where the startups diverge.
-    """
+    """Return the failure of a replacement whose startup diverges at the caller, with its stack."""
     frames = [frame for frame in traceback.extract_stack() if frame.filename != __file__]
     stack = "".join(traceback.format_list(frames[-_DIVERGING_CALL_FRAMES:])).rstrip()
     return ReplacementCannotStart(f"{reason}. The diverging call (most recent call last):\n{stack}")
 
 
 class RecordedExchange(NamedTuple):
-    """A startup collective and every rank's pickled payload as rank 0 received it.
-
-    ``rank_varying`` names the :meth:`StartupRecord.rank_varying` block of the collective, or is
-    None outside such a block.
-    """
+    """A startup collective's :meth:`StartupRecord.rank_varying` block and rank 0's payloads."""
 
     rank_varying: Optional[str]
     payloads: List[Optional[bytes]]
@@ -149,7 +142,7 @@ class StartupRecord:
         self._pauses += 1
 
     def resume(self) -> None:
-        """End the innermost :meth:`pause`, and on an original rank keep the tactics tuned meanwhile.
+        """End the innermost :meth:`pause`, and on an original rank keep the tactics tuned in it.
 
         Raises:
             RuntimeError: No :meth:`pause` is open.
@@ -203,11 +196,8 @@ class StartupRecord:
     def agree(self, name: str, gather: Callable[[], Any], per_process: bool = False) -> Any:
         """Return the result of ``gather``, or rank 0's recorded result while a replacement replays.
 
-        Args:
-            name: The name of the startup value.
-            gather: The collective that returns the value.
-            per_process: Record and replay the value even while paused. Set it for an agreement that
-                each process makes once, whichever executor it starts first.
+        ``per_process`` records and replays the value even while paused, for an agreement that each
+        process makes once, whichever executor it starts first.
         """
         recorded_now = not self._pauses or per_process
         if self._replaying and recorded_now:
@@ -237,11 +227,8 @@ class StartupRecord:
     ) -> int:
         """Return the ``capacity`` of rank ``rank``, or its predecessor's on a replacement rank.
 
-        ``gather`` returns every rank's ``capacity``.
-
-        Raises:
-            RuntimeError: The replacement rank's own ``capacity`` is below its predecessor's. A
-                restart may not repeat this once the predecessor's memory is free.
+        ``gather`` returns every rank's ``capacity``. A replacement's own ``capacity`` below its
+        predecessor's raises RuntimeError, which a restart may not repeat once that memory is free.
         """
         recorded = self.agree(name, gather)[rank]
         if recorded > capacity:

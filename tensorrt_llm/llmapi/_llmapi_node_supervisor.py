@@ -73,7 +73,6 @@ class _Process:
     admitted_s: Optional[float] = None
     # The reason the membership left it out while it joined.
     left_out_reason: str = ""
-    # When the supervisor killed it.
     killed_s: Optional[float] = None
     status: Optional[int] = None
     started_s: float = 0.0
@@ -597,7 +596,7 @@ class NodeSupervisor:
         connector.start()
 
     def _open_connection(self, connecting: concurrent.futures.Future) -> None:
-        """Open the supervisor's connection to the authority as the result of ``connecting``.
+        """Open the connection to the authority as the result of ``connecting``.
 
         Send no hello once the supervisor stopped, since the authority would count the node as
         connected.

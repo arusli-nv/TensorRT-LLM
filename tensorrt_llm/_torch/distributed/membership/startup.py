@@ -69,15 +69,8 @@ def ensure_rendezvous(
     """Return the shared secret and rendezvous address for the ranks this process starts.
 
     Exported values are kept. Otherwise the secret is new, and an SO_REUSEADDR socket that never
-    listens reserves the port, so the authority can still bind it. Keep the socket open while the
-    deployment runs. An attached serving frontend starts no rank, so it gets no values.
-
-    Args:
-        orchestrator_type: ``orchestrator_type`` from the LLM arguments.
-
-    Returns:
-        The environment variables to start the ranks with, and the socket that reserves the port,
-        if any.
+    listens reserves the port, so the authority can still bind it. Keep the returned socket open
+    while the deployment runs. An attached serving frontend starts no rank, so it gets no values.
 
     Raises:
         ValueError: The deployment does not use the MPI executor, this process is a rank of an MPI
@@ -211,12 +204,8 @@ def wait_for_node_host_weights(
 ) -> None:
     """Wait until the other ranks on this node hold their EPLB host weights.
 
-    The node's shared memory shows when a peer's replacement has rebuilt them.
-
-    Args:
-        rank: The rank this process replaces.
-        ranks_without_host_weights: Return the other ranks on this node whose host weights are
-            missing or broken.
+    ``ranks_without_host_weights`` returns the other ranks on this node whose host weights in the
+    node's shared memory are missing or broken.
 
     Raises:
         ReplacementCannotStart: An active rank's host weights are missing or broken, or a rank
@@ -294,10 +283,7 @@ def start_rank(worker_main_args: dict) -> None:
 
 
 def _worker_args_for_other_ranks(worker_main_args: dict) -> bytes:
-    """Return rank 0's worker arguments without its IPC addresses and keys.
-
-    The rendezvous store does not encrypt its values.
-    """
+    """Return rank 0's worker arguments without IPC addresses and keys, for the plaintext store."""
     from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
 
     return pickle.dumps(
@@ -417,10 +403,7 @@ _startup_waiting_for = 0
 
 
 def _report_startup_wait(waiting_for: int) -> None:
-    """Report each change in the peers that a startup collective waits for.
-
-    A ``waiting_for`` of 0 means that the collective completed.
-    """
+    """Report each change in the peers that a startup collective waits for, 0 once it completed."""
     global _startup_steps, _startup_waiting_for
     if waiting_for and waiting_for == _startup_waiting_for:
         return
