@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the host collectives over MNNVL memory, ``TPHostExchange`` and ``MnnvlDist``.
+"""Tests for the host collectives over MNNVL memory, ``HostExchange`` and ``MnnvlDist``.
 
 The ranks run in threads of one process and exchange over rows of host memory.
 """
@@ -37,7 +37,7 @@ from tensorrt_llm._torch.distributed import (
     mnnvl_host_exchange,
     mnnvl_memory,
 )
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
+from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist
 from tensorrt_llm._torch.distributed.membership import (
     Authority,
     RankReport,
@@ -60,7 +60,7 @@ JOIN_TIMEOUT_S = 30.0
 
 
 class _HostCopies:
-    """Run the copies and the native wait of TPHostExchange between host addresses, each whole."""
+    """Run the copies and the native wait of HostExchange between host addresses, each whole."""
 
     CUresult = SimpleNamespace(CUDA_SUCCESS=0)
     CUmemorytype = SimpleNamespace(CU_MEMORYTYPE_DEVICE="device", CU_MEMORYTYPE_HOST="host")
@@ -132,7 +132,7 @@ _SLOT_BYTES = 64
 
 
 def _host_exchange_group(monkeypatch, nranks, slot_bytes):
-    """Return a TPHostExchange for each of ``nranks`` ranks over shared host rows."""
+    """Return a HostExchange for each of ``nranks`` ranks over shared host rows."""
     copies = _HostCopies()
     monkeypatch.setattr(mnnvl_memory, "cuda", copies)
     monkeypatch.setattr(mnnvl_host_exchange, "wait_for_slots", copies.wait_for_slots)
@@ -143,7 +143,7 @@ def _host_exchange_group(monkeypatch, nranks, slot_bytes):
     stride = MnnvlHostExchangeGroup.buffer_bytes(nranks, slot_bytes)
     memory = np.zeros(nranks * stride, dtype=np.uint8)
     return [
-        TPHostExchange(
+        HostExchange(
             MnnvlHostExchangeGroup(rank, nranks, _HostRows(memory, stride, rank), slot_bytes)
         )
         for rank in range(nranks)
@@ -415,7 +415,7 @@ class _LocalGroup:
 def test_exchange_over_any_group():
     """Check a round, a cancel and an install over a group that has only the interface."""
     slots = {}
-    exchanges = [TPHostExchange(_LocalGroup(rank, 3, slots)) for rank in range(3)]
+    exchanges = [HostExchange(_LocalGroup(rank, 3, slots)) for rank in range(3)]
 
     def survivor(exchange):
         first = exchange.exchange(b"r%d" % exchange.rank)
@@ -440,7 +440,7 @@ def test_exchange_over_any_group():
 def test_lagging_rank_takes_completed_round():
     """Check that a rank one round behind takes the round that its install completed."""
     slots = {}
-    exchange = TPHostExchange(_LocalGroup(0, 2, slots))
+    exchange = HostExchange(_LocalGroup(0, 2, slots))
     exchange.interrupted = lambda: bool(exchange.waiting_for & 0b10)
 
     def change():
@@ -603,7 +603,7 @@ def test_communicators_share_host_exchange(fresh_distributed, monkeypatch):
         created.append(mapping)
         return SimpleNamespace(rank=mapping.tp_rank, nranks=mapping.tp_size)
 
-    monkeypatch.setattr(TPHostExchange, "create", classmethod(create))
+    monkeypatch.setattr(HostExchange, "create", classmethod(create))
     Distributed.set_implementation(MnnvlDist.create, StartupRecord())
     with monkeypatch.context() as patched:
         patched.setattr(MnnvlDist, "check_requirements", staticmethod(lambda mapping: None))

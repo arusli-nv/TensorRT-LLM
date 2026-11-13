@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests that compare MnnvlDist's host collectives over TPHostExchange with MPIDist's."""
+"""Tests that compare MnnvlDist's host collectives over HostExchange with MPIDist's."""
 
 import contextlib
 import math
@@ -31,7 +31,7 @@ from utils.util import skip_no_mnnvl_fabric_handles
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed.communicator import MPIDist, ReduceOp
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
+from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist
 from tensorrt_llm._torch.distributed.membership import latest_epoch, next_epoch
 from tensorrt_llm._torch.distributed.mnnvl_host_exchange import (
     HostExchangeMnnvlMemory,
@@ -103,7 +103,7 @@ def _collectives(tp):
     values = [rank, -rank, 2**40 + rank]
     assert np.array_equal(mnnvl.tp_allgather_int64(values), mpi.tp_allgather_int64(values))
     # Rows that arrive with their headers, that need a second poll, and that take several rounds.
-    slot_values = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 8
+    slot_values = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 8
     for n in (0, 1, MnnvlHostExchangeGroup._HEADER_POLL_PACKETS, slot_values, 2 * slot_values + 3):
         row = np.arange(n, dtype=np.int64) * (rank + 1) - 2**40
         assert np.array_equal(mnnvl.tp_allgather_int64(row), mpi.tp_allgather_int64(row)), n
@@ -121,7 +121,7 @@ def _stress(tp):
     """Check many gathers of random sizes, up to three rounds each, byte for byte."""
     mnnvl, _, rank = _dists(tp)
     rng = np.random.default_rng(1234)
-    slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
+    slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
     for step in range(2000):
         # Every rank draws the same sizes.
         sizes = rng.integers(0, 3 * slot, size=tp)
@@ -154,7 +154,7 @@ def _epoch_wrap(tp):
     assert 1 in epochs, epochs
     assert all((a ^ b) & 1 for a, b in zip(epochs, epochs[1:])), epochs
     exchange.admit(exchange.active_mask, 0xFFFFFFFE - 3)
-    half_slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 2
+    half_slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES // 2
     for step in range(16):
         # Each payload takes two rounds.
         large = bytes([step, rank]) * (half_slot + 100 * rank)
@@ -215,7 +215,7 @@ def _membership(tp):
     mnnvl, mpi, rank = _dists(tp)
     exchange = mnnvl.host_exchange
     all_ranks = (1 << tp) - 1
-    slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
+    slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
     payloads = (
         lambda r: {"rank": r},
         lambda r: bytes([r]) * (100 + r),
@@ -292,12 +292,10 @@ def _admission(tp):
     if rank == leaver:
         _skip_rebuild(mpi)
         exchange.group.rows.close()
-        slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
+        slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
         isolated = StoreGroup(None, "rows", rank, range(tp), active=[rank])
         rows = HostExchangeMnnvlMemory(isolated, MnnvlHostExchangeGroup.buffer_bytes(tp, slot))
-        exchange = mnnvl._host_exchange = TPHostExchange(
-            MnnvlHostExchangeGroup(rank, tp, rows, slot)
-        )
+        exchange = mnnvl._host_exchange = HostExchange(MnnvlHostExchangeGroup(rank, tp, rows, slot))
     else:
         _rebuild(exchange, _MpiGroup(), survivors, epoch)
         assert mnnvl.allgather(rank) == [r if _in_mask(survivors, r) else None for r in range(tp)]
@@ -446,7 +444,7 @@ def _payload_rows(tp):
 
 
 class _DeviceRows:
-    """Hold the rows of a ``TPHostExchange`` whose ranks are all in this process, in device memory."""
+    """Hold the rows of a ``HostExchange`` whose ranks are all in this process, in device memory."""
 
     def __init__(self, nranks, nbytes):
         self._memory = torch.zeros(nranks * nbytes, dtype=torch.uint8, device="cuda")
@@ -459,9 +457,9 @@ class _DeviceRows:
 def _local_exchange(nranks):
     """Return rank 0 of a ``nranks``-rank exchange whose other ranks never send unless told to."""
     torch.cuda.set_device(tensorrt_llm.mpi_rank())
-    slot = TPHostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
+    slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
     rows = _DeviceRows(nranks, MnnvlHostExchangeGroup.buffer_bytes(nranks, slot))
-    return TPHostExchange(MnnvlHostExchangeGroup(0, nranks, rows, slot))
+    return HostExchange(MnnvlHostExchangeGroup(0, nranks, rows, slot))
 
 
 def _wait_until(condition, timeout_s=10.0):

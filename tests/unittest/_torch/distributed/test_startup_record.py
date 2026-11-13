@@ -32,7 +32,7 @@ import pytest
 from tensorrt_llm._torch.autotuner import AutoTuner, DistributedTuningStrategy
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist, TPHostExchange
+from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START, startup
 from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
 from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
@@ -60,7 +60,7 @@ GIB = 1 << 30
 
 
 class FakeHostExchange:
-    """Fake the ``TPHostExchange`` of ``rank``, where peer ``r`` sends ``peers(r, obj)``."""
+    """Fake the ``HostExchange`` of ``rank``, where peer ``r`` sends ``peers(r, obj)``."""
 
     def __init__(self, rank, active_mask=(1 << WORLD) - 1, peers=lambda r, obj: obj):
         self.rank, self.active_mask, self.peers = rank, active_mask, peers
@@ -107,7 +107,7 @@ def _dist(rank, host_exchange):
             get_node_rank=lambda rank: 0,
         )
     )
-    with patch.object(TPHostExchange, "create", return_value=host_exchange):
+    with patch.object(HostExchange, "create", return_value=host_exchange):
         assert dist.host_exchange is host_exchange
     return dist
 

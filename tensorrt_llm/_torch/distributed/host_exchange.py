@@ -16,7 +16,7 @@
 
 ``MnnvlDist`` implements the attention-DP host collectives of ``Distributed`` without MPI, so they
 keep working after a rank fails or a replacement joins. Each collective is one or more rounds of
-``TPHostExchange``, which runs every round over a ``HostExchangeGroup``. The group moves one slot
+``HostExchange``, which runs every round over a ``HostExchangeGroup``. The group moves one slot
 per rank; the exchange owns the epochs, the active ranks and the agreement on a round that a
 membership change interrupted. ``MnnvlHostExchangeGroup`` moves the slots through MNNVL memory.
 """
@@ -42,7 +42,7 @@ from .mnnvl_host_exchange import MnnvlHostExchangeGroup
 
 
 class HostExchangeGroup(Protocol):
-    """Transport of ``TPHostExchange``: rounds that move one slot per rank among the active ranks.
+    """Transport of ``HostExchange``: rounds that move one slot per rank among the active ranks.
 
     A round returns one row of packets per sender, in the slot layout of ``mnnvl_host_exchange``. A
     backend may build them on receipt.
@@ -104,7 +104,7 @@ class HostExchangeGroup(Protocol):
         """
 
 
-class TPHostExchange:
+class HostExchange:
     """All-to-all of byte strings between the host processes of a TP group.
 
     Every active rank gets the same result across a membership change. If a rank fails in a round
@@ -148,8 +148,8 @@ class TPHostExchange:
         self._ranks_by_mask: dict[int, tuple[np.ndarray, list[int]]] = {}
 
     @classmethod
-    def create(cls, mapping, group_type: type[HostExchangeGroup]) -> "TPHostExchange":
-        """Create the TP group's exchange over ``group_type``, collectively over its ranks."""
+    def create(cls, mapping, group_type: type[HostExchangeGroup]) -> "HostExchange":
+        """Create the exchange over ``group_type``, collectively over the TP group's ranks."""
         group, active_mask = group_type.open(mapping, cls.DEFAULT_SLOT_PAYLOAD_BYTES)
         exchange = cls(group)
         exchange.active_mask = active_mask
@@ -496,7 +496,7 @@ class MnnvlDist(Distributed):
 
     @property
     def host_exchange(self):
-        """Return the ``TPHostExchange``, created collectively on first use.
+        """Return the ``HostExchange``, created collectively on first use.
 
         Raises:
             RuntimeError: The exchange this communicator shares serves another TP group.
@@ -504,7 +504,7 @@ class MnnvlDist(Distributed):
         if self._host_exchange is None:
             owner = self._host_exchange_owner
             exchange = (
-                TPHostExchange.create(self.mapping, self.group_type)
+                HostExchange.create(self.mapping, self.group_type)
                 if owner is self
                 else owner.host_exchange
             )
@@ -519,7 +519,7 @@ class MnnvlDist(Distributed):
     def _exchange(
         self, obj, readers=None, recipients=None, idle=False, reduce_op=None, active_only=False
     ) -> list:
-        """Exchange ``obj`` as ``TPHostExchange.exchange`` does, and unpickle the payloads.
+        """Exchange ``obj`` as ``HostExchange.exchange`` does, and unpickle the payloads.
 
         ``reduce_op`` (``min`` or ``max``) lets a replacement's startup replay check its own value
         against the original ranks' reduced result. ``active_only`` drops inactive ranks.
