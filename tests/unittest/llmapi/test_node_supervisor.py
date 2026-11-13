@@ -1224,6 +1224,19 @@ def test_exit_skips_connect_in_flight(deployment, monkeypatch, supervisor_proces
         assert supervisor.wait(10) == 128 + signal.SIGTERM
 
 
+def test_supervisor_removes_cpu_affinity_constraints(deployment, supervisor_process):
+    """Run the supervisor on every CPU, though its launcher binds it to one."""
+    _, environ = deployment
+    environ.pop("TLLM_NUMA_AWARE_WORKER_AFFINITY", None)
+    allowed = os.sched_getaffinity(0)
+    if len(allowed) < 2:
+        pytest.skip("needs two CPUs")
+    supervisor = supervisor_process(
+        environ, serving=True, preexec_fn=lambda: os.sched_setaffinity(0, {min(allowed)})
+    )
+    assert os.sched_getaffinity(supervisor.pid) >= allowed
+
+
 def test_signal_forwarded_to_rank_0_only(tmp_path, deployment, supervisor_process, fake_mpirun):
     """Forward the signal to rank 0, which runs the frontend, and later SIGTERM the other ranks."""
     _, environ = deployment

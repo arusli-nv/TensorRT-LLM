@@ -53,6 +53,7 @@ from .records import (
     next_epoch,
     rank_env,
     rank_mask,
+    remove_cpu_affinity_constraints,
 )
 from .rendezvous import (
     LIVENESS_KEY,
@@ -109,6 +110,7 @@ __all__ = [
     "parse_shared_secret",
     "rank_env",
     "rank_mask",
+    "remove_cpu_affinity_constraints",
     "rendezvous_host_port",
     "rendezvous_store",
     "wait_for_keys",

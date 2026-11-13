@@ -674,6 +674,40 @@ def test_single_node_authority_listens_on_loopback_only(monkeypatch):
                 taken.close()
 
 
+@pytest.mark.parametrize(
+    "numa_aware_affinity", [None, "1", "0"], ids=["unset", "opted_in", "opted_out"]
+)
+def test_authority_removes_cpu_affinity_constraints(monkeypatch, numa_aware_affinity):
+    """Run the authority on every CPU, though rank 0 starts it bound to one.
+
+    With ``TLLM_NUMA_AWARE_WORKER_AFFINITY`` set to ``0``, the authority keeps the binding it
+    inherits.
+    """
+    allowed = os.sched_getaffinity(0)
+    if len(allowed) < 2:
+        pytest.skip("needs two CPUs")
+    for name in (SHARED_SECRET_ENV, RENDEZVOUS_ENV, "TLLM_NUMA_AWARE_WORKER_AFFINITY"):
+        monkeypatch.delenv(name, raising=False)
+    if numa_aware_affinity is not None:
+        monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", numa_aware_affinity)
+    env, reserved = startup_module.ensure_rendezvous(None)
+    with reserved:
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        bound = {min(allowed)}
+        os.sched_setaffinity(0, bound)
+        try:
+            process = startup_module._start_authority(world_size=1, gpus_per_node=1, timeout_s=60.0)
+        finally:
+            os.sched_setaffinity(0, allowed)
+        try:
+            affinity = os.sched_getaffinity(process.pid)
+            assert affinity == bound if numa_aware_affinity == "0" else affinity >= allowed
+        finally:
+            process.kill()
+            process.wait()
+
+
 @pytest.mark.parametrize("forger_secret", [None, "cd" * 32], ids=["unsigned", "other_secret"])
 def test_forged_worker_args_are_never_unpickled(launched, monkeypatch, forger_secret):
     """Reject worker args that a process without the deployment's secret set, before unpickling them."""

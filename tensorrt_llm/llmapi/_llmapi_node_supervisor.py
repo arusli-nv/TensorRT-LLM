@@ -910,6 +910,7 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
         RENDEZVOUS_ENV,
         SHARED_SECRET_ENV,
         parse_shared_secret,
+        remove_cpu_affinity_constraints,
         rendezvous_host_port,
     )
     from tensorrt_llm.llmapi._mpirun_job import end_job_function
@@ -942,6 +943,7 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
             end_job = end_job_function(environ, args.nodes)
         except ValueError as error:
             parser.error(str(error))
+    remove_cpu_affinity_constraints()
     supervisor = NodeSupervisor(
         args.node_rank,
         args.nodes,

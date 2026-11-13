@@ -47,6 +47,7 @@ from .records import (
     has_rank,
     message_bytes,
     rank_mask,
+    remove_cpu_affinity_constraints,
 )
 from .rendezvous import (
     LIVENESS_KEY,
@@ -160,10 +161,16 @@ class AuthorityProcess:
         decide_s = time.monotonic()
         while True:
             self._poll(max(0.0, decide_s - time.monotonic()))
-            if not self._changed and time.monotonic() < decide_s:
+            now_s = time.monotonic()
+            if not self._changed and now_s < decide_s:
                 continue
+            if now_s - decide_s > HEARTBEAT_INTERVAL_S:
+                logger.warning(
+                    f"The membership authority decided {now_s - decide_s:.1f} s late, so its "
+                    "heartbeats to the ranks were late too"
+                )
             self._changed = False
-            decide_s = time.monotonic() + REPORT_INTERVAL_S
+            decide_s = now_s + REPORT_INTERVAL_S
             self._send_heartbeats(time.monotonic())
             summary = self._authority.last_transaction
             if self._parent_ended_s is not None:
@@ -525,6 +532,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--gpus-per-node", type=int, required=True)
     parser.add_argument("--address-fd", type=int, required=True)
     args = parser.parse_args(argv)
+    remove_cpu_affinity_constraints()
 
     from torch.distributed import TCPStore
 

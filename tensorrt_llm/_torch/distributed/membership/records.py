@@ -20,6 +20,7 @@ whose bit ``r`` is set when it holds rank ``r``.
 """
 
 import enum
+import os
 from typing import Dict, Iterable, List, Literal, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict
@@ -66,6 +67,20 @@ def launcher_free_env(environ: Mapping[str, str]) -> Dict[str, str]:
         for name, value in environ.items()
         if not name.startswith(_LAUNCHER_ENV_PREFIXES)
     }
+
+
+def remove_cpu_affinity_constraints() -> None:
+    """Let this process run on every CPU unless ``TLLM_NUMA_AWARE_WORKER_AFFINITY`` opts out.
+
+    As ``configure_cpu_affinity`` does for a worker, override the inherited binding when the variable
+    is unset or ``1``, and keep it for any other value. A process that uses no GPU has no NUMA node to
+    pick, so it runs on every CPU. Without this, a process inherits its parent's binding, which a
+    launcher can set to the one CPU that rank 0 starts on.
+    """
+    from tensorrt_llm.llmapi.utils import _set_affinity_all_threads
+
+    if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None, "1"):
+        _set_affinity_all_threads(list(range(os.cpu_count())))
 
 
 def rank_env(environ: Mapping[str, str]) -> Dict[str, str]:
