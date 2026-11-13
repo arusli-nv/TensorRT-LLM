@@ -728,6 +728,8 @@ class Clients(_Threads):
                     request.token_ids.extend(ids)
             if chunk.get("usage"):
                 request.completion_tokens = chunk["usage"]["completion_tokens"]
+        # A stream that breaks off ends the iteration without an exception.
+        request.error = "the stream ended before [DONE]"
 
     def load_requests(self) -> List[Request]:
         return [r for r in self.requests if r.question is None]
