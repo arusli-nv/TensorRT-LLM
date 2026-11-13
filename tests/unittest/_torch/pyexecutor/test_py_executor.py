@@ -2120,18 +2120,31 @@ def test_kv_pool_resize_runs_with_every_cache_suspended():
 
 
 def test_fail_requests_by_id_flushes_errors():
-    """Check that requests failed by id reach the next flush of the buffered responses."""
+    """Check that requests failed by id reach the next flush, each with its own error.
+
+    The client raises the error of every failed response, so a shared exception would grow its
+    traceback with every raise.
+    """
     executor = object.__new__(PyExecutor)
     executor._pending_transfer_responses = []
     executor._pending_response_terminations = []
     executor.enable_attention_dp = True
     executor._enqueue_responses = Mock()
     error = RankFailureError()
-    executor.fail_requests_by_id({11: 111}, error)
+    executor.fail_requests_by_id({11: 111, 12: 112, 13: 113}, error)
     executor._flush_pending_transfer_responses()
     ((responses,), _) = executor._enqueue_responses.call_args
-    ((request_id, response),) = responses
-    assert (request_id, response.client_id, response.error_msg) == (11, 111, error)
+    assert [(request_id, response.client_id) for request_id, response in responses] == [
+        (11, 111),
+        (12, 112),
+        (13, 113),
+    ]
+    for _, response in responses:
+        assert type(response.error_msg) is RankFailureError
+        assert str(response.error_msg) == str(error)
+        with pytest.raises(RankFailureError) as raised:
+            raise response.error_msg
+        assert raised.value.__traceback__.tb_next is None
 
 
 def _previous_batch_consumer(consumer, dropped):

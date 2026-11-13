@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import atexit
+import copy
 import dataclasses
 import datetime
 import math
@@ -2021,14 +2022,19 @@ class PyExecutor:
         The error responses go out with the next flush of the buffered
         responses. Every rank runs that flush in lockstep.
 
+        Each response carries its own copy of ``error``, since the client
+        raises the error of every failed response and an exception raised
+        more than once keeps the traceback of every raise.
+
         Args:
             client_ids: The client id of each request to fail, by request id.
             error: The error that every response carries.
         """
         self._pending_transfer_responses.extend(
             (request_id,
-             LlmResponse(
-                 request_id=request_id, error_msg=error, client_id=client_id))
+             LlmResponse(request_id=request_id,
+                         error_msg=copy.copy(error),
+                         client_id=client_id))
             for request_id, client_id in client_ids.items())
 
     def _flush_iter_stats_synced(self):
