@@ -2028,7 +2028,9 @@ class PyExecutor:
 
         Args:
             client_ids: The client id of each request to fail, by request id.
-            error: The error that every response carries.
+            error: The error that every response carries. An exception
+                must be copyable with ``copy.copy``, which rebuilds it from
+                its ``args``.
         """
         self._pending_transfer_responses.extend(
             (request_id,

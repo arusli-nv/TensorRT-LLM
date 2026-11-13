@@ -58,6 +58,7 @@ from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import SERVING_TIMEOUT_ENV
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor import rank_failure_memory as memory_module
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery_module
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -66,6 +67,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.rank_failure_memory import StartupMemory
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import (
@@ -77,6 +79,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
 from tensorrt_llm.executor.rank_failure_requests import RankFailureError
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.llmapi.llm_args import LoadFormat
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -461,6 +464,32 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
             else check
         )()
     assert "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)" in str(error.value)
+
+
+def test_model_load_checks_support_before_building_model(monkeypatch):
+    """Check that the model load refuses an unsupported setup before it builds the model."""
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    monkeypatch.setattr(
+        recovery_module,
+        "create_moe_load_balancer",
+        lambda config, mapping: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        model_loader_module.AutoModelForCausalLM,
+        "from_config",
+        Mock(side_effect=AssertionError("the model was built before the support check")),
+    )
+    llm_args = SimpleNamespace(
+        enable_wide_ep_fault_tolerance=True,
+        load_format=LoadFormat.AUTO,
+        disable_overlap_scheduler=False,
+        kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True),
+    )
+    mapping = SimpleNamespace(moe_ep_size=WORLD, world_size=WORLD)
+    loader = ModelLoader(llm_args, mapping, None, None, max_num_tokens=128, max_seq_len=128)
+    loader._load_and_validate_config = Mock(return_value=SimpleNamespace(pretrained_config=None))
+    with pytest.raises(ValueError, match="TLLM_FAULT_TOLERANCE_MODE unset"):
+        loader.load("/ckpt", Mock())
 
 
 # Host weights. Every node keeps the weights of every expert in /dev/shm.

@@ -84,7 +84,7 @@ class HostExchangeGroup(Protocol):
 
     @property
     def waiting_for(self) -> int:
-        """Return the ranks the current wait lacks packets from, or every active peer. Thread-safe."""
+        """Return the mask of ranks the current wait still lacks packets from. Thread-safe."""
 
     def end_wait(self) -> None:
         """Forget the ranks that the last wait lacked packets from."""
