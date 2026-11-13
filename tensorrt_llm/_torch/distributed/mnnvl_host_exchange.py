@@ -202,7 +202,7 @@ class MnnvlHostExchangeGroup:
                 (
                     False,
                     "GPUs in one multi-node NVLink (MNNVL) domain, such as a GB200 NVL72, "
-                    "because fault tolerance fences off a failed rank by remapping its memory",
+                    "because fault tolerance isolates a failed rank by remapping its memory",
                 )
             ]
         return [

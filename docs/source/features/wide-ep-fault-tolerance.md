@@ -81,10 +81,10 @@ Fault tolerance rejects at startup, with the reason, what it does not support:
 | Sleep mode | Not supported yet: sleep releases and restores the weights' memory, whose spare slots fault tolerance backs and unbacks itself |
 | Userbuffers, `enable_lm_head_tp_in_adp`, disaggregated serving | Userbuffers exchange handles over an MPI world of every rank; a failed rank would take its vocabulary share; KV transfers do not follow a membership change |
 | TRTLLM-Gen and DeepGEMM (so FP8 DeepSeek-R1, which runs TRTLLM-Gen by default on GB200), CuteDSL with locality domains or on SM107, and other MoE backends without spare-slot tuning | Their tuner profiles the unbacked spare slots |
-| DeepEP, MegaMoE and other MoE communication besides `NVLinkOneSided`; `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=1` | They lack the active rank mask, the abort state or the fence path, the all-to-all mode that keeps a failed rank's late writes out of the survivors' memory |
+| DeepEP, MegaMoE and other MoE communication besides `NVLinkOneSided`; `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=1` | They lack the active rank mask, the abort state, the fence path (the all-to-all synchronization mode that honors both) or the late-write remap, which remaps a failed rank's peer memory at the same addresses so that its late writes stay out of the survivors' memory |
 | `TLLM_FAULT_TOLERANCE_MODE=1` | It gives the MoE layers an EP group health of their own, which the option replaces |
 | Architectures other than `DeepseekV3ForCausalLM`; `modeling_v2: require` | Only DeepSeek-V3 and DeepSeek-R1 are tested, and no `modeling_v2` model supports fault tolerance |
-| `TLLM_DISABLE_MPI`, the Ray and RPC executors, no MNNVL or no fabric memory handles, a `torch.distributed` process group created at startup, the server started on every rank of an MPI job | The membership comes with the MPI executor; host collectives and the fence use MNNVL memory; every rank is its own process, so a replacement could not rejoin such a group |
+| `TLLM_DISABLE_MPI`, the Ray and RPC executors, no MNNVL or no fabric memory handles, a `torch.distributed` process group created at startup, the server started on every rank of an MPI job | The membership comes with the MPI executor; host collectives and the late-write remap use MNNVL memory; every rank is its own process, so a replacement could not rejoin such a group |
 | Node supervisors started by `srun` | Slurm's PMIx plugin cancels the job step when one of them exits |
 | On several nodes, `mpirun` on another host than node 0's, or without `--enable-recovery` on its command line | Without recovery the first rank exit ends the job, and node 0 ends a failed job through its `mpirun` |
 | An all-to-all timeout under 120 s, too little `/dev/shm` for the host weights, a KV cache that cannot lend the largest failure's restore | The all-to-all must outlast the hang timeout twice; the resources a recovery needs are checked up front |
@@ -109,11 +109,11 @@ Planned next steps, each an extension of an existing interface:
 | KV cache events, connectors and compression | KV cache manager V2's deferred reuse commit and pool resize |
 | Sleep mode | The spare-slot storage that fault tolerance backs and unbacks |
 | More MoE backends (TRTLLM-Gen and DeepGEMM for FP8 DeepSeek-R1, CuteDSL locality domains) | Spare-slot tuning (`supports_spare_slots`) |
-| More MoE communication (DeepEP, MegaMoE) | The execution-state binding: the active rank mask, the abort state and the fence |
+| More MoE communication (DeepEP, MegaMoE) | The execution-state binding: the active rank mask, the abort state and the late-write remap |
 | A measured healthy cost within 1%, and the fixes it calls for | The host-collective implementation behind `Distributed` |
 | Online EPLB with host weights on two nodes per expert instead of every node | The EPLB host-weight sharer |
 | A restartable authority | The membership authority and its clients |
-| More than one NVLink domain | An RDMA all-to-all that fences by revoking memory keys, and a network host-collective transport |
+| More than one NVLink domain | An RDMA all-to-all that keeps late writes out by revoking memory keys, and a network host-collective transport |
 
 ## Configuration
 

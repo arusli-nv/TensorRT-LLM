@@ -301,7 +301,7 @@ def test_admission_refuses_row_of_departed_rank(memory, driver):
 @pytest.mark.parametrize(
     "absent, peers, fresh_pages",
     [
-        # Every process that maps the pages is active, so there is nothing to fence.
+        # Every process that maps the pages is active, so there is nothing to remap.
         (set(), {0: _ALL, 2: _ALL, 3: _ALL}, False),
         # Rank 3 failed, and its process may still write into the pages.
         (set(), {0: _ALL, 2: _ALL}, True),
