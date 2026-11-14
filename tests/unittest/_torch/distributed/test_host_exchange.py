@@ -497,6 +497,21 @@ def test_retried_install_keeps_completed_round(monkeypatch):
     np.testing.assert_array_equal(exchange._finished_round[2, : sent.size], sent)
 
 
+@pytest.mark.parametrize("stopped_epoch", [1, 2], ids=["in-round-1", "after-round-1"])
+def test_install_refused_two_rounds_behind(stopped_epoch):
+    """Check that a rank more than one round behind the latest active rank cannot install.
+
+    The rank stopped in round 1 or just after it, and the latest active rank finished round 3. The
+    peers' rows hold only one round, so the rank could not complete every round it missed.
+    """
+    exchange = HostExchange(_LocalGroup(0, 2, {}))
+    exchange.admit(0b11, 2)
+    exchange.stopped_epoch = stopped_epoch
+    with pytest.raises(RuntimeError, match="more than one round before the latest active rank"):
+        exchange.install(None, 0b11, 4)
+    assert exchange.group.installs == []
+
+
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("seed", range(4))
 def test_long_payloads_reach_only_recipients(monkeypatch, seed):

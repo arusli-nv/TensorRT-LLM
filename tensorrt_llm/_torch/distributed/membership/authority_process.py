@@ -469,19 +469,17 @@ class AuthorityProcess:
         """Return why a hello from ``rank`` is refused, or None to admit it.
 
         A replacement is admitted only once the membership no longer lists the rank, so its
-        connection never hides that its predecessor ended.
+        connection never hides that its predecessor ended. The startup's record lists every rank,
+        so no replacement joins before the deployment has started.
         """
         if not 0 <= rank < self.world_size:
             return f"rank {rank} is not in the deployment"
-        starting = self._authority.record.state == MembershipState.STARTING
         if replacement:
             if rank == 0:
                 return "rank 0 is never replaced"
-            if starting:
-                return "no replacement joins before the deployment has started"
             if self._authority.record.is_active(rank):
                 return f"rank {rank} is active: no replacement joins for it"
-        elif not starting:
+        elif self._authority.record.state != MembershipState.STARTING:
             return f"rank {rank} joins only as a replacement once the deployment has started"
         # A first process and a replacement alike join only while the rank has no connected process.
         if any(c.member is not None and c.member[0] == rank for c in self._connections.values()):

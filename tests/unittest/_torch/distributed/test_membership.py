@@ -1196,6 +1196,17 @@ def test_first_process_refused_after_startup(monkeypatch):
     )
 
 
+def test_replacement_outside_deployment_refused(monkeypatch):
+    """Refuse a replacement of a rank outside the deployment, which keeps serving."""
+    warning = Mock()
+    monkeypatch.setattr(authority.logger, "warning", warning)
+    with _deployment(2) as (store, clients):
+        assert _refused(store, 2, True)
+        assert _committed(clients[0], 0b11)
+    (message,) = [call.args[0] for call in warning.call_args_list if "liveness" in call.args[0]]
+    assert message == "Closing a liveness connection: rank 2 is not in the deployment"
+
+
 def _committed(client, active_mask):
     """Return whether ``client``'s newest record is COMMITTED with ``active_mask``."""
     record = client.record
