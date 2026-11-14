@@ -434,5 +434,5 @@ class MoEEplbWeightLayoutMixin:
                     )
                 else:
                     self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype, weight_tensor.shape[1:]
+                        expert_id, weight_name, weight_tensor.dtype, weight_tensor[0].shape
                     )
