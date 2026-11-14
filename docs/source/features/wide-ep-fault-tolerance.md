@@ -30,6 +30,12 @@ These are the main requirements. Startup checks them and others, and rejects a c
   and no piecewise prefill CUDA graphs (`prefill_cuda_graph_backend: piecewise`), and `enable_chunked_prefill` or a
   `max_seq_len` of at most `max_num_tokens`. Online EPLB (`layer_updates_per_iter` above 0) also needs CDMM mode and
   GDRCopy.
+- Each node's GPUs given to one deployment. A restarted node supervisor starts a rank's replacement only once NVML
+  lists no compute process on that rank's GPU.
+- Room in each rank's KV cache pool for its share of a lost node's experts, which startup checks: a refusal names the
+  GiB a rank needs and the `free_gpu_memory_fraction` that would give it. For DeepSeek-R1 NVFP4 with `num_slots: 256`
+  on nodes of 4 GPUs, the share is about 43 GiB on 2 nodes, 8 GiB on 4 nodes and 2.7 GiB on 8 nodes, plus the
+  all-to-all workspace, so use at least 4 nodes.
 
 ## Single node
 
@@ -106,8 +112,9 @@ CPUs, and no memory limit lower than the node's, because the replacements write 
 
 `--rejoin-node` makes the node's supervisor wait for the membership authority and start only replacements of the
 node's ranks, which load at once. Until the authority admits it, the supervisor connects again for up to 60 s, which
-covers a previous supervisor of the node that is still exiting. It exits with status 1 in four cases. The deployment
-has not started yet. The deployment has ended (shut down or aborted). The deployment's number of ranks is not
+covers a previous supervisor of the node that is still exiting. It exits with status 1 in five cases. The rendezvous
+store's values are not signed with this node's shared secret, so the secret differs from the deployment's. The
+deployment has not started yet. The deployment has ended (shut down or aborted). The deployment's number of ranks is not
 `--nodes` times the step's GPUs (check `--nodes` and the step's GPUs). No authority admitted the node within 60 s,
 because the deployment ended, the node's previous supervisor still runs (check with `ps` and `nvidia-smi`), or the
 node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the step's GPUs).

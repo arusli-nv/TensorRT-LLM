@@ -234,7 +234,8 @@ poll of free device memory, at most once a second, finds it free.
    The authority refuses a second supervisor for a node while the old one is still connected (`_node_refusal`), so
    the rejoining supervisor connects again for up to `DEAD_TIMEOUT_S` (60 s). It exits with status 1 when no
    authority admitted it within that time (the deployment ended, the old supervisor is still connected, or the
-   node's ranks are not in the deployment), when the record is `SHUTDOWN` or `ABORTED`, when the deployment has not
+   node's ranks are not in the deployment), when the store's values are not signed with this node's shared secret (`UnsignedValueError`, at
+   once), when the record is `SHUTDOWN` or `ABORTED`, when the deployment has not
    started, or when the record's rank count is not `--nodes` times the step's GPUs. Its report clears the node's
    given-up ranks, and their replacements rejoin in one membership change. A replacement of a rank that a previous
    supervisor started waits until no process runs on its GPU (NVML), polling every `_BACKOFF_S`, up to
