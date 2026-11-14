@@ -35,7 +35,11 @@ import torch
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+    ActiveRankMaskSnapshot,
+    AlltoAllWatchdog,
+    AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
+    EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
@@ -52,7 +56,6 @@ from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
-from ..ep_group_health import EPGroupHealth
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
 from .execution_state import MoeExecutionState
@@ -413,7 +416,7 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-        ep_group_health: Optional[EPGroupHealth] = None,
+        ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
@@ -694,25 +697,31 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = rank_mask
-        # Rank-mask layers over one EP group health share its execution state. A layer built for
-        # fault tolerance gets its state from bind_execution_state.
         self.execution_state: Optional[MoeExecutionState] = None
-        if self.ep_group_health is not None:
-            self.execution_state = MoeExecutionState.of(
-                self.ep_group_health, self.ep_rank, self.workspace.device
-            )
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
+        flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
+        dispatch_flags_offset_index = self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
+        combine_flags_offset_index = self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
+        if (
+            flag_val_offset_index is None
+            or dispatch_flags_offset_index is None
+            or combine_flags_offset_index is None
+        ):
+            raise RuntimeError("MoE All-to-All metadata indices are not initialized")
         self._workspace_lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
             workspace_state=workspace_state,
             memory=self.mnnvl_mem,
             workspace=self.workspace,
             metainfo=workspace_state["metainfo"],
+            metainfo_index={
+                "FLAG_VAL_OFFSET_INDEX": flag_val_offset_index,
+                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": dispatch_flags_offset_index,
+                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": combine_flags_offset_index,
+            },
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
-            waited_flags=(
-                None if self.execution_state is None else self.execution_state.waited_flags
-            ),
+            health=self.ep_group_health,
         )
         self._workspace_lifecycle.register(
             self,
@@ -750,6 +759,14 @@ class NVLinkOneSided(Communication):
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
         return self._require_workspace_lifecycle().metainfo
+
+    @property
+    def _watchdog_coordinator(self) -> AlltoAllWatchdogCoordinator:
+        return self._require_workspace_lifecycle().coordinator
+
+    @property
+    def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
+        return self._require_workspace_lifecycle().watchdog_for(self)
 
     def bind_execution_state(self, state: MoeExecutionState) -> None:
         """Run every later dispatch and combine with ``state``'s rank mask and abort state.
@@ -993,9 +1010,9 @@ class NVLinkOneSided(Communication):
             all_rank_num_tokens: Token counts per rank [ep_size]
             use_dp_padding: Whether to use DP padding (optional)
             **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` may override the
-                committed membership for dispatch. Without an override, dispatch writes the committed mask into
-                the device mask when its generation changed; combine reuses that mask and fails closed if another
-                dispatch changes it first. A layer bound to an execution state takes the mask its state installs.
+                committed membership for dispatch. Without an override, the committed mask and generation are
+                captured together; combine reuses that mask and fails closed if the generation changes first.
+                A layer bound to an execution state takes the mask its state installs.
                 The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
                 artifact, not valid model output.
 
@@ -1007,7 +1024,7 @@ class NVLinkOneSided(Communication):
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
         state = self.execution_state
-        if self._rank_mask_enabled and state is None:
+        if self._enable_wide_ep_fault_tolerance and state is None:
             raise RuntimeError(
                 "NVLinkOneSided with enable_wide_ep_fault_tolerance dispatches only once bound "
                 "(bind_execution_state)"
@@ -1047,20 +1064,20 @@ class NVLinkOneSided(Communication):
         requested_active_rank_mask = kwargs.get("active_rank_mask")
         if not self._rank_mask_enabled and requested_active_rank_mask is not None:
             raise ValueError("active_rank_mask requires committed EP group health")
-        active_rank_mask, abort_state = None, None
+        if state is not None and requested_active_rank_mask is not None:
+            # install_mask writes the mask of a bound layer, while the model is idle.
+            raise ValueError("A layer bound to an execution state takes no active_rank_mask")
+        active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
+            requested_active_rank_mask
+        )
+        active_rank_mask = active_rank_mask_snapshot.active_rank_mask
+        abort_state = None
         if state is not None:
-            if self._enable_wide_ep_fault_tolerance:
-                # install_mask writes the mask of a bound layer, while the model is idle.
-                if requested_active_rank_mask is not None:
-                    raise ValueError(
-                        "A layer bound to an execution state takes no active_rank_mask"
-                    )
-            else:
-                state.write_rank_mask(requested_active_rank_mask)
             active_rank_mask = state.active_rank_mask
             # Only the fence path honors the abort state and publishes its waits.
             if not can_use_cft_for_dispatch:
                 abort_state = state.abort
+
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -1081,14 +1098,16 @@ class NVLinkOneSided(Communication):
                 abort_state,
             )
         )
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "dispatch", active_rank_mask
+        )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
-        if state is not None:
-            self._dispatch_state["rank_mask_words"] = state.rank_mask_words
+        self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -1153,8 +1172,8 @@ class NVLinkOneSided(Communication):
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
             **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` must match the mask
-                written by dispatch for this collective when supplied. A mask change since dispatch aborts the
-                collective epoch.
+                captured by dispatch for this collective when supplied. A committed-generation change since
+                dispatch aborts the collective epoch.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -1194,28 +1213,22 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
+        active_rank_mask_snapshot = self._dispatch_state.get("active_rank_mask_snapshot")
+        if not isinstance(active_rank_mask_snapshot, ActiveRankMaskSnapshot):
+            raise RuntimeError("combine called but dispatch rank-mask snapshot is missing")
         requested_active_rank_mask = kwargs.get("active_rank_mask")
         if not self._rank_mask_enabled and requested_active_rank_mask is not None:
             raise ValueError("active_rank_mask requires committed EP group health")
-        active_rank_mask, abort_state = None, None
-        if state is not None:
-            dispatch_mask_words = self._dispatch_state.get("rank_mask_words")
-            # Another layer's dispatch over the same EP group health may have written a new mask.
-            if state.rank_mask_words != dispatch_mask_words:
-                raise RuntimeError(
-                    "committed EP membership changed between dispatch and combine; aborting "
-                    "collective epoch"
-                )
-            if requested_active_rank_mask is not None and (
-                tuple(int(word) for word in requested_active_rank_mask.tolist())
-                != dispatch_mask_words
-            ):
-                raise ValueError("active_rank_mask must match the mask written at dispatch")
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
+            active_rank_mask_snapshot,
+            requested_active_rank_mask,
+        )
         use_cft_for_combine = _use_cft_for_combine_payload(
             self.use_cft_for_combine(runtime_max_tokens_per_rank),
             final_hidden_states,
             self.use_low_precision_combine,
         )
+        abort_state = None
         if state is not None:
             active_rank_mask = state.active_rank_mask
             # Only the fence path honors the abort state and publishes its waits.
@@ -1237,6 +1250,9 @@ class NVLinkOneSided(Communication):
             self._rank_mask_enabled,
             active_rank_mask,
             abort_state,
+        )
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "combine", active_rank_mask
         )
 
         # Reset state for next round

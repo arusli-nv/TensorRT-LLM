@@ -12,17 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared rank mask, abort state and workspaces for rank-mask MoE All-to-All collectives.
+"""Shared rank mask, abort state and workspaces for fault-tolerant MoE All-to-All collectives.
 
-Every rank-mask MoE layer over one :class:`EPGroupHealth` runs under one :class:`MoeExecutionState`.
+The MoE layers that Wide-EP fault tolerance binds run under one :class:`MoeExecutionState`.
 The kernels read the rank mask and the abort state at fixed addresses, so captured CUDA graphs
-follow every change. Long waits on peers publish the round flag they wait for in the abort state, which
-the All-to-All watchdog polls.
+follow every change. Long waits on peers publish the round flag they wait for in the abort state,
+which the rank reports to the membership authority.
 """
 
 from __future__ import annotations
 
-import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
@@ -40,11 +39,6 @@ _ABORT_REQUESTED = 0
 _ABORT_FLAGS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX))
 _WAIT_EVIDENCE = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
 _MASK_WORD_BITS = 64
-
-# Execution states by EP group health, kept while a layer holds them.
-_STATES: weakref.WeakValueDictionary[EPGroupHealth, MoeExecutionState] = (
-    weakref.WeakValueDictionary()
-)
 
 
 def _mask_words(mask: int) -> tuple[int, ...]:
@@ -79,7 +73,7 @@ class BindableCommunication(Protocol):
 
 
 class MoeExecutionState:
-    """Own the rank mask and abort state that NVLinkOneSided kernels in rank-mask mode read.
+    """Own the rank mask and abort state that the kernels of bound NVLinkOneSided layers read.
 
     Both are edited only in place, so captured CUDA graphs keep running. The device rank
     mask changes only through :meth:`write_rank_mask`.
@@ -100,7 +94,7 @@ class MoeExecutionState:
         self._abort_flags = self.abort.numpy()[_ABORT_FLAGS]
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
-        self._mask_generation: int | None = snapshot.generation
+        self._mask_generation = snapshot.generation
         self.rank_mask_words = _mask_words(snapshot.mask)
         _require_active(self.rank_mask_words, ep_rank)
         self.active_rank_mask = torch.tensor(self.rank_mask_words, dtype=torch.uint64).to(device)
@@ -111,32 +105,16 @@ class MoeExecutionState:
         self._workspaces: dict[MembershipWorkspace, tuple[Callable[[], None], torch.Tensor]] = {}
         self._layer_resets: list[Callable[[], None]] = []
 
-    @staticmethod
-    def of(ep_group_health: EPGroupHealth, ep_rank: int, device: torch.device) -> MoeExecutionState:
-        """Return the state that every layer over ``ep_group_health`` shares."""
-        state = _STATES.get(ep_group_health)
-        if state is None:
-            state = MoeExecutionState(ep_group_health, ep_rank, device)
-            _STATES[ep_group_health] = state
-        elif state.ep_rank != ep_rank or state._device != device:
-            raise ValueError("Layers over one EP group health must share their EP rank and device")
-        return state
+    def write_rank_mask(self) -> None:
+        """Write the EP group health's rank mask unless its generation is already written.
 
-    def write_rank_mask(self, active_rank_mask: torch.Tensor | None = None) -> None:
-        """Write the rank mask that collectives launched later on the current stream read.
-
-        Without ``active_rank_mask``, write the EP group health's mask unless its generation is
-        already written. A caller's ``active_rank_mask`` belongs to no generation, so the next write
-        without one writes the health's mask again. The write goes through pinned staging, so it
-        does not wait for the GPU.
+        Collectives launched later on the current stream read it. The write goes through pinned
+        staging, so it does not wait for the GPU.
         """
-        if active_rank_mask is None:
-            if self.health.generation == self._mask_generation:
-                return
-            snapshot = self.health.snapshot()
-            words, generation = _mask_words(snapshot.mask), snapshot.generation
-        else:
-            words, generation = tuple(int(word) for word in active_rank_mask.tolist()), None
+        if self.health.generation == self._mask_generation:
+            return
+        snapshot = self.health.snapshot()
+        words = _mask_words(snapshot.mask)
         if words != self.rank_mask_words:
             # The kernels treat this rank's bit as set, so a mask that clears it is refused.
             _require_active(words, self.ep_rank)
@@ -147,7 +125,7 @@ class MoeExecutionState:
             self._mask_staged = torch.cuda.Event()
             self._mask_staged.record(torch.cuda.current_stream(self._device))
             self.rank_mask_words = words
-        self._mask_generation = generation
+        self._mask_generation = snapshot.generation
 
     def register_workspace(
         self,

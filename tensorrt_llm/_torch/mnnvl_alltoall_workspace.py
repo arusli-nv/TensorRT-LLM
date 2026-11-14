@@ -19,7 +19,12 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._torch.alltoall_watchdog import AlltoAllWatchdog, AlltoAllWatchdogTimeout
+from tensorrt_llm._torch.alltoall_watchdog import (
+    AlltoAllWatchdog,
+    AlltoAllWatchdogCoordinator,
+    AlltoAllWatchdogTimeout,
+    EPGroupHealthLike,
+)
 from tensorrt_llm._torch.distributed.mnnvl_memory import (
     MnnvlCheckpointCommunicator,
     MnnvlMemory,
@@ -80,6 +85,7 @@ class _WorkspaceClient(Protocol):
 
 @dataclass(frozen=True)
 class _WatchdogConfig:
+    ep_size: int
     timeout_s: float
     poll_interval_s: float
     on_timeout: Callable[[AlltoAllWatchdogTimeout], None] | None
@@ -103,21 +109,24 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         memory: MnnvlMemory,
         workspace: torch.Tensor,
         metainfo: torch.Tensor,
+        metainfo_index: Mapping[str, int],
         ep_rank: int,
         ep_size: int,
-        waited_flags: Callable[[], Mapping[int, int]] | None,
+        health: EPGroupHealthLike | None,
     ) -> None:
         self._workspace_state = workspace_state
         self._memory = memory
         self._workspace = workspace
         self._metainfo = metainfo
+        self._metainfo_index = dict(metainfo_index)
         self._ep_rank = int(ep_rank)
         self._ep_size = int(ep_size)
-        self._waited_flags = waited_flags
+        self._health = health
         self._clients: WeakSet[_WorkspaceClient] = WeakSet()
         self._watchdog_clients: WeakSet[_WorkspaceClient] = WeakSet()
         self._watchdog_config: _WatchdogConfig | None = None
         self._watchdog: AlltoAllWatchdog | None = None
+        self._coordinator = self._create_coordinator()
 
     @classmethod
     def get_or_create(
@@ -127,15 +136,11 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         memory: MnnvlMemory,
         workspace: torch.Tensor,
         metainfo: torch.Tensor,
+        metainfo_index: Mapping[str, int],
         ep_rank: int,
         ep_size: int,
-        waited_flags: Callable[[], Mapping[int, int]] | None,
+        health: EPGroupHealthLike | None,
     ) -> "_MnnvlAlltoAllWorkspaceLifecycle":
-        """Return the lifecycle of the shared workspace, creating it on first use.
-
-        ``waited_flags`` returns the peers that the collectives wait on, which the watchdog
-        polls. Only rank-mask collectives publish them.
-        """
         lifecycle = workspace_state.get(_WORKSPACE_LIFECYCLE_KEY)
         if lifecycle is None:
             lifecycle = cls(
@@ -143,9 +148,10 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
                 memory=memory,
                 workspace=workspace,
                 metainfo=metainfo,
+                metainfo_index=metainfo_index,
                 ep_rank=ep_rank,
                 ep_size=ep_size,
-                waited_flags=waited_flags,
+                health=health,
             )
             workspace_state[_WORKSPACE_LIFECYCLE_KEY] = lifecycle
             return lifecycle
@@ -155,15 +161,25 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
             memory=memory,
             workspace=workspace,
             metainfo=metainfo,
+            metainfo_index=metainfo_index,
             ep_rank=ep_rank,
             ep_size=ep_size,
-            waited_flags=waited_flags,
+            health=health,
         )
         return lifecycle
 
     @property
     def metainfo(self) -> torch.Tensor:
         return self._metainfo
+
+    @property
+    def coordinator(self) -> AlltoAllWatchdogCoordinator:
+        return self._coordinator
+
+    def watchdog_for(self, client: _WorkspaceClient) -> AlltoAllWatchdog | None:
+        if client not in self._watchdog_clients:
+            return None
+        return self._watchdog
 
     def register(
         self,
@@ -178,13 +194,9 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         if watchdog_timeout_s is None:
             self._clients.add(client)
             return
-        if self._waited_flags is None:
-            raise ValueError(
-                "The AlltoAll watchdog polls the waits that rank-mask collectives publish, so it "
-                "requires an ep_group_health"
-            )
 
         config = _WatchdogConfig(
+            ep_size=self._ep_size,
             timeout_s=float(watchdog_timeout_s),
             poll_interval_s=float(watchdog_poll_interval_s),
             on_timeout=watchdog_on_timeout,
@@ -260,6 +272,7 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
                     )
                 self._metainfo = refreshed_metainfo
                 self._workspace_state["metainfo"] = refreshed_metainfo
+                self._coordinator = self._create_coordinator()
                 torch.cuda.synchronize()
                 self._start_watchdog()
                 for client in list(self._clients):
@@ -286,24 +299,31 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
             self._stop_watchdog()
             raise
 
+    def _create_coordinator(self) -> AlltoAllWatchdogCoordinator:
+        return AlltoAllWatchdogCoordinator(
+            workspace_state=self._workspace_state,
+            workspace=self._workspace,
+            metainfo=self._metainfo,
+            metainfo_index=self._metainfo_index,
+            ep_rank=self._ep_rank,
+            health=self._health,
+        )
+
     def _start_watchdog(self) -> None:
         config = self._watchdog_config
         if config is None or not self._watchdog_clients or self._watchdog is not None:
             return
-        assert self._waited_flags is not None
-        self._watchdog = AlltoAllWatchdog(
-            ep_rank=self._ep_rank,
-            waited_flags=self._waited_flags,
+        self._watchdog = self._coordinator.acquire_watchdog(
+            ep_size=config.ep_size,
             timeout_s=config.timeout_s,
             poll_interval_s=config.poll_interval_s,
             on_timeout=config.on_timeout,
         )
-        self._watchdog.start()
 
     def _stop_watchdog(self) -> None:
         if self._watchdog is None:
             return
-        self._watchdog.stop()
+        self._coordinator.release_watchdog(self._watchdog)
         self._watchdog = None
 
     def _validate_shared_context(
@@ -312,14 +332,16 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         memory: MnnvlMemory,
         workspace: torch.Tensor,
         metainfo: torch.Tensor,
+        metainfo_index: Mapping[str, int],
         ep_rank: int,
         ep_size: int,
-        waited_flags: Callable[[], Mapping[int, int]] | None,
+        health: EPGroupHealthLike | None,
     ) -> None:
         if (
             self._memory is not memory
             or self._workspace is not workspace
             or self._metainfo is not metainfo
+            or self._metainfo_index != dict(metainfo_index)
             or self._ep_rank != ep_rank
             or self._ep_size != ep_size
         ):
@@ -327,13 +349,14 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
                 "MNNVL All-to-All wrappers sharing a workspace must use the "
                 "same allocation, metadata layout, and rank layout"
             )
-        if self._waited_flags == waited_flags:
+        if self._health is health:
             return
         if self._clients or self._watchdog is not None or self._watchdog_config is not None:
             raise ValueError(
                 "MNNVL All-to-All wrappers sharing a workspace must use the same EP health object"
             )
-        self._waited_flags = waited_flags
+        self._health = health
+        self._coordinator = self._create_coordinator()
 
     def _validate_watchdog_config(self, requested: _WatchdogConfig) -> None:
         existing = self._watchdog_config
@@ -341,7 +364,8 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
             self._watchdog_config = requested
             return
         if (
-            existing.timeout_s != requested.timeout_s
+            existing.ep_size != requested.ep_size
+            or existing.timeout_s != requested.timeout_s
             or existing.poll_interval_s != requested.poll_interval_s
             or existing.on_timeout is not requested.on_timeout
         ):

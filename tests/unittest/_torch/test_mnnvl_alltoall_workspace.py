@@ -22,7 +22,6 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
-import tensorrt_llm._torch.mnnvl_alltoall_workspace as workspace_module
 import tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
@@ -72,13 +71,7 @@ class _FakeComm:
         return [local_clients_idle, local_clients_idle]
 
 
-def _waited_flags() -> dict[int, int]:
-    return {}
-
-
-def _make_lifecycle(
-    waited_flags=_waited_flags,
-) -> tuple[_MnnvlAlltoAllWorkspaceLifecycle, Mock, torch.Tensor]:
+def _make_lifecycle() -> tuple[_MnnvlAlltoAllWorkspaceLifecycle, Mock, torch.Tensor]:
     workspace_state = {}
     memory = Mock(mapped=True)
     memory.comm = _FakeComm()
@@ -89,35 +82,16 @@ def _make_lifecycle(
         memory=memory,
         workspace=workspace,
         metainfo=metainfo,
+        metainfo_index={
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 0,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 0,
+        },
         ep_rank=0,
         ep_size=2,
-        waited_flags=waited_flags,
+        health=None,
     )
     return lifecycle, memory, metainfo
-
-
-@pytest.fixture
-def watchdogs(monkeypatch: pytest.MonkeyPatch) -> list[Mock]:
-    """Replace the lifecycle's AlltoAllWatchdog by mocks, and return the ones it creates."""
-    created = []
-
-    def create(**kwargs) -> Mock:
-        created.append(Mock(kwargs=kwargs))
-        return created[-1]
-
-    monkeypatch.setattr(workspace_module, "AlltoAllWatchdog", create)
-    return created
-
-
-def _register_with_watchdog(
-    lifecycle: _MnnvlAlltoAllWorkspaceLifecycle, client: _Client, timeout_s: float = 5.0
-) -> None:
-    lifecycle.register(
-        client,
-        watchdog_timeout_s=timeout_s,
-        watchdog_poll_interval_s=0.1,
-        watchdog_on_timeout=None,
-    )
 
 
 def _register_without_watchdog(
@@ -155,16 +129,23 @@ def test_repeated_checkpoint_prepare_skips_shared_preflight() -> None:
     memory.checkpoint_prepare.assert_called_once_with()
 
 
-def test_detached_checkpoint_prepare_stops_stale_watchdog(watchdogs: list[Mock]) -> None:
+def test_detached_checkpoint_prepare_stops_stale_watchdog() -> None:
     lifecycle, memory, _ = _make_lifecycle()
-    client = _Client()
-    _register_with_watchdog(lifecycle, client)
+    coordinator = Mock()
+    watchdog = Mock()
+    coordinator.acquire_watchdog.return_value = watchdog
+    lifecycle._coordinator = coordinator
+    lifecycle.register(
+        _Client(),
+        watchdog_timeout_s=5.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
     memory.mapped = False
 
     lifecycle.checkpoint_prepare()
 
-    (watchdog,) = watchdogs
-    watchdog.stop.assert_called_once_with()
+    coordinator.release_watchdog.assert_called_once_with(watchdog)
     assert memory.comm.allgather_count == 0
     memory.checkpoint_prepare.assert_called_once_with()
 
@@ -212,122 +193,172 @@ def test_checkpoint_prepare_timeout_fails_closed(monkeypatch) -> None:
     memory.checkpoint_prepare.assert_not_called()
 
 
-def test_checkpoint_prepare_rejects_remote_active_client_before_watchdog_stop(
-    watchdogs: list[Mock],
-) -> None:
+def test_checkpoint_prepare_rejects_remote_active_client_before_watchdog_stop() -> None:
     lifecycle, memory, _ = _make_lifecycle()
     memory.comm = _FakeComm(clients_idle_by_rank=[True, False])
+    coordinator = Mock()
+    watchdog = Mock()
+    coordinator.acquire_watchdog.return_value = watchdog
+    lifecycle._coordinator = coordinator
     client = _Client()
-    _register_with_watchdog(lifecycle, client)
+    lifecycle.register(
+        client,
+        watchdog_timeout_s=5.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
 
     with pytest.raises(RuntimeError, match=r"active MoE All-to-All phase on ranks \[1\]"):
         lifecycle.checkpoint_prepare()
 
-    (watchdog,) = watchdogs
-    watchdog.stop.assert_not_called()
+    coordinator.release_watchdog.assert_not_called()
     memory.checkpoint_prepare.assert_not_called()
 
 
 def test_checkpoint_suspends_and_recreates_one_shared_watchdog(
-    monkeypatch: pytest.MonkeyPatch, watchdogs: list[Mock]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle, memory, metainfo = _make_lifecycle()
+    old_coordinator = Mock()
+    old_watchdog = Mock()
+    old_coordinator.acquire_watchdog.return_value = old_watchdog
+    lifecycle._coordinator = old_coordinator
     first = _Client()
     second = _Client()
 
     for client in (first, second):
-        _register_with_watchdog(lifecycle, client)
+        lifecycle.register(
+            client,
+            watchdog_timeout_s=5.0,
+            watchdog_poll_interval_s=0.1,
+            watchdog_on_timeout=None,
+        )
 
-    (old_watchdog,) = watchdogs
-    assert old_watchdog.kwargs == {
-        "ep_rank": 0,
-        "waited_flags": _waited_flags,
-        "timeout_s": 5.0,
-        "poll_interval_s": 0.1,
-        "on_timeout": None,
-    }
-    old_watchdog.start.assert_called_once_with()
+    old_coordinator.acquire_watchdog.assert_called_once_with(
+        ep_size=2,
+        timeout_s=5.0,
+        poll_interval_s=0.1,
+        on_timeout=None,
+    )
+    assert lifecycle.watchdog_for(first) is old_watchdog
+    assert lifecycle.watchdog_for(second) is old_watchdog
 
     lifecycle.checkpoint_prepare()
 
-    old_watchdog.stop.assert_called_once_with()
+    old_coordinator.release_watchdog.assert_called_once_with(old_watchdog)
     memory.checkpoint_prepare.assert_called_once_with()
 
     memory.mapped = False
     memory.checkpoint_restore.return_value = True
+    new_coordinator = Mock()
+    new_watchdog = Mock()
+    new_coordinator.acquire_watchdog.return_value = new_watchdog
+    monkeypatch.setattr(
+        lifecycle,
+        "_create_coordinator",
+        Mock(return_value=new_coordinator),
+    )
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
     comm = _FakeComm()
 
     lifecycle.checkpoint_restore(comm, Mock(return_value=metainfo))
 
     memory._checkpoint_restore_complete.assert_called_once_with()
-    _, new_watchdog = watchdogs
-    assert new_watchdog.kwargs == old_watchdog.kwargs
-    new_watchdog.start.assert_called_once_with()
-    new_watchdog.stop.assert_not_called()
+    new_coordinator.acquire_watchdog.assert_called_once_with(
+        ep_size=2,
+        timeout_s=5.0,
+        poll_interval_s=0.1,
+        on_timeout=None,
+    )
+    assert lifecycle.watchdog_for(first) is new_watchdog
+    assert lifecycle.watchdog_for(second) is new_watchdog
     assert first.reset_count == 1
     assert second.reset_count == 1
     assert comm.allgather_count == 1
 
 
-def test_unregister_stops_watchdog_after_last_enabled_client(watchdogs: list[Mock]) -> None:
+def test_unregister_stops_watchdog_after_last_enabled_client() -> None:
     lifecycle, _, _ = _make_lifecycle()
+    coordinator = Mock()
+    watchdog = Mock()
+    coordinator.acquire_watchdog.return_value = watchdog
+    lifecycle._coordinator = coordinator
     first = _Client()
     second = _Client()
     for client in (first, second):
-        _register_with_watchdog(lifecycle, client)
+        lifecycle.register(
+            client,
+            watchdog_timeout_s=5.0,
+            watchdog_poll_interval_s=0.1,
+            watchdog_on_timeout=None,
+        )
 
-    (watchdog,) = watchdogs
     lifecycle.unregister(first)
-    watchdog.stop.assert_not_called()
+    coordinator.release_watchdog.assert_not_called()
 
     lifecycle.unregister(second)
-    watchdog.stop.assert_called_once_with()
+    coordinator.release_watchdog.assert_called_once_with(watchdog)
 
 
-def test_shared_watchdog_configuration_mismatch_rejects_new_client(
-    watchdogs: list[Mock],
-) -> None:
+def test_shared_watchdog_configuration_mismatch_rejects_new_client() -> None:
     lifecycle, _, _ = _make_lifecycle()
+    coordinator = Mock()
+    coordinator.acquire_watchdog.return_value = Mock()
+    lifecycle._coordinator = coordinator
     first = _Client()
     second = _Client()
-    _register_with_watchdog(lifecycle, first)
+    lifecycle.register(
+        first,
+        watchdog_timeout_s=5.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
 
     with pytest.raises(ValueError, match="same watchdog configuration"):
-        _register_with_watchdog(lifecycle, second, timeout_s=10.0)
+        lifecycle.register(
+            second,
+            watchdog_timeout_s=10.0,
+            watchdog_poll_interval_s=0.1,
+            watchdog_on_timeout=None,
+        )
 
-    assert len(watchdogs) == 1
-
-
-def test_watchdog_needs_published_waits() -> None:
-    """Only rank-mask collectives publish the waits the watchdog polls."""
-    lifecycle, _, _ = _make_lifecycle(waited_flags=None)
-    client = _Client()
-
-    with pytest.raises(ValueError, match="requires an ep_group_health"):
-        _register_with_watchdog(lifecycle, client)
-
-    _register_without_watchdog(lifecycle, client)
+    assert lifecycle.watchdog_for(second) is None
+    coordinator.acquire_watchdog.assert_called_once()
 
 
 def test_watchdog_registration_is_deferred_while_workspace_is_unmapped(
-    monkeypatch: pytest.MonkeyPatch, watchdogs: list[Mock]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle, memory, metainfo = _make_lifecycle()
     memory.mapped = False
     memory.checkpoint_restore.return_value = True
+    old_coordinator = Mock()
+    lifecycle._coordinator = old_coordinator
     client = _Client()
 
-    _register_with_watchdog(lifecycle, client)
+    lifecycle.register(
+        client,
+        watchdog_timeout_s=5.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
 
-    assert watchdogs == []
+    old_coordinator.acquire_watchdog.assert_not_called()
+    assert lifecycle.watchdog_for(client) is None
 
+    new_coordinator = Mock()
+    new_watchdog = Mock()
+    new_coordinator.acquire_watchdog.return_value = new_watchdog
+    monkeypatch.setattr(
+        lifecycle,
+        "_create_coordinator",
+        Mock(return_value=new_coordinator),
+    )
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
 
     lifecycle.checkpoint_restore(_FakeComm(), Mock(return_value=metainfo))
 
-    (watchdog,) = watchdogs
-    watchdog.start.assert_called_once_with()
+    assert lifecycle.watchdog_for(client) is new_watchdog
 
 
 def test_checkpoint_restore_failure_before_watchdog_start_stays_unpublished(
@@ -373,22 +404,37 @@ def test_checkpoint_restore_rejects_changed_metainfo_and_fails_closed(
 
 
 def test_checkpoint_restore_failure_after_watchdog_start_stops_it(
-    monkeypatch: pytest.MonkeyPatch, watchdogs: list[Mock]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle, memory, metainfo = _make_lifecycle()
+    old_coordinator = Mock()
+    old_watchdog = Mock()
+    old_coordinator.acquire_watchdog.return_value = old_watchdog
+    lifecycle._coordinator = old_coordinator
     client = _FailingResetClient()
-    _register_with_watchdog(lifecycle, client)
+    lifecycle.register(
+        client,
+        watchdog_timeout_s=5.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
     lifecycle.checkpoint_prepare()
     memory.mapped = False
     memory.checkpoint_restore.return_value = True
+    new_coordinator = Mock()
+    new_watchdog = Mock()
+    new_coordinator.acquire_watchdog.return_value = new_watchdog
+    monkeypatch.setattr(
+        lifecycle,
+        "_create_coordinator",
+        Mock(return_value=new_coordinator),
+    )
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
 
     with pytest.raises(RuntimeError, match="frontend reset failed"):
         lifecycle.checkpoint_restore(_FakeComm(), Mock(return_value=metainfo))
 
-    _, new_watchdog = watchdogs
-    new_watchdog.start.assert_called_once_with()
-    new_watchdog.stop.assert_called_once_with()
+    new_coordinator.release_watchdog.assert_called_once_with(new_watchdog)
     memory._checkpoint_restore_failed.assert_called_once_with()
     memory._checkpoint_restore_complete.assert_not_called()
 
@@ -749,6 +795,9 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
     monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
     monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
     monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
     monkeypatch.setattr(
@@ -810,6 +859,9 @@ def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
     monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
     monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
     monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
     monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
@@ -876,6 +928,9 @@ def test_rank_mask_workspace_barrier(
     monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
     monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
     monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     for memory in ("MnnvlMemory", "CftMnnvlMemory", "MembershipMnnvlMemory"):
         monkeypatch.setattr(one_sided_module, memory, _Memory)
     monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=False))

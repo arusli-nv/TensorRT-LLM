@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoeExecutionState checks. ``test_rank_mask_mode_*`` cover TLLM_FAULT_TOLERANCE_MODE=1."""
+"""MoeExecutionState checks."""
 
 import re
 import threading
@@ -25,6 +25,7 @@ import torch
 from test_moe_a2a_abort import _combine, _dispatch, _setup
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.alltoall_watchdog import AlltoAllWatchdogCoordinator
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
@@ -47,9 +48,7 @@ def _frontend(
     comm.ep_group_health = health
     comm._rank_mask_enabled = health is not None or fault_tolerance
     comm._enable_wide_ep_fault_tolerance = fault_tolerance
-    comm.execution_state = (
-        None if health is None else MoeExecutionState.of(health, 0, torch.device("cuda"))
-    )
+    comm.execution_state = None
     comm.ep_rank = 0
     comm._dispatch_state = {"phase": "idle"}
     comm.mnnvl_mem = SimpleNamespace(mapped=False)
@@ -257,21 +256,16 @@ def test_write_rank_mask_without_gpu_sync() -> None:
         assert state.active_rank_mask.cpu().tolist() == words
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_rank_mask_mode_mask_rewritten_only_on_new_generation(monkeypatch, device: str) -> None:
-    """The device mask changes only with the committed generation or with a caller's mask."""
+def test_mask_rewritten_only_on_new_generation(monkeypatch) -> None:
+    """The device mask changes only with the committed generation."""
     health = EPGroupHealth(4)
     state = MoeExecutionState(health, 0, torch.device("cuda"))
     address = state.active_rank_mask.data_ptr()
 
-    def write(words: list[int] | None = None) -> list[int]:
-        mask = None if words is None else torch.tensor(words, dtype=torch.uint64, device=device)
-        state.write_rank_mask(mask)
+    def write() -> list[int]:
+        state.write_rank_mask()
         return state.active_rank_mask.cpu().tolist()
 
-    assert write() == [0b1111, 0, 0, 0]
-    assert write([0b0111, 0, 0, 0]) == [0b0111, 0, 0, 0]
-    assert state.rank_mask_words == (0b0111, 0, 0, 0)
     assert write() == [0b1111, 0, 0, 0]
     # An unchanged generation never reads the mask of the health.
     with monkeypatch.context() as patch:
@@ -280,8 +274,6 @@ def test_rank_mask_mode_mask_rewritten_only_on_new_generation(monkeypatch, devic
     health.mark_failed(3)
     assert write() == [0b0111, 0, 0, 0]
     # The kernels treat this rank's bit as set, so a mask that clears it is refused.
-    with pytest.raises(RuntimeError, match="must mark the local ep_rank"):
-        write([0b0110, 0, 0, 0])
     health.mark_failed(0)
     with pytest.raises(RuntimeError, match="must mark the local ep_rank"):
         write()
@@ -298,24 +290,27 @@ def test_rank_mask_mode_mask_words_cover_a_second_word() -> None:
     assert state.active_rank_mask.cpu().tolist() == [(1 << 64) - 1, 0xBF, 0, 0]
 
 
-def test_rank_mask_mode_layers_share_one_state() -> None:
-    """Every layer over one EP group health reads one device mask and one abort state."""
-    health = EPGroupHealth(2)
-    state = MoeExecutionState.of(health, 0, torch.device("cuda"))
-    assert MoeExecutionState.of(health, 0, torch.device("cuda")) is state
-    assert MoeExecutionState.of(EPGroupHealth(2), 0, torch.device("cuda")) is not state
-    with pytest.raises(ValueError, match="share their EP rank"):
-        MoeExecutionState.of(health, 1, torch.device("cuda"))
-    # The local rank must be active, as the kernels assume.
+def test_state_requires_active_local_rank() -> None:
+    """The kernels assume that the local rank is active."""
     excluded = EPGroupHealth(2)
     excluded.mark_failed(0)
     with pytest.raises(RuntimeError, match="must mark the local ep_rank"):
-        MoeExecutionState.of(excluded, 0, torch.device("cuda"))
+        MoeExecutionState(excluded, 0, torch.device("cuda"))
 
 
 def _collective_frontend(fault_tolerance: bool) -> NVLinkOneSided:
     """Build a ``_frontend`` with the state its dispatch and combine read, for the caller's ops."""
     comm = _frontend(fault_tolerance=fault_tolerance)
+    comm._workspace_lifecycle = Mock(
+        coordinator=AlltoAllWatchdogCoordinator(
+            workspace_state={},
+            workspace=comm.workspace,
+            metainfo=torch.zeros(1, dtype=torch.int64),
+            metainfo_index={},
+            ep_rank=0,
+        ),
+        **{"watchdog_for.return_value": None},
+    )
     comm.mnnvl_mem.mapped = True
     comm._force_cft = None
     comm.cft_max_batch_for_dispatch = comm.cft_max_batch_for_combine = None
@@ -329,7 +324,7 @@ def _collective_frontend(fault_tolerance: bool) -> NVLinkOneSided:
 
 
 @pytest.mark.cpu_only
-def test_rank_mask_layers_pass_their_state_records(monkeypatch) -> None:
+def test_bound_layers_pass_state_records(monkeypatch) -> None:
     """Pass the device mask and the abort state of the execution state to the all-to-all ops."""
     calls = []
     payload = torch.zeros(_EP_SIZE, _TOKENS, _HIDDEN)
@@ -351,8 +346,6 @@ def test_rank_mask_layers_pass_their_state_records(monkeypatch) -> None:
         ep_rank=0,
         abort=torch.zeros(4, dtype=torch.int32),
         active_rank_mask=torch.zeros(4, dtype=torch.uint64),
-        rank_mask_words=(0b11, 0, 0, 0),
-        write_rank_mask=Mock(),
         register_layer=Mock(),
         register_workspace=Mock(),
     )
@@ -364,40 +357,20 @@ def test_rank_mask_layers_pass_their_state_records(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="dispatches only once bound"):
         bound.dispatch(*inputs)
     bound.bind_execution_state(state)
-    rank_mask_mode = _collective_frontend(fault_tolerance=False)
-    rank_mask_mode._rank_mask_enabled = True
-    rank_mask_mode.execution_state = state
-    caller_mask = torch.tensor([0b11, 0, 0, 0], dtype=torch.uint64)
-    for comm, mask in ((without_mask, None), (bound, None), (rank_mask_mode, caller_mask)):
-        comm.dispatch(*inputs, active_rank_mask=mask)
-        comm.combine(payload, active_rank_mask=mask)
+    for comm in (without_mask, bound):
+        comm.dispatch(*inputs)
+        comm.combine(payload)
 
     assert calls[:2] == [(False, None, None)] * 2
     for enabled, mask, abort in calls[2:]:
         assert enabled is True and mask is state.active_rank_mask and abort is state.abort
-    # Only the rank-mask mode writes the mask; install_mask writes it for the bound layer.
-    (written,) = state.write_rank_mask.call_args_list
-    assert written.args[0] is caller_mask
-
-    # Combine runs with the mask that its dispatch wrote.
-    rank_mask_mode.dispatch(*inputs)
-    other_mask = torch.tensor([0b01, 0, 0, 0], dtype=torch.uint64)
-    with pytest.raises(ValueError, match="must match the mask written at dispatch"):
-        rank_mask_mode.combine(payload, active_rank_mask=other_mask)
-    rank_mask_mode.reset_state()
-    rank_mask_mode.dispatch(*inputs)
-    state.rank_mask_words = (0b01, 0, 0, 0)  # another layer's dispatch wrote a new mask
-    with pytest.raises(RuntimeError, match="changed between dispatch and combine"):
-        rank_mask_mode.combine(payload)
-    rank_mask_mode.reset_state()
+    caller_mask = torch.tensor([0b11, 0, 0, 0], dtype=torch.uint64)
     with pytest.raises(ValueError, match="requires committed EP group health"):
         without_mask.dispatch(*inputs, active_rank_mask=caller_mask)
     with pytest.raises(ValueError, match="takes no active_rank_mask"):
         bound.dispatch(*inputs, active_rank_mask=caller_mask)
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
-        rank_mask_mode.dispatch(*inputs)
     bound.dispatch(*inputs)
     bound.combine(payload)
 
