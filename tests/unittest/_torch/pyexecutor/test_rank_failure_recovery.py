@@ -931,10 +931,15 @@ def test_resume_deletes_change_group_keys():
 
     Only the values of the simulated active peers 1 and 3 remain, as each member deletes its own.
     """
+    peer_values = {"host_exchange_rows/1/0/1", "host_exchange_rows/1/0/3"}
     r = _resuming()
+
+    def keys():
+        return {key for key in r.store.values if key.startswith("host_exchange_rows/")}
+
+    assert keys() > peer_values
     r.recovery.before_iteration()
-    remaining = {key for key in r.store.values if key.startswith("host_exchange_rows/")}
-    assert remaining == {"host_exchange_rows/1/0/1", "host_exchange_rows/1/0/3"}
+    assert keys() == peer_values
 
 
 @pytest.mark.parametrize("together", [False, True])
