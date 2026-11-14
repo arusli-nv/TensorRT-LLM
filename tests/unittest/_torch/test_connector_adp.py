@@ -116,7 +116,6 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor._kv_cache_capacity = {}
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
-    executor._fleet_has_live_requests = False
     executor.active_requests = []
     executor.hang_detector = MagicMock()
     executor.hang_detector.detected.return_value = False

@@ -724,6 +724,7 @@ class PyExecutor:
     # the real values.
     _packed_sync_enabled = False
     _stage_timing = False
+    _fleet_has_live_requests = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.

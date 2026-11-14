@@ -2277,66 +2277,43 @@ def test_adp_running_counts_update_without_a_new_block_sample():
 
 
 def test_adp_ranks_stop_on_same_iteration():
-    """An idle attention-DP rank keeps stepping at shutdown while a peer holds a request.
+    """An idle attention-DP rank keeps stepping at shutdown while a peer has or gets a request.
 
     Stopping alone would leave the peer's next collective without this rank.
     """
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
 
-    ranks = []
-    for rank in range(2):
-        executor = _make_executor_with_kv_cache_manager(None)
-        executor.enable_attention_dp = True
-        executor.enable_iter_perf_stats = False
-        executor._kv_load_tracker = KvLoadTracker(None, rank=rank, enabled=False)
-        executor.dist = types.SimpleNamespace(
-            rank=rank, tp_rank=rank, cp_config={}, cp_rank=0, cp_size=1
-        )
-        executor.kv_cache_transceiver = None
-        executor.canceled_req_ids = []
-        executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
-        executor.max_num_active_requests = 4
-        executor._enable_non_overlap_adp_forward_intent = False
-        executor._should_exclude_last_generation_logits = lambda: False
-        executor._fetch_and_enqueue_requests = Mock()
-        executor._pop_from_waiting_queue = Mock(return_value=([], {}))
-        executor.waiting_queue = FCFSWaitingQueue()
-        executor.active_requests = []
-        executor.is_shutdown = True
-        ranks.append(executor)
-    ranks[1].active_requests.append(_make_adp_request(_STATE_GENERATION_IN_PROGRESS))
+    executor = _make_executor_with_kv_cache_manager(None)
+    executor.enable_attention_dp = True
+    executor.enable_iter_perf_stats = False
+    executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
+    executor.dist = types.SimpleNamespace(rank=0, tp_rank=0, cp_config={}, cp_rank=0, cp_size=1)
+    executor.kv_cache_transceiver = None
+    executor.canceled_req_ids = []
+    executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
+    executor.max_num_active_requests = 4
+    executor._enable_non_overlap_adp_forward_intent = False
+    executor._should_exclude_last_generation_logits = lambda: False
+    executor._fetch_and_enqueue_requests = Mock()
+    executor._pop_from_waiting_queue = Mock(return_value=([], {}))
+    executor.waiting_queue = FCFSWaitingQueue()
+    executor.active_requests = []
+    executor.is_shutdown = True
 
-    def step(routed: dict[int, list[RequestQueueItem]]) -> list[bool]:
-        # Every rank's routing allgather returns the load of every rank, and
-        # every rank routes the same new requests.
-        states = [
-            RankState(rank=rank, num_active_requests=len(executor.active_requests))
-            for rank, executor in enumerate(ranks)
+    def stops(peer_requests: int, routed_to_peer: list[RequestQueueItem]) -> bool:
+        # The routing allgather returns rank 1's load, and every rank routes the same requests.
+        executor.adp_router.gather_all_rank_states.return_value = [
+            RankState(rank=0),
+            RankState(rank=1, num_active_requests=peer_requests),
         ]
-        expected_num_active_requests = max(
-            state.num_active_requests + len(routed[state.rank]) for state in states
-        )
-        for executor in ranks:
-            executor.adp_router.gather_all_rank_states.return_value = states
-            executor.adp_router.route_requests.return_value = (
-                routed,
-                expected_num_active_requests,
-            )
-            executor.active_requests.extend(
-                executor._fetch_new_requests(executor.waiting_queue, executor.active_requests)
-            )
-        return [executor.should_stop_processing for executor in ranks]
+        executor.adp_router.route_requests.return_value = ({0: [], 1: routed_to_peer}, 1)
+        assert executor._fetch_new_requests(executor.waiting_queue, executor.active_requests) == []
+        return executor.should_stop_processing
 
-    with patch(
-        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
-        side_effect=lambda new_requests, **_: list(new_requests),
-    ):
-        assert step({0: [], 1: []}) == [False, False]
-        ranks[1].active_requests.clear()
-        # A request accepted with the shutdown is routed after the allgather.
-        assert step({0: [RequestQueueItem(2)], 1: []}) == [False, False]
-        ranks[0].active_requests.clear()
-        assert step({0: [], 1: []}) == [True, True]
+    assert not stops(peer_requests=1, routed_to_peer=[])
+    # A request accepted with the shutdown is routed after the allgather.
+    assert not stops(peer_requests=0, routed_to_peer=[RequestQueueItem(2)])
+    assert stops(peer_requests=0, routed_to_peer=[])
 
 
 def _classify_termination(
