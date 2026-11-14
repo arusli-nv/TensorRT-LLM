@@ -926,6 +926,14 @@ def test_newer_change_installed_before_resume_iteration():
     assert not r.recovery.pauses_forward()
 
 
+def test_resume_deletes_change_group_keys():
+    """Leave no store keys of the change's store groups once serving resumes."""
+    r = _resuming()
+    assert any(key.startswith("host_exchange_rows/") for key in r.store.values)
+    r.recovery.before_iteration()
+    assert not [key for key in r.store.values if key.startswith("host_exchange_rows/")]
+
+
 @pytest.mark.parametrize("together", [False, True])
 def test_commit_with_next_change_resumes(together):
     """Check that a rank resumes at the commit and holds at the next vote with the next change."""

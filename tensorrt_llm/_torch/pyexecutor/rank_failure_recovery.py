@@ -235,6 +235,8 @@ class RankFailureRecovery:
         self._unimportable_peers = 0
         self._install_steps = 0
         self._published_admissions: List[int] = []
+        # Store groups of the uncommitted changes, closed at the next commit.
+        self._change_groups: List[StoreGroup] = []
         self._interrupted: List[LlmRequest] = []
         # Per request id, the outputs mark at the first step discarded since the last recompute.
         self._discarded_marks: Dict[int, PyResult.OutputsMark] = {}
@@ -563,7 +565,7 @@ class RankFailureRecovery:
             if waiting and self._record != record:
                 raise _MembershipRestarted
 
-        return StoreGroup(
+        group = StoreGroup(
             self._store,
             f"{name}/{record.generation}",
             self.rank,
@@ -571,6 +573,8 @@ class RankFailureRecovery:
             on_wait,
             active=[r for r in range(self.world_size) if record.is_active(r)],
         )
+        self._change_groups.append(group)
+        return group
 
     def _fail_install(self, record: MembershipRecord, error: Exception) -> None:
         """Reply FAILED and wait for the next membership record.
@@ -746,13 +750,17 @@ class RankFailureRecovery:
         for generation in self._published_admissions:
             self._store.delete_key(_admission_epoch_key(generation))
         self._published_admissions.clear()
+        # Every active rank replied INSTALLED, so it made its last call in these groups.
+        active = [r for r in range(self.world_size) if record.is_active(r)]
+        for group in self._change_groups:
+            group.close(active)
+        self._change_groups.clear()
         # Serving resumes first. Every rank returns the empty spare slots' memory to the KV cache
         # at the step boundary that the next forward vote picks.
         self._memory.schedule_release()
         still_outstanding = self._outstanding()
         lost = {r: c for r, c in outstanding.items() if r not in known and r in still_outstanding}
         self._executor.fail_requests_by_id(lost, RankFailureError())
-        active = [r for r in range(self.world_size) if record.is_active(r)]
         logger.info(
             f"Rank {self.rank} resumed serving with membership generation {record.generation}, "
             f"ranks {active}. {recomputed} interrupted requests continue by recompute"

@@ -156,6 +156,23 @@ class StoreGroup(StoreComm):
     def Free(self) -> None:
         """Do nothing. The group's exchanges share this process's store client."""
 
+    def close(self, active: Sequence[int]) -> None:
+        """Delete the keys of this group's calls, once the ranks ``active`` made their last call.
+
+        Each call deletes this member's value of the call before it, so this member deletes its
+        values and the arrival counters of its last two calls. It also deletes the keys of the
+        members not in ``active``. Such a member failed and left the keys of its last two calls,
+        which are within one call of this member's last call, as a member enters a call only after
+        every active member set the call before it. Only a group that no rank in ``active`` built,
+        having skipped its change, keeps keys: its failed members' first call values and counter.
+        """
+        self._delete_calls(self._seq - 2, self._seq, [self.Get_rank()], counters=True)
+        failed_indices = [
+            i for i, r in enumerate(self.membership) if r in self._active and r not in active
+        ]
+        if failed_indices:
+            self._delete_calls(self._seq - 3, self._seq + 1, failed_indices, counters=True)
+
     def Abort(self, errorcode: int = 0) -> None:
         """End this process with ``errorcode``. The other members keep running."""
         from .startup import end_process
@@ -235,14 +252,24 @@ class StoreGroup(StoreComm):
             values = self._wait(prefix, [f"{prefix}/{index[r]}" for r in self._active])
         finally:
             self._on_wait(0)
-        if self._seq > 1:
-            previous = f"{self._name}/{self._seq - 2}"
-            self._store.delete_key(f"{previous}/{self.Get_rank()}")
-            if self.rank == min(self._active):
-                for key in self._counters(previous):
-                    self._store.delete_key(key)
+        self._delete_calls(
+            self._seq - 2, self._seq - 1, [self.Get_rank()], counters=self.rank == min(self._active)
+        )
         by_rank = dict(zip(self._active, values))
         return [by_rank.get(r) for r in self.membership]
+
+    def _delete_calls(self, first: int, end: int, indices: List[int], counters: bool) -> None:
+        """Delete the values of the members ``indices`` in calls ``first`` to ``end`` (exclusive).
+
+        Also delete the calls' arrival counters if ``counters``.
+        """
+        for seq in range(max(0, first), end):
+            prefix = f"{self._name}/{seq}"
+            for index in indices:
+                self._store.delete_key(f"{prefix}/{index}")
+            if counters:
+                for key in self._counters(prefix):
+                    self._store.delete_key(key)
 
     def _wait(self, prefix: str, keys: List[str]) -> List[bytes]:
         active_mask = rank_mask(self._active, MAX_RANKS)

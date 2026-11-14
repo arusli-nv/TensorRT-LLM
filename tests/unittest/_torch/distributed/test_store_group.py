@@ -199,6 +199,48 @@ def test_exchange_keeps_only_latest_call_keys():
     assert sorted(store.values) == ["group/2/0", "group/2/1", "group/2/arrived/0"]
 
 
+def test_closed_groups_leave_no_keys(monkeypatch):
+    """Leave no keys once the survivors close a group whose lowest member failed between calls."""
+    monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
+    store = _Store()
+    changed = threading.Event()
+
+    def on_wait(waiting):
+        if waiting and changed.is_set():
+            raise RuntimeError("the membership changed")
+
+    groups = {r: StoreGroup(store, "change", r, range(3), on_wait) for r in range(3)}
+    _run_ranks({r: lambda r=r: [groups[r].allgather(call) for call in range(3)] for r in groups})
+    # Rank 0 fails, and the new membership stops ranks 1 and 2 in their next call.
+    changed.set()
+    results = _run_ranks({r: lambda r=r: groups[r].allgather(3) for r in (1, 2)})
+    assert all(isinstance(result, RuntimeError) for result in results.values())
+    for r in (1, 2):
+        groups[r].close([1, 2])
+    assert store.values == {}
+
+
+def test_close_after_members_stop_at_different_calls(monkeypatch):
+    """Leave no keys once the lowest member stops between calls while another enters the next."""
+    monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
+    store = _Store()
+    changed = threading.Event()
+
+    def on_wait(waiting):
+        if waiting and changed.is_set():
+            raise RuntimeError("the membership changed")
+
+    groups = {r: StoreGroup(store, "change", r, range(3), on_wait) for r in range(3)}
+    _run_ranks({r: lambda r=r: [groups[r].allgather(call) for call in range(3)] for r in groups})
+    # Rank 2 fails. Rank 0 sees the new membership between calls, rank 1 only in its next call.
+    changed.set()
+    with pytest.raises(RuntimeError, match="the membership changed"):
+        groups[1].allgather(3)
+    for r in (0, 1):
+        groups[r].close([0, 1])
+    assert store.values == {}
+
+
 def test_waiting_mask_beyond_first_counter(monkeypatch):
     """Report a missing rank 64, whose arrival bit is in the second counter."""
     monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
