@@ -999,6 +999,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # PyExecutor._handle_responses and LlmResult.spec_dec_totals.
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
+        # Prompt tokens the request's first prefill found in the KV cache,
+        # reported as usage cached_tokens. Set once and kept across a
+        # recompute, whose prefill reuses blocks this request computed itself.
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
@@ -1221,8 +1226,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_csa2_remote_tail_mode = None
         self.py_csa2_remote_tail_start = None
         self.py_csa2_remote_tail_split = None
-        self._cached_tokens = 0
-        self._cached_tokens_set = False
 
     def reset_for_recompute(self, max_input_len: int) -> None:
         """Reset Python-side execution state so the request can replay prefill."""

@@ -899,11 +899,13 @@ class KVCacheAwareADPRouter(ADPRouter):
     ) -> RankState:
         # Remaining-to-compute tokens for a live request (net of KV cache
         # hits), matching the (req_tokens - match_len) scale used by
-        # route_requests scoring.
+        # route_requests scoring. The hit is this prefill's
+        # prepopulated_prompt_len, not the reported cached_tokens: a
+        # recomputed request prefills its generated tokens too.
         def _active_tokens(req) -> int:
             if self.dist.has_cp_helix:
-                return max(req.total_input_len_cp - req.cached_tokens, 0)
-            return max(req.py_orig_prompt_len - req.cached_tokens, 0)
+                return max(req.total_input_len_cp - req.prepopulated_prompt_len, 0)
+            return max(req.py_orig_prompt_len - req.prepopulated_prompt_len, 0)
 
         num_active_tokens = sum(_active_tokens(req) for req in active_requests)
         n_active_for_state = len(active_requests)
