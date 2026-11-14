@@ -23,6 +23,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from test_moe_a2a_abort import _combine, _dispatch, _setup
+from utils.stream_gates import held_stream
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.alltoall_watchdog import AlltoAllWatchdogCoordinator
@@ -253,12 +254,11 @@ def test_write_rank_mask_without_gpu_sync() -> None:
     health = EPGroupHealth(4)
     state = MoeExecutionState(health, 0, torch.device("cuda"))
     for failed, words in ((1, [0b1101, 0, 0, 0]), (2, [0b1001, 0, 0, 0])):
-        torch.cuda._sleep(1 << 31)  # about a second of GPU work ahead of the copy
-        busy = torch.cuda.Event()
-        busy.record()
-        health.mark_failed(failed)
-        state.write_rank_mask()
-        assert not busy.query(), "write_rank_mask waited for the GPU"
+        # The stream is held while the mask is written. A host sync raises, and a wait for the
+        # stream lasts until the watchdog releases it, which fails the block.
+        with held_stream(torch.cuda.current_stream()):
+            health.mark_failed(failed)
+            state.write_rank_mask()
         assert state.active_rank_mask.cpu().tolist() == words
 
 
