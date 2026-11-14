@@ -450,6 +450,13 @@ class RankFailureRecovery:
                 detector.checkpoint()
 
     def _on_exchange_interrupt(self) -> None:
+        """Run the membership change that stopped a host exchange round.
+
+        The change communicates over the rendezvous store and calls ``HostExchange.install`` but
+        starts no host exchange round, so it never re-enters the round it stopped. A joining rank
+        whose install is in progress then abandons the install it was finishing, and
+        ``before_iteration`` finishes the newer change.
+        """
         self._change_membership()
         if self._phase in _INSTALL_IN_PROGRESS and self._installed.is_joining(self.rank):
             raise _MembershipRestarted
