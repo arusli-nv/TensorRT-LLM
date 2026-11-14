@@ -1278,12 +1278,8 @@ class DecoderWarmup:
             clear_memory_buffers()
             torch.cuda.empty_cache()
             return
-        # A replacement rank replays the vote of the rank it replaces, so the
-        # group may skip a pass this process never ran. It runs the pass alone
-        # and outside the startup record: the tactics it took from its
-        # predecessor hit every shape, and each tuning-mode hit compiles the
-        # cached tactic. Without a communicator, as in a non-SPMD tuning
-        # session, a miss tunes every tactic on this rank.
+        # A replacement rank replays its predecessor's vote, so the group can skip
+        # a pass this process never ran. It then runs the pass alone.
         tune_alone = skip_completed_warmup
 
         AutoTuner.get().setup_distributed_state(self.mapping, None if tune_alone else self.dist)
@@ -1304,7 +1300,6 @@ class DecoderWarmup:
             ):
                 # Add generation request to warmup the autotuner cache.
                 warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
-        # Alone, a warmup forward has no peers to agree its shapes with.
         agreement = WarmupAgreement(None, self.mapping) if tune_alone else self._agreement
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
@@ -1358,11 +1353,7 @@ class DecoderWarmup:
             return ran_forward
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        # A replacement rank serves tactics it did not profile, so it runs the
-        # cached tactic of every runner once here, not only the JIT ones, and
-        # no kernel launches for the first time while it serves. It counts each
-        # step of the pass as startup progress, so a long pass is not taken for
-        # a hung startup.
+        # A replacement rank launches every cached tactic before it serves.
         startup_record = Distributed.startup_record
         replacement = startup_record is not None and startup_record.replacement
         if tune_alone:
