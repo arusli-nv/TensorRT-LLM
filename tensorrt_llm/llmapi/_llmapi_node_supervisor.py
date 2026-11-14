@@ -906,8 +906,11 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
     if not command:
         parser.error("give the command of each rank after --")
     environ = dict(os.environ)
+    # A Slurm step of one task, such as one that starts a lost node's supervisor again, ends with
+    # that task alone.
     if (
         "SLURM_PROCID" in environ
+        and environ.get("SLURM_STEP_NUM_TASKS") != "1"
         and "OMPI_COMM_WORLD_RANK" not in environ
         and not args.rank_0_in_session
     ):

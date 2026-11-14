@@ -1000,16 +1000,40 @@ def test_supervisor_rejects_bad_variable(
     assert not authority.hellos
 
 
-def test_supervisor_started_by_srun_rejected(monkeypatch, capfd):
-    """Reject a node supervisor that Slurm started as a task instead of mpirun."""
-    monkeypatch.setenv("SLURM_PROCID", "1")
-    monkeypatch.delenv("OMPI_COMM_WORLD_RANK", raising=False)
-    with pytest.raises(SystemExit) as error:
-        supervisor_module.main(
-            ["--node-rank", "1", "--nodes", "2", "--gpus-per-node", "2", "--", "true"]
-        )
-    assert error.value.code == 2
-    assert "requires `mpirun --enable-recovery`, not srun" in capfd.readouterr().err
+def _slurm_task(environ, step_tasks):
+    """Make ``environ`` that of a Slurm task in a step of ``step_tasks`` tasks, if not None."""
+    del environ["OMPI_COMM_WORLD_RANK"]
+    environ["SLURM_PROCID"] = "0"
+    environ.pop("SLURM_STEP_NUM_TASKS", None)
+    if step_tasks is not None:
+        environ["SLURM_STEP_NUM_TASKS"] = step_tasks
+
+
+@pytest.mark.parametrize("step_tasks", [None, "2"])
+def test_supervisor_started_by_srun_rejected(tmp_path, deployment, supervisor_process, step_tasks):
+    """Reject a node supervisor that Slurm started as a task instead of mpirun.
+
+    A step of several tasks ends all of them once one exits. A task outside a step (the batch
+    script) is rejected too.
+    """
+    _, environ = deployment
+    _slurm_task(environ, step_tasks)
+    stderr = _rejected_start(tmp_path, supervisor_process, environ)
+    assert "requires `mpirun --enable-recovery`, not srun" in stderr
+
+
+def test_supervisor_in_one_task_step_accepted(tmp_path, deployment, supervisor_process):
+    """Start a node supervisor that Slurm started as the one task of a step, which ends alone.
+
+    An operator starts a lost node's supervisor again this way. Its ranks do not inherit the step's
+    variables.
+    """
+    authority, environ = deployment
+    _slurm_task(environ, "1")
+    supervisor_process(environ, serving=True)
+    assert authority.hellos == [["node", "1", "2,3", socket.gethostname()]]
+    for rank in RANKS:
+        assert not any(name.startswith("SLURM_") for name in _read(tmp_path, rank, 0)["environ"])
 
 
 def test_supervisor_imports_no_moe_backend():
