@@ -1651,23 +1651,43 @@ def test_signal_lets_ranks_end_after_shutdown(tmp_path, deployment, monkeypatch,
 
 
 @pytest.mark.parametrize("authority_ends", [False, True])
-def test_ranks_end_after_shutdown(tmp_path, deployment, authority_ends):
+def test_ranks_end_after_shutdown(tmp_path, deployment, monkeypatch, authority_ends):
     """Wait for the active ranks to end after SHUTDOWN while the authority runs, however long.
 
     Each rank leaves the membership and ends on its own, and the authority runs until every active
     rank left. Rank 0 is waited for past the grace period that follows the authority's end too:
-    its end is the deployment's end, which its launcher bounds.
+    its end is the deployment's end, which its launcher bounds. The supervisor's clock runs ahead
+    of the grace period instead of the test waiting for it.
     """
     authority, environ = deployment
+    clock_s = [0.0]
+    monkeypatch.setattr(
+        supervisor_module, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + clock_s[0])
+    )
     draining = (0,) if authority_ends else (0, 1)
     environ["SUPERVISOR_TEST_MODES"] = " ".join(f"{rank}:0=drains" for rank in draining)
     running = _serving(tmp_path, authority, environ, node=0)
     authority.push(_record(MembershipState.SHUTDOWN))
+    _until(lambda: running.supervisor._view.record.state == MembershipState.SHUTDOWN)
     if authority_ends:
         _until(lambda: not _alive(_read(tmp_path, 1, 0)["pid"]))
         authority.close()
         _until(lambda: running.supervisor._connection is None)
-    time.sleep(2 * supervisor_module._STOP_GRACE_S)
+    steps_s = []
+    step = running.supervisor._step
+
+    def recorded_step(now_s):
+        status = step(now_s)
+        steps_s.append(now_s)
+        return status
+
+    running.supervisor._step = recorded_step
+    # Two steps, each two grace periods later, so a grace period that the first one starts ends.
+    for _ in range(2):
+        clock_s[0] += 2 * supervisor_module._STOP_GRACE_S
+        later_s = supervisor_module.time.monotonic()
+        running.supervisor._wake()
+        _until(lambda later_s=later_s: any(s >= later_s for s in steps_s))
     assert all(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in draining)
     (tmp_path / "drained").touch()
     assert running.wait() == 0
@@ -1712,23 +1732,28 @@ def test_shutdown_stops_rank_left_after_authority(tmp_path, deployment, end, sta
 
 
 def test_job_end_unlinks_before_mpirun_kills(
-    tmp_path, deployment, supervisor_process, host_weights
+    tmp_path, deployment, supervisor_process, fake_mpirun, host_weights
 ):
-    """Unlink the host weights within the time mpirun leaves a supervisor at a job end.
+    """Unlink the host weights on the signal, before the supervisor forwards it to rank 0.
 
-    mpirun (PRRTE 3) sends SIGKILL about 0.45 s after its SIGTERM; the test leaves 0.2 s. The ranks
-    then end through their parent-death signal, and the authority connection closes.
+    mpirun (PRRTE 3) sends SIGKILL about 0.45 s after its SIGTERM, so the unlink cannot wait until
+    the supervisor stops the ranks. The test kills the supervisor once rank 0 got the forwarded
+    signal, while rank 1 still runs. The ranks then end through their parent-death signal, and the
+    authority connection closes.
     """
     authority, environ = deployment
-    segments = host_weights(RANKS)
-    supervisor = supervisor_process(environ, serving=True)
+    environ["SUPERVISOR_TEST_MODES"] = "0:0=records-signals"
+    _, environ["PMIX_SERVER_URI41"] = fake_mpirun("--enable-recovery")
+    ranks = (0, 1)
+    segments = host_weights(ranks)
+    supervisor = supervisor_process(environ, node=0, serving=True)
     _write(segments)
     supervisor.send_signal(signal.SIGTERM)
-    time.sleep(0.2)
+    _until(lambda: (tmp_path / "signals-0-0").exists())
     supervisor.kill()
     supervisor.wait()
     assert not any(segment.exists() for segment in segments)
-    _until(lambda: not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in RANKS), 10)
+    _until(lambda: not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in ranks), 10)
     assert authority.closed.wait(10)
 
 
