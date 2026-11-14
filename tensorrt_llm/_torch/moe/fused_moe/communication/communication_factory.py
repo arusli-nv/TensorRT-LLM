@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.logger import logger
 
 from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
@@ -229,10 +230,10 @@ class CommunicationFactory:
             return strategy
         except Exception as e:
             if model_config.enable_wide_ep_fault_tolerance:
-                raise RuntimeError(
+                raise ValueError(
                     "Wide-EP fault tolerance requires the NVLinkOneSided all-to-all, the only MoE "
-                    "communication that follows a membership change, but it is unavailable: "
-                    f"{e}"
+                    f"communication that can leave out a failed rank, but it is unavailable ({e}); "
+                    f"change the configuration or {TURN_FAULT_TOLERANCE_OFF}"
                 ) from e
             logger.info(f"NVLinkOneSided not available: {e}")
 
