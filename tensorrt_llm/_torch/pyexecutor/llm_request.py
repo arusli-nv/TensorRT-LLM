@@ -385,7 +385,12 @@ class PyResult:
 
     @dataclass(frozen=True)
     class OutputsMark:
-        """Where the stored outputs of a request end."""
+        """Where the stored outputs of a request end before a step.
+
+        A step that a rank failure discards has already stored its logits, its
+        additional outputs and, for a context chunk, its prompt rows.
+        ``rewind_outputs`` drops them, so the recomputed step stores them once.
+        """
         context_rows_end: int
         context_logits_appends: int
         prompt_logprob_appends: int
