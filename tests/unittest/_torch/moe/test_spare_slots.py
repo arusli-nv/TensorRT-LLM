@@ -41,6 +41,13 @@ from tensorrt_llm._torch.distributed.membership import (
     startup,
 )
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslGroupedGemmNvfp4Impl
+from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+    DeepgemmCudaHopperFp8BlockScalesImpl,
+    TrtllmCutlassNvfp4Impl,
+    TrtllmCutlassUnquantizedImpl,
+    TrtllmCutlassW4a16Nvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     DeploymentHostWeights,
     EplbExpertRestore,
@@ -50,7 +57,10 @@ from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     plan_layer_placement,
     use_spare_slot_storage,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import (
+    MoEEplbWeightLayoutMixin,
+    MoEWeightOwnerMixin,
+)
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
@@ -734,6 +744,46 @@ def test_replacement_nvfp4_registers_no_host_rows():
         name: (getattr(module, name).dtype, getattr(module, name).shape[1:])
         for name in ("fc31_alpha", "fc2_alpha", "w3_w1_weight_scale", "w2_weight_scale")
     }
+
+
+class _SpareSlotOwner(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin):
+    """A MoE layer's weight owner with the quantization method of the MoE backend ``leaf``."""
+
+    def __init__(self, leaf, spare_slot_count):
+        self.layer_load_balancer = SimpleNamespace(spare_slot_count=spare_slot_count)
+        self.method = leaf.__new__(leaf)._get_quant_method()
+        self.method.create_weights = Mock()
+
+    def _get_quant_method(self):
+        return self.method
+
+
+@pytest.mark.parametrize(
+    "leaf, spare_slot_count, refusal",
+    [
+        (TrtllmCutlassNvfp4Impl, 2, None),
+        (TrtllmCutedslGroupedGemmNvfp4Impl, 2, None),
+        (TrtllmCutlassUnquantizedImpl, 2, None),
+        (TrtllmCutlassW4a16Nvfp4Impl, 2, "W4A16NVFP4CutlassFusedMoEMethod"),
+        (DeepgemmCudaHopperFp8BlockScalesImpl, 2, "DeepSeekFP8BlockScalesFusedMoEMethod"),
+        (TrtllmCutlassW4a16Nvfp4Impl, 0, None),
+    ],
+)
+def test_spare_slot_quantization_checked_at_weight_creation(
+    monkeypatch, leaf, spare_slot_count, refusal
+):
+    """Refuse spare slots for a quantization method that fault tolerance does not support."""
+    monkeypatch.setattr(f"{_ER}.create_spare_slot_weights", Mock())
+    owner = _SpareSlotOwner(leaf, spare_slot_count)
+    if refusal is None:
+        owner.create_weights()
+        owner.method.create_weights.assert_called_once_with(owner)
+    else:
+        with pytest.raises(
+            ValueError, match=f"support the {refusal} quantization method yet.*fault tolerance off"
+        ):
+            owner.create_weights()
+        owner.method.create_weights.assert_not_called()
 
 
 def _record(

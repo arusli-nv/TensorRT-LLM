@@ -263,8 +263,10 @@ cache estimation and it runs a tuning pass of its own:
 
 Generic code holds no class checks. A communication strategy binds through the duck-typed
 `bind_execution_state(MoeExecutionState)` (`BindableCommunication`), called for every MoE layer by `prepare_model`
-before weights load. A MoE backend declares `supports_spare_slots`. A backend that lacks a property is rejected at
-startup with the reason.
+before weights load. A MoE backend declares `supports_spare_slots`, and so does its quantization method
+(`FusedMoEMethodBase.supports_spare_slots`, True on the NVFP4 Cutlass and CuteDSL methods and the unquantized one).
+A backend that lacks a property is rejected at startup with the reason; a quantization method without it is rejected
+when the MoE layer creates its weights (`MoEWeightOwnerMixin.create_weights`).
 
 | Property | Communication must | Today (`NVLinkOneSided`) |
 |---|---|---|
@@ -288,6 +290,7 @@ startup with the reason.
 | CuteDSL with locality domains or SM107 kernels | Spare-slot tuning | Rejected in `ConfigurableMoE.validate_backend` |
 | DeepEP and other communication without `bind_execution_state` | Mask, abort state, fence path | Rejected at model load (`moe_comms` in `tensorrt_llm/_torch/pyexecutor/rank_failure_model_load.py`) |
 | MegaMoE (communication inside its own kernels, `comm` is None) | Kernels that honor mask, abort and remap | Rejected at model load |
+| Any other quantization on Cutlass (FP8 block scales, W4A16 NVFP4, ...) | `supports_spare_slots` on the quantization method | Rejected at model load (`MoEWeightOwnerMixin.create_weights`) |
 
 Expert restore is the EPLB target's restore (`EplbExpertRestore`): `plan_expert_restore` then `restore_lost_experts`.
 Every active rank plans from the same input, the slots each rank gathered after abandoning its EPLB iterations

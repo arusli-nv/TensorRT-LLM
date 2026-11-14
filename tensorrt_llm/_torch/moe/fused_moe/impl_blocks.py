@@ -42,6 +42,11 @@ from typing import Dict, List, Mapping, Optional, Union
 
 import torch
 
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    SUPPORTED_MOE_CONFIGURATIONS,
+    TURN_FAULT_TOLERANCE_OFF,
+)
+
 from ...utils import Fp4QuantizedTensor
 from .impl_contract import MoEInputRequirement, MoEStaticCapability
 
@@ -162,10 +167,20 @@ class MoEWeightOwnerMixin:
         Override when allocation needs more than this: TRTLLMGen passes a
         fused-shared-expert count for FP8 block scales, and MegaMoE-CuteDsl must
         rendezvous a symmetric-memory provider before anything is registered.
+
+        Raises:
+            ValueError: The load balancer gives this module spare slots, and the
+                quantization method does not declare ``supports_spare_slots``.
         """
         if self._weights_created:
             return
         self.quant_method = self._get_quant_method()
+        if self.uses_spare_slots and not self.quant_method.supports_spare_slots:
+            raise ValueError(
+                "Wide-EP fault tolerance does not support the "
+                f"{type(self.quant_method).__name__} quantization method yet. Use "
+                f"{SUPPORTED_MOE_CONFIGURATIONS}, or {TURN_FAULT_TOLERANCE_OFF}."
+            )
         self.quant_method.create_weights(self)
         if self.uses_spare_slots:
             from .eplb_expert_restore import create_spare_slot_weights
