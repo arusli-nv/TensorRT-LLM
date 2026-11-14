@@ -22,7 +22,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from moe_a2a_test_utils import a2a_combine, a2a_dispatch, a2a_workspace
+from moe_a2a_test_utils import (
+    a2a_combine,
+    a2a_dispatch,
+    a2a_workspace,
+    nvlink_one_sided_for_binding,
+)
 from utils.stream_gates import held_stream
 
 import tensorrt_llm  # noqa: F401
@@ -50,18 +55,13 @@ def _frontend(
     health: EPGroupHealth | None = None, *, fault_tolerance: bool = True
 ) -> NVLinkOneSided:
     """Build an NVLinkOneSided with only the state that execution binding reads."""
-    comm = NVLinkOneSided.__new__(NVLinkOneSided)
-    comm.can_use_cft_counted_writes = False
-    comm.ep_group_health = health
-    comm._rank_mask_enabled = health is not None or fault_tolerance
-    comm._enable_wide_ep_fault_tolerance = fault_tolerance
-    comm.execution_state = None
-    comm.ep_rank = 0
-    comm._dispatch_state = {"phase": "idle"}
-    comm.mnnvl_mem = _Memory()
-    comm._workspace_lifecycle = Mock()
-    comm.workspace = torch.zeros(2, 1, dtype=torch.uint8)
-    return comm
+    return nvlink_one_sided_for_binding(
+        workspace=torch.zeros(2, 1, dtype=torch.uint8),
+        mnnvl_mem=_Memory(),
+        workspace_lifecycle=Mock(),
+        health=health,
+        fault_tolerance=fault_tolerance,
+    )
 
 
 _EP_SIZE, _TOKENS, _HIDDEN = 2, 8, 128

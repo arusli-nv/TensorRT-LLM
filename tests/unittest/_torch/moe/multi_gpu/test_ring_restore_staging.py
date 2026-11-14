@@ -28,15 +28,15 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from test_moe_a2a_late_writes import (
-    _EP_SIZE,
-    _TIMEOUT,
-    _VICTIM,
-    _bound_state,
-    _map_workspace,
-    _StoreComm,
-    _victim,
-    _workers,
+from mnnvl_workers_test_utils import (
+    EP_SIZE,
+    TIMEOUT,
+    VICTIM,
+    StoreComm,
+    bound_state,
+    map_workspace,
+    run_victim,
+    run_workers,
 )
 
 import tensorrt_llm  # noqa: F401
@@ -49,7 +49,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import SingleLayerMoeLo
 
 _LAYERS = 3
 # Two experts per rank and two spare slots.
-_PLACEMENT = [[2 * rank, 2 * rank + 1, -1, -1] for rank in range(_EP_SIZE)]
+_PLACEMENT = [[2 * rank, 2 * rank + 1, -1, -1] for rank in range(EP_SIZE)]
 # Per slot: w1 32 MiB of bytes and w2 8 MiB of bfloat16, so that each target takes several chunks.
 _WEIGHTS = {"w1": (32 << 20, torch.uint8), "w2": (4 << 20, torch.bfloat16)}
 
@@ -65,7 +65,7 @@ def _expert_restore(rank: int) -> EplbExpertRestore:
     """Return the expert restore of ``rank``, with its slots and the host weights its node keeps."""
     balancer = SimpleNamespace(
         ep_rank=rank,
-        ep_size=_EP_SIZE,
+        ep_size=EP_SIZE,
         layer_updates_per_iter=0,
         mapping=SimpleNamespace(get_node_rank=lambda r: r),
         in_iter=False,
@@ -81,7 +81,7 @@ def _expert_restore(rank: int) -> EplbExpertRestore:
         layer = SingleLayerMoeLoadBalancer(
             impl,
             Mock(Get_rank=Mock(return_value=0), Get_size=Mock(return_value=1)),
-            2 * _EP_SIZE,
+            2 * EP_SIZE,
             updates_enabled=False,
             total_slot_count_per_rank=len(_PLACEMENT[0]),
             spare_slot_count=2,
@@ -107,15 +107,15 @@ def _expert_restore(rank: int) -> EplbExpertRestore:
 
 def _survivor(store, memory, workspace, meta, rank: int) -> None:
     """Remap the workspace with the other survivors and restore the failed rank's experts."""
-    state = _bound_state(memory, workspace, meta, rank)
+    state = bound_state(memory, workspace, meta, rank)
     restore = _expert_restore(rank)
     store.set(f"captured/{rank}", "1")
     store.wait(["proceed"])
 
-    gather = _StoreComm(store, rank, "survivors", range(_VICTIM))
-    state.health.mark_failed(_VICTIM)
-    state.remap_workspaces(gather, frozenset(range(_EP_SIZE)))
-    active = [r != _VICTIM for r in range(_EP_SIZE)]
+    gather = StoreComm(store, rank, "survivors", range(VICTIM))
+    state.health.mark_failed(VICTIM)
+    state.remap_workspaces(gather, frozenset(range(EP_SIZE)))
+    active = [r != VICTIM for r in range(EP_SIZE)]
     plan = restore.plan_expert_restore(active, [np.array(_PLACEMENT)] * _LAYERS)
     # Ranks 0 and 1 stage experts 6 and 7, whose host weights only rank 2 keeps.
     staged = {(target, source) for _, target, _, _, source in plan.staged.tolist()}
@@ -139,13 +139,13 @@ def _survivor(store, memory, workspace, meta, rank: int) -> None:
 
 
 def _worker(rank: int, port: int, mode: str) -> None:
-    store, memory, workspace, meta = _map_workspace(rank, port)
-    if rank != _VICTIM:
+    store, memory, workspace, meta = map_workspace(rank, port)
+    if rank != VICTIM:
         _survivor(store, memory, workspace, meta, rank)
     elif mode == "writing":
-        _victim(store, workspace, meta)
+        run_victim(store, workspace, meta)
     else:
-        store.wait([f"captured/{survivor}" for survivor in range(_VICTIM)])
+        store.wait([f"captured/{survivor}" for survivor in range(VICTIM)])
         store.set("running", "1")
         store.wait(["done"])
 
@@ -153,11 +153,11 @@ def _worker(rank: int, port: int, mode: str) -> None:
 @pytest.mark.parametrize("mode", ["idle", "writing"])
 def test_staged_restore_is_bit_exact(mode: str) -> None:
     """Check that the restored slots hold their experts' host weights byte for byte."""
-    with _workers(__file__, mode) as (store, workers):
+    with run_workers(__file__, mode) as (store, workers):
         *survivors, victim = workers
         store.set("proceed", "1")
         for survivor in survivors:
-            assert survivor.wait(timeout=_TIMEOUT.total_seconds()) == 0
+            assert survivor.wait(timeout=TIMEOUT.total_seconds()) == 0
         assert victim.poll() is None, "the victim exited before the survivors finished"
 
 
