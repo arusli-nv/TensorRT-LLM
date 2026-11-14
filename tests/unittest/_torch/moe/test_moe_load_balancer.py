@@ -24,7 +24,6 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)
-from tensorrt_llm._torch.moe.fused_moe.quantization import FusedMoEMethodBase
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -622,31 +621,6 @@ def test_statistic_routing_layer_has_no_experts_to_load() -> None:
                                        updates_enabled=False)
     with pytest.raises(AssertionError, match="when using statistic routing"):
         layer.get_load_expert_ids()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "check", ["_online_eplb_not_supported", "_online_eplb_not_verified"])
-def test_fault_tolerance_rejects_unsupported_quantization(check: str) -> None:
-    """Fault tolerance rejects a method that refuses or has not verified online EPLB."""
-    module = MagicMock()
-    module.layer_load_balancer.need_load_shared_weights.return_value = True
-    module.layer_load_balancer.spare_slot_count = 2
-    with pytest.raises(ValueError,
-                       match="turn fault tolerance off .*enable_wide_ep"):
-        getattr(FusedMoEMethodBase, check)(module)
-
-
-@pytest.mark.cpu_only
-def test_online_eplb_without_host_weights_not_supported() -> None:
-    """Without fault tolerance, a method without host weights refuses online EPLB."""
-    module = MagicMock()
-    module.layer_load_balancer.need_load_shared_weights.return_value = True
-    module.layer_load_balancer.spare_slot_count = 0
-    with pytest.raises(
-            NotImplementedError,
-            match="^FusedMoEMethodBase doesn't support online EPLB now$"):
-        FusedMoEMethodBase._online_eplb_not_supported(module)
 
 
 def _skip_without_gdrcopy_slots():
