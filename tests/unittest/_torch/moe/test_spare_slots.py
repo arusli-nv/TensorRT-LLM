@@ -52,8 +52,11 @@ from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
-from tensorrt_llm._torch.moe.fused_moe.quantization import UnquantizedFusedMoEMethod
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    UnquantizedFusedMoEMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
+)
 from tensorrt_llm._torch.pyexecutor.rank_failure_model_load import create_moe_load_balancer
 from tensorrt_llm.mapping import Mapping
 
@@ -658,6 +661,78 @@ def test_replacement_reattaching_host_weights_loads_none(monkeypatch, tracked):
     assert reattached_host_weights.keys() == host_weights.keys()
     for key, t in host_weights.items():
         assert torch.equal(reattached_host_weights[key], t), key
+
+
+class _ReplacementLayer(MoEEplbWeightLayoutMixin, torch.nn.Module):
+    """A MoE layer of a replacement that reattached its node's host weights, so it loads none."""
+
+    num_experts = EXPERTS
+    expert_size_per_partition = 2
+
+    def __init__(self):
+        super().__init__()
+        comm = Mock(Get_rank=Mock(return_value=0), Get_size=Mock(return_value=1))
+        self.sharer = HostMoeTensorSharer(0, EXPERTS, comm)
+        self.sharer.keep_experts([])
+        self.layer_load_balancer = SimpleNamespace(
+            spare_slot_count=1,
+            get_load_expert_ids=lambda: self.sharer.own_expert_ids,
+            host_tensor_sharer=self.sharer,
+            add_to_migrate_weight_fn=Mock(),
+        )
+
+    def _using_dynamic_load_balancer(self) -> bool:
+        return False
+
+
+def test_zero_row_host_weights_register_shapes():
+    """A replacement's host weights have no rows, and their shapes are registered all the same."""
+    layer = _ReplacementLayer()
+    layer.register_all_parameter_slot_and_to_fix_weight_fns({"w": torch.empty(0, 2, 3)})
+    assert layer.sharer.name_info == {"w": (torch.float32, torch.Size([2, 3]))}
+
+
+def test_replacement_nvfp4_registers_no_host_rows():
+    """NVFP4 weight processing of a replacement registers its empty host scales and alphas."""
+    method = W4A16NVFP4CutlassFusedMoEMethod()
+    method.block_scales_vec_size = 4
+    module = _ReplacementLayer()
+    module.tp_size, module.tp_rank = 1, 0
+    module.initial_local_expert_ids = [2, 0]
+    module.w3_w1_weight_scale = torch.nn.Parameter(
+        torch.zeros(2, 128, 4, dtype=torch.int32), requires_grad=False
+    )
+    module.w2_weight_scale = torch.nn.Parameter(
+        torch.zeros(2, 256, 2, dtype=torch.int32), requires_grad=False
+    )
+    module.local_shared_w3_w1_scale_tensors = torch.zeros(0, 128, 4, dtype=torch.int32)
+    module.local_shared_w2_scale_tensors = torch.zeros(0, 256, 2, dtype=torch.int32)
+    module.fc31_input_scale = torch.nn.Parameter(torch.ones(()), requires_grad=False)
+    module.fc2_input_scale = torch.nn.Parameter(torch.ones(()), requires_grad=False)
+    module.fc31_alpha = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    module.fc2_alpha = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    module.tmp_raw_input_scales = {
+        i: {name: torch.tensor(1.0) for name in ("w1", "w3", "w2")} for i in range(EXPERTS)
+    }
+    module.tmp_weight_scale_2 = {
+        slot: {"w1": torch.tensor(1.0), "w3": torch.tensor(1.0), "w2": torch.tensor(2.0)}
+        for slot in range(2)
+    }
+    module.tmp_shared_weight_scale_2 = {}
+    for slot in range(2):
+        w1 = torch.ones(128, 16).to(torch.float8_e4m3fn)
+        w2 = torch.ones(256, 8).to(torch.float8_e4m3fn)
+        method.load_expert_w3_w1_weight_scale_nvfp4(
+            module, w1, None, module.w3_w1_weight_scale[slot], expert_idx=slot
+        )
+        method.load_expert_w2_weight_scale_nvfp4(module, w2, module.w2_weight_scale[slot])
+
+    method.process_weights_after_loading(module)
+
+    assert module.sharer.name_info == {
+        name: (getattr(module, name).dtype, getattr(module, name).shape[1:])
+        for name in ("fc31_alpha", "fc2_alpha", "w3_w1_weight_scale", "w2_weight_scale")
+    }
 
 
 def _record(
