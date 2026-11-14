@@ -311,8 +311,9 @@ def test_plan_rejects_expert_without_host_weights():
     current = [without_node_1.placements[0]]
     # Node 0 keeps node 1's experts' host weights, and node 2 keeps node 0's.
     restore.plan_expert_restore(_active([1, 2, 3]), current)
-    # Node 1 kept those of node 2, so rank 4's experts 8 and 9 have none left.
-    with pytest.raises(ValueError, match="keeps host weights for expert 8 in MoE layer 0"):
+    # Node 1 kept those of node 2, so rank 4's experts 8 and 9 have none left. The error names the
+    # ranks that kept them.
+    with pytest.raises(ValueError, match=r"expert 8 of MoE layer 0: only ranks \[2, 3\] keep them"):
         restore.plan_expert_restore(_active([2, 3, 4]), current)
 
 

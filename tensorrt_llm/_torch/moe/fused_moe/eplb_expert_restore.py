@@ -683,9 +683,13 @@ class EplbExpertRestore:
                     continue
                 sources = tuple(np.flatnonzero(has_host_weights[:, expert] & active).tolist())
                 if not sources:
+                    holders = np.flatnonzero(has_host_weights[:, expert]).tolist()
                     raise ValueError(
-                        f"No node with an active rank keeps host weights for expert {expert} in "
-                        f"MoE layer {layer.get_layer_idx()}"
+                        f"No active rank keeps host weights for expert {expert} of MoE layer "
+                        f"{layer.get_layer_idx()}: only ranks {holders} keep them, and none of them "
+                        "is active. With static EPLB, each node keeps the host weights of the next "
+                        "node's experts, so after the loss of a node, the next node's experts have "
+                        "no host copy until a rank of the lost node rejoins"
                     )
                 staged.append((i, target, slot, expert, sources[turns[sources] % len(sources)]))
                 turns[sources] += 1
