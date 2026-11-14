@@ -1057,6 +1057,12 @@ class RankFailureRecovery:
             if plan is not None:
                 from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlanMismatchError
 
+                def restore_progress() -> None:
+                    # A newer change stops the loads that this one planned, as the store groups do.
+                    if self._record != record:
+                        raise _MembershipRestarted
+                    self._install_step_done()
+
                 # Experts are staged through the remapped workspace, which no former member writes.
                 try:
                     balancer.expert_restore.restore_lost_experts(
@@ -1064,7 +1070,7 @@ class RankFailureRecovery:
                         self._moe.staging_workspace(),
                         self._active_group(record, "expert_staging").allgather,
                         timer.times_ms,
-                        progress=self._install_step_done,
+                        progress=restore_progress,
                     )
                 except ExpertRestorePlanMismatchError as error:
                     raise _ExpertsNotRestorable(str(error)) from error

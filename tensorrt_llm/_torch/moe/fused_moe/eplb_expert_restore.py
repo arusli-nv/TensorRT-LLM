@@ -766,7 +766,8 @@ class EplbExpertRestore:
                 for an inactive rank.
             times: Receives each phase's duration in milliseconds.
             progress: Called after the backing, each staged chunk and each layer loaded locally, so
-                that a long restore keeps reporting progress.
+                that a long restore keeps reporting progress. It may raise to stop the restore. The
+                slots loaded so far then hold no expert in this rank's view until the next restore.
 
         Raises:
             ExpertRestorePlanMismatchError: The plan or the workspace row size of this rank differs

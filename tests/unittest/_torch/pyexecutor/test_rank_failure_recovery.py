@@ -1262,6 +1262,23 @@ def test_install_restores_lost_experts(monkeypatch, extra_free):
     assert device.free == FREE_BYTES + extra_free
 
 
+def test_newer_change_stops_expert_restore(monkeypatch):
+    """Check that a restore stops loading experts once a newer change arrives."""
+    r = _resuming()
+    calls, _, _ = _eplb(monkeypatch, r)
+    expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
+
+    def restore_lost_experts(plan, staging_workspace, allgather, times, progress):
+        r.client.deliver(_record(MembershipState.PROPOSE, generation=2, active_mask=0b0011))
+        progress()
+        calls.append("load after the newer change")
+
+    expert_restore.restore_lost_experts = restore_lost_experts
+    r.recovery.before_iteration()
+    assert "load after the newer change" not in calls
+    r.moe.rearm.assert_not_called()
+
+
 def test_full_kv_pool_preempts_newest_requests(monkeypatch):
     """Check that a restore into a full KV cache pool preempts the newest requests until it fits."""
     r = _resuming()
