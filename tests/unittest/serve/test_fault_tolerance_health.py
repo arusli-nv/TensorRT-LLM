@@ -275,6 +275,26 @@ def test_closed_reader_stops_reading(new_reader):
     assert health_module.open_store.call_count == 1
 
 
+def test_close_waits_for_read_in_progress(monkeypatch, new_reader):
+    """Check that closing a reader during a read returns once its refresh thread has ended."""
+    monkeypatch.setattr(health_module, "_STATUS_REFRESH_PERIOD_S", 0.01)
+    store = FakeRendezvousStore(_record(MembershipState.COMMITTED))
+    threads = set(threading.enumerate())
+    health = new_reader(store)
+    reading = threading.Event()
+    answers = store.check
+
+    def slow_check(keys):
+        reading.set()
+        time.sleep(0.1)  # The store takes a while to answer.
+        return answers(keys)
+
+    store.check = slow_check
+    assert reading.wait(10.0)
+    health.close()
+    assert set(threading.enumerate()) <= threads
+
+
 @pytest.mark.parametrize(
     "error, status, code",
     [

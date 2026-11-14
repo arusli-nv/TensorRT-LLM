@@ -48,6 +48,9 @@ if TYPE_CHECKING:
 
 _STATUS_READ_TIMEOUT_S = 1.0
 _STATUS_REFRESH_PERIOD_S = 1.0
+# How long closing waits for a read in progress, whose few store requests each time out after
+# _STATUS_READ_TIMEOUT_S.
+_CLOSE_TIMEOUT_S = 10.0
 # Report "stalled" once the active ranks have waited this long on a rank that makes no progress.
 # Half the hang timeout keeps one long step, such as a long prefill, from reading as stalled.
 _STALLED_STATE_AFTER_S = HANG_TIMEOUT_S / 2
@@ -110,7 +113,10 @@ class FaultToleranceHealth:
         self._closed = threading.Event()
         # Read once, so that a server answers its first probe with the membership in the store.
         self._last_status = self.read_status()
-        threading.Thread(target=self._refresh, name="FaultToleranceHealth", daemon=True).start()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh, name="FaultToleranceHealth", daemon=True
+        )
+        self._refresh_thread.start()
 
     @classmethod
     def from_environment(
@@ -275,8 +281,9 @@ class FaultToleranceHealth:
         registry.register(FaultToleranceMetricsCollector(self, self._metric_labels))
 
     def close(self) -> None:
-        """Stop reading the status."""
+        """Stop reading the status, and wait for a read in progress to end."""
         self._closed.set()
+        self._refresh_thread.join(_CLOSE_TIMEOUT_S)
 
     def _refresh(self) -> None:
         try:
@@ -288,7 +295,7 @@ class FaultToleranceHealth:
             if not self._closed.is_set():
                 # A read raised, so report the store as unreadable rather than the last status.
                 logger.error("Stopped reading the rendezvous store for the fault-tolerance status")
-                self.close()
+                self._closed.set()
                 self.read_status()
 
 
