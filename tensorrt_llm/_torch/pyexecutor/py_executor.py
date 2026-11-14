@@ -16,7 +16,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, NoReturn, Optional, Set, Tuple, Union)
+                    Literal, NamedTuple, NoReturn, Optional, Set, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -565,6 +565,15 @@ class ScheduledBatchStats:
     num_gen_requests: Optional[int] = None
     num_gen_kv_tokens: Optional[int] = None
     num_paused_requests: Optional[int] = None
+
+
+class WaitingState(NamedTuple):
+    """The requests a rank has not scheduled yet, with their pending
+    cancellations and the shutdown flag."""
+
+    queue: List[RequestQueueItem]
+    canceled_req_ids: List[int]
+    is_shutdown: bool
 
 
 @dataclasses.dataclass
@@ -7018,8 +7027,9 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _retire_inflight_batch_for_control(self) -> None:
-        """Retire the overlap loop's in-flight batch before a control action fires.
+    def retire_inflight_batch(self) -> None:
+        """Retire the overlap loop's in-flight batch at a point every rank
+        reaches in the same iteration, such as before a control action fires.
 
         ``_handle_control_request`` runs on the executor-loop thread at a point
         every rank reaches in the same iteration (the control sentinel travels
@@ -7112,6 +7122,30 @@ class PyExecutor:
         self.iter_counter = iteration
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
+
+    def known_request_ids(self) -> Set[int]:
+        """Return the ids of the requests this rank holds, queued or active."""
+        known = {
+            request.py_request_id
+            for request in self.active_requests if not request.is_dummy
+        }
+        known.update(item.id for item in self.waiting_queue)
+        known.update(item.id for item in self.request_accumulated)
+        known.update(self.executor_request_queue.queued_request_ids())
+        return known
+
+    def export_waiting_state(self) -> WaitingState:
+        """Return the requests not scheduled yet, for another rank to take."""
+        return WaitingState(list(self.waiting_queue),
+                            list(self.canceled_req_ids), self.is_shutdown)
+
+    def import_waiting_state(self, state: WaitingState) -> None:
+        """Replace the requests not scheduled yet with another rank's."""
+        self.is_shutdown = state.is_shutdown
+        queued = {item.id for item in self.waiting_queue}
+        self.waiting_queue.remove_by_ids(queued)
+        self.waiting_queue.add_requests(state.queue)
+        self.canceled_req_ids[:] = state.canceled_req_ids
 
     def _num_inflight_kv_transfers(self) -> int:
         """Context-only requests whose KV has not been pulled yet.
@@ -7231,7 +7265,7 @@ class PyExecutor:
         # Retire the overlap loop's in-flight batch (lockstep on all ranks) so
         # the action runs against a quiescent executor and nothing consumes it
         # later from a per-rank code path.
-        self._retire_inflight_batch_for_control()
+        self.retire_inflight_batch()
         self.control_requests.pop(0)
         control_id = getattr(pending, "control_id", None)
         self._active_control_id = control_id
@@ -12732,7 +12766,7 @@ class PyExecutor:
 
         Must run at a control-action boundary: ``_handle_control_request``
         retires the overlap loop's in-flight batch on every rank before the
-        action fires (see ``_retire_inflight_batch_for_control``), so
+        action fires (see ``retire_inflight_batch``), so
         everything here is rank-local and issues no TP collectives. Consuming
         an in-flight batch here instead would gather on some attention-DP
         ranks only and deadlock the engine.

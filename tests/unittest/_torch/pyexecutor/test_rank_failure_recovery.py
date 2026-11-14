@@ -57,7 +57,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, WaitingState
 from tensorrt_llm._torch.pyexecutor.rank_failure_memory import StartupMemory
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import RankFailureRecovery
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
@@ -229,6 +229,9 @@ def _executor(rank=0):
         "_accept_or_discard_previous_batch",
         "_discard_previous_batch",
         "resume_at_iteration",
+        "known_request_ids",
+        "export_waiting_state",
+        "import_waiting_state",
     ):
         setattr(executor, step, partial(getattr(PyExecutor, step), executor))
 
@@ -236,7 +239,7 @@ def _executor(rank=0):
         executor._accept_or_discard_previous_batch()
         executor.previous_batch = None
 
-    executor._retire_inflight_batch_for_control = Mock(side_effect=retire)
+    executor.retire_inflight_batch = Mock(side_effect=retire)
     return executor
 
 
@@ -564,7 +567,7 @@ def test_hang_detector_paused_during_change(paused_before):
         seen = []
         install = r.exchange.install
         r.exchange.install = lambda *args: (seen.append(detector.paused()), install(*args))
-        retire = r.executor._retire_inflight_batch_for_control
+        retire = r.executor.retire_inflight_batch
         retire.side_effect = lambda: seen.append(detector.paused())
         install_record = _record(MembershipState.INSTALL, resume=ResumeState(iteration=9))
         committed = install_record.model_copy(update=dict(state=MembershipState.COMMITTED))
@@ -1154,7 +1157,7 @@ def _short_release(monkeypatch, fresh_rows=frozenset(range(WORLD))):
     r.recovery.before_iteration()  # The install and the commit.
     _vote(r)
     r.recovery.before_iteration()  # The release.
-    r.executor._retire_inflight_batch_for_control.reset_mock()
+    r.executor.retire_inflight_batch.reset_mock()
     return r, device, clock
 
 
@@ -1168,7 +1171,7 @@ def _retry_vote(r, device, clock, freed=4 * MIB):
 def test_retried_release_regains_freed_memory(monkeypatch):
     """Check that the retry retires the step in flight and takes back what the ended rank freed."""
     r, device, clock = _short_release(monkeypatch)
-    retire = r.executor._retire_inflight_batch_for_control
+    retire = r.executor.retire_inflight_batch
     assert device.gpu_quota == 54 * MIB
     device.take(-4 * MIB)  # The excluded process ended.
     clock.now_s += 1.0
@@ -1238,7 +1241,7 @@ def test_healthy_step_checks_no_device_memory(monkeypatch):
     r.recovery.before_iteration()
     mem_get_info.assert_not_called()
     empty_cache.assert_not_called()
-    r.executor._retire_inflight_batch_for_control.assert_not_called()
+    r.executor.retire_inflight_batch.assert_not_called()
 
 
 def _rejoining(monkeypatch):
@@ -1264,7 +1267,7 @@ def test_rejoin_releases_memory_after_resume(monkeypatch):
     # Serving resumed with the spare slots still backed and the pool short of the workspace.
     assert device.backed == 6 * MIB
     assert device.gpu_quota == 54 * MIB
-    retire = r.executor._retire_inflight_batch_for_control
+    retire = r.executor.retire_inflight_batch
     retire.reset_mock()
     # Rank 1 holds its steps for the next change, so no rank releases memory at this step boundary.
     assert _vote(r, peers=((3, 1, 0), (5, 0, 0), (2, 0, 0)))[0] == [4, 0, 1]
@@ -1280,7 +1283,7 @@ def test_rejoin_releases_memory_after_resume(monkeypatch):
     other = _rank(rank=1)
     _vote(other, peers=((4, 0, 1), (5, 0, 0), (2, 0, 0)))
     other.recovery.before_iteration()
-    other.executor._retire_inflight_batch_for_control.assert_called_once()
+    other.executor.retire_inflight_batch.assert_called_once()
     (released,) = [c.args[0] for c in info.call_args_list if "returned the empty" in c.args[0]]
     assert released.startswith(
         "Rank 0 returned the empty spare slots of membership generation 1 to the KV cache pool: "
@@ -1295,7 +1298,7 @@ def test_release_waits_for_newer_change(monkeypatch):
     r.recovery.before_iteration()
     assert _vote(r)[0] == [4, 0, 1]
     newer = _record(MembershipState.PROPOSE, generation=2, active_mask=0b0011)
-    retire = r.executor._retire_inflight_batch_for_control
+    retire = r.executor.retire_inflight_batch
     retire.reset_mock()
     retire.side_effect = lambda: r.client.deliver(newer)
     r.recovery.before_iteration()
@@ -1555,7 +1558,7 @@ def _admitting(monkeypatch, rank):
     r.executor.dist.allgather.side_effect = lambda local: [
         local if i == rank else (set(), None) for i in range(WORLD)
     ]
-    r.exchange.rank0_object = ([RequestQueueItem(7)], [8], False)
+    r.exchange.rank0_object = WaitingState([RequestQueueItem(7)], [8], False)
     r.executor.waiting_queue = FCFSWaitingQueue()
     committed = install.model_copy(update=dict(state=MembershipState.COMMITTED, joining_mask=0))
     r.client.answers[(Reply.INSTALLED, 2)] = [committed]
@@ -1613,7 +1616,7 @@ def test_rank0_admits_joining_rank(monkeypatch, shutdown):
 @pytest.mark.parametrize("shutdown", [False, True])
 def test_joining_rank_takes_rank0_waiting_queue(monkeypatch, shutdown):
     r = _admitting(monkeypatch, rank=FAILED)
-    r.exchange.rank0_object = ([RequestQueueItem(7)], [8], shutdown)
+    r.exchange.rank0_object = WaitingState([RequestQueueItem(7)], [8], shutdown)
     executor = r.executor
     # The queue that an earlier attempt of this admission took.
     executor.waiting_queue.add_requests([RequestQueueItem(5)])
@@ -1631,7 +1634,7 @@ def test_joining_rank_takes_rank0_waiting_queue(monkeypatch, shutdown):
     assert (readers, recipients) == ([0], [])
     executor.dist.broadcast.assert_not_called()
     # It ran no step and enters the host exchange only at its admission.
-    executor._retire_inflight_batch_for_control.assert_not_called()
+    executor.retire_inflight_batch.assert_not_called()
     r.moe.remap_workspaces.assert_called_once()
     r.moe.rearm.assert_called_once()
     r.moe.install_mask.assert_called_once()
@@ -1652,7 +1655,7 @@ def test_active_ranks_retire_step_before_resize(monkeypatch, rank):
         steps.append(("retire", executor.previous_batch is not None))
         executor.previous_batch = None
 
-    executor._retire_inflight_batch_for_control.side_effect = retire
+    executor.retire_inflight_batch.side_effect = retire
     r.exchange.admit = lambda active_mask, epoch: steps.append("admit")
     r.moe.workspace_bytes.return_value = 4 * MIB
     device.measure(monkeypatch)
@@ -1692,7 +1695,7 @@ def test_newer_change_during_resume_keeps_collectives(monkeypatch, installed):
         else:
             r.client.deliver(_NEWER)
 
-    r.executor._retire_inflight_batch_for_control.side_effect = retire
+    r.executor.retire_inflight_batch.side_effect = retire
     r.recovery.before_iteration()
     # A rank that installed the newer change still hands over the waiting queue of the replaced one.
     r.executor.dist.allgather.assert_called_once()

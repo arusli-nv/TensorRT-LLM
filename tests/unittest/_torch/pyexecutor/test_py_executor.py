@@ -2193,7 +2193,7 @@ def _previous_batch_consumer(consumer, dropped):
         calls,
         {
             "rebalance": executor._consume_previous_batch_for_rebalance,
-            "control": executor._retire_inflight_batch_for_control,
+            "control": executor.retire_inflight_batch,
         }[consumer],
     )
 

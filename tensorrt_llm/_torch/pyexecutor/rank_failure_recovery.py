@@ -673,7 +673,7 @@ class RankFailureRecovery:
         # complete here, before the rank gathers its slots.
         self._end_eplb_iterations()
         if not record.is_joining(self.rank):
-            self._executor._retire_inflight_batch_for_control()
+            self._executor.retire_inflight_batch()
         recomputed = self._recompute_interrupted_requests()
         if record.joining_mask:
             if self._installed is record:
@@ -699,7 +699,7 @@ class RankFailureRecovery:
             own_slots = [
                 ranks[self.rank] for _, ranks in balancer.expert_restore.current_placement()
             ]
-        own_requests = set() if record.is_joining(self.rank) else self._known_request_ids()
+        own_requests = set() if record.is_joining(self.rank) else executor.known_request_ids()
         gathered = executor.dist.allgather((own_requests, own_slots))
         if record.joining_mask:
             self._hand_over_waiting_queue(record)
@@ -715,13 +715,8 @@ class RankFailureRecovery:
         admitted after the shutdown request drains and stops with the others. The queue goes
         through the host exchange, so user prompts stay out of the rendezvous store.
         """
-        executor = self._executor
         if self.rank == 0:
-            waiting = (
-                list(executor.waiting_queue),
-                list(executor.canceled_req_ids),
-                executor.is_shutdown,
-            )
+            waiting = self._executor.export_waiting_state()
             joining = [r for r in range(self.world_size) if record.is_joining(r)]
             self._exchange.exchange(pickle.dumps(waiting), readers=[], recipients=joining)
             return
@@ -730,11 +725,8 @@ class RankFailureRecovery:
             pickle.dumps(None), readers=[0] if joining else [], recipients=[]
         )
         if joining:
-            queue, canceled, executor.is_shutdown = pickle.loads(payloads[0])  # nosec B301
             # Rank 0's queue replaces the one an earlier attempt of this admission took.
-            executor.waiting_queue.remove_by_ids({item.id for item in executor.waiting_queue})
-            executor.waiting_queue.add_requests(queue)
-            executor.canceled_req_ids[:] = canceled
+            self._executor.import_waiting_state(pickle.loads(payloads[0]))  # nosec B301
 
     def _resume_serving(
         self,
@@ -782,7 +774,7 @@ class RankFailureRecovery:
         """
         release = self._memory.end_release_vote()
         torch.cuda.synchronize()
-        self._executor._retire_inflight_batch_for_control()
+        self._executor.retire_inflight_batch()
         # A change that arrived after the vote keeps the memory until it is committed.
         if release and not self.pauses_forward():
             self._memory.release(_moe_load_balancer_of(self._executor), self._installed.generation)
@@ -915,16 +907,6 @@ class RankFailureRecovery:
             self._store.set(epoch_key, str(epoch).encode())
             self._published_admissions.append(record.generation)
         self._exchange.admit(record.active_mask, epoch)
-
-    def _known_request_ids(self) -> Set[int]:
-        executor = self._executor
-        known = {
-            request.py_request_id for request in executor.active_requests if not request.is_dummy
-        }
-        known.update(item.id for item in executor.waiting_queue)
-        known.update(item.id for item in executor.request_accumulated)
-        known.update(executor.executor_request_queue.queued_request_ids())
-        return known
 
     def pauses_forward(self) -> bool:
         """Return True while a membership change that is not yet committed pauses the forward."""
