@@ -40,7 +40,7 @@ from tensorrt_llm._torch.distributed import (
     mnnvl_memory,
 )
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
-from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist
+from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist, MnnvlDistFactory
 from tensorrt_llm._torch.distributed.membership import (
     Authority,
     RankReport,
@@ -609,7 +609,7 @@ def fresh_distributed(monkeypatch):
 
 def test_fault_tolerance_needs_host_collectives(fresh_distributed):
     """Refuse a mapping that the host collectives do not support, instead of falling back to MPI."""
-    Distributed.set_implementation(MnnvlDist.create, StartupRecord())
+    Distributed.set_implementation(MnnvlDistFactory(), StartupRecord())
     with pytest.raises(ValueError, match=r"requires attention DP \(enable_attention_dp=True\)"):
         Distributed.get(Mapping(world_size=2, rank=0, gpus_per_node=2, tp_size=2))
 
@@ -619,33 +619,58 @@ def test_rank_identity_alone_keeps_mpi(fresh_distributed, monkeypatch):
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, RankIdentity(0, 2, 2, False).env_value())
     assert not isinstance(Distributed.get(Mapping(world_size=2, rank=0, tp_size=2)), MnnvlDist)
     with pytest.raises(RuntimeError, match="before any communicator is created"):
-        Distributed.set_implementation(MnnvlDist.create, StartupRecord())
+        Distributed.set_implementation(MnnvlDistFactory(), StartupRecord())
 
 
-def test_communicators_share_host_exchange(fresh_distributed, monkeypatch):
-    """Check that every ``MnnvlDist`` of a process uses the host exchange of the first one."""
+_TP2 = Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True)
+
+
+@pytest.fixture
+def created_exchanges(fresh_distributed, monkeypatch):
+    """Make ``HostExchange.create`` record each mapping and return a fake exchange."""
     created = []
 
     def create(cls, mapping, group_type):
         created.append(mapping)
-        return SimpleNamespace(rank=mapping.tp_rank, nranks=mapping.tp_size)
+        return SimpleNamespace(rank=mapping.tp_rank, nranks=mapping.tp_size, waiting_for=0b10)
 
     monkeypatch.setattr(HostExchange, "create", classmethod(create))
-    Distributed.set_implementation(MnnvlDist.create, StartupRecord())
-    with monkeypatch.context() as patched:
-        patched.setattr(MnnvlDist, "check_requirements", staticmethod(lambda mapping: None))
-        first = Distributed.get(Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True))
-        second = Distributed.get(
-            Mapping(world_size=2, rank=1, tp_size=2, moe_ep_size=2, enable_attention_dp=True)
-        )
-        other_tp_group = Distributed.get(
-            Mapping(world_size=4, rank=1, tp_size=4, enable_attention_dp=True)
-        )
+    monkeypatch.setattr(MnnvlDist, "check_requirements", staticmethod(lambda mapping: None))
+    return created
+
+
+def test_communicators_share_host_exchange(created_exchanges):
+    """Check that every ``MnnvlDist`` of a factory uses the host exchange of the first one."""
+    Distributed.set_implementation(MnnvlDistFactory(), StartupRecord())
+    first = Distributed.get(_TP2)
+    second = Distributed.get(
+        Mapping(world_size=2, rank=1, tp_size=2, moe_ep_size=2, enable_attention_dp=True)
+    )
+    other_tp_group = Distributed.get(
+        Mapping(world_size=4, rank=1, tp_size=4, enable_attention_dp=True)
+    )
     assert second is not first
     assert second.host_exchange is first.host_exchange
-    assert len(created) == 1
+    assert len(created_exchanges) == 1
     with pytest.raises(RuntimeError, match="cannot serve TP rank 1/4"):
         other_tp_group.host_exchange
+
+
+def test_factory_reports_host_collective_waits(created_exchanges):
+    """Report the waits of the factory's host exchange, and none before it exists."""
+    factory = MnnvlDistFactory()
+    Distributed.set_implementation(factory, StartupRecord())
+    dist = Distributed.get(_TP2)
+    assert factory.waiting_for == 0
+    dist.host_exchange
+    assert factory.waiting_for == 0b10
+
+
+def test_each_factory_has_own_host_exchange(created_exchanges):
+    """Give the communicators of another factory, as of a new start, their own host exchange."""
+    first, other = MnnvlDistFactory()(_TP2), MnnvlDistFactory()(_TP2)
+    assert other.host_exchange is not first.host_exchange
+    assert len(created_exchanges) == 2
 
 
 def _start_alone(monkeypatch, record):
@@ -656,7 +681,7 @@ def _start_alone(monkeypatch, record):
     monkeypatch.setattr(mnnvl_memory.TpMnnvlMemory, "comm_signature", None)
     startup_group = StoreGroup(None, "startup", 0, [0], startup=record.replacement)
     monkeypatch.setattr(_utils, "comm", startup_group)
-    Distributed.set_implementation(MnnvlDist.create, record)
+    Distributed.set_implementation(MnnvlDistFactory(), record)
     return Distributed.get(Mapping(world_size=1, rank=0, tp_size=1, enable_attention_dp=True))
 
 

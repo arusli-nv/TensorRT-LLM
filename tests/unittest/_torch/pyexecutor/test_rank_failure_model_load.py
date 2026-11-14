@@ -112,7 +112,7 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
     )
     check = partial(check_supported, llm_args, mapping)
     if lacks in ("tp", "cp", "mnnvl", "fabric", "mpi"):
-        # MnnvlDist.create checks the host collectives.
+        # MnnvlDist.check_requirements checks the host collectives.
         check = partial(MnnvlDist.check_requirements, mapping)
     if fix is None:
         check()

@@ -58,6 +58,8 @@ from .signed_store import SHARED_SECRET_BYTES, SignedStore, parse_shared_secret
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ..host_exchange import MnnvlDistFactory
+
 _EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
 _client: Optional[MembershipClient] = None
@@ -409,13 +411,18 @@ def _report_startup_wait(waiting_for: int) -> None:
     _client.report(waiting_for=waiting_for, progress=_startup_steps)
 
 
+def _on_tick_at_startup(host_collectives: MnnvlDistFactory) -> None:
+    """Report the peers that a startup collective of the startup group or ``MnnvlDist`` waits for."""
+    _client.report(waiting_for=_startup_waiting_for | host_collectives.waiting_for)
+
+
 def join_startup_group(mapping: Mapping) -> None:
     """Make the startup group this rank's ``mpi_comm()`` and MPI world, and set ``TLLM_RANK``.
 
     ``Distributed`` then runs the host collectives over MNNVL memory (``MnnvlDist``).
     """
     from ..communicator import Distributed
-    from ..host_exchange import MnnvlDist
+    from ..host_exchange import MnnvlDistFactory
 
     identity = _rank_identity()
     one_node = identity.world_size <= min(identity.gpus_per_node, mapping.gpus_per_node)
@@ -447,7 +454,14 @@ def join_startup_group(mapping: Mapping) -> None:
         startup=True,
     )
     set_mpi_world_comm(startup_group)
-    Distributed.set_implementation(MnnvlDist.create, _startup_record)
+    host_collectives = MnnvlDistFactory()
+    Distributed.set_implementation(host_collectives, _startup_record)
+    # A host collective waits in native code, so the client's thread reports whom it waits for.
+    _client.bind(
+        _on_record_at_startup,
+        functools.partial(_on_tick_at_startup, host_collectives),
+        _on_error_at_startup,
+    )
     if not isinstance(local_mpi_comm(), StoreGroup):
         raise RuntimeError(
             "The node's communicator was split from MPI before the startup group was set"

@@ -38,7 +38,7 @@ from torch.distributed import DistStoreError, TCPStore
 from tensorrt_llm import _utils
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDistFactory
 from tensorrt_llm._torch.distributed.membership import (
     LIVENESS_KEY,
     RENDEZVOUS_ENV,
@@ -152,6 +152,13 @@ def test_startup_collective_reports_waits_and_steps(store, monkeypatch):
         dict(waiting_for=0b10, progress=0),
         dict(waiting_for=0, progress=1),
     ]
+
+
+def test_startup_reports_host_collective_waits(store, monkeypatch):
+    """Report the peers a startup host collective waits for, with those of the startup group."""
+    monkeypatch.setattr(startup_module, "_startup_waiting_for", 0b0010)
+    startup_module._on_tick_at_startup(SimpleNamespace(waiting_for=0b0100))
+    startup_module._client.report.assert_called_once_with(waiting_for=0b0110)
 
 
 def test_startup_ends_when_authority_fails():
@@ -422,7 +429,9 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     assert _utils.local_mpi_size() == 4
     assert startup_module.os.environ["TLLM_RANK"] == "1"
     assert _utils.mpi_comm() is _utils.world_comm
-    assert Distributed._create == MnnvlDist.create
+    assert isinstance(Distributed._create, MnnvlDistFactory)
+    # The membership client reports the waits of the host collectives.
+    assert startup_module._client.bind.call_args.args[1].args == (Distributed._create,)
     assert Distributed.startup_record is startup_module._startup_record
 
 

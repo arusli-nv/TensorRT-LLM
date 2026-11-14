@@ -426,14 +426,16 @@ class MnnvlDist(Distributed):
     # The transport of the host exchange.
     group_type: type[HostExchangeGroup] = MnnvlHostExchangeGroup
 
-    # The first MnnvlDist that Distributed.get created in this process.
-    _first: Optional[MnnvlDist] = None
+    def __init__(self, mapping: Mapping, host_exchange_owner: Optional[MnnvlDist] = None):
+        """Create the communicator of ``mapping``.
 
-    def __init__(self, mapping: Mapping):
+        Args:
+            host_exchange_owner: The communicator whose host exchange this one uses, by default
+                itself.
+        """
         super().__init__(mapping)
         self._host_exchange = None
-        # The MnnvlDist whose host exchange this one uses.
-        self._host_exchange_owner = self
+        self._host_exchange_owner = self if host_exchange_owner is None else host_exchange_owner
 
     @staticmethod
     def check_requirements(mapping: Mapping) -> None:
@@ -466,20 +468,6 @@ class MnnvlDist(Distributed):
         if all(met for met, _ in checks):
             checks += MnnvlDist.group_type.requirements()
         check_fault_tolerance_requirements(checks)
-
-    @staticmethod
-    def create(mapping: Mapping) -> MnnvlDist:
-        """Return a ``MnnvlDist`` for ``mapping`` after checking its requirements.
-
-        It shares the process's first host exchange, so a membership change reaches all of them.
-        """
-        MnnvlDist.check_requirements(mapping)
-        dist = MnnvlDist(mapping)
-        if Distributed.get.cache_info().currsize:
-            dist._host_exchange_owner = MnnvlDist._first
-        else:
-            MnnvlDist._first = dist
-        return dist
 
     @property
     def local_world_size(self):
@@ -524,6 +512,15 @@ class MnnvlDist(Distributed):
                 )
             self._host_exchange = exchange
         return self._host_exchange
+
+    @property
+    def waiting_for(self) -> int:
+        """Return the mask of ranks a running host collective lacks packets from. Thread-safe.
+
+        Before the first host collective, return 0 without creating the exchange.
+        """
+        exchange = self._host_exchange_owner._host_exchange
+        return 0 if exchange is None else exchange.waiting_for
 
     def _exchange(
         self, obj, readers=None, recipients=None, idle=False, reduce_op=None, active_only=False
@@ -628,3 +625,26 @@ class MnnvlDist(Distributed):
 
     def tp_cp_broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
         return self.broadcast_int64(values, root)
+
+
+class MnnvlDistFactory:
+    """Create a process's ``MnnvlDist`` communicators for ``Distributed.get``.
+
+    They share the first one's host exchange, so a membership change reaches all of them.
+    """
+
+    def __init__(self) -> None:
+        self._first: Optional[MnnvlDist] = None
+
+    def __call__(self, mapping: Mapping) -> MnnvlDist:
+        """Return a ``MnnvlDist`` for ``mapping`` after checking its requirements."""
+        MnnvlDist.check_requirements(mapping)
+        dist = MnnvlDist(mapping, self._first)
+        if self._first is None:
+            self._first = dist
+        return dist
+
+    @property
+    def waiting_for(self) -> int:
+        """Return the mask of ranks a running host collective lacks packets from. Thread-safe."""
+        return 0 if self._first is None else self._first.waiting_for
