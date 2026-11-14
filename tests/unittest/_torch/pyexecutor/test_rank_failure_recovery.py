@@ -535,6 +535,17 @@ def test_stop_without_shutdown_record_logs_it(monkeypatch):
     assert message.endswith("phase SERVING")
 
 
+def test_completed_stop_ends_on_aborted_deployment(monkeypatch):
+    """Check that a completed run exits with status 1 when the deployment aborts before SHUTDOWN."""
+    monkeypatch.setattr(recovery_module, "_AUTHORITY_TIMEOUT_S", 0.01)
+    _exit_raises(monkeypatch)
+    r = _rank(rank=1)
+    r.client.deliver(_record(MembershipState.ABORTED))
+    with pytest.raises(SystemExit) as exited:
+        r.recovery.stop(True)
+    assert exited.value.code == 1
+
+
 @pytest.mark.parametrize("fatal_error", [None, RuntimeError("Fatal error: a test error")])
 def test_failed_run_stop_exits_without_shutdown(monkeypatch, fatal_error):
     """Check that a failed loop, or a completed one after a fatal error, exits with no SHUTDOWN."""

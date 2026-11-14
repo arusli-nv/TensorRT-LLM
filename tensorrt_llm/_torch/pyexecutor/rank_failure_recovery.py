@@ -320,22 +320,28 @@ class RankFailureRecovery:
         """Leave the membership after a completed run, or end the process after a failed one.
 
         After a completed run, rank 0 records SHUTDOWN, so that the node supervisors do not take
-        the ranks' exits for failures. MPI_Finalize waits for every rank, so after a rank failure
-        an atexit handler ends the process before mpi4py finalizes MPI. Handlers registered later
-        still run before it.
+        the ranks' exits for failures. If the deployment aborts instead, as when rank 0 is lost
+        first, the process ends with status 1. MPI_Finalize waits for every rank, so after a rank
+        failure an atexit handler ends the process before mpi4py finalizes MPI. Handlers
+        registered later still run before it.
         """
         if completed:
             if self.rank == 0:
                 self._client.report(shutdown=True)
             with self._record_changed:
-                shut_down = self._record_changed.wait_for(
-                    lambda: self._record.state == MembershipState.SHUTDOWN, _AUTHORITY_TIMEOUT_S
+                self._record_changed.wait_for(
+                    lambda: self._record.state
+                    in (MembershipState.SHUTDOWN, MembershipState.ABORTED),
+                    _AUTHORITY_TIMEOUT_S,
                 )
-            if not shut_down:
+                record = self._record
+            if record.state == MembershipState.ABORTED:
+                end_process(self.rank, 1, f"the membership record is {record!r}")
+            if record.state != MembershipState.SHUTDOWN:
                 logger.error(
                     f"Rank {self.rank} received no SHUTDOWN record in {_AUTHORITY_TIMEOUT_S:.0f} "
                     "s, so its node supervisor may take its exit for a failure. Membership "
-                    f"record {self._record!r}, phase {self._phase.name}"
+                    f"record {record!r}, phase {self._phase.name}"
                 )
             self._client.stop()
             if self._authority is not None:
