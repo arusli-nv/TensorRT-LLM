@@ -341,7 +341,11 @@ def test_waiting_for_during_flag_rewrites(monkeypatch):
     waiter.start()
     try:
         assert rewriting.wait(JOIN_TIMEOUT_S)
+        # Read until the reads saw the flags change, which a contended node can delay.
+        deadline_s = time.monotonic() + JOIN_TIMEOUT_S
         masks = {read() for _ in range(2000)}
+        while len(masks) == 1 and time.monotonic() < deadline_s:
+            masks |= {read() for _ in range(2000)}
     finally:
         stopping.set()
         exchange.wake()
