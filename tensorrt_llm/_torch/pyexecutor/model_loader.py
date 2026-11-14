@@ -1321,8 +1321,8 @@ class ModelLoader:
 
         fault_tolerance = self.llm_args.enable_wide_ep_fault_tolerance
         if fault_tolerance:
-            from .rank_failure_recovery import (check_supported,
-                                                create_moe_load_balancer)
+            from .rank_failure_model_load import (check_supported,
+                                                  create_moe_load_balancer)
             check_supported(self.llm_args, self.mapping)
         else:
             create_moe_load_balancer = maybe_create_moe_load_balancer
@@ -1347,7 +1347,7 @@ class ModelLoader:
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
             if fault_tolerance:
-                from .rank_failure_recovery import prepare_model
+                from .rank_failure_model_load import prepare_model
                 prepare_model(model)
 
             requires_standard_hf_loading = any(

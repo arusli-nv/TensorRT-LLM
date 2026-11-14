@@ -33,7 +33,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatt
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import moe_comms, prepare_model
+from tensorrt_llm._torch.pyexecutor.rank_failure_model_load import moe_comms, prepare_model
 from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping

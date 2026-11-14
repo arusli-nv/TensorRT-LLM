@@ -54,7 +54,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMix
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.moe.fused_moe.quantization import UnquantizedFusedMoEMethod
-from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import create_moe_load_balancer
+from tensorrt_llm._torch.pyexecutor.rank_failure_model_load import create_moe_load_balancer
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
