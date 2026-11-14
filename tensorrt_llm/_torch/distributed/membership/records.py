@@ -40,8 +40,10 @@ MAX_RANKS = 256
 # the default 300 s executor hang detector and all-to-all timeouts.
 HANG_TIMEOUT_S = 60.0
 REPORT_INTERVAL_S = 0.5
-# The authority sends an empty line to a rank that it has sent nothing for this long.
-HEARTBEAT_INTERVAL_S = 5.0
+# The authority sends an empty line to a rank that it has sent nothing for this long. A rank then
+# hears from it at least every heartbeat plus report interval, so it outlasts an authority stall of
+# the silence timeout less both (28.5 s).
+HEARTBEAT_INTERVAL_S = 1.0
 # The age at which a rank takes the authority as silent. It is half the hang timeout, as the
 # authority takes a rank's reports as stale after half of its own hang timeout.
 AUTHORITY_SILENCE_TIMEOUT_S = HANG_TIMEOUT_S / 2

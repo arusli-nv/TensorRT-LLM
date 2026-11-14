@@ -442,6 +442,8 @@ def test_membership_timeouts_keep_their_order():
         < timing.HANG_TIMEOUT_S
     )
     assert timing.ADMISSION_TIMEOUT_S < timing.HANG_TIMEOUT_S
+    silence_s = timing.AUTHORITY_SILENCE_TIMEOUT_S
+    assert silence_s - timing.HEARTBEAT_INTERVAL_S - timing.REPORT_INTERVAL_S >= 28.5
 
 
 def test_unconnected_replacement_join_request_dropped():
