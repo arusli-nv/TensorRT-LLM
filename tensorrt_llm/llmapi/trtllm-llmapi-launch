@@ -57,9 +57,18 @@ function mpi_world_size {
 # Prefer OMPI_*, since mpirun inside a Slurm allocation passes the batch step's SLURM_* variables.
 if [ -n "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] && [ -z "$TLLM_FAULT_TOLERANCE_RANK" ]; then
     launcher_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-    exec python3 "$launcher_directory/_llmapi_node_supervisor.py" \
-        --node-rank "${OMPI_COMM_WORLD_RANK:-$mpi_rank}" \
-        --nodes "${OMPI_COMM_WORLD_SIZE:-$(mpi_world_size)}" -- \
+    node_options=(--node-rank "${OMPI_COMM_WORLD_RANK:-$mpi_rank}" --nodes "${OMPI_COMM_WORLD_SIZE:-$(mpi_world_size)}")
+    # An operator returns lost node <i> of <n> to its deployment: --rejoin-node <i> --nodes <n> <task>.
+    if [ "${task_with_command[0]}" = "--rejoin-node" ] || [ "${task_with_command[0]}" = "--nodes" ]; then
+        if [ "${task_with_command[0]}" != "--rejoin-node" ] || [ "${task_with_command[2]}" != "--nodes" ] \
+            || [ "${#task_with_command[@]}" -lt 5 ]; then
+            echo "usage: trtllm-llmapi-launch --rejoin-node <node rank> --nodes <node count> <task>" >&2
+            exit 2
+        fi
+        node_options=(--node-rank "${task_with_command[1]}" --nodes "${task_with_command[3]}" --rejoin)
+        task_with_command=("${task_with_command[@]:4}")
+    fi
+    exec python3 "$launcher_directory/_llmapi_node_supervisor.py" "${node_options[@]}" -- \
         "$launcher_directory/$(basename -- "${BASH_SOURCE[0]}")" "${task_with_command[@]}"
 fi
 

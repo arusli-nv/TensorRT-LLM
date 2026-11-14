@@ -1668,6 +1668,36 @@ def test_node_launch_runs_supervisor(tmp_path, fault_tolerance):
         assert args == ["-m", "tensorrt_llm.llmapi.mgmn_worker_node"]
 
 
+def test_rejoin_node_option_runs_supervisor(tmp_path):
+    """Run the supervisor of the node given with --rejoin-node in rejoin mode, whatever the task variables say."""
+    secret = {"TLLM_FAULT_TOLERANCE_SHARED_SECRET": secrets.token_hex(32)}
+    result = _run_launcher(tmp_path, 0, ["--rejoin-node", "1", "--nodes", "3", "task"], **secret)
+    assert result.returncode == 0, result.stderr
+    args = (tmp_path / "python3-args").read_text().split()
+    assert Path(args[0]).resolve() == _SUPERVISOR.resolve()
+    assert args[1:7] == ["--node-rank", "1", "--nodes", "3", "--rejoin", "--"]
+    assert Path(args[7]).resolve() == (_LLMAPI / "trtllm-llmapi-launch").resolve()
+    assert args[8:] == ["task"]
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        ["--rejoin-node", "1", "task"],
+        ["--rejoin-node", "1", "--nodes", "3"],
+        ["--nodes", "3", "--rejoin-node", "1", "task"],
+    ],
+    ids=["no-nodes", "no-task", "nodes-first"],
+)
+def test_malformed_rejoin_node_rejected(tmp_path, task):
+    """Reject a --rejoin-node launch that is not followed by --nodes and a task, starting no supervisor."""
+    secret = {"TLLM_FAULT_TOLERANCE_SHARED_SECRET": secrets.token_hex(32)}
+    result = _run_launcher(tmp_path, 0, task, **secret)
+    assert result.returncode == 2, result.stderr
+    assert "usage: trtllm-llmapi-launch --rejoin-node" in result.stderr
+    assert not (tmp_path / "python3-args").exists()
+
+
 @pytest.mark.parametrize("fault_tolerance", [False, True])
 def test_early_mpi_server_exit_status(tmp_path, fault_tolerance):
     """Exit 0 on a clean shutdown of a rank that the node supervisor started, and 1 otherwise.
