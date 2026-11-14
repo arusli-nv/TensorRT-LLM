@@ -1460,11 +1460,12 @@ def test_sessions_keep_own_rendezvous(monkeypatch):
     assert not any(name in os.environ for name in names)
 
 
-@pytest.mark.parametrize("end", ["SIGINT", "SIGTERM", "ABORTED", "SHUTDOWN"])
+@pytest.mark.parametrize("end", ["SIGTERM", "ABORTED", "SHUTDOWN"])
 def test_host_weights_unlinked_at_end(tmp_path, deployment, supervisor_process, host_weights, end):
     """Unlink the node's host weights however the deployment ends.
 
-    Keep another deployment's host weights.
+    Keep another deployment's host weights. SIGINT takes the same signal handler as SIGTERM, and
+    test_signal_forwarded_to_rank_0_only checks its exit status.
     """
     authority, environ = deployment
     segments = host_weights(RANKS)
@@ -1476,7 +1477,7 @@ def test_host_weights_unlinked_at_end(tmp_path, deployment, supervisor_process, 
     else:
         authority.push(_record(MembershipState[end]))
     status = supervisor.wait(30)
-    assert status == {"SIGINT": 130, "SIGTERM": 143, "ABORTED": 1, "SHUTDOWN": 0}[end]
+    assert status == {"SIGTERM": 143, "ABORTED": 1, "SHUTDOWN": 0}[end]
     assert not any(segment.exists() for segment in segments)
     assert other.exists()
     assert not any(_alive(_read(tmp_path, rank, 0)["pid"]) for rank in RANKS)
