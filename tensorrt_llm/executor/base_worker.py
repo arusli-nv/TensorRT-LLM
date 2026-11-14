@@ -230,7 +230,7 @@ class BaseWorker(GenerationExecutor):
             self.max_seq_len = self.engine.max_seq_len
         if self._rank_failure_requests is not None:
             self.engine.rank_failure_recovery.set_outstanding_requests(
-                self._rank_failure_requests.outstanding)
+                self.outstanding_requests)
 
         self._lora_manager: Optional[LoraManager] = None
 
@@ -348,6 +348,37 @@ class BaseWorker(GenerationExecutor):
                 )
                 return
             self.engine.cancel_request(request_id)
+
+    def outstanding_requests(self) -> Dict[int, int]:
+        """Map request id to client id for every request without a final response.
+
+        A request has a result until its final response. The submit may store
+        the request id after that response, so the result decides.
+        """
+        return {
+            request_id: client_id
+            for client_id, request_id in dict(
+                self._client_id_to_request_id).items()
+            if client_id in self._results
+        }
+
+    def resubmit(self, client_id: int, request: GenerationRequest) -> bool:
+        """Enqueue ``request`` again for ``client_id``, whose result is pending.
+
+        Returns:
+            Whether the request was enqueued. A request whose result is gone,
+            or whose first enqueue has not stored its request id yet, is not.
+        """
+        if (client_id not in self._results
+                or client_id not in self._client_id_to_request_id):
+            return False
+        try:
+            request_id = self._enqueue_request(request)
+        except RequestError as error:
+            logger.warning(f"Could not resubmit request {client_id}: {error}")
+            return False
+        self._client_id_to_request_id[client_id] = request_id
+        return True
 
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()

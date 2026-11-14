@@ -1097,7 +1097,7 @@ def test_worker_reenqueues_unanswered_failed_request(monkeypatch):
     requests = {client_id: _submit(worker, client_id) for client_id in (7, 8)}
     helper.handle_for_ipc_batched([_output(8), _ended_by_rank_failure(7)])
     assert worker._enqueue_request.call_args_list[-1].args == (requests[7], )
-    assert worker._rank_failure_requests.outstanding() == {102: 7, 101: 8}
+    assert worker.outstanding_requests() == {102: 7, 101: 8}
     assert _sent(worker) == {8: [("output", "sampling params")]}
 
     helper.handle_for_ipc_batched([_output(7), _ended_by_rank_failure(8)])
@@ -1116,7 +1116,7 @@ def test_worker_reenqueues_unanswered_failed_request(monkeypatch):
     helper.handle_for_ipc_batched([_ended_by_rank_failure(9)])
     assert _sent(worker)[9] == [("error", RankFailureError)]
     assert worker._enqueue_request.call_count == 5
-    assert worker._rank_failure_requests.outstanding() == {}
+    assert worker.outstanding_requests() == {}
 
 
 @pytest.mark.cpu_only
@@ -1139,7 +1139,7 @@ def test_worker_reenqueues_multimodal_input(monkeypatch):
     helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
     assert enqueued == [(params, multimodal_input)] * 2
     assert _sent(worker) == {}
-    assert worker._rank_failure_requests.outstanding() == {102: 7}
+    assert worker.outstanding_requests() == {102: 7}
 
 
 @pytest.mark.cpu_only
@@ -1188,7 +1188,22 @@ def test_worker_fails_request_before_id_stored(monkeypatch):
     assert _sent(worker) == {7: [("error", RankFailureError)]}
     # The submit stored the request id after the error, so the id stays without a result.
     assert worker._client_id_to_request_id == {7: 100}
-    assert worker._rank_failure_requests.outstanding() == {}
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_resubmit_stores_the_new_request_id(monkeypatch):
+    """Check that a resubmit enqueues the request again only while its result is pending."""
+    worker, _ = _ipc_worker(monkeypatch, fault_tolerance=False)
+    request = _submit(worker, 7)
+    assert worker.resubmit(7, request)
+    assert worker._enqueue_request.call_args.args == (request, )
+    assert worker._client_id_to_request_id == {7: 101}
+    worker._enqueue_request.side_effect = RequestError("shutting down")
+    assert not worker.resubmit(7, request)
+    assert worker._client_id_to_request_id == {7: 101}
+    worker._results.pop(7)
+    assert not worker.resubmit(7, request)
 
 
 def _set_up_engine(monkeypatch, worker, rank_failure_recovery):
