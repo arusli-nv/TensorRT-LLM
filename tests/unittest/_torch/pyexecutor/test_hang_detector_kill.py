@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import (
     start_rank_crash_kill_watchdog,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
 
 pytestmark = pytest.mark.cpu_only
 
@@ -316,6 +317,17 @@ def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "-1")
     assert hard_kill_on_rank_crash(world_size=8) is False
     assert kills == []
+
+
+def test_no_crash_kill_under_fault_tolerance(monkeypatch):
+    """A fault-tolerant rank arms no kill, since the membership removes it."""
+    kills = []
+    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: None)
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "1,16,4,1")
+    assert hard_kill_on_rank_crash(world_size=16) is False
+    assert kills == []
+    assert start_rank_crash_kill_watchdog(16) is None
 
 
 def test_rank_crash_kill_invalid_grace_uses_default(monkeypatch):
