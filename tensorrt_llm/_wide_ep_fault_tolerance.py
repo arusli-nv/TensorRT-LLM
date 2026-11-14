@@ -69,6 +69,12 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     decoding_type = None if spec_config is None else spec_config.decoding_type
     sa_enhanced = getattr(spec_config, "sa_config", None) is not None
     current_decoding = f"{decoding_type!r} with sa_config" if sa_enhanced else repr(decoding_type)
+    draft_len_schedule = None if spec_config is None else spec_config.draft_len_schedule
+    acceptance_gate = (
+        spec_config is not None
+        and bool(spec_config.acceptance_rate_window_size)
+        and spec_config.acceptance_rate_threshold is not None
+    )
     kv_events = llm_args.kv_cache_config.kv_events_config
     transceiver = llm_args.cache_transceiver_config
     transceiver_backend = None if transceiver is None else transceiver.backend
@@ -167,6 +173,14 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "MTP or no speculative decoding (speculative_config: none, or decoding_type 'MTP' "
                 f"without sa_config, not {current_decoding}), because the other drafters are not "
                 "supported yet: fault tolerance is tested with MTP only",
+            ),
+            (
+                draft_len_schedule is None and not acceptance_gate,
+                "the same draft length on every rank (no speculative_config.draft_len_schedule, "
+                "max_concurrency or acceptance_rate_window_size), which is not supported yet: each "
+                "rank would pick its draft length from its own batch or acceptance rate, and ranks "
+                "with different draft lengths run different numbers of MTP-layer all-to-alls; "
+                "max_draft_len alone gives a fixed draft length",
             ),
             (
                 llm_args.enable_chunked_prefill

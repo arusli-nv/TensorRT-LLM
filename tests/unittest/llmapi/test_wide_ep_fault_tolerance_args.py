@@ -194,6 +194,18 @@ def test_supported_configuration_is_accepted(fields):
                 ),
             )
         ),
+        *(
+            (
+                {"speculative_config": MTPDecodingConfig(max_draft_len=1, **options)},
+                "no speculative_config.draft_len_schedule, max_concurrency or "
+                "acceptance_rate_window_size",
+            )
+            for options in (
+                {"draft_len_schedule": {4: 1}},
+                {"max_concurrency": 8},
+                {"acceptance_rate_window_size": 16, "acceptance_rate_threshold": 0.3},
+            )
+        ),
         # A recomputed request's context can reach max_seq_len, the model's length by default.
         (
             {"max_seq_len": None},
