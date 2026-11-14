@@ -42,7 +42,10 @@
 //   packet 0 (header):  [ epoch : 32 | payload length in bytes : 32 ]
 //   packet i (payload): [ epoch : 32 | 4 payload bytes             ]
 // The epoch counts rounds and skips 0, because the rows start zeroed. A packet belongs to the current round when it
-// carries the round's epoch, so a reader needs no separate ready flag.
+// carries the round's epoch, so a reader needs no separate ready flag. This relies on the copy engines moving each
+// aligned 8-byte packet in one transaction, so that a reader never sees a packet's epoch with the other half of an
+// older packet. CUDA does not document this; a torn header would carry an older payload length, and the wait would
+// return a payload of that length; a torn payload packet would carry older payload bytes.
 //
 // One round on rank r:
 //   1. Copy r's header into slot r of every row, and r's payload into the rows of the ranks that read it. A payload

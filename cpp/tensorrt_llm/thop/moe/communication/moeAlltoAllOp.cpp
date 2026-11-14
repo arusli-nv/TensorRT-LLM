@@ -50,6 +50,8 @@ namespace moe_comm
 // No collective separates a rank's first-touch JIT/autotune work from its dispatch launch, so
 // this device-side budget is in effect a deadline on the slowest peer's host-side progress.
 // Python raises it during warmup (tensorrt_llm/_torch/moe/fused_moe/moe_comm_timeout_guard.py).
+// With Wide-EP fault tolerance the host ends waits on a failed rank through the abort state first, and rejects a
+// budget shorter than twice its hang timeout.
 static std::atomic<int64_t> gTimeoutCycles{tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles};
 
 // Set the budget of subsequent launches in seconds; 0 restores the default.
@@ -232,6 +234,7 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torc
     TORCH_CHECK(
         t.is_cpu() && t.scalar_type() == torch::kInt32 && t.dim() == 1 && t.numel() == kWords && t.is_contiguous(),
         "abort_state must be a contiguous int32 CPU tensor of ", kWords, " elements");
+    TORCH_CHECK(t.is_pinned(), "abort_state must be in pinned memory, because the kernels read it at its host address");
     return static_cast<MoeA2AAbortState*>(t.data_ptr());
 }
 

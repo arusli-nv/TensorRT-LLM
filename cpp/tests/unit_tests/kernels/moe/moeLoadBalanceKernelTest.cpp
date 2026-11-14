@@ -593,7 +593,8 @@ TEST_P(MoeLoadBalanceRouteKernelTest, TestSingleReplicaPerExpertWithSpareSlots)
     auto param = GetParam();
     int const slotCount = param.epSize * param.slotCountPerRank;
 
-    // Each expert has one replica in a random slot. The other slots are spare and hold no expert.
+    // Each expert has one replica in a random slot. The other slots are spare and hold no expert. The start offsets
+    // point one expert further, which only the kernels for several replicas read, so the result shows which kernel ran.
     std::vector<int> slots(slotCount);
     std::iota(slots.begin(), slots.end(), 0);
     std::shuffle(slots.begin(), slots.end(), mRng);
@@ -601,7 +602,7 @@ TEST_P(MoeLoadBalanceRouteKernelTest, TestSingleReplicaPerExpertWithSpareSlots)
     for (int expertId = 0; expertId < param.expertCount; ++expertId)
     {
         mHostExpertReplicaCount[expertId] = 1;
-        mHostExpertReplicaStartOffset[expertId] = expertId;
+        mHostExpertReplicaStartOffset[expertId] = (expertId + 1) % param.expertCount;
         mHostGlobalSlotIdsInfo[expertId] = slots[expertId];
     }
     ASSERT_EQ(cudaMemcpy(mPlacementInfo.expertReplicaCount, mHostExpertReplicaCount.data(),

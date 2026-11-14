@@ -260,10 +260,23 @@ __device__ __forceinline__ void keep_only_rank_in_words(uint64_t (&words)[kRankM
 
 //! Return the incomplete-round value of a round flag value: the flag value with bit 0 set, so that it is nonzero even
 //! for a combine flag value that wrapped to 0. The combine of round N and the dispatch of round N + 1 share a value.
-//! That is harmless, because dispatch tests the word only for nonzero, and combine compares it with its own value.
+//! That is harmless, because dispatch tests the word only for nonzero, and the prepare, the sanitize and the combine
+//! compare it with the round's combine value (only_own_rows_valid).
 __device__ __forceinline__ uint32_t incomplete_round_value(uint32_t flag_value)
 {
     return flag_value | 1U;
+}
+
+//! Return whether only this rank's own rows are valid in the round of `flag_value` (its dispatch or combine flag
+//! value). A word that holds the incomplete-round value of the round's combine was set by this rank's combine after it
+//! aborted, or by a peer's next dispatch, after the peer's combine of this round or that dispatch aborted. It is
+//! ignored, so that the prepare, the sanitize and every block of the combine exchange with the same peers, and the
+//! check after the combine's reduction records the cancel. Any other nonzero value means an earlier collective is
+//! incomplete.
+__device__ __forceinline__ bool only_own_rows_valid(uint32_t incomplete_round, uint32_t flag_value)
+{
+    uint32_t const combine_flag_value = flag_value + (flag_value & 1U);
+    return incomplete_round != 0 && incomplete_round != incomplete_round_value(combine_flag_value);
 }
 
 //! Return the incomplete-round word of `rank`. Requires ptrs.incomplete_round_offset != 0.
@@ -342,7 +355,8 @@ __device__ __forceinline__ void publish_waited_flag(MoeA2AAbortState* abort, int
 
 //! A lane waits on the peers peer_rank, peer_rank + warpSize, ... in turn, so while it waits on `peer_rank` it has
 //! not checked the later ones. Publish the wait on each later active peer whose round flag at `address + k *
-//! warpSize` has not arrived, so that the host sees every missing peer. Return the published peers as bits k.
+//! warpSize` has not arrived, so that the host sees every missing peer. Return the published peers as bits k. They
+//! stay published until the lane's current wait ends, even if they arrive meanwhile.
 __device__ __forceinline__ uint32_t publish_later_waited_flags(MoeA2AAbortState* abort, uint32_t const* address,
     uint32_t expected, int peer_rank, int ep_size, uint64_t const (&rank_mask)[kRankMaskWords])
 {
@@ -1858,8 +1872,8 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 // Copy SrcT payloads, or quantize them to FP8 when LOW_PRECISION is enabled.
 // CFT self contributions go to combine_recv_base; other prepared tokens go to combine_input_base.
 // This kernel performs no remote transfers or reduction.
-// With HAS_INCOMPLETE_ROUND, only this rank's own tokens are valid while the incomplete-round word is set, so rows
-// that peers may still read stay untouched.
+// With HAS_INCOMPLETE_ROUND, only this rank's own tokens are valid while only_own_rows_valid() holds for the
+// incomplete-round word, so rows that peers may still read stay untouched.
 template <bool LOW_PRECISION, typename SrcT, bool HAS_INCOMPLETE_ROUND>
 __global__ void moeA2APrepareCombineKernel(uint8_t* combine_input_base, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
@@ -1871,7 +1885,9 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* combine_input_base, void con
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
-    uint32_t const parity = round_parity(*flag_val_ptr);
+    // Block 0 advances the flag value concurrently, so this may read the round's dispatch or combine flag value.
+    uint32_t const flag_value = *flag_val_ptr;
+    uint32_t const parity = round_parity(flag_value);
     int const* const round_recv_counters = recv_counters + parity * ep_size;
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
@@ -1891,7 +1907,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* combine_input_base, void con
         return;
     if constexpr (HAS_INCOMPLETE_ROUND)
     {
-        if (rank_idx != ep_rank && *incomplete_round != 0)
+        if (rank_idx != ep_rank && only_own_rows_valid(*incomplete_round, flag_value))
             return;
     }
 
@@ -1978,13 +1994,8 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         uint32_t expected_value = *ptrs.flag_val;
         if constexpr (ENABLE_RANK_MASK)
         {
-            // A word that holds this combine's own incomplete-round value was set by another block of this kernel
-            // after it aborted, or by a peer whose next dispatch aborted. Ignore it, so that every block of this
-            // kernel exchanges with the same peers, and the check after the reduction below records the cancel. Any
-            // other nonzero value means an earlier collective is incomplete, so peers' rows may be incomplete and
-            // only this rank's own rows are combined.
             uint32_t const incomplete = ptrs.incomplete_round != nullptr ? *ptrs.incomplete_round : 0;
-            if (incomplete != 0 && incomplete != incomplete_round_value(expected_value))
+            if (only_own_rows_valid(incomplete, expected_value))
             {
                 keep_only_rank_in_words(rank_mask, rank_id);
                 only_rank = rank_id;
@@ -2079,7 +2090,9 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
     if constexpr (ENABLE_RANK_MASK)
     {
         // A peer sets this rank's incomplete-round word before it overwrites rows that this block may have read.
-        // ptrs.abort is a kernel argument, so the whole block takes this branch or skips it.
+        // ptrs.abort is a kernel argument, so the whole block takes this branch or skips it. The reduction's payload
+        // reads are weak loads, which the PTX memory model does not order before this check; it relies on them being
+        // complete when the block passes the barrier.
         if (ptrs.abort != nullptr)
         {
             __syncthreads();
@@ -2540,8 +2553,9 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 }
 
 // Kernel to sanitize expert ids for invalid tokens.
-// With HAS_INCOMPLETE_ROUND, only this rank's own tokens are valid while the incomplete-round word is set, because a
-// peer that this rank did not see complete may have written a receive counter for rows it never finished.
+// With HAS_INCOMPLETE_ROUND, only this rank's own tokens are valid while only_own_rows_valid() holds for the
+// incomplete-round word, because a peer that this rank did not see complete may have written a receive counter for rows
+// it never finished.
 template <bool HAS_INCOMPLETE_ROUND>
 __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t const* recv_counters_ptr,
     uint32_t const* flag_val, int ep_size, int max_tokens_per_rank, int top_k, int32_t invalid_id,
@@ -2559,11 +2573,12 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-    uint32_t const parity = round_parity(*flag_val);
+    uint32_t const flag_value = *flag_val;
+    uint32_t const parity = round_parity(flag_value);
     bool invalid = token_idx >= recv_counters_ptr[parity * ep_size + source_rank];
     if constexpr (HAS_INCOMPLETE_ROUND)
     {
-        invalid = invalid || (source_rank != ep_rank && *incomplete_round != 0);
+        invalid = invalid || (source_rank != ep_rank && only_own_rows_valid(*incomplete_round, flag_value));
     }
     if (invalid)
     {

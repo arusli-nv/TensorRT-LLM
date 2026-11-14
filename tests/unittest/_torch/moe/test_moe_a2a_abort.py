@@ -251,6 +251,46 @@ def test_combine_cancels_on_overwritten_peer_rows(peer_aborts: bool) -> None:
     assert abort[:2].tolist() == [0, int(peer_aborts)]
 
 
+def test_own_round_value_keeps_peer_rows() -> None:
+    """A word holding the round's own combine value keeps peer rows valid in the sanitize and the prepare.
+
+    A peer whose combine of this round aborted stores that value with its next dispatch. The combine then
+    exchanges with every peer, so the rows it publishes must hold the peers' tokens, and it records a cancel.
+    """
+    workspace, meta, experts, payload = _setup(2)
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 1, 2, barrier=False)
+    controls, _ = _rank_mask_controls(3)
+    peer_controls, peer_abort = _rank_mask_controls(3)
+    experts.fill_(1)
+    # Rank 1's dispatch flag for rank 0, and rank 0's combine flag for rank 1.
+    dispatch_flag, _ = _next_parity(workspace, meta, rank=1)
+    _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(dispatch_flag)
+    _word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS"), row=1).fill_(dispatch_flag + 1)
+    _dispatch(workspace, meta, experts, controls, payload)
+    peer_received, offset, _ = _dispatch(workspace, meta, experts, peer_controls, payload, rank=1)
+    # Rank 0's combine of this round aborted, and its next dispatch marked rank 1.
+    _word(workspace, _offset(meta, "INCOMPLETE_ROUND"), row=1).fill_(dispatch_flag + 2)
+    expert_ids = peer_received[1].clone()
+    torch.ops.trtllm.moe_a2a_sanitize_expert_ids(expert_ids, workspace, meta, 1, -1)
+    torch.testing.assert_close(expert_ids, peer_received[1], rtol=0, atol=0)
+    _combine(workspace, meta, peer_received[0].clone(), offset, peer_controls, rank=1)
+    _finish(peer_abort, "rank 1's combine waited for rank 0")
+    rows = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+        workspace, meta, 1, 2, _CAPACITY, payload.dtype, _HIDDEN
+    ).view(2, _CAPACITY, _HIDDEN)
+    torch.testing.assert_close(rows[0], peer_received[0][0], rtol=0, atol=0)
+    assert peer_abort[:2].tolist() == [0, 1]
+
+
+def test_abort_state_must_be_pinned() -> None:
+    """The kernels read the abort state at its host address, so the ops refuse pageable memory."""
+    workspace, meta, experts, payload = _setup(2)
+    controls, _ = _rank_mask_controls(3)
+    controls["abort_state"] = torch.zeros(_ABORT_WORDS, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="pinned"):
+        _dispatch(workspace, meta, experts, controls, payload)
+
+
 def test_incomplete_dispatch_marks_active_peers() -> None:
     """A dispatch whose round is incomplete marks the rounds of the active peers incomplete."""
     workspace, meta, experts, payload = _setup(3)
