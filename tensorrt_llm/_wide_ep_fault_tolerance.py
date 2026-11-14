@@ -202,10 +202,12 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "rank would take its share of the vocabulary with it",
             ),
             (
-                compile_config is None or not compile_config.enable_userbuffers,
-                "no userbuffers (torch_compile_config.enable_userbuffers=False), because their "
-                "setup exchanges memory handles over an MPI world of every rank, and each rank is "
-                "its own MPI world",
+                compile_config is None,
+                "no torch.compile (torch_compile_config=None, and no piecewise prefill CUDA graphs, "
+                "which run it), which is not supported yet: no test has changed the membership "
+                "with the all-to-all inside compiled regions or piecewise CUDA graphs, and the "
+                "userbuffers that it can enable exchange memory handles over an MPI world of every "
+                "rank, while each rank is its own MPI world",
             ),
             (
                 llm_args.modeling_v2 != "require",

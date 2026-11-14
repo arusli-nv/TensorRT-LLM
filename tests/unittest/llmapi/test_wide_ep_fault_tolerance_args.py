@@ -89,10 +89,6 @@ def _args(**fields) -> TorchLlmArgs:
         # An unset max_num_tokens is the default budget of 8192 tokens.
         {"max_num_tokens": None},
         {"max_seq_len": None, "enable_chunked_prefill": True},
-        {
-            "prefill_cuda_graph_backend": "piecewise",
-            "torch_compile_config": TorchCompileConfig(enable_userbuffers=False),
-        },
         # The attached frontends read the membership from the rendezvous store too.
         {"num_serve_frontends": 8},
         # Whoever starts the executor checks the orchestrator, not the arguments.
@@ -218,15 +214,17 @@ def test_supported_configuration_is_accepted(fields):
             "max_num_tokens",
         ),
         ({"enable_lm_head_tp_in_adp": True}, "enable_lm_head_tp_in_adp=False"),
-        # torch.compile enables userbuffers by default.
-        (
-            {"torch_compile_config": TorchCompileConfig()},
-            "torch_compile_config.enable_userbuffers=False",
-        ),
-        # A piecewise prefill CUDA graph runs torch.compile with the default configuration.
-        (
-            {"prefill_cuda_graph_backend": "piecewise"},
-            "torch_compile_config.enable_userbuffers=False",
+        *(
+            (fields, "no torch.compile (torch_compile_config=None")
+            for fields in (
+                {"torch_compile_config": TorchCompileConfig(enable_userbuffers=False)},
+                # A piecewise prefill CUDA graph runs torch.compile with the default configuration.
+                {"prefill_cuda_graph_backend": "piecewise"},
+                {
+                    "prefill_cuda_graph_backend": "piecewise",
+                    "torch_compile_config": TorchCompileConfig(enable_userbuffers=False),
+                },
+            )
         ),
         ({"sleep_config": SleepConfig()}, "sleep_config=None), which is not supported yet"),
         ({"modeling_v2": "require"}, "modeling_v2='auto' or 'off', not 'require'"),
