@@ -547,6 +547,7 @@ def test_failed_replacement_restarts_until_cannot_start(tmp_path, deployment, mo
 def test_failed_replacements_back_off(monkeypatch):
     """Delay each replacement by the backoff, doubled per failed one in a row, then give up the rank."""
     monkeypatch.setattr(supervisor_module, "_BACKOFF_S", 1.0)
+    monkeypatch.setenv(SHARED_SECRET_ENV, secrets.token_hex(32))
     supervisor = supervisor_module.NodeSupervisor(NODE, NODES, GPUS, [], {})
     started_s = []
 
