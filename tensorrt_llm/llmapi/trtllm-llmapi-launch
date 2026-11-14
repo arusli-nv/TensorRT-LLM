@@ -168,7 +168,16 @@ function use_unique_flashinfer_workspace {
     local temporary_root=${TMPDIR:-/tmp}
     local workspace
 
-    if ! workspace=$(mktemp -d "$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.XXXXXXXX"); then
+    if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+        # The rank's worker replaces this shell, so the EXIT trap never removes the workspace.
+        # Every process that the node supervisor (the parent) starts for the rank reuses one.
+        workspace="$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.supervisor-${PPID}"
+        if ! mkdir -m 700 -- "$workspace" 2>/dev/null && \
+            { [ -L "$workspace" ] || [ ! -d "$workspace" ] || [ ! -O "$workspace" ]; }; then
+            log_stderr "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
+            exit 1
+        fi
+    elif ! workspace=$(mktemp -d "$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.XXXXXXXX"); then
         log_stderr "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
         exit 1
     fi

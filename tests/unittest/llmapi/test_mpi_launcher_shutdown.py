@@ -541,6 +541,35 @@ def test_fault_tolerant_rank_0_terminates_task_when_server_fails(tmp_path: Path)
     assert "stop" not in _process_records(tmp_path)
 
 
+def test_fault_tolerant_rank_reuses_its_temporary_flashinfer_workspace(tmp_path: Path) -> None:
+    """Check that every process of a rank reuses one temporary FlashInfer JIT workspace.
+
+    The rank's worker replaces the launcher, whose EXIT trap therefore never removes the workspace.
+    """
+    env = _launcher_env(tmp_path, "clean")
+    (tmp_path / "bin" / "python3").write_text(
+        '#!/bin/sh\necho "$FLASHINFER_WORKSPACE_BASE" >> "$LAUNCHER_TEST_ROOT/workspaces"\n'
+    )
+    # A regular file as HOME sends the launcher to the temporary workspace.
+    Path(env["HOME"]).touch()
+    temporary_root = tmp_path / "tmp"
+    temporary_root.mkdir()
+    env.update(TMPDIR=str(temporary_root), TLLM_FAULT_TOLERANCE_RANK="1,2,1,1")
+    for _ in range(2):
+        result = subprocess.run(  # nosec B603
+            ["bash", str(_LAUNCHER), "/usr/bin/true"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "temporary FlashInfer JIT workspace" in result.stderr
+    workspaces = (tmp_path / "workspaces").read_text().splitlines()
+    assert len(workspaces) == 2 and workspaces[0] == workspaces[1]
+    assert list(temporary_root.iterdir()) == [Path(workspaces[0])]
+
+
 @pytest.mark.parametrize("server_status", [0, 17])
 @pytest.mark.parametrize("task_status", [0, 7, 143])
 def test_server_first_exit_preserves_natural_task_completion(
