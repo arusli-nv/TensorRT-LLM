@@ -1083,7 +1083,8 @@ class RankFailureRecovery:
                 error = RankFailureError(
                     f"Attention DP rank {attention_dp_rank} failed and serves again once its "
                     "replacement joins. Send the request again, or without attention_dp_rank, or "
-                    "with attention_dp_relax."
+                    "with attention_dp_relax.",
+                    resubmit=False,
                 )
             self._executor.fail_requests_by_id(
                 {item.id: getattr(item.request, "client_id", None)}, error

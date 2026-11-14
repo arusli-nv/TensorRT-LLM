@@ -1084,9 +1084,9 @@ def _output(client_id, final=False):
                        client_id=client_id)
 
 
-def _ended_by_rank_failure(client_id):
+def _ended_by_rank_failure(client_id, resubmit=True):
     return LlmResponse(request_id=1,
-                       error_msg=RankFailureError(),
+                       error_msg=RankFailureError(resubmit=resubmit),
                        client_id=client_id)
 
 
@@ -1143,13 +1143,15 @@ def test_worker_reenqueues_multimodal_input(monkeypatch):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "case",
-    ["cancelled", "cancelled_during_enqueue", "result_gone", "flag_off"])
+@pytest.mark.parametrize("case", [
+    "cancelled", "cancelled_during_enqueue", "result_gone", "flag_off",
+    "waits_for_replacement"
+])
 def test_worker_ends_request_after_rank_failure(monkeypatch, case):
     """Check that a request a rank failure ended is not resubmitted.
 
-    Its client cancelled it, before or during the resubmit, its result is gone, or the flag is off.
+    Its client cancelled it, before or during the resubmit, its result is gone, it cannot run
+    before a replacement joins, or the flag is off.
     """
     worker, helper = _ipc_worker(monkeypatch,
                                  fault_tolerance=case != "flag_off")
@@ -1163,7 +1165,8 @@ def test_worker_ends_request_after_rank_failure(monkeypatch, case):
         worker.abort_request(7)
     elif case == "result_gone":
         worker._results.pop(7)
-    helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+    helper.handle_for_ipc_batched(
+        [_ended_by_rank_failure(7, resubmit=case != "waits_for_replacement")])
     if during_enqueue:
         assert worker.engine.cancel_request.call_args.args == (101, )
         assert _sent(worker) == {}

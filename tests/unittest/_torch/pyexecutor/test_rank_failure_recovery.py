@@ -1398,6 +1398,8 @@ def test_requests_pinned_to_absent_rank_fail(rank, given_up):
         ((failed, error), _) = fail.call_args
         assert failed == {2: 102}
         assert isinstance(error, RankFailureError) != given_up
+        # Resubmitted, it would fail the same way until the replacement joins.
+        assert given_up or not error.resubmit
         assert "attention_dp_relax" in str(error)
     else:
         fail.assert_not_called()

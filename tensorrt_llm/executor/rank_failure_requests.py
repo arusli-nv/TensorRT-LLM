@@ -28,12 +28,21 @@ RANK_FAILURE_CODE = "rank_failure"
 
 
 class RankFailureError(RequestError):
-    """Error of a request that a Wide-EP rank failure ended, safe to retry."""
+    """Error of a request that a Wide-EP rank failure ended, safe to retry.
+
+    Args:
+        message: The error message.
+        resubmit: Whether the worker runs the request again if the client has seen none of its
+            output. False for a request that fails the same way until a replacement joins.
+    """
 
     def __init__(
-        self, message: str = "A rank failure ended the request; sending it again can succeed"
+        self,
+        message: str = "A rank failure ended the request; sending it again can succeed",
+        resubmit: bool = True,
     ):
         super().__init__(message)
+        self.resubmit = resubmit
 
 
 class RankFailureRequests:
@@ -67,7 +76,8 @@ class RankFailureRequests:
             Whether the request was resubmitted, in which case ``response`` must not be delivered.
         """
         client_id = response.client_id
-        if not isinstance(response.error_msg, RankFailureError):
+        error = response.error_msg
+        if not isinstance(error, RankFailureError) or not error.resubmit:
             return False
         try:
             request, multimodal = self._without_first_response[client_id]
