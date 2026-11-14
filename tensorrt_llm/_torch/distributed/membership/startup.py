@@ -47,9 +47,15 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     check_fault_tolerance_requirements,
     wide_ep_fault_tolerance_rank,
 )
-from tensorrt_llm.executor.utils import get_spawn_proxy_process_env
+from tensorrt_llm.executor.utils import WorkerCommIpcAddrs, get_spawn_proxy_process_env
+from tensorrt_llm.executor.worker import worker_main
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.version import __version__
 
+from ...autotuner import AutoTuner
+from ..communicator import Distributed
+from ..host_exchange import MnnvlDistFactory
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart, StartupRecord
 from .liveness import MembershipClient, close_in_forked_child, rendezvous_store
 from .records import (
@@ -65,8 +71,6 @@ from .signed_store import SHARED_SECRET_BYTES, SignedStore, parse_shared_secret
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
-
-    from ..host_exchange import MnnvlDistFactory
 
 _EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
@@ -235,8 +239,6 @@ def wait_for_node_host_weights(
             without them gets no replacement.
         RuntimeError: The deployment ended.
     """
-    from ..communicator import Distributed
-
     waited = _peers_to_wait_for(ranks_without_host_weights)
     if waited:
         logger.info(
@@ -277,8 +279,6 @@ def _peers_to_wait_for(ranks_without_host_weights: Callable[[], List[int]]) -> L
 
 def startup_fingerprint(worker_main_args: dict) -> str:
     """Return a digest of the TensorRT-LLM version and the checkpoint's ``config.json``."""
-    from tensorrt_llm.version import __version__
-
     digest = hashlib.sha256(__version__.encode())
     model_dir = worker_main_args.get("hf_model_dir")
     if model_dir is not None and Path(model_dir, "config.json").is_file():
@@ -311,8 +311,6 @@ def start_rank(worker_main_args: dict) -> None:
 
 def _worker_args_for_other_ranks(worker_main_args: dict) -> bytes:
     """Return rank 0's worker arguments without IPC addresses and keys, for the plaintext store."""
-    from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
-
     return pickle.dumps(
         {
             **worker_main_args,
@@ -330,8 +328,6 @@ def worker_node_main() -> None:
     restart would repeat, ends with exit status ``REPLACEMENT_CANNOT_START``.
     """
     identity = _launched_rank()
-    from tensorrt_llm.executor.worker import worker_main
-
     if identity.rank == 0:
         raise ValueError(
             "Rank 0 runs in the process that starts the deployment, not through worker_node_main"
@@ -372,8 +368,6 @@ def publish_tuned_tactics(store: SignedStore, rank: int) -> None:
 
 def _take_tuned_tactics(store: SignedStore, rank: int) -> None:
     """Start this replacement of ``rank`` from its predecessor's tuned tactics, and keep them."""
-    from ...autotuner import AutoTuner
-
     tuned_tactics = pickle.loads(store.get(TUNED_TACTICS_KEY.format(rank)))  # nosec B301
     _state.record.tuned_tactics = tuned_tactics
     AutoTuner.get().profiling_cache.merge_cache_data(tuned_tactics)
@@ -387,8 +381,6 @@ def _start_alone(worker_main_args: dict) -> None:
     ranks, whether the environment or ``env_overrides`` sets it: loading the file would replace the
     tactics it took.
     """
-    from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
-
     os.environ["TRTLLM_SKIP_KV_CACHE_ESTIMATION"] = "1"
     os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
     llm_args = worker_main_args["llm_args"]
@@ -450,9 +442,6 @@ def join_startup_group(mapping: Mapping) -> None:
 
     ``Distributed`` then runs the host collectives over MNNVL memory (``MnnvlDist``).
     """
-    from ..communicator import Distributed
-    from ..host_exchange import MnnvlDistFactory
-
     identity = _rank_identity()
     one_node = identity.world_size <= min(identity.gpus_per_node, mapping.gpus_per_node)
     nodes = identity.world_size // identity.gpus_per_node

@@ -20,7 +20,10 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
 
 from tensorrt_llm._torch.modules.dwdp.rendezvous import StoreComm
+from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
 
+from ..communicator import Distributed
+from ..startup_record import diverged
 from .records import MAX_RANKS, REPORT_INTERVAL_S, rank_mask
 from .signed_store import shared_secret_digest
 
@@ -175,6 +178,7 @@ class StoreGroup(StoreComm):
 
     def Abort(self, errorcode: int = 0) -> None:
         """End this process with ``errorcode``. The other members keep running."""
+        # The startup module imports this one.
         from .startup import end_process
 
         end_process(self.rank, errorcode, "MPI_Abort on its communicator")
@@ -186,9 +190,6 @@ class StoreGroup(StoreComm):
         """
         if not self._startup or self._active != (self.rank,) or len(self.membership) == 1:
             return
-        from ..communicator import Distributed
-        from ..startup_record import diverged
-
         record = Distributed.startup_record
         if record is not None and record.replaying and not record.gathers_rank_varying:
             raise diverged(
@@ -216,7 +217,6 @@ class StoreGroup(StoreComm):
 
     def Split(self, color: int = 0, key: int = 0) -> "StoreGroup":
         """Split as ``MPI.Comm.Split`` does, a replacement taking the colors from the record."""
-        from ..communicator import Distributed
 
         def gather():
             return self.allgather((color, key))
@@ -234,8 +234,6 @@ class StoreGroup(StoreComm):
     def Split_type(self, split_type: int, key: int = 0, info: Any = None) -> "StoreGroup":
         """Return the members on this rank's node, supporting only the node split types."""
         from mpi4py import MPI
-
-        from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
 
         if split_type not in (MPI.COMM_TYPE_SHARED, OMPI_COMM_TYPE_HOST):
             raise NotImplementedError(

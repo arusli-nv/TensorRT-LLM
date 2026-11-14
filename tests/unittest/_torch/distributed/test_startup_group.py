@@ -847,9 +847,7 @@ def _start_rank_2(monkeypatch, replacement):
             AGREED_STARTUP_KEY, pickle.dumps({**agreed, "fingerprint": startup_fingerprint(args)})
         )
     started = []
-    monkeypatch.setattr(
-        "tensorrt_llm.executor.worker.worker_main", lambda **args: started.append(args)
-    )
+    monkeypatch.setattr(startup_module, "worker_main", lambda **args: started.append(args))
     startup_module.worker_node_main()
     return args, started
 
@@ -900,7 +898,7 @@ def test_replacement_reports_replayed_collectives_as_progress(store, launched, m
         record.exchange(2, pickle.dumps(1), None, lambda: [])
         record.close()
 
-    monkeypatch.setattr("tensorrt_llm.executor.worker.worker_main", worker_main)
+    monkeypatch.setattr(startup_module, "worker_main", worker_main)
     startup_module.worker_node_main()
     assert [call.kwargs for call in startup_module._state.client.report.call_args_list] == [
         dict(waiting_for=0, progress=1),

@@ -64,13 +64,13 @@ from ..distributed.membership.startup import (
     wait_for_every_rank,
 )
 from ..distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
+from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlan, ExpertRestorePlanMismatchError
+from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from .rank_failure_memory import RecoveryMemory, StartupMemory, check_largest_failure_fits
 from .rank_failure_model_load import moe_comms
 
 if TYPE_CHECKING:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
-    from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlan
-    from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
     from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from .llm_request import LlmRequest, PyResult
     from .py_executor import BatchState, PyExecutor
@@ -127,8 +127,6 @@ _INSTALL_IN_PROGRESS = frozenset({_Phase.INSTALLING, _Phase.RESUMING, _Phase.JOI
 
 
 def _moe_load_balancer_of(executor: PyExecutor):
-    from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
-
     balancer = executor.model_engine.moe_load_balancer
     return balancer if isinstance(balancer, MoeLoadBalancer) else None
 
@@ -827,7 +825,6 @@ class RankFailureRecovery:
             timer.end("remap")
             self._install_step_done()
             if plan is not None:
-                from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlanMismatchError
 
                 def restore_progress() -> None:
                     # A newer change stops the loads that this one planned, as the store groups do.

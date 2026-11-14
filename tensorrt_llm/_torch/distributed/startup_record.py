@@ -156,6 +156,7 @@ class StartupRecord:
             raise RuntimeError("resume() without a matching pause()")
         self._pauses -= 1
         if not self._replacement and not self._pauses:
+            # Local: keeps the autotuner out of the authority and the node supervisor.
             from ..autotuner import AutoTuner
 
             self.tuned_tactics = dict(AutoTuner.get().profiling_cache.cache)

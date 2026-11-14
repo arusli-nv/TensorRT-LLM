@@ -58,7 +58,6 @@ import os, sys, time
 
 from tensorrt_llm._torch.distributed.membership import startup
 from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_rank
-from tensorrt_llm.executor import worker
 
 load_s, startup.RENDEZVOUS_TIMEOUT_S = float(sys.argv[1]), float(sys.argv[2])
 
@@ -75,7 +74,7 @@ def worker_main(**args):
     time.sleep(3600)
 
 
-worker.worker_main = worker_main
+startup.worker_main = worker_main
 if os.environ["TLLM_FAULT_TOLERANCE_RANK"].startswith("0,"):
     worker_main(
         hf_model_dir=None,

@@ -35,10 +35,11 @@ from tensorrt_llm._torch.alltoall_watchdog import AlltoAllWatchdogCoordinator
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
-from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter, execution_state
+from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.pyexecutor import rank_failure_model_load
 from tensorrt_llm._torch.pyexecutor.rank_failure_model_load import moe_comms, prepare_model
 from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.bindings import internal
@@ -446,7 +447,7 @@ def test_unsupported_architecture_refused(architectures) -> None:
 def test_layers_bound_to_one_membership(monkeypatch, replacement) -> None:
     """prepare_model binds every MoE layer to one execution state over a new membership."""
     monkeypatch.setattr(
-        execution_state,
+        rank_failure_model_load,
         "MoeExecutionState",
         lambda health, ep_rank, device: SimpleNamespace(health=health, ep_rank=ep_rank),
     )

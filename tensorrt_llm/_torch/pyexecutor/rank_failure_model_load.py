@@ -37,14 +37,29 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
 from ..distributed import Distributed
 from ..distributed.membership import HANG_TIMEOUT_S, host_weights_name, host_weights_prefix
 from ..distributed.membership.startup import wait_for_node_host_weights
+from ..moe.fused_moe.communication.execution_state import BindableCommunication, MoeExecutionState
+from ..moe.fused_moe.communication.nvlink_one_sided import FORCE_CFT_ENV, get_force_cft
+from ..moe.fused_moe.ep_group_health import EPGroupHealth
+from ..moe.fused_moe.eplb_expert_restore import (
+    SHARED_MEMORY_DIR,
+    DeploymentHostWeights,
+    FaultTolerantMoeLoadBalancer,
+    slot_parameters,
+)
+from ..moe.fused_moe.fused_moe_vanilla import VanillaMoE
+from ..moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
+from ..moe.fused_moe.interface import MoE
+from ..moe.fused_moe.moe_comm_timeout_guard import (
+    SERVING_TIMEOUT_ENV,
+    resolve_moe_comm_timeout_budgets,
+)
+from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer, maybe_create_moe_load_balancer
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.mapping import Mapping
 
     from ..model_config import ModelConfig
-    from ..moe.fused_moe.communication.execution_state import BindableCommunication
-    from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 
 
 def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
@@ -53,12 +68,6 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     Raises:
         ValueError: The configuration is not supported with fault tolerance.
     """
-    from ..moe.fused_moe.communication.nvlink_one_sided import FORCE_CFT_ENV, get_force_cft
-    from ..moe.fused_moe.moe_comm_timeout_guard import (
-        SERVING_TIMEOUT_ENV,
-        resolve_moe_comm_timeout_budgets,
-    )
-
     # The authority excludes a hung rank about a hang timeout after it stopped. The all-to-all
     # kernels that wait on the rank must not time out before that.
     kernel_timeout_s = resolve_moe_comm_timeout_budgets(os.environ).serving_seconds
@@ -110,9 +119,6 @@ def prepare_model(model: torch.nn.Module) -> None:
     Raises:
         ValueError: The model is not supported with fault tolerance.
     """
-    from ..moe.fused_moe.communication.execution_state import MoeExecutionState
-    from ..moe.fused_moe.ep_group_health import EPGroupHealth
-
     check_model_architectures(model.model_config.pretrained_config.architectures)
     # The keys through which get_wide_ep_ft_options (wide_ep_ft.py) takes an EP group health.
     extra_attrs = model.model_config.extra_attrs
@@ -150,9 +156,6 @@ def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
     Raises:
         ValueError: A MoE layer's communication cannot be bound to an execution state.
     """
-    from ..moe.fused_moe.fused_moe_vanilla import VanillaMoE
-    from ..moe.fused_moe.interface import MoE
-
     comms = {}
     for name, layer in model.named_modules():
         if not isinstance(layer, (MoE, VanillaMoE)):
@@ -177,9 +180,6 @@ def create_moe_load_balancer(
     model_config: ModelConfig, mapping: Mapping
 ) -> contextlib.AbstractContextManager[Optional[BaseMoeLoadBalancer]]:
     """Create this rank's EPLB load balancer, whose host weights outlive the process."""
-    from ..moe.fused_moe.eplb_expert_restore import FaultTolerantMoeLoadBalancer
-    from ..moe.fused_moe.moe_load_balancer import maybe_create_moe_load_balancer
-
     return maybe_create_moe_load_balancer(
         model_config,
         mapping,
@@ -195,13 +195,6 @@ def create_moe_load_balancer(
 
 def _check_host_weights_fit(model: torch.nn.Module) -> None:
     """Check that /dev/shm has room for the host weights the node keeps and does not hold yet."""
-    from ..moe.fused_moe.eplb_expert_restore import (
-        SHARED_MEMORY_DIR,
-        DeploymentHostWeights,
-        slot_parameters,
-    )
-    from ..moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
-
     slot_bytes: Dict[DeploymentHostWeights, List[int]] = {}
     for module in model.modules():
         if not isinstance(module, MoEEplbWeightLayoutMixin) or module.layer_load_balancer is None:
@@ -227,8 +220,6 @@ def _check_host_weights_fit(model: torch.nn.Module) -> None:
 
 def _leftover_entries() -> str:
     """Describe the host weight entries that this user's killed deployments left in /dev/shm."""
-    from ..moe.fused_moe.eplb_expert_restore import SHARED_MEMORY_DIR
-
     with os.scandir(SHARED_MEMORY_DIR) as entries:
         leftovers = [
             f"{entry.name} ({entry.stat().st_blocks * 512 / 2**30:.1f} GiB)"

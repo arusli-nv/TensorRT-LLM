@@ -493,6 +493,7 @@ class MnnvlDist(Distributed):
         ]
         startup_record = Distributed.startup_record
         if startup_record is not None and startup_record.replacement:
+            # The startup module imports this one.
             from .membership.startup import membership_client
 
             record = membership_client().record

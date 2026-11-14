@@ -64,6 +64,7 @@ pytestmark = pytest.mark.cpu_only
 
 _ER = "tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore"
 _MLB = "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer"
+_LOAD = "tensorrt_llm._torch.pyexecutor.rank_failure_model_load"
 _USES_GDRCOPY = "tensorrt_llm.bindings.internal.runtime.host_accessible_device_memory_uses_gdrcopy"
 WORLD_SIZE = 4
 EXPERTS = 4
@@ -423,7 +424,7 @@ def test_host_weights_round_trip_by_name(monkeypatch, tracked):
     with (
         patch("tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer"),
         patch(
-            f"{_MLB}.maybe_create_moe_load_balancer",
+            f"{_LOAD}.maybe_create_moe_load_balancer",
             lambda config, mapping, cls: cls(0, WORLD_SIZE, 0),
         ),
     ):

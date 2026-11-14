@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Literal, Mapping, Optional, Tuple
 from pydantic import BaseModel, ConfigDict
 
 from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_ENV
+from tensorrt_llm.llmapi.utils import _set_affinity_all_threads
 
 # The active mask has room for as many ranks as the all-to-all kernels support.
 MAX_RANKS = 256
@@ -93,8 +94,6 @@ def remove_cpu_affinity_constraints() -> None:
     pick, so it runs on every CPU. Without this, a process inherits its parent's binding, which a
     launcher can set to the one CPU that rank 0 starts on.
     """
-    from tensorrt_llm.llmapi.utils import _set_affinity_all_threads
-
     if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None, "1"):
         _set_affinity_all_threads(list(range(os.cpu_count())))
 
