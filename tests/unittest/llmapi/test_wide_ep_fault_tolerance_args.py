@@ -218,7 +218,7 @@ def test_unsupported_configuration_names_field(fields, fix):
 
 
 @pytest.mark.parametrize("fields", [{}, {"modeling_v2": "auto"}], ids=["default", "explicit"])
-def test_modeling_v2_auto_falls_back_to_built_in_model(monkeypatch, fields):
+def test_modeling_v2_auto_uses_builtin_model(monkeypatch, fields):
     """Check that fault tolerance turns modeling_v2 'auto' off with one warning."""
     warning = Mock()
     monkeypatch.setattr(logger, "warning", warning)
@@ -300,7 +300,7 @@ def test_supervised_rank_requires_flag(monkeypatch):
         check_node_supervisor_launch(False)
 
 
-def test_llmapi_import_loads_no_fault_tolerance_module():
+def test_llmapi_import_skips_fault_tolerance():
     """Check that importing the LLM API loads neither the membership nor the node supervisor."""
     prefixes = (
         "tensorrt_llm._torch.distributed.membership",

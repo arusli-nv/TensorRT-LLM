@@ -334,7 +334,7 @@ def test_rank_failure_answers_503_with_code(error, status, code, expected_type, 
     assert "retry-after" not in response.headers
 
 
-def test_rank_failure_ends_every_stream_with_its_code():
+def test_rank_failure_ends_streams_with_code():
     """Check that a stream that a rank failure ends sends the rank failure's code or message."""
     error = RankFailureError()
     cause = classify_stream_termination(error)
@@ -499,9 +499,7 @@ def test_attached_frontend_forwards_status(monkeypatch, tmp_path, fault_toleranc
     [(True, False), (False, False), (True, True)],
     ids=["serving", "unreadable", "rank_0_ended"],
 )
-def test_launcher_and_attached_frontend_agree_on_health(
-    monkeypatch, tmp_path, store_readable, rank_0_ended
-):
+def test_frontends_agree_on_health(monkeypatch, tmp_path, store_readable, rank_0_ended):
     """Check that every frontend answers /health from its executor, whatever the membership."""
     # A refresh that finds the deployment failed shuts the server down.
     monkeypatch.setattr(openai_server_module.signal, "raise_signal", Mock())

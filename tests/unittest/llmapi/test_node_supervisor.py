@@ -728,7 +728,7 @@ def held_kills(monkeypatch):
             os.kill(pgid, signal.SIGKILL)
 
 
-def test_killed_rank_that_never_ends_is_given_up(tmp_path, deployment, held_kills):
+def test_unkillable_rank_is_given_up(tmp_path, deployment, held_kills):
     """Give up a rank whose killed process did not end within the rendezvous timeout.
 
     Its GPU memory may not be free, so no replacement of it starts.
@@ -854,7 +854,7 @@ def test_refused_reconnect_retried_after_start(tmp_path, deployment):
     _shut_down(running, authority, active_mask=0b0111)
 
 
-def test_ranks_ended_while_reconnect_refused_are_replaced(tmp_path, deployment):
+def test_ranks_replaced_after_refused_reconnect(tmp_path, deployment):
     """Replace the node's ranks that ended while the authority refused the supervisor's reconnects.
 
     The authority fails a node's ranks once it drops the node's previous connection, so they may end
@@ -1076,7 +1076,7 @@ def test_enable_recovery_read_from_mpirun(deployment, monkeypatch, fake_mpirun, 
     ],
     ids=["no URI", "other host", "no --enable-recovery"],
 )
-def test_node_0_requires_mpirun_on_its_host(
+def test_node_0_requires_local_mpirun(
     tmp_path, deployment, supervisor_process, fake_mpirun, mpirun, message
 ):
     """Reject a multi-node job under mpirun whose node 0 cannot end the job through its mpirun.
