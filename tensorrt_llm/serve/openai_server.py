@@ -776,6 +776,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.generator._fault_tolerance_env,
                 MetricsCollector.serving_labels(args, self.model),
                 self._on_deployment_failed)
+            self.fault_tolerance_health.start()
         perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
                                            None) if args else None)
         perf_metrics = resolve_perf_metrics_config(

@@ -94,7 +94,7 @@ class FakeRendezvousStore:
 
 @pytest.fixture
 def new_reader(monkeypatch):
-    """Return a factory of readers that open ``store`` and refresh only once an hour."""
+    """Return a factory of started readers that open ``store`` and refresh only once an hour."""
     monkeypatch.setattr(health_module, "_STATUS_REFRESH_PERIOD_S", 3600.0)
     readers = []
 
@@ -102,6 +102,7 @@ def new_reader(monkeypatch):
         if store is not None:
             monkeypatch.setattr(health_module, "open_store", Mock(return_value=store))
         readers.append(FaultToleranceHealth("host:1", _SECRET))
+        readers[-1].start()
         return readers[-1]
 
     yield new_reader
@@ -122,7 +123,21 @@ def new_reader(monkeypatch):
 )
 def test_health_state(new_reader, record, state):
     """Check that the status answered before any refresh is the membership in the store."""
-    assert new_reader(FakeRendezvousStore(record)).last_status()["state"] == state
+    assert new_reader(FakeRendezvousStore(record)).last_status().state == state
+
+
+def test_reader_reads_nothing_until_started(monkeypatch):
+    """Check that a reader opens no store and starts no thread until it is started."""
+    monkeypatch.setattr(health_module, "open_store", open_store := Mock())
+    threads = set(threading.enumerate())
+    health = FaultToleranceHealth("host:1", _SECRET)
+    assert set(threading.enumerate()) == threads
+    open_store.assert_not_called()
+    assert (health.last_status().state, health.last_status().authority_alive) == (
+        "unprotected",
+        False,
+    )
+    health.close()
 
 
 def test_failed_refresh_reports_store_unreadable(monkeypatch, new_reader):
@@ -135,7 +150,7 @@ def test_failed_refresh_reports_store_unreadable(monkeypatch, new_reader):
     health._refresh_thread.join(10.0)
     assert not health._refresh_thread.is_alive()
     status = health.last_status()
-    assert (status["state"], status["authority_alive"]) == ("unprotected", False)
+    assert (status.state, status.authority_alive) == ("unprotected", False)
 
 
 @pytest.mark.parametrize("active_mask", [0b1111, 0b1011], ids=["healthy", "degraded"])
@@ -151,16 +166,16 @@ def test_stalled_after_half_the_hang_timeout(monkeypatch, new_reader, active_mas
     store.values[STALLED_SINCE_KEY] = b"4000"
     # A long step, such as a long prefill, keeps the other ranks waiting for a shorter time.
     now_s[0] += HANG_TIMEOUT_S / 2 - 1
-    assert health.read_status()["state"] == serving
+    assert health.read_status().state == serving
     now_s[0] += 1
-    assert health.read_status()["state"] == "stalled"
+    assert health.read_status().state == "stalled"
     # The authority clears the stall with an empty value.
     store.values[STALLED_SINCE_KEY] = b""
-    assert health.read_status()["state"] == serving
+    assert health.read_status().state == serving
     # A stall time that does not parse counts as no stall.
     store.values[STALLED_SINCE_KEY] = b"not a time"
     status = health.read_status()
-    assert (status["state"], status["stalled_seconds"]) == (serving, 0.0)
+    assert (status.state, status.stalled_seconds) == (serving, 0.0)
 
 
 def test_unsigned_value_keeps_last_status(new_reader):
@@ -171,7 +186,7 @@ def test_unsigned_value_keeps_last_status(new_reader):
     health = new_reader(store)
     values.values[RECORD_KEY] = _record(MembershipState.ABORTED).model_dump_json().encode()
     status = health.read_status()
-    assert (status["state"], status["authority_alive"]) == ("degraded", True)
+    assert (status.state, status.authority_alive) == ("degraded", True)
 
 
 def test_older_generation_keeps_last_status(new_reader):
@@ -187,8 +202,8 @@ def test_older_generation_keeps_last_status(new_reader):
     health = new_reader(store)
     publish(_record(MembershipState.COMMITTED, active_mask=0b1111), FAILOVER)
     status = health.read_status()
-    assert (status["state"], status["generation"]) == ("degraded", 2)
-    assert status["last_transaction"]["generation"] == 2
+    assert (status.state, status.generation) == ("degraded", 2)
+    assert status.last_transaction.generation == 2
 
 
 def test_invalid_secret_fails_at_start(monkeypatch):
@@ -208,7 +223,7 @@ def test_stopped_after_authority_ended(monkeypatch, new_reader):
     health = new_reader(store)
     store.check = Mock(side_effect=RuntimeError("the store does not answer"))
     status = health.read_status()
-    assert (status["state"], status["authority_alive"]) == ("stopped", False)
+    assert (status.state, status.authority_alive) == ("stopped", False)
 
 
 @pytest.mark.parametrize(
@@ -223,18 +238,18 @@ def test_health_after_failed_read(monkeypatch, new_reader, probe_error, state):
     monkeypatch.setattr(health_module.socket, "create_connection", Mock(side_effect=probe_error))
     store = FakeRendezvousStore(_record(MembershipState.INSTALL))
     health = new_reader(store)
-    assert health.read_status()["state"] == "recovering"
+    assert health.read_status().state == "recovering"
     answers = store.check
     store.check = Mock(side_effect=RuntimeError("the store does not answer"))
     for _ in range(3):
         status = health.read_status()
-        assert status["state"] == state
-        assert status["authority_alive"] == (state != "failed")
-        assert status["active_ranks"] == [0, 1, 3]
+        assert status.state == state
+        assert status.authority_alive == (state != "failed")
+        assert status.active_ranks == [0, 1, 3]
     assert health_module.open_store.call_count == 1
     store.check = answers
     now[0] += health_module._STATUS_READ_TIMEOUT_S
-    assert health.read_status()["state"] == state
+    assert health.read_status().state == state
 
 
 def test_health_unprotected_while_store_silent(monkeypatch, new_reader):
@@ -247,31 +262,31 @@ def test_health_unprotected_while_store_silent(monkeypatch, new_reader):
     monkeypatch.setattr(health_module, "open_store", open_store)
     health = new_reader()
     status = health.read_status()
-    assert status["state"] == "unprotected"
-    assert status["active_ranks"] is None
+    assert status.state == "unprotected"
+    assert status.active_ranks is None
     open_store.side_effect = None
     open_store.return_value = store
     now[0] += health_module._STATUS_READ_TIMEOUT_S
-    assert health.read_status()["state"] == "healthy"
+    assert health.read_status().state == "healthy"
     answers = store.check
     store.check = Mock(side_effect=RuntimeError("the store does not answer"))
     now[0] += AUTHORITY_SILENCE_TIMEOUT_S
-    assert health.read_status()["state"] == "healthy"
+    assert health.read_status().state == "healthy"
     now[0] += health_module._STATUS_READ_TIMEOUT_S
     status = health.read_status()
-    assert status["state"] == "unprotected"
-    assert not status["authority_alive"]
+    assert status.state == "unprotected"
+    assert not status.authority_alive
     store.check = answers
     now[0] += health_module._STATUS_READ_TIMEOUT_S
-    assert health.read_status()["state"] == "healthy"
+    assert health.read_status().state == "healthy"
 
 
 def test_closed_reader_stops_reading(new_reader):
     """Check that a closed reader never reads its store again."""
     health = new_reader(FakeRendezvousStore(_record(MembershipState.COMMITTED)))
-    assert health.read_status()["authority_alive"]
+    assert health.read_status().authority_alive
     health.close()
-    assert not health.read_status()["authority_alive"]
+    assert not health.read_status().authority_alive
     assert health_module.open_store.call_count == 1
 
 
@@ -528,7 +543,7 @@ def test_failed_deployment_shuts_the_server_down(monkeypatch, tmp_path):
             raise_signal.assert_not_called()
             store.values[RECORD_KEY] = _record(MembershipState.ABORTED).model_dump_json().encode()
             assert raised.wait(10.0)
-            assert server.fault_tolerance_health.last_status()["state"] == "failed"
+            assert server.fault_tolerance_health.last_status().state == "failed"
         finally:
             server.fault_tolerance_health.close()
     raise_signal.assert_called_once_with(openai_server_module.signal.SIGINT)

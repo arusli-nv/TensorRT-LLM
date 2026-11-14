@@ -19,9 +19,20 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Dict, Mapping, Optional, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    TypeVar,
+    get_args,
+)
 
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from tensorrt_llm._torch.distributed.membership import (
     AUTHORITY_SILENCE_TIMEOUT_S,
@@ -64,6 +75,28 @@ FORWARDED_ROUTES = (
 )
 
 
+FaultToleranceState = Literal[
+    "healthy", "degraded", "stalled", "recovering", "unprotected", "failed", "stopped"
+]
+ReplacementState = Literal["pending", "given_up"]
+
+
+class FaultToleranceStatus(BaseModel):
+    """The membership status that the server's status endpoint answers."""
+
+    state: FaultToleranceState
+    authority_alive: bool
+    # How long the active ranks have waited on a rank that makes no progress.
+    stalled_seconds: float
+    # The fields below are None until a membership record was read.
+    generation: Optional[int] = None
+    active_ranks: Optional[List[int]] = None
+    failed_ranks: Optional[List[int]] = None
+    replacements: Optional[Dict[int, ReplacementState]] = None
+    incarnations: Optional[List[int]] = None
+    last_transaction: Optional[TransactionSummary] = None
+
+
 _Generational = TypeVar("_Generational", MembershipRecord, TransactionSummary)
 
 
@@ -86,7 +119,9 @@ class FaultToleranceHealth:
         metric_labels: Optional[Mapping[str, str]] = None,
         on_failed: Optional[Callable[[], None]] = None,
     ):
-        """Start reading the membership status from the rendezvous store at ``address``.
+        """Prepare to read the membership status from the rendezvous store at ``address``.
+
+        The store is read only by :meth:`read_status` until :meth:`start` starts the refresh thread.
 
         Args:
             address: The rendezvous store's ``host:port``.
@@ -111,8 +146,13 @@ class FaultToleranceHealth:
         self._authority_ended = False
         self._lock = threading.Lock()
         self._closed = threading.Event()
+        self._last_status = self._status(authority_alive=False)
+        self._refresh_thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Read the status once, then start the thread that refreshes it."""
         # Read once, so that a server answers its first probe with the membership in the store.
-        self._last_status = self.read_status()
+        self.read_status()
         self._refresh_thread = threading.Thread(
             target=self._refresh, name="FaultToleranceHealth", daemon=True
         )
@@ -206,7 +246,7 @@ class FaultToleranceHealth:
             logger.error(f"Cannot parse a value of the rendezvous store: {error!r}")
             return None
 
-    def _state(self, authority_alive: bool, stalled_seconds: float) -> str:
+    def _state(self, authority_alive: bool, stalled_seconds: float) -> FaultToleranceState:
         record = self._record
         if record is None:
             return "unprotected"
@@ -224,34 +264,18 @@ class FaultToleranceHealth:
         world = (1 << len(record.incarnations)) - 1
         return "healthy" if record.active_mask == world else "degraded"
 
-    def read_status(self) -> Dict[str, object]:
-        """Read the membership from the store, waiting for it, and return the status.
-
-        Probes call :meth:`last_status`, which never waits for the store.
-        """
-        authority_alive = self._read_store()
-        record, transaction = self._record, self._transaction
+    def _status(self, authority_alive: bool) -> FaultToleranceStatus:
+        """Return the status of the membership state read last."""
+        record = self._record
         stalled_since = self._stalled_since_unix_ms
         stalled_seconds = (
             0.0 if stalled_since is None else max(0.0, time.time() - stalled_since / 1e3)
         )
-        status = {
-            "state": self._state(authority_alive, stalled_seconds),
-            "authority_alive": authority_alive,
-            "stalled_seconds": stalled_seconds,
-            "generation": None,
-            "active_ranks": None,
-            "failed_ranks": None,
-            "replacements": None,
-            "incarnations": None,
-            "last_transaction": None
-            if transaction is None
-            else transaction.model_dump(mode="json"),
-        }
+        membership = {}
         if record is not None:
             world_size = len(record.incarnations)
             failed_ranks = [r for r in range(world_size) if not record.is_active(r)]
-            status.update(
+            membership = dict(
                 generation=record.generation,
                 active_ranks=[r for r in range(world_size) if record.is_active(r)],
                 failed_ranks=failed_ranks,
@@ -260,21 +284,35 @@ class FaultToleranceHealth:
                 },
                 incarnations=list(record.incarnations),
             )
+        return FaultToleranceStatus(
+            state=self._state(authority_alive, stalled_seconds),
+            authority_alive=authority_alive,
+            stalled_seconds=stalled_seconds,
+            last_transaction=self._transaction,
+            **membership,
+        )
+
+    def read_status(self) -> FaultToleranceStatus:
+        """Read the membership from the store, waiting for it, and return the status.
+
+        Probes call :meth:`last_status`, which never waits for the store.
+        """
+        status = self._status(self._read_store())
         self._last_status = status
         return status
 
-    def last_status(self) -> Dict[str, object]:
+    def last_status(self) -> FaultToleranceStatus:
         """Return the last status read, without waiting for the store.
 
-        A thread reads the status every :data:`_STATUS_REFRESH_PERIOD_S`, so the result is at most
-        that period plus one read old. Each store call times out after
+        Once started, a thread reads the status every :data:`_STATUS_REFRESH_PERIOD_S`, so the
+        result is at most that period plus one read old. Each store call times out after
         :data:`_STATUS_READ_TIMEOUT_S`.
         """
         return self._last_status
 
     async def status_response(self) -> JSONResponse:
         """Answer the server's status endpoint with the last status read."""
-        return JSONResponse(content=self.last_status())
+        return JSONResponse(content=self.last_status().model_dump(mode="json"))
 
     def register_metrics(self, registry: CollectorRegistry) -> None:
         """Add the fault-tolerance metrics to ``registry``."""
@@ -283,12 +321,13 @@ class FaultToleranceHealth:
     def close(self) -> None:
         """Stop reading the status, and wait for a read in progress to end."""
         self._closed.set()
-        self._refresh_thread.join(_CLOSE_TIMEOUT_S)
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(_CLOSE_TIMEOUT_S)
 
     def _refresh(self) -> None:
         try:
             while not self._closed.wait(_STATUS_REFRESH_PERIOD_S):
-                if self.read_status()["state"] == "failed" and self._on_failed is not None:
+                if self.read_status().state == "failed" and self._on_failed is not None:
                     on_failed, self._on_failed = self._on_failed, None
                     on_failed()
         finally:
@@ -302,8 +341,8 @@ class FaultToleranceHealth:
 class FaultToleranceMetricsCollector:
     """Expose the last fault-tolerance status as Prometheus metrics, without a store read."""
 
-    STATES = ("healthy", "degraded", "stalled", "recovering", "unprotected", "failed", "stopped")
-    REPLACEMENT_STATES = ("pending", "given_up")
+    STATES = get_args(FaultToleranceState)
+    REPLACEMENT_STATES = get_args(ReplacementState)
     CHANGE_KINDS = ("failover", "admission", "abort")
 
     def __init__(self, health: FaultToleranceHealth, labels: Dict[str, str]):
@@ -318,44 +357,48 @@ class FaultToleranceMetricsCollector:
         values = list(self._labels.values())
         state = self._family(GaugeMetricFamily, "state", "Membership state", "state")
         for name in self.STATES:
-            state.add_metric([*values, name], float(status["state"] == name))
+            state.add_metric([*values, name], float(status.state == name))
         yield state
         stalled = self._family(
             GaugeMetricFamily,
             "stalled_seconds",
             "How long the active ranks have waited on a rank that makes no progress",
         )
-        stalled.add_metric(values, status["stalled_seconds"])
+        stalled.add_metric(values, status.stalled_seconds)
         yield stalled
-        if status["active_ranks"] is not None:
-            for key in ("active_ranks", "failed_ranks"):
+        if status.active_ranks is not None:
+            for key, ranks_of_kind in (
+                ("active_ranks", status.active_ranks),
+                ("failed_ranks", status.failed_ranks),
+            ):
                 ranks = self._family(GaugeMetricFamily, key, key.replace("_", " ").capitalize())
-                ranks.add_metric(values, len(status[key]))
+                ranks.add_metric(values, len(ranks_of_kind))
                 yield ranks
             replacements = self._family(
                 GaugeMetricFamily, "replacements", "Failed ranks by replacement state", "state"
             )
             for name in self.REPLACEMENT_STATES:
                 replacements.add_metric(
-                    [*values, name], list(status["replacements"].values()).count(name)
+                    [*values, name], list(status.replacements.values()).count(name)
                 )
             yield replacements
             restarts = self._family(CounterMetricFamily, "rank_restarts", "Rank restarts")
-            restarts.add_metric(values, sum(status["incarnations"]))
+            restarts.add_metric(values, sum(status.incarnations))
             yield restarts
-        transaction = status["last_transaction"] or {}
+        transaction = status.last_transaction
         changes = self._family(
             CounterMetricFamily, "membership_changes", "Membership changes", "kind"
         )
         for kind in self.CHANGE_KINDS:
-            changes.add_metric([*values, kind], transaction.get("changes", {}).get(kind, 0))
+            count = 0 if transaction is None else transaction.changes.get(kind, 0)
+            changes.add_metric([*values, kind], count)
         yield changes
-        if transaction:
+        if transaction is not None:
             pause = self._family(
                 GaugeMetricFamily, "last_change_pause_seconds", "Last change pause"
             )
             pause.add_metric(
-                values, (transaction["ended_unix_ms"] - transaction["detected_unix_ms"]) / 1e3
+                values, (transaction.ended_unix_ms - transaction.detected_unix_ms) / 1e3
             )
             yield pause
 

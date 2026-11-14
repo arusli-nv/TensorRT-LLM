@@ -765,7 +765,6 @@ class Monitor(_Threads):
     def stop(self) -> List[str]:
         """Stop watching and return the samplers that raised or still run."""
         failures = self._join(60.0)
-        # The reader's refresh thread runs from its construction.
         self._reader.close()
         return failures
 
@@ -780,7 +779,7 @@ class Monitor(_Threads):
 
     def _sample_membership(self, reader: FaultToleranceHealth) -> None:
         while not self._stop.is_set():
-            status = reader.read_status()
+            status = reader.read_status().model_dump()
             # The public status leaves out the record's own state, which the checks need to time
             # kills in a change.
             record = reader._record
