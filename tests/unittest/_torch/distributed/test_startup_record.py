@@ -175,8 +175,10 @@ def test_replacement_replays_rank_0_results():
     # Too small a capacity may grow once the predecessor's memory is free, so a restart may succeed.
     with pytest.raises(
         RuntimeError, match=f"collective 2 .* is {4096 - 400}, beyond .* min {4096 - 300}"
-    ):
+    ) as failure:
         _startup(_replacement(published), 4096 - 400)
+    # The message names the reduction by its call site.
+    assert "in _startup" in str(failure.value)
 
 
 def test_active_only_gathers_skip_absent_ranks():
@@ -450,14 +452,12 @@ def distributed(monkeypatch):
     return ranks
 
 
-def _auto_host_tier_quota(monkeypatch, mem_available):
+def _auto_host_tier_quota(monkeypatch, mem_available, memlock=resource.RLIM_INFINITY):
     """Return the automatic host tier quota beside an 80 GiB device quota on a node this free."""
     monkeypatch.setattr(
         rank_striped_read_ahead, "effective_available_host_memory", lambda: mem_available
     )
-    monkeypatch.setattr(
-        resource, "getrlimit", lambda limit: (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
-    )
+    monkeypatch.setattr(resource, "getrlimit", lambda limit: (memlock, resource.RLIM_INFINITY))
     mapping = SimpleNamespace(world_size=WORLD)
     limits = get_host_memory_limits(mapping)
     host_quota = _compute_auto_host_tier_quota(
@@ -472,33 +472,43 @@ def _failed(monkeypatch, ranks):
     monkeypatch.setattr(startup, "membership_client", lambda: SimpleNamespace(record=record))
 
 
-def test_replacement_host_tier_needs_room(distributed, monkeypatch):
-    """Check the quota when the survivors' pinned host tiers leave the replacement less memory."""
+def test_replacement_takes_recorded_host_tier(distributed, monkeypatch):
+    """Check that a replacement takes the original ranks' host tier while the node has room."""
     _failed(monkeypatch, {REPLACED})
     distributed.dist = _rank_0()
     assert _auto_host_tier_quota(monkeypatch, 720 * GIB) == 80 * GIB
     published = _publish()
     distributed.dist = _replacement(published)
-    assert _auto_host_tier_quota(monkeypatch, 720 * GIB - 3 * 80 * GIB) == 80 * GIB
+    # Its own heuristic quota is 60 GiB, below the recorded 80 GiB, but its share fits.
+    assert _auto_host_tier_quota(monkeypatch, 120 * GIB) == 80 * GIB
     _record().close()
     distributed.dist = _replacement(published)
-    with pytest.raises(
-        RuntimeError, match=f"is {60 * GIB}, beyond the original ranks' min {80 * GIB}"
-    ) as failure:
-        _auto_host_tier_quota(monkeypatch, 120 * GIB)
-    # The message names the reduction by its call site.
-    assert "in _sync_host_tier_quota" in str(failure.value)
+    with pytest.raises(RuntimeError, match=f"{60 * GIB}-byte share of available host memory"):
+        _auto_host_tier_quota(monkeypatch, 60 * GIB)
 
 
-def test_node_replacements_share_its_free_memory(distributed, monkeypatch):
-    """Check that the replacements of a whole node each size their host tier from a share of it."""
-    _failed(monkeypatch, set(range(WORLD)))
+def test_replacement_host_tier_needs_memlock(distributed, monkeypatch):
+    """Check that a replacement whose RLIMIT_MEMLOCK cannot hold the host tier gives up."""
+    _failed(monkeypatch, {REPLACED})
     distributed.dist = _rank_0()
     assert _auto_host_tier_quota(monkeypatch, 720 * GIB) == 80 * GIB
     distributed.dist = _replacement(_publish())
+    with pytest.raises(ReplacementCannotStart, match=f"RLIMIT_MEMLOCK of {50 * GIB} bytes"):
+        _auto_host_tier_quota(monkeypatch, 720 * GIB, memlock=50 * GIB)
+
+
+def test_node_replacements_share_free_memory(distributed, monkeypatch):
+    """Check that the replacements of a whole node each need their share of its free memory."""
+    _failed(monkeypatch, set(range(WORLD)))
+    distributed.dist = _rank_0()
+    assert _auto_host_tier_quota(monkeypatch, 720 * GIB) == 80 * GIB
+    published = _publish()
+    distributed.dist = _replacement(published)
     assert distributed.dist.local_world_size == WORLD
-    with pytest.raises(RuntimeError, match="beyond the original ranks' min"):
+    with pytest.raises(RuntimeError, match=f"{60 * GIB}-byte share"):
         _auto_host_tier_quota(monkeypatch, 240 * GIB)
+    distributed.dist = _replacement(published)
+    assert _auto_host_tier_quota(monkeypatch, 400 * GIB) == 80 * GIB
 
 
 def _gemm(num_tokens):
