@@ -1002,6 +1002,7 @@ def test_replacement_starts_after_removal_commit(store, monkeypatch, committed):
     )
     if committed:
         join()
-        return
-    with pytest.raises(TimeoutError, match="release its predecessor's memory"):
-        join()
+    else:
+        with pytest.raises(TimeoutError, match="release its predecessor's memory"):
+            join()
+    assert startup_module._state.predecessor_memory_released.is_set() == committed
