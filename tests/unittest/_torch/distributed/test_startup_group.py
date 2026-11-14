@@ -161,6 +161,23 @@ def test_startup_reports_host_collective_waits(store, monkeypatch):
     startup_module._client.report.assert_called_once_with(waiting_for=0b0110)
 
 
+def test_host_weights_wait_reports_startup_progress(store, monkeypatch):
+    """Report each poll for the node's host weights as a step of the replacement's startup."""
+    monkeypatch.setattr(startup_module, "_startup_steps", 0)
+    monkeypatch.setattr(startup_module, "_HOST_WEIGHTS_CHECK_S", 0.0)
+    monkeypatch.setattr(Distributed, "startup_record", startup_module._startup_record)
+    client = startup_module._client
+    client.record = MembershipRecord(
+        generation=1, state=MembershipState.COMMITTED, active_mask=0b1011
+    )
+    checks = iter([[2], [2], []])
+    startup_module.wait_for_node_host_weights(3, lambda: next(checks))
+    assert [call.kwargs for call in client.report.call_args_list] == [
+        dict(waiting_for=0, progress=1),
+        dict(waiting_for=0, progress=2),
+    ]
+
+
 def test_startup_ends_when_authority_fails():
     """Check that a wait for a peer ends at once when the authority hosting the store is gone."""
     authority = subprocess.Popen(  # nosec B603

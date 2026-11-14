@@ -214,6 +214,8 @@ def wait_for_node_host_weights(
             without them gets no replacement.
         RuntimeError: The deployment ended.
     """
+    from ..communicator import Distributed
+
     waited = _peers_to_wait_for(ranks_without_host_weights)
     if waited:
         logger.info(
@@ -222,6 +224,9 @@ def wait_for_node_host_weights(
         )
     while waited:
         time.sleep(_HOST_WEIGHTS_CHECK_S)
+        # The peers' own startups are watched for stalls, and a stalled peer is replaced or given
+        # up, which ends this wait. So each poll counts as a step of this rank's startup.
+        Distributed.report_startup_progress()
         waited = _peers_to_wait_for(ranks_without_host_weights)
 
 
