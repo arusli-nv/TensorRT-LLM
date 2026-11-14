@@ -103,7 +103,7 @@ def _rendezvous_address():
 
 
 class Deployment:
-    """Run the processes of a deployment of ``world`` ranks and queue their printed lines."""
+    """Run the processes of a deployment of ``world`` ranks and queue their output lines."""
 
     def __init__(self, world, rendezvous_timeout_s=RENDEZVOUS_TIMEOUT_S):
         self.world = world
@@ -131,6 +131,7 @@ class Deployment:
             [sys.executable, "-c", _WORKER, str(load_s), str(self.rendezvous_timeout_s)],
             env=env,
             stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
         )
         self.processes[rank] = process
@@ -255,9 +256,17 @@ def test_startup_failure_ends_every_process(failed_rank):
 
 @pytest.mark.timeout(900)
 def test_rank_without_rank_0_times_out():
+    """End a rank with an error once rank 0's rendezvous store did not answer within the timeout."""
     with Deployment(2) as ranks:
         ranks.start(1)
-        assert ranks.statuses_within([1], STARTUP_S + RENDEZVOUS_TIMEOUT_S)[1] != 0
+        ranks.wait_for_all("ENTERED", [1])
+        entered_s = time.monotonic()
+        assert ranks.statuses_within([1], RENDEZVOUS_TIMEOUT_S + PROMPT_EXIT_S)[1] == 1
+        waited_s = time.monotonic() - entered_s
+        ranks.end()
+        printed = [line for _, line in ranks.seen] + list(ranks.lines.queue)
+    assert waited_s >= RENDEZVOUS_TIMEOUT_S - 1.0, waited_s
+    assert any("timed out" in line.lower() for line in printed), printed
 
 
 def test_rank_0_forwards_every_worker_argument(monkeypatch):
