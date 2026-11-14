@@ -413,14 +413,57 @@ def _deploy(
     assert not left, f"host weights the deployment left in /dev/shm after it ended: {left}"
 
 
+class _ClassDeployment:
+    """The deployment that the tests of a class share, started again after a test broke it."""
+
+    def __init__(self, tmp_path_factory: pytest.TempPathFactory):
+        self._tmp_path_factory = tmp_path_factory
+        self._running = contextlib.ExitStack()
+        self.deployment: Optional[Deployment] = None
+
+    def start(self) -> None:
+        self.deployment = self._running.enter_context(
+            _deploy(self._tmp_path_factory.mktemp("deployment"))
+        )
+
+    def end(self) -> None:
+        self.deployment = None
+        self._running.close()
+
+
+def _serves_every_rank(deployment: Deployment) -> bool:
+    """Return whether the deployment runs with every rank active, as each test leaves it."""
+    if deployment.launcher.poll() is not None:
+        return False
+    status = _status(deployment.base)
+    return status is not None and status["state"] == "healthy"
+
+
 @pytest.fixture(scope="class")
-def shared_deployment(tmp_path_factory: pytest.TempPathFactory):
-    """Start one deployment for the tests of a class, which each end with every rank active."""
+def class_deployment(tmp_path_factory: pytest.TempPathFactory):
     # A class-scoped fixture is set up before the skip_less_device check runs.
     if get_device_count() < WORLD_SIZE:
         pytest.skip(f"needs {WORLD_SIZE} GPUs")
-    with _deploy(tmp_path_factory.mktemp("deployment")) as deployment:
-        yield deployment
+    shared = _ClassDeployment(tmp_path_factory)
+    try:
+        shared.start()
+        yield shared
+    finally:
+        shared.end()
+
+
+@pytest.fixture
+def shared_deployment(class_deployment: _ClassDeployment):
+    """Return the deployment of the test's class, which each test ends with every rank active.
+
+    A test that leaves it otherwise ends it, so that the next test starts a new one instead of
+    failing on the state that test left.
+    """
+    if class_deployment.deployment is None:
+        class_deployment.start()
+    yield class_deployment.deployment
+    if not _serves_every_rank(class_deployment.deployment):
+        class_deployment.end()
 
 
 def _holds_gpu(pid: int) -> bool:
