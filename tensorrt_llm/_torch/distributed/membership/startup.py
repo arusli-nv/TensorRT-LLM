@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, List, NoReturn, Optional, Tuple
 
@@ -62,8 +63,25 @@ if TYPE_CHECKING:
 
 _EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
 
-_client: Optional[MembershipClient] = None
-_authority: Optional[subprocess.Popen] = None
+
+@dataclass
+class RankStartState:
+    """The state of this process's start as a fault-tolerant rank."""
+
+    record: StartupRecord
+    client: Optional[MembershipClient] = None
+    # The authority process, which only rank 0 starts.
+    authority: Optional[subprocess.Popen] = None
+    fingerprint: Optional[str] = None
+    # The startup steps this rank completed, and the peers its running startup collective waits for.
+    steps: int = 0
+    waiting_for: int = 0
+    every_rank_started: threading.Event = field(default_factory=threading.Event)
+    predecessor_memory_released: threading.Event = field(default_factory=threading.Event)
+
+
+# Every rank reports its startup steps, so a long checkpoint load is not taken for a stalled startup.
+_state = RankStartState(StartupRecord(report_progress=lambda: _report_startup_wait(0)))
 
 
 def ensure_rendezvous(
@@ -194,10 +212,6 @@ WORKER_ARGS_KEY = "worker_args"
 # Each rank's tuned tactics, which a replacement of the rank takes. Format with the rank.
 TUNED_TACTICS_KEY = "tuned_tactics/{}"
 
-# Every rank reports its startup steps, so a long checkpoint load is not taken for a stalled startup.
-_startup_record = StartupRecord(report_progress=lambda: _report_startup_wait(0))
-_startup_fingerprint: Optional[str] = None
-
 _HOST_WEIGHTS_CHECK_S = 1.0
 
 
@@ -234,7 +248,7 @@ def _peers_to_wait_for(ranks_without_host_weights: Callable[[], List[int]]) -> L
     """Return the other ranks on this node whose replacements still build their host weights."""
     # The store can hold an older record written back, but the connection cannot. A rank builds
     # its host weights before it joins, so read the record first.
-    record = _client.record
+    record = _state.client.record
     waited = ranks_without_host_weights()
     active = [peer for peer in waited if record.is_active(peer)]
     if active:
@@ -271,18 +285,17 @@ def start_rank(worker_main_args: dict) -> None:
     On rank 0, start the authority, publish the worker arguments for the other ranks, join the
     membership and record the startup. On another rank, check that :func:`worker_node_main` joined.
     """
-    global _startup_fingerprint, _authority
-    _startup_fingerprint = startup_fingerprint(worker_main_args)
+    _state.fingerprint = startup_fingerprint(worker_main_args)
     identity = _launched_rank()
     if identity.rank == 0:
-        _authority = _start_authority(
+        _state.authority = _start_authority(
             identity.world_size, identity.gpus_per_node, RENDEZVOUS_TIMEOUT_S
         )
         store = _startup_store()
         store.set(WORKER_ARGS_KEY, _worker_args_for_other_ranks(worker_main_args))
         _join_at_entry(store, identity)
-        _startup_record.record()
-    elif _client is None:
+        _state.record.record()
+    elif _state.client is None:
         raise ValueError(
             f"Rank {identity.rank} must start through worker_node_main, as trtllm-llmapi-launch "
             "does"
@@ -328,7 +341,7 @@ def worker_node_main() -> None:
                     "The replacement's TensorRT-LLM version or checkpoint differs from the "
                     "deployment's"
                 )
-            _startup_record.replay(agreed_startup)
+            _state.record.replay(agreed_startup)
             _take_tuned_tactics(store, identity.rank)
             _start_alone(worker_main_args)
         worker_main(**worker_main_args)
@@ -347,7 +360,7 @@ def publish_tuned_tactics(store: SignedStore, rank: int) -> None:
     the original ranks' later warmup. Each rank publishes its own, because the cache keys of some
     MoE ops hold the rank's expert offset.
     """
-    store.set(TUNED_TACTICS_KEY.format(rank), pickle.dumps(_startup_record.tuned_tactics))
+    store.set(TUNED_TACTICS_KEY.format(rank), pickle.dumps(_state.record.tuned_tactics))
 
 
 def _take_tuned_tactics(store: SignedStore, rank: int) -> None:
@@ -355,7 +368,7 @@ def _take_tuned_tactics(store: SignedStore, rank: int) -> None:
     from ...autotuner import AutoTuner
 
     tuned_tactics = pickle.loads(store.get(TUNED_TACTICS_KEY.format(rank)))  # nosec B301
-    _startup_record.tuned_tactics = tuned_tactics
+    _state.record.tuned_tactics = tuned_tactics
     AutoTuner.get().profiling_cache.merge_cache_data(tuned_tactics)
 
 
@@ -401,24 +414,19 @@ def _startup_store() -> SignedStore:
     return rendezvous_store(RENDEZVOUS_TIMEOUT_S)
 
 
-_startup_steps = 0
-_startup_waiting_for = 0
-
-
 def _report_startup_wait(waiting_for: int) -> None:
     """Report each change in the peers that a startup collective waits for, 0 once it completed."""
-    global _startup_steps, _startup_waiting_for
-    if waiting_for and waiting_for == _startup_waiting_for:
+    if waiting_for and waiting_for == _state.waiting_for:
         return
-    _startup_waiting_for = waiting_for
+    _state.waiting_for = waiting_for
     if not waiting_for:
-        _startup_steps += 1
-    _client.report(waiting_for=waiting_for, progress=_startup_steps)
+        _state.steps += 1
+    _state.client.report(waiting_for=waiting_for, progress=_state.steps)
 
 
 def _on_tick_at_startup(host_collectives: MnnvlDistFactory) -> None:
     """Report the peers that a startup collective of the startup group or ``MnnvlDist`` waits for."""
-    _client.report(waiting_for=_startup_waiting_for | host_collectives.waiting_for)
+    _state.client.report(waiting_for=_state.waiting_for | host_collectives.waiting_for)
 
 
 def join_startup_group(mapping: Mapping) -> None:
@@ -460,9 +468,9 @@ def join_startup_group(mapping: Mapping) -> None:
     )
     set_mpi_world_comm(startup_group)
     host_collectives = MnnvlDistFactory()
-    Distributed.set_implementation(host_collectives, _startup_record)
+    Distributed.set_implementation(host_collectives, _state.record)
     # A host collective waits in native code, so the client's thread reports whom it waits for.
-    _client.bind(
+    _state.client.bind(
         _on_record_at_startup,
         functools.partial(_on_tick_at_startup, host_collectives),
         _on_error_at_startup,
@@ -483,60 +491,59 @@ def _join_at_entry(store: SignedStore, identity: RankIdentity) -> None:
     Raises:
         TimeoutError: A replacement saw no such commit within the rendezvous timeout.
     """
-    global _client
-    _client = MembershipClient(
+    _state.client = MembershipClient(
         identity.rank,
         store,
         _on_record_at_startup,
         replacement=identity.replacement,
         on_error=_on_error_at_startup,
     )
-    _client.start()
-    if identity.replacement and not _predecessor_memory_released.wait(RENDEZVOUS_TIMEOUT_S):
+    _state.client.start()
+    if identity.replacement and not _state.predecessor_memory_released.wait(RENDEZVOUS_TIMEOUT_S):
         raise TimeoutError(
             f"Rank {identity.rank}'s replacement waited {RENDEZVOUS_TIMEOUT_S:.0f} s for the "
             "active ranks to release its predecessor's memory"
         )
 
 
-_every_rank_started = threading.Event()
-_predecessor_memory_released = threading.Event()
-
-
 def _on_record_at_startup(record: MembershipRecord) -> None:
     if record.state in (MembershipState.ABORTED, MembershipState.SHUTDOWN):
         status = 0 if record.state == MembershipState.SHUTDOWN else 1
-        end_process(_client.rank, status, f"the membership record is {record} during the startup")
+        end_process(
+            _state.client.rank, status, f"the membership record is {record} during the startup"
+        )
     if record.state != MembershipState.STARTING:
-        _every_rank_started.set()
-    if record.state == MembershipState.COMMITTED and not record.is_active(_client.rank):
-        _predecessor_memory_released.set()
+        _state.every_rank_started.set()
+    if record.state == MembershipState.COMMITTED and not record.is_active(_state.client.rank):
+        _state.predecessor_memory_released.set()
 
 
 def _on_error_at_startup(error: Exception) -> None:
-    end_process(_client.rank, 1, f"the membership client failed during the startup ({error!r})")
+    end_process(
+        _state.client.rank, 1, f"the membership client failed during the startup ({error!r})"
+    )
 
 
 def membership_client() -> MembershipClient:
     """Return the membership client this process started when its worker began."""
-    return _client
+    return _state.client
 
 
 def authority_process() -> Optional[subprocess.Popen]:
     """Return the authority process that this process started. Only rank 0 starts one."""
-    return _authority
+    return _state.authority
 
 
 def publish_startup_record(store: SignedStore) -> None:
     """Publish rank 0's startup record and startup fingerprint for a replacement to replay."""
-    agreed_startup = {**_startup_record.published(), "fingerprint": _startup_fingerprint}
+    agreed_startup = {**_state.record.published(), "fingerprint": _state.fingerprint}
     store.set(AGREED_STARTUP_KEY, pickle.dumps(agreed_startup))
 
 
 def wait_for_every_rank() -> None:
     """Report this rank started and wait until every rank has."""
-    _client.report(started=True)
-    _every_rank_started.wait()
+    _state.client.report(started=True)
+    _state.every_rank_started.wait()
 
 
 def end_process(rank: int, status: int, reason: str) -> NoReturn:

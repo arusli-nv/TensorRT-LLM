@@ -691,7 +691,7 @@ def _record(
 def test_replacement_without_node_host_weights_fails(monkeypatch, tracked, record, error, message):
     """Refuse to start rank 3's replacement when rank 2 on its node lacks its host weights."""
     _replacement(monkeypatch)
-    monkeypatch.setattr(startup, "_client", SimpleNamespace(record=record))
+    monkeypatch.setattr(startup._state, "client", SimpleNamespace(record=record))
     monkeypatch.setattr(startup, "_HOST_WEIGHTS_CHECK_S", 0.01)
     replacement = _sharer(1, 0.0, node_size=2)
     replacement.finalize_layer_weights()
@@ -716,7 +716,9 @@ def test_replacement_without_node_host_weights_fails(monkeypatch, tracked, recor
 @pytest.mark.timeout(60)
 def test_replacement_waits_until_host_weights_are_built_again(monkeypatch):
     """Wait for the node's host weights that a later replacement of rank 2 builds again."""
-    monkeypatch.setattr(startup, "_client", SimpleNamespace(record=_record(0b0011, (0, 0, 1, 1))))
+    monkeypatch.setattr(
+        startup._state, "client", SimpleNamespace(record=_record(0b0011, (0, 0, 1, 1)))
+    )
     monkeypatch.setattr(startup, "_HOST_WEIGHTS_CHECK_S", 0.01)
     startup.wait_for_node_host_weights(2, lambda: [])
     checks = iter([[2], [2], [2], []])

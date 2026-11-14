@@ -68,7 +68,7 @@ def worker_main(**args):
     rank = wide_ep_fault_tolerance_rank().rank
     print(f"STARTED {rank} {args['marker']}", flush=True)
     if rank == 0:
-        print(f"AUTHORITY {startup._authority.pid}", flush=True)
+        print(f"AUTHORITY {startup._state.authority.pid}", flush=True)
     time.sleep(load_s)  # the model load
     startup.wait_for_every_rank()
     print(f"SERVING {rank}", flush=True)

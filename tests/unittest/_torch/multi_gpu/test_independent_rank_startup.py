@@ -55,13 +55,13 @@ def _rank_main(rank: int, world_size: int, incarnation: int) -> dict:
     check(MPI.COMM_WORLD.Get_size() == 1, "the rank is not its own MPI world")
     torch.cuda.set_device(rank)
     # Stand in for the membership client that takes the startup collectives' reports.
-    startup._client = Mock()
+    startup._state.client = Mock()
     if incarnation:
         # Replay the original ranks' splits of the startup group: the host collectives' TP group,
         # then the all-to-all workspace's EP group.
         splits = [(0, r) for r in range(world_size)]
         values = {"startup_group_split": [splits, splits]}
-        startup._startup_record.replay({"values": values, "exchanges": []})
+        startup._state.record.replay({"values": values, "exchanges": []})
     mapping = Mapping(
         world_size=world_size,
         rank=rank,

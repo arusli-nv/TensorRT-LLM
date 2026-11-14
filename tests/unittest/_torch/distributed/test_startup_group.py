@@ -83,6 +83,13 @@ def _client(port):
     return TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=30))
 
 
+@pytest.fixture(autouse=True)
+def fresh_start(monkeypatch):
+    """Give each test the startup state of a process that has not started a rank yet."""
+    record = StartupRecord(report_progress=lambda: startup_module._report_startup_wait(0))
+    monkeypatch.setattr(startup_module, "_state", startup_module.RankStartState(record))
+
+
 @pytest.fixture
 def store(monkeypatch):
     """Host the rendezvous store, give each thread its own client, and return the store's port."""
@@ -95,9 +102,7 @@ def store(monkeypatch):
         return clients.store
 
     monkeypatch.setattr(startup_module, "_startup_store", client)
-    monkeypatch.setattr(startup_module, "_client", Mock())
-    record = StartupRecord(report_progress=lambda: startup_module._report_startup_wait(0))
-    monkeypatch.setattr(startup_module, "_startup_record", record)
+    monkeypatch.setattr(startup_module._state, "client", Mock())
     yield server.port
 
 
@@ -131,9 +136,7 @@ def test_starting_ranks_gather_through_store(store):
 
 def test_startup_collective_reports_waits_and_steps(store, monkeypatch):
     """Check that a startup collective reports each change of its awaited peers, then its step."""
-    client = startup_module._client
-    monkeypatch.setattr(startup_module, "_startup_steps", 0)
-    monkeypatch.setattr(startup_module, "_startup_waiting_for", 0)
+    client = startup_module._state.client
     waiting = threading.Event()
     client.report.side_effect = lambda **report: report["waiting_for"] and waiting.set()
 
@@ -156,17 +159,16 @@ def test_startup_collective_reports_waits_and_steps(store, monkeypatch):
 
 def test_startup_reports_host_collective_waits(store, monkeypatch):
     """Report the peers a startup host collective waits for, with those of the startup group."""
-    monkeypatch.setattr(startup_module, "_startup_waiting_for", 0b0010)
+    monkeypatch.setattr(startup_module._state, "waiting_for", 0b0010)
     startup_module._on_tick_at_startup(SimpleNamespace(waiting_for=0b0100))
-    startup_module._client.report.assert_called_once_with(waiting_for=0b0110)
+    startup_module._state.client.report.assert_called_once_with(waiting_for=0b0110)
 
 
 def test_host_weights_wait_reports_startup_progress(store, monkeypatch):
     """Report each poll for the node's host weights as a step of the replacement's startup."""
-    monkeypatch.setattr(startup_module, "_startup_steps", 0)
     monkeypatch.setattr(startup_module, "_HOST_WEIGHTS_CHECK_S", 0.0)
-    monkeypatch.setattr(Distributed, "startup_record", startup_module._startup_record)
-    client = startup_module._client
+    monkeypatch.setattr(Distributed, "startup_record", startup_module._state.record)
+    client = startup_module._state.client
     client.record = MembershipRecord(
         generation=1, state=MembershipState.COMMITTED, active_mask=0b1011
     )
@@ -208,8 +210,7 @@ def test_startup_ends_when_authority_fails():
 def test_replacement_groups_hold_only_itself(monkeypatch):
     """Check that a replacement's groups have the deployment's layout with only itself active."""
     client = Mock()
-    monkeypatch.setattr(startup_module, "_client", client)
-    monkeypatch.setattr(startup_module, "_startup_steps", 0)
+    monkeypatch.setattr(startup_module._state, "client", client)
     world = StoreGroup(
         None, "w", 5, range(8), startup_module._report_startup_wait, active=[5], gpus_per_node=4
     )
@@ -233,7 +234,7 @@ def test_replacement_startup_group_refuses_value_collectives(store, monkeypatch)
     monkeypatch.setattr(Distributed, "_create", None)
     monkeypatch.setattr(Distributed, "startup_record", None)
     Distributed.get.cache_clear()
-    record = startup_module._startup_record
+    record = startup_module._state.record
     record.replay({"values": {}, "exchanges": []})
     join_startup_group(
         Mapping(
@@ -448,8 +449,8 @@ def test_an_original_rank_starts_without_mpi(store, monkeypatch):
     assert _utils.mpi_comm() is _utils.world_comm
     assert isinstance(Distributed._create, MnnvlDistFactory)
     # The membership client reports the waits of the host collectives.
-    assert startup_module._client.bind.call_args.args[1].args == (Distributed._create,)
-    assert Distributed.startup_record is startup_module._startup_record
+    assert startup_module._state.client.bind.call_args.args[1].args == (Distributed._create,)
+    assert Distributed.startup_record is startup_module._state.record
 
 
 @pytest.mark.parametrize(
@@ -500,8 +501,8 @@ def test_original_rank_waits_for_every_rank(monkeypatch):
 
     client = Mock(record=starting, rank=1)
     started = Started()
-    monkeypatch.setattr(startup_module, "_client", client)
-    monkeypatch.setattr(startup_module, "_every_rank_started", started)
+    monkeypatch.setattr(startup_module._state, "client", client)
+    monkeypatch.setattr(startup_module._state, "every_rank_started", started)
     waiter = threading.Thread(target=startup_module.wait_for_every_rank, daemon=True)
     waiter.start()
     startup_module._on_record_at_startup(starting)
@@ -823,7 +824,7 @@ def _publish_tactics(monkeypatch):
     Return the autotuner that a replacement of rank 2 then starts with.
     """
     for rank in range(WORLD):
-        startup_module._startup_record.tuned_tactics = _tactics(rank)
+        startup_module._state.record.tuned_tactics = _tactics(rank)
         startup_module.publish_tuned_tactics(startup_module._startup_store(), rank)
     tuner = Mock()
     monkeypatch.setattr(AutoTuner, "get", Mock(return_value=tuner))
@@ -872,14 +873,12 @@ def test_replacement_takes_its_predecessors_tactics(store, launched, monkeypatch
     taken = [call.args for call in tuner.profiling_cache.merge_cache_data.call_args_list]
     assert taken == ([(_tactics(2),)] if replacement else [])
     if replacement:
-        assert startup_module._startup_record.tuned_tactics == _tactics(2)
+        assert startup_module._state.record.tuned_tactics == _tactics(2)
 
 
 def test_replacement_reports_replayed_collectives_as_progress(store, launched, monkeypatch):
     """Check that each startup collective a replacement replays counts as startup progress."""
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
-    monkeypatch.setattr(startup_module, "_startup_steps", 0)
-    monkeypatch.setattr(startup_module, "_startup_waiting_for", 0)
     args = _rank_0_args(llm_args=_LlmArgs())
     original = StartupRecord()
     original.record()
@@ -894,14 +893,14 @@ def test_replacement_reports_replayed_collectives_as_progress(store, launched, m
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
 
     def worker_main(**worker_main_args):
-        record = startup_module._startup_record
+        record = startup_module._state.record
         assert record.agree("max_seq_len", lambda: 9) == 8
         record.exchange(2, pickle.dumps(1), None, lambda: [])
         record.close()
 
     monkeypatch.setattr("tensorrt_llm.executor.worker.worker_main", worker_main)
     startup_module.worker_node_main()
-    assert [call.kwargs for call in startup_module._client.report.call_args_list] == [
+    assert [call.kwargs for call in startup_module._state.client.report.call_args_list] == [
         dict(waiting_for=0, progress=1),
         dict(waiting_for=0, progress=2),
     ]
@@ -937,8 +936,6 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,4,0")
     # Two nodes, so the rendezvous host must resolve to an address that the other node reaches.
     monkeypatch.setenv(RENDEZVOUS_ENV, "192.0.2.1:29600")
-    monkeypatch.setattr(startup_module, "_authority", None)
-    monkeypatch.setattr(startup_module, "_startup_fingerprint", None)
     monkeypatch.setattr(
         startup_module,
         "_start_authority",
@@ -969,7 +966,7 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
     startup_module.start_rank(args)
     assert events == [("authority", 8, 4), ("join", True, 0)]
     # Rank 0 records its startup for the replacements.
-    record = startup_module._startup_record
+    record = startup_module._state.record
     assert record.agree("rank_hosts", lambda: ["a"] * WORLD) == ["a"] * WORLD
     assert record.values == {"rank_hosts": [["a"] * WORLD]}
     client = startup_module._startup_store()
@@ -997,10 +994,7 @@ def test_replacement_starts_after_removal_commit(store, monkeypatch, committed):
     def membership_client(rank, store, on_record, **kwargs):
         return Mock(rank=rank, incarnation=1, start=lambda: [on_record(r) for r in records])
 
-    monkeypatch.setattr(startup_module, "_client", None)
     monkeypatch.setattr(startup_module, "MembershipClient", membership_client)
-    monkeypatch.setattr(startup_module, "_every_rank_started", threading.Event())
-    monkeypatch.setattr(startup_module, "_predecessor_memory_released", threading.Event())
     # The join waits no time, so it times out unless the records released the predecessor's memory.
     monkeypatch.setattr(startup_module, "RENDEZVOUS_TIMEOUT_S", 0.0)
     join = functools.partial(

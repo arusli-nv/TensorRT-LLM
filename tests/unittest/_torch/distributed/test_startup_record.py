@@ -703,9 +703,9 @@ def test_replacement_warmup_reports_startup_progress():
 def test_original_rank_reports_startup_progress(monkeypatch):
     """Report each startup step of an original rank to the authority."""
     client = Mock()
-    monkeypatch.setattr(startup, "_client", client)
-    monkeypatch.setattr(startup, "_startup_steps", 0)
-    startup._startup_record.report_progress()
+    monkeypatch.setattr(startup._state, "client", client)
+    monkeypatch.setattr(startup._state, "steps", 0)
+    startup._state.record.report_progress()
     client.report.assert_called_once_with(waiting_for=0, progress=1)
 
 
