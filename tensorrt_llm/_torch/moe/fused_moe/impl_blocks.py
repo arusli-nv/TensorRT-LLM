@@ -433,6 +433,7 @@ class MoEEplbWeightLayoutMixin:
                         expert_id, weight_name, weight_tensor[local_slot_id]
                     )
                 else:
+                    # weight_tensor has no rows on a rank that loads no host weights.
                     self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype, weight_tensor[0].shape
+                        expert_id, weight_name, weight_tensor.dtype, weight_tensor.shape[1:]
                     )
