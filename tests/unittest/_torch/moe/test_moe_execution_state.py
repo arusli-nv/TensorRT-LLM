@@ -39,6 +39,12 @@ from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
 
+class _Memory:
+    """Stand-in for a workspace's MNNVL memory, which hashes by identity as the real one does."""
+
+    mapped = False
+
+
 def _frontend(
     health: EPGroupHealth | None = None, *, fault_tolerance: bool = True
 ) -> NVLinkOneSided:
@@ -51,7 +57,7 @@ def _frontend(
     comm.execution_state = None
     comm.ep_rank = 0
     comm._dispatch_state = {"phase": "idle"}
-    comm.mnnvl_mem = SimpleNamespace(mapped=False)
+    comm.mnnvl_mem = _Memory()
     comm._workspace_lifecycle = Mock()
     comm.workspace = torch.zeros(2, 1, dtype=torch.uint8)
     return comm
