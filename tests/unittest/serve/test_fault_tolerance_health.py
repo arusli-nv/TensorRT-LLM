@@ -131,9 +131,9 @@ def test_failed_refresh_reports_store_unreadable(monkeypatch, new_reader):
     store = FakeRendezvousStore(_record(MembershipState.COMMITTED, active_mask=0b1111))
     health = new_reader(store)
     store.check = Mock(side_effect=KeyError("unexpected"))
-    deadline = time.monotonic() + 10.0
-    while health.last_status()["authority_alive"] and time.monotonic() < deadline:
-        time.sleep(0.01)
+    # The refresh thread ends after the read that raised, with one last read.
+    health._refresh_thread.join(10.0)
+    assert not health._refresh_thread.is_alive()
     status = health.last_status()
     assert (status["state"], status["authority_alive"]) == ("unprotected", False)
 
@@ -480,6 +480,8 @@ def test_launcher_and_attached_frontend_agree_on_health(
     monkeypatch, tmp_path, store_readable, rank_0_ended
 ):
     """Check that every frontend answers /health from its executor, whatever the membership."""
+    # A refresh that finds the deployment failed shuts the server down.
+    monkeypatch.setattr(openai_server_module.signal, "raise_signal", Mock())
     store = FakeRendezvousStore(_record(MembershipState.ABORTED)) if store_readable else None
     with isolated_serve_env(tmp_path) as env:
         launcher, attached = (
@@ -504,19 +506,28 @@ def test_launcher_and_attached_frontend_agree_on_health(
 def test_failed_deployment_shuts_the_server_down(monkeypatch, tmp_path):
     """Check that the server raises SIGINT once when a refresh finds the deployment failed."""
     monkeypatch.setattr(health_module, "_STATUS_REFRESH_PERIOD_S", 0.01)
-    raise_signal = Mock()
+    raised = threading.Event()
+    raise_signal = Mock(side_effect=lambda signum: raised.set())
     monkeypatch.setattr(openai_server_module.signal, "raise_signal", raise_signal)
     store = FakeRendezvousStore(_record(MembershipState.COMMITTED))
+    record_checks = threading.Semaphore(0)
+    answers = store.check
+
+    def counted_check(keys):
+        if RECORD_KEY in keys:
+            record_checks.release()
+        return answers(keys)
+
     with isolated_serve_env(tmp_path) as env:
         server = _server(env, monkeypatch, store)
+        store.check = counted_check
         try:
-            time.sleep(0.1)
+            # Each read checks the record once, so by the second check a whole read has ended.
+            for _ in range(2):
+                assert record_checks.acquire(timeout=10.0)
             raise_signal.assert_not_called()
             store.values[RECORD_KEY] = _record(MembershipState.ABORTED).model_dump_json().encode()
-            deadline = time.monotonic() + 10.0
-            while not raise_signal.called and time.monotonic() < deadline:
-                time.sleep(0.01)
-            time.sleep(0.1)
+            assert raised.wait(10.0)
             assert server.fault_tolerance_health.last_status()["state"] == "failed"
         finally:
             server.fault_tolerance_health.close()
@@ -525,21 +536,27 @@ def test_failed_deployment_shuts_the_server_down(monkeypatch, tmp_path):
 
 def test_status_never_waits_for_store(monkeypatch, tmp_path):
     """Check that the status endpoint answers from the last status during a read."""
+    # The released read finds the deployment failed, which shuts the server down.
+    monkeypatch.setattr(openai_server_module.signal, "raise_signal", Mock())
     store = FakeRendezvousStore(_record(MembershipState.ABORTED))
-    unblocked = threading.Event()
+    reading, unblocked = threading.Event(), threading.Event()
     ended_reads = []
 
     def blocked_read(keys):
+        reading.set()
         unblocked.wait(30.0)
         ended_reads.append(keys)
 
     with isolated_serve_env(tmp_path) as env:
-        client = env.client(_server(env, monkeypatch, store).app)
+        server = _server(env, monkeypatch, store)
+        client = env.client(server.app)
         store.check = blocked_read
         try:
+            assert reading.wait(10.0)
             response = client.get("/fault_tolerance_status")
             assert not ended_reads
             assert response.status_code == 200
         finally:
             unblocked.set()
+            server.fault_tolerance_health.close()
     assert response.json()["state"] == "failed"

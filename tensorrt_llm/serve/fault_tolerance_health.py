@@ -139,9 +139,9 @@ class FaultToleranceHealth:
 
         The authority counts as alive while the store answered within the timeout after which the
         ranks consider it hung. A failed read keeps the last state and reopens the store at most
-        once per read timeout. Once the store has answered, a refused connection means the
-        authority ended, and every later read returns False at once. A record or transaction older
-        than the last one read is ignored.
+        once per read timeout. Once a record was read, a refused connection means the authority
+        ended, and every later read returns False at once. A record or transaction older than the
+        last one read is ignored.
         """
         with self._lock:
             if self._authority_ended or self._closed.is_set():
@@ -161,7 +161,7 @@ class FaultToleranceHealth:
                 )
             except (RuntimeError, OSError):
                 self._store = None
-                # Before the store first answered, a refused port means the authority has not started.
+                # Before a record was read, a refused port means the authority has not started.
                 self._authority_ended = self._record is not None and self._store_refuses()
                 return not self._authority_ended and self._answered_recently()
             except UnsignedValueError as error:
