@@ -32,7 +32,6 @@ import subprocess
 import threading
 import time
 import traceback
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
@@ -98,21 +97,6 @@ class _ExpertsNotRestorable(Exception):
     """The active ranks cannot hold, load or agree on every expert after a membership change."""
 
 
-class _RecordOutcome(enum.Enum):
-    NEXT_RECORD = enum.auto()
-    INSTALLED = enum.auto()
-    ABORTED = enum.auto()
-    SHUTDOWN = enum.auto()
-    EXCLUDED = enum.auto()
-
-
-_PROCESS_EXITS = {
-    _RecordOutcome.ABORTED: (1, "the deployment cannot recover from the rank failure"),
-    _RecordOutcome.SHUTDOWN: (0, "the deployment is shutting down"),
-    _RecordOutcome.EXCLUDED: (1, "the membership no longer includes this rank"),
-}
-
-
 class _Phase(enum.Enum):
     """Where a rank is in the membership changes.
 
@@ -143,13 +127,6 @@ _PHASE_TRANSITIONS = {
 }
 # The phases from an install until its commit, in which no forward runs.
 _INSTALL_IN_PROGRESS = frozenset({_Phase.INSTALLING, _Phase.RESUMING, _Phase.JOINING})
-
-
-@dataclass
-class _InstallAttempt:
-    """Whether an attempt to install a membership record completed or stopped for the next one."""
-
-    completed: bool = False
 
 
 def _moe_load_balancer_of(executor: PyExecutor):
@@ -482,34 +459,34 @@ class RankFailureRecovery:
         with self._hang_detection_paused():
             record = self._installed
             listed = record is not None
-            outcome = _RecordOutcome.NEXT_RECORD
-            while outcome is _RecordOutcome.NEXT_RECORD:
+            installed = False
+            while not installed:
                 record = self._next_record(record)
-                outcome = self._take_part_in(record, listed)
+                installed = self._take_part_in(record, listed)
                 listed = listed or record.is_member(self.rank, self.incarnation)
-            if outcome in _PROCESS_EXITS:
-                end_process(self.rank, *_PROCESS_EXITS[outcome])
 
-    def _take_part_in(self, record: MembershipRecord, listed: bool) -> _RecordOutcome:
-        """Handle one record of a membership change and return the next step.
+    def _take_part_in(self, record: MembershipRecord, listed: bool) -> bool:
+        """Handle one record of a membership change and return whether the change is installed.
 
-        ``listed`` tells if an earlier record of this change listed this rank.
+        ``listed`` tells if an earlier record of this change listed this rank. A record that ends
+        the deployment or no longer includes this rank ends the process.
         """
         if record.state == MembershipState.ABORTED:
-            return _RecordOutcome.ABORTED
+            end_process(self.rank, 1, "the deployment cannot recover from the rank failure")
         if record.state == MembershipState.SHUTDOWN:
-            return _RecordOutcome.SHUTDOWN
+            end_process(self.rank, 0, "the deployment is shutting down")
         if not record.is_member(self.rank, self.incarnation):
             if self._phase is not _Phase.JOINING or listed:
-                return _RecordOutcome.EXCLUDED
-            return _RecordOutcome.NEXT_RECORD
+                end_process(self.rank, 1, "the membership no longer includes this rank")
+            return False
         if record.state == MembershipState.PROPOSE:
-            return self._on_propose(record)
+            self._on_propose(record)
+            return False
         if record.state == MembershipState.INSTALL:
             return self._on_install(record)
-        return _RecordOutcome.INSTALLED
+        return True
 
-    def _on_propose(self, record: MembershipRecord) -> _RecordOutcome:
+    def _on_propose(self, record: MembershipRecord) -> None:
         self._end_eplb_iterations()
         if self._record == record:
             paused_at = ResumeState(
@@ -518,25 +495,25 @@ class RankFailureRecovery:
             self._client.report(
                 reply=Reply.READY, reply_generation=record.generation, paused_at=paused_at
             )
-        return _RecordOutcome.NEXT_RECORD
 
-    def _on_install(self, record: MembershipRecord) -> _RecordOutcome:
+    def _on_install(self, record: MembershipRecord) -> bool:
         self._client.report(joining_ready=False)
-        with self._install_attempt(record) as attempt:
+        installed = False
+        with self._install_attempt(record):
             self._install(record)
-        return _RecordOutcome.INSTALLED if attempt.completed else _RecordOutcome.NEXT_RECORD
+            installed = True
+        return installed
 
     @contextlib.contextmanager
-    def _install_attempt(self, record: MembershipRecord) -> Iterator[_InstallAttempt]:
-        """Stop installing ``record`` at an expected error and record whether the attempt completed.
+    def _install_attempt(self, record: MembershipRecord) -> Iterator[None]:
+        """Stop installing ``record`` at an expected error.
 
         A newer change only stops the attempt. After the other expected errors, the rank tells the
         authority which ranks failed and waits for its next record. Any other error ends this rank's
         process, which the authority then removes like any failed rank.
         """
-        attempt = _InstallAttempt()
         try:
-            yield attempt
+            yield
         except _MembershipRestarted as error:
             logger.warning(
                 f"Rank {self.rank} stopped installing membership generation "
@@ -546,8 +523,6 @@ class RankFailureRecovery:
             self._wait_on_unimportable_peers(record, error)
         except (MnnvlMappingError, _ExpertsNotRestorable) as error:
             self._fail_install(record, error)
-        else:
-            attempt.completed = True
 
     def _next_record(self, seen: Optional[MembershipRecord]) -> MembershipRecord:
         with self._record_changed:
@@ -668,11 +643,13 @@ class RankFailureRecovery:
         """
         timer = _PhaseTimer()
         torch.cuda.synchronize()
-        with self._install_attempt(record) as attempt:
+        restored = False
+        with self._install_attempt(record):
             recomputed, outstanding = self._prepare_install(record, timer)
             known, own_slots = self._gather_rank_state(record, timer)
             self._restore(record, own_slots, timer)
-        if not attempt.completed:
+            restored = True
+        if not restored:
             return False
         self._client.report(reply=Reply.INSTALLED, reply_generation=record.generation)
         # The next change may replace COMMITTED before this rank reads it.

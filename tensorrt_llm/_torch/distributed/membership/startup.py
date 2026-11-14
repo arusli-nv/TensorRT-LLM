@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, NoReturn, Optional, Tuple
 
 from tensorrt_llm._utils import global_mpi_size, local_mpi_comm, set_mpi_world_comm
 from tensorrt_llm._wide_ep_fault_tolerance import (
@@ -520,7 +520,7 @@ def wait_for_every_rank() -> None:
     _every_rank_started.wait()
 
 
-def end_process(rank: int, status: int, reason: str) -> None:
+def end_process(rank: int, status: int, reason: str) -> NoReturn:
     """End this process with ``status`` at once, logging ``reason``."""
     (logger.info if status == 0 else logger.error)(f"Rank {rank} exits: {reason}")
     logging.shutdown()
