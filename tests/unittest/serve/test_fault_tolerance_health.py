@@ -310,19 +310,27 @@ def test_close_waits_for_read_in_progress(monkeypatch, new_reader):
     assert set(threading.enumerate()) <= threads
 
 
+@pytest.mark.parametrize("err_type", ["BadRequestError", "internal_error"])
 @pytest.mark.parametrize(
-    "error, status, code",
+    "error, status, code, expected_type",
     [
-        (RankFailureError(), 503, RANK_FAILURE_CODE),
-        (RequestError(str(RankFailureError())), 400, 400),  # The type decides, not the text.
+        (RankFailureError(), 503, RANK_FAILURE_CODE, "ServiceUnavailableError"),
+        # The type decides, not the text.
+        (RequestError(str(RankFailureError())), 400, 400, None),
     ],
 )
-def test_rank_failure_answers_503_with_code(error, status, code):
-    """Check that only a RankFailureError, by type, answers 503 rank_failure without Retry-After."""
-    response = OpenAIServer.create_error_response(error)
+def test_rank_failure_answers_503_with_code(error, status, code, expected_type, err_type):
+    """Check that only a RankFailureError, by type, answers 503 rank_failure without Retry-After.
+
+    Any other error keeps the caller's error type.
+    """
+    server = OpenAIServer.__new__(OpenAIServer)
+    response = server.create_exception_error_response(error, err_type)
     body = json.loads(response.body)
     assert response.status_code == status
     assert body["code"] == code
+    assert body["type"] == (expected_type or err_type)
+    assert body["message"] == str(error)
     assert "retry-after" not in response.headers
 
 

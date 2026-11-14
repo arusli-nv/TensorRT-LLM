@@ -1225,29 +1225,39 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
     def create_error_response(
-            message: Union[str, Exception],
+            message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        rank_failure = isinstance(message, RankFailureError)
-        message = str(message)
         # Over-length prompts are detected from the message text because they
         # cross the executor IPC boundary as plain strings (RequestError), so
         # no exception type survives to here.
         code: Union[int, str] = status_code.value
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
-        elif rank_failure:
-            # A RankFailureError keeps its type, since the engine fails the
-            # request with the exception object and the result raises it as
-            # is. It answers 503 rank_failure whatever the caller passed.
-            err_type, status_code = ("ServiceUnavailableError",
-                                     HTTPStatus.SERVICE_UNAVAILABLE)
-            code = RANK_FAILURE_CODE
         error_response = ErrorResponse(message=message,
                                        type=err_type,
                                        code=code)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=status_code.value)
+
+    def create_exception_error_response(
+            self,
+            error: Exception,
+            err_type: str = "BadRequestError") -> Response:
+        """Answer a request that failed with ``error``.
+
+        A RankFailureError answers 503 with the rank_failure code, since
+        sending the request again can succeed. Any other error answers 400
+        with ``err_type`` and the error's message.
+        """
+        if not isinstance(error, RankFailureError):
+            return self.create_error_response(message=str(error),
+                                              err_type=err_type)
+        error_response = ErrorResponse(message=str(error),
+                                       type="ServiceUnavailableError",
+                                       code=RANK_FAILURE_CODE)
+        return JSONResponse(content=error_response.model_dump(),
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -2658,7 +2668,7 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(e)
+            return self.create_exception_error_response(e)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -3078,7 +3088,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(e)
+            return self.create_exception_error_response(e)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3298,7 +3308,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(e)
+            return self.create_exception_error_response(e)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3460,8 +3470,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
-            return self.create_error_response(message=e,
-                                              err_type="internal_error")
+            return self.create_exception_error_response(
+                e, err_type="internal_error")
 
     def _responses_prompt_tokens_excluded_from_usage(
             self, request: ResponsesRequest) -> int:
@@ -3726,7 +3736,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(e)
+            return self.create_exception_error_response(e)
 
         return JSONResponse(content={"detail": "None"})
 
