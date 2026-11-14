@@ -193,7 +193,8 @@ class RankFailureRecovery:
     Every other method runs on the executor thread. Both threads read and write ``_record``,
     ``_installed`` and ``_phase`` under ``_record_changed``. The client thread makes one phase
     transition, JOINING to RESUMING when a COMMITTED record admits this replacement. The
-    executor thread makes every other one.
+    executor thread makes every other one. Only the client thread writes ``_record`` and leaves
+    JOINING, so it reads both without the lock.
     """
 
     def __init__(
@@ -356,10 +357,11 @@ class RankFailureRecovery:
                 self._committed_mask = record.active_mask
                 self._committed_generation = record.generation
             change_not_installed = self._change_not_installed()
+            joining = self._phase is _Phase.JOINING
             self._record_changed.notify_all()
         if change_not_installed:
             self._exchange.wake()
-        if self._phase is _Phase.JOINING:
+        if joining:
             return
         if record.state in (MembershipState.PROPOSE, MembershipState.ABORTED) or self._excluded(
             record
