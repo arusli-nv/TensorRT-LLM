@@ -1135,6 +1135,33 @@ def test_full_kv_pool_preempts_newest_requests(monkeypatch):
     assert calls[-4:] == [("resize", 54 * MIB), "remap", ("restore", plan), "resume"]
 
 
+@pytest.mark.parametrize("backed, fits", [(46 * MIB, True), (56 * MIB, False)])
+def test_restore_beyond_kv_pool_refused_before_preempting(monkeypatch, backed, fits):
+    """Check that a restore that the KV cache pool cannot release replies FAILED at once.
+
+    The spare slots of earlier failures stay backed until a rejoin, so a second failure's restore
+    of 10 MiB needs more than the 64 MiB startup quota less 56 MiB can give.
+    """
+    r = _resuming()
+    r.client.answers[(Reply.FAILED, 1)] = [
+        _record(MembershipState.PROPOSE, generation=2, active_mask=0b0011)
+    ]
+    calls, plan, device = _eplb(monkeypatch, r, device=_Device(backed=backed))
+    executor = r.executor
+    executor.active_requests = [_request(i) for i in (20, 21)]
+
+    def recompute(requests):
+        for request in requests:
+            request.py_seq_slot = None
+
+    executor.recompute_requests.side_effect = recompute
+    r.recovery.before_iteration()
+    assert _replies(r) == [Reply.INSTALLED if fits else Reply.FAILED]
+    assert _recomputed(executor) == []
+    assert _resizes(device) == ([8 * MIB] if fits else [])
+    assert (("restore", plan) in calls) is fits
+
+
 @pytest.mark.parametrize(
     "allocate, quota", [("cache", 58 * MIB), ("take", 54 * MIB), ("no growth", 54 * MIB)]
 )

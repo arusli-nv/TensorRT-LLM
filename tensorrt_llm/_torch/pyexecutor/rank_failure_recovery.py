@@ -809,6 +809,10 @@ class RankFailureRecovery:
         # The remap maps fresh pages for this rank's rows before it frees the pages they replace.
         workspace_bytes = self._moe.workspace_bytes() if self.rank in fresh_rows else 0
         restore_bytes = workspace_bytes + (0 if plan is None else plan.device_bytes)
+        try:
+            self._memory.check_restore_fits(restore_bytes, balancer)
+        except ValueError as error:
+            raise _ExpertsNotRestorable(str(error)) from error
         timer.begin()
         with self._memory.kv_cache_shrunk_by(
             restore_bytes, balancer, self._recomputable

@@ -201,6 +201,25 @@ class RecoveryMemory:
         """Return whether the last forward vote agreed on a release."""
         return self._release_agreed
 
+    def check_restore_fits(self, restore_bytes: int, balancer: Optional[MoeLoadBalancer]) -> None:
+        """Check that the KV cache pool can release ``restore_bytes``.
+
+        The pool releases at most its startup quota less the backed spare slots, which hold the
+        experts of the failures since the last rejoin, even with every request preempted.
+
+        Raises:
+            ValueError: The restore needs more device memory than the KV cache pool can release.
+        """
+        backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
+        quota = self._startup_memory.kv_cache_quota
+        if restore_bytes > quota - backed:
+            raise ValueError(
+                f"Rank {self._rank} needs {restore_bytes} bytes of device memory to restore the "
+                f"lost experts and workspaces, but its KV cache pool can release at most "
+                f"{quota - backed} bytes: its startup quota of {quota} bytes less the {backed} "
+                "bytes of spare slots that hold the experts of earlier failures"
+            )
+
     @contextlib.contextmanager
     def kv_cache_shrunk_by(
         self,
