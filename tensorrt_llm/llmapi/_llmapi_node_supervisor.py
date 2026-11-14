@@ -196,7 +196,11 @@ class NodeSupervisor:
             self._selector.register(self._wake_read, selectors.EVENT_READ, _WAKE)
             self._connect()
             # The first view tells whether the node starts its ranks. A rejoining node connects again
-            # until it has one.
+            # until it has one, for up to DEAD_TIMEOUT_S: within that time the authority drops the
+            # connection of the node's previous supervisor once it ended (at once on a close, else
+            # through the keepalive), and an authority silent for that long counts as gone, as any
+            # silent peer does.
+            rejoin_due_s = time.monotonic() + self._membership.DEAD_TIMEOUT_S
             while self._signum is None and (
                 self._connecting is not None
                 or self._connection_awaiting_view is not None
@@ -205,6 +209,7 @@ class NodeSupervisor:
                     and self._view is None
                     and not self._refused_by_authority
                     and not self._parent_ended
+                    and time.monotonic() < rejoin_due_s
                 )
             ):
                 if self._connecting is None and self._connection_awaiting_view is None:
@@ -220,6 +225,15 @@ class NodeSupervisor:
                 return self._step(time.monotonic())
             if self._refused_by_authority:
                 return 1
+            if self._rejoin and self._view is None:
+                self._logger.error(
+                    "No membership authority at "
+                    f"{os.environ[self._membership.RENDEZVOUS_ENV]} admitted node {self._node} "
+                    f"within {self._membership.DEAD_TIMEOUT_S:.0f} s: the deployment ended, the "
+                    "node's previous supervisor still runs, or the node's ranks are not in this "
+                    "deployment (check --rejoin-node, --nodes and the step's GPUs)"
+                )
+                return 1
             if self._view is not None and self._view.record.state in (
                 self._membership.MembershipState.SHUTDOWN,
                 self._membership.MembershipState.ABORTED,
@@ -231,6 +245,12 @@ class NodeSupervisor:
             if self._rejoin and not self._deployment_started:
                 self._logger.error(
                     f"The deployment has not started, so start node {self._node} without --rejoin"
+                )
+                return 1
+            if self._rejoin and len(self._view.record.incarnations) != self._world_size:
+                self._logger.error(
+                    f"The deployment has {len(self._view.record.incarnations)} ranks, not "
+                    f"{self._world_size}: check --nodes and the step's GPUs"
                 )
                 return 1
             self._start_first_processes()
@@ -776,12 +796,13 @@ class NodeSupervisor:
                 for view in views:
                     self._on_view(view)
                 return
-        # Once the deployment has started, the authority has admitted this supervisor before. It then
-        # refuses a reconnect only while it still holds the previous connection, so connect again.
+        # Once the deployment has started, the authority has admitted this node's supervisor before.
+        # It then refuses a reconnect, or a rejoin, only while it still holds the previous
+        # connection, so connect again.
         if (
             data == b""
             and self._connection_awaiting_view is not None
-            and not self._deployment_started
+            and not (self._deployment_started or self._rejoin)
         ):
             self._logger.error(
                 f"The membership authority refused the supervisor of node {self._node}"

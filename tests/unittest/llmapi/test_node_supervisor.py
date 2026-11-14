@@ -1000,6 +1000,50 @@ def test_rejoin_before_deployment_started_ends(tmp_path, deployment):
     assert not list(tmp_path.glob("rank-*.json"))
 
 
+@pytest.mark.parametrize("authority_state", ["ended", "refusing"])
+def test_rejoin_ends_without_authority(tmp_path, deployment, monkeypatch, authority_state):
+    """End a rejoining supervisor, which starts no rank, once no authority admitted it in time.
+
+    Nothing listens at the rendezvous address of a deployment that ended. An authority refuses a
+    node whose ranks are not in the deployment every time.
+    """
+    monkeypatch.setattr(membership, "DEAD_TIMEOUT_S", 1.0)
+    errors = []
+    monkeypatch.setattr(logger, "error", errors.append)
+    authority, environ = deployment
+    if authority_state == "refusing":
+        authority.refusals = 1000
+        authority.start()
+    running = Running(tmp_path, environ, rejoin=True)
+    assert running.wait() == 1
+    assert not list(tmp_path.glob("rank-*.json"))
+    hint = "check --rejoin-node, --nodes and the step's GPUs"
+    assert any("admitted node 1 within 1 s" in error and hint in error for error in errors)
+
+
+def test_rejoin_retried_while_refused(tmp_path, deployment):
+    """Connect again while the authority refuses a rejoin.
+
+    The authority refuses it while it holds the connection of the node's previous supervisor.
+    """
+    authority, environ = deployment
+    authority.refusals = 2
+    authority.start(_record(active_mask=0b0011))
+    running = Running(tmp_path, environ, rejoin=True)
+    _until(lambda: all(_read(tmp_path, rank, 1) for rank in RANKS))
+    assert authority.refusals == 0
+    _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=2)
+
+
+def test_rejoin_with_other_world_size_ends(tmp_path, deployment):
+    """End a rejoining supervisor, which starts no rank, whose world size is not the deployment's."""
+    authority, environ = deployment
+    authority.start(_record(active_mask=0b110011, incarnations=(0,) * 6))
+    running = Running(tmp_path, environ, rejoin=True)
+    assert running.wait() == 1
+    assert not list(tmp_path.glob("rank-*.json"))
+
+
 # A parent that starts the command after its first argument, with output to the file that argument
 # names, prints the command's PID and ends once its stdin closes.
 _PARENT = (
