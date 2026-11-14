@@ -690,6 +690,19 @@ def test_rows_require_fabric_handles(rows_driver, monkeypatch):
     assert rows_driver.reserved == []
 
 
+def test_failed_communicator_query_reserves_nothing(rows_driver, monkeypatch):
+    """Check that rows query the communicator before they reserve an address range."""
+    comm = _gather_without({2, 3})
+
+    def get_rank():
+        raise RuntimeError("communicator closed")
+
+    monkeypatch.setattr(comm, "Get_rank", get_rank)
+    with pytest.raises(RuntimeError, match="communicator closed"):
+        HostExchangeMnnvlMemory(comm, _SIZE)
+    assert rows_driver.reserved == []
+
+
 @pytest.mark.parametrize(
     "error",
     [MnnvlMappingError([3, 1], "rank 3: export failed"), MnnvlPeerHandleError([5], "rank 5")],

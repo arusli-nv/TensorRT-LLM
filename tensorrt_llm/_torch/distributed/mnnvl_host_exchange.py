@@ -85,7 +85,7 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
             )
         granularity = cls.get_allocation_granularity(dev_id)
         stride = granularity * ceil_div(nbytes, granularity)
-        nranks = comm.Get_size()
+        nranks, comm_rank, members = comm.Get_size(), comm.Get_rank(), comm_members(comm)
         ptr = int(
             _check_cu_result(
                 mnnvl_memory.cuda.cuMemAddressReserve(nranks * stride, granularity, 0, 0)
@@ -96,8 +96,8 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
             _MnnvlAllocationRecord(
                 comm=None,
                 comm_size=nranks,
-                comm_rank=comm.Get_rank(),
-                comm_membership=comm_members(comm),
+                comm_rank=comm_rank,
+                comm_membership=members,
                 aligned_size=stride,
                 mem_handles=[None] * nranks,
                 start_address=ptr,
@@ -109,7 +109,7 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
         self.segment_size = nbytes
         self.ptr, self.rank_stride = ptr, stride
         try:
-            self.remap(comm, frozenset(comm_members(comm)))
+            self.remap(comm, frozenset(members))
         except BaseException:
             self.close()
             raise
