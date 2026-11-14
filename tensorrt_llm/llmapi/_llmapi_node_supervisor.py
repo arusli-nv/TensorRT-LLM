@@ -107,14 +107,12 @@ class NodeSupervisor:
         end_job: Optional[Callable[[], None]] = None,
     ):
         from tensorrt_llm._torch.distributed import membership
-        from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
         from tensorrt_llm.llmapi._llmapi_process_guard import _signal_group
         from tensorrt_llm.logger import logger
 
         self._membership = membership
         self._logger = logger
         self._signal_group = _signal_group
-        self._rank_env = FAULT_TOLERANCE_RANK_ENV
         self._node = node
         self._gpus_per_node = gpus_per_node
         self._world_size = nodes * gpus_per_node
@@ -486,10 +484,10 @@ class NodeSupervisor:
         self._signal_group(process.child.pid, signal.SIGKILL)
 
     def _start(self, rank: int, replacement: bool) -> None:
-        from tensorrt_llm._wide_ep_fault_tolerance import RankIdentity
+        from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV, RankIdentity
 
         identity = RankIdentity(rank, self._world_size, self._gpus_per_node, replacement)
-        environ = {**self._environ, self._rank_env: identity.env_value()}
+        environ = {**self._environ, FAULT_TOLERANCE_RANK_ENV: identity.env_value()}
         child = subprocess.Popen(  # nosec B603
             [*self._exec_rank, *self._command],
             env=environ,
@@ -823,7 +821,7 @@ def start_session_node_supervisor(n_workers: int, env: Dict[str, str]) -> subpro
     return subprocess.Popen(  # nosec B603
         [
             sys.executable,
-            os.path.abspath(__file__),
+            _SCRIPT,
             "--node-rank",
             "0",
             "--nodes",

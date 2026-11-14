@@ -15,7 +15,6 @@
 """Configuration checks for Wide-EP fault tolerance, and the rank identity from its launcher."""
 
 import os
-from functools import lru_cache
 from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence, Tuple
 
 from .logger import logger
@@ -252,11 +251,7 @@ class RankIdentity(NamedTuple):
 
 def wide_ep_fault_tolerance_rank() -> Optional[RankIdentity]:
     """Return the rank identity the node supervisor gave this process, if one started it."""
-    return _parse_rank_identity(os.environ.get(FAULT_TOLERANCE_RANK_ENV))
-
-
-@lru_cache(maxsize=1)
-def _parse_rank_identity(value: Optional[str]) -> Optional[RankIdentity]:
+    value = os.environ.get(FAULT_TOLERANCE_RANK_ENV)
     if value is None:
         return None
     rank, world_size, gpus_per_node, replacement = (int(field) for field in value.split(","))
