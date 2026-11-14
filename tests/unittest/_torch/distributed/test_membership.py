@@ -934,15 +934,16 @@ def test_unchanged_membership_sends_nothing():
         store.set = writes
         # No transaction starts for a replacement that has not reported that it is ready to join.
         with open_liveness_connection(store, 1, replacement=True) as connection:
-            connection.sock.settimeout(1.5)
             received = b""
-            with contextlib.suppress(socket.timeout):
-                while True:
+            deadline_s = time.monotonic() + 3 * membership.records.HEARTBEAT_INTERVAL_S
+            while (left_s := deadline_s - time.monotonic()) > 0:
+                connection.sock.settimeout(left_s)
+                with contextlib.suppress(socket.timeout):
                     data = connection.sock.recv(1 << 16)
                     assert data, "the authority closed the connection"
                     received += data
-            # Only the record that gives it its incarnation arrives.
-            assert len(connection.lines.decode(received)) == 1
+            # Only the record that gives it its incarnation arrives, besides empty heartbeat lines.
+            assert len([line for line in connection.lines.decode(received) if line]) == 1
             writes.assert_not_called()  # until the connection closes
 
 

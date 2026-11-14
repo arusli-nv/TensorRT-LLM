@@ -927,11 +927,14 @@ def test_newer_change_installed_before_resume_iteration():
 
 
 def test_resume_deletes_change_group_keys():
-    """Leave no store keys of the change's store groups once serving resumes."""
+    """Delete this rank's store keys of the change's groups once serving resumes.
+
+    Only the values of the simulated active peers 1 and 3 remain, as each member deletes its own.
+    """
     r = _resuming()
-    assert any(key.startswith("host_exchange_rows/") for key in r.store.values)
     r.recovery.before_iteration()
-    assert not [key for key in r.store.values if key.startswith("host_exchange_rows/")]
+    remaining = {key for key in r.store.values if key.startswith("host_exchange_rows/")}
+    assert remaining == {"host_exchange_rows/1/0/1", "host_exchange_rows/1/0/3"}
 
 
 @pytest.mark.parametrize("together", [False, True])
