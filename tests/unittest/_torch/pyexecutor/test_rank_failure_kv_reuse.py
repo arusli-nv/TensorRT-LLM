@@ -62,26 +62,34 @@ def manager():
     manager.shutdown()
 
 
-def _executor(manager, fault_tolerance):
-    """Return the executor's context update and commit paths over ``manager``."""
+def _executor(manager, accept_step):
+    """Return the executor's context update and commit paths over ``manager``.
+
+    ``accept_step`` is rank failure recovery's verdict on each step, or None without fault
+    tolerance.
+    """
     executor = SimpleNamespace(
-        rank_failure_recovery=SimpleNamespace(accept_step=lambda batch: True)
-        if fault_tolerance
-        else None,
+        rank_failure_recovery=None
+        if accept_step is None
+        else SimpleNamespace(accept_step=lambda batch: accept_step),
         kv_cache_manager=manager,
         enable_joint_kv_cache_reuse=False,
         resource_manager=SimpleNamespace(get_resource_manager=lambda _type: None),
         _wait_for_model_engine_input_copy=lambda: None,
         previous_batch=None,
+        drafter=None,
+        use_spec_decode=False,
+        capturable_guided_decoder=None,
     )
     executor.update = partial(PyExecutor._update_v2_context_resources, executor)
+    executor._discard_previous_batch = partial(PyExecutor._discard_previous_batch, executor)
 
-    def accept(step):
+    def finish(step):
+        """Accept or discard ``step`` as the executor does before it handles the step's results."""
         executor.previous_batch = step
         PyExecutor._accept_or_discard_previous_batch(executor)
-        assert executor.previous_batch is step
 
-    executor.accept = accept
+    executor.finish = finish
     return executor
 
 
@@ -124,16 +132,16 @@ def _reused_prefix(manager, request_id, first_token):
     return probe.context_current_position
 
 
-@pytest.mark.parametrize("fault_tolerance", [False, True], ids=["off", "on"])
-@pytest.mark.parametrize("accepted", [False, True], ids=["discarded", "accepted"])
-def test_chunk_reusable_after_step_accepted(manager, fault_tolerance, accepted):
-    executor = _executor(manager, fault_tolerance)
+@pytest.mark.parametrize(
+    "accept_step", [None, True, False], ids=["off", "on-accepted", "on-discarded"]
+)
+def test_chunk_reusable_after_step_accepted(manager, accept_step):
+    executor = _executor(manager, accept_step)
     request = _request(1, first_token=1000)
     step = _launch(executor, _schedule_chunk(manager, request))
-    if accepted and fault_tolerance:  # the executor accepts a step's commits only in this case
-        executor.accept(step)
+    executor.finish(step)
     # A discarded step stands for a rank failure, which frees the request for recompute.
+    assert (executor.previous_batch is step) == (accept_step is not False)
     manager.free_resources(request)
     # Without fault tolerance the chunk is committed at its launch.
-    reusable = accepted or not fault_tolerance
-    assert _reused_prefix(manager, 2, first_token=1000) == (CHUNK if reusable else 0)
+    assert _reused_prefix(manager, 2, first_token=1000) == (0 if accept_step is False else CHUNK)
