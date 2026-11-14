@@ -1027,13 +1027,13 @@ class Run:
         failure: str,
         at_admission: Optional[Callable[[], Dict[int, psutil.Process]]] = None,
         at_admission_state: Optional[str] = None,
-        at_failover_install: Optional[Dict[int, psutil.Process]] = None,
+        at_failover: Optional[Dict[int, psutil.Process]] = None,
     ) -> None:
         """Fail a rank with ``crash`` or ``hang``, wait for N ranks, and serve a window.
 
         ``at_admission`` returns processes to kill once the store shows the admission in
-        ``at_admission_state``, which the suspended joining rank holds open. The
-        ``at_failover_install`` processes are killed once the store shows the failover's INSTALL.
+        ``at_admission_state``, which the suspended joining rank holds open. The ``at_failover``
+        processes are killed during the failover, which a suspended survivor holds open.
         """
         self.cycles += 1
         d, index = self.deployment, self.cycles
@@ -1053,18 +1053,31 @@ class Run:
             victim.kill()
         self.failure_times.append(t_fail)
         detection_s = HANG_TIMEOUT_S if failure == "hang" else 0.0
-        killed_at_failover = sorted(at_failover_install or {})
-        if at_failover_install:
-            _, installing = self.monitor.wait_for(
-                lambda s: s["membership_state"] == "INSTALL"
+        killed_at_failover = sorted(at_failover or {})
+        if at_failover:
+            holding = min(
+                (r for r in workers_before if r not in (0, VICTIM, *killed_at_failover)),
+                default=None,
+            )
+            assert holding is not None, f"no survivor to hold: {sorted(workers_before)}"
+            # Suspend a survivor once the store shows the failover. It then neither replies nor
+            # installs, so the change cannot commit before the kill, far within the hang timeout.
+            # It holds PROPOSE if it had not replied READY yet, INSTALL otherwise.
+            _, failing_over = self.monitor.wait_for(
+                lambda s: s["membership_state"] in ("PROPOSE", "INSTALL")
                 and s["generation"] > status["generation"]
                 and VICTIM not in s["active_ranks"],
                 t_fail,
                 detection_s + RECOVERY_TIMEOUT_S,
             )
-            for process in at_failover_install.values():
-                process.kill()
-            self.failure_times.append(time.monotonic())
+            workers_before[holding].suspend()
+            try:
+                for process in at_failover.values():
+                    process.kill()
+                self.failure_times.append(time.monotonic())
+            finally:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    workers_before[holding].resume()
         failed = sorted({VICTIM, *killed_at_failover})
         t_degraded, failover_status = self.monitor.wait_for(
             lambda s: _committed_after(status["generation"])(s)
@@ -1072,12 +1085,18 @@ class Run:
             t_fail,
             detection_s + RECOVERY_TIMEOUT_S,
         )
-        if at_failover_install:
-            # The kill must land before the failover commits: its INSTALL's generation then never
-            # commits.
+        if at_failover:
+            # The kill must land before the failover commits: its generation then never commits.
+            # The failover's last record before the next change shows the phase it landed in.
+            generation = failing_over["generation"]
+            landed_in = [s for _, s in self.monitor.membership if s["generation"] == generation][-1]
+            print(
+                f"cycle {index}: the second rank was killed in the failover's "
+                f"{landed_in['membership_state']}"
+            )
             self.check(
-                installing["generation"] not in self._committed_generations(),
-                f"cycle {index}: the kill did not land during the failover's install: {installing}",
+                generation not in self._committed_generations(),
+                f"cycle {index}: the kill did not land during the failover: {landed_in}",
             )
         self.monitor.wait_for_health(200, "degraded", t_degraded, RECOVERY_TIMEOUT_S)
         self.phases.append(Phase("failover", index, t_fail, t_degraded, event=t_fail))
@@ -1462,13 +1481,13 @@ class TestRankFailures:
         _crash_during_admission(shared_deployment, "INSTALL")
 
     @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
-    def test_failure_during_failover_install(self, shared_deployment: Deployment):
-        """Crash a second rank while the survivors install the first one's failover.
+    def test_failure_during_failover(self, shared_deployment: Deployment):
+        """Crash a second rank during the first one's failover, in its PROPOSE or INSTALL.
 
         The survivors commit a membership without both ranks and serve on, and both rejoin.
         """
         with Run(shared_deployment) as run:
-            run.cycle("crash", at_failover_install=_second_rank(shared_deployment))
+            run.cycle("crash", at_failover=_second_rank(shared_deployment))
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)

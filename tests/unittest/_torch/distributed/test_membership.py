@@ -714,10 +714,11 @@ class SignedTcpStore:
 
 
 @contextlib.contextmanager
-def _deployment(world, store=None, **authority_options):
+def _deployment(world, store=None, reply=None, **authority_options):
     """Run an authority process and a client per rank, yield the store and clients, then shut down.
 
-    The store is in memory unless ``store`` is given.
+    The store is in memory unless ``store`` is given. The clients answer records with ``reply``,
+    by default as an executor does.
     """
     store = DictStore() if store is None else store
     thread, returned = _serve(
@@ -725,7 +726,7 @@ def _deployment(world, store=None, **authority_options):
     )
     clients = []
     try:
-        clients += [_member(store, r, world) for r in range(world)]
+        clients += [_member(store, r, world, reply=reply) for r in range(world)]
         _until(
             lambda: all(
                 client.record is not None and client.record.state == MembershipState.COMMITTED
@@ -776,12 +777,13 @@ def _until(condition, timeout_s=TIMEOUT_S):
         time.sleep(0.01)
 
 
-def _member(store, rank, world, replacement=False, on_error=None):
-    """Start a rank's client that replies to every record as an executor does."""
+def _member(store, rank, world, replacement=False, on_error=None, reply=None):
+    """Start a rank's client that replies to each record with ``reply``, or as an executor does."""
+    reply = _reply if reply is None else reply
     client = MembershipClient(
         rank,
         store,
-        lambda record: _reply(client, record),
+        lambda record: reply(client, record),
         replacement=replacement,
         on_error=on_error,
     )
@@ -1204,6 +1206,35 @@ def test_replacement_refused_until_rank_removed(monkeypatch, store_type):
         _until(lambda: _committed(clients[0], 0b111))
         assert clients[0].record.incarnations == (0, 0, 1)
         assert _refused(store, 2, False)
+
+
+def test_second_failure_during_failover_install():
+    """Fail a second rank while a survivor installs the first one's failover, with real clients.
+
+    Rank 3 holds its reply to the failover's INSTALL, so the INSTALL is open when rank 2 fails.
+    The failover's generation never commits, and the next change commits without both ranks.
+    """
+    held, seen = [], []
+
+    def holding_reply(client, record):
+        if client.rank == 0:
+            seen.append((record.generation, record.state))
+        if client.rank == 3 and record.state == MembershipState.INSTALL and not held:
+            held.append(record.generation)
+            return
+        _reply(client, record)
+
+    with _deployment(4, reply=holding_reply) as (store, clients):
+        clients[1].stop()
+        _until(lambda: held)
+        clients[2].stop()
+        _until(lambda: _committed(clients[0], 0b1001))
+        summary = TransactionSummary.model_validate_json(store.get(TRANSACTION_KEY))
+    (failover,) = held
+    assert (failover, MembershipState.INSTALL) in seen
+    assert (failover, MembershipState.COMMITTED) not in seen
+    assert summary.generation > failover
+    assert summary.removed_ranks == (1, 2)
 
 
 def test_authority_stamps_reports_on_receipt(monkeypatch):
