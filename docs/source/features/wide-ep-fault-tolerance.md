@@ -77,7 +77,7 @@ Fault tolerance rejects at startup, with the reason, what it does not support:
 | No EPLB, or per-layer dynamic EPLB; online EPLB without GDRCopy | Spare slots take a failed rank's experts; online EPLB writes them from the CPU through GDRCopy |
 | KV-balanced admission, KV-aware routing or conversation affinity in `attention_dp_config` | Not supported yet: they keep per-rank state that a replacement does not share |
 | KV cache events, KV cache connectors, KV cache compression, KV cache manager V1 | Not supported yet: removal events for a failed rank's blocks, saving only accepted steps, and resizing compressed pools are missing; only V2 holds reuse commits until a step is accepted |
-| NGram, user-provided and DSpark drafters | Not supported yet: their drafting state is not rolled back when a failure discards a step |
+| Speculative decoding other than MTP (such as Eagle3, SA, PARD, DFlash, DSpark, NGram, or MTP with `sa_config`) | Not supported yet: fault tolerance is tested with MTP only |
 | Sleep mode | Not supported yet: sleep releases and restores the weights' memory, whose spare slots fault tolerance backs and unbacks itself |
 | Userbuffers, `enable_lm_head_tp_in_adp`, disaggregated serving | Userbuffers exchange handles over an MPI world of every rank; a failed rank would take its vocabulary share; KV transfers do not follow a membership change |
 | TRTLLM-Gen and DeepGEMM (so FP8 DeepSeek-R1, which runs TRTLLM-Gen by default on GB200), CuteDSL with locality domains or on SM107, and other MoE backends without spare-slot tuning | Their tuner profiles the unbacked spare slots |
@@ -384,8 +384,7 @@ The launcher's output has these log lines:
   `context_parallel_size: 1`, `gpus_per_node` equal to the GPUs that each node supervisor sees (one rank per GPU),
   and, if set, `TRTLLM_MOE_COMM_TIMEOUT_SEC` of at least 120 s.
 - Rejected at startup: pipeline parallelism, TRTLLM-Gen, DeepGEMM (the FP8 DeepSeek-R1 backends) and other MoE
-  backends (not supported yet), two-model speculation (such as Eagle3 or draft-target), NGram, user-provided and
-  DSpark drafters (one-model MTP works), disaggregated serving, KV cache connectors, events and compression
+  backends (not supported yet), speculative decoding other than MTP (MTP with `sa_config` included), disaggregated serving, KV cache connectors, events and compression
   (`kv_cache_compression_config`), sleep mode, `enable_lm_head_tp_in_adp`, userbuffers,
   `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=1` (fault tolerance runs on the fence path) and `modeling_v2: require`.
 - Rejected when submitted: requests with `n > 1`, `best_of > 1` or `use_beam_search`.

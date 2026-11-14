@@ -33,13 +33,20 @@ from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (
     AttentionDpConfig,
+    AutoDecodingConfig,
     CacheTransceiverConfig,
     ColdPageQuantizationCompressionConfig,
+    DFlashDecodingConfig,
+    DraftTargetDecodingConfig,
     DSparkDecodingConfig,
+    Eagle3DecodingConfig,
     KvCacheConfig,
     KvCacheConnectorConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
+    PARDDecodingConfig,
+    SADecodingConfig,
+    SAEnhancerConfig,
     SleepConfig,
     TorchCompileConfig,
     TorchLlmArgs,
@@ -74,7 +81,9 @@ def _args(**fields) -> TorchLlmArgs:
                 enable_balance=True, batching_wait_iters=0, timeout_iters=60
             )
         },
+        # DeepSeek's single MTP layer runs MTP-Eagle one-model, the default MTP path.
         {"speculative_config": MTPDecodingConfig(num_nextn_predict_layers=1)},
+        {"speculative_config": MTPDecodingConfig(max_draft_len=1, use_mtp_vanilla=True)},
         {"max_seq_len": 8192},
         # An unset max_num_tokens is the default budget of 8192 tokens.
         {"max_num_tokens": None},
@@ -153,12 +162,27 @@ def test_supported_configuration_is_accepted(fields):
         *(
             (
                 {"speculative_config": config},
-                f"speculative_config: none, or another decoding_type such as MTP, not {name!r})",
+                "speculative_config: none, or decoding_type 'MTP' without sa_config, "
+                f"not {current})",
             )
-            for config, name in (
-                (NGramDecodingConfig(max_draft_len=1), "NGram"),
-                (UserProvidedDecodingConfig(max_draft_len=1, drafter=object()), "User_Provided"),
-                (DSparkDecodingConfig(max_draft_len=1, speculative_model="draft"), "DSpark"),
+            for config, current in (
+                (NGramDecodingConfig(max_draft_len=1), "'NGram'"),
+                (UserProvidedDecodingConfig(max_draft_len=1, drafter=object()), "'User_Provided'"),
+                (DSparkDecodingConfig(max_draft_len=1, speculative_model="draft"), "'DSpark'"),
+                (Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"), "'Eagle3'"),
+                (SADecodingConfig(max_draft_len=4), "'SA'"),
+                # AUTO resolves to SA when the executor starts.
+                (AutoDecodingConfig(max_draft_len=4), "'AUTO'"),
+                (PARDDecodingConfig(max_draft_len=2, speculative_model="draft"), "'PARD'"),
+                (DFlashDecodingConfig(max_draft_len=2, use_rejection_sampling=False), "'DFlash'"),
+                (
+                    DraftTargetDecodingConfig(max_draft_len=4, speculative_model="draft"),
+                    "'Draft_Target'",
+                ),
+                (
+                    MTPDecodingConfig(max_draft_len=1, sa_config=SAEnhancerConfig()),
+                    "'MTP' with sa_config",
+                ),
             )
         ),
         # A recomputed request's context can reach max_seq_len, the model's length by default.

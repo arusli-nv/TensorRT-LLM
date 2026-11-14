@@ -73,6 +73,8 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     spec_config = llm_args.speculative_config
     spec_mode = None if spec_config is None else spec_config.spec_dec_mode
     decoding_type = None if spec_config is None else spec_config.decoding_type
+    sa_enhanced = getattr(spec_config, "sa_config", None) is not None
+    current_decoding = f"{decoding_type!r} with sa_config" if sa_enhanced else repr(decoding_type)
     transceiver = llm_args.cache_transceiver_config
     transceiver_backend = None if transceiver is None else transceiver.backend
     load_balancer = llm_args.moe_config.load_balancer
@@ -164,11 +166,10 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "the compressed pages",
             ),
             (
-                spec_mode is None or not (spec_mode.has_spec_drafter() or spec_mode.is_dspark()),
-                "no NGram or user-provided drafter and no DSpark (speculative_config: none, or "
-                f"another decoding_type such as MTP, not {decoding_type!r}), which are not supported "
-                "yet: their drafting state outside the model forward is not rolled back when a "
-                "failure discards a step",
+                spec_mode is None or (spec_mode.is_mtp_one_model() and not sa_enhanced),
+                "MTP or no speculative decoding (speculative_config: none, or decoding_type 'MTP' "
+                f"without sa_config, not {current_decoding}), because the other drafters are not "
+                "supported yet: fault tolerance is tested with MTP only",
             ),
             (
                 llm_args.enable_chunked_prefill
