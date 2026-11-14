@@ -75,8 +75,8 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
-    convert_anthropic_count_tokens_request, convert_anthropic_request,
-    convert_chat_response, reframe_openai_stream)
+    anthropic_error_type, convert_anthropic_count_tokens_request,
+    convert_anthropic_request, convert_chat_response, reframe_openai_stream)
 from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
                                                   BatchStoreFullError,
                                                   results_to_jsonl)
@@ -2719,11 +2719,12 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 payload = json.loads(response.body)
                 message = payload.get("message") or json.dumps(payload)
+                code = payload.get("code")
             except (json.JSONDecodeError, AttributeError):
-                message = "Internal server error"
-            err_type = ("invalid_request_error"
-                        if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+                message, code = "Internal server error", None
+            return anthropic_error_response(message,
+                                            anthropic_error_type(status, code),
+                                            status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -2871,10 +2872,13 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 payload = json.loads(response.body)
                 message = payload.get("message") or json.dumps(payload)
+                code = payload.get("code")
             except (json.JSONDecodeError, AttributeError):
-                message = "Internal server error"
-            err_type = "invalid_request_error" if 400 <= status < 500 else "api_error"
-            return "errored", {"type": err_type, "message": message}
+                message, code = "Internal server error", None
+            return "errored", {
+                "type": anthropic_error_type(status, code),
+                "message": message
+            }
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))

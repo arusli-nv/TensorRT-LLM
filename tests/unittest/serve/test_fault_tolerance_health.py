@@ -49,6 +49,7 @@ from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.serve import fault_tolerance_health as health_module
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.anthropic_adapter import reframe_openai_stream
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.fault_tolerance_health import FaultToleranceHealth
 from tensorrt_llm.serve.openai_server import OpenAIServer, _stream_error_events
 from tensorrt_llm.serve.responses_utils import (
@@ -354,9 +355,30 @@ def test_rank_failure_ends_streams_with_code():
     name, data = asyncio.run(collect())[-1].strip().split("\n")
     assert name == "event: error"
     assert json.loads(data[len("data: ") :])["error"] == {
-        "type": "api_error",
+        "type": "overloaded_error",
         "message": str(error),
     }
+
+
+def test_rank_failure_is_an_anthropic_overloaded_error():
+    """Check that a Messages request and a batched one that a rank failure ends get overloaded_error."""
+    error = RankFailureError()
+
+    async def openai_chat(chat_request, raw_request):
+        return server.create_exception_error_response(error)
+
+    server = object.__new__(OpenAIServer)
+    server.model = "model"
+    server.openai_chat = openai_chat
+    request = AnthropicMessagesRequest(
+        model="model", max_tokens=8, messages=[{"role": "user", "content": "hi"}]
+    )
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+    response = asyncio.run(server.anthropic_messages(request, raw_request))
+    assert response.status_code == 503
+    expected = {"type": "overloaded_error", "message": str(error)}
+    assert json.loads(response.body)["error"] == expected
+    assert asyncio.run(server._run_batched_message(request)) == ("errored", expected)
 
 
 _FAULT_TOLERANCE_ENV = {RENDEZVOUS_ENV: "host:1", SHARED_SECRET_ENV: "ab" * 32}

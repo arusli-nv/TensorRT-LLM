@@ -98,6 +98,16 @@ def anthropic_error_response(
     return JSONResponse(content=envelope.model_dump(exclude_none=True), status_code=status_code)
 
 
+def anthropic_error_type(status_code: int, code: Any = None) -> AnthropicErrorType:
+    """Return the Anthropic error type of an OpenAI error response's HTTP status and ``code``.
+
+    A rank failure is an overloaded_error, the type of a temporary failure that a retry can pass.
+    """
+    if code == RANK_FAILURE_CODE:
+        return "overloaded_error"
+    return "invalid_request_error" if 400 <= status_code < 500 else "api_error"
+
+
 # ---------------------------------------------------------------------------
 # Request conversion: Anthropic -> ChatCompletionRequest
 # ---------------------------------------------------------------------------
@@ -1104,12 +1114,12 @@ class AnthropicStreamReframer:
         frames.append(anthropic_sse(AnthropicMessageStopEvent()))
         return frames
 
-    def error(self, message: str) -> List[str]:
+    def error(self, message: str, error_type: AnthropicErrorType = "api_error") -> List[str]:
         """Close any open block, then surface an error event."""
         frames = self._close_block()
         frames.append(
             anthropic_sse(
-                AnthropicErrorEvent(error=AnthropicError(type="api_error", message=message))
+                AnthropicErrorEvent(error=AnthropicError(type=error_type, message=message))
             )
         )
         return frames
@@ -1298,8 +1308,10 @@ async def reframe_openai_stream(
                 error = payload["error"]
                 logger.error(f"Chat stream behind /v1/messages ended with an error: {error}")
                 rank_failure = isinstance(error, dict) and error.get("code") == RANK_FAILURE_CODE
-                closing_frames = reframer.error(
-                    error["message"] if rank_failure else "Internal server error"
+                closing_frames = (
+                    reframer.error(error["message"], "overloaded_error")
+                    if rank_failure
+                    else reframer.error("Internal server error")
                 )
                 done = True
                 continue
