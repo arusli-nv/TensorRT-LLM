@@ -228,6 +228,13 @@ def test_modeling_v2_auto_falls_back_to_built_in_model(monkeypatch, fields):
     assert _args(enable_wide_ep_fault_tolerance=False, **fields).modeling_v2 == "auto"
 
 
+def test_check_leaves_args_unchanged():
+    """Check that checking the arguments for fault tolerance does not change them."""
+    args = _args(enable_wide_ep_fault_tolerance=False)
+    _wide_ep_fault_tolerance.check_llm_args(args)
+    assert args.modeling_v2 == "auto"
+
+
 @pytest.mark.parametrize("mode, rejected", [("standard", False), ("per_layer_dynamic", True)])
 def test_load_balancer_from_yaml_checked(tmp_path, mode, rejected):
     """Check that a load balancer given as a YAML path is checked once loaded."""

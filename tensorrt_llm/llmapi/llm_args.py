@@ -8787,9 +8787,18 @@ class TorchLlmArgs(BaseLlmArgs):
     # is loaded by then.
     @model_validator(mode="after")
     def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
-        """Reject what enable_wide_ep_fault_tolerance does not support."""
+        """Reject what enable_wide_ep_fault_tolerance does not support.
+
+        ``modeling_v2='auto'`` falls back to the built-in model, because no
+        modeling_v2 target supports fault tolerance yet.
+        """
         if self.enable_wide_ep_fault_tolerance:
             check_llm_args(self)
+            if self.modeling_v2 == "auto":
+                logger.warning(
+                    "modeling_v2: no target supports Wide-EP fault tolerance; "
+                    "using the built-in implementation")
+                self.modeling_v2 = "off"
         return self
 
     @model_validator(mode="after")
