@@ -261,10 +261,10 @@ def test_rank_without_rank_0_times_out():
         ranks.start(1)
         ranks.wait_for_all("ENTERED", [1])
         entered_s = time.monotonic()
-        assert ranks.statuses_within([1], RENDEZVOUS_TIMEOUT_S + PROMPT_EXIT_S)[1] == 1
+        assert ranks.statuses_within([1], STARTUP_S + RENDEZVOUS_TIMEOUT_S)[1] == 1
         waited_s = time.monotonic() - entered_s
         ranks.end()
-        printed = [line for _, line in ranks.seen] + list(ranks.lines.queue)
+        printed = [line for _, line in ranks.seen + list(ranks.lines.queue)]
     assert waited_s >= RENDEZVOUS_TIMEOUT_S - 1.0, waited_s
     assert any("timed out" in line.lower() for line in printed), printed
 
