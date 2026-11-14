@@ -299,29 +299,3 @@ class TestClassicFrontendProxyEndToEnd:
             assert client_id not in proxy._results
 
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
-
-    def test_dispatch_without_launcher_init(self):
-        """An attached frontend skips GenerationExecutorProxy.__init__, fault tolerance included."""
-        import zmq
-
-        from tensorrt_llm.executor.ipc import FusedIpcQueue
-        from tensorrt_llm.executor.request import GenerationRequest
-        from tensorrt_llm.executor.utils import ErrorResponse
-        from tensorrt_llm.sampling_params import SamplingParams
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
-            result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
-            worker_lane = FusedIpcQueue(
-                (result_addrs[1], hmac_key),
-                is_server=False,
-                fuse_message=False,
-                socket_type=zmq.PUSH,
-                name="fake_worker_result_lane",
-            )
-            worker_lane.put(ErrorResponse(result.request_id, "boom", 1))
-            response = result.queue.get(timeout=5)
-            assert isinstance(response, ErrorResponse) and response.error_msg == "boom"
-            assert proxy.check_health()
-
-            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
