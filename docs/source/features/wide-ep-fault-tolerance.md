@@ -139,6 +139,9 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
   node supervisor is gone. A node's ranks return to `pending` once its supervisor is started again. Until then,
   requests pinned to such a rank (`attention_dp_rank` without `attention_dp_relax`) fail with HTTP 400. Requests
   pinned to a `pending` rank fail with HTTP 503 `rank_failure`.
+- A node's ranks share their node supervisor's standard output and error. When every rank logs each step (for example
+  `TLLM_PROFILE_LOG_RANKS=all`) into a file on a shared filesystem that another node reads while serving, the writing
+  ranks can stall on the file lock and every rank waits for them. Keep such logs on node-local storage.
 
 | State | Meaning |
 | --- | --- |
