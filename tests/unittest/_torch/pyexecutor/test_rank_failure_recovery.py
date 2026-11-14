@@ -470,7 +470,7 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
-def test_model_load_checks_support_before_building_model(monkeypatch):
+def test_model_load_checks_support_first(monkeypatch):
     """Check that the model load refuses an unsupported setup before it builds the model."""
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     monkeypatch.setattr(
@@ -652,7 +652,7 @@ def test_change_returns_after_exchange_install():
         (_record(MembershipState.SHUTDOWN), 0),
     ],
 )
-def test_abort_exclusion_or_shutdown_ends_the_process(monkeypatch, record, status):
+def test_abort_exclusion_or_shutdown_ends_process(monkeypatch, record, status):
     _exit_raises(monkeypatch)
     r = _rank(rank=1)
     r.client.deliver(record)
@@ -983,7 +983,7 @@ def test_resume_recomputes_interrupted_fails_lost(monkeypatch):
     assert isinstance(error, RankFailureError)
 
 
-def test_rearm_waits_for_device_before_record_lock(monkeypatch):
+def test_rearm_synchronizes_before_record_lock(monkeypatch):
     """Check that the rank waits for the device before it takes the membership record's lock."""
     r = _resuming()
     lock = r.recovery._record_changed
@@ -1519,7 +1519,7 @@ def test_requests_pinned_to_absent_rank_fail(rank, given_up):
 _STARTUP = ((4, ((0, -1), (1, -1), (2, -1), (3, -1))),)
 
 
-def test_agreed_placement_takes_each_rank_own_slots():
+def test_agreed_placement_uses_own_slots():
     """Check that the agreed placement is the slots each active rank gathered."""
     own_slots = [
         _own_slots(((4, ((1, -1), (0, -1), (3, -1), (2, -1))),), 0),

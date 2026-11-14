@@ -224,7 +224,7 @@ def test_can_queue_gathers_only_the_batch_size():
     assert can_queue is False and this_rank is True
 
 
-def test_a_rank_that_holds_its_steps_votes_with_an_empty_batch():
+def test_can_queue_takes_recovery_vote():
     """Check that the gathered rows alone decide on every rank under rank failure recovery.
 
     The recovery takes the vote over the executor's gather, since it holds its steps before the

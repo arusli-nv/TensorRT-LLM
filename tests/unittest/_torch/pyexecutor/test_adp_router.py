@@ -784,7 +784,7 @@ class TestDefaultADPRouter:
         )
 
     @pytest.mark.parametrize("iter_stats_enabled", [False, True])
-    def test_gather_all_rank_states_skips_inactive_ranks(self, iter_stats_enabled: bool) -> None:
+    def test_gather_all_rank_states_skips_inactive(self, iter_stats_enabled: bool) -> None:
         dist = _mock_dist(tp_rank=0, tp_size=3, has_cp_helix=False)
         # The active-only gathers leave out inactive rank 1. The full gathers give it as None
         # (object gather) or as a zero row (int64 gather).

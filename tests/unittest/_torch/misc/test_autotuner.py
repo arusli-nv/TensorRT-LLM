@@ -171,8 +171,7 @@ class JitGemmRunner(GemmRunner):
         return super().forward(inputs, tactic=tactic, **kwargs)
 
 
-def test_report_progress_per_profiled_tactic_and_primed_tactic(
-        monkeypatch) -> None:
+def test_report_progress_per_tactic(monkeypatch) -> None:
     """Report progress once per (runner, tactic) profiled and once per cached tactic primed."""
     monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
     w = torch.randn(64, 128)

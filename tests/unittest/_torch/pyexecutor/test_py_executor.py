@@ -2079,7 +2079,7 @@ def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata(
     assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
 
 
-def test_kv_pool_resize_runs_with_every_cache_suspended():
+def test_kv_pools_suspended_resumes_requests():
     """Check that a resize in kv_pools_suspended resumes every request and reads the capacity."""
 
     class Manager:
@@ -2276,7 +2276,7 @@ def test_adp_running_counts_update_without_a_new_block_sample():
         ]
 
 
-def test_adp_ranks_stop_processing_on_the_same_iteration():
+def test_adp_ranks_stop_on_same_iteration():
     """An idle attention-DP rank keeps stepping at shutdown while a peer holds a request.
 
     Stopping alone would leave the peer's next collective without this rank.

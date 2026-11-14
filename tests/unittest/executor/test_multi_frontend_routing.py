@@ -300,7 +300,7 @@ class TestClassicFrontendProxyEndToEnd:
 
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
 
-    def test_dispatch_reads_no_state_that_only_the_launcher_s_init_sets(self):
+    def test_dispatch_without_launcher_init(self):
         """An attached frontend skips GenerationExecutorProxy.__init__, fault tolerance included."""
         import zmq
 
