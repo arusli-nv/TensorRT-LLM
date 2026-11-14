@@ -279,6 +279,9 @@ def test_own_round_value_keeps_peer_rows() -> None:
         workspace, meta, 1, 2, _CAPACITY, payload.dtype, _HIDDEN
     ).view(2, _CAPACITY, _HIDDEN)
     torch.testing.assert_close(rows[0], peer_received[0][0], rtol=0, atol=0)
+    # The combine published its readiness to rank 0, so it exchanged with every peer.
+    ready = _word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS") + 4)
+    assert ready.item() == dispatch_flag + 1
     assert peer_abort[:2].tolist() == [0, 1]
 
 
