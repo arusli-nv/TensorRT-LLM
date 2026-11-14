@@ -2137,11 +2137,20 @@ def test_stream_ends_with_an_error_when_the_upstream_fails_mid_stream(monkeypatc
     assert events[-1][1]["error"]["message"] == "Internal server error"
 
 
-def test_stream_ends_with_a_generic_error_at_an_upstream_error_event():
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": "engine failed: internal detail", "type": "server_error"},
+        "engine failed: internal detail",
+    ],
+)
+def test_stream_ends_with_a_generic_error_at_an_upstream_error_event(error):
     """An upstream error event ends the message with a generic error once the upstream ends."""
     lines = [
         _line(chunk({"content": "hello"})),
-        'data: {"error": {"message": "engine failed: internal detail", "type": "server_error"}}\n\n',
+        f"data: {json.dumps({'error': error})}\n\n",
+        # More lines than the task reading the upstream reads ahead.
+        *[": keep-alive\n\n"] * 3,
         "data: [DONE]\n\n",
     ]
     read = []

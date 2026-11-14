@@ -1297,7 +1297,7 @@ async def reframe_openai_stream(
                 # passes its message on. Other errors are only logged.
                 error = payload["error"]
                 logger.error(f"Chat stream behind /v1/messages ended with an error: {error}")
-                rank_failure = error.get("code") == RANK_FAILURE_CODE
+                rank_failure = isinstance(error, dict) and error.get("code") == RANK_FAILURE_CODE
                 closing_frames = reframer.error(
                     error["message"] if rank_failure else "Internal server error"
                 )
