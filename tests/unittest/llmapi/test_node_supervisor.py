@@ -1275,6 +1275,30 @@ def test_signal_unlinks_while_connect_blocks(tmp_path, deployment, held_connect,
     held_connect.finish()
 
 
+def test_signal_handler_logs_nothing(tmp_path, deployment, host_weights):
+    """Log from the loop, not the signal handler, which may interrupt a log write of the loop.
+
+    The loop logs the host weights that the handler unlinked.
+    """
+    authority, environ = deployment
+    segments = host_weights(RANKS)
+    _write(segments)
+    running = _serving(tmp_path, authority, environ)
+    handler_thread = threading.current_thread()
+    in_handler, in_loop = [], []
+
+    def record(message):
+        (in_handler if threading.current_thread() is handler_thread else in_loop).append(message)
+
+    levels = ("debug", "info", "warning", "error")
+    running.supervisor._logger = Mock(**{f"{level}.side_effect": record for level in levels})
+    running.supervisor.on_signal(signal.SIGTERM)
+    assert running.wait() == 128 + signal.SIGTERM
+    assert not any(segment.exists() for segment in segments)
+    assert in_handler == []
+    assert f"Unlinked the node's {len(segments)} shared-memory segments of host weights" in in_loop
+
+
 def test_early_signal_starts_no_rank(tmp_path, deployment, held_connect, host_weights):
     """Stop at once, with no rank started, on a signal during the first connect.
 

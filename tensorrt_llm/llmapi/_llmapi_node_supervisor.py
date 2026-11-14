@@ -153,6 +153,8 @@ class NodeSupervisor:
         self._first_failure: Optional[int] = None
         self._signum: Optional[int] = None
         self._signal_handled = False
+        # The host weights segments that the signal handler unlinked, for the loop to log.
+        self._unlinked_on_signal = 0
         # When the supervisor stops the ranks still running after SHUTDOWN, once the authority left.
         self._shutdown_grace_due_s: Optional[float] = None
         self._signal_grace_due_s = 0.0
@@ -166,12 +168,14 @@ class NodeSupervisor:
         """Unlink the node's host weights, then stop the supervisor and forward the signal to rank 0.
 
         The unlink runs here, before the loop wakes, since the launcher may kill this process soon
-        after the signal (mpirun within a second).
+        after the signal (mpirun within a second). The loop logs it, since the handler may
+        interrupt a log write, and a log write from the handler would then fail as a reentrant call.
         """
         if self._signum is None:
-            self._signum = signum
+            self._unlinked_on_signal = self._unlink_host_weights()
             self._signal_grace_due_s = time.monotonic() + _STOP_GRACE_S
-            self._unlink_host_weights()
+            # Last, since the loop acts on the signal once it sees it.
+            self._signum = signum
         self._wake()
 
     def _wake(self) -> None:
@@ -309,6 +313,7 @@ class NodeSupervisor:
         """
         if not self._signal_handled:
             self._signal_handled = True
+            self._log_unlinked(self._unlinked_on_signal)
             rank_0 = self._processes.get(0)
             # Through the pidfd, which unlike Popen.send_signal never reaps the process.
             if rank_0 is not None and rank_0.status is None:
@@ -757,7 +762,7 @@ class NodeSupervisor:
         With ``end_job_reason``, end the whole job as failed first. Unlink the node's host weights.
         """
         # Before the job ends, since the launcher then kills this process.
-        self._unlink_host_weights()
+        self._log_unlinked(self._unlink_host_weights())
         # A connect in flight then sends no hello.
         self._connecting = None
         if end_job_reason is not None:
@@ -770,7 +775,7 @@ class NodeSupervisor:
         for process in ranks:
             self._signal_group(process.child.pid, signal.SIGKILL)
         # A rank stopped above may have created a segment after the first pass.
-        self._unlink_host_weights()
+        self._log_unlinked(self._unlink_host_weights())
         return status
 
     def _wait_for(self, processes: List[_Process]) -> None:
@@ -796,16 +801,20 @@ class NodeSupervisor:
         except OSError as error:
             self._logger.error(f"Cannot end the job: {error!r}")
 
-    def _unlink_host_weights(self) -> None:
+    def _unlink_host_weights(self) -> int:
+        """Unlink the node's host weights, and return the number of segments."""
         names = [
             name for name in os.listdir(_SHM_DIR) if name.startswith(self._host_weights_prefix)
         ]
         for name in names:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(_SHM_DIR, name))
-        if names:
+        return len(names)
+
+    def _log_unlinked(self, segments: int) -> None:
+        if segments:
             self._logger.info(
-                f"Unlinked the node's {len(names)} shared-memory segments of host weights"
+                f"Unlinked the node's {segments} shared-memory segments of host weights"
             )
 
 
