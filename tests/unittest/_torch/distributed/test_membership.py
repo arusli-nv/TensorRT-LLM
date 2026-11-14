@@ -26,6 +26,7 @@ import socket
 import threading
 import time
 import weakref
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -49,6 +50,7 @@ from tensorrt_llm._torch.distributed.membership import (
     RankReport,
     Reply,
     ResumeState,
+    SignedStore,
     TransactionSummary,
     authority,
     authority_process,
@@ -696,10 +698,28 @@ class DictStore:
         _until(lambda: self.check(keys), timeout.total_seconds())
 
 
+class SignedTcpStore:
+    """A real TCPStore that each thread reaches through its own signing client, as a process does."""
+
+    def __init__(self):
+        self._server = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+        self._clients = threading.local()
+        self.host, self.port = "127.0.0.1", self._server.port
+
+    def __getattr__(self, name):
+        if not hasattr(self._clients, "store"):
+            client = TCPStore(self.host, self.port, is_master=False, timeout=timedelta(seconds=30))
+            self._clients.store = SignedStore(client)
+        return getattr(self._clients.store, name)
+
+
 @contextlib.contextmanager
-def _deployment(world, **authority_options):
-    """Run an authority process and a client per rank, yield the store and clients, then shut down."""
-    store = DictStore()
+def _deployment(world, store=None, **authority_options):
+    """Run an authority process and a client per rank, yield the store and clients, then shut down.
+
+    The store is in memory unless ``store`` is given.
+    """
+    store = DictStore() if store is None else store
     thread, returned = _serve(
         store, AuthorityProcess(world, world, store, Authority(world, **authority_options))
     )
@@ -1152,10 +1172,12 @@ def test_startup_without_node_supervisor_aborts(monkeypatch, connected_nodes):
     assert SHARED_SECRET_ENV in returned[0].reason
 
 
-def test_replacement_refused_until_rank_removed(monkeypatch):
+@pytest.mark.parametrize("store_type", [DictStore, SignedTcpStore])
+def test_replacement_refused_until_rank_removed(monkeypatch, store_type):
     """Refuse a replacement for rank 0, or for a rank until the membership removes it.
 
     The replacement gets the rank's next incarnation, and the first process is no longer admitted.
+    Also over a real store with signed values, as the deployment's processes use.
     """
     deciding = threading.Event()
     deciding.set()
@@ -1167,7 +1189,7 @@ def test_replacement_refused_until_rank_removed(monkeypatch):
         return decide(self, now_s, reports, connected_mask) if deciding.is_set() else None
 
     monkeypatch.setattr(Authority, "tick", tick)
-    with _deployment(3) as (store, clients):
+    with _deployment(3, store_type()) as (store, clients):
         assert _refused(store, 0, True)
         assert _refused(store, 2, True)
         deciding.clear()
