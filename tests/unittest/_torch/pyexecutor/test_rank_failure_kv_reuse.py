@@ -145,3 +145,27 @@ def test_chunk_reusable_after_step_accepted(manager, accept_step):
     manager.free_resources(request)
     # Without fault tolerance the chunk is committed at its launch.
     assert _reused_prefix(manager, 2, first_token=1000) == (0 if accept_step is False else CHUNK)
+
+
+def test_discarded_middle_chunk_recomputed(manager):
+    """Keep a prompt's accepted first chunk, drop its discarded second one, and recompute it.
+
+    A rank failure discards the step of the second chunk and frees the request. Only the first
+    chunk is then reusable, and the recompute runs the rest of the prompt, which becomes reusable.
+    """
+    executor = _executor(manager, True)
+    request = _request(1, first_token=1000)
+    executor.finish(_launch(executor, _schedule_chunk(manager, request)))
+    executor.rank_failure_recovery.accept_step = lambda batch: False
+    step = _launch(executor, _schedule_chunk(manager, request))
+    executor.finish(step)
+    assert executor.previous_batch is None
+    manager.free_resources(request)
+    assert _reused_prefix(manager, 2, first_token=1000) == CHUNK
+
+    executor.rank_failure_recovery.accept_step = lambda batch: True
+    recomputed = _request(3, first_token=1000)
+    while recomputed.context_remaining_length > 0:
+        executor.finish(_launch(executor, _schedule_chunk(manager, recomputed)))
+    manager.free_resources(recomputed)
+    assert _reused_prefix(manager, 4, first_token=1000) >= 2 * CHUNK
