@@ -20,7 +20,10 @@ from ranks and node supervisors, and publishes each new record in the rendezvous
 
 import argparse
 import hmac
+import logging
+import logging.handlers
 import os
+import queue
 import selectors
 import signal
 import socket
@@ -520,6 +523,22 @@ class AuthorityProcess:
         return {c.member[0]: c.report for c in self._connections.values() if c.report is not None}
 
 
+def log_from_own_thread() -> logging.handlers.QueueListener:
+    """Write this process's log records from their own thread, and return its listener.
+
+    The authority shares rank 0's standard output, whose writes can block. A blocked write must not
+    hold up the heartbeats.
+    """
+    python_logger = logging.getLogger(logger.PREFIX)
+    records = queue.SimpleQueue()
+    listener = logging.handlers.QueueListener(
+        records, *python_logger.handlers, respect_handler_level=True
+    )
+    python_logger.handlers = [logging.handlers.QueueHandler(records)]
+    listener.start()
+    return listener
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Run the authority process.
 
@@ -533,6 +552,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--address-fd", type=int, required=True)
     args = parser.parse_args(argv)
     remove_cpu_affinity_constraints()
+    log_listener = log_from_own_thread()
 
     from torch.distributed import TCPStore
 
@@ -558,5 +578,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     process = AuthorityProcess(
         args.world_size, args.gpus_per_node, store, authority, parent=sys.stdin.fileno()
     )
-    record = process.run(host)
+    try:
+        record = process.run(host)
+    finally:
+        log_listener.stop()
     return 0 if record.state == MembershipState.SHUTDOWN else 1

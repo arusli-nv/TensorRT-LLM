@@ -18,6 +18,7 @@ The authority process and the membership clients run over loopback sockets and a
 """
 
 import contextlib
+import logging
 import os
 import random
 import select
@@ -56,6 +57,7 @@ from tensorrt_llm._torch.distributed.membership import (
 )
 from tensorrt_llm._torch.distributed.membership.liveness import Lines
 from tensorrt_llm._torch.distributed.membership.rendezvous import hello_token
+from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.cpu_only
 
@@ -808,6 +810,26 @@ def test_authority_heartbeats_keep_ranks_connected(monkeypatch, shutdown):
         time.sleep(3 * liveness.AUTHORITY_SILENCE_TIMEOUT_S)
         # A client that took the authority as hung has ended.
         assert all(client._thread.is_alive() for client in clients)
+
+
+def test_authority_logs_past_blocked_output(monkeypatch):
+    """Log from the authority's loop without waiting for an output stream that blocks."""
+    released, written = threading.Event(), []
+
+    class BlockedOutput(logging.Handler):
+        def emit(self, record):
+            released.wait(JOIN_TIMEOUT_S)
+            written.append(record.getMessage())
+
+    monkeypatch.setattr(logging.getLogger(logger.PREFIX), "handlers", [BlockedOutput()])
+    listener = authority_process.log_from_own_thread()
+    try:
+        logger.error("Membership: logged while the output blocks")
+        assert written == []
+    finally:
+        released.set()
+        listener.stop()
+    assert len(written) == 1
 
 
 def test_liveness_connections_keep_alive(monkeypatch):
