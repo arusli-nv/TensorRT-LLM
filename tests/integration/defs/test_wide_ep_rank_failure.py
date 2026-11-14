@@ -20,7 +20,6 @@ the replacement is admitted) and ``rejoined``.
 """
 
 import contextlib
-import copy
 import glob
 import http.client
 import json
@@ -537,15 +536,21 @@ class Gsm8k:
             "stop": gen_kwargs.get("until", []),
         }
 
-    def score(self, question: int, text: str) -> float:
-        """Score one answer with ACCURACY_FILTER, as ``_RunningScoreTracker.update`` does."""
-        probe = copy.copy(self.instances[question])
-        probe.resps = [text]
-        probe.filtered_resps = {}
-        (ensemble,) = [e for e in self._task._filters if e.name == ACCURACY_FILTER]
-        ensemble.apply([probe])
-        metrics = self._task.process_results(probe.doc, [probe.filtered_resps[ensemble.name]])
-        return float(metrics["exact_match"])
+    def score(self, answers: Dict[int, str]) -> Dict[int, float]:
+        """Score one answer per question with ACCURACY_FILTER, as the lm-eval evaluator does."""
+        for question, instance in enumerate(self.instances):
+            instance.resps = [answers.get(question, "")]
+            instance.filtered_resps = {}
+        self._task.apply_filters()
+        return {
+            question: float(
+                self._task.process_results(
+                    self.instances[question].doc,
+                    [self.instances[question].filtered_resps[ACCURACY_FILTER]],
+                )["exact_match"]
+            )
+            for question in answers
+        }
 
 
 @dataclass
@@ -1197,20 +1202,19 @@ class Run:
 
     def _check_accuracy(self) -> None:
         """Check that the healthy phase answered every GSM8K question and no later phase lost accuracy."""
-        requests = self.clients.requests
-        scores = {
-            i: self.gsm8k.score(r.question, r.text)
-            for i, r in enumerate(requests)
-            if r.question is not None and r.error is None
-        }
+        requests = sorted(
+            (r for r in self.clients.requests if r.question is not None and r.error is None),
+            key=lambda r: r.start,
+        )
         healthy = None
         alpha = ACCURACY_ALPHA / max(1, len(self.phases) - 1)
         for phase in self.phases:
             # Score each question by its first answer in the phase.
-            answers: Dict[int, float] = {}
-            for i in sorted(scores, key=lambda i: requests[i].start):
-                if phase.covers(requests[i]):
-                    answers.setdefault(requests[i].question, scores[i])
+            texts: Dict[int, str] = {}
+            for r in requests:
+                if phase.covers(r):
+                    texts.setdefault(r.question, r.text)
+            answers = self.gsm8k.score(texts)
             label = f"cycle {phase.cycle} {phase.name}"
             if healthy is None:
                 healthy = answers
