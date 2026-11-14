@@ -311,9 +311,20 @@ class MembershipClient:
                 if listed and not member:
                     return
                 listed = member
-            readable, _, _ = select.select(
-                [self._sock, self._wake_read], [], [], max(0.0, tick_s - time.monotonic())
-            )
+            watched = [self._sock, self._wake_read]
+            readable, _, _ = select.select(watched, [], [], max(0.0, tick_s - time.monotonic()))
+            if (
+                self._sock not in readable
+                and time.monotonic() - heard_s > AUTHORITY_SILENCE_TIMEOUT_S
+            ):
+                # This thread can wait long for a CPU or the GIL after its select returns, while the
+                # authority's lines arrive. Look again before taking the authority as silent.
+                readable, _, _ = select.select(watched, [], [], 0.0)
+                if self._sock not in readable:
+                    raise TimeoutError(
+                        "the membership authority sent nothing for "
+                        f"{AUTHORITY_SILENCE_TIMEOUT_S:g} s"
+                    )
             lines = []
             if self._sock in readable:
                 data = self._sock.recv(1 << 16)
@@ -322,10 +333,6 @@ class MembershipClient:
                 lines = self._lines.decode(data)
                 if lines:
                     heard_s = time.monotonic()
-            elif time.monotonic() - heard_s > AUTHORITY_SILENCE_TIMEOUT_S:
-                raise TimeoutError(
-                    f"the membership authority sent nothing for {AUTHORITY_SILENCE_TIMEOUT_S:g} s"
-                )
             due = time.monotonic() >= tick_s
             if due:
                 tick_s = time.monotonic() + REPORT_INTERVAL_S

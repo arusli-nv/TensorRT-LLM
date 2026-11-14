@@ -20,10 +20,12 @@ The authority process and the membership clients run over loopback sockets and a
 import contextlib
 import os
 import random
+import select
 import socket
 import threading
 import time
 import weakref
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -1195,6 +1197,32 @@ def test_rank_ends_on_silent_authority(monkeypatch, resend_s):
         else:
             time.sleep(2 * silence_s)
             assert not errors
+
+
+def test_late_wakeup_keeps_live_authority(monkeypatch):
+    """Keep a client whose thread wakes after the silence timeout while the authority's lines wait."""
+    silence_s = 1.0
+    monkeypatch.setattr(liveness, "AUTHORITY_SILENCE_TIMEOUT_S", silence_s)
+    skipped_s = [0.0]
+    monkeypatch.setattr(
+        liveness, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + skipped_s[0])
+    )
+    calls = []
+
+    def select_with_late_wakeup(watched, *rest):
+        calls.append(watched)
+        if len(calls) > 1:
+            return select.select(watched, *rest)
+        # The authority's line has arrived, but the thread wakes only after the silence timeout.
+        select.select(watched[:1], [], [])
+        skipped_s[0] += 2 * silence_s
+        return [], [], []
+
+    monkeypatch.setattr(liveness, "select", SimpleNamespace(select=select_with_late_wakeup))
+    errors = []
+    with _scripted_client(errors, resend_s=0.1):
+        _until(lambda: errors or len(calls) > 2)
+    assert not errors
 
 
 def test_callback_error_logged_with_traceback(monkeypatch):
