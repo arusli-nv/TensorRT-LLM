@@ -63,10 +63,16 @@ class RankFailureRequests:
         self._without_first_response.pop(client_id, None)
 
     def outstanding(self) -> Dict[int, int]:
-        """Map request id to client id for every request without a final response."""
+        """Map request id to client id for every request without a final response.
+
+        A request has a result until its final response. The submit may store the request id
+        after that response, so the result decides.
+        """
+        results = self._worker._results
         return {
             request_id: client_id
             for client_id, request_id in dict(self._worker._client_id_to_request_id).items()
+            if client_id in results
         }
 
     def resubmit_if_unanswered(self, response: "LlmResponse") -> bool:
@@ -78,6 +84,10 @@ class RankFailureRequests:
         worker = self._worker
         client_id = response.client_id
         if client_id not in worker._results or not isinstance(response.error_msg, RankFailureError):
+            return False
+        # The submit stores the request id after the first enqueue returns. A request that ends
+        # before that store fails, since the submit would replace the resubmitted request's id.
+        if client_id not in worker._client_id_to_request_id:
             return False
         try:
             request, multimodal = self._without_first_response[client_id]

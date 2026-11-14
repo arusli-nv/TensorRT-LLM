@@ -1172,6 +1172,25 @@ def test_worker_ends_request_after_rank_failure(monkeypatch, case):
         assert _sent(worker) == {7: [("error", RankFailureError)]}
 
 
+@pytest.mark.cpu_only
+def test_worker_fails_request_before_id_stored(monkeypatch):
+    """Check that a request a rank failure ended before its submit returned is not resubmitted."""
+    worker, helper = _ipc_worker(monkeypatch)
+
+    def enqueue(request):
+        if worker._enqueue_request.call_count == 1:
+            helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+        return 99 + worker._enqueue_request.call_count
+
+    worker._enqueue_request.side_effect = enqueue
+    _submit(worker, 7)
+    assert worker._enqueue_request.call_count == 1
+    assert _sent(worker) == {7: [("error", RankFailureError)]}
+    # The submit stored the request id after the error, so the id stays without a result.
+    assert worker._client_id_to_request_id == {7: 100}
+    assert worker._rank_failure_requests.outstanding() == {}
+
+
 def _set_up_engine(monkeypatch, worker, rank_failure_recovery):
     """Set up the worker's engine, whose rank failure recovery is ``rank_failure_recovery``."""
     engine = SimpleNamespace(max_seq_len=None,
