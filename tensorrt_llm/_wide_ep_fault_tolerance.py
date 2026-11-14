@@ -69,6 +69,7 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     decoding_type = None if spec_config is None else spec_config.decoding_type
     sa_enhanced = getattr(spec_config, "sa_config", None) is not None
     current_decoding = f"{decoding_type!r} with sa_config" if sa_enhanced else repr(decoding_type)
+    kv_events = llm_args.kv_cache_config.kv_events_config
     transceiver = llm_args.cache_transceiver_config
     transceiver_backend = None if transceiver is None else transceiver.backend
     load_balancer = llm_args.moe_config.load_balancer
@@ -137,10 +138,12 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "share",
             ),
             (
-                llm_args.kv_cache_config.event_buffer_max_size == 0,
+                llm_args.kv_cache_config.event_buffer_max_size == 0
+                and (kv_events is None or not kv_events.enable_kv_cache_events),
                 "no KV cache events (kv_cache_config.event_buffer_max_size=0, not "
-                f"{llm_args.kv_cache_config.event_buffer_max_size}), which are not supported yet: "
-                "a failed rank's KV cache blocks would need removal events",
+                f"{llm_args.kv_cache_config.event_buffer_max_size}, and no "
+                "kv_cache_config.kv_events_config.enable_kv_cache_events), which are not supported "
+                "yet: a failed rank's KV cache blocks would need removal events",
             ),
             (
                 transceiver_backend is None,

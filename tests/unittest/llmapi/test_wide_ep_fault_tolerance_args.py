@@ -42,6 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
     KvCacheConfig,
     KvCacheConnectorConfig,
+    KVEventsConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     PARDDecodingConfig,
@@ -140,6 +141,14 @@ def test_supported_configuration_is_accepted(fields):
         (
             {"kv_cache_config": KvCacheConfig(event_buffer_max_size=1024)},
             "kv_cache_config.event_buffer_max_size=0, not 1024",
+        ),
+        (
+            {
+                "kv_cache_config": KvCacheConfig(
+                    kv_events_config=KVEventsConfig(enable_kv_cache_events=True)
+                )
+            },
+            "and no kv_cache_config.kv_events_config.enable_kv_cache_events), which are not supported",
         ),
         (
             {"cache_transceiver_config": CacheTransceiverConfig(backend="DEFAULT")},
