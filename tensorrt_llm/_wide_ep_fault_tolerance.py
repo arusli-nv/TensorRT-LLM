@@ -128,9 +128,9 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
             ),
             (
                 llm_args.max_beam_width in (None, 1),
-                f"no beam search (max_beam_width=1, not {llm_args.max_beam_width}), which is not "
-                "supported yet: continuing an interrupted request by recompute would need to "
-                "restore its beams",
+                f"no beam search (max_beam_width=1, not {llm_args.max_beam_width}), because a "
+                "request that a failure interrupts continues by recompute, which does not restore "
+                "its beams",
             ),
             (
                 not llm_args.disable_overlap_scheduler,
@@ -154,20 +154,19 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "the default attention-DP routing and admission (no enable_kv_balanced_admission, "
                 "enable_kv_cache_aware_routing or kv_cache_routing_conversation_affinity in "
                 f"attention_dp_config, which sets {', '.join(adp_routing)}), because the others "
-                "are not supported yet: they keep per-rank state that a replacement would not "
-                "share",
+                "keep per-rank state that a replacement would not share",
             ),
             (
                 llm_args.kv_cache_config.event_buffer_max_size == 0,
                 "no KV cache events (kv_cache_config.event_buffer_max_size=0, not "
-                f"{llm_args.kv_cache_config.event_buffer_max_size}), which are not supported yet: "
-                "a failed rank's KV cache blocks would need removal events",
+                f"{llm_args.kv_cache_config.event_buffer_max_size}), because the events would "
+                "miss the removal of a failed rank's KV cache blocks",
             ),
             (
                 kv_events is None or not kv_events.enable_kv_cache_events,
                 "no streaming KV cache events (kv_cache_config.kv_events_config."
-                "enable_kv_cache_events=False, not True), which are not supported yet: a failed "
-                "rank's KV cache blocks would need removal events",
+                "enable_kv_cache_events=False, not True), because the events would miss the "
+                "removal of a failed rank's KV cache blocks",
             ),
             (
                 transceiver_backend is None,
@@ -177,28 +176,26 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
             ),
             (
                 llm_args.kv_connector_config is None,
-                "no KV cache connector (kv_connector_config=None), which is not supported yet: a "
-                "connector saves the KV cache of a step before the step is accepted",
+                "no KV cache connector (kv_connector_config=None), because a connector saves the "
+                "KV cache of a step before the step is accepted",
             ),
             (
                 llm_args.kv_cache_compression_config is None,
-                "no KV cache compression (kv_cache_compression_config=None), which is not "
-                "supported yet: the KV cache pool that a membership change resizes would also hold "
-                "the compressed pages",
+                "no KV cache compression (kv_cache_compression_config=None), because the KV cache "
+                "pool that a membership change resizes would also hold the compressed pages",
             ),
             (
                 spec_mode is None or (spec_mode.is_mtp_one_model() and not sa_enhanced),
                 "MTP or no speculative decoding (speculative_config: none, or decoding_type 'MTP' "
-                f"without sa_config, not {current_decoding}), because the other drafters are not "
-                "supported yet: fault tolerance is tested with MTP only",
+                f"without sa_config, not {current_decoding})",
             ),
             (
                 not rank_local_draft_len,
                 "a fixed draft length (no speculative_config.draft_len_schedule or max_concurrency, "
                 "and no acceptance-rate gate, which is acceptance_rate_window_size with "
                 f"acceptance_rate_threshold; not {', '.join(rank_local_draft_len)}), because "
-                "rank-local draft lengths are not supported yet: ranks with different draft lengths "
-                "run different numbers of MTP-layer all-to-alls",
+                "ranks with different draft lengths run different numbers of MTP-layer "
+                "all-to-alls",
             ),
             (
                 llm_args.enable_chunked_prefill
@@ -222,10 +219,9 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
             (
                 compile_config is None,
                 "no torch.compile (torch_compile_config=None, and no piecewise prefill CUDA graphs, "
-                "which run it), which is not supported yet: no test has changed the membership "
-                "with the all-to-all inside compiled regions or piecewise CUDA graphs, and the "
-                "userbuffers that it can enable exchange memory handles over an MPI world of every "
-                "rank, while each rank is its own MPI world",
+                "which run it), because fault tolerance does not support torch.compile yet (for "
+                "example, the userbuffers that it can enable exchange memory handles over an MPI "
+                "world of every rank, while each rank is its own MPI world)",
             ),
             (
                 llm_args.modeling_v2 != "require",
@@ -236,9 +232,8 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
             ),
             (
                 llm_args.sleep_config is None,
-                "no sleep mode (sleep_config=None), which is not supported yet: sleep releases and "
-                "restores the GPU memory of the weights, whose spare slots fault tolerance backs "
-                "and unbacks itself",
+                "no sleep mode (sleep_config=None), because sleep releases and restores the GPU "
+                "memory of the weights, whose spare slots fault tolerance backs and unbacks itself",
             ),
         ]
     )
@@ -256,7 +251,7 @@ def check_model_architectures(architectures: Optional[Sequence[str]]) -> None:
                 bool(architectures)
                 and all(name in SUPPORTED_ARCHITECTURES for name in architectures),
                 f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3 and "
-                f"DeepSeek-R1), the only ones tested with it, not {architectures}",
+                f"DeepSeek-R1), not {architectures}",
             )
         ]
     )

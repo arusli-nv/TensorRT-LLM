@@ -160,7 +160,7 @@ def test_supported_configuration_is_accepted(fields):
                     connector_worker_class="Worker",
                 )
             },
-            "kv_connector_config=None), which is not supported yet",
+            "kv_connector_config=None), because a connector saves the KV cache",
         ),
         (
             {"kv_cache_compression_config": ColdPageQuantizationCompressionConfig()},
@@ -232,7 +232,7 @@ def test_supported_configuration_is_accepted(fields):
                 },
             )
         ),
-        ({"sleep_config": SleepConfig()}, "sleep_config=None), which is not supported yet"),
+        ({"sleep_config": SleepConfig()}, "sleep_config=None), because sleep releases"),
         ({"modeling_v2": "require"}, "modeling_v2='auto' or 'off', not 'require'"),
     ],
 )
