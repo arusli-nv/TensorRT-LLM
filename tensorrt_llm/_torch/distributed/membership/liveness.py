@@ -209,7 +209,11 @@ class MembershipClient:
         self._received: List[bytes] = []
 
     def start(self) -> None:
-        """Connect, take the incarnation from the authority's first record and start the thread."""
+        """Connect, take the authority's first record and start the thread.
+
+        The first record sets ``record`` and ``incarnation`` at once. The thread also delivers it
+        to ``on_record``.
+        """
         connection = open_liveness_connection(self._store, self.rank, self._replacement)
         self._sock, self._lines = connection.sock, connection.lines
         self._sock.settimeout(HELLO_TIMEOUT_S)
@@ -222,9 +226,8 @@ class MembershipClient:
                 )
             self._received = self._lines.decode(data)
         self._sock.settimeout(None)
-        self.incarnation = MembershipRecord.model_validate_json(self._received[0]).incarnations[
-            self.rank
-        ]
+        self.record = MembershipRecord.model_validate_json(self._received[0])
+        self.incarnation = self.record.incarnations[self.rank]
         self._send_report()
         self._thread.start()
 

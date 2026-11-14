@@ -1255,6 +1255,14 @@ def test_report_rejects_invalid_field(changes):
     assert not errors
 
 
+def test_client_holds_first_record_after_start(monkeypatch):
+    """Hold the authority's first record once start() returns, before the thread delivers it."""
+    monkeypatch.setattr(liveness.MembershipClient, "_serve", lambda self: self._stop.wait())
+    with _scripted_client([]) as client:
+        assert client.record is not None
+        assert client.record.incarnations[0] == client.incarnation
+
+
 def test_late_wakeup_keeps_live_authority(monkeypatch):
     """Keep a client whose thread wakes after the silence timeout while the authority's lines wait."""
     silence_s = 1.0
