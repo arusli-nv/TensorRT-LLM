@@ -125,6 +125,12 @@ DRAIN_MAX_TOKENS = 3500
 
 # A rank logs this per graph shape when it captures.
 CAPTURE_LINE = re.compile(r"\[RANK (\d+)\].*(CUDA graph capture|Capturing \d+ graphs)")
+# The node supervisor logs the end of each process of the victim, and the victim why it exits.
+VICTIM_END_LOG = re.compile(rf"Rank {VICTIM} (\(.*\) ended with status|exits: )")
+# The node supervisor logs one of these when it gives the victim up.
+VICTIM_GIVEN_UP_LOG = re.compile(
+    rf"replacements of rank {VICTIM} failed in a row|The replacement of rank {VICTIM} cannot start"
+)
 RANK_ENV = ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "PMIX_RANK")
 GPU_DEVICE = re.compile(r"/dev/nvidia\d+")
 # The states a run may read. During a hang, until the hung rank is removed, it may also read stalled.
@@ -835,11 +841,28 @@ def _committed_after(generation: int) -> Callable[[dict], bool]:
     return lambda s: s["membership_state"] == "COMMITTED" and s["generation"] > generation
 
 
-def _wait_for_replacement(secret: str, replaced_pid: int) -> Dict[int, psutil.Process]:
-    """Wait for and return the victim's worker process that replaces ``replaced_pid``."""
+def _running(process: psutil.Process) -> bool:
+    """Return whether ``process`` runs, so it has neither ended nor waits to be reaped."""
+    try:
+        return process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+def _wait_for_replacement(deployment: Deployment, replaced_pid: int) -> Dict[int, psutil.Process]:
+    """Wait for and return the victim's worker process that replaces ``replaced_pid``.
+
+    Fail at once when the node supervisor gives the victim up instead.
+    """
     deadline = time.monotonic() + REJOIN_TIMEOUT_S
-    while (process := _rank_workers(secret).get(VICTIM)) is None or process.pid == replaced_pid:
+    while (
+        process := _rank_workers(deployment.secret).get(VICTIM)
+    ) is None or process.pid == replaced_pid:
         assert time.monotonic() < deadline, f"no replacement of rank {VICTIM} started"
+        given_up = [
+            line for line in _log_lines(deployment.logs) if VICTIM_GIVEN_UP_LOG.search(line)
+        ]
+        assert not given_up, f"no replacement of rank {VICTIM} started: {given_up[-1].strip()}"
         time.sleep(1)
     return {VICTIM: process}
 
@@ -1327,7 +1350,7 @@ class TestRankFailures:
             )
 
             victim_pid = _rank_workers(d.secret)[VICTIM].pid
-            run.cycle("crash", at_admission=lambda: _wait_for_replacement(d.secret, victim_pid))
+            run.cycle("crash", at_admission=lambda: _wait_for_replacement(d, victim_pid))
 
     @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
     def test_failure_during_admission(self, shared_deployment: Deployment):
@@ -1402,7 +1425,7 @@ def test_shutdown_after_rank_given_up(tmp_path: Path):
                 _committed_after(status["generation"]), t_fail, RECOVERY_TIMEOUT_S
             )
             for _ in range(_MAX_FAILED_REPLACEMENTS):
-                victim = _wait_for_replacement(deployment.secret, victim.pid)[VICTIM]
+                victim = _wait_for_replacement(deployment, victim.pid)[VICTIM]
                 victim.kill()
             t_given_up, given_up = run.monitor.wait_for(
                 lambda s: s["replacements"] == {VICTIM: "given_up"}, t_degraded, RECOVERY_TIMEOUT_S
@@ -1451,10 +1474,15 @@ def test_shutdown_during_admission(tmp_path: Path):
         captures = _capture_lines(deployment.logs)[VICTIM]
         victim = _rank_workers(deployment.secret)[VICTIM]
         victim.kill()
-        replacement = _wait_for_replacement(deployment.secret, victim.pid)[VICTIM]
+        replacement = _wait_for_replacement(deployment, victim.pid)[VICTIM]
         deadline = time.monotonic() + REJOIN_TIMEOUT_S
         while _capture_lines(deployment.logs)[VICTIM] == captures:
             assert time.monotonic() < deadline, f"rank {VICTIM}'s replacement captured no graph"
+            if not _running(replacement):
+                ends = [line for line in _log_lines(deployment.logs) if VICTIM_END_LOG.search(line)]
+                pytest.fail(
+                    f"rank {VICTIM}'s replacement ended before a capture:\n{''.join(ends[-2:])}"
+                )
             time.sleep(0.1)
         replacement.suspend()
         attached = replace(deployment, frontends=deployment.frontends[1:])
