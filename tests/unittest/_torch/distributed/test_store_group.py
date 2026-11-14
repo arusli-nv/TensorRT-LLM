@@ -26,12 +26,14 @@ import pytest
 from mpi4py import MPI
 from torch.distributed import DistStoreError
 
+from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.membership import (
     SHARED_SECRET_ENV,
     SignedStore,
     StoreGroup,
     rendezvous,
 )
+from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.pyexecutor import hang_detector
 
 pytestmark = pytest.mark.cpu_only
@@ -117,6 +119,25 @@ def test_split_orders_members_by_key():
     results = _run_ranks({r: lambda r=r: split(r) for r in groups})
     assert results[0] == results[2] == ((2, 0), [2, 0])
     assert results[1] == results[3] == ((3, 1), [3, 1])
+
+
+def test_replacement_replays_split_made_in_pause(monkeypatch):
+    """Replay a split that rank 0 made while paused, which a replacement makes outside a pause."""
+    store = _Store()
+    for rank in range(1, 4):
+        store.set(f"group/0/{rank}", pickle.dumps((rank % 2, rank)))
+    original = StartupRecord()
+    monkeypatch.setattr(communicator.Distributed, "startup_record", original)
+    original.record()
+    original.pause()
+    assert _group(store, 0, range(4)).Split(color=0, key=0).membership == (0, 2)
+    original.close()
+    replacement = StartupRecord()
+    replacement.replay(original.published())
+    monkeypatch.setattr(communicator.Distributed, "startup_record", replacement)
+    group = _group(_Store(), 2, range(4), active=[2], startup=True)
+    assert group.Split(color=0, key=2).membership == (0, 2)
+    replacement.close()
 
 
 def test_split_type_groups_ranks_by_node():

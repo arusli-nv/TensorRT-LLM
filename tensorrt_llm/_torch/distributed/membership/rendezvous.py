@@ -204,8 +204,9 @@ class StoreGroup(StoreComm):
         def gather():
             return self.allgather((color, key))
 
-        record = Distributed.startup_record
-        splits = gather() if record is None else record.agree("startup_group_split", gather)
+        # A process splits at whichever startup step first needs the communicator, even while the
+        # startup record is paused, such as in the KV cache estimation that a replacement skips.
+        splits = Distributed.agree_per_process("startup_group_split", gather)
         ranks = sorted(
             (split[1], index, rank)
             for index, (rank, split) in enumerate(zip(self.membership, splits))
