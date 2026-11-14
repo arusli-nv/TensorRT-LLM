@@ -213,10 +213,21 @@ def _process_ended(pid, timeout_s):
             with open(f"/proc/{pid}/stat") as stat:
                 if stat.read().rsplit(")", 1)[1].split()[0] == "Z":
                     return True  # ended, not reaped yet
-        except FileNotFoundError:
+        # The process may be reaped between the open and the read.
+        except (FileNotFoundError, ProcessLookupError):
             return True
         time.sleep(0.2)
     return False
+
+
+def test_process_ended_while_reaped(monkeypatch):
+    """Report a process reaped between the open and the read of its stat file as ended."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    stat = open(f"/proc/{process.pid}/stat")
+    process.kill()
+    process.wait()
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: stat)
+    assert _process_ended(process.pid, timeout_s=1)
 
 
 @pytest.mark.timeout(900)

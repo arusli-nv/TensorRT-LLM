@@ -383,8 +383,19 @@ def _alive(pid):
     try:
         with open(f"/proc/{pid}/stat") as stat:
             return stat.read().split(")")[-1].split()[0] != "Z"
-    except FileNotFoundError:
+    # The process may be reaped between the open and the read.
+    except (FileNotFoundError, ProcessLookupError):
         return False
+
+
+def test_alive_while_process_is_reaped(monkeypatch):
+    """Report a process reaped between the open and the read of its stat file as ended."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    stat = open(f"/proc/{process.pid}/stat")
+    process.kill()
+    process.wait()
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: stat)
+    assert not _alive(process.pid)
 
 
 class Running:
