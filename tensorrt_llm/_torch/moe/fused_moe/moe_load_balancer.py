@@ -322,9 +322,7 @@ class HostMoeTensorSharer:
 
     def post_shutdown_cleanup(self):
         """
-        Unlink the shared host weights this rank owns.
-
-        Call after the barrier that follows every rank's pre_shutdown_cleanup.
+        Clean up the resources before C++ shutdown and barrier
         """
         if self.own_shm:
             self.own_shm.unlink()
@@ -844,8 +842,8 @@ class SingleLayerMoeLoadBalancer:
 
     def py_post_shutdown_cleanup(self):
         """
-        Unlink the shared host weights. Call after the C++ shutdown and the barrier.
-        """
+         Clean up the resources after C++ shutdown and barrier
+         """
         if self.need_load_shared_weights():
             self.host_tensor_sharer.post_shutdown_cleanup()
 
@@ -1171,7 +1169,7 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.load_balancer_impl.shutdown()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
-        # Every rank closes its mappings before the owner unlinks the shared memory.
+        # use this sync to make sure all the shm resources can be cleaned up
         self.shared_mpi_comm.barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_post_shutdown_cleanup()
