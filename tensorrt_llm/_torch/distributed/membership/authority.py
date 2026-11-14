@@ -484,8 +484,8 @@ class Authority:
         collective epochs its peers wait on. During a change the ranks that have not replied are
         waited on, and during startup the ranks that have not started. A rank's waits count only
         while its reports advance. Rank 0 idle while waiting for requests is never hung. A joining
-        rank is hung after at most the admission timeout, so the survivors do not pause a full
-        hang timeout for it.
+        rank that waits on no peer is hung after at most the admission timeout, so the survivors
+        do not pause a full hang timeout for it.
 
         Also record the failure causes and since when the active ranks stall.
         """
@@ -537,9 +537,9 @@ class Authority:
                     self.stalled_since_s is None or since_s < self.stalled_since_s
                 ):
                     self.stalled_since_s = since_s
-                limit_s = (
-                    min(timeout_s, self.admission_timeout_s) if r in self._joining else timeout_s
-                )
+                # A joiner that waits on a peer may be held up by it, so it gets the full timeout.
+                stalled_joiner = r in self._joining and not waits.get(r)
+                limit_s = min(timeout_s, self.admission_timeout_s) if stalled_joiner else timeout_s
                 if now_s - since_s > limit_s:
                     failed |= 1 << r
                     self._causes.setdefault(r, "hung")

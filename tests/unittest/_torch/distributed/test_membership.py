@@ -432,6 +432,23 @@ def test_stalled_joiner_left_out_early():
     assert cluster.now - stalled_s <= admission_s + 0.2
 
 
+def test_frozen_survivor_removed_before_joiner():
+    """Remove a survivor that froze during an admission, not the joiner it holds up."""
+    cluster = Cluster(hang_timeout_s=4.0, admission_timeout_s=1.0)
+    cluster.alive.discard(3)
+    cluster.run(1.0)
+    _join(cluster, 3)
+    cluster.run_until(MembershipState.INSTALL)
+    # Rank 2 freezes while it waits for the joiner's slot, and the joiner waits on rank 2's.
+    cluster.waiting_for.update({2: 1 << 3, 3: 1 << 2})
+    cluster.hung.update({2, 3})
+    cluster.step()
+    cluster.stopped.add(2)
+    record = _first_change(cluster, 8.0)
+    assert record.state == MembershipState.PROPOSE
+    assert record.active_mask == _without(2)
+
+
 def test_membership_timeouts_keep_their_order():
     """Check the order of the membership's timeouts that its rules rely on."""
     timing = membership.records
