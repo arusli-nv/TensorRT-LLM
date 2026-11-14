@@ -630,12 +630,12 @@ def _replacement_engine(published, tuned_tactics):
     """
     values = {}
     store = SimpleNamespace(set=values.__setitem__, get=values.__getitem__)
-    with patch.object(startup, "_startup_record", SimpleNamespace(tuned_tactics=tuned_tactics)):
+    with patch.object(startup._state, "record", SimpleNamespace(tuned_tactics=tuned_tactics)):
         startup.publish_tuned_tactics(store, REPLACED)
     dist = _replacement(published)
     tuner = _new_autotuner()
     with (
-        patch.object(startup, "_startup_record", _record()),
+        patch.object(startup._state, "record", _record()),
         patch.object(AutoTuner, "get", return_value=tuner),
     ):
         startup._take_tuned_tactics(store, REPLACED)
