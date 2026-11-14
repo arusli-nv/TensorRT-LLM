@@ -1021,6 +1021,27 @@ def test_given_up_ranks_published_during_change(monkeypatch):
         assert stored.given_up_mask == 0
 
 
+def test_node_view_names_connected_ranks(monkeypatch):
+    """Send node supervisors the ranks with a connected process, again once one leaves."""
+    deciding = threading.Event()
+    deciding.set()
+    decide = Authority.tick
+
+    def tick(self, now_s, reports, connected_mask):
+        return decide(self, now_s, reports, connected_mask) if deciding.is_set() else None
+
+    monkeypatch.setattr(Authority, "tick", tick)
+    with _deployment(4) as (store, clients):
+        node_0 = _NodeSupervisor(store, 0, [0, 1])
+        node_0.until(lambda view: view.connected_mask == 0b1111)
+        # No membership change follows the leave, so only the connected ranks change.
+        deciding.clear()
+        clients[3].stop()
+        view = node_0.until(lambda view: view.connected_mask == 0b0111)
+        assert view.record.active_mask == 0b1111
+        deciding.set()
+
+
 @pytest.mark.parametrize("connected_nodes", [[0], []], ids=["one", "none"])
 def test_startup_without_node_supervisor_aborts(monkeypatch, connected_nodes):
     """Abort a startup in which a node's supervisor did not connect, naming the nodes and the fix."""

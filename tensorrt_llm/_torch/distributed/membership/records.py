@@ -230,11 +230,13 @@ class MembershipRecord(_Message):
 
 
 class NodeView(_Message):
-    """What the authority sends a node supervisor: the record and the stalled replacements."""
+    """What the authority sends a node supervisor."""
 
     record: MembershipRecord
     # The ranks whose replacement made no startup progress for the rendezvous timeout.
     stalled_replacements: Tuple[int, ...] = ()
+    # Rank mask of the ranks whose current process has a liveness connection to the authority.
+    connected_mask: int = 0
 
 
 class NodeReport(_Message):

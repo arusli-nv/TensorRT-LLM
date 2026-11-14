@@ -128,6 +128,7 @@ class AuthorityProcess:
         self._supervised_mask = 0
         self._started_s = 0.0
         self._sent_stalled_replacements: Tuple[int, ...] = ()
+        self._sent_connected_mask = 0
         self._published_stalled_since_s: Optional[float] = None
         # The ranks that no replacement is started for, which every published record carries.
         self._given_up_mask = 0
@@ -180,8 +181,9 @@ class AuthorityProcess:
                 record = self._authority.abort("rank 0's process ended")
             else:
                 record = self._check_supervisors(time.monotonic())
+            connected = self._connected()
             if record is None:
-                record = self._authority.tick(time.monotonic(), self._reports(), self._connected())
+                record = self._authority.tick(time.monotonic(), self._reports(), connected)
             self._publish_stall()
             if record is None:
                 if self._record.given_up_mask != self._given_up_mask:
@@ -190,7 +192,10 @@ class AuthorityProcess:
                     self._publish(
                         self._record, ranks=self._record.state == MembershipState.COMMITTED
                     )
-                elif self._authority.stalled_replacements != self._sent_stalled_replacements:
+                elif (
+                    self._authority.stalled_replacements != self._sent_stalled_replacements
+                    or connected != self._sent_connected_mask
+                ):
                     self._send_record(ranks=False)
                 continue
             logger.info(f"Membership: {record!r}")
@@ -269,8 +274,13 @@ class AuthorityProcess:
     def _send_record(self, ranks: bool = True) -> None:
         record = message_bytes(self._record)
         self._sent_stalled_replacements = self._authority.stalled_replacements
+        self._sent_connected_mask = self._connected()
         view = message_bytes(
-            NodeView(record=self._record, stalled_replacements=self._sent_stalled_replacements)
+            NodeView(
+                record=self._record,
+                stalled_replacements=self._sent_stalled_replacements,
+                connected_mask=self._sent_connected_mask,
+            )
         )
         for sock, connection in list(self._connections.items()):
             # A connection an earlier send in this loop dropped is gone.

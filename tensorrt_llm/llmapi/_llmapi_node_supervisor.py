@@ -447,6 +447,18 @@ class NodeSupervisor:
                 f"{self._membership.RENDEZVOUS_TIMEOUT_S:.0f} s"
             )
             self._kill(process)
+        # The authority times a replacement's startup only once it connects, so time the part before
+        # that here.
+        elif not self._membership.has_rank(self._view.connected_mask, rank):
+            due_s = process.started_s + self._membership.RENDEZVOUS_TIMEOUT_S
+            if now_s < due_s:
+                self._deadlines_s.append(due_s)
+                return
+            self._logger.warning(
+                f"Killing rank {rank}'s process, which is not connected to the membership "
+                f"authority {self._membership.RENDEZVOUS_TIMEOUT_S:.0f} s after it started"
+            )
+            self._kill(process)
 
     def _check_killed(self, rank: int, process: _Process, now_s: float) -> None:
         """Give up ``rank`` if its killed process did not end within the rendezvous timeout."""

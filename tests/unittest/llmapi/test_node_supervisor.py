@@ -251,9 +251,13 @@ class FakeAuthority:
         selector.unregister(sock)
         self.closed.set()
 
-    def push(self, record, stalled_replacements=()):
+    def push(self, record, stalled_replacements=(), connected_mask=0):
         with self._lock:
-            self._view = NodeView(record=record, stalled_replacements=stalled_replacements)
+            self._view = NodeView(
+                record=record,
+                stalled_replacements=stalled_replacements,
+                connected_mask=connected_mask,
+            )
             for sock, lines in self._connections:
                 with contextlib.suppress(OSError):
                     sock.sendall(lines.encode(self._view.model_dump_json().encode()))
@@ -414,16 +418,16 @@ def _serving(tmp_path, authority, environ, node=NODE, **options):
     return running
 
 
-def _push_and_wait_for_step(running, authority, record):
+def _push_and_wait_for_step(running, authority, record, **view):
     """Push a new view and wait until the supervisor has acted on it and on every earlier event.
 
     The supervisor acts on each view before it waits for the next event. Once it has taken a later
-    view, it has acted on this one.
+    view, it has acted on this one. ``view`` holds the view's other fields.
     """
-    authority.push(record)
-    _until(lambda: running.supervisor._view == NodeView(record=record))
+    authority.push(record, **view)
+    _until(lambda: running.supervisor._view == NodeView(record=record, **view))
     following = record.model_copy(update={"generation": record.generation + 1})
-    authority.push(following)
+    authority.push(following, **view)
     _until(lambda: running.supervisor._view.record == following)
 
 
@@ -632,6 +636,31 @@ def test_replacement_killed_once_reported_stalled(tmp_path, deployment):
     # The view that reported the stalled startup came before the next replacement started.
     assert _alive(_read(tmp_path, 3, 2)["pid"])
     _shut_down(running, authority, active_mask=0b0111, generation=5)
+
+
+def test_replacement_killed_if_never_connected(tmp_path, deployment, monkeypatch):
+    """Kill a replacement that does not connect to the authority within the rendezvous timeout."""
+    authority, environ = deployment
+    clock_s = [0.0]
+    monkeypatch.setattr(
+        supervisor_module, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + clock_s[0])
+    )
+    running = _serving(tmp_path, authority, environ)
+    os.kill(_read(tmp_path, 3, 0)["pid"], signal.SIGKILL)
+    without_3 = _record(MembershipState.COMMITTED, active_mask=0b0111)
+    authority.push(without_3, connected_mask=0b1111)
+    _until(lambda: _read(tmp_path, 3, 1))
+    clock_s[0] += membership.RENDEZVOUS_TIMEOUT_S
+    _push_and_wait_for_step(
+        running, authority, without_3.model_copy(update=dict(generation=2)), connected_mask=0b1111
+    )
+    assert _alive(_read(tmp_path, 3, 1)["pid"])
+    _push_and_wait_for_step(
+        running, authority, without_3.model_copy(update=dict(generation=4)), connected_mask=0b0111
+    )
+    _until(lambda: _read(tmp_path, 3, 2))
+    assert not _alive(_read(tmp_path, 3, 1)["pid"])
+    _shut_down(running, authority, active_mask=0b0111, generation=6)
 
 
 def test_rank_0_end_stops_node(tmp_path, deployment):
