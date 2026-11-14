@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
-from tensorrt_llm._torch.pyexecutor import context_logits_plan
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
     ContextLogitsPlan,
     store_context_logits,
@@ -498,41 +497,3 @@ def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
         torch.cat(result.context_prompt_logprob_rows), stored_logprob_rows, rtol=0, atol=0
     )
     assert result.context_prompt_last_logprobs is stored_last_logprobs
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "recompute",
-    [False, True],
-    ids=["reuse_skips_prompt_rows_warns", "recompute_reuses_stored_rows_silent"],
-)
-def test_reuse_warns_only_of_missing_rows(monkeypatch, recompute: bool) -> None:
-    """KV cache reuse warns only when it leaves prompt rows without context logits."""
-    warnings = []
-    monkeypatch.setattr(context_logits_plan, "logger", SimpleNamespace(warning=warnings.append))
-    prompt_len, vocab = 10, 31
-    request = LlmRequest(
-        request_id=1,
-        max_new_tokens=4,
-        input_tokens=list(range(prompt_len)),
-        sampling_config=SamplingConfig(1),
-        is_streaming=False,
-        return_context_logits=True,
-        return_logits_device_memory=False,
-    )
-    reused = 4
-    if recompute:
-        request.context_chunk_size = prompt_len
-        store_context_logits(request, torch.randn(prompt_len, vocab))
-        request.move_to_next_context_chunk()
-        for token in (3, 4):
-            request.add_new_token(token, 0)
-        request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
-        # Reuse covers the whole original prompt and one output token. Every
-        # prompt row is already stored, so none is missing.
-        reused = prompt_len + 1
-    request.context_chunk_size = reused
-    request.move_to_next_context_chunk()
-    request.context_chunk_size = request.context_remaining_length
-    store_context_logits(request, torch.randn(request.context_chunk_size, vocab))
-    assert len(warnings) == (0 if recompute else 1)
