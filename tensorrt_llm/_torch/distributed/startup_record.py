@@ -52,11 +52,17 @@ class ReplacementCannotStart(SystemExit):
         self.code = REPLACEMENT_CANNOT_START
 
 
+def _caller_stack() -> str:
+    """Return the innermost frames of the call stack outside this module."""
+    frames = [frame for frame in traceback.extract_stack() if frame.filename != __file__]
+    return "".join(traceback.format_list(frames[-_DIVERGING_CALL_FRAMES:])).rstrip()
+
+
 def diverged(reason: str) -> ReplacementCannotStart:
     """Return the failure of a replacement whose startup diverges at the caller, with its stack."""
-    frames = [frame for frame in traceback.extract_stack() if frame.filename != __file__]
-    stack = "".join(traceback.format_list(frames[-_DIVERGING_CALL_FRAMES:])).rstrip()
-    return ReplacementCannotStart(f"{reason}. The diverging call (most recent call last):\n{stack}")
+    return ReplacementCannotStart(
+        f"{reason}. The diverging call (most recent call last):\n{_caller_stack()}"
+    )
 
 
 class RecordedExchange(NamedTuple):
@@ -326,5 +332,6 @@ class StartupRecord:
             return True
         raise RuntimeError(
             f"The value of this replacement rank to {collective} of its startup is {own}, "
-            f"beyond the original ranks' {reduce_op.__name__} {result}"
+            f"beyond the original ranks' {reduce_op.__name__} {result}. The call (most recent "
+            f"call last):\n{_caller_stack()}"
         )

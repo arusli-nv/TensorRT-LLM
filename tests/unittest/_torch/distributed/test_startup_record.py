@@ -484,8 +484,10 @@ def test_replacement_host_tier_needs_room(distributed, monkeypatch):
     distributed.dist = _replacement(published)
     with pytest.raises(
         RuntimeError, match=f"is {60 * GIB}, beyond the original ranks' min {80 * GIB}"
-    ):
+    ) as failure:
         _auto_host_tier_quota(monkeypatch, 120 * GIB)
+    # The message names the reduction by its call site.
+    assert "in _sync_host_tier_quota" in str(failure.value)
 
 
 def test_node_replacements_share_its_free_memory(distributed, monkeypatch):
