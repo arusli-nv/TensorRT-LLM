@@ -22,7 +22,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from test_moe_a2a_abort import _combine, _dispatch, _setup
+from moe_a2a_test_utils import a2a_combine, a2a_dispatch, a2a_workspace
 from utils.stream_gates import held_stream
 
 import tensorrt_llm  # noqa: F401
@@ -77,8 +77,8 @@ def _collective_round(state: MoeExecutionState, workspace, meta, experts, payloa
         "active_rank_mask": state.active_rank_mask,
         "abort_state": state.abort,
     }
-    received, offset, _ = _dispatch(workspace, meta, experts, controls, payload)
-    return _combine(workspace, meta, received[0], offset, controls)
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+    return a2a_combine(workspace, meta, received[0], offset, controls)
 
 
 def _wait_for(condition, state: MoeExecutionState, failure: str, timeout_s: float = 10) -> None:
@@ -100,7 +100,7 @@ def _queued_work_done():
 
 def test_abort_and_rearm_after_peer_failure() -> None:
     """A dispatch stuck on a failed peer aborts from another thread, and runs again after rearm."""
-    workspace, meta, experts, payload = _setup(_EP_SIZE)
+    workspace, meta, experts, payload = a2a_workspace(_EP_SIZE)
     health = EPGroupHealth(_EP_SIZE)
     state = MoeExecutionState(health, 0, workspace.device)
     resets = []
@@ -143,7 +143,7 @@ def test_abort_and_rearm_after_peer_failure() -> None:
 
 def test_graph_replay_follows_written_mask() -> None:
     """A CUDA graph captured with every rank active replays without the rank excluded afterwards."""
-    workspace, meta, experts, payload = _setup(_EP_SIZE)
+    workspace, meta, experts, payload = a2a_workspace(_EP_SIZE)
     health = EPGroupHealth(_EP_SIZE)
     state = MoeExecutionState(health, 0, workspace.device)
     torch.cuda.synchronize()

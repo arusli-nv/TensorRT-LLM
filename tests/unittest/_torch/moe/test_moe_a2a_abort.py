@@ -26,12 +26,11 @@ import time
 
 import pytest
 import torch
+from moe_a2a_test_utils import CAPACITY, HIDDEN, a2a_combine, a2a_dispatch, a2a_workspace
 
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm.bindings import internal
 
-_CAPACITY, _HIDDEN = 8, 128
 # The abort state holds ``requested`` and ``status``, then the flag value awaited from each peer.
 _ABORT_WORDS = int(internal.thop.MOE_A2A_ABORT_STATE_WORDS)
 
@@ -56,31 +55,6 @@ def _rank_mask_controls(mask: int) -> tuple[dict, torch.Tensor]:
     return {"enable_rank_mask": True, "active_rank_mask": words, "abort_state": abort}, abort
 
 
-def _setup(ep_size: int, tokens: int = _CAPACITY) -> tuple[torch.Tensor, ...]:
-    meta = NVLinkOneSided._make_workspace_layout(
-        ep_size, 1, tokens, _HIDDEN, torch.bfloat16, None, 32, False, False, rank_mask=True
-    )
-    size = int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
-    workspace = torch.zeros((ep_size, size), dtype=torch.uint8, device="cuda")
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, ep_size, barrier=False)
-    experts = torch.zeros((tokens, 1), dtype=torch.int32, device="cuda")
-    payload = torch.arange(tokens * _HIDDEN, dtype=torch.bfloat16, device="cuda")
-    return workspace, meta, experts, payload.reshape(tokens, _HIDDEN)
-
-
-def _dispatch(workspace, meta, experts, controls, payload, tokens=_CAPACITY, rank=0):
-    """Dispatch [payload, experts] like the MoE layer as ``rank``."""
-    ep_size = workspace.size(0)
-    args = (experts, [payload, experts], workspace, meta, tokens, rank, ep_size, 1, ep_size, None)
-    return torch.ops.trtllm.moe_a2a_dispatch(*args, **controls)
-
-
-def _combine(workspace, meta, payload, offset, controls, tokens=_CAPACITY, rank=0):
-    """Combine like the MoE layer as ``rank``."""
-    args = (payload, tokens, workspace, meta, tokens, rank, workspace.size(0), 1, offset, False)
-    return torch.ops.trtllm.moe_a2a_combine(*args, **controls)
-
-
 def _next_parity(workspace: torch.Tensor, meta: torch.Tensor, rank: int = 0) -> tuple[int, int]:
     """Return the flag value and receive-count parity of ``rank``'s next round."""
     expected_flag = _word(workspace, _offset(meta, "FLAG_VAL"), row=rank).item() + 1
@@ -102,13 +76,13 @@ def _finish(abort: torch.Tensor, failure: str, timeout_s: float = 10) -> None:
 
 def test_cancel_and_exclusion_on_replay() -> None:
     """One captured graph observes the abort state and the mask written before each replay."""
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     controls, abort = _rank_mask_controls(3)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        received, offset, _ = _dispatch(workspace, meta, experts, controls, payload)
-        output = _combine(workspace, meta, received[0], offset, controls)
+        received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+        output = a2a_combine(workspace, meta, received[0], offset, controls)
 
     # Peer 1 never signals. A pending abort request releases the dispatch's wait, and the combine of
     # the incomplete round takes only this rank's own rows.
@@ -153,11 +127,11 @@ def test_cancel_and_exclusion_on_replay() -> None:
 @pytest.mark.parametrize("ep_size, rank", [(2, 0), (72, 70)], ids=["first_word", "second_word"])
 def test_no_peer_writes_after_incomplete_round(ep_size: int, rank: int) -> None:
     """Until the workspace reset, a dispatch writes nothing into rows a peer may still read."""
-    workspace, meta, experts, payload = _setup(ep_size)
+    workspace, meta, experts, payload = a2a_workspace(ep_size)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size, barrier=False)
     controls, abort = _rank_mask_controls((1 << ep_size) - 1)
     abort[0] = 1  # No peer signals, so the round stays incomplete.
-    _dispatch(workspace, meta, experts, controls, payload, rank=rank)
+    a2a_dispatch(workspace, meta, experts, controls, payload, rank=rank)
     _finish(abort, "the abort request did not release the dispatch's wait")
     assert _word(workspace, _offset(meta, "INCOMPLETE_ROUND"), row=rank).item() == 1
 
@@ -167,7 +141,7 @@ def test_no_peer_writes_after_incomplete_round(ep_size: int, rank: int) -> None:
     experts.copy_(
         torch.tensor([0, 65, 71, 64, 3, 70, 69, 1], dtype=torch.int32).view(-1, 1) % ep_size
     )
-    _dispatch(workspace, meta, experts, controls, payload, rank=rank)
+    a2a_dispatch(workspace, meta, experts, controls, payload, rank=rank)
     _finish(abort, "the dispatch after the incomplete round waited for a peer")
     assert torch.equal(torch.cat([workspace[:rank], workspace[rank + 1 :]]), peers)
 
@@ -183,21 +157,21 @@ def test_aborted_dispatch_uses_no_rows_of_unconfirmed_peers(
     The peer writes its receive count but never its flag, and again after the abort. Rank 34 of 72
     waits on peer 2 and then on itself in the same lane, and keeps its own rows.
     """
-    workspace, meta, experts, payload = _setup(ep_size)
+    workspace, meta, experts, payload = a2a_workspace(ep_size)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size, barrier=False)
     experts.fill_(rank)
     controls, abort = _rank_mask_controls((1 << ep_size) - 1)
     _, parity = _next_parity(workspace, meta, rank)
     counts = _offset(meta, "RECV_COUNTERS") + 4 * parity * ep_size
     count = _word(workspace, counts + 4 * peer, row=rank)
-    count.fill_(_CAPACITY)
+    count.fill_(CAPACITY)
     abort[0] = 1
-    received, offset, _ = _dispatch(workspace, meta, experts, controls, payload, rank=rank)
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload, rank=rank)
     _finish(abort, "the abort request did not release the dispatch's wait")
     assert count.item() == 0
-    assert _word(workspace, counts + 4 * rank, row=rank).item() == _CAPACITY
+    assert _word(workspace, counts + 4 * rank, row=rank).item() == CAPACITY
 
-    count.fill_(_CAPACITY)
+    count.fill_(CAPACITY)
     expert_ids = received[1]
     expert_ids[peer].fill_(12345)  # an expert id that no rank owns
     torch.ops.trtllm.moe_a2a_sanitize_expert_ids(expert_ids, workspace, meta, rank, -1)
@@ -205,11 +179,11 @@ def test_aborted_dispatch_uses_no_rows_of_unconfirmed_peers(
     assert torch.equal(expert_ids[rank], experts)
 
     # The rows of the peer in this rank's combine input region, which the peer reads.
-    stride = _HIDDEN * payload.element_size()
-    first = offset + peer * _CAPACITY * stride
-    peer_rows = workspace[rank, first : first + _CAPACITY * stride]
+    stride = HIDDEN * payload.element_size()
+    first = offset + peer * CAPACITY * stride
+    peer_rows = workspace[rank, first : first + CAPACITY * stride]
     peer_rows.fill_(0x7F)
-    output = _combine(workspace, meta, received[0], offset, controls, rank=rank)
+    output = a2a_combine(workspace, meta, received[0], offset, controls, rank=rank)
     _finish(abort, "the combine of the incomplete round waited for the peer")
     assert torch.all(peer_rows == 0x7F)
     torch.testing.assert_close(output, payload, rtol=0, atol=0)
@@ -223,7 +197,7 @@ def test_combine_cancels_on_overwritten_peer_rows(peer_aborts: bool) -> None:
     combine. Rank 1 completes its round before rank 0 combines it. With ``peer_aborts``, rank 1
     then aborts its next dispatch and overwrites that region like its next MoE.
     """
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 1, 2, barrier=False)
     controls, abort = _rank_mask_controls(3)
     peer_controls, peer_abort = _rank_mask_controls(3)
@@ -232,19 +206,19 @@ def test_combine_cancels_on_overwritten_peer_rows(peer_aborts: bool) -> None:
     dispatch_flag, _ = _next_parity(workspace, meta)
     _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(dispatch_flag)
     _word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS"), row=1).fill_(dispatch_flag + 1)
-    received, offset, _ = _dispatch(workspace, meta, experts, controls, payload)
-    peer_received, _, _ = _dispatch(workspace, meta, experts, peer_controls, payload, rank=1)
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+    peer_received, _, _ = a2a_dispatch(workspace, meta, experts, peer_controls, payload, rank=1)
     moe_output = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
-        workspace, meta, 1, 2, _CAPACITY, payload.dtype, _HIDDEN
-    ).view(2, _CAPACITY, _HIDDEN)
+        workspace, meta, 1, 2, CAPACITY, payload.dtype, HIDDEN
+    ).view(2, CAPACITY, HIDDEN)
     moe_output.copy_(peer_received[0])
-    _combine(workspace, meta, moe_output, offset, peer_controls, rank=1)
+    a2a_combine(workspace, meta, moe_output, offset, peer_controls, rank=1)
     if peer_aborts:
         peer_abort[0] = 1
-        _dispatch(workspace, meta, experts, peer_controls, payload, rank=1)
+        a2a_dispatch(workspace, meta, experts, peer_controls, payload, rank=1)
         moe_output.fill_(-1)
     _finish(peer_abort, "rank 1's round waited for rank 0")
-    output = _combine(workspace, meta, received[0], offset, controls)
+    output = a2a_combine(workspace, meta, received[0], offset, controls)
     _finish(abort, "rank 0's combine waited for rank 1")
     expected = torch.full_like(payload, -1) if peer_aborts else payload
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
@@ -257,7 +231,7 @@ def test_own_round_value_keeps_peer_rows() -> None:
     A peer whose combine of this round aborted stores that value with its next dispatch. The combine then
     exchanges with every peer, so the rows it publishes must hold the peers' tokens, and it records a cancel.
     """
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 1, 2, barrier=False)
     controls, _ = _rank_mask_controls(3)
     peer_controls, peer_abort = _rank_mask_controls(3)
@@ -266,18 +240,20 @@ def test_own_round_value_keeps_peer_rows() -> None:
     dispatch_flag, _ = _next_parity(workspace, meta, rank=1)
     _word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4).fill_(dispatch_flag)
     _word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS"), row=1).fill_(dispatch_flag + 1)
-    _dispatch(workspace, meta, experts, controls, payload)
-    peer_received, offset, _ = _dispatch(workspace, meta, experts, peer_controls, payload, rank=1)
+    a2a_dispatch(workspace, meta, experts, controls, payload)
+    peer_received, offset, _ = a2a_dispatch(
+        workspace, meta, experts, peer_controls, payload, rank=1
+    )
     # Rank 0's combine of this round aborted, and its next dispatch marked rank 1.
     _word(workspace, _offset(meta, "INCOMPLETE_ROUND"), row=1).fill_(dispatch_flag + 2)
     expert_ids = peer_received[1].clone()
     torch.ops.trtllm.moe_a2a_sanitize_expert_ids(expert_ids, workspace, meta, 1, -1)
     torch.testing.assert_close(expert_ids, peer_received[1], rtol=0, atol=0)
-    _combine(workspace, meta, peer_received[0].clone(), offset, peer_controls, rank=1)
+    a2a_combine(workspace, meta, peer_received[0].clone(), offset, peer_controls, rank=1)
     _finish(peer_abort, "rank 1's combine waited for rank 0")
     rows = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
-        workspace, meta, 1, 2, _CAPACITY, payload.dtype, _HIDDEN
-    ).view(2, _CAPACITY, _HIDDEN)
+        workspace, meta, 1, 2, CAPACITY, payload.dtype, HIDDEN
+    ).view(2, CAPACITY, HIDDEN)
     torch.testing.assert_close(rows[0], peer_received[0][0], rtol=0, atol=0)
     # The combine published its readiness to rank 0, so it exchanged with every peer.
     ready = _word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS") + 4)
@@ -287,21 +263,21 @@ def test_own_round_value_keeps_peer_rows() -> None:
 
 def test_abort_state_must_be_pinned() -> None:
     """The kernels read the abort state at its host address, so the ops refuse pageable memory."""
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     controls, _ = _rank_mask_controls(3)
     controls["abort_state"] = torch.zeros(_ABORT_WORDS, dtype=torch.int32)
     with pytest.raises(RuntimeError, match="pinned"):
-        _dispatch(workspace, meta, experts, controls, payload)
+        a2a_dispatch(workspace, meta, experts, controls, payload)
 
 
 def test_incomplete_dispatch_marks_active_peers() -> None:
     """A dispatch whose round is incomplete marks the rounds of the active peers incomplete."""
-    workspace, meta, experts, payload = _setup(3)
+    workspace, meta, experts, payload = a2a_workspace(3)
     controls, abort = _rank_mask_controls(0b011)  # rank 2 is inactive
     incomplete_round = _offset(meta, "INCOMPLETE_ROUND")
     # The incomplete-round value of a peer's aborted dispatch with flag value 5.
     _word(workspace, incomplete_round).fill_(5)
-    _dispatch(workspace, meta, experts, controls, payload)
+    a2a_dispatch(workspace, meta, experts, controls, payload)
     _finish(abort, "the dispatch of an incomplete round waited for a peer")
     assert [_word(workspace, incomplete_round, row=r).item() for r in range(3)] == [5, 5, 0]
 
@@ -317,7 +293,7 @@ def test_long_wait_publishes_every_missing_peer_of_the_lane(missing, inactive, w
     Every other peer of rank 0 of 72 delivers its dispatch flag. A peer the mask clears is silent.
     """
     ep_size = 72
-    workspace, meta, experts, payload = _setup(ep_size)
+    workspace, meta, experts, payload = a2a_workspace(ep_size)
     mask = (1 << ep_size) - 1
     for peer in inactive:
         mask &= ~(1 << peer)
@@ -327,7 +303,7 @@ def test_long_wait_publishes_every_missing_peer_of_the_lane(missing, inactive, w
     for peer in range(1, ep_size):
         if peer not in missing:
             _word(workspace, flags + 4 * peer).fill_(expected_flag)
-    _dispatch(workspace, meta, experts, controls, payload)
+    a2a_dispatch(workspace, meta, experts, controls, payload)
     deadline = time.monotonic() + 10
     while abort[2 + waited[-1]].item() == 0 and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -342,22 +318,22 @@ def test_long_wait_publishes_every_missing_peer_of_the_lane(missing, inactive, w
 
 def test_rank_mask_mode_takes_a_cpu_mask() -> None:
     """The ops also take the rank mask as a CPU tensor, and refuse one without the local rank."""
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     controls, abort = _rank_mask_controls(1)
     controls["active_rank_mask"] = _mask_words(1)
-    received, offset, _ = _dispatch(workspace, meta, experts, controls, payload)
-    output = _combine(workspace, meta, received[0], offset, controls)
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+    output = a2a_combine(workspace, meta, received[0], offset, controls)
     _finish(abort, "the round without peer 1 waited for it")
     torch.testing.assert_close(output, payload, rtol=0, atol=0)
 
     controls["active_rank_mask"] = _mask_words(2)
     with pytest.raises(RuntimeError, match=r"must mark the local ep_rank \(0\) as active"):
-        _dispatch(workspace, meta, experts, controls, payload)
+        a2a_dispatch(workspace, meta, experts, controls, payload)
 
 
 def test_cpu_mask_written_only_on_change() -> None:
     """A CPU rank mask reaches the workspace's mask words only when it differs from the last one."""
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     controls, abort = _rank_mask_controls(3)
     # With the abort requested up front, every round returns at once, so a mask may name peer 1.
     abort[0] = 1
@@ -366,7 +342,7 @@ def test_cpu_mask_written_only_on_change() -> None:
 
     def dispatch(mask: int) -> list[int]:
         controls["active_rank_mask"] = _mask_words(mask)
-        _dispatch(workspace, meta, experts, controls, payload)
+        a2a_dispatch(workspace, meta, experts, controls, payload)
         _finish(abort, "a dispatch with the abort requested kept waiting")
         return device_words.tolist()
 
@@ -382,20 +358,20 @@ def test_cpu_mask_written_only_on_change() -> None:
 
 def test_cpu_mask_refused_during_capture() -> None:
     """A captured graph would not see later changes of a CPU rank mask, so capture refuses one."""
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     controls, _ = _rank_mask_controls(1)
     controls["active_rank_mask"] = _mask_words(1)
     with pytest.raises(RuntimeError, match="during CUDA graph capture"):
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
-            _dispatch(workspace, meta, experts, controls, payload)
+            a2a_dispatch(workspace, meta, experts, controls, payload)
 
 
 def _fence_timeout() -> None:
     """Check that a fence wait on a silent peer still fails at the timeout."""
     torch.ops.trtllm.moe_a2a_set_timeout(1)
-    workspace, meta, experts, payload = _setup(2)
+    workspace, meta, experts, payload = a2a_workspace(2)
     controls, _ = _rank_mask_controls(3)
-    _dispatch(workspace, meta, experts, controls, payload)
+    a2a_dispatch(workspace, meta, experts, controls, payload)
     try:
         torch.cuda.synchronize()
     except RuntimeError:
