@@ -296,6 +296,8 @@ def _admission(tp):
     if rank == leaver:
         _skip_rebuild(mpi)
         exchange.group.rows.close()
+        # A second close does nothing.
+        exchange.group.rows.close()
         slot = HostExchange.DEFAULT_SLOT_PAYLOAD_BYTES
         isolated = StoreGroup(None, "rows", rank, range(tp), active=[rank])
         rows = HostExchangeMnnvlMemory(isolated, MnnvlHostExchangeGroup.buffer_bytes(tp, slot))

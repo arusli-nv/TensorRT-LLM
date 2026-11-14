@@ -672,7 +672,11 @@ def test_failed_scratch_release_not_repeated(rows_driver, monkeypatch):
     assert rows_driver.mapped == {}
     assert len(attempts) == 3
     assert sum(handle is scratch for handle in attempts) == 1
-    assert not hasattr(rows, "ptr")
+    # Neither a second close nor collection releases the rows again.
+    rows.close()
+    del rows
+    gc.collect()
+    assert len(attempts) == 3
 
 
 def test_rows_require_fabric_handles(rows_driver, monkeypatch):

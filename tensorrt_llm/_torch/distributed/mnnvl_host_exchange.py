@@ -62,6 +62,8 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
     """
 
     absent_rows_on_scratch = True
+    # Whether ``close`` ran, after which neither ``close`` nor collection releases the rows again.
+    closed: bool = False
 
     @classmethod
     def uses_fabric_handles(cls, dev_id: int) -> bool:
@@ -71,6 +73,9 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
 
     def __init__(self, comm: StoreGroup, nbytes: int):
         """Reserve a row of ``nbytes`` per member of ``comm`` and map it among the active members.
+
+        The rows are shared over ``comm`` rather than over the communicator of a ``Mapping``, so
+        this replaces ``MnnvlMemory.__init__`` and the rows have no ``mapping``.
 
         Raises:
             MnnvlPeerHandleError: An active rank could not import a peer's handle.
@@ -130,10 +135,15 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
         return self.ptr + rank * self.rank_stride
 
     def close(self) -> None:
-        """Unmap every row and free the address range."""
-        ptr = self.ptr
-        del self.ptr
-        type(self).close_mnnvl_memory(ptr)
+        """Unmap every row and free the address range, once even if that fails."""
+        if self.closed:
+            return
+        self.closed = True
+        type(self).close_mnnvl_memory(self.ptr)
+
+    def __del__(self):
+        if not self.closed:
+            super().__del__()
 
 
 class MnnvlHostExchangeGroup:
