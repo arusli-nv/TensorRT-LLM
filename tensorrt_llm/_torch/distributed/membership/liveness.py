@@ -29,16 +29,18 @@ from typing import Any, Callable, List, Optional
 from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV
 from tensorrt_llm.logger import logger
 
-from .records import HANG_TIMEOUT_S, REPORT_INTERVAL_S, MembershipRecord, RankReport, message_bytes
+from .records import (
+    AUTHORITY_SILENCE_TIMEOUT_S,
+    DEAD_TIMEOUT_S,
+    HELLO_TIMEOUT_S,
+    REPORT_INTERVAL_S,
+    MembershipRecord,
+    RankReport,
+    message_bytes,
+)
 from .rendezvous import LIVENESS_KEY, hello_token, rendezvous_host_port
 from .signed_store import SignedStore
 
-# Longer than a network stall that TCP recovers from. A peer that stays connected but stops making
-# progress is bounded by the hang timeout instead.
-DEAD_TIMEOUT_S = 60.0
-# The age at which the authority takes a rank's reports as stale.
-AUTHORITY_SILENCE_TIMEOUT_S = HANG_TIMEOUT_S / 2
-HELLO_TIMEOUT_S = 10.0
 _MAX_LINE_BYTES = 1 << 20
 _KEEPALIVE_PROBES = 6
 _AUTHORITY_WAIT_WARNING_S = 30.0

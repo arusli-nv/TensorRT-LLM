@@ -30,11 +30,28 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 # The active mask has room for as many ranks as the all-to-all kernels support.
 MAX_RANKS = 256
 
+# The membership's timing. A report interval is shorter than a heartbeat interval, which is shorter
+# than the silence timeout, which is shorter than the hang timeout. The admission timeout is shorter
+# than the hang timeout too. The startup checks that the all-to-all kernels wait at least twice the
+# hang timeout.
+
 # Long enough that a slow but healthy host step is not taken as a hang. A hang found during a
 # membership change can take a second timeout to remove, and twice this stays within
 # the default 300 s executor hang detector and all-to-all timeouts.
 HANG_TIMEOUT_S = 60.0
 REPORT_INTERVAL_S = 0.5
+# The authority sends an empty line to a rank that it has sent nothing for this long.
+HEARTBEAT_INTERVAL_S = 5.0
+# The age at which a rank takes the authority as silent. It is half the hang timeout, as the
+# authority takes a rank's reports as stale after half of its own hang timeout.
+AUTHORITY_SILENCE_TIMEOUT_S = HANG_TIMEOUT_S / 2
+# A joining rank that makes no progress in its admission for this long is left out, so a stalled
+# joiner pauses the survivors far less than a hang timeout.
+ADMISSION_TIMEOUT_S = 20.0
+# Longer than a network stall that TCP recovers from. A peer that stays connected but stops making
+# progress is bounded by the hang timeout instead.
+DEAD_TIMEOUT_S = 60.0
+HELLO_TIMEOUT_S = 10.0
 RENDEZVOUS_TIMEOUT_S = 600.0
 # Node supervisors start with the job and connect within seconds of the authority, so one still
 # missing after this is a launch mistake.

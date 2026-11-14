@@ -36,8 +36,10 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 from tensorrt_llm.logger import logger
 
 from .authority import Authority
-from .liveness import HELLO_TIMEOUT_S, Lines, keep_alive
+from .liveness import Lines, keep_alive
 from .records import (
+    HEARTBEAT_INTERVAL_S,
+    HELLO_TIMEOUT_S,
     MAX_RANKS,
     NODE_SUPERVISOR_TIMEOUT_S,
     REPORT_INTERVAL_S,
@@ -62,8 +64,6 @@ from .rendezvous import (
 )
 from .signed_store import SignedStore
 
-# The authority sends an empty line to a rank that it has sent nothing for this long.
-HEARTBEAT_INTERVAL_S = 5.0
 # A peer with more unsent bytes queued than this reads nothing, so its connection is closed.
 _MAX_UNSENT_BYTES = 1 << 22
 # Selector data for rank 0's pipe. End of file on it means rank 0's process ended.

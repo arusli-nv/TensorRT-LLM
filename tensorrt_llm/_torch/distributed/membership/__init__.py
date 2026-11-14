@@ -26,9 +26,6 @@ from .authority import Authority
 from .authority_process import AuthorityProcess
 from .host_weights import host_weights_name, host_weights_prefix
 from .liveness import (
-    AUTHORITY_SILENCE_TIMEOUT_S,
-    DEAD_TIMEOUT_S,
-    HELLO_TIMEOUT_S,
     MembershipClient,
     open_liveness_connection,
     open_node_supervisor_connection,
@@ -36,7 +33,10 @@ from .liveness import (
     rendezvous_store,
 )
 from .records import (
+    AUTHORITY_SILENCE_TIMEOUT_S,
+    DEAD_TIMEOUT_S,
     HANG_TIMEOUT_S,
+    HELLO_TIMEOUT_S,
     NODE_SUPERVISOR_LAUNCH,
     RENDEZVOUS_TIMEOUT_S,
     REPORT_INTERVAL_S,

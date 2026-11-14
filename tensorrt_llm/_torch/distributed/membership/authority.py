@@ -25,6 +25,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from tensorrt_llm.logger import logger
 
 from .records import (
+    ADMISSION_TIMEOUT_S,
     HANG_TIMEOUT_S,
     MAX_RANKS,
     RENDEZVOUS_TIMEOUT_S,
@@ -41,10 +42,6 @@ from .records import (
     next_epoch,
     rank_mask,
 )
-
-# A joining rank that makes no progress in its admission for this long is left out, so a stalled
-# joiner pauses the survivors far less than a hang timeout.
-ADMISSION_TIMEOUT_S = 20.0
 
 
 def _ranks(mask: int) -> List[int]:
@@ -125,12 +122,14 @@ class Authority:
         world_size: int,
         hang_timeout_s: float = HANG_TIMEOUT_S,
         rendezvous_timeout_s: float = RENDEZVOUS_TIMEOUT_S,
+        admission_timeout_s: float = ADMISSION_TIMEOUT_S,
     ):
         if not 0 < world_size <= MAX_RANKS:
             raise ValueError(f"world_size must be in (0, {MAX_RANKS}], got {world_size}")
         self.world_size = world_size
         self.hang_timeout_s = hang_timeout_s
         self.rendezvous_timeout_s = rendezvous_timeout_s
+        self.admission_timeout_s = admission_timeout_s
         self.record = MembershipRecord(
             generation=0, state=MembershipState.STARTING, active_mask=all_ranks(world_size)
         )
@@ -485,7 +484,7 @@ class Authority:
         collective epochs its peers wait on. During a change the ranks that have not replied are
         waited on, and during startup the ranks that have not started. A rank's waits count only
         while its reports advance. Rank 0 idle while waiting for requests is never hung. A joining
-        rank is hung after at most :data:`ADMISSION_TIMEOUT_S`, so the survivors do not pause a full
+        rank is hung after at most the admission timeout, so the survivors do not pause a full
         hang timeout for it.
 
         Also record the failure causes and since when the active ranks stall.
@@ -538,7 +537,9 @@ class Authority:
                     self.stalled_since_s is None or since_s < self.stalled_since_s
                 ):
                     self.stalled_since_s = since_s
-                limit_s = min(timeout_s, ADMISSION_TIMEOUT_S) if r in self._joining else timeout_s
+                limit_s = (
+                    min(timeout_s, self.admission_timeout_s) if r in self._joining else timeout_s
+                )
                 if now_s - since_s > limit_s:
                     failed |= 1 << r
                     self._causes.setdefault(r, "hung")

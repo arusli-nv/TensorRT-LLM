@@ -418,17 +418,30 @@ def test_progressing_install_is_not_hung():
 
 def test_stalled_joiner_left_out_early():
     """Leave out a joining rank that stalls in its admission after the admission timeout."""
-    cluster = Cluster()
+    admission_s = 2.0
+    cluster = Cluster(admission_timeout_s=admission_s)
     cluster.alive.discard(2)
     cluster.run(1.0)
     _join(cluster, 2)
     cluster.hung.add(2)  # ready to join, but it never installs the change that adds it
     cluster.run_until(MembershipState.INSTALL)
     stalled_s = cluster.now
-    record = _first_change(cluster, authority.ADMISSION_TIMEOUT_S + 1.0)
+    record = _first_change(cluster, admission_s + 1.0)
     assert record.state == MembershipState.PROPOSE
     assert record.active_mask == _without(2)
-    assert cluster.now - stalled_s <= authority.ADMISSION_TIMEOUT_S + 0.2
+    assert cluster.now - stalled_s <= admission_s + 0.2
+
+
+def test_membership_timeouts_keep_their_order():
+    """Check the order of the membership's timeouts that its rules rely on."""
+    timing = membership.records
+    assert (
+        timing.REPORT_INTERVAL_S
+        < timing.HEARTBEAT_INTERVAL_S
+        < timing.AUTHORITY_SILENCE_TIMEOUT_S
+        < timing.HANG_TIMEOUT_S
+    )
+    assert timing.ADMISSION_TIMEOUT_S < timing.HANG_TIMEOUT_S
 
 
 def test_unconnected_replacement_join_request_dropped():
