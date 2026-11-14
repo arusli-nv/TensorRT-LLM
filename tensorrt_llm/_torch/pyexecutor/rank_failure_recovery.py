@@ -244,6 +244,17 @@ class RankFailureRecovery:
     def create(cls, executor: PyExecutor) -> RankFailureRecovery:
         """Take over the membership this process joined at startup.
 
+        Called once, on the thread that starts the executor, before its worker thread starts. It:
+
+        - closes the startup record, and checks that no torch.distributed group exists;
+        - on an original rank with an MoE load balancer, checks that the largest failure fits;
+        - publishes this rank's tuned tactics and, on rank 0, the startup record, for replacements;
+        - on an original rank, reports it started and waits until every rank has;
+        - binds the membership client's callbacks to the returned object (:meth:`start`), after
+          which the client thread calls ``_on_record``, ``_on_tick`` and ``_on_client_error``;
+        - on a replacement, runs the change that admits it, and resumes the executor at the
+          iteration where the active ranks resume.
+
         An original rank returns once every rank has started, a replacement once the change that
         adds it is installed.
         """
