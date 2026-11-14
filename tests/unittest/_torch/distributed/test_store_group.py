@@ -23,6 +23,7 @@ import re
 import threading
 
 import pytest
+from _torch.distributed.store_group_test_utils import Unpickled
 from mpi4py import MPI
 from torch.distributed import DistStoreError, TCPStore
 
@@ -285,19 +286,6 @@ def test_hard_kill_ends_only_this_rank(monkeypatch):
     assert kills == []
 
 
-class _Unpickled:
-    """A value whose unpickling runs code, as a forged pickle in the store would."""
-
-    calls = []
-
-    @staticmethod
-    def record():
-        _Unpickled.calls.append("unpickled")
-
-    def __reduce__(self):
-        return (_Unpickled.record, ())
-
-
 @pytest.mark.parametrize("secret", ["ab" * 31, "zz" * 32], ids=["short", "not_hex"])
 def test_store_client_requires_ranks_secret(secret):
     """Refuse a store client, as of the node supervisor or the authority, with a weak secret."""
@@ -311,14 +299,14 @@ def test_forged_store_value_is_never_unpickled(monkeypatch, forger_secret):
     store = _Store()
     forger = store if forger_secret is None else SignedStore(store, forger_secret)
     signed = SignedStore(store, "ab" * 32)
-    monkeypatch.setattr(_Unpickled, "calls", [])
-    forged = pickle.dumps(_Unpickled())
+    monkeypatch.setattr(Unpickled, "calls", [])
+    forged = pickle.dumps(Unpickled())
     # Rank 1's value and arrival at the first call of a group of ranks 0 and 1.
     forger.set("forged/0/1", forged)
     forger.add("forged/0/arrived/0", 1 << 1)
     with pytest.raises(ValueError, match="is not signed with this deployment's"):
         StoreGroup(signed, "forged", 0, [0, 1]).allgather("rank 0")
-    assert _Unpickled.calls == []
+    assert Unpickled.calls == []
     # The deployment's own values pass.
     signed.set("own", forged)
     assert signed.get("own") == forged

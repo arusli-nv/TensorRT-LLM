@@ -31,8 +31,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from _torch.distributed.store_group_test_utils import Unpickled
 from mpi4py import MPI
-from test_store_group import _Unpickled
 from torch.distributed import DistStoreError, TCPStore
 
 from tensorrt_llm import _utils
@@ -748,13 +748,13 @@ def test_forged_worker_args_are_never_unpickled(launched, monkeypatch, forger_se
     if forger_secret is not None:
         forger = SignedStore(forger, forger_secret)
     signed = open_store(f"127.0.0.1:{server.port}", timeout_s=30.0)
-    monkeypatch.setattr(_Unpickled, "calls", [])
-    forged = pickle.dumps(_Unpickled())
+    monkeypatch.setattr(Unpickled, "calls", [])
+    forged = pickle.dumps(Unpickled())
     forger.set(WORKER_ARGS_KEY, forged)
     monkeypatch.setattr(startup_module, "_startup_store", lambda: signed)
     with pytest.raises(ValueError, match="is not signed with this deployment's"):
         startup_module.worker_node_main()
-    assert _Unpickled.calls == []
+    assert Unpickled.calls == []
 
 
 def test_wait_for_keys_checks_while_blocked(store):
