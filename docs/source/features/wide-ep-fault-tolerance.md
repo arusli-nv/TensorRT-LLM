@@ -101,13 +101,16 @@ srun --jobid <job> --overlap -w <host of node i> -N1 -n1 --container-name=<the d
     trtllm-llmapi-launch --rejoin-node <i> --nodes <number of nodes> <the deployment command>
 ```
 
+The flags a step needs depend on the cluster: make sure the step sees the node's GPUs (`nvidia-smi -L`), all of its
+CPUs, and no memory limit lower than the node's, because the replacements write host weights to `/dev/shm`.
+
 `--rejoin-node` makes the node's supervisor wait for the membership authority and start only replacements of the
 node's ranks, which load at once. Until the authority admits it, the supervisor connects again for up to 60 s, which
-covers a previous supervisor of the node that is still exiting. It exits with status 1 in three cases. The deployment
-has not started yet. The deployment's number of ranks is not `--nodes` times the step's GPUs (check `--nodes` and
-the step's GPUs). No authority admitted the node within 60 s, because the deployment ended, the node's previous
-supervisor still runs (check with `ps` and `nvidia-smi`), or the node's ranks are not in the deployment (check
-`--rejoin-node`, `--nodes` and the step's GPUs).
+covers a previous supervisor of the node that is still exiting. It exits with status 1 in four cases. The deployment
+has not started yet. The deployment has ended (shut down or aborted). The deployment's number of ranks is not
+`--nodes` times the step's GPUs (check `--nodes` and the step's GPUs). No authority admitted the node within 60 s,
+because the deployment ended, the node's previous supervisor still runs (check with `ps` and `nvidia-smi`), or the
+node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the step's GPUs).
 
 ## Requests, health and monitoring
 
@@ -141,7 +144,7 @@ supervisor still runs (check with `ps` and `nvidia-smi`), or the node's ranks ar
 
 - Anything outside the requirements is rejected at startup with the reason.
 - Only process failures are covered. A node that crashes or loses power ends the deployment, as does the loss of rank
-  0 or its node, or a 30 s network or CPU stall on node 0. Kubernetes is not supported.
+  0 or its node, or a network or CPU stall of about 28.5 s on node 0. Kubernetes is not supported.
 - While degraded, the survivors give up part of their KV cache memory to the failed ranks' experts, so fewer requests
   fit. A further failure before a replacement rejoins is recovered only if the spare slots and host weights still hold
   every expert.
