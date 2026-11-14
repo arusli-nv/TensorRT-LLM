@@ -337,6 +337,46 @@ def test_attached_frontends_reach_the_launcher_until_they_exit(
     ]
 
 
+def test_launcher_socket_server_keeps_the_graceful_shutdown_timeout(tmp_path, monkeypatch) -> None:
+    """Check that the launcher's Unix socket server bounds its graceful shutdown too.
+
+    A request forwarded by an attached frontend must not keep the launcher waiting without
+    bound after the HTTP server stopped.
+    """
+    configs = []
+
+    class _RecordingServer:
+        def __init__(self, config) -> None:
+            configs.append(config)
+            self.started = True
+            self.should_exit = False
+            self.force_exit = False
+
+        async def serve(self, sockets=None) -> None:
+            self.should_exit = True
+
+    async def stop_attached_frontends(force_exit) -> None:
+        pass
+
+    monkeypatch.setattr(openai_server, "create_uvicorn_server", _RecordingServer)
+    monkeypatch.setattr(openai_server.uvicorn, "Server", _RecordingServer)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+    # A VisualGen server needs no model to load.
+    with mock.patch.object(openai_server, "_is_visual_gen_instance", return_value=True):
+        server = OpenAIServer(
+            generator=SimpleNamespace(),
+            model="dummy",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+            graceful_shutdown_timeout=7,
+            stop_attached_frontends=stop_attached_frontends,
+        )
+    sockets = [SimpleNamespace(family=socket.AF_INET), SimpleNamespace(family=socket.AF_UNIX)]
+    asyncio.run(server("localhost", 0, sockets=sockets))
+    assert [config.timeout_graceful_shutdown for config in configs] == [7, 7]
+
+
 def test_force_exit_kills_attached_frontends_that_still_drain() -> None:
     """Check that a second Ctrl-C ends the wait for attached frontends without a deadline."""
     ignores_sigterm = (

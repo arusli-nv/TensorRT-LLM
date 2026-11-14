@@ -4463,7 +4463,8 @@ class OpenAIServer(_VideoRoutesMixin):
             uvicorn.Config(self.app,
                            lifespan="off",
                            log_level="info",
-                           timeout_keep_alive=TIMEOUT_KEEP_ALIVE))
+                           timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                           **config_kwargs))
 
         async def serve_http() -> None:
             try:
