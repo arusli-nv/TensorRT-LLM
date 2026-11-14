@@ -171,7 +171,7 @@ class Reply(enum.IntEnum):
 class _Message(BaseModel):
     """A membership protocol message, sent as JSON."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class ResumeState(_Message):

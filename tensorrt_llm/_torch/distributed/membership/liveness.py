@@ -252,9 +252,14 @@ class MembershipClient:
                 on_record(self.record)
 
     def report(self, **changes) -> None:
-        """Update report fields and wake the thread to send it."""
+        """Update report fields and wake the thread to send it.
+
+        Raises:
+            pydantic.ValidationError: ``changes`` names a field the report lacks or has a value of
+                the wrong type.
+        """
         with self._lock:
-            self._report = self._report.model_copy(update=changes)
+            self._report = RankReport.model_validate({**self._report.model_dump(), **changes})
         self._wake()
 
     def _wake(self) -> None:

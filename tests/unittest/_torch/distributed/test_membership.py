@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from pydantic import ValidationError
 from torch.distributed import TCPStore
 
 from tensorrt_llm._torch.distributed import membership
@@ -1240,6 +1241,18 @@ def test_rank_ends_on_silent_authority(monkeypatch, resend_s):
         else:
             time.sleep(2 * silence_s)
             assert not errors
+
+
+@pytest.mark.parametrize(
+    "changes", [{"waiting_on": 0b10}, {"progress": "first"}], ids=["unknown", "mistyped"]
+)
+def test_report_rejects_invalid_field(changes):
+    """Refuse a report change that names no report field or has a value of the wrong type."""
+    errors = []
+    with _scripted_client(errors) as client:
+        with pytest.raises(ValidationError):
+            client.report(**changes)
+    assert not errors
 
 
 def test_late_wakeup_keeps_live_authority(monkeypatch):
