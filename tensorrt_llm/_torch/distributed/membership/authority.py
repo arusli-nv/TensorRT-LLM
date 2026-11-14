@@ -20,7 +20,7 @@ report :class:`TransactionSummary` times in Unix milliseconds.
 """
 
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -52,29 +52,53 @@ def _ranks(mask: int) -> List[int]:
     return [r for r in range(mask.bit_length()) if has_rank(mask, r)]
 
 
-def _chain_end(rank: int, waits: Dict[int, int]) -> bool:
-    """Return whether ``rank`` is the end of a wait-for chain, so it may be hung.
+def _chain_ends(ranks: Iterable[int], waits: Dict[int, int]) -> int:
+    """Return a mask of the ``ranks`` that are the end of a wait-for chain, so they may be hung.
 
-    ``waits`` maps each rank to a mask of the ranks it waits on. ``rank`` is an end when every rank
+    ``waits`` maps each rank to a mask of the ranks it waits on. A rank is an end when every rank
     it reaches through ``waits`` also reaches it, so it waits on nobody or only within its cycle.
     A cycle forms when a stopped process's last report names a peer that now waits on it. In
     ``0 -> 2 -> 3 -> 2``, ranks 2 and 3 are ends and rank 0 is not. A rank that waits on a rank
     that waits on nobody is never an end.
+
+    The ends are the strongly connected components that no wait leaves. Tarjan's algorithm finds
+    the components in one depth-first search over the waits.
     """
-    if any(not waits.get(q, 0) for q in _ranks(waits.get(rank, 0))):
-        return False
-
-    def reach(r: int) -> int:
-        reached = frontier = waits.get(r, 0)
-        while frontier:
-            beyond = 0
-            for q in _ranks(frontier):
-                beyond |= waits.get(q, 0)
-            frontier = beyond & ~reached
-            reached |= frontier
-        return reached
-
-    return all(has_rank(reach(q), rank) for q in _ranks(reach(rank)))
+    order: Dict[int, int] = {}
+    low: Dict[int, int] = {}
+    stack: List[int] = []
+    # The ranks whose component is found, and the ends among them.
+    done = ends = 0
+    for root in ranks:
+        if root in order:
+            continue
+        order[root] = low[root] = len(order)
+        stack.append(root)
+        path = [(root, iter(_ranks(waits.get(root, 0))))]
+        while path:
+            r, peers = path[-1]
+            q = next(peers, None)
+            if q is not None:
+                if q not in order:
+                    order[q] = low[q] = len(order)
+                    stack.append(q)
+                    path.append((q, iter(_ranks(waits.get(q, 0)))))
+                elif not has_rank(done, q):
+                    low[r] = min(low[r], order[q])
+                continue
+            path.pop()
+            if path:
+                parent = path[-1][0]
+                low[parent] = min(low[parent], low[r])
+            if low[r] != order[r]:
+                continue
+            component = 0
+            while not has_rank(component, r):
+                component |= 1 << stack.pop()
+            done |= component
+            if not any(waits.get(q, 0) & ~component for q in _ranks(component)):
+                ends |= component
+    return ends
 
 
 def _update_last_change(seen: Dict[int, tuple], rank: int, value, now_s: float) -> float:
@@ -456,7 +480,7 @@ class Authority:
         """Return a mask of active ranks that are dead, or hung for ``timeout_s``.
 
         A rank whose connection closed is dead. A rank is hung when other ranks wait on it, it is
-        the end of a wait-for chain (:func:`_chain_end`), and it made no progress for the timeout.
+        the end of a wait-for chain (:func:`_chain_ends`), and it made no progress for the timeout.
         Progress counts its iteration, install steps, and the all-to-all rounds and host
         collective epochs its peers wait on. During a change the ranks that have not replied are
         waited on, and during startup the ranks that have not started. A rank's waits count only
@@ -494,6 +518,7 @@ class Authority:
                 rounds.setdefault(peer, set()).add(("all-to-all", round_flag))
             for peer, epoch in report.waited_epochs:
                 rounds.setdefault(peer, set()).add(("host exchange", epoch))
+        chain_ends = _chain_ends(active, waits)
         failed = active_mask & ~connected
         for r in _ranks(failed):
             self._causes.setdefault(r, "disconnected")
@@ -504,7 +529,7 @@ class Authority:
             progressed_s = _update_last_change(self._progress, r, progress, now_s)
             # Rank 0 waiting for requests keeps the others' collectives waiting, but is not hung.
             idle = r == 0 and state == MembershipState.COMMITTED and r in waits and report.idle
-            if has_rank(waited_on, r) and not idle and _chain_end(r, waits):
+            if has_rank(waited_on, r) and not idle and has_rank(chain_ends, r):
                 # A rank whose reports stopped advancing has stalled since its last report.
                 stalled_s = now_s if r in waits else self._received_s(r, reports, now_s)
                 since_s = max(self._hung_since.setdefault(r, stalled_s), progressed_s)

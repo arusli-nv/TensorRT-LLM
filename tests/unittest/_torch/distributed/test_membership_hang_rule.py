@@ -31,6 +31,7 @@ empty, so a rank's progress is its iteration.
 """
 
 import itertools
+import random
 
 import pytest
 
@@ -232,6 +233,26 @@ def test_only_chain_ends_are_hung(world):
     assert not mismatches, f"{len(mismatches)} of {count} cases: " + "\n".join(mismatches[:20])
 
 
+def _reachability_chain_ends(world, waits):
+    """Return the mask of the ranks that every rank they reach through the waits reaches back."""
+    reach = dict(waits)
+    changed = True
+    while changed:
+        changed = False
+        for r in range(world):
+            beyond = reach[r]
+            for q in range(world):
+                if reach[r] >> q & 1:
+                    beyond |= reach[q]
+            changed |= beyond != reach[r]
+            reach[r] = beyond
+    ends = 0
+    for r in range(world):
+        if all(reach[q] >> r & 1 for q in range(world) if reach[r] >> q & 1):
+            ends |= 1 << r
+    return ends
+
+
 @pytest.mark.parametrize("world", [2, 3, 4])
 def test_chain_end_matches_reachability(world):
     """Find the chain ends of every wait-for graph, cycles included.
@@ -243,15 +264,22 @@ def test_chain_end_matches_reachability(world):
         waits = {r: 0 for r in range(world)}
         for (r, q), edge in zip(pairs, edges):
             waits[r] |= edge << q
-        reach = dict(waits)
-        for _ in range(world):
-            for r in range(world):
-                for q in range(world):
-                    if reach[r] >> q & 1:
-                        reach[r] |= reach[q]
-        for r in range(world):
-            expected = all(reach[q] >> r & 1 for q in range(world) if reach[r] >> q & 1)
-            assert authority._chain_end(r, waits) == expected, (r, waits)
+        expected = _reachability_chain_ends(world, waits)
+        assert authority._chain_ends(range(world), waits) == expected, waits
+
+
+@pytest.mark.parametrize("world", [8, 32, 64])
+@pytest.mark.parametrize("density", [0.02, 0.1, 0.5])
+def test_chain_ends_match_reachability_on_random_graphs(world, density):
+    """Find the chain ends of random wait-for graphs of many ranks, with chains and cycles."""
+    rng = random.Random(world * 1000 + round(density * 100))
+    for _ in range(20):
+        waits = {
+            r: sum(1 << q for q in range(world) if q != r and rng.random() < density)
+            for r in range(world)
+        }
+        expected = _reachability_chain_ends(world, waits)
+        assert authority._chain_ends(range(world), waits) == expected, waits
 
 
 def test_hang_timer_restarts_after_stall_ends():
