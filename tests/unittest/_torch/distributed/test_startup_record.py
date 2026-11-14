@@ -623,10 +623,23 @@ def _original_rank_0(estimation_num_tokens, final_num_tokens):
 
 
 def _replacement_engine(published, tuned_tactics):
-    """Return the engine of a replacement that replays ``published`` and takes ``tuned_tactics``."""
+    """Return the engine of a replacement that replays ``published``.
+
+    Its predecessor publishes ``tuned_tactics`` in the rendezvous store, and the replacement takes
+    them into its autotuner, as their startups do.
+    """
+    values = {}
+    store = SimpleNamespace(set=values.__setitem__, get=values.__getitem__)
+    with patch.object(startup, "_startup_record", SimpleNamespace(tuned_tactics=tuned_tactics)):
+        startup.publish_tuned_tactics(store, REPLACED)
+    dist = _replacement(published)
     tuner = _new_autotuner()
-    tuner.profiling_cache.merge_cache_data(tuned_tactics)
-    return _DecoderEngine(_replacement(published), measured_ms=0.05, tuner=tuner)
+    with (
+        patch.object(startup, "_startup_record", _record()),
+        patch.object(AutoTuner, "get", return_value=tuner),
+    ):
+        startup._take_tuned_tactics(store, REPLACED)
+    return _DecoderEngine(dist, measured_ms=0.05, tuner=tuner)
 
 
 def test_replacement_runs_warmup_originals_skip():
