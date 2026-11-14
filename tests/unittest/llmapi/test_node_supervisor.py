@@ -24,6 +24,7 @@ import json
 import os
 import secrets
 import select
+import selectors
 import shutil
 import signal
 import socket
@@ -163,7 +164,8 @@ class FakeAuthority:
 
     :meth:`start` opens a rendezvous store that publishes the listener's address. The listener
     accepts node supervisors and sends them the views given to :meth:`push`. Once it sent SHUTDOWN,
-    the fake ranks under ``root`` end. The listener thread runs until :meth:`close`.
+    the fake ranks under ``root`` end. One thread, started with the authority before a test runs,
+    serves every connection until :meth:`close`, so that a test leaves no thread of it behind.
     """
 
     def __init__(self, root):
@@ -186,11 +188,11 @@ class FakeAuthority:
         self.answering = threading.Event()
         self.answering.set()
         self._connections = []
-        self._threads = []
         self._lock = threading.Lock()
         self._view = NodeView(record=_record())
         self._listener = socket.create_server(("127.0.0.1", 0))
-        self._acceptor = self._thread(self._accept)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
 
     def start(self, record=None):
         if record is not None:
@@ -202,40 +204,51 @@ class FakeAuthority:
         self.store.set(LIVENESS_KEY, f"127.0.0.1:{self._listener.getsockname()[1]}".encode())
         return self
 
-    def _thread(self, target, *args):
-        thread = threading.Thread(target=target, args=args, daemon=True)
-        thread.start()
-        self._threads.append(thread)
-        return thread
+    def _serve(self):
+        with selectors.DefaultSelector() as selector:
+            selector.register(self._listener, selectors.EVENT_READ)
+            while True:
+                for key, _ in selector.select():
+                    if key.fileobj is not self._listener:
+                        self._read_reports(selector, key.fileobj, key.data)
+                        continue
+                    try:
+                        sock, _ = self._listener.accept()
+                    except OSError:
+                        return
+                    lines = self._answer_hello(sock)
+                    if lines is not None:
+                        selector.register(sock, selectors.EVENT_READ, lines)
 
-    def _accept(self):
-        while True:
-            try:
-                sock, _ = self._listener.accept()
-            except OSError:
-                return
-            # Nothing follows the hello before the view, so the buffered read takes nothing more.
-            token, *announcement = sock.makefile("rb").readline().decode().split() or [None]
-            if token != self._hello_token:
-                sock.close()
-                continue
-            if self.refusals:
-                self.refusals -= 1
-                sock.close()
-                continue
-            lines = Lines()
-            self.hellos.append(announcement)
-            self.answering.wait()
-            with self._lock:
-                self._connections.append((sock, lines))
-                sock.sendall(lines.encode(self._view.model_dump_json().encode()))
-            self._thread(self._watch, sock, lines)
+    def _answer_hello(self, sock):
+        """Send the view to a supervisor that sent a hello, and return the connection's framing.
 
-    def _watch(self, sock, lines):
+        Return None for a connection that is refused.
+        """
+        # Nothing follows the hello before the view, so the buffered read takes nothing more.
+        token, *announcement = sock.makefile("rb").readline().decode().split() or [None]
+        if token != self._hello_token:
+            sock.close()
+            return None
+        if self.refusals:
+            self.refusals -= 1
+            sock.close()
+            return None
+        lines = Lines()
+        self.hellos.append(announcement)
+        self.answering.wait()
+        with self._lock:
+            self._connections.append((sock, lines))
+            sock.sendall(lines.encode(self._view.model_dump_json().encode()))
+        return lines
+
+    def _read_reports(self, selector, sock, lines):
         with contextlib.suppress(OSError):
-            while data := sock.recv(256):
+            if data := sock.recv(256):
                 for line in lines.decode(data):
                     self.given_up = NodeReport.model_validate_json(line).given_up
+                return
+        selector.unregister(sock)
         self.closed.set()
 
     def push(self, record, stalled_replacements=()):
@@ -248,24 +261,21 @@ class FakeAuthority:
             (self._root / "shutdown").touch()
 
     def close(self):
-        """Close every socket and join the threads.
+        """Join the thread and close every socket.
 
-        Only a shutdown, not a close, wakes a thread blocked on a socket. The listener stops first,
-        so that a connection accepted during the close is shut down too.
+        Only a shutdown, not a close, wakes the thread blocked on the listener. The thread ends
+        first, so that a connection it accepted during the close is shut down too.
         """
         self.answering.set()
         self._reserved.close()
         with contextlib.suppress(OSError):
             self._listener.shutdown(socket.SHUT_RDWR)
-        self._acceptor.join(_JOIN_TIMEOUT_S)
+        self._thread.join(_JOIN_TIMEOUT_S)
         with self._lock:
             sockets = [*(sock for sock, _ in self._connections), self._listener]
         for sock in sockets:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
-        for thread in self._threads:
-            thread.join(_JOIN_TIMEOUT_S)
-        for sock in sockets:
             sock.close()
 
 
