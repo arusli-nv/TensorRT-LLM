@@ -226,14 +226,6 @@ def test_waiting_mask_beyond_first_counter(monkeypatch):
     assert waiting[0] == [1 << 64, 0]
 
 
-def test_missing_communicator_method_named():
-    """Name the communicator methods the group has, for one that main's startup code calls."""
-    group = _group(_Store(), 0, (0, 1))
-    with pytest.raises(AttributeError, match="has no Dup. .* implements only Get_rank"):
-        group.Dup()
-    assert not hasattr(group, "Iprobe")
-
-
 def test_hard_kill_ends_only_this_rank(monkeypatch):
     """Check that the hang detector's hard kill through the group exits only this process."""
     exits, kills = [], []

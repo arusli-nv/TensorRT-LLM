@@ -65,7 +65,7 @@ def wait_for_keys(
 
 
 class StoreGroup(StoreComm):
-    """A communicator of the global ranks ``ranks`` over the rendezvous store.
+    """A subset of an mpi4py communicator of the global ranks ``ranks``, over the rendezvous store.
 
     Only the members in ``active`` take part, and the others' values are None. While a call waits,
     ``on_wait`` gets a mask of active members whose values are missing, and may raise to stop
@@ -226,12 +226,6 @@ class StoreGroup(StoreComm):
             )
         node = self.rank // self._gpus_per_node
         return self.subgroup(r for r in self.membership if r // self._gpus_per_node == node)
-
-    def __getattr__(self, name: str) -> Any:
-        raise AttributeError(
-            f"StoreGroup has no {name}. It implements only Get_rank, Get_size, Abort, allgather, "
-            "allreduce, barrier, bcast, Free, Split and Split_type"
-        )
 
     def _gather(self, prefix: str) -> List[Optional[bytes]]:
         """Return the active members' payloads for call ``prefix``, None for the others."""
