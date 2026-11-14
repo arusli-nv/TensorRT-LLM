@@ -1210,12 +1210,14 @@ def _set_up_engine(monkeypatch, worker, rank_failure_recovery):
     """Set up the worker's engine, whose rank failure recovery is ``rank_failure_recovery``."""
     engine = SimpleNamespace(max_seq_len=None,
                              rank_failure_recovery=rank_failure_recovery)
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.model_loader.construct_checkpoint_loader",
-        Mock())
+    # Patching create_py_executor first imports py_executor_creator, so that
+    # module keeps the real construct_checkpoint_loader after the test.
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.py_executor_creator.create_py_executor",
         Mock(return_value=engine))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.construct_checkpoint_loader",
+        Mock())
     worker._configure_device = Mock()
     worker.setup_engine()
     assert worker.engine is engine
