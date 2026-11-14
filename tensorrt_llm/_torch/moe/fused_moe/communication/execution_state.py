@@ -41,8 +41,10 @@ _ABORT_FLAGS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
 _WAIT_EVIDENCE = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
 _MASK_WORD_BITS = 64
 
-# Execution states keyed by id(ep_group_health), kept while a layer holds them.
-_STATES: weakref.WeakValueDictionary[int, MoeExecutionState] = weakref.WeakValueDictionary()
+# Execution states by EP group health, kept while a layer holds them.
+_STATES: weakref.WeakValueDictionary[EPGroupHealth, MoeExecutionState] = (
+    weakref.WeakValueDictionary()
+)
 
 
 def _mask_words(mask: int) -> tuple[int, ...]:
@@ -106,18 +108,16 @@ class MoeExecutionState:
             EP_MASK_NUM_WORDS, dtype=torch.uint64, pin_memory=prefer_pinned()
         )
         self._mask_staged: torch.cuda.Event | None = None
-        self._workspaces: dict[
-            int, tuple[MembershipWorkspace, Callable[[], None], torch.Tensor]
-        ] = {}
+        self._workspaces: dict[MembershipWorkspace, tuple[Callable[[], None], torch.Tensor]] = {}
         self._layer_resets: list[Callable[[], None]] = []
 
     @staticmethod
     def of(ep_group_health: EPGroupHealth, ep_rank: int, device: torch.device) -> MoeExecutionState:
         """Return the state that every layer over ``ep_group_health`` shares."""
-        state = _STATES.get(id(ep_group_health))
+        state = _STATES.get(ep_group_health)
         if state is None:
             state = MoeExecutionState(ep_group_health, ep_rank, device)
-            _STATES[id(ep_group_health)] = state
+            _STATES[ep_group_health] = state
         elif state.ep_rank != ep_rank or state._device != device:
             raise ValueError("Layers over one EP group health must share their EP rank and device")
         return state
@@ -160,7 +160,7 @@ class MoeExecutionState:
         ``reset_workspace`` resets this rank's row, and ``rows`` is the workspace's
         ``[ep_size, bytes]`` uint8 view.
         """
-        self._workspaces.setdefault(id(workspace), (workspace, reset_workspace, rows))
+        self._workspaces.setdefault(workspace, (reset_workspace, rows))
 
     def staging_workspace(self) -> torch.Tensor:
         """Return the rows of the largest bound workspace.
@@ -168,21 +168,16 @@ class MoeExecutionState:
         The workspace is idle from :meth:`remap_workspaces` until :meth:`rearm`, so restores may
         stage expert weights through it.
         """
-        return max(
-            (rows for _, _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1]
-        )
+        return max((rows for _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1])
 
     def workspace_bytes(self) -> int:
         """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
-        return sum(workspace.local_device_bytes for workspace, _, _ in self._workspaces.values())
+        return sum(workspace.local_device_bytes for workspace in self._workspaces)
 
     def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
         """Return every row if a former member may still write into any bound workspace."""
         return frozenset().union(
-            *(
-                workspace.rows_needing_fresh_pages(comm)
-                for workspace, _, _ in self._workspaces.values()
-            )
+            *(workspace.rows_needing_fresh_pages(comm) for workspace in self._workspaces)
         )
 
     def remap_workspaces(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
@@ -191,7 +186,7 @@ class MoeExecutionState:
         Call only while no rank is in a collective. Every rank must :meth:`rearm` before the next
         collective.
         """
-        for workspace, _, _ in self._workspaces.values():
+        for workspace in self._workspaces:
             workspace.remap(comm, fresh_rows)
 
     def register_layer(self, reset_state: Callable[[], None]) -> None:
@@ -209,7 +204,7 @@ class MoeExecutionState:
         """
         torch.cuda.synchronize(self._device)
         self.abort.zero_()
-        for _, reset, _ in self._workspaces.values():
+        for reset, _ in self._workspaces.values():
             reset()
         for reset_state in self._layer_resets:
             reset_state()
