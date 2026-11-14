@@ -22,7 +22,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from moe_a2a_test_utils import (
+from _torch.moe.moe_a2a_test_utils import (
     a2a_combine,
     a2a_dispatch,
     a2a_workspace,

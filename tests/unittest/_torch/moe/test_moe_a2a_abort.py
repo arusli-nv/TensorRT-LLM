@@ -23,10 +23,11 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 import torch
-from moe_a2a_test_utils import CAPACITY, HIDDEN, a2a_combine, a2a_dispatch, a2a_workspace
+from _torch.moe.moe_a2a_test_utils import CAPACITY, HIDDEN, a2a_combine, a2a_dispatch, a2a_workspace
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm.bindings import internal
@@ -386,6 +387,9 @@ def test_fence_timeout_still_traps() -> None:
     # The child traps on purpose, in a fresh interpreter without the launcher's environment.
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)}
+    # The child imports the shared helpers of the unit tests, as pytest makes them importable.
+    unittest_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (unittest_root, env.get("PYTHONPATH")) if p)
     result = subprocess.run(
         [sys.executable, __file__], env=env, capture_output=True, text=True, timeout=300
     )
