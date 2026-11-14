@@ -26,8 +26,10 @@ These are the main requirements. Startup checks them and others, and rejects a c
 - DeepSeek-V3 or DeepSeek-R1 (`DeepseekV3ForCausalLM`) with the Cutlass MoE backend, or NVFP4 with `backend: CUTEDSL`.
   FP8 checkpoints are not supported.
 - Attention DP with tensor and expert parallelism over all ranks, `NVLinkOneSided` MoE communication, EPLB, KV cache
-  manager V2, the overlap scheduler, MTP or no speculative decoding, and `enable_chunked_prefill` or a `max_seq_len`
-  of at most `max_num_tokens`. Online EPLB (`layer_updates_per_iter` above 0) also needs CDMM mode and GDRCopy.
+  manager V2, the overlap scheduler, MTP with a fixed draft length or no speculative decoding, no `torch_compile_config`
+  and no piecewise prefill CUDA graphs (`prefill_cuda_graph_backend: piecewise`), and `enable_chunked_prefill` or a
+  `max_seq_len` of at most `max_num_tokens`. Online EPLB (`layer_updates_per_iter` above 0) also needs CDMM mode and
+  GDRCopy.
 
 ## Single node
 
@@ -62,7 +64,7 @@ load.
    and `TLLM_FAULT_TOLERANCE_RENDEZVOUS`, a `host:port` of node 0 that every node reaches, with a free port outside the
    ephemeral port range. Keep the secret out of the command line, where other users can read it.
 2. Size `/dev/shm` on every node for the host weights. With static EPLB, a node keeps the experts of one other node,
-   about 46 GB for DeepSeek-R1 NVFP4 on 8 nodes. With online EPLB, it keeps every routed expert, about 364 GB.
+   about 46 GB for DeepSeek-R1 NVFP4 on 8 nodes. With online EPLB, it keeps every routed expert, about 368 GB.
 3. On node 0's host, start `trtllm-llmapi-launch` once per node with `mpirun --enable-recovery` of Open MPI 5, which
    the release container provides. A launch by `srun` of several tasks is rejected, unlike the one-task step that
    returns a lost node (see [Returning a lost node](#returning-a-lost-node)). On Slurm, run `mpirun` in a
@@ -143,5 +145,7 @@ connected. Retry, since the authority drops the old one within 60 s.
 - A replacement takes minutes to rejoin, and one with no startup progress for 10 min is killed and retried. A rank
   whose replacements fail 3 times in a row is given up. A failure before the deployment first serves ends it.
 - Fault tolerance can lower throughput while no rank fails.
+- Online EPLB with DeepSeek-R1 NVFP4 needs about 368 GB of `/dev/shm` on every node (24.8 MB per expert), and
+  startup refuses a node with less, with the reason.
 - A killed job leaves its host weights in `/dev/shm/moe_shared_*` (`<TRTLLM_EPLB_SHM_NAME>_*` when set). Remove them
   before the next job, or give each job its own `/dev/shm`.
