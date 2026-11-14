@@ -31,6 +31,7 @@ import torch
 from torch.distributed import DistStoreError
 
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import (
     RENDEZVOUS_ENV,
     SHARED_SECRET_ENV,
@@ -44,6 +45,8 @@ from tensorrt_llm._torch.distributed.membership import (
 )
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
+from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
     EplbExpertRestore,
     ExpertRestorePlanMismatchError,
@@ -203,9 +206,9 @@ class FakeClient:
 def _executor(rank=0):
     """Return an overlap executor with the steps that rank failure recovery calls."""
     executor = SimpleNamespace(
-        dist=MagicMock(rank=rank, world_size=WORLD, tp_size=WORLD),
+        dist=MagicMock(spec=MnnvlDist, rank=rank, world_size=WORLD, tp_size=WORLD),
         iter_counter=5,
-        hang_detector=Mock(paused=Mock(return_value=False), timeout=300),
+        hang_detector=Mock(spec=HangDetector, paused=Mock(return_value=False), timeout=300),
         executor_request_queue=Mock(wraps=ExecutorRequestQueue(MagicMock(), 8, False, 0)),
         waiting_queue=[],
         canceled_req_ids=[],
@@ -251,7 +254,8 @@ def _bind_moe_state(monkeypatch, r):
 
 
 def _moe_state():
-    moe = MagicMock()
+    moe = MagicMock(spec=MoeExecutionState)
+    moe.health = MagicMock(spec=EPGroupHealth)
     moe.aborted.return_value = False
     moe.waited_flags.return_value = {}
     moe.workspace_bytes.return_value = 0
