@@ -541,6 +541,24 @@ def test_failed_replacement_restarts_until_cannot_start(tmp_path, deployment, mo
     _shut_down(running, authority, active_mask=0b0111)
 
 
+def test_failed_replacements_back_off(monkeypatch):
+    """Delay each replacement by the backoff, doubled per failed one in a row, then give up the rank."""
+    monkeypatch.setattr(supervisor_module, "_BACKOFF_S", 1.0)
+    supervisor = supervisor_module.NodeSupervisor(NODE, NODES, GPUS, [], {})
+    started_s = []
+
+    def cannot_start(rank, replacement):
+        started_s.append(now_s)
+        raise OSError("cannot start")
+
+    monkeypatch.setattr(supervisor, "_start", cannot_start)
+    record = _record(active_mask=0b0111)
+    for now_s in (0.0, 0.9, 1.0, 2.9, 3.0, 100.0):
+        supervisor._replace_when_due(3, record, now_s)
+    assert started_s == [0.0, 1.0, 3.0]
+    assert supervisor._given_up == {3}
+
+
 _INSTALL = "a replacement could not install the change that adds it"
 # The membership gives no reason when it leaves out a hung replacement.
 _HUNG = ""
