@@ -395,10 +395,12 @@ def test_wake_returns_a_waiting_fetch(executor_queue):
     """Test that wake ends a waiting fetch without a request."""
     fetched = []
     waiter = threading.Thread(target=lambda: fetched.append(
-        executor_queue.get_from_request_queue(datetime.timedelta(seconds=30))))
+        executor_queue.get_from_request_queue(datetime.timedelta(seconds=30))),
+                              daemon=True)
     waiter.start()
     executor_queue.wake()
     waiter.join(timeout=5)  # Well before the fetch's own 30 s timeout.
+    assert not waiter.is_alive(), "wake did not end the fetch"
     assert fetched == [[]]
 
 
