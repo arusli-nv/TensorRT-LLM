@@ -640,6 +640,8 @@ def test_collecting_failed_rows_keeps_retry_open(rows_driver, monkeypatch):
     try:
         HostExchangeMnnvlMemory(comm, _SIZE)
     except MnnvlPeerHandleError:
+        # The failed mapping released its own row's handle and the unmapped scratch handle.
+        assert rows_driver.released == [("local", 100), ("local", 101)]
         # The error's traceback keeps the failed object alive during the retry.
         rows_driver.fail_import = False
         rows = HostExchangeMnnvlMemory(comm, _SIZE)

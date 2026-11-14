@@ -593,6 +593,7 @@ class MnnvlMemory:
             members = range(comm.Get_size())
         kept = [None] * comm.Get_size() if mapped_handles is None else list(mapped_handles)
         local_handle = None
+        scratch_handle = None
         exported_handle = None
         pidfds = []
         remote_fds = []
@@ -715,35 +716,31 @@ class MnnvlMemory:
             access_desc = cuda.CUmemAccessDesc()
             access_desc.location = allocation_prop.location
             access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-            scratch_handle = None
+            if absent_rows_on_scratch and len(active) < len(all_handles_data):
+                scratch_handle = _check_cu_result(
+                    cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                )
             for rank, handle_data in enumerate(all_handles_data):
                 rank_ptr = start_address + rank_stride * rank + address_offset
                 if kept[rank] is not None:
-                    if exported_by_rank[rank] is None:
+                    if handle_data is None:
                         raise RuntimeError(
                             f"Rank {members[rank]} left while this rank maps its pages, "
                             "so its row needs fresh pages"
                         )
                     mem_handles[rank] = kept[rank]
                     continue
-                if rank == comm.Get_rank():
-                    handle = local_handle
-                elif exported_by_rank[rank] is not None:
-                    try:
-                        handle = _check_cu_result(
-                            cuda.cuMemImportFromShareableHandle(
-                                handle_data, allocation_prop.requestedHandleTypes
-                            )
-                        )
-                    except RuntimeError as error:
-                        raise MnnvlPeerHandleError([members[rank]], str(error)) from error
-                elif absent_rows_on_scratch:
-                    if scratch_handle is None:
-                        scratch_handle = _check_cu_result(
-                            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
-                        )
-                    handle = scratch_handle
-                else:
+                handle = (
+                    local_handle
+                    if rank == comm.Get_rank()
+                    else cls._peer_row_handle(
+                        handle_data,
+                        allocation_prop.requestedHandleTypes,
+                        members[rank],
+                        scratch_handle,
+                    )
+                )
+                if handle is None:
                     continue
                 mem_handles[rank] = handle
                 _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, handle, 0))
@@ -758,7 +755,7 @@ class MnnvlMemory:
                     logger.warning(f"Failed to unmap incomplete MNNVL allocation: {error}")
 
             handles_to_release = []
-            for handle in [*mem_handles, local_handle]:
+            for handle in [*mem_handles, local_handle, scratch_handle]:
                 # Release each handle once, as the scratch handle backs several rows, and never a
                 # kept handle, which the caller still maps.
                 if handle is not None and all(
@@ -787,6 +784,25 @@ class MnnvlMemory:
                     os.close(int(exported_handle))
                 except OSError as error:
                     logger.warning(f"Failed to close exported MNNVL file descriptor: {error}")
+
+    @staticmethod
+    def _peer_row_handle(
+        handle_data: Any, handle_type: Any, member: int, absent_row_handle: Any
+    ) -> Any:
+        """Return the handle that maps the row of the peer ``member``.
+
+        A peer that exported ``handle_data`` gets its imported handle. An absent peer, whose
+        ``handle_data`` is None, gets ``absent_row_handle``, and None leaves its row unmapped.
+
+        Raises:
+            MnnvlPeerHandleError: The peer's handle could not be imported.
+        """
+        if handle_data is None:
+            return absent_row_handle
+        try:
+            return _check_cu_result(cuda.cuMemImportFromShareableHandle(handle_data, handle_type))
+        except RuntimeError as error:
+            raise MnnvlPeerHandleError([member], str(error)) from error
 
     @staticmethod
     def _init_device() -> int:
