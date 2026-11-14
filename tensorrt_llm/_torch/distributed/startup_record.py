@@ -80,7 +80,13 @@ class StartupRecord:
     still cover it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, report_progress: Callable[[], None] = lambda: None) -> None:
+        """Create an empty record.
+
+        Args:
+            report_progress: Called after each startup step of this rank, such as a replayed
+                collective, an autotuner warmup step or a loaded checkpoint file.
+        """
         self.values: Dict[str, List[Any]] = {}
         self.exchanges: List[RecordedExchange] = []
         # This rank's profiling cache where the recorded collectives start, at the end of its KV cache
@@ -91,7 +97,7 @@ class StartupRecord:
         self._replaying = False
         self._taken: Dict[str, int] = {}
         self._replayed_exchanges = 0
-        self.report_progress: Callable[[], None] = lambda: None
+        self.report_progress = report_progress
         self._pauses = 0
         self._rank_varying: Optional[str] = None
 
@@ -119,16 +125,9 @@ class StartupRecord:
         self._pauses = 0
         self._recording = True
 
-    def replay(
-        self, published: Dict[str, Any], report_progress: Callable[[], None] = lambda: None
-    ) -> None:
-        """Replay the record that rank 0 published until :meth:`close`.
-
-        ``report_progress`` is called after each replayed startup collective, and after each step
-        of this rank's autotuner warmup.
-        """
+    def replay(self, published: Dict[str, Any]) -> None:
+        """Replay the record that rank 0 published until :meth:`close`."""
         self.values, self.exchanges = published["values"], published["exchanges"]
-        self.report_progress = report_progress
         self._replacement = self._replaying = True
 
     def published(self) -> Dict[str, Any]:

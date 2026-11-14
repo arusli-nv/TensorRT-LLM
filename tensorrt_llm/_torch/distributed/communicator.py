@@ -428,6 +428,13 @@ class Distributed(ABC):
         if Distributed.startup_record is not None:
             Distributed.startup_record.resume()
 
+    @staticmethod
+    def report_startup_progress() -> None:
+        """Report a step of this rank's startup, such as a loaded checkpoint
+        file."""
+        if Distributed.startup_record is not None:
+            Distributed.startup_record.report_progress()
+
     def broadcast_int64(self,
                         values: ArrayLike,
                         root: int = 0,

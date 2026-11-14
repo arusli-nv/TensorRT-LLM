@@ -96,7 +96,8 @@ def store(monkeypatch):
 
     monkeypatch.setattr(startup_module, "_startup_store", client)
     monkeypatch.setattr(startup_module, "_client", Mock())
-    monkeypatch.setattr(startup_module, "_startup_record", StartupRecord())
+    record = StartupRecord(report_progress=lambda: startup_module._report_startup_wait(0))
+    monkeypatch.setattr(startup_module, "_startup_record", record)
     yield server.port
 
 

@@ -687,6 +687,15 @@ def test_replacement_warmup_reports_startup_progress():
     _record().close()
 
 
+def test_original_rank_reports_startup_progress(monkeypatch):
+    """Report each startup step of an original rank to the authority."""
+    client = Mock()
+    monkeypatch.setattr(startup, "_client", client)
+    monkeypatch.setattr(startup, "_startup_steps", 0)
+    startup._startup_record.report_progress()
+    client.report.assert_called_once_with(waiting_for=0, progress=1)
+
+
 @pytest.mark.parametrize("cache_file", [False, True])
 def test_replacement_replays_originals_final_warmup(monkeypatch, tmp_path, cache_file):
     """Check a final autotuner warmup that the original ranks run, for a larger token count.
