@@ -1051,16 +1051,15 @@ class Run:
                 ),
                 f"cycle {index}: the status did not read stalled during the hang",
             )
-            # The excluded process runs again under load. It must exit without disturbing others.
-            with contextlib.suppress(psutil.NoSuchProcess):
-                victim.resume()
-                try:
-                    victim.wait(EXCLUDED_EXIT_TIMEOUT_S)
-                except psutil.TimeoutExpired:
-                    self.failures.append(
-                        f"cycle {index}: the excluded process still runs "
-                        f"{EXCLUDED_EXIT_TIMEOUT_S} s after it was resumed"
-                    )
+            # The node supervisor kills the stopped process once the membership drops it, so it
+            # never runs again.
+            try:
+                victim.wait(EXCLUDED_EXIT_TIMEOUT_S)
+            except psutil.TimeoutExpired:
+                self.failures.append(
+                    f"cycle {index}: the excluded process still exists "
+                    f"{EXCLUDED_EXIT_TIMEOUT_S} s after the failover"
+                )
 
         killed_at_admission: List[int] = []
         if at_admission is not None:
