@@ -1032,8 +1032,8 @@ class Run:
         """Fail a rank with ``crash`` or ``hang``, wait for N ranks, and serve a window.
 
         ``at_admission`` returns processes to kill once the store shows the admission in
-        ``at_admission_state``. The ``at_failover_install`` processes are killed once the store
-        shows the failover's INSTALL.
+        ``at_admission_state``, which the suspended joining rank holds open. The
+        ``at_failover_install`` processes are killed once the store shows the failover's INSTALL.
         """
         self.cycles += 1
         d, index = self.deployment, self.cycles
@@ -1106,21 +1106,40 @@ class Run:
 
         killed_at_admission: List[int] = []
         if at_admission is not None:
+            joining = _wait_for_replacement(d, victim.pid)[VICTIM]
             processes = at_admission()
             killed_at_admission = sorted(processes)
-            # Kill them once the store shows the admission, at its first PROPOSE or in that state.
-            states = ("PROPOSE", "INSTALL") if at_admission_state is None else (at_admission_state,)
-            t_admitting, admitting = self.monitor.wait_for(
-                lambda s: s["membership_state"] in states
-                and s["generation"] > failover_status["generation"]
-                and VICTIM in s["active_ranks"],
-                t_degraded,
-                REJOIN_TIMEOUT_S,
+
+            def admitting_in(states: Tuple[str, ...]) -> Callable[[dict], bool]:
+                return lambda s: (
+                    s["membership_state"] in states
+                    and s["generation"] > failover_status["generation"]
+                    and VICTIM in s["active_ranks"]
+                )
+
+            # Suspend the joining rank once the store shows the admission. The admission then
+            # cannot commit, since the joining rank must install it, and the survivors still move
+            # it from PROPOSE to INSTALL, as a joining rank's readiness counts as its reply. The
+            # authority gives a suspended joining rank up only after ADMISSION_TIMEOUT_S.
+            t_admitting, _ = self.monitor.wait_for(
+                admitting_in(("PROPOSE", "INSTALL")), t_degraded, REJOIN_TIMEOUT_S
             )
-            for process in processes.values():
-                process.kill()
-            t_kill = time.monotonic()
-            self.failure_times.append(t_kill)
+            joining.suspend()
+            try:
+                # Kill them in the admission's first PROPOSE or INSTALL, or in that state.
+                states = (
+                    ("PROPOSE", "INSTALL") if at_admission_state is None else (at_admission_state,)
+                )
+                _, admitting = self.monitor.wait_for(
+                    admitting_in(states), t_degraded, RECOVERY_TIMEOUT_S
+                )
+                for process in processes.values():
+                    process.kill()
+                t_kill = time.monotonic()
+                self.failure_times.append(t_kill)
+            finally:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    joining.resume()
             # The kill must land before the admission commits. The admission's generation then never
             # commits, and the next committed record leaves the killed ranks out.
             t_after_kill, after_kill = self.monitor.wait_for(
@@ -1471,6 +1490,11 @@ def test_authority_loss_ends_deployment(tmp_path: Path):
         # Rank 0 ends once its connection to the authority closes, maybe before a probe reads 503.
         assert code in (503, None), f"/health answered {code} after the authority ended"
         assert deployment.launcher.wait(AUTHORITY_LOSS_END_S) != 0
+        # Rank 0 ended because its connection to the authority failed, not for another reason.
+        assert any(
+            "Rank 0 exits: the membership client failed" in line
+            for line in _log_lines(deployment.logs)
+        ), "rank 0 did not log that it exits for the loss of the authority"
 
 
 def _interrupt_server(deployment: Deployment, clients: Clients) -> float:
