@@ -576,16 +576,23 @@ class NodeSupervisor:
         A rank's process that this supervisor started has ended once it is reaped. One that a
         previous supervisor started ends through its parent-death signal, which proves nothing, so
         wait for the GPU, up to the rendezvous timeout. Then give the rank up.
+
+        Any process on the GPU counts. Each rank holds a context only on its own GPU, and NVML may
+        report the PIDs of another PID namespace.
         """
         if rank in self._processes:
             return False
-        local_rank = rank - self._ranks[0]
         visible = self._environ.get("CUDA_VISIBLE_DEVICES")
-        gpu = visible.split(",")[local_rank] if visible else str(local_rank)
-        # A rank this supervisor started belongs to another GPU, even if it holds a context here.
-        started = {process.child.pid for process in self._processes.values()}
+        if visible is None:
+            gpus = [str(index) for index in range(_local_gpu_count(self._environ))]
+        else:
+            gpus = [device for device in visible.split(",") if device]
+        if not gpus:
+            return False
+        # The GPU that the rank's worker selects, as BaseWorker._configure_device does.
+        gpu = gpus[rank % len(gpus)]
         try:
-            pids = [pid for pid in _gpu_compute_processes(gpu) if pid not in started]
+            pids = _gpu_compute_processes(gpu)
         except RuntimeError as error:
             self._logger.warning(f"Cannot check that GPU {gpu} of rank {rank} is free: {error}")
             return False
@@ -1042,9 +1049,16 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
             "trtllm-llmapi-launch, because Slurm's PMIx plugin cancels the job step when one of its "
             "tasks exits"
         )
-    gpus_per_node = args.gpus_per_node or _local_gpu_count(environ)
+    visible_gpus = _local_gpu_count(environ)
+    gpus_per_node = args.gpus_per_node or visible_gpus
     if gpus_per_node <= 0:
         parser.error("this process sees no GPU: give --gpus-per-node")
+    # A replacement starts once no process runs on its rank's GPU, which a rank sharing it would hold.
+    if gpus_per_node > visible_gpus > 0:
+        parser.error(
+            f"--gpus-per-node {gpus_per_node} is more than the {visible_gpus} GPUs this process "
+            "sees: each rank needs a GPU of its own"
+        )
     # This process uses neither MPI nor a GPU, so it skips the library initialization (MPI_Init).
     os.environ.update(
         TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""

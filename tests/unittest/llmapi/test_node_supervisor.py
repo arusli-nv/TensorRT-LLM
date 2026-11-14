@@ -308,6 +308,7 @@ def deployment(tmp_path, monkeypatch):
         "SUPERVISOR_TEST_ROOT": str(tmp_path),
         "OMPI_COMM_WORLD_RANK": "1",
         "PMIX_RANK": "1",
+        "CUDA_VISIBLE_DEVICES": ",".join(map(str, range(GPUS))),
     }
     yield authority, environ
     authority.close()
@@ -913,11 +914,14 @@ def test_restarted_supervisor_replaces_rank_on_free_gpu_only(
     """Replace a rank that this supervisor did not start only once no process runs on its GPU.
 
     The rank's last process ran under the previous supervisor, so only the GPU shows that it ended.
-    The rank is given up if its GPU is still in use after the rendezvous timeout.
+    Any process counts, since NVML may report PIDs of another PID namespace. The GPU is the one the
+    rank's worker selects. The rank is given up if its GPU is still in use after the rendezvous
+    timeout.
     """
     authority, environ = deployment
-    environ.pop("CUDA_VISIBLE_DEVICES", None)
-    in_use = {"0": [4242], "1": [4243] if gpu == "held" else []}
+    # Ranks 2 and 3 of 4 select the third and fourth visible GPU.
+    environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+    in_use = {"6": [4242], "7": [4243] if gpu == "held" else []}
     checks = []
 
     def compute_processes(index):
@@ -936,11 +940,13 @@ def test_restarted_supervisor_replaces_rank_on_free_gpu_only(
         _shut_down(running, authority, active_mask=0b0011, generation=2)
         return
     _until(lambda: _read(tmp_path, 3, 1))
-    # The supervisor checked rank 2's GPU again after it found the GPU in use.
-    _until(lambda: checks.count("0") >= 2)
+    # A PID that equals one of this supervisor's ranks still counts.
+    in_use["6"] = [_read(tmp_path, 3, 1)["pid"]]
+    checked = checks.count("6")
+    # The supervisor checks again only after it acted on a check that read the new list.
+    _until(lambda: checks.count("6") > checked + 1)
     assert _read(tmp_path, 2, 1) is None
-    # Only a rank that this supervisor started still holds a context there.
-    in_use["0"] = [_read(tmp_path, 3, 1)["pid"]]
+    in_use["6"] = []
     _until(lambda: _read(tmp_path, 2, 1))
     assert running.supervisor._given_up == set()
     _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=2)
@@ -1172,6 +1178,8 @@ def _rejected_start(tmp_path, supervisor_process, environ, node=NODE):
             str(GPUS),
             f"mpirun started {GPUS} node supervisors on this node",
         ),
+        # Two ranks would share a GPU.
+        ("CUDA_VISIBLE_DEVICES", "0", f"--gpus-per-node {GPUS} is more than the 1 GPUs"),
     ],
     ids=[
         "unset-secret",
@@ -1179,6 +1187,7 @@ def _rejected_start(tmp_path, supervisor_process, environ, node=NODE):
         "malformed-secret",
         "malformed-rendezvous",
         "per-gpu-launch",
+        "more-ranks-than-gpus",
     ],
 )
 def test_supervisor_rejects_bad_variable(
