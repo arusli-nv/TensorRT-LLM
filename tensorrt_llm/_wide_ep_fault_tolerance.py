@@ -31,6 +31,11 @@ SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
 SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM",)
 # The alternative that each error about an unmet fault tolerance requirement offers.
 TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
+# The MoE backends and checkpoints that fault tolerance supports, named by each error that rejects one.
+SUPPORTED_MOE_CONFIGURATIONS = (
+    "an NVFP4 checkpoint with moe_config.backend set to CUTEDSL (without locality domains or the "
+    "SM107 Rubin kernels) or CUTLASS, a BF16 checkpoint with CUTLASS"
+)
 
 
 def check_node_supervisor_launch(enabled: bool) -> None:

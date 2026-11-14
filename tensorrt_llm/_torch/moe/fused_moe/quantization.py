@@ -34,6 +34,8 @@ from tensorrt_llm._torch.utils import (ActivationType,
                                        swizzle_sf, unswizzle_sf)
 from tensorrt_llm._utils import (get_sm_version, is_device_integrated,
                                  is_sm_100f, is_sm_120f)
+from tensorrt_llm._wide_ep_fault_tolerance import (SUPPORTED_MOE_CONFIGURATIONS,
+                                                   TURN_FAULT_TOLERANCE_OFF)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.functional import \
@@ -386,16 +388,24 @@ class FusedMoEMethodBase(ABC):
     @classmethod
     def _online_eplb_not_supported(cls, module):
         if cls.need_load_shared_weights(module):
-            feature = ('the host weights of Wide-EP fault tolerance'
-                       if module.layer_load_balancer.spare_slot_count else
-                       'online EPLB')
+            cls._reject_spare_slots(module)
             raise NotImplementedError(
-                f'{cls.__name__} doesn\'t support {feature} now')
+                f'{cls.__name__} doesn\'t support online EPLB now')
 
     @classmethod
     def _online_eplb_not_verified(cls, module):
         if cls.need_load_shared_weights(module):
+            cls._reject_spare_slots(module)
             logger.warning(f'{cls.__name__} online EPLB is not verified yet')
+
+    @classmethod
+    def _reject_spare_slots(cls, module):
+        """Reject Wide-EP fault tolerance, whose spare slots load host weights."""
+        if module.layer_load_balancer.spare_slot_count:
+            raise ValueError(
+                f"Wide-EP fault tolerance does not support {cls.__name__} "
+                f"yet. Use {SUPPORTED_MOE_CONFIGURATIONS}, or "
+                f"{TURN_FAULT_TOLERANCE_OFF}.")
 
     def create_weights(
         self,

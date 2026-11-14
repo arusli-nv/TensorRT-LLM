@@ -625,19 +625,27 @@ def test_statistic_routing_layer_has_no_experts_to_load() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("spare_slot_count, feature", [
-    (0, "online EPLB"),
-    (2, "the host weights of Wide-EP fault tolerance"),
-])
-def test_quantization_without_host_weights_names_the_refused_feature(
-        spare_slot_count: int, feature: str) -> None:
-    """A quantization method without host weights names the feature that needs them."""
+@pytest.mark.parametrize(
+    "check", ["_online_eplb_not_supported", "_online_eplb_not_verified"])
+def test_fault_tolerance_rejects_unsupported_quantization(check: str) -> None:
+    """Fault tolerance rejects any method not marked SUPPORTED, with a remedy."""
     module = MagicMock()
     module.layer_load_balancer.need_load_shared_weights.return_value = True
-    module.layer_load_balancer.spare_slot_count = spare_slot_count
+    module.layer_load_balancer.spare_slot_count = 2
+    with pytest.raises(ValueError,
+                       match="turn fault tolerance off .*enable_wide_ep"):
+        getattr(FusedMoEMethodBase, check)(module)
+
+
+@pytest.mark.cpu_only
+def test_online_eplb_without_host_weights_not_supported() -> None:
+    """Without fault tolerance, a method without host weights refuses online EPLB."""
+    module = MagicMock()
+    module.layer_load_balancer.need_load_shared_weights.return_value = True
+    module.layer_load_balancer.spare_slot_count = 0
     with pytest.raises(
             NotImplementedError,
-            match=f"^FusedMoEMethodBase doesn't support {feature} now$"):
+            match="^FusedMoEMethodBase doesn't support online EPLB now$"):
         FusedMoEMethodBase._online_eplb_not_supported(module)
 
 
