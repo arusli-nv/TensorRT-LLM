@@ -109,6 +109,9 @@ srun --jobid <job> --overlap -w <host of node i> -N1 -n1 --container-name=<the d
 
 The flags a step needs depend on the cluster: make sure the step sees the node's GPUs (`nvidia-smi -L`), all of its
 CPUs, and no memory limit lower than the node's, because the replacements write host weights to `/dev/shm`.
+The replacements inherit the step's environment, so run it in the deployment's container image (the same
+`--container-image` and `--container-name`) and do not reset its environment: a replacement without the deployment's
+tools and settings, such as a missing `ptxas`, fails its warmup until the rank is given up.
 
 `--rejoin-node` makes the node's supervisor wait for the membership authority and start only replacements of the
 node's ranks, which load at once. Until the authority admits it, the supervisor connects again for up to 60 s, which
