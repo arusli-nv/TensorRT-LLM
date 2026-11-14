@@ -69,6 +69,9 @@ _spec.loader.exec_module(supervisor_module)
 NODE, NODES, GPUS = 1, 2, 2  # node 1 runs ranks 2 and 3 of 4
 RANKS = (2, 3)
 _JOIN_TIMEOUT_S = 10.0
+# How long a test waits for a supervisor process, which imports TensorRT-LLM (about 10 s) before it
+# starts its ranks or checks its parent and launch variables.
+_SUPERVISOR_START_TIMEOUT_S = 90.0
 _TIMINGS = dict(_CONNECT_TIMEOUT_S=0.5, _STOP_GRACE_S=2.0, _BACKOFF_S=0.05)
 
 
@@ -1094,7 +1097,7 @@ def test_rejoin_ends_with_parent(tmp_path, deployment):
         parent.stdin.close()
         parent.wait()
         parent.stdout.close()
-        _until(lambda: not _alive(supervisor), 10)
+        _until(lambda: not _alive(supervisor), _SUPERVISOR_START_TIMEOUT_S)
     finally:
         if _alive(supervisor):
             os.kill(supervisor, signal.SIGKILL)
@@ -1156,7 +1159,9 @@ def supervisor_process(tmp_path, deployment):
         started.append(supervisor)
         if serving:
             ranks = range(node * GPUS, (node + 1) * GPUS)
-            _until(lambda: all(_read(tmp_path, rank, 0) for rank in ranks))
+            _until(
+                lambda: all(_read(tmp_path, rank, 0) for rank in ranks), _SUPERVISOR_START_TIMEOUT_S
+            )
             authority.start()
             _until(lambda: authority.hellos)
         return supervisor
@@ -1170,7 +1175,7 @@ def supervisor_process(tmp_path, deployment):
 def _rejected_start(tmp_path, supervisor_process, environ, node=NODE):
     """Check that the supervisor exits with status 2 and starts no rank, and return its stderr."""
     supervisor = supervisor_process(environ, node, stderr=subprocess.PIPE, text=True)
-    _, stderr = supervisor.communicate(timeout=60)
+    _, stderr = supervisor.communicate(timeout=_SUPERVISOR_START_TIMEOUT_S)
     assert supervisor.returncode == 2
     assert not list(tmp_path.glob("rank-*.json"))
     return stderr
@@ -1295,7 +1300,7 @@ def test_node_0_ends_job_through_mpirun(tmp_path, deployment, fake_mpirun):
         env=environ,
     )
     try:
-        assert shell.wait(30) == 0
+        assert shell.wait(_SUPERVISOR_START_TIMEOUT_S) == 0
         assert mpirun.wait(10) == -signal.SIGTERM
     finally:
         shell.kill()
@@ -1590,7 +1595,7 @@ def test_exit_skips_connect_in_flight(deployment, monkeypatch, supervisor_proces
         environ[RENDEZVOUS_ENV] = f"127.0.0.1:{silent.getsockname()[1]}"
         supervisor = supervisor_process(environ)
         # The store client connected, and waits for an answer that never comes.
-        assert select.select([silent], [], [], 30)[0]
+        assert select.select([silent], [], [], _SUPERVISOR_START_TIMEOUT_S)[0]
         supervisor.send_signal(signal.SIGTERM)
         assert supervisor.wait(10) == 128 + signal.SIGTERM
 

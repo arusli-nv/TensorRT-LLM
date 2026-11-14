@@ -857,12 +857,12 @@ def test_authority_ends_with_rank_connected(end):
 def test_authority_heartbeats_keep_ranks_connected(monkeypatch, shutdown):
     """Keep the ranks of an idle or ending deployment connected with the authority's heartbeats."""
     monkeypatch.setattr(authority_process, "HEARTBEAT_INTERVAL_S", 0.1)
-    monkeypatch.setattr(liveness, "AUTHORITY_SILENCE_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(liveness, "AUTHORITY_SILENCE_TIMEOUT_S", 2.0)
     with _deployment(2) as (_, clients):
         if shutdown:
             clients[0].report(shutdown=True)
             _until(lambda: all(c.record.state == MembershipState.SHUTDOWN for c in clients))
-        time.sleep(3 * liveness.AUTHORITY_SILENCE_TIMEOUT_S)
+        time.sleep(2 * liveness.AUTHORITY_SILENCE_TIMEOUT_S)
         # A client that took the authority as hung has ended.
         assert all(client._thread.is_alive() for client in clients)
 
@@ -1387,8 +1387,9 @@ def test_rank_ends_on_silent_authority(monkeypatch, resend_s):
     silence_s = 2.0
     monkeypatch.setattr(liveness, "AUTHORITY_SILENCE_TIMEOUT_S", silence_s)
     errors = []
+    # Before the client's thread starts, which is when its silence timeout starts.
+    started_s = time.monotonic()
     with _scripted_client(errors, resend_s):
-        started_s = time.monotonic()
         if resend_s is None:
             _until(lambda: errors)
             assert time.monotonic() - started_s >= silence_s

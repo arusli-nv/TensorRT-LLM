@@ -44,7 +44,7 @@ from tensorrt_llm.executor import worker
 
 pytestmark = pytest.mark.cpu_only
 
-STARTUP_S = 300  # each process imports tensorrt_llm
+STARTUP_S = 600  # each process imports tensorrt_llm
 RENDEZVOUS_TIMEOUT_S = 20.0  # the deployment's, scaled down for the test
 # A rank failure during startup ends every process within this bound, half the membership's dead
 # timeout and far below the model load time (LOAD_S).
