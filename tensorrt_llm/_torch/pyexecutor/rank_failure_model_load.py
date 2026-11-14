@@ -115,7 +115,7 @@ def prepare_model(model: torch.nn.Module) -> None:
 
     check_model_architectures(model.model_config.pretrained_config.architectures)
     # The keys through which get_wide_ep_ft_options (wide_ep_ft.py) takes an EP group health.
-    extra_attrs = getattr(model.model_config, "extra_attrs", {})
+    extra_attrs = model.model_config.extra_attrs
     injected = ("wide_ep_ft_ep_group_health", "ep_group_health")
     check_fault_tolerance_requirements(
         [
@@ -204,8 +204,10 @@ def _check_host_weights_fit(model: torch.nn.Module) -> None:
 
     slot_bytes: Dict[DeploymentHostWeights, List[int]] = {}
     for module in model.modules():
-        sharer = getattr(getattr(module, "layer_load_balancer", None), "host_tensor_sharer", None)
-        if isinstance(module, MoEEplbWeightLayoutMixin) and sharer is not None:
+        if not isinstance(module, MoEEplbWeightLayoutMixin) or module.layer_load_balancer is None:
+            continue
+        sharer = module.layer_load_balancer.host_tensor_sharer
+        if sharer is not None:
             slot_bytes.setdefault(sharer, []).extend(
                 param.numel() // param.shape[0] * param.element_size()
                 for _, param in slot_parameters(module)

@@ -454,6 +454,7 @@ def test_layers_bound_to_one_membership(monkeypatch, replacement) -> None:
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
         mapping=SimpleNamespace(moe_ep_size=4, moe_ep_rank=1),
+        extra_attrs={},
     )
     prepare_model(model)
     (state,), (other,) = (comm.bind_execution_state.call_args.args for comm in comms)

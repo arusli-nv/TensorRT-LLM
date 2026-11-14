@@ -239,8 +239,8 @@ class RankFailureRecovery:
         self._install_steps = 0
         self._published_admissions: List[int] = []
         self._interrupted: List[LlmRequest] = []
-        # Per request, the outputs mark at the first step discarded since the last recompute.
-        self._discarded_marks: Dict[int, Tuple[LlmRequest, PyResult.OutputsMark]] = {}
+        # Per request id, the outputs mark at the first step discarded since the last recompute.
+        self._discarded_marks: Dict[int, PyResult.OutputsMark] = {}
         exchange.set_interrupt_handler(self._membership_changing, self._on_exchange_interrupt)
 
     @classmethod
@@ -985,7 +985,7 @@ class RankFailureRecovery:
         for request, mark in batch.outputs_marks:
             # The next step in flight was marked after this step's outputs, so it rewinds to the
             # first discarded step's mark too.
-            _, first_mark = self._discarded_marks.setdefault(id(request), (request, mark))
+            first_mark = self._discarded_marks.setdefault(request.py_request_id, mark)
             request.py_result.rewind_outputs(first_mark)
         return False
 
@@ -1030,12 +1030,13 @@ class RankFailureRecovery:
 
     def _recompute_interrupted_requests(self) -> int:
         """Pause the discarded steps' requests for recompute like a preemption and count them."""
-        interrupted, self._interrupted = {id(request) for request in self._interrupted}, []
+        interrupted = {request.py_request_id for request in self._interrupted}
+        self._interrupted = []
         self._discarded_marks = {}
         requests = [
             request
             for request in self._executor.active_requests
-            if id(request) in interrupted and self._recomputable(request)
+            if request.py_request_id in interrupted and self._recomputable(request)
         ]
         self._executor.recompute_requests(requests)
         return len(requests)
