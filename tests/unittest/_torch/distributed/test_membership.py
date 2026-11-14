@@ -1286,7 +1286,10 @@ def _scripted_authority(listener, resend_s, stop):
 
 @contextlib.contextmanager
 def _scripted_client(errors, resend_s=None):
-    """Yield a started client of rank 0, connected to a scripted authority."""
+    """Yield a started client of rank 0, connected to a scripted authority.
+
+    The authority closes the connection first on exit, so the client may then add an error.
+    """
     store = DictStore()
     stop = threading.Event()
     with socket.create_server(("127.0.0.1", 0)) as listener:
@@ -1331,7 +1334,7 @@ def test_report_rejects_invalid_field(changes):
     with _scripted_client(errors) as client:
         with pytest.raises(ValidationError):
             client.report(**changes)
-    assert not errors
+        assert not errors
 
 
 def test_client_holds_first_record_after_start(monkeypatch):
@@ -1365,7 +1368,7 @@ def test_late_wakeup_keeps_live_authority(monkeypatch):
     errors = []
     with _scripted_client(errors, resend_s=0.1):
         _until(lambda: errors or len(calls) > 2)
-    assert not errors
+        assert not errors
 
 
 def test_callback_error_logged_with_traceback(monkeypatch):
