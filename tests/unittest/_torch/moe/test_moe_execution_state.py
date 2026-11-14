@@ -382,9 +382,13 @@ def test_bound_layers_pass_state_records(monkeypatch) -> None:
 
 
 def _moe_layer(cls: type, **attributes) -> torch.nn.Module:
-    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it."""
+    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it.
+
+    Like a layer built without EPLB, it has no load balancer.
+    """
     layer = cls.__new__(cls)
     torch.nn.Module.__init__(layer)
+    layer.layer_load_balancer = None
     for name, value in attributes.items():
         setattr(layer, name, value)
     return layer
