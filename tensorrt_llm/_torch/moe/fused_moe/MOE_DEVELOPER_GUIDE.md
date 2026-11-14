@@ -236,6 +236,8 @@ Given an `ep_group_health`, `NVLinkOneSided` runs in rank-mask mode, as it does 
 
 Under `enable_wide_ep_fault_tolerance`, a communication backend binds to the shared `MoeExecutionState` (`bind_execution_state`), which owns the device rank mask and a pinned host abort state. Its kernels read the active-rank mask through that state's fixed device pointer, so captured CUDA graphs follow membership changes, and stop waiting on a peer once the state's abort request is set. A fence-path kernel that waits on a peer for longer than about 10 ms publishes the round flag it waits for in the abort state, which the rank reports to the membership authority. `NVLinkOneSided` is the only backend that implements this. A MoE backend runs with the unbacked spare EPLB slots of fault tolerance only if it declares `supports_spare_slots`: its autotuner profiles only the active slots (`tuner_layout_kwargs`).
 
+For the membership changes, recovery and expert restore around these pieces, see the [Wide-EP Fault Tolerance Developer Guide](../../distributed/membership/FAULT_TOLERANCE_DEVELOPER_GUIDE.md).
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components
