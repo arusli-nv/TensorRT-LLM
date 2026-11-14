@@ -933,6 +933,7 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
     from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
 
     events = []
+    authority = Mock()
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,4,0")
     # Two nodes, so the rendezvous host must resolve to an address that the other node reaches.
     monkeypatch.setenv(RENDEZVOUS_ENV, "192.0.2.1:29600")
@@ -940,7 +941,7 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
         startup_module,
         "_start_authority",
         lambda world_size, gpus_per_node, timeout_s: (
-            events.append(("authority", world_size, gpus_per_node)) or Mock()
+            events.append(("authority", world_size, gpus_per_node)) or authority
         ),
     )
     monkeypatch.setattr(
@@ -965,6 +966,8 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
     }
     startup_module.start_rank(args)
     assert events == [("authority", 8, 4), ("join", True, 0)]
+    # Rank 0 hands its authority process to the executor, which waits for it to end at shutdown.
+    assert startup_module.authority_process() is authority
     # Rank 0 records its startup for the replacements.
     record = startup_module._state.record
     assert record.agree("rank_hosts", lambda: ["a"] * WORLD) == ["a"] * WORLD
