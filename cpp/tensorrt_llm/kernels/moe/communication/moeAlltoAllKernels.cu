@@ -395,6 +395,7 @@ struct AbortPoll
 };
 
 //! Set up the block's AbortPoll, or return nullptr without ENABLE_RANK_MASK.
+//! Call from one warp per block only.
 template <bool ENABLE_RANK_MASK>
 __device__ __forceinline__ AbortPoll* start_abort_poll(int lane_id)
 {
