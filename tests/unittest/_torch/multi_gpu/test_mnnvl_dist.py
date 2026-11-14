@@ -406,12 +406,16 @@ def _change_without_loss(tp):
 
 
 def _backoff(tp):
-    """Check that a wait on a late peer sleeps between polls after its spin, so it uses little CPU."""
+    """Check that a wait on a late peer sleeps between polls after its spin, so it uses little CPU.
+
+    A wait that polled back to back would keep its thread on the CPU for the whole wait, so the
+    check compares the thread's CPU time with the wait's duration, which a slow node lengthens.
+    """
     mnnvl, _, rank = _dists(tp)
     for idle in (False, True):
         mnnvl.barrier()
         MPI.COMM_WORLD.barrier()
-        started_s = time.thread_time()
+        started_s, started_cpu_s = time.monotonic(), time.thread_time()
         if rank == 0:
             # Far longer than a spin, so that every other rank's wait sleeps.
             time.sleep(1.0)
@@ -420,7 +424,8 @@ def _backoff(tp):
         else:
             assert mnnvl.allgather(rank) == list(range(tp))
         if rank != 0:
-            assert time.thread_time() - started_s < 0.2, idle
+            cpu_s, wait_s = time.thread_time() - started_cpu_s, time.monotonic() - started_s
+            assert cpu_s < wait_s / 2, (idle, cpu_s, wait_s)
 
 
 def _payload_rows(tp):
@@ -489,9 +494,12 @@ def _bursty_thread(tp):
     """Check that a thread with bursts of Python work delays an exchange by one GIL handover at most.
 
     A wait that released the GIL around each driver call would hand it over three times or more.
+    Each handover waits for the switch interval, which the check makes long against the
+    scheduling delays of a shared node.
     """
     exchange = _local_exchange(1)
-    switch_s = sys.getswitchinterval()
+    default_switch_s, switch_s = sys.getswitchinterval(), 50e-3
+    sys.setswitchinterval(switch_s)
     stop, bursting = threading.Event(), threading.Event()
 
     def bursts():
@@ -507,17 +515,20 @@ def _bursty_thread(tp):
     thread = threading.Thread(target=bursts, daemon=True)
     thread.start()
     try:
-        for step in range(600):
+        step = 0
+        while min(len(in_burst), len(between)) <= 20:
+            assert thread.is_alive()
             # The executor waits for the GPU between collectives.
             time.sleep(1e-3)
             durations = in_burst if bursting.is_set() else between
             started_s = time.perf_counter()
             assert exchange.exchange(b"%d" % step) == [b"%d" % step]
             durations.append(time.perf_counter() - started_s)
+            step += 1
     finally:
         stop.set()
         thread.join()
-    assert len(in_burst) > 20 and len(between) > 20, (len(in_burst), len(between))
+        sys.setswitchinterval(default_switch_s)
     assert np.median(in_burst) < 2 * switch_s, sorted(in_burst)
     assert np.median(between) < switch_s / 2, sorted(between)
 
@@ -535,14 +546,14 @@ def _abort_wait(tp):
     epoch = next_epoch(exchange.epoch)
     _write_slot(exchange, bytes(4096), 0, 2, epoch)
     changing = threading.Event()
-    checks, woken_s, stopped_s, waiting_for = [], [], [], []
+    checks, stopped_at_check, waiting_for = [], [], []
 
     def interrupted():
         checks.append(changing.is_set())
         return changing.is_set()
 
     def on_interrupt():
-        stopped_s.append(time.perf_counter())
+        stopped_at_check.append(len(checks))
         raise _Stopped
 
     exchange.set_interrupt_handler(interrupted, on_interrupt)
@@ -553,7 +564,6 @@ def _abort_wait(tp):
         _polled_again(exchange, checks)
         waiting_for.append(exchange.waiting_for)
         changing.set()
-        woken_s.append(time.perf_counter())
         exchange.wake()
 
     client = threading.Thread(target=membership_client, daemon=True)
@@ -563,9 +573,10 @@ def _abort_wait(tp):
     client.join()
     assert waiting_for == [0b010]
     assert checks == [False, False, False, True]
+    # The wait stopped once, at the first check that held.
+    assert stopped_at_check == [4]
     # The wakes that did not stop the wait did not restart its round either.
     assert exchange.stopped_epoch == epoch
-    assert stopped_s[0] - woken_s[0] < 0.05
     assert exchange.waiting_for == 0
 
 
