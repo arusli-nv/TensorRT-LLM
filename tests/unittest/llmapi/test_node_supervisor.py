@@ -804,6 +804,33 @@ def test_late_store_keeps_first_connection(tmp_path, deployment, monkeypatch):
     _shut_down(running, authority)
 
 
+def test_first_connect_waits_without_polling(tmp_path, deployment, held_connect, monkeypatch):
+    """Wait for a first connect that outlasts the connect timeout on the connect itself."""
+
+    class RecordingSelector(selectors.DefaultSelector):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        def select(self, timeout=None):
+            self.timeouts.append(timeout)
+            return super().select(timeout)
+
+    monkeypatch.setattr(supervisor_module.selectors, "DefaultSelector", RecordingSelector)
+    authority, environ = deployment
+    authority.start(_record(MembershipState.STARTING))
+    held_connect.hold.set()
+    running = Running(tmp_path, environ)
+    _until(held_connect.held.is_set)
+    timeouts = running.supervisor._selector.timeouts
+    _until(lambda: timeouts)
+    # Only the connect's end wakes the loop, so it waits once and with no timeout.
+    assert timeouts == [None]
+    held_connect.finish()
+    _until(lambda: running.supervisor._view is not None)
+    _shut_down(running, authority)
+
+
 def test_refused_reconnect_retried_after_start(tmp_path, deployment):
     """Connect again, and keep the ranks, when the authority refuses a reconnect after the start.
 

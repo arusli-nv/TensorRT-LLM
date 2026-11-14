@@ -187,11 +187,8 @@ class NodeSupervisor:
             while self._signum is None and (
                 self._connecting is not None or self._connection_awaiting_view is not None
             ):
-                if self._connection_awaiting_view is not None:
-                    self._deadlines_s = [self._view_due_s]
-                else:
-                    self._deadlines_s = [self._connect_due_s]
                 self._wait()
+                self._deadlines_s = []
                 self._take_connection()
                 self._check_first_view(time.monotonic())
             if self._signum is not None:
@@ -592,8 +589,8 @@ class NodeSupervisor:
     def _connect(self) -> None:
         """Start connecting to the authority, whose first view then arrives as an event.
 
-        Reaching the store and sending the hello are bounded by the connect timeout. The first view
-        may take up to the protocol's hello timeout. The supervisor keeps taking events meanwhile.
+        The connect wakes the loop when it ends, with a connection or an error. The first view may
+        take up to the protocol's hello timeout. The supervisor keeps taking events meanwhile.
         """
         self._connect_due_s = time.monotonic() + _CONNECT_TIMEOUT_S
         self._connecting = concurrent.futures.Future()
