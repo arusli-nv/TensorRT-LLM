@@ -47,12 +47,9 @@ from .records import (
 ADMISSION_TIMEOUT_S = 20.0
 
 
-def _ranks_in(mask: int):
-    """Yield the ranks set in ``mask``, lowest first."""
-    while mask:
-        low = mask & -mask
-        yield low.bit_length() - 1
-        mask ^= low
+def _ranks(mask: int) -> List[int]:
+    """Return the ranks set in ``mask``, lowest first."""
+    return [r for r in range(mask.bit_length()) if has_rank(mask, r)]
 
 
 def _chain_end(rank: int, waits: Dict[int, int]) -> bool:
@@ -64,20 +61,20 @@ def _chain_end(rank: int, waits: Dict[int, int]) -> bool:
     ``0 -> 2 -> 3 -> 2``, ranks 2 and 3 are ends and rank 0 is not. A rank that waits on a rank
     that waits on nobody is never an end.
     """
-    if any(not waits.get(q, 0) for q in _ranks_in(waits.get(rank, 0))):
+    if any(not waits.get(q, 0) for q in _ranks(waits.get(rank, 0))):
         return False
 
     def reach(r: int) -> int:
         reached = frontier = waits.get(r, 0)
         while frontier:
             beyond = 0
-            for q in _ranks_in(frontier):
+            for q in _ranks(frontier):
                 beyond |= waits.get(q, 0)
             frontier = beyond & ~reached
             reached |= frontier
         return reached
 
-    return all(has_rank(reach(q), rank) for q in _ranks_in(reach(rank)))
+    return all(has_rank(reach(q), rank) for q in _ranks(reach(rank)))
 
 
 def _update_last_change(seen: Dict[int, tuple], rank: int, value, now_s: float) -> float:
@@ -187,7 +184,7 @@ class Authority:
             return None if s is None else now_unix_ms + (s - now_s) * 1e3
 
         began_s = self._transaction_began_s
-        removed = tuple(self._ranks(committed & ~record.active_mask))
+        removed = tuple(_ranks(committed & ~record.active_mask))
         if record.state == MembershipState.ABORTED:
             kind = "abort"
         else:
@@ -198,7 +195,7 @@ class Authority:
             outcome=record.state.name,
             removed_ranks=removed,
             causes={r: self._causes[r] for r in removed if r in self._causes},
-            added_ranks=tuple(self._ranks(record.active_mask & ~committed)),
+            added_ranks=tuple(_ranks(record.active_mask & ~committed)),
             detected_unix_ms=unix_ms(began_s if self._detected_s is None else self._detected_s),
             began_unix_ms=unix_ms(began_s),
             ready_unix_ms=unix_ms(self._ready_s),
@@ -222,7 +219,7 @@ class Authority:
             return self._await_startup(now_s, reports, connected)
         failed = self._detect_failures(now_s, reports, connected, self.hang_timeout_s)
         # A replacement that disconnects or fails withdraws its join request.
-        self._forget_joins(failed | ~connected)
+        self._forget_joins((failed | ~connected) & all_ranks(self.world_size))
         if state == MembershipState.COMMITTED:
             return self._start_change(now_s, reports, failed)
         if failed:
@@ -230,7 +227,7 @@ class Authority:
         return self._advance_change(now_s, reports)
 
     def _forget_joins(self, gone_mask: int) -> None:
-        gone = set(self._ranks(gone_mask))
+        gone = set(_ranks(gone_mask))
         self._requested -= gone
         self._joining -= gone
 
@@ -266,7 +263,7 @@ class Authority:
         left out.
         """
         state = self.record.state
-        active = self._ranks(self.record.active_mask)
+        active = _ranks(self.record.active_mask)
         failed_replies = {r for r in active if self._rank_replied(r, reports, Reply.FAILED)}
         failed_survivors = failed_replies - self._joining
         if failed_survivors:
@@ -324,7 +321,7 @@ class Authority:
         record = self.record
         self._joining -= set(active)
         self._replaced_install_epoch = 0
-        for r in self._ranks(self._committed_mask & ~record.active_mask):
+        for r in _ranks(self._committed_mask & ~record.active_mask):
             self._failed_in[r] = record.generation
         for r in active:
             self._failed_in.pop(r, None)
@@ -349,15 +346,15 @@ class Authority:
         failed = self._detect_failures(now_s, reports, connected, self.rendezvous_timeout_s)
         if failed & self._connected_once:
             return self.abort(
-                f"ranks {self._ranks(failed & self._connected_once)} failed during the startup"
+                f"ranks {_ranks(failed & self._connected_once)} failed during the startup"
             )
         absent = everyone & ~self._connected_once
         if absent and now_s - self._rendezvous_began_s > self.rendezvous_timeout_s:
             return self.abort(
-                f"ranks {self._ranks(absent)} did not reach the rendezvous within "
+                f"ranks {_ranks(absent)} did not reach the rendezvous within "
                 f"{self.rendezvous_timeout_s:.0f} s"
             )
-        if absent or not all(reports.get(r, RankReport()).started for r in self._ranks(everyone)):
+        if absent or not all(reports.get(r, RankReport()).started for r in _ranks(everyone)):
             return None
         logger.info("Every rank started")
         self._progress.clear()
@@ -470,7 +467,7 @@ class Authority:
         Also record the failure causes and since when the active ranks stall.
         """
         state, active_mask = self.record.state, self.record.active_mask
-        active = self._ranks(active_mask)
+        active = _ranks(active_mask)
         expected = {MembershipState.PROPOSE: Reply.READY, MembershipState.INSTALL: Reply.INSTALLED}
         waited_on = 0
         if state in expected:
@@ -498,7 +495,7 @@ class Authority:
             for peer, epoch in report.waited_epochs:
                 rounds.setdefault(peer, set()).add(("host exchange", epoch))
         failed = active_mask & ~connected
-        for r in _ranks_in(failed):
+        for r in _ranks(failed):
             self._causes.setdefault(r, "disconnected")
         self.stalled_since_s = None
         for r in active:
@@ -539,11 +536,8 @@ class Authority:
             report = reports.get(r, RankReport())
             described.append(
                 f"rank {r}: iteration {report.progress}, idle {report.idle}, waits for "
-                f"{self._ranks(waits.get(r, 0))}, all-to-all rounds {list(report.waited_flags)}, "
+                f"{_ranks(waits.get(r, 0))}, all-to-all rounds {list(report.waited_flags)}, "
                 f"host-exchange epochs {list(report.waited_epochs)}, reported "
                 f"{now_s - self._received_s(r, reports, now_s):.1f} s ago"
             )
         return "; ".join(described)
-
-    def _ranks(self, mask: int) -> List[int]:
-        return [r for r in range(self.world_size) if has_rank(mask, r)]

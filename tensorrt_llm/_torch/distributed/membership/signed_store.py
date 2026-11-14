@@ -53,7 +53,7 @@ def parse_shared_secret(secret: str) -> bytes:
 
 def shared_secret_digest(label: bytes) -> str:
     """Return the hex HMAC-SHA256 of ``label`` keyed by the shared secret in ``SHARED_SECRET_ENV``."""
-    secret = bytes.fromhex(os.environ[SHARED_SECRET_ENV])
+    secret = parse_shared_secret(os.environ[SHARED_SECRET_ENV])
     return hmac.new(secret, label, hashlib.sha256).hexdigest()
 
 
@@ -103,11 +103,8 @@ class SignedStore:
     def check(self, keys: List[str]) -> bool:
         return self._store.check(keys)
 
-    def wait(self, keys: List[str], timeout: Optional[timedelta] = None) -> None:
-        if timeout is None:
-            self._store.wait(keys)
-        else:
-            self._store.wait(keys, timeout)
+    def wait(self, keys: List[str], timeout: timedelta) -> None:
+        self._store.wait(keys, timeout)
 
     def add(self, key: str, amount: int) -> int:
         return self._store.add(key, amount)

@@ -500,10 +500,8 @@ def launched(monkeypatch):
     monkeypatch.setattr(startup_module, "_join_at_entry", lambda store, identity: None)
 
 
-_SECRET_OR_RENDEZVOUS = (
-    f"hex shared secret in {SHARED_SECRET_ENV} and host:port in {RENDEZVOUS_ENV}"
-)
-_SHORT_SECRET = f"shared secret of at least 32 bytes in {SHARED_SECRET_ENV}"
+_SECRET_OR_RENDEZVOUS = f"shared secret in {SHARED_SECRET_ENV} and host:port in {RENDEZVOUS_ENV}"
+_SHORT_SECRET = f"shared secret of at least 32 bytes (64 hex digits) in {SHARED_SECRET_ENV}"
 
 
 @pytest.mark.parametrize(
@@ -513,8 +511,8 @@ _SHORT_SECRET = f"shared secret of at least 32 bytes in {SHARED_SECRET_ENV}"
         ({RENDEZVOUS_ENV: "head-node"}, _SECRET_OR_RENDEZVOUS),
         ({RENDEZVOUS_ENV: "head-node:port"}, _SECRET_OR_RENDEZVOUS),
         ({SHARED_SECRET_ENV: None}, _SECRET_OR_RENDEZVOUS),
-        ({SHARED_SECRET_ENV: "not hex"}, _SECRET_OR_RENDEZVOUS),
         # The authority admits only processes that hold the secret.
+        ({SHARED_SECRET_ENV: "not hex"}, _SHORT_SECRET),
         ({SHARED_SECRET_ENV: ""}, _SHORT_SECRET),
         ({SHARED_SECRET_ENV: "ab" * 31}, _SHORT_SECRET),
     ],

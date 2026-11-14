@@ -129,10 +129,10 @@ class AuthorityProcess:
         # The ranks that no replacement is started for, which every published record carries.
         self._given_up_mask = 0
 
-    def run(self, host: str, port: int = 0) -> MembershipRecord:
+    def run(self, host: str) -> MembershipRecord:
         """Serve on ``host`` until the record is ABORTED or SHUTDOWN, and return that record."""
         try:
-            with socket.create_server((host, port)) as listener:
+            with socket.create_server((host, 0)) as listener:
                 listener.setblocking(False)
                 self._selector.register(listener, selectors.EVENT_READ)
                 if self._parent is not None:

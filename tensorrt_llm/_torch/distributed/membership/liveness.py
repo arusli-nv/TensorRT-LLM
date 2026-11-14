@@ -123,8 +123,8 @@ def _warn_while_no_authority(store: SignedStore) -> None:
 def _open_connection(store: SignedStore, announcement: str, timeout_s: float) -> LivenessConnection:
     """Open a connection to the authority and send the hello that carries ``announcement``."""
     _warn_while_no_authority(store)
-    host, port = store.get(LIVENESS_KEY).decode().rsplit(":", 1)
-    sock = socket.create_connection((host, int(port)), timeout=timeout_s)
+    address = rendezvous_host_port(store.get(LIVENESS_KEY).decode())
+    sock = socket.create_connection(address, timeout=timeout_s)
     keep_alive(sock)
     lines = Lines()
     sock.sendall(lines.encode(f"{hello_token()} {announcement}".encode()))
@@ -133,10 +133,10 @@ def _open_connection(store: SignedStore, announcement: str, timeout_s: float) ->
 
 
 def open_liveness_connection(
-    store: SignedStore, rank: int, replacement: bool = False, timeout_s: float = HELLO_TIMEOUT_S
+    store: SignedStore, rank: int, replacement: bool = False
 ) -> LivenessConnection:
     """Open this process's liveness connection to the authority for ``rank``."""
-    connection = _open_connection(store, f"{rank} {int(replacement)}", timeout_s)
+    connection = _open_connection(store, f"{rank} {int(replacement)}", HELLO_TIMEOUT_S)
     close_in_forked_child(connection.sock)
     return connection
 

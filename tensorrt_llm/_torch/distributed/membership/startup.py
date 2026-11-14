@@ -53,7 +53,7 @@ from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart, S
 from .liveness import MembershipClient, close_in_forked_child, rendezvous_store
 from .records import RENDEZVOUS_TIMEOUT_S, MembershipRecord, MembershipState, launcher_free_env
 from .rendezvous import StoreGroup, rendezvous_host_port
-from .signed_store import SHARED_SECRET_BYTES, SignedStore
+from .signed_store import SHARED_SECRET_BYTES, SignedStore, parse_shared_secret
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
@@ -139,19 +139,17 @@ def _warn_if_ephemeral(address: str) -> None:
 def _launched_rank() -> RankIdentity:
     """Return this process's rank after checking the shared secret and rendezvous address."""
     try:
-        secret = bytes.fromhex(os.environ[SHARED_SECRET_ENV])
-        int(os.environ[RENDEZVOUS_ENV].rsplit(":", 1)[1])
-    except (KeyError, IndexError, ValueError):
+        secret = os.environ[SHARED_SECRET_ENV]
+        rendezvous_host_port(os.environ[RENDEZVOUS_ENV])
+    except (KeyError, ValueError):
         raise ValueError(
-            f"Wide-EP fault tolerance requires a hex shared secret in {SHARED_SECRET_ENV} and "
+            f"Wide-EP fault tolerance requires a shared secret in {SHARED_SECRET_ENV} and "
             f"host:port in {RENDEZVOUS_ENV} on every rank, or {TURN_FAULT_TOLERANCE_OFF}"
         ) from None
-    if len(secret) < SHARED_SECRET_BYTES:
-        raise ValueError(
-            "Wide-EP fault tolerance requires a shared secret of at least "
-            f"{SHARED_SECRET_BYTES} bytes in {SHARED_SECRET_ENV}, not {len(secret)}. Set a longer "
-            f"one or {TURN_FAULT_TOLERANCE_OFF}"
-        )
+    try:
+        parse_shared_secret(secret)
+    except ValueError as error:
+        raise ValueError(f"{error}. Set it on every rank, or {TURN_FAULT_TOLERANCE_OFF}") from None
     identity = _rank_identity()
     if identity.world_size > identity.gpus_per_node:
         _check_rendezvous_reachable(os.environ[RENDEZVOUS_ENV])
