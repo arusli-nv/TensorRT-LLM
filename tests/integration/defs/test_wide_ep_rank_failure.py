@@ -384,7 +384,7 @@ def _deploy(
         with contextlib.suppress(ProcessLookupError):
             os.killpg(launcher.pid, signal.SIGINT)
         try:
-            launcher.wait(120)
+            launcher.wait(SHUTDOWN_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             os.killpg(launcher.pid, signal.SIGKILL)
             launcher.wait()
@@ -814,16 +814,15 @@ class Monitor(_Threads):
                     )
                 self._changed.wait(min(remaining, 1.0))
 
-    def wait_for_health(self, code: int, state: str, since: float, timeout_s: float) -> float:
-        """Return when each frontend's ``/health`` answered ``code`` in ``state`` after ``since``."""
+    def wait_for_health(self, code: int, state: str, since: float, timeout_s: float) -> None:
+        """Wait until each frontend's ``/health`` answered ``code`` in ``state`` after ``since``."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline and not self._failures:
-            answered = [
-                [t for t, c, s in list(samples) if t > since and (c, s) == (code, state)]
+            if all(
+                any(t > since and (c, s) == (code, state) for t, c, s in list(samples))
                 for samples in self.health.values()
-            ]
-            if all(answered):
-                return max(times[0] for times in answered)
+            ):
+                return
             self._deployment.check_running()
             time.sleep(0.1)
         last = {base: samples[-1] if samples else None for base, samples in self.health.items()}
@@ -865,9 +864,13 @@ class Run:
     """Run the load, the monitor and failures on one deployment, then check."""
 
     def __init__(self, deployment: Deployment):
+        status = deployment.status()
+        assert status["active_ranks"] == list(range(WORLD_SIZE)), status
+        assert not status["failed_ranks"], status
         self.deployment = deployment
+        self.status_after_warmup = status
+        self.captures_after_warmup = _capture_lines(deployment.logs)
         self.gsm8k = Gsm8k(EVAL_QUESTIONS)
-        self.monitor = Monitor(deployment)
         self.clients = Clients(deployment, self.gsm8k)
         self.phases: List[Phase] = []
         self.cycles = 0
@@ -877,20 +880,14 @@ class Run:
         self.hangs: List[Tuple[float, float]] = []
         self.failures: List[str] = []
         self.t0 = time.monotonic()
-        self.status_after_warmup: Optional[dict] = None
-        self.captures_after_warmup: Dict[int, int] = {}
+        # Last, since its status reader runs from its construction until it stops.
+        self.monitor = Monitor(deployment)
 
     def check(self, ok: bool, message: str) -> None:
         if not ok:
             self.failures.append(message)
 
     def __enter__(self) -> "Run":
-        d = self.deployment
-        status = d.status()
-        assert status["active_ranks"] == list(range(WORLD_SIZE)), status
-        assert not status["failed_ranks"], status
-        self.status_after_warmup = status
-        self.captures_after_warmup = _capture_lines(d.logs)
         self.t0 = time.monotonic()
         self.monitor.start()
         self.clients.start()
@@ -1365,6 +1362,27 @@ def test_authority_loss_ends_deployment(tmp_path: Path):
         assert deployment.launcher.wait(AUTHORITY_LOSS_END_S) != 0
 
 
+def _interrupt_server(deployment: Deployment, clients: Clients) -> float:
+    """Stop the clients sending, send SIGINT to rank 0's trtllm-serve, and return the time."""
+    (server_pid,) = {
+        int(m.group(1)) for m in map(SERVER_PID_LOG.search, _log_lines(deployment.logs)) if m
+    }
+    # The clients send no new request, so every request was sent before the stop.
+    clients._stop.set()
+    os.kill(server_pid, signal.SIGINT)
+    return time.monotonic()
+
+
+def _wait_for_shutdown(deployment: Deployment, t_stop: float) -> None:
+    """Wait for the launcher to end after the SIGINT, and check that the deployment shut down."""
+    try:
+        deployment.launcher.wait(max(0.0, t_stop + SHUTDOWN_TIMEOUT_S - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"the launcher still ran {SHUTDOWN_TIMEOUT_S} s after the SIGINT")
+    states = {m.group(1) for m in map(MEMBERSHIP_LOG.search, _log_lines(deployment.logs)) if m}
+    assert "SHUTDOWN" in states and "ABORTED" not in states, states
+
+
 @pytest.mark.skip_less_device(WORLD_SIZE)
 @pytest.mark.timeout(STARTUP_TIMEOUT_S + REJOIN_TIMEOUT_S + 1200)
 def test_shutdown_after_rank_given_up(tmp_path: Path):
@@ -1403,18 +1421,9 @@ def test_shutdown_after_rank_given_up(tmp_path: Path):
         clients = Clients(deployment, run.gsm8k)
         clients.start()
         time.sleep(SETTLE_S)
-        (server_pid,) = {
-            int(m.group(1)) for m in map(SERVER_PID_LOG.search, _log_lines(deployment.logs)) if m
-        }
-        # The clients send no new request, so every request was sent before the stop.
-        clients._stop.set()
-        os.kill(server_pid, signal.SIGINT)
-        t_stop = time.monotonic()
+        t_stop = _interrupt_server(deployment, clients)
         assert not clients.stop()
-        try:
-            deployment.launcher.wait(max(0.0, t_stop + SHUTDOWN_TIMEOUT_S - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            pytest.fail(f"the launcher still ran {SHUTDOWN_TIMEOUT_S} s after the SIGINT")
+        _wait_for_shutdown(deployment, t_stop)
         assert any(r.spans(t_stop) for r in clients.requests), (
             "no request was in flight at the stop"
         )
@@ -1427,8 +1436,6 @@ def test_shutdown_after_rank_given_up(tmp_path: Path):
             f"{len(incomplete)} requests did not complete, the first with "
             f"{len(incomplete[0].token_ids)} tokens and the error {incomplete[0].error}"
         )
-        states = {m.group(1) for m in map(MEMBERSHIP_LOG.search, _log_lines(deployment.logs)) if m}
-        assert "SHUTDOWN" in states and "ABORTED" not in states, states
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
@@ -1455,21 +1462,13 @@ def test_shutdown_during_admission(tmp_path: Path):
         clients = Clients(attached, Gsm8k(EVAL_QUESTIONS), max_tokens=DRAIN_MAX_TOKENS)
         clients.start()
         time.sleep(SETTLE_S)
-        (server_pid,) = {
-            int(m.group(1)) for m in map(SERVER_PID_LOG.search, _log_lines(deployment.logs)) if m
-        }
-        clients._stop.set()
-        os.kill(server_pid, signal.SIGINT)
-        t_stop = time.monotonic()
+        t_stop = _interrupt_server(deployment, clients)
         while not any(APP_SHUTDOWN_LOG in line for line in _log_lines(deployment.logs)):
             assert time.monotonic() < t_stop + SHUTDOWN_TIMEOUT_S, "the engine was not stopped"
             time.sleep(0.1)
         replacement.resume()
         assert not clients.stop()
-        try:
-            deployment.launcher.wait(max(0.0, t_stop + SHUTDOWN_TIMEOUT_S - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            pytest.fail(f"the launcher still ran {SHUTDOWN_TIMEOUT_S} s after the SIGINT")
+        _wait_for_shutdown(deployment, t_stop)
         # A request completes, or the attached frontend rejects it with an error response.
         broken = [
             r
@@ -1486,8 +1485,6 @@ def test_shutdown_during_admission(tmp_path: Path):
         after_stop = "".join(lines[stop:])
         assert f"Rank {VICTIM} exits: the executor completed" in after_stop
         assert "The deployment shut down" in after_stop and "did not end within" not in after_stop
-        states = {m.group(1) for m in map(MEMBERSHIP_LOG.search, lines) if m}
-        assert "SHUTDOWN" in states and "ABORTED" not in states, states
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
