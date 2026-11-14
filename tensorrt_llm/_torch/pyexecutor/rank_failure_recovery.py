@@ -50,7 +50,6 @@ from ..distributed.membership import (
     ResumeState,
     SignedStore,
     StoreGroup,
-    has_rank,
     next_epoch,
     rank_mask,
     rendezvous_store,
@@ -374,18 +373,15 @@ class RankFailureRecovery:
 
     def _on_tick(self) -> None:
         waited_flags = self._moe.waited_flags()
-        host_waits, epoch = self._exchange.waiting_for, self._exchange.epoch
         self._client.report(
             progress=self._executor.iter_counter,
             idle=self._executor.hang_detector.paused(),
-            waiting_for=host_waits
+            waiting_for=self._exchange.waiting_for
             | self._waiting_in_store
             | self._unimportable_peers
             | rank_mask(waited_flags, self.world_size),
             waited_flags=tuple(sorted(waited_flags.items())),
-            waited_epochs=tuple(
-                (peer, epoch) for peer in range(self.world_size) if has_rank(host_waits, peer)
-            ),
+            waited_epochs=self._exchange.waited_epochs,
         )
 
     def _set_phase(self, phase: _Phase, reason: str) -> None:

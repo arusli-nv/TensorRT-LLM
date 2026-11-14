@@ -111,6 +111,7 @@ class FakeExchange:
         self.interrupted = None
         self.on_interrupt = None
         self.waiting_for = 0
+        self.waited_epochs = ()
         self.stopped_epoch = 6
         self.epoch = 40
         self.installs = []

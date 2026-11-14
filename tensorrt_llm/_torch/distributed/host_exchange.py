@@ -359,6 +359,14 @@ class HostExchange:
         """Return the mask of ranks the current wait still lacks packets from. Thread-safe."""
         return self.group.waiting_for
 
+    @property
+    def waited_epochs(self) -> tuple[tuple[int, int], ...]:
+        """Return (rank, epoch) for each rank the current wait lacks packets from."""
+        waiting_for, epoch = self.waiting_for, self._epoch
+        return tuple(
+            (rank, epoch) for rank in range(waiting_for.bit_length()) if has_rank(waiting_for, rank)
+        )
+
     def wake(self) -> None:
         """Make a running wait return and check for a membership change. Safe from any thread."""
         self.group.cancel()
@@ -514,13 +522,13 @@ class MnnvlDist(Distributed):
         return self._host_exchange
 
     @property
-    def waiting_for(self) -> int:
-        """Return the mask of ranks a running host collective lacks packets from. Thread-safe.
+    def waited_epochs(self) -> tuple[tuple[int, int], ...]:
+        """Return (rank, epoch) for each rank a running host collective lacks packets from.
 
-        Before the first host collective, return 0 without creating the exchange.
+        Before the first host collective, return an empty tuple without creating the exchange.
         """
         exchange = self._host_exchange_owner._host_exchange
-        return 0 if exchange is None else exchange.waiting_for
+        return () if exchange is None else exchange.waited_epochs
 
     def _exchange(
         self, obj, readers=None, recipients=None, idle=False, reduce_op=None, active_only=False
@@ -645,6 +653,6 @@ class MnnvlDistFactory:
         return dist
 
     @property
-    def waiting_for(self) -> int:
-        """Return the mask of ranks a running host collective lacks packets from. Thread-safe."""
-        return 0 if self._first is None else self._first.waiting_for
+    def waited_epochs(self) -> tuple[tuple[int, int], ...]:
+        """Return (rank, epoch) for each rank a running host collective lacks packets from."""
+        return () if self._first is None else self._first.waited_epochs

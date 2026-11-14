@@ -52,7 +52,14 @@ from tensorrt_llm.logger import logger
 
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart, StartupRecord
 from .liveness import MembershipClient, close_in_forked_child, rendezvous_store
-from .records import RENDEZVOUS_TIMEOUT_S, MembershipRecord, MembershipState, launcher_free_env
+from .records import (
+    MAX_RANKS,
+    RENDEZVOUS_TIMEOUT_S,
+    MembershipRecord,
+    MembershipState,
+    launcher_free_env,
+    rank_mask,
+)
 from .rendezvous import StoreGroup, rendezvous_host_port
 from .signed_store import SHARED_SECRET_BYTES, SignedStore, parse_shared_secret
 
@@ -425,8 +432,17 @@ def _report_startup_wait(waiting_for: int) -> None:
 
 
 def _on_tick_at_startup(host_collectives: MnnvlDistFactory) -> None:
-    """Report the peers that a startup collective of the startup group or ``MnnvlDist`` waits for."""
-    _state.client.report(waiting_for=_state.waiting_for | host_collectives.waiting_for)
+    """Report the peers that a startup collective of the startup group or ``MnnvlDist`` waits for.
+
+    The peers a host collective waits for are the ranks of its waited epochs. As in serving, each
+    new host collective round that waits for a peer counts as the peer's progress, so a peer that
+    keeps completing host collectives is not taken as hung.
+    """
+    waited_epochs = host_collectives.waited_epochs
+    _state.client.report(
+        waiting_for=_state.waiting_for | rank_mask((r for r, _ in waited_epochs), MAX_RANKS),
+        waited_epochs=waited_epochs,
+    )
 
 
 def join_startup_group(mapping: Mapping) -> None:

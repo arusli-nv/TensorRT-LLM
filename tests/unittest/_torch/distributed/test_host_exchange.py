@@ -423,6 +423,29 @@ class _LocalGroup:
 
 
 @pytest.mark.timeout(60)
+def test_waited_epochs_name_lacking_ranks():
+    """Report the running round's epoch with each rank that the round lacks packets from."""
+    slots = {}
+    exchanges = [HostExchange(_LocalGroup(rank, 3, slots)) for rank in range(3)]
+    seen = []
+
+    def first(exchange):
+        exchange.exchange(b"r0")
+        return exchange.epoch
+
+    def late(exchange):
+        while not seen:
+            if exchange.rank == 1 and exchanges[0].waiting_for == 0b110:
+                seen.append(exchanges[0].waited_epochs)
+            time.sleep(1e-4)
+        return exchange.exchange(b"late")
+
+    results = _run_ranks(exchanges, [first, late, late])
+    assert results[0] > 0
+    assert seen == [((1, results[0]), (2, results[0]))]
+
+
+@pytest.mark.timeout(60)
 def test_exchange_over_any_group():
     """Check a round, a cancel and an install over a group that has only the interface."""
     slots = {}
@@ -632,7 +655,9 @@ def created_exchanges(fresh_distributed, monkeypatch):
 
     def create(cls, mapping, group_type):
         created.append(mapping)
-        return SimpleNamespace(rank=mapping.tp_rank, nranks=mapping.tp_size, waiting_for=0b10)
+        return SimpleNamespace(
+            rank=mapping.tp_rank, nranks=mapping.tp_size, waited_epochs=((1, 7),)
+        )
 
     monkeypatch.setattr(HostExchange, "create", classmethod(create))
     monkeypatch.setattr(MnnvlDist, "check_requirements", staticmethod(lambda mapping: None))
@@ -661,9 +686,9 @@ def test_factory_reports_host_collective_waits(created_exchanges):
     factory = MnnvlDistFactory()
     Distributed.set_implementation(factory, StartupRecord())
     dist = Distributed.get(_TP2)
-    assert factory.waiting_for == 0
+    assert factory.waited_epochs == ()
     dist.host_exchange
-    assert factory.waiting_for == 0b10
+    assert factory.waited_epochs == ((1, 7),)
 
 
 def test_each_factory_has_own_host_exchange(created_exchanges):

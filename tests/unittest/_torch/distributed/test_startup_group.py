@@ -158,10 +158,12 @@ def test_startup_collective_reports_waits_and_steps(store, monkeypatch):
 
 
 def test_startup_reports_host_collective_waits(store, monkeypatch):
-    """Report the peers a startup host collective waits for, with those of the startup group."""
+    """Report the peers and round a startup host collective waits in, and the startup group's."""
     monkeypatch.setattr(startup_module._state, "waiting_for", 0b0010)
-    startup_module._on_tick_at_startup(SimpleNamespace(waiting_for=0b0100))
-    startup_module._state.client.report.assert_called_once_with(waiting_for=0b0110)
+    startup_module._on_tick_at_startup(SimpleNamespace(waited_epochs=((2, 7),)))
+    startup_module._state.client.report.assert_called_once_with(
+        waiting_for=0b0110, waited_epochs=((2, 7),)
+    )
 
 
 def test_host_weights_wait_reports_startup_progress(store, monkeypatch):
