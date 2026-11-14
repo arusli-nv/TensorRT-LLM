@@ -301,7 +301,8 @@ def test_pauses_nest():
     original.resume()
     assert not original.active
     original.agree("steady_clock_offset", lambda: 2, per_process=True)
-    original.resume()
+    with patch.object(AutoTuner, "get", return_value=_new_autotuner()):
+        original.resume()
     assert original.active
     original.agree("max_seq_len", lambda: 3)
     with pytest.raises(RuntimeError, match="without a matching pause"):
@@ -340,7 +341,8 @@ def test_replacement_replays_paused_clock_calibration(monkeypatch):
     rank_0 = _rank_0(lambda r, obj: obj + r if isinstance(obj, float) else obj)
     communicator.Distributed.pause_startup_record()
     assert _calibrate_steady_clock(rank_0, 100.0, monkeypatch) == 0.0
-    communicator.Distributed.resume_startup_record()
+    with patch.object(AutoTuner, "get", return_value=_new_autotuner()):
+        communicator.Distributed.resume_startup_record()
     # The final executor of an original rank keeps the offset of its first one.
     assert _calibrate_steady_clock(rank_0, 200.0, monkeypatch) == 0.0
     published = _publish()

@@ -30,6 +30,8 @@ import pytest
 import torch
 from numpy.lib.stride_tricks import as_strided
 
+from tensorrt_llm import _utils
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import (
     Distributed,
     MPIDist,
@@ -37,12 +39,14 @@ from tensorrt_llm._torch.distributed import (
     mnnvl_host_exchange,
     mnnvl_memory,
 )
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist
 from tensorrt_llm._torch.distributed.membership import (
     Authority,
     RankReport,
     Reply,
     ResumeState,
+    StoreGroup,
     rank_mask,
 )
 from tensorrt_llm._torch.distributed.mnnvl_host_exchange import MnnvlHostExchangeGroup
@@ -131,8 +135,8 @@ class _HostRows:
 _SLOT_BYTES = 64
 
 
-def _host_exchange_group(monkeypatch, nranks, slot_bytes):
-    """Return a HostExchange for each of ``nranks`` ranks over shared host rows."""
+def _use_host_copies(monkeypatch):
+    """Run the copies and the native wait of the host exchange between host addresses."""
     copies = _HostCopies()
     monkeypatch.setattr(mnnvl_memory, "cuda", copies)
     monkeypatch.setattr(mnnvl_host_exchange, "wait_for_slots", copies.wait_for_slots)
@@ -140,6 +144,11 @@ def _host_exchange_group(monkeypatch, nranks, slot_bytes):
     monkeypatch.setattr(
         torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=0, synchronize=lambda: None)
     )
+
+
+def _host_exchange_group(monkeypatch, nranks, slot_bytes):
+    """Return a HostExchange for each of ``nranks`` ranks over shared host rows."""
+    _use_host_copies(monkeypatch)
     stride = MnnvlHostExchangeGroup.buffer_bytes(nranks, slot_bytes)
     memory = np.zeros(nranks * stride, dtype=np.uint8)
     return [
@@ -622,6 +631,57 @@ def test_communicators_share_host_exchange(fresh_distributed, monkeypatch):
     assert len(created) == 1
     with pytest.raises(RuntimeError, match="cannot serve TP rank 1/4"):
         other_tp_group.host_exchange
+
+
+def _start_alone(monkeypatch, record):
+    """Start rank 0 of a one-rank deployment as a new process does, and return its ``MnnvlDist``."""
+    Distributed.get.cache_clear()
+    monkeypatch.setattr(Distributed, "_create", None)
+    monkeypatch.setattr(mnnvl_memory.TpMnnvlMemory, "comm", None)
+    monkeypatch.setattr(mnnvl_memory.TpMnnvlMemory, "comm_signature", None)
+    startup_group = StoreGroup(None, "startup", 0, [0], startup=record.replacement)
+    monkeypatch.setattr(_utils, "comm", startup_group)
+    Distributed.set_implementation(MnnvlDist.create, record)
+    return Distributed.get(Mapping(world_size=1, rank=0, tp_size=1, enable_attention_dp=True))
+
+
+def _final_kv_cache_allocation(dist):
+    """Make the startup collectives of the final KV cache allocation and return their results."""
+    max_tokens = dist.allreduce(256, op=ReduceOp.MIN)
+    quota = Distributed.agree_rank_capacity(
+        "kv_cache_device_quota", 0, 100, lambda: dist.allgather(100)
+    )
+    return max_tokens, quota, dist.tp_allgather_int64([8, 1]).tolist()
+
+
+def test_replacement_replays_paused_first_collective(fresh_distributed, monkeypatch):
+    """Replay a startup whose first host collective ran in the KV cache estimation of rank 0.
+
+    That collective creates the host exchange and splits its communicator. A replacement skips the
+    estimation, so it does both outside a pause.
+    """
+    _use_host_copies(monkeypatch)
+    monkeypatch.setattr(MnnvlHostExchangeGroup, "requirements", classmethod(lambda cls: []))
+    monkeypatch.setattr(
+        mnnvl_host_exchange,
+        "HostExchangeMnnvlMemory",
+        lambda comm, nbytes: _HostRows(np.zeros(nbytes, dtype=np.uint8), nbytes, 0),
+    )
+    original = StartupRecord()
+    original.record()
+    rank_0 = _start_alone(monkeypatch, original)
+    Distributed.pause_startup_record()
+    assert rank_0.allreduce(512, op=ReduceOp.MIN) == 512
+    # The resume keeps the tactics that the autotuner tuned during the pause, here none.
+    tuner = SimpleNamespace(profiling_cache=SimpleNamespace(cache={}))
+    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
+    Distributed.resume_startup_record()
+    results = _final_kv_cache_allocation(rank_0)
+    original.close()
+    replacement = StartupRecord()
+    replacement.replay(original.published())
+    assert _final_kv_cache_allocation(_start_alone(monkeypatch, replacement)) == results
+    replacement.close()
 
 
 def test_pp_cp_p2p_collectives_unavailable():
