@@ -610,8 +610,10 @@ class NodeSupervisor:
     def _open_connection(self, connecting: concurrent.futures.Future) -> None:
         """Open the connection to the authority as the result of ``connecting``.
 
-        Send no hello once the supervisor stopped, since the authority would count the node as
-        connected.
+        Send no hello if the supervisor stopped while the store client connected, since the
+        authority would count the node as connected. A supervisor that stops after this check may
+        still send the hello. Its exit then closes the connection, which the authority treats as the
+        end of the node's ranks, as the stop makes them end.
         """
         membership = self._membership
         try:
@@ -763,7 +765,7 @@ class NodeSupervisor:
         """
         # Before the job ends, since the launcher then kills this process.
         self._log_unlinked(self._unlink_host_weights())
-        # A connect in flight then sends no hello.
+        # A connect whose store client is still connecting then sends no hello.
         self._connecting = None
         if end_job_reason is not None:
             self._end_job(end_job_reason)
