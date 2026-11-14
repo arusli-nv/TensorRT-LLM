@@ -79,6 +79,12 @@ def _timings(monkeypatch):
         monkeypatch.setattr(supervisor_module, name, value)
 
 
+@pytest.fixture(autouse=True)
+def _free_gpus(monkeypatch):
+    """Report every GPU free, since the fake ranks use none."""
+    monkeypatch.setattr(supervisor_module, "_gpu_compute_processes", lambda gpu: [])
+
+
 # A fake rank. It records itself in SUPERVISOR_TEST_ROOT as the rank's n-th process, 0 for the
 # original, and ends with status 0 once the fake authority sent SHUTDOWN and wrote "shutdown" there.
 # SUPERVISOR_TEST_MODES maps "<rank>:<n>" to a mode, "serves" by default. "records-signals" records
@@ -898,6 +904,67 @@ def test_ranks_replaced_after_refused_reconnect(tmp_path, deployment):
     authority.refusals = 0
     _until(lambda: all(_read(tmp_path, rank, 1) for rank in RANKS))
     _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=3)
+
+
+@pytest.mark.parametrize("gpu", ["freed", "held"])
+def test_restarted_supervisor_replaces_rank_on_free_gpu_only(
+    tmp_path, deployment, monkeypatch, gpu
+):
+    """Replace a rank that this supervisor did not start only once no process runs on its GPU.
+
+    The rank's last process ran under the previous supervisor, so only the GPU shows that it ended.
+    The rank is given up if its GPU is still in use after the rendezvous timeout.
+    """
+    authority, environ = deployment
+    environ.pop("CUDA_VISIBLE_DEVICES", None)
+    in_use = {"0": [4242], "1": [4243] if gpu == "held" else []}
+    checks = []
+
+    def compute_processes(index):
+        checks.append(index)
+        return in_use[index]
+
+    monkeypatch.setattr(supervisor_module, "_gpu_compute_processes", compute_processes)
+    if gpu == "held":
+        # No replacement starts, so the shorter timeout bounds only the wait for the GPUs.
+        monkeypatch.setattr(membership, "RENDEZVOUS_TIMEOUT_S", 1.0)
+    authority.start(_record(MembershipState.COMMITTED, active_mask=0b0011))
+    running = Running(tmp_path, environ)
+    if gpu == "held":
+        _until(lambda: authority.given_up == RANKS)
+        assert running.supervisor._processes == {}
+        _shut_down(running, authority, active_mask=0b0011, generation=2)
+        return
+    _until(lambda: _read(tmp_path, 3, 1))
+    # The supervisor checked rank 2's GPU again after it found the GPU in use.
+    _until(lambda: checks.count("0") >= 2)
+    assert _read(tmp_path, 2, 1) is None
+    # Only a rank that this supervisor started still holds a context there.
+    in_use["0"] = [_read(tmp_path, 3, 1)["pid"]]
+    _until(lambda: _read(tmp_path, 2, 1))
+    assert running.supervisor._given_up == set()
+    _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=2)
+
+
+def test_rank_runs_only_with_parent_death_signal(tmp_path):
+    """Run no rank's command without the parent-death signal that ends it with its supervisor."""
+    marker = tmp_path / "ran"
+    code = (
+        "import runpy, sys\n"
+        f"sys.path.insert(0, {str(_LLMAPI)!r})\n"
+        "import _llmapi_process_guard\n"
+        "_llmapi_process_guard._arm_parent_death_signal = lambda: False\n"
+        f"runpy.run_path({str(_SUPERVISOR)!r})['_exec_rank'](int(sys.argv[1]), sys.argv[2:])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", code, str(os.getpid()), "touch", str(marker)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 1
+    assert "would outlive its node supervisor" in result.stderr
+    assert not marker.exists()
 
 
 def test_rejoining_node_starts_replacements(tmp_path, deployment, monkeypatch):

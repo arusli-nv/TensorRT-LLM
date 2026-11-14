@@ -156,6 +156,8 @@ class NodeSupervisor:
         # Per rank, the failed replacements in a row and when the next one may start.
         self._failed_replacements: Dict[int, int] = {}
         self._replacement_due_s: Dict[int, float] = {}
+        # Per rank this supervisor has not started, since when a process runs on its GPU.
+        self._gpu_in_use_since_s: Dict[int, float] = {}
         self._first_failure: Optional[int] = None
         self._signum: Optional[int] = None
         self._signal_handled = False
@@ -539,12 +541,52 @@ class NodeSupervisor:
         )
 
     def _replace(self, rank: int, now_s: float) -> None:
+        if self._waits_for_gpu(rank, now_s):
+            return
         try:
             self._logger.warning(f"Starting a replacement of rank {rank}")
             self._start(rank, replacement=True)
         except (OSError, subprocess.SubprocessError) as error:
             self._logger.error(f"Cannot start a replacement of rank {rank}: {error!r}")
             self._count_failed_replacement(rank, f"it could not start: {error!r}", now_s)
+
+    def _waits_for_gpu(self, rank: int, now_s: float) -> bool:
+        """Return whether ``rank``'s replacement waits until no process runs on its GPU.
+
+        A rank's process that this supervisor started has ended once it is reaped. One that a
+        previous supervisor started ends through its parent-death signal, which proves nothing, so
+        wait for the GPU, up to the rendezvous timeout. Then give the rank up.
+        """
+        if rank in self._processes:
+            return False
+        local_rank = rank - self._ranks[0]
+        visible = self._environ.get("CUDA_VISIBLE_DEVICES")
+        gpu = visible.split(",")[local_rank] if visible else str(local_rank)
+        # A rank this supervisor started belongs to another GPU, even if it holds a context here.
+        started = {process.child.pid for process in self._processes.values()}
+        try:
+            pids = [pid for pid in _gpu_compute_processes(gpu) if pid not in started]
+        except RuntimeError as error:
+            self._logger.warning(f"Cannot check that GPU {gpu} of rank {rank} is free: {error}")
+            return False
+        if not pids:
+            return False
+        timeout_s = self._membership.RENDEZVOUS_TIMEOUT_S
+        since_s = self._gpu_in_use_since_s.setdefault(rank, now_s)
+        if now_s >= since_s + timeout_s:
+            self._logger.error(
+                f"Processes {pids} still run on GPU {gpu} of rank {rank} after {timeout_s:.0f} s. "
+                f"The deployment serves without rank {rank}"
+            )
+            self._give_up(rank)
+            return True
+        if since_s == now_s:
+            self._logger.warning(
+                f"The replacement of rank {rank} waits until processes {pids} end on its GPU {gpu}"
+            )
+        self._replacement_due_s[rank] = min(now_s + _BACKOFF_S, since_s + timeout_s)
+        self._deadlines_s.append(self._replacement_due_s[rank])
+        return True
 
     def _give_up(self, rank: int) -> None:
         self._given_up.add(rank)
@@ -851,6 +893,30 @@ def _local_gpu_count(environ: Dict[str, str]) -> int:
     return len(glob.glob("/dev/nvidia[0-9]*"))
 
 
+def _gpu_compute_processes(gpu: str) -> List[int]:
+    """Return the PIDs of the compute processes on ``gpu``, an index or a UUID.
+
+    Raises:
+        RuntimeError: NVML cannot list them.
+    """
+    try:
+        import pynvml
+    except ImportError as error:
+        raise RuntimeError(f"cannot import pynvml: {error}") from error
+    try:
+        pynvml.nvmlInit()
+        try:
+            if gpu.isdigit():
+                handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu))
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByUUID(gpu)
+            return [process.pid for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)]
+        finally:
+            pynvml.nvmlShutdown()
+    except pynvml.NVMLError as error:
+        raise RuntimeError(f"NVML failed: {error}") from error
+
+
 def start_session_node_supervisor(n_workers: int, env: Dict[str, str]) -> subprocess.Popen:
     """Start the node supervisor of ranks 1 to ``n_workers - 1`` for a session that runs rank 0.
 
@@ -904,7 +970,12 @@ def _exec_rank(supervisor: int, command: List[str]) -> NoReturn:
     # The process guard sits next to this script, and this script runs without site packages.
     from _llmapi_process_guard import _arm_parent_death_signal
 
-    _arm_parent_death_signal()
+    # Only this signal ends the rank, and so frees its GPU, once its supervisor ends. A replacement
+    # that the next supervisor starts would otherwise share the GPU with it.
+    if not _arm_parent_death_signal():
+        print("Cannot start the rank, which would outlive its node supervisor", file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(1)
     # The supervisor ended before the parent-death signal was armed.
     if os.getppid() != supervisor:
         os._exit(1)
