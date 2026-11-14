@@ -94,6 +94,9 @@ class NodeSupervisor:
         command: The command that starts each rank process. With ``rank_0_in_session``, it
             starts every rank but 0.
         end_job: The function that ends the whole job as failed. Set on node 0 under ``mpirun``.
+        rejoin: The node returns to a running deployment that lost it. The supervisor connects
+            until the authority's first view, and starts only replacements.
+        parent: The process whose end stops the node, by default this process's parent.
     """
 
     def __init__(
@@ -105,6 +108,8 @@ class NodeSupervisor:
         environ: Dict[str, str],
         rank_0_in_session: bool = False,
         end_job: Optional[Callable[[], None]] = None,
+        rejoin: bool = False,
+        parent: Optional[int] = None,
     ):
         from tensorrt_llm._torch.distributed import membership
         from tensorrt_llm.llmapi._llmapi_process_guard import _signal_group
@@ -119,8 +124,9 @@ class NodeSupervisor:
         self._ranks = list(range(node * gpus_per_node, (node + 1) * gpus_per_node))
         self._command = command
         self._rank_0_in_session = rank_0_in_session
+        self._rejoin = rejoin
         self._environ = membership.rank_env(environ)
-        self._parent = os.getppid()
+        self._parent = os.getppid() if parent is None else parent
         self._parent_ended = False
         self._selector = selectors.DefaultSelector()
         # Written by the signal handler and the connector, so that they end the selector's wait.
@@ -187,15 +193,28 @@ class NodeSupervisor:
             self._watch_parent()
             self._selector.register(self._wake_read, selectors.EVENT_READ, _WAKE)
             self._connect()
-            # The first view tells whether the node starts its ranks.
+            # The first view tells whether the node starts its ranks. A rejoining node connects again
+            # until it has one.
             while self._signum is None and (
-                self._connecting is not None or self._connection_awaiting_view is not None
+                self._connecting is not None
+                or self._connection_awaiting_view is not None
+                or (
+                    self._rejoin
+                    and self._view is None
+                    and not self._refused_by_authority
+                    and not self._parent_ended
+                )
             ):
+                if self._connecting is None and self._connection_awaiting_view is None:
+                    if time.monotonic() >= self._connect_due_s:
+                        self._connect()
+                    else:
+                        self._deadlines_s = [self._connect_due_s]
                 self._wait()
                 self._deadlines_s = []
                 self._take_connection()
                 self._check_first_view(time.monotonic())
-            if self._signum is not None:
+            if self._signum is not None or self._parent_ended:
                 return self._step(time.monotonic())
             if self._refused_by_authority:
                 return 1
@@ -205,6 +224,11 @@ class NodeSupervisor:
             ):
                 self._logger.error(
                     "The deployment at the rendezvous address ended. Use a new shared secret."
+                )
+                return 1
+            if self._rejoin and not self._deployment_started:
+                self._logger.error(
+                    f"The deployment has not started, so start node {self._node} without --rejoin"
                 )
                 return 1
             self._start_first_processes()
@@ -888,6 +912,8 @@ def _exec_rank(supervisor: int, command: List[str]) -> NoReturn:
 
 
 def main(argv: Optional[List[str]] = None) -> NoReturn:
+    # Before the imports below, which take seconds, so that a parent ending meanwhile is noticed.
+    parent = os.getppid()
     parser = argparse.ArgumentParser(
         prog="_llmapi_node_supervisor.py",
         description="Supervise the ranks of one node under Wide-EP fault tolerance",
@@ -899,6 +925,11 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
         "--rank-0-in-session",
         action="store_true",
         help="start every rank but 0, which runs in the MpiPoolSession that starts this supervisor",
+    )
+    parser.add_argument(
+        "--rejoin",
+        action="store_true",
+        help="return this node to a running deployment that lost it, with replacements of its ranks",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- <command of each rank>")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
@@ -973,6 +1004,8 @@ def main(argv: Optional[List[str]] = None) -> NoReturn:
         environ,
         rank_0_in_session=args.rank_0_in_session,
         end_job=end_job,
+        rejoin=args.rejoin,
+        parent=parent,
     )
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, supervisor.on_signal)

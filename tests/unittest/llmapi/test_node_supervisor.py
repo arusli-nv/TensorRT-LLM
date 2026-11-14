@@ -138,15 +138,18 @@ while not end.exists() and time.monotonic() < deadline:
     time.sleep(0.05)
 """
 
-# Run the supervisor as its script does, with the test's timings.
+# Run the supervisor as its script does, with the test's timings. The "started" file marks the start
+# of main(), before its imports of TensorRT-LLM.
 _SUPERVISOR_SCRIPT = r"""
 import importlib.util
+from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("node_supervisor", %(supervisor)r)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 for name, value in %(timings)r.items():
     setattr(module, name, value)
+Path(%(started)r).touch()
 module.main()
 """
 
@@ -896,6 +899,82 @@ def test_ranks_replaced_after_refused_reconnect(tmp_path, deployment):
     _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=3)
 
 
+def test_rejoining_node_starts_replacements(tmp_path, deployment, monkeypatch):
+    """Start only replacements on a rejoining node, which connects until the authority answers.
+
+    The deployment lost the node, so the authority's first view lists none of its ranks.
+    """
+    authority, environ = deployment
+    connects = []
+    open_store = membership.open_store
+
+    def open_counted_store(*args):
+        connects.append(args)
+        return open_store(*args)
+
+    monkeypatch.setattr(membership, "open_store", open_counted_store)
+    running = Running(tmp_path, environ, rejoin=True)
+    _until(lambda: len(connects) >= 3)
+    assert not list(tmp_path.glob("rank-*.json"))
+    authority.start(_record(active_mask=0b0011))
+    _until(lambda: all(_read(tmp_path, rank, 1) for rank in RANKS))
+    assert not list(tmp_path.glob("rank-*-0.json"))
+    _until(lambda: authority.given_up == ())
+    _shut_down(running, authority, incarnations=(0, 0, 1, 1), generation=2)
+
+
+def test_rejoin_before_deployment_started_ends(tmp_path, deployment):
+    """End a rejoining supervisor, which starts no rank, while the deployment has not started."""
+    authority, environ = deployment
+    authority.start(_record(MembershipState.STARTING))
+    running = Running(tmp_path, environ, rejoin=True)
+    assert running.wait() == 1
+    assert not list(tmp_path.glob("rank-*.json"))
+
+
+# A parent that starts the command after its first argument, with output to the file that argument
+# names, prints the command's PID and ends once its stdin closes.
+_PARENT = (
+    "import subprocess, sys\n"
+    "with open(sys.argv[1], 'ab') as out:\n"
+    "    print(subprocess.Popen(sys.argv[2:], stdout=out, stderr=out).pid, flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+def test_rejoin_ends_with_parent(tmp_path, deployment):
+    """End a rejoining supervisor, which starts no rank, once its parent ends before any view.
+
+    The parent ends as soon as the supervisor's main() starts, while it imports TensorRT-LLM.
+    """
+    _, environ = deployment
+    environ["TLLM_LOG_LEVEL"] = "warning"
+    command = _supervisor_command(tmp_path)
+    command.insert(command.index("--"), "--rejoin")
+    output = tmp_path / "supervisor.log"
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _PARENT, str(output), *command],
+        env=environ,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    supervisor = int(parent.stdout.readline())
+    try:
+        _until(lambda: (tmp_path / "supervisor.started").exists(), 10)
+        parent.stdin.close()
+        parent.wait()
+        parent.stdout.close()
+        _until(lambda: not _alive(supervisor), 10)
+    finally:
+        if _alive(supervisor):
+            os.kill(supervisor, signal.SIGKILL)
+    assert not list(tmp_path.glob("rank-*.json"))
+    logged = output.read_text()
+    assert "because the supervisor's parent ended" in logged
+    assert "without --rejoin" not in logged
+
+
 @pytest.fixture
 def fake_mpirun(tmp_path):
     """Return a starter of a process named prterun, which is killed after the test.
@@ -921,7 +1000,14 @@ def fake_mpirun(tmp_path):
 def _supervisor_command(tmp_path, node=NODE):
     """Return the command that runs the supervisor of ``node`` as its script does, with fake ranks."""
     script = tmp_path / "supervisor.py"
-    script.write_text(_SUPERVISOR_SCRIPT % {"supervisor": str(_SUPERVISOR), "timings": _TIMINGS})
+    script.write_text(
+        _SUPERVISOR_SCRIPT
+        % {
+            "supervisor": str(_SUPERVISOR),
+            "timings": _TIMINGS,
+            "started": str(tmp_path / "supervisor.started"),
+        }
+    )
     options = ["--node-rank", str(node), "--nodes", str(NODES), "--gpus-per-node", str(GPUS)]
     return [sys.executable, str(script), *options, "--", sys.executable, str(tmp_path / "rank.py")]
 
