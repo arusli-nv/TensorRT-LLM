@@ -422,6 +422,22 @@ def test_model_without_moe_layers_refused() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "architectures",
+    [["LlamaForCausalLM"], ["DeepseekV3ForCausalLM", "LlamaForCausalLM"], [], None],
+    ids=["other", "mixed", "empty", "none"],
+)
+def test_unsupported_architecture_refused(architectures) -> None:
+    model = torch.nn.Linear(1, 1)
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=architectures)
+    )
+    with pytest.raises(ValueError, match=re.escape(f"not {architectures}")) as error:
+        prepare_model(model)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
 def test_layers_bound_to_one_membership(monkeypatch, replacement) -> None:
     """prepare_model binds every MoE layer to one execution state over a new membership."""
