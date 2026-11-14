@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import uvicorn
 from starlette.routing import Match
 from test_common.serve import app_factory, fakes
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
@@ -524,35 +525,52 @@ def test_frontends_agree_on_health(monkeypatch, tmp_path, store_readable, rank_0
     assert codes == ([503, 503] if rank_0_ended else [200, 200])
 
 
-def test_failed_deployment_shuts_the_server_down(monkeypatch, tmp_path):
-    """Check that the server raises SIGINT once when a refresh finds the deployment failed."""
+@pytest.mark.parametrize("shutting_down", [False, True], ids=["serving", "shutting_down"])
+def test_failed_deployment_shuts_the_server_down(monkeypatch, tmp_path, shutting_down):
+    """Check that a failed deployment raises SIGINT once, and none while the server shuts down.
+
+    Uvicorn takes a second SIGINT as a forced exit, which cuts the open streams.
+    """
     monkeypatch.setattr(health_module, "_STATUS_REFRESH_PERIOD_S", 0.01)
-    raised = threading.Event()
-    raise_signal = Mock(side_effect=lambda signum: raised.set())
+    raise_signal = Mock()
     monkeypatch.setattr(openai_server_module.signal, "raise_signal", raise_signal)
     store = FakeRendezvousStore(_record(MembershipState.COMMITTED))
-    record_checks = threading.Semaphore(0)
+    record_checks = 0
+    checked = threading.Condition()
     answers = store.check
 
     def counted_check(keys):
-        if RECORD_KEY in keys:
-            record_checks.release()
+        nonlocal record_checks
+        with checked:
+            record_checks += RECORD_KEY in keys
+            checked.notify_all()
         return answers(keys)
+
+    def wait_for_reads(count):
+        # Each read checks the record once, so once the read after them checks it, the next
+        # ``count`` reads have ended.
+        with checked:
+            target = record_checks + count + 1
+            assert checked.wait_for(lambda: record_checks >= target, timeout=10.0)
 
     with isolated_serve_env(tmp_path) as env:
         server = _server(env, monkeypatch, store)
+        server._uvicorn_server = uvicorn.Server(uvicorn.Config(server.app))
+        server._uvicorn_server.should_exit = shutting_down
         store.check = counted_check
         try:
-            # Each read checks the record once, so by the second check a whole read has ended.
-            for _ in range(2):
-                assert record_checks.acquire(timeout=10.0)
+            wait_for_reads(3)
             raise_signal.assert_not_called()
             store.values[RECORD_KEY] = _record(MembershipState.ABORTED).model_dump_json().encode()
-            assert raised.wait(10.0)
+            # Later reads that find the deployment failed raise no second signal.
+            wait_for_reads(3)
             assert server.fault_tolerance_health.last_status().state == "failed"
         finally:
             server.fault_tolerance_health.close()
-    raise_signal.assert_called_once_with(openai_server_module.signal.SIGINT)
+    if shutting_down:
+        raise_signal.assert_not_called()
+    else:
+        raise_signal.assert_called_once_with(openai_server_module.signal.SIGINT)
 
 
 def test_status_never_waits_for_store(monkeypatch, tmp_path):

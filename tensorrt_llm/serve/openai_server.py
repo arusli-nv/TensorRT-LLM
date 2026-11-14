@@ -612,6 +612,8 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
 class OpenAIServer(_VideoRoutesMixin):
 
     fault_tolerance_health: Optional["FaultToleranceHealth"] = None
+    # The uvicorn server that serves the app, set once __call__ creates it.
+    _uvicorn_server: Optional[uvicorn.Server] = None
     # Class defaults, so a server built without __init__ serves alone.
     _stop_attached_frontends: Optional[Callable[..., Awaitable]] = None
     _attached_frontends_stopped: Optional[asyncio.Task] = None
@@ -1822,8 +1824,15 @@ class OpenAIServer(_VideoRoutesMixin):
         """Shut the server down once its Wide-EP deployment cannot recover.
 
         The executor reaches doing_shutdown when it reaps the ended rank 0,
-        so the fatal-error branch of ``health`` sends no signal then.
+        so the fatal-error branch of ``health`` sends no signal then. A
+        server that is already shutting down gets no second signal: uvicorn
+        takes a second SIGINT as a forced exit, which cuts the open streams.
         """
+        server = self._uvicorn_server
+        if server is not None and server.should_exit:
+            logger.error("The Wide-EP deployment failed while the server "
+                         "shuts down")
+            return
         logger.error("The Wide-EP deployment failed, initiating server "
                      "shutdown")
         _record_generator_termination(self.generator)
@@ -4417,6 +4426,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                                 **config_kwargs)
         server = create_uvicorn_server(config)
+        self._uvicorn_server = server
 
         async def _register_after_serving():
             with _StartupTimer("http_server_start"):
