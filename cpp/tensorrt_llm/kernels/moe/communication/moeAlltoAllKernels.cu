@@ -856,8 +856,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #if !DISABLE_SYNC_FOR_PROFILING
             uint32_t expected_value = *ptrs.flag_val;
 
-            // Make the receive counts and EPLB stats stored above visible to peers before the completion
-            // flags below. The "memory" clobber keeps the compiler from moving those stores past the fence.
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
             asm volatile("fence.release.sys;" ::: "memory");
@@ -2040,9 +2038,6 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
                 }
             }
         }
-        // Order the peers' payload writes, signaled by the flags above, before this block reads them.
-        // The "memory" clobber keeps the compiler from hoisting those reads above the fence on its own,
-        // without relying on the __syncthreads() that follows.
 #if TLLM_MOE_A2A_COMPILE_SM90
         // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
         asm volatile("fence.acquire.sys;" ::: "memory");
@@ -2084,19 +2079,23 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
     if constexpr (ENABLE_RANK_MASK)
     {
         // A peer sets this rank's incomplete-round word before it overwrites rows that this block may have read.
-        __syncthreads();
-        if (threadIdx.x == 0 && ptrs.abort != nullptr)
+        // ptrs.abort is a kernel argument, so the whole block takes this branch or skips it.
+        if (ptrs.abort != nullptr)
         {
-#if TLLM_MOE_A2A_COMPILE_SM90
-            asm volatile("fence.acquire.sys;" ::: "memory");
-#else
-            asm volatile("fence.acq_rel.sys;" ::: "memory");
-#endif
-            uint32_t incomplete;
-            asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(incomplete) : "l"(ptrs.incomplete_round) : "memory");
-            if (incomplete != 0)
+            __syncthreads();
+            if (threadIdx.x == 0)
             {
-                record_cancelled(ptrs.abort);
+#if TLLM_MOE_A2A_COMPILE_SM90
+                asm volatile("fence.acquire.sys;" ::: "memory");
+#else
+                asm volatile("fence.acq_rel.sys;" ::: "memory");
+#endif
+                uint32_t incomplete;
+                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(incomplete) : "l"(ptrs.incomplete_round) : "memory");
+                if (incomplete != 0)
+                {
+                    record_cancelled(ptrs.abort);
+                }
             }
         }
     }

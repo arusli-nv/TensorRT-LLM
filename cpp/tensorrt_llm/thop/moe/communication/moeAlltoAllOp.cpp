@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftManager.h"
@@ -23,6 +24,7 @@
 #include "tensorrt_llm/thop/moe/communication/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <algorithm>
 #include <atomic>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
@@ -155,12 +157,25 @@ inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
     return maskTensor.has_value() && maskTensor.value().defined();
 }
 
-// Return the rank-mask tensor on the workspace device, which the kernels read at execution time. A tensor on the
-// workspace device is read in place, so a captured CUDA graph follows later updates of it. A CPU tensor is checked to
-// mark the local rank active and copied for this launch. On failure (wrong dtype / device / shape), throw at the
-// Python op boundary rather than launch.
-inline torch::Tensor resolveActiveRankMask(
-    torch::optional<torch::Tensor> const& maskTensor, int64_t epRank, torch::Tensor const& workspace)
+using RankMaskWords = std::array<uint64_t, tensorrt_llm::kernels::moe_comm::kRankMaskWords>;
+
+// The CPU masks last written into the active-rank mask words of each workspace row, by the device address of the words.
+static std::mutex gWrittenRankMasksMutex;
+static std::unordered_map<uint64_t const*, RankMaskWords> gWrittenRankMasks;
+
+// Forget the mask written into the active-rank mask words at rowWords, so that the next CPU mask is written again.
+inline void forgetWrittenRankMask(uint64_t const* rowWords)
+{
+    std::lock_guard<std::mutex> lock(gWrittenRankMasksMutex);
+    gWrittenRankMasks.erase(rowWords);
+}
+
+// Return the device address of the rank mask, which the kernels read at execution time. A tensor on the workspace
+// device is read in place, so a captured CUDA graph follows later updates of it. A CPU tensor is checked to mark the
+// local rank active and written into the active-rank mask words of this rank's workspace row, unless those already hold
+// it. On failure (wrong dtype / device / shape), throw at the Python op boundary rather than launch.
+inline uint64_t const* resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTensor, int64_t epRank,
+    torch::Tensor const& workspace, uint8_t* rankWorkSpacePtr, MoeA2AWorkspaceLayout const& layout)
 {
     using tensorrt_llm::kernels::moe_comm::kRankMaskWords;
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
@@ -176,13 +191,31 @@ inline torch::Tensor resolveActiveRankMask(
     TORCH_CHECK(t.is_contiguous(), "active_rank_mask must be contiguous");
     if (!t.is_cpu())
     {
-        return t;
+        return static_cast<uint64_t const*>(t.const_data_ptr());
     }
     auto const* words = static_cast<uint64_t const*>(t.const_data_ptr());
     // Local rank's bit must be set; otherwise the kernel would be running on a "dead" rank.
     TORCH_CHECK((words[epRank >> 6] >> (epRank & 63)) & 1ULL, "active_rank_mask must mark the local ep_rank (", epRank,
         ") as active");
-    return t.to(workspace.device(), torch::kUInt64, /*non_blocking=*/true);
+    TORCH_CHECK(layout[ACTIVE_RANK_MASK_OFFSET_INDEX] != 0,
+        "A CPU active_rank_mask needs a workspace layout built with rank_mask=True");
+    auto const stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamCaptureStatus captureStatus;
+    TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &captureStatus));
+    TORCH_CHECK(captureStatus == cudaStreamCaptureStatusNone,
+        "A CPU active_rank_mask cannot be used during CUDA graph capture, because the graph would not see its later "
+        "changes; pass a tensor on the workspace device");
+    auto* rowWords = reinterpret_cast<uint64_t*>(rankWorkSpacePtr + layout[ACTIVE_RANK_MASK_OFFSET_INDEX]);
+    RankMaskWords mask;
+    std::copy_n(words, kRankMaskWords, mask.begin());
+    std::lock_guard<std::mutex> lock(gWrittenRankMasksMutex);
+    auto [written, inserted] = gWrittenRankMasks.try_emplace(rowWords, mask);
+    if (inserted || written->second != mask)
+    {
+        written->second = mask;
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(rowWords, mask.data(), sizeof(mask), cudaMemcpyHostToDevice, stream));
+    }
+    return rowWords;
 }
 
 // The kernels read the host abort state through unified virtual addressing, so the caller allocates it in pinned
@@ -248,6 +281,7 @@ MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTok
     if (rankMask)
     {
         reserve(INCOMPLETE_ROUND_OFFSET_INDEX, sizeof(uint32_t));
+        reserve(ACTIVE_RANK_MASK_OFFSET_INDEX, sizeof(RankMaskWords), sizeof(uint64_t));
     }
 
     // Dispatch writes these counters and routes; combine reuses the completed routes.
@@ -330,6 +364,10 @@ void moeA2AInitializeOp(
     uint8_t* rankWorkspace = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     cudaMemsetAsync(rankWorkspace + layout[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
         2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
+    if (layout[ACTIVE_RANK_MASK_OFFSET_INDEX] != 0)
+    {
+        forgetWrittenRankMask(reinterpret_cast<uint64_t const*>(rankWorkspace + layout[ACTIVE_RANK_MASK_OFFSET_INDEX]));
+    }
     // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
     // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
     // NVLinkOneSided strategy unusable there; fall back to the Torch process
@@ -808,11 +846,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Rank-mask mode reads the mask through its device address; without it, the mask-free kernels run.
     params.enable_rank_mask = enableRankMask;
-    torch::Tensor deviceRankMask; // Holds the mask on the device until the launches below.
     if (params.enable_rank_mask)
     {
-        deviceRankMask = resolveActiveRankMask(activeRankMask, epRank, workspace);
-        params.active_rank_mask = static_cast<uint64_t const*>(deviceRankMask.const_data_ptr());
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, epRank, workspace, rankWorkSpacePtr, offsets);
     }
     else
     {
@@ -1027,11 +1063,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Rank-mask mode reads the mask through its device address; without it, the mask-free kernels run.
     params.enable_rank_mask = enableRankMask;
-    torch::Tensor deviceRankMask; // Holds the mask on the device until the launches below.
     if (params.enable_rank_mask)
     {
-        deviceRankMask = resolveActiveRankMask(activeRankMask, epRank, workspace);
-        params.active_rank_mask = static_cast<uint64_t const*>(deviceRankMask.const_data_ptr());
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, epRank, workspace, rankWorkSpacePtr, offsets);
     }
     else
     {

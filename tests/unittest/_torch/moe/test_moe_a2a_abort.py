@@ -312,6 +312,41 @@ def test_rank_mask_mode_takes_a_cpu_mask() -> None:
         _dispatch(workspace, meta, experts, controls, payload)
 
 
+def test_cpu_mask_written_only_on_change() -> None:
+    """A CPU rank mask reaches the workspace's mask words only when it differs from the last one."""
+    workspace, meta, experts, payload = _setup(2)
+    controls, abort = _rank_mask_controls(3)
+    # With the abort requested up front, every round returns at once, so a mask may name peer 1.
+    abort[0] = 1
+    offset = _offset(meta, "ACTIVE_RANK_MASK")
+    device_words = workspace[0, offset : offset + 32].view(torch.int64)
+
+    def dispatch(mask: int) -> list[int]:
+        controls["active_rank_mask"] = _mask_words(mask)
+        _dispatch(workspace, meta, experts, controls, payload)
+        _finish(abort, "a dispatch with the abort requested kept waiting")
+        return device_words.tolist()
+
+    assert dispatch(1) == [1, 0, 0, 0]
+    assert dispatch(3) == [3, 0, 0, 0]
+    # An unchanged mask is not written again, so words changed behind the op's back stay.
+    device_words.copy_(torch.tensor([1, 0, 0, 0]))
+    assert dispatch(3) == [1, 0, 0, 0]
+    # Initializing the row zeroes its mask words, so the next mask is written again.
+    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, 2, barrier=False)
+    assert dispatch(3) == [3, 0, 0, 0]
+
+
+def test_cpu_mask_refused_during_capture() -> None:
+    """A captured graph would not see later changes of a CPU rank mask, so capture refuses one."""
+    workspace, meta, experts, payload = _setup(2)
+    controls, _ = _rank_mask_controls(1)
+    controls["active_rank_mask"] = _mask_words(1)
+    with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            _dispatch(workspace, meta, experts, controls, payload)
+
+
 def _fence_timeout() -> None:
     """Check that a fence wait on a silent peer still fails at the timeout."""
     torch.ops.trtllm.moe_a2a_set_timeout(1)

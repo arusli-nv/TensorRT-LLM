@@ -99,8 +99,10 @@ enum MoeA2AMetaInfoIndex : int64_t
     WORKSPACE_SIZE_INDEX = 24,
     // Offset of the incomplete-round word (see moeAlltoAllKernels.h), 0 in layouts without a rank mask.
     INCOMPLETE_ROUND_OFFSET_INDEX = 25,
+    // Offset of the active-rank mask words that a caller's CPU mask is written to, 0 in layouts without a rank mask.
+    ACTIVE_RANK_MASK_OFFSET_INDEX = 26,
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
-    NUM_METAINFO_FIELDS = 26
+    NUM_METAINFO_FIELDS = 27
 };
 
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -136,6 +138,7 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
         {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
         {"MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX", INCOMPLETE_ROUND_OFFSET_INDEX},
+        {"MOE_A2A_ACTIVE_RANK_MASK_OFFSET_INDEX", ACTIVE_RANK_MASK_OFFSET_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},
