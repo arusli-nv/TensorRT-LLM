@@ -24,13 +24,14 @@ import threading
 
 import pytest
 from mpi4py import MPI
-from torch.distributed import DistStoreError
+from torch.distributed import DistStoreError, TCPStore
 
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.membership import (
     SHARED_SECRET_ENV,
     SignedStore,
     StoreGroup,
+    UnsignedValueError,
     rendezvous,
 )
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
@@ -279,3 +280,34 @@ def test_forged_store_value_is_never_unpickled(monkeypatch, forger_secret):
     # The deployment's own values pass.
     signed.set("own", forged)
     assert signed.get("own") == forged
+
+
+def _libuv_store():
+    """Host a TCPStore on torch's default server backend, whose values are limited to 8 MiB."""
+    return TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, use_libuv=True)
+
+
+def test_value_over_store_server_limit():
+    """Set, get and delete values over the 8 MiB that torch's default TCPStore server accepts."""
+    server = _libuv_store()
+    keys = server.num_keys()
+    signed = SignedStore(server, "ab" * 32)
+    large = os.urandom(9 << 20)
+    signed.set("large", large)
+    signed.set("small", b"small")
+    assert signed.get("large") == large
+    assert signed.multi_get(["small", "large"]) == [b"small", large]
+    assert signed.delete_key("large") and signed.delete_key("small")
+    assert server.num_keys() == keys
+
+
+def test_forged_chunks_rejected():
+    """Reject a large value whose chunks another process set under the deployment's signed key."""
+    server = _libuv_store()
+    signed = SignedStore(server, "ab" * 32)
+    signed.set("large", os.urandom(9 << 20))
+    deployment_key = server.get("large")
+    SignedStore(server, "cd" * 32).set("large", os.urandom(9 << 20))
+    server.set("large", deployment_key)
+    with pytest.raises(UnsignedValueError, match="do not match its signed digest"):
+        signed.get("large")

@@ -21,11 +21,16 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, List, Optional
 
 from tensorrt_llm._wide_ep_fault_tolerance import SHARED_SECRET_ENV
+from tensorrt_llm.math_utils import ceil_div
 
 if TYPE_CHECKING:
     from torch.distributed import Store
 
 _TAG_BYTES = hashlib.sha256().digest_size
+_CHUNK_COUNT_BYTES = 4
+# Values above this size are split into chunks of this size, half the 8 MiB value limit of torch's
+# default (libuv) TCPStore server.
+_CHUNK_BYTES = 4 << 20
 SHARED_SECRET_BYTES = 32
 
 
@@ -60,9 +65,14 @@ def shared_secret_digest(label: bytes) -> str:
 class SignedStore:
     """A rendezvous store client that signs the values it sets and verifies those it gets.
 
-    Each value is prefixed with an HMAC-SHA256 tag over its key and bytes, keyed by a digest of
-    the shared secret. A process without the secret cannot set a value that the deployment's
+    A value's key holds an HMAC-SHA256 tag, keyed by a digest of the shared secret, over the key, a
+    chunk count and the value. A process without the secret cannot set a value that the deployment's
     processes accept. Counters (``add``) carry no tag.
+
+    A value larger than ``_CHUNK_BYTES`` is set in chunks under ``<key>/chunks/<i>``, and ``key``
+    holds their count and the value's SHA-256 digest in place of the value. The chunks are set
+    before ``key``, so a process that waits for ``key`` finds them. A value under one key has a
+    chunk count of 0.
     """
 
     def __init__(self, store: "Store", secret: Optional[str] = None):
@@ -86,7 +96,16 @@ class SignedStore:
         return self._store.port
 
     def set(self, key: str, value: bytes) -> None:
-        self._store.set(key, self._tag(key, value) + value)
+        value = bytes(value)
+        chunks, head = 0, value
+        if len(value) > _CHUNK_BYTES:
+            chunks = ceil_div(len(value), _CHUNK_BYTES)
+            for i in range(chunks):
+                chunk = value[i * _CHUNK_BYTES : (i + 1) * _CHUNK_BYTES]
+                self._store.set(_chunk_key(key, i), chunk)
+            head = hashlib.sha256(value).digest()
+        signed = chunks.to_bytes(_CHUNK_COUNT_BYTES, "big") + head
+        self._store.set(key, self._tag(key, signed) + signed)
 
     def get(self, key: str) -> bytes:
         """Wait until ``key`` is set and return its value.
@@ -94,11 +113,11 @@ class SignedStore:
         Raises:
             UnsignedValueError: The value is not signed with the deployment's shared secret.
         """
-        return self._verified(key, self._store.get(key))
+        return self._value(key, self._store.get(key))
 
     def multi_get(self, keys: List[str]) -> List[bytes]:
         """Return the values for ``keys``, as :meth:`get` does."""
-        return [self._verified(k, v) for k, v in zip(keys, self._store.multi_get(keys))]
+        return [self._value(k, v) for k, v in zip(keys, self._store.multi_get(keys))]
 
     def check(self, keys: List[str]) -> bool:
         return self._store.check(keys)
@@ -110,18 +129,38 @@ class SignedStore:
         return self._store.add(key, amount)
 
     def delete_key(self, key: str) -> bool:
-        return self._store.delete_key(key)
+        """Delete ``key`` and its chunks, and return whether ``key`` was set."""
+        deleted = self._store.delete_key(key)
+        chunk = 0
+        while self._store.delete_key(_chunk_key(key, chunk)):
+            chunk += 1
+        return deleted
 
     def _tag(self, key: str, value: bytes) -> bytes:
         encoded = key.encode()
-        message = len(encoded).to_bytes(4, "big") + encoded + bytes(value)
+        message = len(encoded).to_bytes(4, "big") + encoded + value
         return hmac.new(self._key, message, hashlib.sha256).digest()
 
-    def _verified(self, key: str, signed: bytes) -> bytes:
-        tag, value = signed[:_TAG_BYTES], signed[_TAG_BYTES:]
-        if not hmac.compare_digest(tag, self._tag(key, value)):
+    def _value(self, key: str, stored: bytes) -> bytes:
+        """Return the value of ``key`` from its ``stored`` bytes and its chunks, if it has any."""
+        tag, signed = stored[:_TAG_BYTES], stored[_TAG_BYTES:]
+        if not hmac.compare_digest(tag, self._tag(key, signed)):
             raise UnsignedValueError(
                 f"Rendezvous store value {key!r} is not signed with this deployment's "
                 f"{SHARED_SECRET_ENV}, so another process set it"
             )
+        chunks = int.from_bytes(signed[:_CHUNK_COUNT_BYTES], "big")
+        head = signed[_CHUNK_COUNT_BYTES:]
+        if chunks == 0:
+            return head
+        value = b"".join(self._store.get(_chunk_key(key, i)) for i in range(chunks))
+        if not hmac.compare_digest(hashlib.sha256(value).digest(), head):
+            raise UnsignedValueError(
+                f"The chunks of rendezvous store value {key!r} do not match its signed digest, so "
+                "another process set them or the value changed while it was read"
+            )
         return value
+
+
+def _chunk_key(key: str, index: int) -> str:
+    return f"{key}/chunks/{index}"
