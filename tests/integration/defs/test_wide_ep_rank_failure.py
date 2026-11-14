@@ -971,16 +971,26 @@ class Run:
         self.phases.append(phase)
         return phase
 
+    def _committed_generations(self) -> set:
+        """Return the generations of the membership changes that committed so far."""
+        return {
+            s["last_transaction"]["generation"]
+            for _, s in self.monitor.membership
+            if s["last_transaction"] is not None
+        }
+
     def cycle(
         self,
         failure: str,
         at_admission: Optional[Callable[[], Dict[int, psutil.Process]]] = None,
         at_admission_state: Optional[str] = None,
+        at_failover_install: Optional[Dict[int, psutil.Process]] = None,
     ) -> None:
         """Fail a rank with ``crash`` or ``hang``, wait for N ranks, and serve a window.
 
         ``at_admission`` returns processes to kill once the store shows the admission in
-        ``at_admission_state``.
+        ``at_admission_state``. The ``at_failover_install`` processes are killed once the store
+        shows the failover's INSTALL.
         """
         self.cycles += 1
         d, index = self.deployment, self.cycles
@@ -1000,9 +1010,32 @@ class Run:
             victim.kill()
         self.failure_times.append(t_fail)
         detection_s = HANG_TIMEOUT_S if failure == "hang" else 0.0
+        killed_at_failover = sorted(at_failover_install or {})
+        if at_failover_install:
+            _, installing = self.monitor.wait_for(
+                lambda s: s["membership_state"] == "INSTALL"
+                and s["generation"] > status["generation"]
+                and VICTIM not in s["active_ranks"],
+                t_fail,
+                detection_s + RECOVERY_TIMEOUT_S,
+            )
+            for process in at_failover_install.values():
+                process.kill()
+            self.failure_times.append(time.monotonic())
+        failed = sorted({VICTIM, *killed_at_failover})
         t_degraded, failover_status = self.monitor.wait_for(
-            _committed_after(status["generation"]), t_fail, detection_s + RECOVERY_TIMEOUT_S
+            lambda s: _committed_after(status["generation"])(s)
+            and not set(failed) & set(s["active_ranks"]),
+            t_fail,
+            detection_s + RECOVERY_TIMEOUT_S,
         )
+        if at_failover_install:
+            # The kill must land before the failover commits: its INSTALL's generation then never
+            # commits.
+            self.check(
+                installing["generation"] not in self._committed_generations(),
+                f"cycle {index}: the kill did not land during the failover's install: {installing}",
+            )
         self.monitor.wait_for_health(200, "degraded", t_degraded, RECOVERY_TIMEOUT_S)
         self.phases.append(Phase("failover", index, t_fail, t_degraded, event=t_fail))
         time.sleep(SETTLE_S)
@@ -1054,13 +1087,8 @@ class Run:
             self.phases.append(
                 Phase("admission_failure", index, t_kill, t_after_kill, event=t_kill)
             )
-            committed = {
-                s["last_transaction"]["generation"]
-                for _, s in self.monitor.membership
-                if s["last_transaction"] is not None
-            }
             self.check(
-                admitting["generation"] not in committed
+                admitting["generation"] not in self._committed_generations()
                 and not set(killed_at_admission) & set(after_kill["active_ranks"]),
                 f"cycle {index}: the kill did not land during the admission: {after_kill}",
             )
@@ -1088,7 +1116,7 @@ class Run:
         workers_after = _rank_workers(d.secret)
         gpus_after = _rank_gpus(workers_after)
         captures_after = _capture_lines(d.logs)
-        replaced = sorted({VICTIM, *killed_at_admission})
+        replaced = sorted({*failed, *killed_at_admission})
 
         # The longest time without a streamed token at the failure, at the admission, at a kill
         # during the admission, and from the commit at N ranks to the end of the window.
@@ -1139,8 +1167,8 @@ class Run:
         )
         self.check(
             failover_status["generation"] > status["generation"]
-            and failover_status["failed_ranks"] == [VICTIM]
-            and failover_status["active_ranks"] == [r for r in range(WORLD_SIZE) if r != VICTIM]
+            and failover_status["failed_ranks"] == failed
+            and failover_status["active_ranks"] == [r for r in range(WORLD_SIZE) if r not in failed]
             and failover_status["authority_alive"],
             f"cycle {index}: status after the failover: {failover_status}",
         )
@@ -1158,7 +1186,7 @@ class Run:
         # A replacement takes the next incarnation, and one killed during its admission is
         # replaced once more.
         expected = [
-            n + (r == VICTIM) + (r in killed_at_admission)
+            n + (r in failed) + (r in killed_at_admission)
             for r, n in enumerate(status["incarnations"])
         ]
         self.check(
@@ -1318,13 +1346,19 @@ def _check_refused_join(run: Run, kind: str, replacement: bool, reason: str) -> 
     run.check(changed is None, f"a {kind} join for rank {VICTIM} {changed}")
 
 
+def _second_rank(deployment: Deployment) -> Dict[int, psutil.Process]:
+    """Return the process of a rank on this node to fail second, neither rank 0 nor the victim."""
+    workers = _rank_workers(deployment.secret)
+    second = min((r for r in workers if r not in (0, VICTIM)), default=None)
+    assert second is not None, f"no second rank to fail on this node: {sorted(workers)}"
+    return {second: workers[second]}
+
+
 def _crash_during_admission(deployment: Deployment, state: Optional[str] = None) -> None:
     """Crash the victim, then a second rank on this node during the victim's admission."""
     with Run(deployment) as run:
-        workers = _rank_workers(deployment.secret)
-        second = min((r for r in workers if r not in (0, VICTIM)), default=None)
-        assert second is not None, f"no second rank to fail on this node: {sorted(workers)}"
-        run.cycle("crash", at_admission=lambda: {second: workers[second]}, at_admission_state=state)
+        second = _second_rank(deployment)
+        run.cycle("crash", at_admission=lambda: second, at_admission_state=state)
 
 
 class TestRankFailures:
@@ -1365,6 +1399,15 @@ class TestRankFailures:
     def test_failure_during_install(self, shared_deployment: Deployment):
         """Crash a second rank while the active ranks install the first one's admission."""
         _crash_during_admission(shared_deployment, "INSTALL")
+
+    @pytest.mark.timeout(STARTUP_TIMEOUT_S + 2 * REJOIN_TIMEOUT_S + 1200)
+    def test_failure_during_failover_install(self, shared_deployment: Deployment):
+        """Crash a second rank while the survivors install the first one's failover.
+
+        The survivors commit a membership without both ranks and serve on, and both rejoin.
+        """
+        with Run(shared_deployment) as run:
+            run.cycle("crash", at_failover_install=_second_rank(shared_deployment))
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)
