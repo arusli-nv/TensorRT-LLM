@@ -102,9 +102,12 @@ srun --jobid <job> --overlap -w <host of node i> -N1 -n1 --container-name=<the d
 ```
 
 `--rejoin-node` makes the node's supervisor wait for the membership authority and start only replacements of the
-node's ranks, which load at once. It exits with status 1 if the deployment has not started yet or has ended. A
-supervisor that exits with "refused the supervisor of node `<i>`" found the node's previous supervisor still
-connected. Retry, since the authority drops the old one within 60 s.
+node's ranks, which load at once. Until the authority admits it, the supervisor connects again for up to 60 s, which
+covers a previous supervisor of the node that is still exiting. It exits with status 1 in three cases. The deployment
+has not started yet. The deployment's number of ranks is not `--nodes` times the step's GPUs (check `--nodes` and
+the step's GPUs). No authority admitted the node within 60 s, because the deployment ended, the node's previous
+supervisor still runs (check with `ps` and `nvidia-smi`), or the node's ranks are not in the deployment (check
+`--rejoin-node`, `--nodes` and the step's GPUs).
 
 ## Requests, health and monitoring
 
