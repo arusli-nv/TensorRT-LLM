@@ -17,8 +17,6 @@
 The restore shrinks the KV cache pool for the lost experts it loads into spare slots and for the
 workspace rows it remaps. Once the change is committed, every rank returns the empty spare slots
 to the pool, and the replaced workspace rows once no excluded process maps them.
-
-See ``docs/source/features/wide-ep-fault-tolerance.md``.
 """
 
 from __future__ import annotations

@@ -17,8 +17,6 @@
 Every rank runs a RankFailureRecovery, which takes part in each membership change that the
 authority process drives with PROPOSE, INSTALL and COMMITTED records. The ranks pause the forward,
 install the new membership in lockstep, restore the lost experts and resume serving.
-
-See ``docs/source/features/wide-ep-fault-tolerance.md``.
 """
 
 from __future__ import annotations
