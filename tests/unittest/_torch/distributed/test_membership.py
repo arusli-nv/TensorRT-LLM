@@ -314,7 +314,7 @@ def test_hang_during_transaction_restarts_it(phase, how):
 
 
 @pytest.mark.parametrize("cause", ["install", "rank 0"])
-def test_transaction_aborts_on_failed_install_or_rank0_loss(cause):
+def test_failed_install_or_rank0_loss_aborts(cause):
     """Abort on a failed survivor install or the loss of rank 0."""
     cluster = Cluster()
     if cause == "install":
@@ -356,7 +356,7 @@ def test_survivor_failure_during_admission_commits():
     assert MembershipState.ABORTED not in states(cluster)
 
 
-def test_commit_waits_for_every_rank_to_install():
+def test_commit_waits_for_every_install():
     """Never commit a generation that a rank replied READY to but did not install."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(3)
@@ -426,7 +426,7 @@ def test_stalled_joiner_left_out_early():
     assert cluster.now - stalled_s <= authority.ADMISSION_TIMEOUT_S + 0.2
 
 
-def test_join_request_of_unconnected_replacement_is_dropped():
+def test_unconnected_replacement_join_request_dropped():
     """Drop the join request of a replacement that never connects."""
     cluster = Cluster()
     cluster.alive.discard(3)
@@ -504,7 +504,7 @@ def test_replacements_added_in_one_transaction(late):
 
 @pytest.mark.parametrize("failure", ["failed_reply", "hang"])
 @pytest.mark.parametrize("phase", [MembershipState.PROPOSE, MembershipState.INSTALL])
-def test_failed_replacement_is_left_out_of_the_change(phase, failure):
+def test_failed_replacement_left_out_of_change(phase, failure):
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.alive.discard(2)
     cluster.run(1.0)
@@ -623,7 +623,7 @@ def test_startup_collective_hang_aborts(peer):
         assert authority.record.reason == "ranks [2] failed during the startup"
 
 
-def test_first_failover_gives_cause_after_staggered_startup():
+def test_first_failover_cause_after_staggered_startup():
     """Give a hung rank's cause, not that it connected after the others during the startup."""
     cluster = Cluster(hang_timeout_s=1.0)
     cluster.authority = Authority(WORLD, hang_timeout_s=1.0)
@@ -958,7 +958,7 @@ def test_node_supervisor_loss_fails_its_ranks(monkeypatch, lost_by):
         )
 
 
-def test_given_up_change_waits_for_next_record(monkeypatch):
+def test_given_up_ranks_published_during_change(monkeypatch):
     """Publish the ranks a node supervisor gave up at once, or during a change with its next record."""
     proposed, resumed = threading.Event(), threading.Event()
     decide = Authority.tick
@@ -1214,7 +1214,7 @@ def test_callback_error_logged_with_traceback(monkeypatch):
     assert "Traceback" in message
 
 
-def test_client_thread_error_is_reported_and_closes_connection(monkeypatch):
+def test_client_thread_error_closes_connection(monkeypatch):
     """Report any error that ends a client's thread, and close its liveness connection."""
     logged, errors = [], []
     monkeypatch.setattr(liveness.logger, "error", logged.append)

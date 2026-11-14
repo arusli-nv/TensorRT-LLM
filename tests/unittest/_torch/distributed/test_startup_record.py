@@ -200,7 +200,7 @@ def test_failed_startup_leaves_no_pause():
         _record().resume()
 
 
-def test_agreement_without_fault_tolerance_is_not_recorded():
+def test_agreement_unrecorded_without_fault_tolerance():
     assert _record().agree("rank_hosts", lambda: ["a"] * WORLD) == ["a"] * WORLD
     assert _record().published() == {"values": {}, "exchanges": []}
 
@@ -627,7 +627,7 @@ def _replacement_engine(published, tuned_tactics):
     return _DecoderEngine(_replacement(published), measured_ms=0.05, tuner=tuner)
 
 
-def test_replacement_compiles_tactics_in_the_warmup_originals_skip():
+def test_replacement_runs_warmup_originals_skip():
     """Check the final autotuner warmup, which the original ranks skip, on a replacement.
 
     The replacement runs it alone in tuning mode, so the cached tactics of every runner, its
@@ -665,7 +665,7 @@ def test_replacement_tunes_a_missing_shape_alone():
     _record().close()
 
 
-def test_replacement_reports_its_warmup_alone_as_startup_progress():
+def test_replacement_warmup_reports_startup_progress():
     """Check that each step of the warmup a replacement runs alone counts as startup progress.
 
     The steps go through the progress report of its replayed collectives, so a long warmup that
@@ -686,7 +686,7 @@ def test_replacement_reports_its_warmup_alone_as_startup_progress():
 
 
 @pytest.mark.parametrize("cache_file", [False, True])
-def test_replacement_replays_the_final_warmup_of_originals(monkeypatch, tmp_path, cache_file):
+def test_replacement_replays_originals_final_warmup(monkeypatch, tmp_path, cache_file):
     """Check a final autotuner warmup that the original ranks run, for a larger token count.
 
     The replacement starts from the tactics its predecessor had before that warmup, so it tunes the

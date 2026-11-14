@@ -256,7 +256,7 @@ def test_replacement_starts_alone(monkeypatch, requested, logged):
             log.assert_not_called()
 
 
-def test_replacement_drops_the_autotuner_cache_file_override(monkeypatch):
+def test_replacement_drops_autotuner_cache_override(monkeypatch):
     """Check that a replacement's environment overrides do not set the autotuner cache file again."""
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
     monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", "/cache/autotuner.json")
@@ -549,7 +549,7 @@ def test_launch_needs_rank_identity(launched, monkeypatch):
     ],
     ids=["loopback", "debian_hostname", "remote", "one_node"],
 )
-def test_launch_rejects_loopback_rendezvous_on_several_nodes(
+def test_multi_node_launch_rejects_loopback_rendezvous(
     launched, monkeypatch, identity, address, refused
 ):
     """Refuse a loopback rendezvous address on several nodes, which the other nodes cannot reach."""
@@ -563,7 +563,7 @@ def test_launch_rejects_loopback_rendezvous_on_several_nodes(
         startup_module._launched_rank()
 
 
-def test_launch_rejects_unresolvable_rendezvous_on_several_nodes(launched, monkeypatch):
+def test_multi_node_launch_rejects_unresolvable_rendezvous(launched, monkeypatch):
     """Name the rendezvous setting when its host does not resolve on a node of several."""
 
     def unresolvable(host):
@@ -648,7 +648,7 @@ def test_exported_rendezvous_in_ephemeral_range_warns(monkeypatch, tmp_path, por
         assert "outside net.ipv4.ip_local_port_range" in warning.call_args.args[0]
 
 
-def test_single_node_authority_listens_on_loopback_only(monkeypatch):
+def test_single_node_authority_binds_loopback_only(monkeypatch):
     """Check that the authority of one node binds only the rendezvous port, on loopback only."""
     for name in (SHARED_SECRET_ENV, RENDEZVOUS_ENV):
         monkeypatch.delenv(name, raising=False)
