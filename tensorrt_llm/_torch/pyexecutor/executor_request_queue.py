@@ -77,7 +77,8 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_wake_request)
 
     @property
     def is_prefix_load_completion_request(self):
@@ -94,6 +95,10 @@ class RequestQueueItem:
     @property
     def is_profile_stop_request(self):
         return self.id == PROFILE_STOP_REQUEST_ID
+
+    @property
+    def is_wake_request(self):
+        return self.id == WAKE_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -298,8 +303,7 @@ class ExecutorRequestQueue:
         with self.request_queue.mutex:
             return {
                 item.id
-                for item in self.request_queue.queue
-                if item.is_normal_request and item.id != WAKE_REQUEST_ID
+                for item in self.request_queue.queue if item.is_normal_request
             }
 
     def enqueue_control_request(self,
@@ -382,11 +386,11 @@ class ExecutorRequestQueue:
             pass
         # wake() sets _wake_pending before it queues the wake item, so a
         # queue without a pending wake is never scanned.
-        woken = self._wake_pending and any(item.id == WAKE_REQUEST_ID
+        woken = self._wake_pending and any(item.is_wake_request
                                            for item in items)
         if woken:
             self._wake_pending = False
-            items = [item for item in items if item.id != WAKE_REQUEST_ID]
+            items = [item for item in items if not item.is_wake_request]
 
         if not wait_for_batch or self.batch_wait_timeout_ms == 0 or woken:
             return items
@@ -405,7 +409,7 @@ class ExecutorRequestQueue:
                 item = self.request_queue.get(timeout=remaining_timeout)
             except queue.Empty:
                 break
-            if self._wake_pending and item.id == WAKE_REQUEST_ID:
+            if self._wake_pending and item.is_wake_request:
                 self._wake_pending = False
                 break
             items.append(item)

@@ -11,6 +11,7 @@ import datetime
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
@@ -426,3 +427,14 @@ def test_queued_request_ids_skip_wake(executor_queue):
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     executor_queue.wake()
     assert executor_queue.queued_request_ids() == {1}
+
+
+def test_request_stats_skip_wake(executor_queue):
+    """Test that the request stats do not list a pending wake as queued."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+    executor_queue.wake()
+    executor = SimpleNamespace(executor_request_queue=executor_queue)
+    stats = PyExecutor._populate_req_stats(executor, [], [], None)
+    assert [stat.id for stat in stats] == [1]
