@@ -996,6 +996,61 @@ def test_node_supervisor_loss_fails_its_ranks(monkeypatch, lost_by):
         )
 
 
+def test_lost_node_rejoins_in_one_change():
+    """Admit a lost node's new supervisor and its replacements, which join in one change."""
+    with _deployment(4) as (store, clients):
+        states = []
+
+        def on_record(record):
+            states.append(record.state)
+            _reply(clients[0], record)
+
+        clients[0].bind(on_record)
+        node_0 = _NodeSupervisor(store, 0, [0, 1])
+        node_1 = _NodeSupervisor(store, 1, [2, 3])
+        node_1.until(lambda view: True)
+        node_1.connection.sock.close()
+        _until(lambda: _committed(clients[0], 0b0011))
+        node_1 = _NodeSupervisor(store, 1, [2, 3])
+        view = node_1.until(lambda view: True)
+        assert (view.record.state, view.record.active_mask) == (MembershipState.COMMITTED, 0b0011)
+        node_1.report()
+        _until(lambda: clients[0].record.given_up_mask == 0)
+        # The supervisor starts both replacements at once, so both connect before either is ready.
+        joiners = {}
+        for rank in (2, 3):
+            joiners[rank] = MembershipClient(
+                rank,
+                store,
+                lambda record, rank=rank: _reply(joiners[rank], record),
+                replacement=True,
+            )
+            joiners[rank].start()
+            clients.append(joiners[rank])
+        for joiner in joiners.values():
+            joiner.report(joining_ready=True)
+        _until(lambda: _committed(clients[0], 0b1111))
+        assert states.count(MembershipState.PROPOSE) == 2  # the failover and the admission
+        summary = TransactionSummary.model_validate_json(store.get(TRANSACTION_KEY))
+        assert summary.added_ranks == (2, 3)
+        assert clients[0].record.incarnations == (0, 0, 1, 1)
+        node_0.until(lambda view: view.record.active_mask == 0b1111)
+
+
+@pytest.mark.parametrize("node, ranks", [(1, [2, 3]), (2, [3])], ids=["same node", "same rank"])
+def test_second_node_supervisor_refused(node, ranks):
+    """Refuse a supervisor for a node, or a rank, that a connected supervisor holds."""
+    with _deployment(4) as (store, _):
+        node_1 = _NodeSupervisor(store, 1, [2, 3])
+        node_1.until(lambda view: True)
+        with open_node_supervisor_connection(store, node, ranks, f"host-{node}") as second:
+            second.sock.settimeout(10)
+            assert second.sock.recv(1 << 16) == b"", "a second supervisor was admitted"
+        # The authority still admits another node's supervisor.
+        node_0 = _NodeSupervisor(store, 0, [0, 1])
+        assert node_0.until(lambda view: True).record.active_mask == 0b1111
+
+
 def test_given_up_ranks_published_during_change(monkeypatch):
     """Publish the ranks a node supervisor gave up at once, or during a change with its next record."""
     proposed, resumed = threading.Event(), threading.Event()
