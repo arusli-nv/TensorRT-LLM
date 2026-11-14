@@ -628,7 +628,7 @@ def test_statistic_routing_layer_has_no_experts_to_load() -> None:
 @pytest.mark.parametrize(
     "check", ["_online_eplb_not_supported", "_online_eplb_not_verified"])
 def test_fault_tolerance_rejects_unsupported_quantization(check: str) -> None:
-    """Fault tolerance rejects any method not marked SUPPORTED, with a remedy."""
+    """Fault tolerance rejects a method that refuses or has not verified online EPLB."""
     module = MagicMock()
     module.layer_load_balancer.need_load_shared_weights.return_value = True
     module.layer_load_balancer.spare_slot_count = 2

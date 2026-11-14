@@ -74,12 +74,21 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     decoding_type = None if spec_config is None else spec_config.decoding_type
     sa_enhanced = getattr(spec_config, "sa_config", None) is not None
     current_decoding = f"{decoding_type!r} with sa_config" if sa_enhanced else repr(decoding_type)
-    draft_len_schedule = None if spec_config is None else spec_config.draft_len_schedule
-    acceptance_gate = (
-        spec_config is not None
-        and bool(spec_config.acceptance_rate_window_size)
-        and spec_config.acceptance_rate_threshold is not None
-    )
+    # The options with which each rank picks its own draft length.
+    rank_local_draft_len = []
+    if spec_config is not None:
+        if spec_config.max_concurrency is not None:
+            rank_local_draft_len.append(f"max_concurrency={spec_config.max_concurrency}")
+        elif spec_config.draft_len_schedule is not None:
+            rank_local_draft_len.append(f"draft_len_schedule={spec_config.draft_len_schedule}")
+        if (
+            spec_config.acceptance_rate_window_size
+            and spec_config.acceptance_rate_threshold is not None
+        ):
+            rank_local_draft_len.append(
+                f"acceptance_rate_window_size={spec_config.acceptance_rate_window_size} with "
+                f"acceptance_rate_threshold={spec_config.acceptance_rate_threshold}"
+            )
     kv_events = llm_args.kv_cache_config.kv_events_config
     transceiver = llm_args.cache_transceiver_config
     transceiver_backend = None if transceiver is None else transceiver.backend
@@ -149,12 +158,16 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "share",
             ),
             (
-                llm_args.kv_cache_config.event_buffer_max_size == 0
-                and (kv_events is None or not kv_events.enable_kv_cache_events),
+                llm_args.kv_cache_config.event_buffer_max_size == 0,
                 "no KV cache events (kv_cache_config.event_buffer_max_size=0, not "
-                f"{llm_args.kv_cache_config.event_buffer_max_size}, and no "
-                "kv_cache_config.kv_events_config.enable_kv_cache_events), which are not supported "
-                "yet: a failed rank's KV cache blocks would need removal events",
+                f"{llm_args.kv_cache_config.event_buffer_max_size}), which are not supported yet: "
+                "a failed rank's KV cache blocks would need removal events",
+            ),
+            (
+                kv_events is None or not kv_events.enable_kv_cache_events,
+                "no streaming KV cache events (kv_cache_config.kv_events_config."
+                "enable_kv_cache_events=False, not True), which are not supported yet: a failed "
+                "rank's KV cache blocks would need removal events",
             ),
             (
                 transceiver_backend is None,
@@ -180,12 +193,12 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "supported yet: fault tolerance is tested with MTP only",
             ),
             (
-                draft_len_schedule is None and not acceptance_gate,
-                "the same draft length on every rank (no speculative_config.draft_len_schedule, "
-                "max_concurrency or acceptance_rate_window_size), which is not supported yet: each "
-                "rank would pick its draft length from its own batch or acceptance rate, and ranks "
-                "with different draft lengths run different numbers of MTP-layer all-to-alls; "
-                "max_draft_len alone gives a fixed draft length",
+                not rank_local_draft_len,
+                "a fixed draft length (no speculative_config.draft_len_schedule or max_concurrency, "
+                "and no acceptance-rate gate, which is acceptance_rate_window_size with "
+                f"acceptance_rate_threshold; not {', '.join(rank_local_draft_len)}), because "
+                "rank-local draft lengths are not supported yet: ranks with different draft lengths "
+                "run different numbers of MTP-layer all-to-alls",
             ),
             (
                 llm_args.enable_chunked_prefill

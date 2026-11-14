@@ -85,6 +85,8 @@ def _args(**fields) -> TorchLlmArgs:
         # DeepSeek's single MTP layer runs MTP-Eagle one-model, the default MTP path.
         {"speculative_config": MTPDecodingConfig(num_nextn_predict_layers=1)},
         {"speculative_config": MTPDecodingConfig(max_draft_len=1, use_mtp_vanilla=True)},
+        # A window without a threshold turns no acceptance-rate gate on.
+        {"speculative_config": MTPDecodingConfig(max_draft_len=1, acceptance_rate_window_size=16)},
         {"max_seq_len": 8192},
         # An unset max_num_tokens is the default budget of 8192 tokens.
         {"max_num_tokens": None},
@@ -144,7 +146,7 @@ def test_supported_configuration_is_accepted(fields):
                     kv_events_config=KVEventsConfig(enable_kv_cache_events=True)
                 )
             },
-            "and no kv_cache_config.kv_events_config.enable_kv_cache_events), which are not supported",
+            "no streaming KV cache events (kv_cache_config.kv_events_config.enable_kv_cache_events=False, not True)",
         ),
         (
             {"cache_transceiver_config": CacheTransceiverConfig(backend="DEFAULT")},
@@ -193,13 +195,17 @@ def test_supported_configuration_is_accepted(fields):
         *(
             (
                 {"speculative_config": MTPDecodingConfig(max_draft_len=1, **options)},
-                "no speculative_config.draft_len_schedule, max_concurrency or "
-                "acceptance_rate_window_size",
+                "a fixed draft length (no speculative_config.draft_len_schedule or max_concurrency, "
+                "and no acceptance-rate gate, which is acceptance_rate_window_size with "
+                f"acceptance_rate_threshold; not {current})",
             )
-            for options in (
-                {"draft_len_schedule": {4: 1}},
-                {"max_concurrency": 8},
-                {"acceptance_rate_window_size": 16, "acceptance_rate_threshold": 0.3},
+            for options, current in (
+                ({"draft_len_schedule": {4: 1}}, "draft_len_schedule={4: 1}"),
+                ({"max_concurrency": 8}, "max_concurrency=8"),
+                (
+                    {"acceptance_rate_window_size": 16, "acceptance_rate_threshold": 0.3},
+                    "acceptance_rate_window_size=16 with acceptance_rate_threshold=0.3",
+                ),
             )
         ),
         # A recomputed request's context can reach max_seq_len, the model's length by default.
