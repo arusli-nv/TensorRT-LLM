@@ -19,7 +19,7 @@ also summarized in the [MoE Developer Guide](../../moe/fused_moe/MOE_DEVELOPER_G
 
 | In scope | Out of scope (rejected at startup with the reason, or not covered) |
 |---|---|
-| A rank's process exits (crash, `kill -9`), hangs, or is cut off from the network | Hardware failures (a node that crashes, reboots or loses power) |
+| A rank's process exits (crash, `kill -9`) or hangs | Hardware and network failures (a node that crashes, reboots, loses power or is cut off); the authority's keepalive (`DEAD_TIMEOUT_S`) still detects a silent connection |
 | Every process of the deployment on one node exits, while the launcher's own processes there survive | Losing rank 0, node 0 or the authority (the deployment ends) |
 | Serving at N-K on the same CUDA graphs, then back at N after a replacement rejoins on the same GPU | A replacement on another GPU or node; restarting a lost node automatically |
 | DeepSeek-V3 / R1 (`DeepseekV3ForCausalLM`), attention DP, `NVLinkOneSided` fence path, standard EPLB, KV cache manager V2, the overlap scheduler, MTP, the MPI executor, one NVLink domain | Every configuration that `check_llm_args` (`tensorrt_llm/_wide_ep_fault_tolerance.py`), `check_supported` and the MoE backend checks reject, with the reason (the feature page's Requirements list the main ones); Kubernetes |
@@ -87,7 +87,7 @@ These are fixed for this feature. A change that needs to revisit one is a design
 | Late-write remap | `tensorrt_llm/_torch/distributed/membership_mnnvl_memory.py` (`MembershipMnnvlMemory.rows_needing_fresh_pages`, `remap`); `tensorrt_llm/_torch/distributed/mnnvl_memory.py` |
 | Masked, abortable all-to-all | `cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.{cu,h}`, `cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp`; `tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py`; `tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py` (`MoeExecutionState`, `BindableCommunication`, `MembershipWorkspace`); `tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py` (`EPGroupHealth`) |
 | Spare slots | `cpp/tensorrt_llm/runtime/moeLoadBalancer/unbackedSlotMemory.{h,cpp}`, `cpp/tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.{h,cpp}`, `cpp/tensorrt_llm/thop/moe/loadBalance/moeUnbackedSlotOp.cpp`; `create_spare_slot_storage` in `tensorrt_llm/_torch/moe/fused_moe/eplb_expert_restore.py`; `tensorrt_llm/_torch/moe/fused_moe/impl_blocks.py` (`supports_spare_slots`, `tuner_layout_kwargs`) |
-| Expert restore | `tensorrt_llm/_torch/moe/fused_moe/eplb_expert_restore.py` (`FaultTolerantMoeLoadBalancer`, `EplbExpertRestore`, `plan_layer_placement`, `DeploymentHostWeights`); `MoeLoadBalancer::restorePlacement` and `abandonIterations` in `cpp/tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.cpp` |
+| Expert restore | `tensorrt_llm/_torch/moe/fused_moe/eplb_expert_restore.py` (`FaultTolerantMoeLoadBalancer`, `EplbExpertRestore`, `plan_layer_placement`, `DeploymentHostWeights`); `tensorrt_llm/_torch/distributed/membership/host_weights.py` (`host_weights_name`: the `/dev/shm` names derived from the shared secret); `MoeLoadBalancer::restorePlacement` and `abandonIterations` in `cpp/tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.cpp` |
 | Executor failover and rejoin | `tensorrt_llm/_torch/pyexecutor/rank_failure_recovery.py` (`RankFailureRecovery`); `tensorrt_llm/_torch/pyexecutor/rank_failure_memory.py` (`StartupMemory`, `RecoveryMemory`); hooks in `tensorrt_llm/_torch/pyexecutor/py_executor.py`, `tensorrt_llm/_torch/pyexecutor/executor_request_queue.py`, `tensorrt_llm/_torch/pyexecutor/hang_detector.py`, `tensorrt_llm/_torch/pyexecutor/model_loader.py` and `tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py` |
 | Node supervisor and launch | `tensorrt_llm/llmapi/_llmapi_node_supervisor.py` (`NodeSupervisor`); `tensorrt_llm/llmapi/_node_supervised_mpi_session.py` (one node, `trtllm-serve` and the LLM API); `tensorrt_llm/llmapi/_mpirun_job.py` (ends a failed job through `mpirun`); `tensorrt_llm/llmapi/trtllm-llmapi-launch` |
 | Serving | `tensorrt_llm/executor/rank_failure_requests.py` (`RankFailureError`, `RANK_FAILURE_CODE`); `tensorrt_llm/serve/fault_tolerance_health.py` (`FaultToleranceHealth`, `FaultToleranceMetricsCollector`); `tensorrt_llm/serve/openai_server.py` |
@@ -234,8 +234,8 @@ poll of free device memory, at most once a second, finds it free.
    The authority refuses a second supervisor for a node while the old one is still connected (`_node_refusal`), so
    the rejoining supervisor connects again for up to `DEAD_TIMEOUT_S` (60 s). It exits with status 1 when no
    authority admitted it within that time (the deployment ended, the old supervisor is still connected, or the
-   node's ranks are not in the deployment), when the store's values are not signed with this node's shared secret (`UnsignedValueError`, at
-   once), when the record is `SHUTDOWN` or `ABORTED`, when the deployment has not
+   node's ranks are not in the deployment), when the store's values are not signed with this node's shared secret
+   (`UnsignedValueError`, at once), when the record is `SHUTDOWN` or `ABORTED`, when the deployment has not
    started, or when the record's rank count is not `--nodes` times the step's GPUs. Its report clears the node's
    given-up ranks, and their replacements rejoin in one membership change. A replacement of a rank that a previous
    supervisor started waits until no process runs on its GPU (NVML), polling every `_BACKOFF_S`, up to

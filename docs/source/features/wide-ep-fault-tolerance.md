@@ -9,12 +9,11 @@ A wide expert-parallel (Wide-EP) deployment spreads the experts of every MoE lay
 rank ends the whole deployment. With `enable_wide_ep_fault_tolerance`, the surviving ranks remove a failed rank,
 restore its experts into spare EPLB slots from host weights (copies of the experts in `/dev/shm`), and keep serving at
 reduced capacity with the same CUDA graphs. A replacement of the failed rank then starts on the same GPU and rejoins.
-A rank fails when its process exits, when its node is cut off from the network for 60 s, or when it makes no progress
-for 60 s while other ranks wait for it.
+A rank fails when its process exits, or when it makes no progress for 60 s while other ranks wait for it.
 
 ```{warning}
 Wide-EP fault tolerance is a prototype and is subject to change. It is tested on one GB200 NVL72 node (4 ranks).
-Several nodes and the loss of a whole node are not tested yet.
+Several nodes and the loss of a whole node are not covered by CI yet.
 ```
 
 ## Requirements
@@ -23,8 +22,8 @@ These are the main requirements. Startup checks them and others, and rejects a c
 
 - GB200 NVL72 nodes with every GPU of the deployment in one NVLink domain, and an IMEX channel in the container (see
   the [Wide-EP example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep)).
-- DeepSeek-V3 or DeepSeek-R1 (`DeepseekV3ForCausalLM`) with the Cutlass MoE backend, or NVFP4 with `backend: CUTEDSL`.
-  FP8 checkpoints are not supported.
+- DeepSeek-V3 or DeepSeek-R1 (`DeepseekV3ForCausalLM`) as a BF16 or NVFP4 checkpoint with the Cutlass MoE backend, or
+  NVFP4 with `backend: CUTEDSL`. Other quantizations, FP8 among them, are rejected at startup.
 - Attention DP with tensor and expert parallelism over all ranks, `NVLinkOneSided` MoE communication, EPLB, KV cache
   manager V2, the overlap scheduler, MTP with a fixed draft length or no speculative decoding, no `torch_compile_config`
   and no piecewise prefill CUDA graphs (`prefill_cuda_graph_backend: piecewise`), and `enable_chunked_prefill` or a
@@ -35,7 +34,7 @@ These are the main requirements. Startup checks them and others, and rejects a c
 - Room in each rank's KV cache pool for its share of a lost node's experts, which startup checks: a refusal names the
   GiB a rank needs and the `free_gpu_memory_fraction` that would give it. For DeepSeek-R1 NVFP4 with `num_slots: 256`
   on nodes of 4 GPUs, the share is about 43 GiB on 2 nodes, 8 GiB on 4 nodes and 2.7 GiB on 8 nodes, plus the
-  all-to-all workspace, so use at least 4 nodes.
+  all-to-all workspace, so a deployment of several nodes needs at least 4 of them.
 
 ## Single node
 
@@ -156,8 +155,9 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
 ## Limitations
 
 - Anything outside the requirements is rejected at startup with the reason.
-- Only process failures are covered. A node that crashes or loses power ends the deployment, as does the loss of rank
-  0 or its node, or a network or CPU stall of about 28.5 s on node 0. Kubernetes is not supported.
+- Only process failures are covered. A node that crashes, loses power or is cut off from the network ends the
+  deployment, as does the loss of rank 0 or its node, or a network or CPU stall of about 28.5 s on node 0. Kubernetes
+  is not supported.
 - While degraded, the survivors give up part of their KV cache memory to the failed ranks' experts, so fewer requests
   fit. A further failure before a replacement rejoins is recovered only if the spare slots and host weights still hold
   every expert.
