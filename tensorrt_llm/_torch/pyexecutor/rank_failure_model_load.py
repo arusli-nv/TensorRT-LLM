@@ -220,12 +220,17 @@ def _check_host_weights_fit(model: torch.nn.Module) -> None:
 
 def _leftover_entries() -> str:
     """Describe the host weight entries that this user's killed deployments left in /dev/shm."""
+    leftovers = []
     with os.scandir(SHARED_MEMORY_DIR) as entries:
-        leftovers = [
-            f"{entry.name} ({entry.stat().st_blocks * 512 / 2**30:.1f} GiB)"
-            for entry in entries
-            if entry.name.startswith(host_weights_prefix()) and entry.stat().st_uid == os.getuid()
-        ]
+        for entry in entries:
+            if not entry.name.startswith(host_weights_prefix()):
+                continue
+            try:
+                stat = entry.stat()
+            except FileNotFoundError:  # Its deployment unlinked it after the scan listed it.
+                continue
+            if stat.st_uid == os.getuid():
+                leftovers.append(f"{entry.name} ({stat.st_blocks * 512 / 2**30:.1f} GiB)")
     if not leftovers:
         return ""
     return (

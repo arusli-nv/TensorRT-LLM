@@ -208,3 +208,14 @@ def test_startup_check_needs_dev_shm_room(monkeypatch, shortfall):
     message = str(error.value)
     assert f"{leftover} (0.0 GiB)" in message
     assert TURN_FAULT_TOLERANCE_OFF in message
+
+
+def test_leftover_unlinked_during_scan_is_skipped(monkeypatch):
+    """Check that host weights unlinked while /dev/shm is scanned are not named as leftovers."""
+
+    def unlinked():
+        raise FileNotFoundError
+
+    entry = SimpleNamespace(name=f"{host_weights_prefix()}unlinked", stat=unlinked)
+    monkeypatch.setattr(os, "scandir", lambda path: contextlib.nullcontext([entry]))
+    assert rank_failure_model_load._leftover_entries() == ""
