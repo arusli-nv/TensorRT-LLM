@@ -370,7 +370,9 @@ def test_staging_pieces_never_overlap():
             )
 
 
-def _restore_in_threads(restores, plans, before_gather=lambda rank: None):
+def _restore_in_threads(
+    restores, plans, before_gather=lambda rank: None, progress=lambda rank: None
+):
     """Restore ``plans`` on one thread per rank and return each rank's number of allgathers."""
     barrier = threading.Barrier(len(restores))
     values = {}
@@ -390,7 +392,10 @@ def _restore_in_threads(restores, plans, before_gather=lambda rank: None):
     def run(rank):
         try:
             restores[rank].restore_lost_experts(
-                plans[rank], workspace, functools.partial(allgather, rank)
+                plans[rank],
+                workspace,
+                functools.partial(allgather, rank),
+                progress=functools.partial(progress, rank),
             )
         except BaseException as error:  # noqa: BLE001 - the test thread raises it.
             errors.append(error)
@@ -445,6 +450,36 @@ def test_restore_loads_slots_bit_exactly(monkeypatch):
             assert not any(tensor[slot].any() for tensor in layers[i].slot_tensors.values())
 
     _restore_in_threads(restores, plans, local_slots_empty)
+
+
+def test_restore_reports_progress_per_step(monkeypatch):
+    """Report progress after the backing, each staged chunk and each layer loaded locally."""
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
+    placement = [rank[:3] for rank in _PLACEMENT]
+    restores = {
+        rank: _restore(_NODES, rank, layers=2, placement=placement, spares=1) for rank in range(4)
+    }
+    plans = {
+        rank: restore.plan_expert_restore(_active([4, 5]), [np.array(placement)] * 2)
+        for rank, restore in restores.items()
+    }
+    local = {(i, slot) for i, slot in _local_slots(plans[2], 2)}
+    assert {i for i, _ in local} == {0, 1}
+    gathers = collections.Counter()
+    reports = []
+
+    def progress(rank):
+        if rank == 2:
+            layers = restores[2].balancer.single_layer_load_balancers
+            loaded = {i for i, slot in local if layers[i].slot_tensors["w1"][slot].any()}
+            reports.append((gathers[2], loaded))
+
+    _restore_in_threads(restores, plans, lambda rank: gathers.update([rank]), progress)
+    # One allgather agrees on the plan, and each staged chunk takes one more.
+    n = gathers[2]
+    assert n >= 2
+    assert [count for count, _ in reports] == [1, *range(2, n + 1), n, n]
+    assert [loaded for _, loaded in reports[-2:]] == [{0}, {0, 1}]
 
 
 def test_ranks_with_other_views_restore_together(monkeypatch):

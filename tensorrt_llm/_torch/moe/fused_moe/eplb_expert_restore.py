@@ -752,6 +752,7 @@ class EplbExpertRestore:
         workspace: torch.Tensor,
         allgather: Callable[[Any], Sequence[Any]],
         times: Optional[Dict[str, float]] = None,
+        progress: Callable[[], None] = lambda: None,
     ) -> int:
         """Load the slots that ``plan`` changes on this rank, install it and return the bytes mapped.
 
@@ -764,6 +765,8 @@ class EplbExpertRestore:
             allgather: Return the values that every active rank passes to it, by rank, with None
                 for an inactive rank.
             times: Receives each phase's duration in milliseconds.
+            progress: Called after the backing, each staged chunk and each layer loaded locally, so
+                that a long restore keeps reporting progress.
 
         Raises:
             ExpertRestorePlanMismatchError: The plan or the workspace row size of this rank differs
@@ -812,9 +815,10 @@ class EplbExpertRestore:
             True,
         )
         start_s = _phase_done(times, "back", start_s)
+        progress()
         # Local loads need no peer, so they run after the staging that peers wait for.
-        self._stage_slots(plan.staged, workspace, allgather)
-        self._load_local_slots(plan)
+        self._stage_slots(plan.staged, workspace, allgather, progress)
+        self._load_local_slots(plan, progress)
         start_s = _phase_done(times, "load", start_s)
         balancer.load_balancer_impl.restore_placement(
             [rank for rank, active in enumerate(plan.active_ranks) if not active],
@@ -831,7 +835,7 @@ class EplbExpertRestore:
         placement = plan.placements[layer_idx][ep_rank]
         return (placement >= 0) & (placement != plan.placement_before[layer_idx][ep_rank])
 
-    def _load_local_slots(self, plan: ExpertRestorePlan) -> None:
+    def _load_local_slots(self, plan: ExpertRestorePlan, progress: Callable[[], None]) -> None:
         """Load this rank's unstaged slots that ``plan`` changes from this node's host weights."""
         ep_rank = self.balancer.ep_rank
         for i, (layer, placement) in enumerate(
@@ -844,12 +848,14 @@ class EplbExpertRestore:
                 for name, tensor in layer.slot_tensors.items():
                     host = layer.host_tensor_sharer.node_host_weights[(expert, name)]
                     _bytes(tensor[slot]).copy_(_bytes(host))
+            progress()
 
     def _stage_slots(
         self,
         staged: np.ndarray,
         workspace: torch.Tensor,
         allgather: Callable[[Any], Sequence[Any]],
+        progress: Callable[[], None],
     ) -> None:
         """Copy the ``staged`` experts into their slots through ``workspace``, chunk by chunk.
 
@@ -878,6 +884,7 @@ class EplbExpertRestore:
                     workspace[piece.target, piece.row_range].copy_(_bytes(host)[piece.weight_range])
             stream.synchronize()
             allgather(None)
+            progress()
             for piece in chunk_pieces:
                 if piece.target == ep_rank:
                     name = names[piece.layer][piece.weight]

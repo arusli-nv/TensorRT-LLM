@@ -1064,6 +1064,7 @@ class RankFailureRecovery:
                         self._moe.staging_workspace(),
                         self._active_group(record, "expert_staging").allgather,
                         timer.times_ms,
+                        progress=self._install_step_done,
                     )
                 except ExpertRestorePlanMismatchError as error:
                     raise _ExpertsNotRestorable(str(error)) from error

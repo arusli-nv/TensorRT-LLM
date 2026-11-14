@@ -1194,10 +1194,11 @@ def _eplb(monkeypatch, r, restored=6 * MIB, workspace=4 * MIB, device=None, rele
         device.backed += num_bytes
         balancer.expert_restore.backed_spare_slot_bytes = device.backed
 
-    def restore_lost_experts(restore, staging_workspace, allgather, times):
+    def restore_lost_experts(restore, staging_workspace, allgather, times, progress):
         calls.append(("restore", restore))
         assert staging_workspace is r.moe.staging_workspace.return_value
         back(restored)
+        progress()
         times.update({"back": 1.0, "load": 2.0, "install": 3.0})
         return restored
 
@@ -1242,13 +1243,14 @@ def test_install_restores_lost_experts(monkeypatch, extra_free):
     assert order == sorted(order)
     # The pool also gives up the workspace size for the fresh workspace pages.
     assert _resizes(device) == [54 * MIB + 4096]
-    # The authority sees every completed install step, so a long install is not taken for a hang.
+    # The authority sees every completed install step, the restore's own progress included, so a
+    # long install is not taken for a hang.
     steps = [
         report.get("install_steps", report.get("reply"))
         for report in r.client.reports
         if {"install_steps", "reply"} & report.keys()
     ]
-    assert steps == [1, 2, 3, 4, 5, 6, Reply.INSTALLED]
+    assert steps == [1, 2, 3, 4, 5, 6, 7, Reply.INSTALLED]
     _vote(r)
     r.recovery.before_iteration()
     # Once serving resumed, the pool takes back the workspace memory once per change.
