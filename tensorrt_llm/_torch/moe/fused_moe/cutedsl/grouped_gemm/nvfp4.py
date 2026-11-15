@@ -15,6 +15,7 @@
 """``TrtllmCutedslGroupedGemmNvfp4Impl``: ``trtllm.cutedsl.grouped_gemm.nvfp4``."""
 
 import os
+from functools import cached_property, partial
 
 import torch
 
@@ -98,6 +99,42 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     def supports_spare_slots(self) -> bool:
         # The GEMMs of the locality-domain path and the SM107 (Rubin) kernels tune every local slot.
         return self._locality_domain_runtime is None and not _uses_rubin_kernels()
+
+    def create_weights(self) -> None:
+        if self._weights_created:
+            return
+        super().create_weights()
+        if self.uses_spare_slots:
+            # The GEMMs and their tuner profile only the active slots.
+            layout = self.tuner_layout_kwargs
+            self._fused_moe_runner = partial(CuteDslFusedMoENvfp4Runner, **layout)
+            self._gather_act_fusion_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell, **layout
+            )
+            self._finalize_inplace_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell, **layout
+            )
+            self._grouped_gemm_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell, **layout
+            )
+
+    # The runner and the Blackwell ops of the forward. A module with spare slots binds the tuner
+    # layout of its active slots to them in create_weights; the Rubin kernels take no spare slots.
+    @cached_property
+    def _fused_moe_runner(self):
+        return CuteDslFusedMoENvfp4Runner
+
+    @cached_property
+    def _gather_act_fusion_op(self):
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell
+
+    @cached_property
+    def _finalize_inplace_op(self):
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell
+
+    @cached_property
+    def _grouped_gemm_op(self):
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell
 
     # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
     # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
@@ -358,7 +395,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ]
 
         tuner = AutoTuner.get()
-        runner = CuteDslFusedMoENvfp4Runner(
+        runner = self._fused_moe_runner(
             forward_impl=forward_impl,
             num_experts=self.num_slots,
             top_k=effective_top_k,
@@ -370,7 +407,6 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
-            **self.tuner_layout_kwargs,
         )
 
         if use_direct_expert_metadata:
@@ -508,7 +544,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         gather_act_op = (
             torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin
             if use_rubin
-            else torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell
+            else self._gather_act_fusion_op
         )
 
         gather_act_kwargs = dict(
@@ -527,7 +563,6 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
-            **self.tuner_layout_kwargs,
         )
         if use_count_native_expert_metadata:
             gather_act_kwargs["expert_counts"] = recv_expert_count
@@ -585,7 +620,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             finalize_inplace_op = (
                 torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin
                 if use_rubin
-                else torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell
+                else self._finalize_inplace_op
             )
 
             finalize_inplace_kwargs = dict(
@@ -606,7 +641,6 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
-                **self.tuner_layout_kwargs,
             )
             if use_rubin:
                 # The Rubin op has no count-native variant, so it does not
@@ -636,7 +670,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                     "Basic grouped GEMM without finalize fusion is not yet "
                     "supported on Rubin."
                 )
-            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            x = self._grouped_gemm_op(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -650,7 +684,6 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
-                **self.tuner_layout_kwargs,
             )
             torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,

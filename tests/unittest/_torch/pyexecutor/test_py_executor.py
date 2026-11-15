@@ -4900,6 +4900,48 @@ class TestPendingTransferResponseFlush:
         # Once for the retry pass and once for the following clean exit.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
+    @pytest.mark.parametrize("fault_tolerance", [False, True])
+    def test_overlap_idle_pass_runs_rank_failure_hooks_only_with_recovery(
+            self, monkeypatch, fault_tolerance):
+        """Without rank failure recovery the loop calls none of its hooks."""
+        executor = self._make_executor_loop_stub()
+        recovery = Mock() if fault_tolerance else None
+        executor.rank_failure_recovery = recovery
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[], paused_requests=[], generation_requests=[])
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)])
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        executor._terminate_requests = Mock()
+        executor._pause_requests = Mock()
+        executor._can_queue = Mock(return_value=(False, False))
+        executor.kv_connector_manager = None
+        executor._release_unused_connector_reservations = Mock()
+        executor._revert_gen_alloc = Mock()
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor.enable_early_first_token_response = False
+        executor.enable_kv_cache_events = False
+        executor.previous_batch = None
+        executor._enqueue_responses = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._adp_clear_packed_sync_state = Mock()
+        executor._kv_connector_terminate_requests = Mock()
+        executor._accept_or_discard_previous_batch = Mock()
+        executor._update_v2_context_resources_deferred = Mock()
+        executor.iter_counter = 0
+        monkeypatch.setattr(PyExecutor, "disagg",
+                            Mock(handle_errors_synced=Mock(return_value=False)))
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        assert executor._accept_or_discard_previous_batch.call_count == int(fault_tolerance)
+        executor._update_v2_context_resources_deferred.assert_not_called()
+        if fault_tolerance:
+            assert recovery.before_iteration.call_count == 2
+
 
 class TestOneModelMTPDraftTokenScheduling:
     """Regression tests for the one-model MTP over-scheduling bug (#16101).

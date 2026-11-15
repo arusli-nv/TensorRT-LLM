@@ -497,22 +497,23 @@ class ADPRouter(ABC):
             The requests to admit, and the ranks planned for them (request id ->
             rank) to pass to ``route_requests``; empty when no ranks are planned.
         """
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        if len(all_rank_states) < self.dist.tp_size:
+            all_ranks_num_active_requests = self._values_by_rank(
+                all_rank_states, all_ranks_num_active_requests
+            )
         requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=True,
             max_num_active_requests=max_num_active_requests,
-            all_ranks_num_active_requests=self._values_by_rank(
-                all_rank_states, "num_active_requests"
-            ),
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
         )
         return requests, {}
 
-    def _values_by_rank(self, all_rank_states: list[RankState], field: str) -> list[int]:
-        """Return ``field`` of the ranks in the gather, indexed by rank, with 0 for the others."""
-        values = [getattr(state, field) for state in all_rank_states]
-        if len(all_rank_states) == self.dist.tp_size:
-            return values
+    def _values_by_rank(self, all_rank_states: list[RankState], values: list[int]) -> list[int]:
+        """Return the values of the ranks in an active-only gather indexed by rank, with 0 for
+        the ranks it left out."""
         by_rank = [0] * self.dist.tp_size
         for state, value in zip(all_rank_states, values):
             by_rank[state.rank] = value
@@ -717,8 +718,15 @@ class DefaultADPRouter(ADPRouter):
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
         }
-        all_ranks_num_active_requests = self._values_by_rank(all_rank_states, "num_active_requests")
-        all_ranks_num_active_tokens = self._values_by_rank(all_rank_states, "num_active_tokens")
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+        if tp_size < self.dist.tp_size:
+            all_ranks_num_active_requests = self._values_by_rank(
+                all_rank_states, all_ranks_num_active_requests
+            )
+            all_ranks_num_active_tokens = self._values_by_rank(
+                all_rank_states, all_ranks_num_active_tokens
+            )
 
         if placement:
             # Admitted by KV-balanced admission: place them as planned.

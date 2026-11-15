@@ -5391,15 +5391,21 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
-    def _update_v2_context_resources(
-            self,
-            scheduled_batch,
-            context_commits: Optional["ContextCommits"] = None) -> None:
-        """Update self, draft, and cross caches after a context forward.
+    def _update_v2_context_resources(self, scheduled_batch) -> None:
+        """Update self, draft, and cross caches after a context forward."""
+        self.kv_cache_manager.update_context_resources(scheduled_batch)
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.update_context_resources(
+                scheduled_batch)
+        cross_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is not None:
+            cross_kv_cache_manager.update_context_resources(scheduled_batch)
 
-        With ``context_commits``, the reuse commits wait until the step is
-        accepted.
-        """
+    def _update_v2_context_resources_deferred(
+            self, scheduled_batch, context_commits: "ContextCommits") -> None:
+        """:meth:`_update_v2_context_resources` with the reuse commits deferred
+        into ``context_commits`` until the step is accepted."""
         managers = [self.kv_cache_manager]
         if self.enable_joint_kv_cache_reuse:
             managers.append(self.draft_kv_cache_manager)
@@ -5408,12 +5414,9 @@ class PyExecutor:
         if cross_kv_cache_manager is not None:
             managers.append(cross_kv_cache_manager)
         for manager in managers:
-            if context_commits is None:
+            with manager.deferred_context_commits() as commit_ends:
                 manager.update_context_resources(scheduled_batch)
-            else:
-                with manager.deferred_context_commits() as commit_ends:
-                    manager.update_context_resources(scheduled_batch)
-                context_commits.append((manager, commit_ends))
+            context_commits.append((manager, commit_ends))
 
     def _accept_or_discard_previous_batch(self) -> None:
         """Accept the previous step, or discard it if rank failure recovery aborted it.
@@ -8036,7 +8039,6 @@ class PyExecutor:
                         self._submit_encoder_step(
                             scheduled_batch.encoder_requests)
 
-                    outputs_marks = context_commits = None
                     if self.rank_failure_recovery is not None:
                         outputs_marks = self.rank_failure_recovery.mark_outputs(
                             scheduled_batch)
@@ -8080,7 +8082,8 @@ class PyExecutor:
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
 
-                if should_process_previous_batch:
+                if (should_process_previous_batch
+                        and self.rank_failure_recovery is not None):
                     self._accept_or_discard_previous_batch()
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -8172,8 +8175,11 @@ class PyExecutor:
                     # Only applies to KV cache manager V2 + scheduler V2.
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
-                        self._update_v2_context_resources(
-                            scheduled_batch, context_commits)
+                        if self.rank_failure_recovery is None:
+                            self._update_v2_context_resources(scheduled_batch)
+                        else:
+                            self._update_v2_context_resources_deferred(
+                                scheduled_batch, context_commits)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -8237,9 +8243,10 @@ class PyExecutor:
                         gpu_forward_end_event=gpu_forward_end,
                         gpu_forward_events_from_perf_pool=
                         gpu_forward_events_from_perf_pool,
-                        guided_batch_id=self._capturable_guided_batch_id(),
-                        context_commits=context_commits,
-                        outputs_marks=outputs_marks)
+                        guided_batch_id=self._capturable_guided_batch_id())
+                    if self.rank_failure_recovery is not None:
+                        self.previous_batch.context_commits = context_commits
+                        self.previous_batch.outputs_marks = outputs_marks
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None

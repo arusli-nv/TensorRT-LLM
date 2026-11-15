@@ -63,9 +63,7 @@ def nvlink_one_sided_for_binding(
     comm = NVLinkOneSided.__new__(NVLinkOneSided)
     comm.can_use_cft_counted_writes = False
     comm.ep_group_health = health
-    comm._rank_mask_enabled = health is not None or fault_tolerance
-    comm._enable_wide_ep_fault_tolerance = fault_tolerance
-    comm.execution_state = None
+    comm._init_execution(health is not None or fault_tolerance, fault_tolerance)
     comm._dispatch_state = {"phase": "idle"}
     comm.workspace = workspace
     comm.ep_rank = ep_rank

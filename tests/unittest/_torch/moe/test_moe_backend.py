@@ -102,6 +102,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
     trtllm_gen_leaf,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -904,6 +905,121 @@ def test_cutedsl_rejects_direct_metadata_without_fused_finalize() -> None:
     backend.use_fused_finalize = False
     backend._weights_created = True
     assert backend.can_use_deep_ep_direct_metadata(True) is False
+
+
+def _cutedsl_nvfp4_after_create_weights(spare_slot_count: int, monkeypatch):
+    """A CuteDSL NVFP4 backend whose create_weights ran with ``spare_slot_count`` spare slots and
+    3 active slots per rank. Without spare slots, reading the tuner layout fails the test."""
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
+
+    monkeypatch.setattr(nvfp4, "_uses_rubin_kernels", lambda: False)
+    if not spare_slot_count:
+
+        def tuner_layout_kwargs(self):
+            pytest.fail("a module without spare slots read the tuner layout")
+
+        monkeypatch.setattr(
+            TrtllmCutedslGroupedGemmNvfp4Impl, "tuner_layout_kwargs", property(tuner_layout_kwargs)
+        )
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
+    backend._weights_created = False
+    backend._check_quant_config_is_my_format = lambda: None
+    backend.layer_load_balancer = SimpleNamespace(
+        spare_slot_count=spare_slot_count, active_slot_count_per_rank=3
+    )
+    monkeypatch.setattr(MoEWeightOwnerMixin, "create_weights", lambda self: None)
+    backend.create_weights()
+    backend._locality_domain_runtime = None
+    backend._pending_x_ready_event = None
+    backend.hidden_size = 4
+    backend.num_slots = 4
+    return backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("spare_slot_count", [0, 2])
+def test_cutedsl_nvfp4_runner_gets_the_tuner_layout_only_with_spare_slots(
+    spare_slot_count, monkeypatch
+):
+    """The forward builds its runner with the active slots' tuner layout only with spare slots."""
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
+
+    runners = []
+
+    class Runner:
+        def __init__(self, **kwargs):
+            runners.append(kwargs)
+
+        def get_tuning_config(self):
+            return None
+
+        def __call__(self, inputs, tactic):
+            return "output"
+
+    monkeypatch.setattr(nvfp4, "CuteDslFusedMoENvfp4Runner", Runner)
+    monkeypatch.setattr(
+        nvfp4, "AutoTuner", SimpleNamespace(get=lambda: Mock(**{"choose_one.return_value": (None, 0)}))
+    )
+    backend = _cutedsl_nvfp4_after_create_weights(spare_slot_count, monkeypatch)
+    backend.use_fused_finalize = True
+
+    output = backend.run_moe_nvfp4(
+        MagicMock(),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.float32),
+        moe_output=torch.empty((2, 4), dtype=torch.bfloat16),
+        weight_view=MagicMock(expert_size_per_partition=4, slot_start=0),
+    )
+
+    assert output == "output" and len(runners) == 1
+    assert runners[0].get("tuner_num_local_experts") == (3 if spare_slot_count else None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_fused_finalize", [True, False])
+@pytest.mark.parametrize("spare_slot_count", [0, 2])
+def test_cutedsl_nvfp4_grouped_gemms_get_the_tuner_layout_only_with_spare_slots(
+    spare_slot_count, use_fused_finalize, monkeypatch
+):
+    """The forward's grouped GEMMs get the active slots' tuner layout only with spare slots."""
+    calls = {}
+
+    def record(name, result=None):
+        def op(**kwargs):
+            calls[name] = kwargs
+            return result
+
+        monkeypatch.setattr(torch.ops.trtllm, name, op, raising=False)
+
+    gather = "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell"
+    finalize = "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell"
+    gemm = "cute_dsl_nvfp4_grouped_gemm_blackwell"
+    record(gather, (MagicMock(), MagicMock()))
+    record(finalize)
+    record(gemm, MagicMock())
+    record("moe_output_memset_inplace")
+    record("moe_unpermute_inplace")
+    backend = _cutedsl_nvfp4_after_create_weights(spare_slot_count, monkeypatch)
+    backend.use_fused_finalize = use_fused_finalize
+    backend._has_moe_output_memset_aux_stream = lambda: False
+    backend.mapping = SimpleNamespace(moe_ep_size=1)
+    backend.fc2_input_scale = None
+    backend.activation_type = ActivationType.Swiglu
+    backend.act_clamp = None
+    sort_tables = SimpleNamespace(tile_size=128, outputs=tuple(MagicMock() for _ in range(6)))
+
+    backend.run_moe_nvfp4_impl(
+        MagicMock(),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.float32),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(expert_size_per_partition=4, slot_start=0),
+        sort_tables=sort_tables,
+    )
+
+    for name in (gather, finalize if use_fused_finalize else gemm):
+        assert calls[name].get("tuner_num_local_experts") == (3 if spare_slot_count else None)
 
 
 @pytest.mark.cpu_only
@@ -7049,6 +7165,38 @@ def test_cutlass_leaf_run_moe_hands_the_op_its_declarations(leaf_cls, monkeypatc
     # Only the leaves that fuse LoRA hand lora_params to the op.
     fuses_lora = leaf_cls.capabilities.supports_moe_lora
     assert (calls[0].get("fc1_lora_ranks") == "fc1-ranks") is fuses_lora
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("leaf_cls", _CUTLASS_FUSED_MOE_OP_LEAVES, ids=lambda cls: cls.__name__)
+def test_cutlass_leaf_without_spare_slots_never_reads_the_tuner_layout(leaf_cls, monkeypatch):
+    """Without spare slots the op runs with its own arguments only, and no tuner layout is read per call."""
+    calls = _record_fused_moe(monkeypatch)
+
+    def tuner_layout_kwargs(self):
+        pytest.fail("a forward without spare slots read the tuner layout")
+
+    monkeypatch.setattr(leaf_cls, "tuner_layout_kwargs", property(tuner_layout_kwargs))
+    leaf = _cutlass_leaf_on_cpu(leaf_cls)
+    leaf.run_moe(_cpu_run_context())
+
+    assert len(calls) == 1 and "tuner_num_local_experts" not in calls[0]
+    assert leaf._fused_moe_op is torch.ops.trtllm.fused_moe
+
+
+@pytest.mark.cpu_only
+def test_cutlass_leaf_with_spare_slots_tunes_its_active_slots(monkeypatch):
+    """A layer with spare slots binds the tuner layout of its active slots once, at weight creation."""
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(_CUTLASS_FUSED_MOE_OP_LEAVES[0])
+    leaf.layer_load_balancer = SimpleNamespace(spare_slot_count=2, active_slot_count_per_rank=3)
+    leaf._weights_created = False
+    leaf._check_quant_config_is_my_format = lambda: None
+    monkeypatch.setattr(MoEWeightOwnerMixin, "create_weights", lambda self: None)
+    leaf.create_weights()
+    leaf.run_moe(_cpu_run_context())
+
+    assert len(calls) == 1 and calls[0]["tuner_num_local_experts"] == 3
 
 
 @pytest.mark.cpu_only

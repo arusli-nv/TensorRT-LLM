@@ -66,6 +66,8 @@ def _frontend(
 
 
 _EP_SIZE, _TOKENS, _HIDDEN = 2, 8, 128
+# Positional arguments of the all-to-all dispatch and combine ops up to active_rank_mask.
+_DISPATCH_ARGS, _COMBINE_ARGS = 15, 14
 # Word of the abort state holding the wait evidence on peer 0.
 _EVIDENCE = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
 _JOIN_TIMEOUT_S = 10.0
@@ -338,11 +340,11 @@ def test_bound_layers_pass_state_records(monkeypatch) -> None:
     received = [payload, torch.zeros(_EP_SIZE, _TOKENS, 1, dtype=torch.int32)]
 
     def dispatch_op(*args, **kwargs):
-        calls.append(args[-3:])
+        calls.append((args, kwargs))
         return received, 0, torch.empty(0)
 
     def combine_op(*args, **kwargs):
-        calls.append(args[-3:])
+        calls.append((args, kwargs))
         return torch.zeros(_TOKENS, _HIDDEN)
 
     monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_dispatch", dispatch_op, raising=False)
@@ -363,13 +365,24 @@ def test_bound_layers_pass_state_records(monkeypatch) -> None:
     # A layer built for fault tolerance takes its membership only from an execution state.
     with pytest.raises(RuntimeError, match="dispatches only once bound"):
         bound.dispatch(*inputs)
+    # A layer without fault tolerance resolves the ops at its first launch; binding replaces a
+    # fault-tolerant layer's ops.
+    assert not {"_dispatch_op", "_combine_op"} & vars(without_mask).keys()
+    unbound = (bound._dispatch_op, bound._combine_op)
     bound.bind_execution_state(state)
+    assert bound._dispatch_op is not unbound[0] and bound._combine_op is not unbound[1]
     for comm in (without_mask, bound):
         comm.dispatch(*inputs)
         comm.combine(payload)
+    assert (without_mask._dispatch_op, without_mask._combine_op) == (dispatch_op, combine_op)
 
-    assert calls[:2] == [(False, None, None)] * 2
-    for enabled, mask, abort in calls[2:]:
+    # Without fault tolerance the ops get exactly their arguments on main: no abort state.
+    assert [(len(args), args[-2:], kwargs) for args, kwargs in calls[:2]] == [
+        (_DISPATCH_ARGS, (False, None), {}),
+        (_COMBINE_ARGS, (False, None), {}),
+    ]
+    for args, _ in calls[2:]:
+        enabled, mask, abort = args[-3:]
         assert enabled is True and mask is state.active_rank_mask and abort is state.abort
     caller_mask = torch.tensor([0b11, 0, 0, 0], dtype=torch.uint64)
     with pytest.raises(ValueError, match="requires committed EP group health"):

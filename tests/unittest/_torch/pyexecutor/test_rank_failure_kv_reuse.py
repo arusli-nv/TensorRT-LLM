@@ -81,7 +81,6 @@ def _executor(manager, accept_step):
         use_spec_decode=False,
         capturable_guided_decoder=None,
     )
-    executor.update = partial(PyExecutor._update_v2_context_resources, executor)
     executor._discard_previous_batch = partial(PyExecutor._discard_previous_batch, executor)
 
     def finish(step):
@@ -119,8 +118,11 @@ def _launch(executor, batch):
     """Launch the forward, update the caches as the executor does, and return the step."""
     for request in batch.context_requests:
         request.move_to_next_context_chunk()
-    context_commits = [] if executor.rank_failure_recovery is not None else None
-    executor.update(batch, context_commits)
+    if executor.rank_failure_recovery is None:
+        PyExecutor._update_v2_context_resources(executor, batch)
+        return BatchState(scheduled_requests=batch, sample_state=None)
+    context_commits = []
+    PyExecutor._update_v2_context_resources_deferred(executor, batch, context_commits)
     return BatchState(scheduled_requests=batch, sample_state=None, context_commits=context_commits)
 
 
