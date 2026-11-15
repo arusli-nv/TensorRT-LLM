@@ -161,6 +161,9 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
 - While degraded, the survivors give up part of their KV cache memory to the failed ranks' experts, so fewer requests
   fit. A further failure before a replacement rejoins is recovered only if the spare slots and host weights still hold
   every expert.
+- While degraded, context (prefill) steps can take longer. On DeepSeek-V3-Lite over 4 GPUs, the survivors' context
+  steps after some failovers took about 1.2-1.5x as long as before the failure, while decode steps barely changed.
+  DeepSeek-R1 over 16 GPUs showed no such slowdown after the loss of every process of a node.
 - A replacement takes minutes to rejoin, and one with no startup progress for 10 min is killed and retried. A rank
   whose replacements fail 3 times in a row is given up. A failure before the deployment first serves ends it.
 - Fault tolerance can lower throughput while no rank fails.
