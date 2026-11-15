@@ -22,6 +22,7 @@ workspace from a rank whose node has them.
 """
 
 import collections
+import concurrent.futures
 import ctypes
 import functools
 import hashlib
@@ -769,9 +770,9 @@ class EplbExpertRestore:
             allgather: Return the values that every active rank passes to it, by rank, with None
                 for an inactive rank.
             times: Receives each phase's duration in milliseconds.
-            progress: Called after the backing, each staged chunk and each layer loaded locally, so
-                that a long restore keeps reporting progress. It may raise to stop the restore. The
-                slots loaded so far then hold no expert in this rank's view until the next restore.
+            progress: Called after each staged chunk and each layer loaded locally, so that a long
+                restore keeps reporting progress. It may raise to stop the restore. The slots loaded
+                so far then hold no expert in this rank's view until the next restore.
 
         Raises:
             ExpertRestorePlanMismatchError: The plan or the workspace row size of this rank differs
@@ -812,19 +813,49 @@ class EplbExpertRestore:
                 self._invalid_slots.setdefault(i, set()).update(loaded)
         start_s = time.perf_counter()
         # A spare slot is backed before an expert is loaded into it and before routing can reach it.
-        mapped = self.set_spare_slots_backed(
-            [
-                filled_spare_slots(layer, placement[balancer.ep_rank])
-                for layer, placement in zip(layers, plan.placements)
-            ],
-            True,
+        # A worker thread backs the layers in order, while this thread loads each layer once it is
+        # backed, so the loads overlap the backing of the layers after them.
+        backing = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="spare_slot_backing"
         )
-        start_s = _phase_done(times, "back", start_s)
-        progress()
-        # Local loads need no peer, so they run after the staging that peers wait for.
-        self._stage_slots(plan.staged, workspace, allgather, progress)
-        self._load_local_slots(plan, progress)
-        start_s = _phase_done(times, "load", start_s)
+        try:
+            layer_backings: List[concurrent.futures.Future] = []
+            for i, (layer, placement) in enumerate(zip(layers, plan.placements)):
+                layer_backings.append(
+                    backing.submit(
+                        self._back_layer_spare_slots,
+                        i,
+                        filled_spare_slots(layer, placement[balancer.ep_rank]),
+                        layer_backings[-1] if layer_backings else None,
+                    )
+                )
+
+            def wait_backed(layer_idx: int) -> None:
+                layer_backings[layer_idx].result()
+
+            loaded_layers = 0
+
+            def load_local_slots(end: int) -> None:
+                """Load the local slots of the layers before ``end`` that are not loaded yet."""
+                nonlocal loaded_layers
+                for i in range(loaded_layers, end):
+                    self._load_local_slots(plan, i, wait_backed, progress)
+                loaded_layers = max(loaded_layers, end)
+
+            self._stage_slots(
+                plan.staged, workspace, allgather, wait_backed, load_local_slots, progress
+            )
+            load_local_slots(len(layers))
+            backed = [layer_backing.result() for layer_backing in layer_backings]
+        finally:
+            # A stopped restore waits for the layer being backed and backs no other.
+            backing.shutdown(cancel_futures=True)
+        mapped = sum(changed for changed, _ in backed)
+        # "back" ends when the last layer is backed, and "load" is the part of the loads after it.
+        backed_s = max((done_s for _, done_s in backed), default=start_s)
+        if times is not None:
+            times["back"] = (backed_s - start_s) * 1e3
+        start_s = _phase_done(times, "load", backed_s)
         balancer.load_balancer_impl.restore_placement(
             [rank for rank, active in enumerate(plan.active_ranks) if not active],
             [placement.tolist() for placement in plan.placements],
@@ -840,31 +871,65 @@ class EplbExpertRestore:
         placement = plan.placements[layer_idx][ep_rank]
         return (placement >= 0) & (placement != plan.placement_before[layer_idx][ep_rank])
 
-    def _load_local_slots(self, plan: ExpertRestorePlan, progress: Callable[[], None]) -> None:
-        """Load this rank's unstaged slots that ``plan`` changes from this node's host weights."""
+    def _back_layer_spare_slots(
+        self,
+        layer_idx: int,
+        slots: List[int],
+        previous: Optional[concurrent.futures.Future],
+    ) -> Tuple[int, float]:
+        """Back ``slots`` of layer ``layer_idx``. Return the bytes mapped and when it finished.
+
+        If backing the ``previous`` layer failed, raise its error and back nothing.
+        """
+        if previous is not None:
+            previous.result()
+        layer_slots: List[List[int]] = [[] for _ in self.balancer.single_layer_load_balancers]
+        layer_slots[layer_idx] = slots
+        return self.set_spare_slots_backed(layer_slots, True), time.perf_counter()
+
+    def _load_local_slots(
+        self,
+        plan: ExpertRestorePlan,
+        layer_idx: int,
+        wait_backed: Callable[[int], None],
+        progress: Callable[[], None],
+    ) -> None:
+        """Load the unstaged slots that ``plan`` changes on this rank in layer ``layer_idx``.
+
+        They are copied from this node's host weights once ``wait_backed`` returns for the layer.
+        """
         ep_rank = self.balancer.ep_rank
-        for i, (layer, placement) in enumerate(
-            zip(self.balancer.single_layer_load_balancers, plan.placements)
-        ):
-            staged = plan.staged[(plan.staged[:, 0] == i) & (plan.staged[:, 1] == ep_rank), 2]
-            changed = self._loaded_slots(plan, i)
-            for slot in np.flatnonzero(changed & ~np.isin(np.arange(changed.size), staged)):
-                expert = int(placement[ep_rank, slot])
-                for name, tensor in layer.slot_tensors.items():
-                    host = layer.host_tensor_sharer.node_host_weights[(expert, name)]
-                    _bytes(tensor[slot]).copy_(_bytes(host))
-            progress()
+        layer = self.balancer.single_layer_load_balancers[layer_idx]
+        staged = plan.staged[(plan.staged[:, 0] == layer_idx) & (plan.staged[:, 1] == ep_rank), 2]
+        changed = self._loaded_slots(plan, layer_idx)
+        slots = np.flatnonzero(changed & ~np.isin(np.arange(changed.size), staged))
+        if slots.size:
+            wait_backed(layer_idx)
+        for slot in slots:
+            expert = int(plan.placements[layer_idx][ep_rank, slot])
+            for name, tensor in layer.slot_tensors.items():
+                host = layer.host_tensor_sharer.node_host_weights[(expert, name)]
+                _bytes(tensor[slot]).copy_(_bytes(host))
+        progress()
 
     def _stage_slots(
         self,
         staged: np.ndarray,
         workspace: torch.Tensor,
         allgather: Callable[[Any], Sequence[Any]],
+        wait_backed: Callable[[int], None],
+        load_local_slots: Callable[[int], None],
         progress: Callable[[], None],
     ) -> None:
         """Copy the ``staged`` experts into their slots through ``workspace``, chunk by chunk.
 
         Every active rank meets in ``allgather`` between the sources' writes and the targets' reads.
+        A target reads a layer's pieces once ``wait_backed`` returns for the layer.
+
+        Args:
+            load_local_slots: Loads the local slots of the layers before the given one. Local loads
+                need no peer, so before each chunk's allgather this rank loads those up to the
+                chunk's last layer, while the ranks that read the chunk may still be backing it.
         """
         if not staged.size:
             return
@@ -887,11 +952,13 @@ class EplbExpertRestore:
                         (piece.expert, name)
                     ]
                     workspace[piece.target, piece.row_range].copy_(_bytes(host)[piece.weight_range])
+            load_local_slots(max(piece.layer for piece in chunk_pieces) + 1)
             stream.synchronize()
             allgather(None)
             progress()
             for piece in chunk_pieces:
                 if piece.target == ep_rank:
+                    wait_backed(piece.layer)
                     name = names[piece.layer][piece.weight]
                     slot_weight = layers[piece.layer].slot_tensors[name][piece.slot]
                     _bytes(slot_weight)[piece.weight_range].copy_(

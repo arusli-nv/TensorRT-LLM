@@ -15,11 +15,13 @@
 """Tests for the EPLB host weights that Wide-EP fault tolerance keeps in a ring of nodes."""
 
 import collections
+import concurrent.futures
 import functools
 import itertools
 import os
 import secrets
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -444,17 +446,141 @@ def test_restore_loads_slots_bit_exactly(monkeypatch):
         restore.balancer.load_balancer_impl.restore_placement.side_effect = functools.partial(
             _check_loaded, restore, plans[rank]
         )
+    _restore_in_threads(restores, plans)
 
-    def local_slots_empty(rank):
-        layers = restores[rank].balancer.single_layer_load_balancers
-        for i, slot in _local_slots(plans[rank], rank):
-            assert not any(tensor[slot].any() for tensor in layers[i].slot_tensors.values())
 
-    _restore_in_threads(restores, plans, local_slots_empty)
+class _HostWeightsReadAfter(dict):
+    """Host weights whose reads wait until ``event`` is set."""
+
+    def __init__(self, event, weights):
+        super().__init__(weights)
+        self._event = event
+
+    def __getitem__(self, key):
+        started = self._event.wait(timeout=10)
+        assert started, f"Expert {key[0]} was read before the next layer's backing started"
+        return super().__getitem__(key)
+
+
+def _wait_until(condition, timeout_s=10):
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(1e-3)
+    return True
+
+
+def _overlap_backing(restore, plan):
+    """Make ``restore`` back one layer per call, overlapping the loads of the layer before it.
+
+    Backing layer L + 1 starts before any host weight of layer L is read, and it ends only once
+    layer L's slots are loaded. Return the layers backed, in order.
+    """
+    rank = restore.balancer.ep_rank
+    layers = restore.balancer.single_layer_load_balancers
+    started = [threading.Event() for _ in layers]
+    backed = []
+
+    def loaded(i):
+        """Return whether each slot that ``plan`` loads in layer ``i`` holds its expert."""
+        placement, before = plan.placements[i][rank], plan.placement_before[i][rank]
+        slots = np.flatnonzero((placement >= 0) & (placement != before))
+        return [layers[i].slot_tensors["w1"][slot].any() for slot in slots]
+
+    def set_spare_slots_backed(layer_slots, is_backed):
+        assert is_backed
+        backing = [i for i, slots in enumerate(layer_slots) if slots]
+        assert len(backing) == 1, f"Rank {rank} backed layers {backing} in one call"
+        (i,) = backing
+        assert not any(loaded(i)), f"Rank {rank} loaded layer {i} before backing it"
+        started[i].set()
+        assert i == 0 or _wait_until(lambda: all(loaded(i - 1))), (
+            f"Rank {rank} waited for layer {i} to be backed before it loaded layer {i - 1}"
+        )
+        backed.append(i)
+        return 0
+
+    restore.set_spare_slots_backed = set_spare_slots_backed
+    for layer, next_started in zip(layers, started[1:]):
+        sharer = layer.host_tensor_sharer
+        sharer.node_host_weights = _HostWeightsReadAfter(next_started, sharer.node_host_weights)
+    return backed
+
+
+def test_restore_backs_next_layer_while_loading(monkeypatch):
+    """Back each layer before loading it, and back the next layer while loading it."""
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
+    placement = [rank[:3] for rank in _PLACEMENT]
+    restores = {
+        rank: _restore(_NODES, rank, layers=2, placement=placement, spares=1) for rank in range(4)
+    }
+    plans = {
+        rank: restore.plan_expert_restore(_active([4, 5]), [np.array(placement)] * 2)
+        for rank, restore in restores.items()
+    }
+    # Ranks 0 and 1 read both layers' experts from the staging workspace, and ranks 2 and 3 load
+    # them from host weights and stage them out.
+    assert all(any(_local_slots(plans[rank], rank)) == (rank >= 2) for rank in range(4))
+    backed = {rank: _overlap_backing(restore, plans[rank]) for rank, restore in restores.items()}
+    for rank, restore in restores.items():
+        restore.balancer.load_balancer_impl.restore_placement.side_effect = functools.partial(
+            _check_loaded, restore, plans[rank]
+        )
+    gathers = _restore_in_threads(restores, plans)
+    assert backed == {rank: [0, 1] for rank in range(4)}
+    # The ranks agree on the plan, then meet once per staged chunk.
+    assert set(gathers.values()) == {4}
+    assert not _backing_threads()
+
+
+def _backing_threads():
+    """Return the threads that back spare slots for a restore."""
+    return [
+        thread for thread in threading.enumerate() if thread.name.startswith("spare_slot_backing")
+    ]
+
+
+class _BackingError(RuntimeError):
+    pass
+
+
+class _RunEveryBacking(concurrent.futures.ThreadPoolExecutor):
+    """Run every queued backing at shutdown, so that only the restore can skip a layer."""
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        super().shutdown(wait=True)
+
+
+def test_failed_backing_stops_the_restore(monkeypatch):
+    """Raise a layer's backing error in the restore and back no later layer."""
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _RunEveryBacking)
+    placement = [rank[:3] for rank in _PLACEMENT]
+    restore = _restore(_NODES, 2, layers=2, placement=placement, spares=1)
+    plan = restore.plan_expert_restore(_active([4, 5]), [np.array(placement)] * 2)
+    error = _BackingError("out of memory")
+    backing = []
+
+    def set_spare_slots_backed(layer_slots, is_backed):
+        backing.append([i for i, slots in enumerate(layer_slots) if slots])
+        raise error
+
+    restore.set_spare_slots_backed = set_spare_slots_backed
+    workspace = torch.zeros(len(_NODES), 1024, dtype=torch.uint8)
+    with pytest.raises(_BackingError) as raised:
+        restore.restore_lost_experts(plan, workspace, lambda value: [value] * len(_NODES))
+    assert raised.value is error
+    assert backing == [[0]]
+    assert not _backing_threads()
+    restore.balancer.load_balancer_impl.restore_placement.assert_not_called()
 
 
 def test_restore_reports_progress_per_step(monkeypatch):
-    """Report progress after the backing, each staged chunk and each layer loaded locally."""
+    """Report progress after each staged chunk and each layer loaded locally.
+
+    A rank loads its local slots of a chunk's layers before the chunk's allgather.
+    """
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: Mock())
     placement = [rank[:3] for rank in _PLACEMENT]
     restores = {
@@ -476,11 +602,11 @@ def test_restore_reports_progress_per_step(monkeypatch):
             reports.append((gathers[2], loaded))
 
     _restore_in_threads(restores, plans, lambda rank: gathers.update([rank]), progress)
-    # One allgather agrees on the plan, and each staged chunk takes one more.
-    n = gathers[2]
-    assert n >= 2
-    assert [count for count, _ in reports] == [1, *range(2, n + 1), n, n]
-    assert [loaded for _, loaded in reports[-2:]] == [{0}, {0, 1}]
+    # One allgather agrees on the plan, and each of the three staged chunks takes one more. Chunk 0
+    # stages layer 0 and chunk 1 starts layer 1, so rank 2 loads its local slot of each layer
+    # before that chunk's allgather.
+    assert gathers[2] == 4
+    assert reports == [(1, {0}), (2, {0}), (2, {0, 1}), (3, {0, 1}), (4, {0, 1})]
 
 
 def test_ranks_with_other_views_restore_together(monkeypatch):
@@ -555,6 +681,7 @@ def test_interrupted_restore_reloads_its_slots(monkeypatch):
     workspace = torch.zeros(len(_NODES), 1024, dtype=torch.uint8)
     with pytest.raises(RuntimeError, match="a newer membership change"):
         restore.restore_lost_experts(plan, workspace, allgather)
+    assert not _backing_threads()
     # Rank 2's view names no expert in the slot until a restore installs a placement.
     ((_, view),) = restore.current_placement()
     assert view[2] == [-1, 5, -1, -1]
