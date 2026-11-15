@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
+#include <cstddef>
 #include <cuda_fp16.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -49,7 +50,12 @@ struct CftCombinePeerInfo
 {
     uint32_t ids[kMaxRanks];
     uint32_t* completion_flags[kMaxRanks];
-    uint64_t const* active_rank_mask;
+    // Sized as in DispatchKernelPointers.
+    union
+    {
+        uint64_t const* active_rank_mask;
+        uint64_t active_rank_mask_slot[kRankMaskWords];
+    };
 };
 
 // Nominal clock64 rate used to convert timeout seconds to SM cycles.
@@ -152,14 +158,16 @@ struct DispatchKernelPointers
     // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
     // The address is fixed, so captured CUDA graphs read a mask rewritten in place while no collective runs.
     uint64_t const* active_rank_mask{nullptr};
-
-    // Host-selected wait budget in clock64() cycles.
-    int64_t timeout_cycles{kDefaultTimeoutCycles};
-
     // Byte offset from completion_flags[rank] to the incomplete-round word (see above) of that rank, or 0 without one.
     // Every rank's workspace has the same layout, so one offset locates the word of every rank.
     int64_t incomplete_round_offset{0};
     MoeA2AAbortState* abort{nullptr};
+    // The rank-mask fields above fill kRankMaskWords words, so the parameter offsets of the fields and of the kernel
+    // arguments after them do not depend on them.
+    uint64_t rank_mask_reserved{0};
+
+    // Host-selected wait budget in clock64() cycles.
+    int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
 // Gather one contribution slice per expert rank.
@@ -187,14 +195,24 @@ struct CombineKernelPointers
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
     // completion flag writes/waits to/from inactive peers.
     uint64_t const* active_rank_mask{nullptr};
-
-    // Host-selected wait budget in clock64() cycles.
-    int64_t timeout_cycles{kDefaultTimeoutCycles};
-
     // Incomplete-round word in the local workspace (see above), or nullptr without one.
     uint32_t* incomplete_round{nullptr};
     MoeA2AAbortState* abort{nullptr};
+    // The rank-mask fields above fill kRankMaskWords words, as in DispatchKernelPointers.
+    uint64_t rank_mask_reserved{0};
+
+    // Host-selected wait budget in clock64() cycles.
+    int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
+
+// The kernels take these structs by value, followed by scalar arguments, so the rank-mask fields keep a fixed
+// kRankMaskWords-word slot and timeout_cycles stays the last field.
+static_assert(offsetof(DispatchKernelPointers, timeout_cycles)
+        == offsetof(DispatchKernelPointers, active_rank_mask) + kRankMaskWords * sizeof(uint64_t));
+static_assert(sizeof(DispatchKernelPointers) == offsetof(DispatchKernelPointers, timeout_cycles) + sizeof(int64_t));
+static_assert(offsetof(CombineKernelPointers, timeout_cycles)
+        == offsetof(CombineKernelPointers, active_rank_mask) + kRankMaskWords * sizeof(uint64_t));
+static_assert(sizeof(CombineKernelPointers) == offsetof(CombineKernelPointers, timeout_cycles) + sizeof(int64_t));
 
 // Dispatch phase parameters
 struct MoeA2ADispatchParams

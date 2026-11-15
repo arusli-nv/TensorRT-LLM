@@ -1452,12 +1452,18 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
-    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
-        "rank-mask mode needs the device address of active_rank_mask");
-    TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round_offset != 0,
-        "an abort state needs a workspace laid out with rank_mask");
-    TLLM_CHECK_WITH_INFO(params.abort == nullptr || (params.enable_rank_mask && !params.use_cft_counted_writes),
-        "the abort state needs enable_rank_mask without CFT counted writes");
+    if (params.enable_rank_mask)
+    {
+        TLLM_CHECK_WITH_INFO(
+            params.active_rank_mask != nullptr, "rank-mask mode needs the device address of active_rank_mask");
+    }
+    if (params.abort != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(
+            params.incomplete_round_offset != 0, "an abort state needs a workspace laid out with rank_mask");
+        TLLM_CHECK_WITH_INFO(params.enable_rank_mask && !params.use_cft_counted_writes,
+            "the abort state needs enable_rank_mask without CFT counted writes");
+    }
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -2443,12 +2449,18 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
-    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
-        "rank-mask mode needs the device address of active_rank_mask");
-    TLLM_CHECK_WITH_INFO(params.abort == nullptr || params.incomplete_round != nullptr,
-        "an abort state needs a workspace laid out with rank_mask");
-    TLLM_CHECK_WITH_INFO(params.abort == nullptr || (params.enable_rank_mask && !params.use_cft_for_combine),
-        "the abort state needs enable_rank_mask without CFT counted writes");
+    if (params.enable_rank_mask)
+    {
+        TLLM_CHECK_WITH_INFO(
+            params.active_rank_mask != nullptr, "rank-mask mode needs the device address of active_rank_mask");
+    }
+    if (params.abort != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(
+            params.incomplete_round != nullptr, "an abort state needs a workspace laid out with rank_mask");
+        TLLM_CHECK_WITH_INFO(params.enable_rank_mask && !params.use_cft_for_combine,
+            "the abort state needs enable_rank_mask without CFT counted writes");
+    }
 
     // ---- CFT combine path (one block per token). ----
     // Bypasses the base fence combine below entirely. The CFT push is launched separately by
