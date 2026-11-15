@@ -112,8 +112,8 @@ class TestKVCacheAwareADPRouter:
         mgr = _mock_kv_cache_manager()
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
 
-        req1 = Mock(py_orig_prompt_len=100, prepopulated_prompt_len=0)
-        req2 = Mock(py_orig_prompt_len=200, prepopulated_prompt_len=0)
+        req1 = Mock(py_orig_prompt_len=100, cached_tokens=0)
+        req2 = Mock(py_orig_prompt_len=200, cached_tokens=0)
         state = router.create_rank_state([req1, req2], [])
         assert state.rank == 0
         assert state.num_active_requests == 2
@@ -126,12 +126,12 @@ class TestKVCacheAwareADPRouter:
 
         req1 = Mock(
             py_orig_prompt_len=100,
-            prepopulated_prompt_len=0,
+            cached_tokens=0,
             state=LlmRequestState.GENERATION_IN_PROGRESS,
         )
         req2 = Mock(
             py_orig_prompt_len=200,
-            prepopulated_prompt_len=0,
+            cached_tokens=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
         dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
@@ -146,7 +146,7 @@ class TestKVCacheAwareADPRouter:
         dist = _mock_dist(tp_rank=0)
         mgr = _mock_kv_cache_manager()
         transfer_mgr = MagicMock()
-        in_transfer_req = Mock(py_orig_prompt_len=70, prepopulated_prompt_len=0)
+        in_transfer_req = Mock(py_orig_prompt_len=70, cached_tokens=0)
         transfer_mgr.requests_in_transfer.return_value = {1: in_transfer_req}
         router = KVCacheAwareADPRouter(
             dist=dist,
@@ -158,12 +158,12 @@ class TestKVCacheAwareADPRouter:
 
         req1 = Mock(
             py_orig_prompt_len=100,
-            prepopulated_prompt_len=0,
+            cached_tokens=0,
             state=LlmRequestState.GENERATION_IN_PROGRESS,
         )
         req2 = Mock(
             py_orig_prompt_len=200,
-            prepopulated_prompt_len=0,
+            cached_tokens=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
         dist.tp_allgather_int64.side_effect = lambda payload, active_only: np.asarray([payload])
@@ -179,7 +179,7 @@ class TestKVCacheAwareADPRouter:
         mgr = _mock_kv_cache_manager()
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, has_seq_slot_headroom=True)
 
-        req1 = Mock(total_input_len_cp=150, prepopulated_prompt_len=0)
+        req1 = Mock(total_input_len_cp=150, cached_tokens=0)
         state = router.create_rank_state([req1], [])
         assert state.rank == 1
         assert state.num_active_tokens == 150
