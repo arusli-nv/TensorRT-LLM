@@ -660,13 +660,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
-    if (params.enable_rank_mask)
-    {
-        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
-    }
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
+        "rank-mask mode needs the device address of active_rank_mask");
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -704,12 +699,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_target_indices = params.topk_target_indices;
     kernel_ptrs.eplb_local_stats = params.eplb_local_stats;
-
-    // Copy active-rank bitmask into the kernel pointers struct
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
-    }
+    kernel_ptrs.active_rank_mask = params.active_rank_mask;
 
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)
@@ -1183,13 +1173,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
-    // The local rank must always be marked active in its own view of the mask;
-    // otherwise the kernel itself would be running on a "dead" rank.
-    if (params.enable_rank_mask)
-    {
-        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
-            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
-    }
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask || params.active_rank_mask != nullptr,
+        "rank-mask mode needs the device address of active_rank_mask");
 
     // Configure kernel launch (one block per token).
     int grid = params.local_num_tokens;
@@ -1223,12 +1208,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_target_indices = params.topk_target_indices;
-
-    // Copy active-rank bitmask into the kernel pointers struct
-    for (int w = 0; w < kRankMaskWords; ++w)
-    {
-        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
-    }
+    kernel_ptrs.active_rank_mask = params.active_rank_mask;
 
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
         SWITCH_DTYPE(params.dtype, T, {

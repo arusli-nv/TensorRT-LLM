@@ -2735,7 +2735,7 @@
         },
         "enable_wide_ep_fault_tolerance": {
           "default": false,
-          "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all and no CUDA graphs (cuda_graph_config=None).",
+          "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all.",
           "status": "prototype",
           "title": "Enable Wide Ep Fault Tolerance",
           "type": "boolean"
@@ -11086,7 +11086,7 @@
     },
     "enable_wide_ep_fault_tolerance": {
       "default": false,
-      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all and no CUDA graphs (cuda_graph_config=None).",
+      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all.",
       "status": "prototype",
       "title": "Enable Wide Ep Fault Tolerance",
       "type": "boolean"

@@ -8645,7 +8645,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Run the MoE all-to-all of wide expert parallelism in its "
         "fault-tolerant mode, in which the NVLink one-sided all-to-all "
         "exchanges only with the EP ranks marked active. Requires the NVLink "
-        "one-sided all-to-all and no CUDA graphs (cuda_graph_config=None).",
+        "one-sided all-to-all.",
         status="prototype")
 
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
@@ -9775,11 +9775,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "in a future release. It no longer turns on Wide-EP fault "
                 "tolerance for the MoE layers; set "
                 "enable_wide_ep_fault_tolerance=True instead.")
-        if (self.enable_wide_ep_fault_tolerance
-                and self.cuda_graph_config is not None):
-            raise ValueError(
-                "enable_wide_ep_fault_tolerance does not support CUDA graphs; "
-                "set cuda_graph_config=None")
         return self
 
     @model_validator(mode="after")

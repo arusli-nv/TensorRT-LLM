@@ -794,107 +794,108 @@ def test_nvlink_one_sided(case: Case, mpi_pools: dict[tuple[int, bool], MPIPoolE
 
 
 # ============================================================================
-# Dispatch completion flags for the host watchdog
+# CUDA graphs under an execution state
 # ============================================================================
 
 
-def _run_watchdog_worker(_unused: int) -> dict:
-    """Dispatch once with a watchdog armed, and report what it saw."""
+def _run_graph_replay_worker(failed_rank: int) -> dict:
+    """Capture one round trip with every rank active, then replay it without ``failed_rank``."""
     # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
-    import os
-
     import torch
 
-    # The default policy: a watchdog communicator must keep the sentinel transport off by itself.
-    os.environ.pop(SYNC_PROTOCOL_ENV, None)
-
+    from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
     from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 
     rank = MPI.COMM_WORLD.Get_rank()
     ep_size = MPI.COMM_WORLD.Get_size()
     torch.cuda.set_device(rank)
     MnnvlMemory.initialize()
-
     if not all(MPI.COMM_WORLD.allgather(MnnvlMemory.supports_mnnvl())):
         return {"skip": "NVLink one-sided is not supported on every participating GPU"}
 
-    timeouts: list = []
+    hidden, capacity, slots_per_rank = 256, 8, 2
+    health = EPGroupHealth(ep_size)
+    state = MoeExecutionState(health, rank, torch.device("cuda", rank))
     mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
     comm = NVLinkOneSided(
         mapping=mapping,
-        num_slots=ep_size * 2,
+        num_slots=ep_size * slots_per_rank,
         top_k=1,
-        max_num_tokens_per_rank=8,
-        hidden_size=512,
+        max_num_tokens_per_rank=capacity,
+        hidden_size=hidden,
         dtype=torch.bfloat16,
-        ep_group_health=EPGroupHealth(ep_size),
-        alltoall_watchdog_timeout_s=5.0,
-        alltoall_watchdog_poll_interval_s=0.02,
-        alltoall_watchdog_on_timeout=timeouts.append,
+        enable_wide_ep_fault_tolerance=True,
     )
-    try:
-        num_tokens = 4
-        slots = torch.randint(0, ep_size * 2, (num_tokens, 1), dtype=torch.int32, device="cuda")
-        payload = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
-        scales = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
-        comm.dispatch(payload, None, slots, scales, [num_tokens] * ep_size)
-        torch.cuda.synchronize()
+    comm.bind_execution_state(state)
+    everyone = list(range(ep_size))
+    active = [r for r in everyone if r != failed_rank]
+    x = torch.empty(capacity, hidden, dtype=torch.bfloat16, device="cuda")
+    slots = torch.empty(capacity, 1, dtype=torch.int32, device="cuda")
+    weights = torch.ones(capacity, 1, device="cuda")
+    errors = []
 
-        # The flags the watchdog polls live in this rank's own workspace row.
-        offset = comm.moe_a2a_metainfo[comm.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX].item()
-        flags = (
-            comm.workspace[comm.ep_rank, offset : offset + ep_size * 4]
-            .view(torch.int32)
-            .cpu()
-            .tolist()
-        )
-        flag_val_offset = comm.moe_a2a_metainfo[comm.FLAG_VAL_OFFSET_INDEX].item()
-        expected = int(
-            comm.workspace[comm.ep_rank, flag_val_offset : flag_val_offset + 4]
-            .view(torch.int32)
-            .cpu()
-            .item()
-        )
-        MPI.COMM_WORLD.barrier()
-        return {
-            "rank": rank,
-            "flags": flags,
-            "expected_flag": expected,
-            "timeouts": [t.missing_ranks for t in timeouts],
-            "sentinel_max_tokens": comm.sentinel_max_tokens,
-        }
+    def check(ok: bool, what: str) -> None:
+        if not ok:
+            errors.append(f"rank {rank}: {what}")
+
+    def set_inputs(owners: list[int], seed: int) -> None:
+        """Route this rank's tokens, in turn, to the first slot of each of ``owners``."""
+        generator = torch.Generator().manual_seed(seed * ep_size + rank)
+        x.copy_(torch.randn(capacity, hidden, generator=generator).bfloat16())
+        owner = torch.tensor(owners)[torch.arange(capacity) % len(owners)]
+        slots.copy_((owner * slots_per_rank)[:, None].int())
+
+    def round_trip() -> torch.Tensor:
+        """The experts return their input, so a complete round combines each token to itself."""
+        recv = comm.dispatch(x, None, slots, weights, [capacity] * ep_size)
+        return comm.combine(recv[0])
+
+    try:
+        set_inputs(everyone, 0)
+        check(torch.equal(round_trip(), x), "eager round combined wrong")
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = round_trip()
+        set_inputs(everyone, 1)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(torch.equal(output, x), "replay with every rank combined wrong")
+        MPI.COMM_WORLD.Barrier()
+
+        # The failed rank replays nothing more; the others install the mask without it and
+        # replay the graph captured before.
+        health.mark_failed(failed_rank)
+        if rank in active:
+            address = state.active_rank_mask.data_ptr()
+            state.install_mask()
+            check(state.active_rank_mask.data_ptr() == address, "the mask moved")
+            for seed in (2, 3):
+                set_inputs(active, seed)
+                graph.replay()
+                torch.cuda.synchronize()
+                check(torch.equal(output, x), f"replay {seed} without rank {failed_rank} wrong")
+        MPI.COMM_WORLD.Barrier()
+        return {"rank": rank, "errors": errors, "sentinel_max_tokens": comm.sentinel_max_tokens}
     finally:
         comm.destroy()
 
 
-@pytest.mark.parametrize("ep_size", [2, 4])
-def test_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
-    """Dispatch must publish completion flags so the watchdog sees live peers.
-
-    The host watchdog observes only the completion flag table. Without the
-    flags a healthy collective is reported as every peer missing.
-    """
+def test_graph_replay_follows_installed_mask() -> None:
+    """A CUDA graph captured with every rank active replays without a rank masked out later."""
+    ep_size, failed_rank = 4, 2
     if torch.cuda.device_count() < ep_size:
         pytest.skip(f"requires {ep_size} GPUs")
-    executor = MPIPoolExecutor(ep_size)
+    # A replay that waited for the masked rank would end at this kernel timeout.
+    executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "60"})
     try:
-        results = list(executor.map(_run_watchdog_worker, range(ep_size)))
+        results = list(executor.map(_run_graph_replay_worker, [failed_rank] * ep_size))
         skipped = [r["skip"] for r in results if "skip" in r]
         if skipped:
             pytest.skip(skipped[0])
-        results.sort(key=lambda r: r["rank"])
-        for result in results:
-            rank = result["rank"]
-            expected = result["expected_flag"]
-            assert result["flags"] == [expected] * ep_size, (
-                f"rank {rank}: dispatch completion flags {result['flags']} did not all "
-                f"reach {expected}; the watchdog would report healthy peers as missing"
-            )
-            assert result["timeouts"] == [], (
-                f"rank {rank}: watchdog reported {result['timeouts']} on a healthy collective"
-            )
-            # Sentinel steps write no completion flags, so the watchdog keeps them off.
-            assert result["sentinel_max_tokens"] == 0, f"rank {rank}: sentinel on with a watchdog"
-
+        assert [e for r in results for e in r["errors"]] == []
+        # The sentinel transport takes no active-rank mask, so every step takes the fence one.
+        assert all(r["sentinel_max_tokens"] == 0 for r in results)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)

@@ -1429,6 +1429,9 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
+            if self.llm_args.enable_wide_ep_fault_tolerance:
+                from .rank_failure_model_load import prepare_model
+                prepare_model(model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

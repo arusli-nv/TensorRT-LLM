@@ -128,6 +128,71 @@ def test_sentinel_workspace_layout(payload_format: str) -> None:
         )
 
 
+# Workspace layout fields of a layout without a rank mask, by metainfo field name. The expected values follow from
+# the regions alone, as calculateWorkspaceLayout (cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp) places
+# them: each region in index order at its alignment (4 bytes; 128 for the completion flags, the routes and the EPLB
+# stats; 256 for the payloads, whose sizes are also padded to 256), with the sentinel fields 0.
+_LAYOUT_FIELDS = (
+    "FLAG_VAL_OFFSET_INDEX",
+    "LOCAL_TOKEN_COUNTER_OFFSET_INDEX",
+    "SEND_COUNTERS_OFFSET_INDEX",
+    "RECV_COUNTERS_OFFSET_INDEX",
+    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX",
+    "TOPK_TARGET_RANKS_OFFSET_INDEX",
+    "TOPK_TARGET_INDICES_OFFSET_INDEX",
+    "EPLB_GATHERED_STATS_OFFSET_INDEX",
+    "DISPATCH_PAYLOAD_OFFSET_INDEX",
+    "DISPATCH_PAYLOAD_SIZE_INDEX",
+    "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX",
+    "COMBINE_INPUT_OFFSET_INDEX",
+    "COMBINE_INPUT_SIZE_INDEX",
+    "MAX_NUM_TOKENS_INDEX",
+    "TOP_K_INDEX",
+    "EP_SIZE_INDEX",
+    "EPLB_STATS_NUM_EXPERTS_INDEX",
+    "WORKSPACE_SIZE_INDEX",
+    "SENTINEL_MAX_NUM_TOKENS_INDEX",
+    "SENTINEL_PAYLOAD_FORMAT_INDEX",
+    "SENTINEL_HIDDEN_SIZE_INDEX",
+    "SENTINEL_STATE_OFFSET_INDEX",
+    "SENTINEL_LANDING_OFFSET_INDEX",
+    "SENTINEL_COMBINE_LANDING_OFFSET_INDEX",
+    "SENTINEL_RECV_OFFSET_INDEX",
+    "SENTINEL_RECV_SIZE_INDEX",
+)
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        # ep_size, max_num_tokens_per_rank, top_k, dispatch_payload_bytes, combine_input_bytes, EPLB experts
+        (
+            (8, 128, 8, 1000, 3000, 288),
+            (0, 4, 8, 40, 128, 256, 4352, 8448, 17664, 1024)  # dispatch regions
+            + (18688, 18944, 3072)  # combine regions
+            + (128, 8, 8, 288, 22016)  # configuration and workspace size
+            + (0,) * 8,  # sentinel regions
+        ),
+        (
+            (36, 77, 6, 4096, 70000, None),
+            (0, 4, 8, 152, 512, 768, 2688, 4608, 4608, 4096)
+            + (8704, 8960, 70144)
+            + (77, 6, 36, 0, 79104)
+            + (0,) * 8,
+        ),
+    ],
+)
+def test_workspace_layout_without_rank_mask_is_unchanged(args: tuple, expected: tuple) -> None:
+    """Without a rank mask, the workspace layout keeps main's offsets and fields."""
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+    layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args)
+    actual = {name: int(layout[getattr(thop, f"MOE_A2A_{name}")]) for name in _LAYOUT_FIELDS}
+    assert actual == dict(zip(_LAYOUT_FIELDS, expected))
+    assert layout.numel() == len(_LAYOUT_FIELDS)
+
+
 def test_sentinel_row_geometry() -> None:
     hidden_size, top_k = 7168, 8
     # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.

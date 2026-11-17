@@ -164,15 +164,12 @@ def test_wide_ep_fault_tolerance_defaults_off(
 
 
 @pytest.mark.cpu_only
-def test_wide_ep_fault_tolerance_rejects_cuda_graphs(
+def test_wide_ep_fault_tolerance_keeps_cuda_graphs(
         monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
-    with pytest.raises(ValidationError, match="set cuda_graph_config=None"):
-        TorchLlmArgs(model=llama_model_path,
-                     enable_wide_ep_fault_tolerance=True)
-    assert TorchLlmArgs(model=llama_model_path,
-                        enable_wide_ep_fault_tolerance=True,
-                        cuda_graph_config=None).enable_wide_ep_fault_tolerance
+    args = TorchLlmArgs(model=llama_model_path,
+                        enable_wide_ep_fault_tolerance=True)
+    assert args.cuda_graph_config is not None
 
 
 @pytest.mark.cpu_only

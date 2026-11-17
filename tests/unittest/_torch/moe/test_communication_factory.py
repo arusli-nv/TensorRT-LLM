@@ -24,7 +24,6 @@ import pytest
 import torch
 from packaging.version import Version
 
-from tensorrt_llm._torch.alltoall_watchdog import DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S
 from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard, nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as one_sided_module
@@ -33,7 +32,6 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
-from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -63,7 +61,6 @@ def _make_model_config(
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
         enable_wide_ep_fault_tolerance=False,
-        extra_attrs={},
     )
 
 
@@ -602,7 +599,7 @@ def _create_one_sided(model_config, forced: bool):
 
 
 @pytest.mark.parametrize("forced", [False, True])
-def test_one_sided_without_fault_tolerance_gets_no_ep_group_health(
+def test_one_sided_without_fault_tolerance_runs_without_rank_mask(
     monkeypatch: pytest.MonkeyPatch, forced: bool
 ):
     """Without enable_wide_ep_fault_tolerance, NVLinkOneSided is built without a rank mask."""
@@ -624,32 +621,27 @@ def test_one_sided_without_fault_tolerance_gets_no_ep_group_health(
         dtype=torch.bfloat16,
         num_experts=None,
         use_low_precision_combine=False,
-        ep_group_health=None,
-        alltoall_watchdog_timeout_s=None,
-        alltoall_watchdog_poll_interval_s=DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+        enable_wide_ep_fault_tolerance=False,
         sentinel_payload_format=one_sided_module.sentinel_payload_format(None),
     )
     actual.apply_defaults()
     expected.apply_defaults()
     assert actual.arguments == expected.arguments
-    assert model_config.extra_attrs == {}
 
 
 @pytest.mark.parametrize("forced", [False, True])
-def test_fault_tolerance_shares_one_ep_group_health(monkeypatch: pytest.MonkeyPatch, forced: bool):
-    """Every MoE layer of a fault-tolerant model runs in rank-mask mode on one EP membership."""
+def test_fault_tolerance_builds_one_sided_with_rank_mask(
+    monkeypatch: pytest.MonkeyPatch, forced: bool
+):
+    """Every NVLinkOneSided of a fault-tolerant model runs the rank-mask kernels."""
     model_config = _make_model_config()
     model_config.enable_wide_ep_fault_tolerance = True
     one_sided = Mock()
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
 
     _create_one_sided(model_config, forced)
-    _create_one_sided(model_config, forced)
 
-    first, second = (call.kwargs["ep_group_health"] for call in one_sided.call_args_list)
-    assert isinstance(first, EPGroupHealth)
-    assert second is first
-    assert first.moe_world_size == model_config.mapping.moe_ep_size
+    assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is True
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])

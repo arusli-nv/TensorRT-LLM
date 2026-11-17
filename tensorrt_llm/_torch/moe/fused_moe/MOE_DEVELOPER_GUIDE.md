@@ -250,6 +250,10 @@ strategy checks or private workspace attributes. The executor request queue
 owns admission around the checkpoint and reopens it only after a complete
 wakeup.
 
+### Wide-EP fault tolerance
+
+Under `enable_wide_ep_fault_tolerance`, `CommunicationFactory` builds `NVLinkOneSided` with its rank-mask kernels, and the model loader binds every MoE layer's communication to one `MoeExecutionState` (`communication/execution_state.py`, bound by `pyexecutor/rank_failure_model_load.py`) before the weights load. The kernels exchange only with the EP ranks set in the state's device mask, which they read when they run, so captured CUDA graphs follow a mask that `install_mask` rewrites while no collective runs. These layers set up no sentinel transport, whose kernels take no rank mask.
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components

@@ -26,20 +26,10 @@ NVLINK One-Sided supports post-quant dispatch.
 
 import os
 import sys
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.alltoall_watchdog import (
-    DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
-    DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
-    ActiveRankMaskSnapshot,
-    AlltoAllWatchdog,
-    AlltoAllWatchdogCoordinator,
-    AlltoAllWatchdogTimeout,
-    EPGroupHealthLike,
-    reject_rank_mask_cuda_graph_capture,
-)
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -50,6 +40,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
+from .execution_state import MoeExecutionState
 from .pull_combine import PULL_COMBINE_MIN_TOKENS, PullCombineSync, pull_reduce
 
 SYNC_PROTOCOL_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL"
@@ -248,7 +239,7 @@ def _sentinel_unsupported_reason(
     if use_low_precision_combine:
         return "it has no FP8 combine"
     if fault_tolerant:
-        return "the AlltoAll watchdog and rank-mask recovery observe fence completion flags only"
+        return "it takes no active-rank mask (Wide-EP fault tolerance)"
     if payload_format not in SENTINEL_PAYLOAD_FORMATS:
         return f"it does not carry the payload format {payload_format}"
     try:
@@ -429,10 +420,7 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-        ep_group_health: EPGroupHealthLike | None = None,
-        alltoall_watchdog_timeout_s: Optional[float] = None,
-        alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
-        alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+        enable_wide_ep_fault_tolerance: bool = False,
         sentinel_payload_format: Optional[str] = "BF16",
     ) -> None:
         """
@@ -450,8 +438,8 @@ class NVLinkOneSided(Communication):
         ``sentinel_payload_format``; the fence transport takes the other
         steps. It needs SM100, SM103 or SM107, at most 64 EP ranks, BF16 expert
         outputs without FP8 combine, expert slots that split evenly across ranks,
-        and no AlltoAll watchdog or rank-mask recovery (which observe the fence
-        completion flags). TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL=fence turns it
+        and no Wide-EP fault tolerance (its kernels take no active-rank mask).
+        TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL=fence turns it
         off and =sentinel asks for it (a warning names the reason when it stays
         off); unset or "auto", it is on. TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS sets the token limit,
         which otherwise is the largest step whose dispatch grid stays within one
@@ -481,13 +469,10 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
-            ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
-                enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
-                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
-            alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
-                watchdog is disabled.
-            alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
-            alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
+            enable_wide_ep_fault_tolerance: Run the rank-mask kernels, which exchange only with the
+                EP ranks set in the device mask of the execution state that ``bind_execution_state``
+                binds before the first dispatch. They read the mask when they run, so CUDA graphs
+                follow its later changes. Corresponds to model_config.enable_wide_ep_fault_tolerance.
             sentinel_payload_format: Dispatch payload format whose small steps the sentinel transport carries,
                 one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()), or None when the layer
                 dispatches rows the transport does not carry (no sentinel regions then). Needs
@@ -552,8 +537,7 @@ class NVLinkOneSided(Communication):
                 hidden_size,
                 dtype,
                 sentinel_payload_format,
-                fault_tolerant=ep_group_health is not None
-                or alltoall_watchdog_timeout_s is not None,
+                fault_tolerant=enable_wide_ep_fault_tolerance,
             )
             auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
         workspace_mb_env = os.environ.get(_WORKSPACE_MB_ENV)
@@ -665,40 +649,18 @@ class NVLinkOneSided(Communication):
         self.mnnvl_mem = workspace_state["mnnvl_mem"]
         self.workspace = workspace_state["workspace"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
-        self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
-        self._rank_mask_enabled = ep_group_health is not None
-        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
-            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
-        flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
-        dispatch_flags_offset_index = self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
-        combine_flags_offset_index = self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
-        if (
-            flag_val_offset_index is None
-            or dispatch_flags_offset_index is None
-            or combine_flags_offset_index is None
-        ):
-            raise RuntimeError("MoE All-to-All metadata indices are not initialized")
+        self._rank_mask_enabled = enable_wide_ep_fault_tolerance
+        self.execution_state: Optional[MoeExecutionState] = None
         self._workspace_lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
             workspace_state=workspace_state,
             memory=self.mnnvl_mem,
             workspace=self.workspace,
             metainfo=workspace_state["metainfo"],
-            metainfo_index={
-                "FLAG_VAL_OFFSET_INDEX": flag_val_offset_index,
-                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": dispatch_flags_offset_index,
-                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": combine_flags_offset_index,
-            },
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
-            health=self.ep_group_health,
         )
-        self._workspace_lifecycle.register(
-            self,
-            watchdog_timeout_s=alltoall_watchdog_timeout_s,
-            watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
-            watchdog_on_timeout=alltoall_watchdog_on_timeout,
-        )
+        self._workspace_lifecycle.register(self)
         if workspace_created:
             NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         NVLinkOneSided._WORKSPACE = workspace_state
@@ -708,14 +670,13 @@ class NVLinkOneSided(Communication):
         self._workspace_registered = True
 
         # Two ranks may pull each other's BF16 partials straight from the workspace (pull_combine.py)
-        # once enable_pull_combine attaches the handshake. The watchdog watches only native kernels.
+        # once enable_pull_combine attaches the handshake.
         self._pull_sync: Optional[PullCombineSync] = None
         self._pull_combine_supported = (
             self.ep_size == 2
             and dtype == torch.bfloat16
             and not self.use_low_precision_combine
             and not self._rank_mask_enabled
-            and alltoall_watchdog_timeout_s is None
         )
 
         # Initialize dispatch state
@@ -944,13 +905,32 @@ class NVLinkOneSided(Communication):
     def moe_a2a_metainfo(self) -> torch.Tensor:
         return self._require_workspace_lifecycle().metainfo
 
-    @property
-    def _watchdog_coordinator(self) -> AlltoAllWatchdogCoordinator:
-        return self._require_workspace_lifecycle().coordinator
+    def bind_execution_state(self, state: MoeExecutionState) -> None:
+        """Run every later dispatch and combine with the device rank mask of ``state``."""
+        if not self._rank_mask_enabled:
+            raise ValueError(
+                "Bound execution requires an NVLinkOneSided built with "
+                "enable_wide_ep_fault_tolerance"
+            )
+        if self.execution_state is not None:
+            raise RuntimeError("NVLinkOneSided is already bound to an execution state")
+        # The kernels treat the local rank as active, which the state checks for its own rank.
+        if state.ep_rank != self.ep_rank:
+            raise ValueError(
+                f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
+            )
+        self.execution_state = state
 
-    @property
-    def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
-        return self._require_workspace_lifecycle().watchdog_for(self)
+    def _active_rank_mask(self) -> Optional[torch.Tensor]:
+        """Return the device mask that the rank-mask kernels read, or None without a rank mask."""
+        if not self._rank_mask_enabled:
+            return None
+        if self.execution_state is None:
+            raise RuntimeError(
+                "NVLinkOneSided with enable_wide_ep_fault_tolerance dispatches only once bound "
+                "(bind_execution_state)"
+            )
+        return self.execution_state.active_rank_mask
 
     def _require_workspace_lifecycle(self) -> _MnnvlAlltoAllWorkspaceLifecycle:
         lifecycle = self._workspace_lifecycle
@@ -1112,11 +1092,9 @@ class NVLinkOneSided(Communication):
             token_final_scales: Router weights [local_num_tokens, top_k]
             all_rank_num_tokens: Token counts per rank [ep_size]
             use_dp_padding: Whether to use DP padding (optional)
-            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` may override the
-                committed membership for dispatch. Without an override, the committed mask and generation are
-                captured together; combine reuses that mask and fails closed if the generation changes first.
-                The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
-                artifact, not valid model output.
+            **kwargs: Strategy-specific arguments. With enable_wide_ep_fault_tolerance, the kernels
+                exchange only with the EP ranks set in the bound execution state's device mask and drop
+                the routes to the other ranks (their ``topk_target_ranks`` entries are -1).
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -1129,7 +1107,6 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -1163,13 +1140,6 @@ class NVLinkOneSided(Communication):
             assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
                 "eplb_local_stats size must match eplb_stats_num_experts"
             )
-        requested_active_rank_mask = kwargs.get("active_rank_mask")
-        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
-            raise ValueError("active_rank_mask requires committed EP group health")
-        active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
-            requested_active_rank_mask
-        )
-        active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
@@ -1187,22 +1157,16 @@ class NVLinkOneSided(Communication):
                 expert_id_payload_index=expert_id_payload_index if use_sentinel else None,
                 invalid_token_expert_id=int(self.invalid_token_expert_id) if use_sentinel else None,
                 enable_rank_mask=self._rank_mask_enabled,
-                active_rank_mask=active_rank_mask,
+                active_rank_mask=self._active_rank_mask(),
                 use_sentinel=use_sentinel,
             )
         )
-        # A sentinel round writes no completion flags for the watchdog to observe.
-        if not use_sentinel:
-            self._watchdog_coordinator.watch_collective(
-                self._alltoall_watchdog, "dispatch", active_rank_mask
-            )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
-        self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
         self._dispatch_state["sentinel"] = use_sentinel
         self._dispatch_state["phase"] = "dispatched"
 
@@ -1267,9 +1231,8 @@ class NVLinkOneSided(Communication):
             final_hidden_states: Output from MoE computation
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
-            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` must match the mask
-                captured by dispatch for this collective when supplied. A committed-generation change since
-                dispatch aborts the collective epoch.
+            **kwargs: Strategy-specific arguments. With enable_wide_ep_fault_tolerance, the kernels
+                exchange only with the EP ranks set in the bound execution state's device mask.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -1278,7 +1241,6 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1306,16 +1268,6 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
-        active_rank_mask_snapshot = self._dispatch_state.get("active_rank_mask_snapshot")
-        if not isinstance(active_rank_mask_snapshot, ActiveRankMaskSnapshot):
-            raise RuntimeError("combine called but dispatch rank-mask snapshot is missing")
-        requested_active_rank_mask = kwargs.get("active_rank_mask")
-        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
-            raise ValueError("active_rank_mask requires committed EP group health")
-        active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
-            active_rank_mask_snapshot,
-            requested_active_rank_mask,
-        )
         # A sentinel dispatch is followed by a sentinel combine.
         use_sentinel = bool(self._dispatch_state.get("sentinel", False))
         addend = kwargs.get("addend")
@@ -1347,13 +1299,9 @@ class NVLinkOneSided(Communication):
             bool(self.payload_in_workspace),
             use_low_precision=bool(self.use_low_precision_combine),
             enable_rank_mask=self._rank_mask_enabled,
-            active_rank_mask=active_rank_mask,
+            active_rank_mask=self._active_rank_mask(),
             use_sentinel=use_sentinel,
         )
-        if not use_sentinel:
-            self._watchdog_coordinator.watch_collective(
-                self._alltoall_watchdog, "combine", active_rank_mask
-            )
 
         # Reset state for next round
         self.reset_state()

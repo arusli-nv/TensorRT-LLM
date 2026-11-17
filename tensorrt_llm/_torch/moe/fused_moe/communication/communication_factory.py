@@ -28,7 +28,6 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
-from ..ep_group_health import EPGroupHealth
 from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
 from ..nccl_ep_utils import (
     is_nccl_ep_installed,
@@ -54,24 +53,6 @@ if TYPE_CHECKING:
 # TODO: Remove this compatibility check after upgrading to NCCL-EP v0.2,
 # which removes the v0.1.0 LL-combine launch limitation.
 _NCCL_EP_V0_1_LL_MAX_WARP_GROUPS = 14
-
-# The ModelConfig.extra_attrs key of the EP membership that the MoE layers of a model share.
-_EP_GROUP_HEALTH_ATTR = "moe_ep_group_health"
-
-
-def _ep_group_health(model_config: ModelConfig) -> Optional[EPGroupHealth]:
-    """Return the EP membership of the model's MoE layers under enable_wide_ep_fault_tolerance.
-
-    Every layer of the model gets the same EPGroupHealth, so all of them exchange with the
-    same active ranks. Without fault tolerance, return None.
-    """
-    if not model_config.enable_wide_ep_fault_tolerance:
-        return None
-    health = model_config.extra_attrs.get(_EP_GROUP_HEALTH_ATTR)
-    if health is None:
-        health = EPGroupHealth(model_config.mapping.moe_ep_size)
-        model_config.extra_attrs[_EP_GROUP_HEALTH_ATTR] = health
-    return health
 
 
 def _get_nccl_ep_ll_combine_smem_requirement(
@@ -248,7 +229,7 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
-                ep_group_health=_ep_group_health(model_config),
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
                 sentinel_payload_format=sentinel_format,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
@@ -437,7 +418,7 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
-                ep_group_health=_ep_group_health(model_config),
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
                 sentinel_payload_format=sentinel_format,
             )
         elif method == "DEEPEP":
