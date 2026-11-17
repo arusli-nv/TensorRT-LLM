@@ -504,7 +504,8 @@ class CUDAGraphRunner:
             payload.append(-1 if packed_split is None else int(packed_split))
         if sampling_mode is not None:
             payload.append(sampling_mode)
-        gathered = self.config.dist.tp_allgather_int64(payload)
+        gathered = self.config.dist.tp_allgather_int64(payload,
+                                                       active_only=True)
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()

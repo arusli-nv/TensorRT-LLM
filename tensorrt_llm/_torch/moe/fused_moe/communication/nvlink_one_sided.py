@@ -24,6 +24,7 @@ This module implements the NVLINK one-sided comm AllToAll throughput communicati
 NVLINK One-Sided supports post-quant dispatch.
 """
 
+import functools
 import os
 import sys
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
@@ -40,6 +41,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
 )
+from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -50,6 +52,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
+from .execution_state import MoeExecutionState
 from .pull_combine import PULL_COMBINE_MIN_TOKENS, PullCombineSync, pull_reduce
 
 SYNC_PROTOCOL_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL"
@@ -258,6 +261,34 @@ def _sentinel_unsupported_reason(
     return None
 
 
+def _require_execution_state(*args, **kwargs):
+    raise RuntimeError(
+        "NVLinkOneSided with enable_wide_ep_fault_tolerance dispatches only once bound "
+        "(bind_execution_state)"
+    )
+
+
+def _launch_with_execution_state(
+    op_name: str,
+    state: MoeExecutionState,
+    *args,
+    active_rank_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+):
+    """Launch the all-to-all op ``op_name`` with the rank mask and the abort state of ``state``.
+
+    ``args`` and ``kwargs`` are the op's other arguments. A bound layer runs on the fence
+    transport, whose kernels honor the abort state, and its kernels read the rank mask at its
+    device address, so CUDA graphs captured with it follow later masks.
+    """
+    if active_rank_mask is not None:
+        # install_mask writes the mask of a bound layer, while the model is idle.
+        raise ValueError("A layer bound to an execution state takes no active_rank_mask")
+    return getattr(torch.ops.trtllm, op_name)(
+        *args, active_rank_mask=state.active_rank_mask, abort_state=state.abort, **kwargs
+    )
+
+
 # The moe_a2a kernels' own timeout (kDefaultTimeoutCycles), used while no budget is set.
 _NATIVE_A2A_TIMEOUT_SEC = 300
 
@@ -340,6 +371,7 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int],
         extra_payload_bytes_per_token: int,
+        rank_mask: bool = False,
     ) -> torch.Tensor:
         """Plan per-rank control buffers and independently sized payload regions."""
         if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
@@ -368,6 +400,7 @@ class NVLinkOneSided(Communication):
             dispatch_bytes,
             combine_input_bytes,
             eplb_stats_num_experts,
+            rank_mask,
         )
 
     @staticmethod
@@ -376,6 +409,7 @@ class NVLinkOneSided(Communication):
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
         top_k: Optional[int] = None,
+        rank_mask: bool = False,
     ) -> int:
         """Control-buffer bytes; omitted top_k reserves the native routing limit."""
         layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(
@@ -385,6 +419,7 @@ class NVLinkOneSided(Communication):
             0,
             0,
             eplb_stats_num_experts,
+            rank_mask,
         )
         return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
@@ -434,6 +469,7 @@ class NVLinkOneSided(Communication):
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
         sentinel_payload_format: Optional[str] = "BF16",
+        enable_wide_ep_fault_tolerance: bool = False,
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -492,6 +528,11 @@ class NVLinkOneSided(Communication):
                 one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()), or None when the layer
                 dispatches rows the transport does not carry (no sentinel regions then). Needs
                 hidden_size and dtype.
+            enable_wide_ep_fault_tolerance: Use a remappable workspace and the rank mask of
+                ``bind_execution_state``, called before the first dispatch, on the fence transport
+                (no sentinel transport). Corresponds to model_config.enable_wide_ep_fault_tolerance.
+                Such a layer starts no AlltoAll watchdog, because its rank reports the published
+                waits to the membership authority.
         """
         super().__init__(mapping)
         if mapping.has_cp_helix():
@@ -528,6 +569,7 @@ class NVLinkOneSided(Communication):
         self.eplb_stats_num_experts = num_experts
         # Initialize constants from C++
         self._init_constants()
+        rank_mask = ep_group_health is not None or enable_wide_ep_fault_tolerance
 
         # Get workspace size
         auto_workspace_size = None
@@ -541,12 +583,15 @@ class NVLinkOneSided(Communication):
                 dtype,
                 self.eplb_stats_num_experts,
                 0,
+                rank_mask=rank_mask,
             )
         # Largest step of the sentinel transport; 0 when this instance does not use it.
         self.sentinel_max_tokens = 0
         self._sentinel_format: str | None = None
         self._sentinel_row: SentinelRow | None = None
-        if metainfo is not None:
+        # The sentinel kernels take no rank mask or abort state, and the sentinel vote is a collective
+        # over MnnvlMemory's communicator, so fault tolerance runs on the fence transport.
+        if metainfo is not None and not enable_wide_ep_fault_tolerance:
             self._setup_sentinel(
                 metainfo,
                 hidden_size,
@@ -555,6 +600,7 @@ class NVLinkOneSided(Communication):
                 fault_tolerant=ep_group_health is not None
                 or alltoall_watchdog_timeout_s is not None,
             )
+        if metainfo is not None:
             auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
         workspace_mb_env = os.environ.get(_WORKSPACE_MB_ENV)
         if workspace_mb_env:
@@ -586,6 +632,7 @@ class NVLinkOneSided(Communication):
                 max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
                 self.top_k,
+                rank_mask=rank_mask,
             )
             # Split the rest between the dispatch payload and combine input regions.
             capacity = (self.workspace_size_per_rank - control_bytes) // 2 // alignment * alignment
@@ -598,11 +645,14 @@ class NVLinkOneSided(Communication):
                 capacity,
                 capacity,
                 self.eplb_stats_num_experts,
+                rank_mask,
             )
         # Fixed region capacities are shared by allocation, native bounds checks,
         # and workspace-backed views. Runtime shapes only pack tokens inside them.
         MnnvlMemory.initialize()
+        memory_cls = MembershipMnnvlMemory if enable_wide_ep_fault_tolerance else MnnvlMemory
         self._workspace_key = (
+            memory_cls,
             self.workspace_size_per_rank,
             self.max_num_tokens_per_rank,
             self.ep_rank,
@@ -623,9 +673,18 @@ class NVLinkOneSided(Communication):
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
+            mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
+            torch.ops.trtllm.moe_a2a_initialize(
+                workspace,
+                metainfo,
+                self.ep_rank,
+                self.ep_size,
+                barrier=not enable_wide_ep_fault_tolerance,
+            )
+            if enable_wide_ep_fault_tolerance:
+                # No rank may write into a peer's workspace before the peer has initialized it.
+                memory_cls.get_comm(mapping).barrier()
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
@@ -666,8 +725,7 @@ class NVLinkOneSided(Communication):
         self.workspace = workspace_state["workspace"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
         self.ep_group_health = ep_group_health
-        # Keep the kernel specialization stable for this communicator's lifetime.
-        self._rank_mask_enabled = ep_group_health is not None
+        self._init_execution(rank_mask, enable_wide_ep_fault_tolerance)
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
@@ -952,6 +1010,60 @@ class NVLinkOneSided(Communication):
     def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
         return self._require_workspace_lifecycle().watchdog_for(self)
 
+    def _init_execution(self, rank_mask: bool, enable_wide_ep_fault_tolerance: bool) -> None:
+        """Fix the kernel specialization for this communicator's lifetime.
+
+        A fault-tolerant layer launches its collectives only once :meth:`bind_execution_state` has
+        replaced its ops. Its kernels read the rank mask at a fixed device address, so CUDA graphs
+        may capture them.
+        """
+        self._rank_mask_enabled = rank_mask
+        self._enable_wide_ep_fault_tolerance = enable_wide_ep_fault_tolerance
+        self._rejects_cuda_graph_capture = rank_mask and not enable_wide_ep_fault_tolerance
+        self.execution_state: Optional[MoeExecutionState] = None
+        if enable_wide_ep_fault_tolerance:
+            self._dispatch_op = self._combine_op = _require_execution_state
+
+    def _dispatch_op(self, *args, **kwargs):
+        """Launch the all-to-all dispatch op; :meth:`bind_execution_state` replaces this method."""
+        return torch.ops.trtllm.moe_a2a_dispatch(*args, **kwargs)
+
+    def _combine_op(self, *args, **kwargs):
+        """Launch the all-to-all combine op; :meth:`bind_execution_state` replaces this method."""
+        return torch.ops.trtllm.moe_a2a_combine(*args, **kwargs)
+
+    def bind_execution_state(self, state: MoeExecutionState) -> None:
+        """Run every later dispatch and combine with ``state``'s rank mask and abort state.
+
+        CUDA graphs captured afterwards stay valid when the state installs a new rank mask or
+        requests an abort.
+        """
+        if not self._enable_wide_ep_fault_tolerance:
+            # Only its workspace can be remapped when the EP membership changes.
+            raise ValueError(
+                "Bound execution requires an NVLinkOneSided built with "
+                "enable_wide_ep_fault_tolerance"
+            )
+        if self.execution_state is not None:
+            raise RuntimeError("NVLinkOneSided is already bound to an execution state")
+        if state.ep_rank != self.ep_rank:
+            raise ValueError(
+                f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
+            )
+        state.register_layer(self.reset_state)
+        state.register_workspace(self.mnnvl_mem, self._reset_local_workspace, self.workspace)
+        self.execution_state = state
+        self._dispatch_op = functools.partial(
+            _launch_with_execution_state, "moe_a2a_dispatch", state
+        )
+        self._combine_op = functools.partial(_launch_with_execution_state, "moe_a2a_combine", state)
+
+    def _reset_local_workspace(self) -> None:
+        """Return this rank's workspace row to its initial state."""
+        torch.ops.trtllm.moe_a2a_initialize(
+            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
+        )
+
     def _require_workspace_lifecycle(self) -> _MnnvlAlltoAllWorkspaceLifecycle:
         lifecycle = self._workspace_lifecycle
         if lifecycle is None:
@@ -1115,6 +1227,7 @@ class NVLinkOneSided(Communication):
             **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` may override the
                 committed membership for dispatch. Without an override, the committed mask and generation are
                 captured together; combine reuses that mask and fails closed if the generation changes first.
+                A layer bound to an execution state takes the mask its state installs.
                 The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
                 artifact, not valid model output.
 
@@ -1129,7 +1242,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        reject_rank_mask_cuda_graph_capture(self._rejects_cuda_graph_capture)
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -1171,25 +1284,23 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
-        recv_buffers, combine_payload_offset, eplb_gathered_stats = (
-            torch.ops.trtllm.moe_a2a_dispatch(
-                token_selected_slots,
-                payloads,
-                self.workspace,
-                self.moe_a2a_metainfo,
-                runtime_max_tokens_per_rank,
-                self.ep_rank,
-                self.ep_size,
-                self.top_k,
-                self.num_experts,
-                eplb_local_stats,
-                # A sentinel dispatch fills the expert IDs of rows without a token itself.
-                expert_id_payload_index=expert_id_payload_index if use_sentinel else None,
-                invalid_token_expert_id=int(self.invalid_token_expert_id) if use_sentinel else None,
-                enable_rank_mask=self._rank_mask_enabled,
-                active_rank_mask=active_rank_mask,
-                use_sentinel=use_sentinel,
-            )
+        recv_buffers, combine_payload_offset, eplb_gathered_stats = self._dispatch_op(
+            token_selected_slots,
+            payloads,
+            self.workspace,
+            self.moe_a2a_metainfo,
+            runtime_max_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            self.num_experts,
+            eplb_local_stats,
+            # A sentinel dispatch fills the expert IDs of rows without a token itself.
+            expert_id_payload_index=expert_id_payload_index if use_sentinel else None,
+            invalid_token_expert_id=int(self.invalid_token_expert_id) if use_sentinel else None,
+            enable_rank_mask=self._rank_mask_enabled,
+            active_rank_mask=active_rank_mask,
+            use_sentinel=use_sentinel,
         )
         # A sentinel round writes no completion flags for the watchdog to observe.
         if not use_sentinel:
@@ -1278,7 +1389,7 @@ class NVLinkOneSided(Communication):
         self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
-        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+        reject_rank_mask_cuda_graph_capture(self._rejects_cuda_graph_capture)
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -1334,7 +1445,7 @@ class NVLinkOneSided(Communication):
             )
             self.reset_state()
             return output
-        output = torch.ops.trtllm.moe_a2a_combine(
+        output = self._combine_op(
             final_hidden_states,
             int(local_num_tokens),
             self.workspace,

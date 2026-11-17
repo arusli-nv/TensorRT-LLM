@@ -233,6 +233,7 @@ l0_b200:
   # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
   - unittest/_torch/moe/test_kimi_k3_route_sort.py
   - unittest/_torch/moe/test_moe_sorted_routing.py
+  - unittest/_torch/moe/test_moe_a2a_abort.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
   - unittest/_torch/modeling/test_kimi_k3_moe_front.py
@@ -278,9 +279,11 @@ l0_b200:
   - unittest/_torch/moe/test_moe_comm_timeout_guard.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
+  - unittest/_torch/moe/test_moe_execution_state.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_tunes_only_the_active_slots
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm

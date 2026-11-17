@@ -57,6 +57,10 @@ from tensorrt_llm._torch.utils import (
     Fp4QuantizedTensor,
     is_torch_compiling,
 )
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    SUPPORTED_MOE_CONFIGURATIONS,
+    TURN_FAULT_TOLERANCE_OFF,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -905,6 +909,8 @@ class ConfigurableMoE(MoE):
              must be able to honor it: the backend returns the unfinalized
              triple, the combine (if any) is an unweighted row sum, and the
              routing weights are not folded into the activations.
+          4. With spare EPLB slots (Wide-EP fault tolerance), the backend
+             supports them (``backend.supports_spare_slots``).
 
         Backend-specific checks are delegated to
         ``backend.validate_configurable_moe(self)``; backends with extra
@@ -958,6 +964,13 @@ class ConfigurableMoE(MoE):
                     "apply_router_weight_on_input folds them into the activations "
                     "and leaves only placeholders. The two are not combinable."
                 )
+
+        if backend.uses_spare_slots and not backend.supports_spare_slots:
+            raise ValueError(
+                f"Wide-EP fault tolerance does not support the {type(backend).__name__} MoE "
+                f"backend yet: {backend.spare_slots_refusal_reason}. Use "
+                f"{SUPPORTED_MOE_CONFIGURATIONS}, or {TURN_FAULT_TOLERANCE_OFF}."
+            )
 
         backend.validate_configurable_moe(self)
 

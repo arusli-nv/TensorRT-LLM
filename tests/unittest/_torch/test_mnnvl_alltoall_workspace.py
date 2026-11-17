@@ -29,6 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
     MnnvlMoe,
     NVLinkTwoSided,
 )
+from tensorrt_llm.bindings import internal as _tllm_internal
 
 
 class _Client:
@@ -826,6 +827,159 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
     assert NVLinkOneSided._WORKSPACE is None
     lifecycle.unregister.assert_not_called()
+
+
+def _build_one_sided(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool, **kwargs: object
+) -> tuple[Mock, _FakeComm]:
+    """Build an EP-2 NVLinkOneSided on fake MNNVL memory, with or without Wide-EP fault tolerance.
+
+    Returns the mock of moe_a2a_initialize and the communicator of the fake memory.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+
+    comm = _FakeComm()
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        @classmethod
+        def get_comm(cls, mapping: object) -> _FakeComm:
+            return comm
+
+        def __init__(self, mapping: object, size: int) -> None:
+            pass
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(2, 64, dtype=torch.uint8)
+
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(
+        NVLinkOneSided,
+        "WORKSPACE_SIZE_INDEX",
+        int(_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX),
+    )
+    for memory in ("MnnvlMemory", "MembershipMnnvlMemory"):
+        monkeypatch.setattr(one_sided_module, memory, _Memory)
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    initialize = Mock(return_value=torch.tensor([1]))
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", initialize)
+    mapping = SimpleNamespace(
+        world_size=2, moe_ep_size=2, moe_ep_rank=0, has_cp_helix=Mock(return_value=False)
+    )
+    NVLinkOneSided(
+        mapping=mapping,
+        num_slots=8,
+        top_k=2,
+        max_num_tokens_per_rank=1,
+        ep_group_health=None if fault_tolerance else EPGroupHealth(2),
+        enable_wide_ep_fault_tolerance=fault_tolerance,
+        **kwargs,
+    )
+    return initialize, comm
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_rank_mask_workspace_barrier(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+) -> None:
+    """Only Wide-EP fault tolerance replaces the workspace initialization's barrier with its own."""
+    initialize, comm = _build_one_sided(monkeypatch, fault_tolerance)
+    assert initialize.call_args.kwargs == {"barrier": not fault_tolerance}
+    assert comm.barrier_count == int(fault_tolerance)
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_fault_tolerance_skips_sentinel_transport(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+) -> None:
+    """Wide-EP fault tolerance never sets up the sentinel transport, so it holds no sentinel vote.
+
+    The sentinel kernels take no rank mask or abort state.
+    """
+    setup_sentinel = Mock()
+    monkeypatch.setattr(NVLinkOneSided, "_setup_sentinel", setup_sentinel)
+    _build_one_sided(monkeypatch, fault_tolerance, hidden_size=64, dtype=torch.bfloat16)
+    assert setup_sentinel.call_count == int(not fault_tolerance)
+
+
+# Workspace layout fields of a layout without a rank mask, by metainfo field name. Such a layout holds no rank-mask
+# region, so the expected values below follow from the other regions alone, as calculateWorkspaceLayout
+# (cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp) places them: each region in index order at its
+# alignment (4 bytes; 128 for the completion flags, the routes and the EPLB stats; 256 for the payloads, whose sizes
+# are also padded to 256), with the sentinel fields 0.
+_LAYOUT_FIELDS = (
+    "FLAG_VAL_OFFSET_INDEX",
+    "LOCAL_TOKEN_COUNTER_OFFSET_INDEX",
+    "SEND_COUNTERS_OFFSET_INDEX",
+    "RECV_COUNTERS_OFFSET_INDEX",
+    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX",
+    "TOPK_TARGET_RANKS_OFFSET_INDEX",
+    "TOPK_TARGET_INDICES_OFFSET_INDEX",
+    "EPLB_GATHERED_STATS_OFFSET_INDEX",
+    "DISPATCH_PAYLOAD_OFFSET_INDEX",
+    "DISPATCH_PAYLOAD_SIZE_INDEX",
+    "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX",
+    "COMBINE_INPUT_OFFSET_INDEX",
+    "COMBINE_INPUT_SIZE_INDEX",
+    "MAX_NUM_TOKENS_INDEX",
+    "TOP_K_INDEX",
+    "EP_SIZE_INDEX",
+    "EPLB_STATS_NUM_EXPERTS_INDEX",
+    "WORKSPACE_SIZE_INDEX",
+    "SENTINEL_MAX_NUM_TOKENS_INDEX",
+    "SENTINEL_PAYLOAD_FORMAT_INDEX",
+    "SENTINEL_HIDDEN_SIZE_INDEX",
+    "SENTINEL_STATE_OFFSET_INDEX",
+    "SENTINEL_LANDING_OFFSET_INDEX",
+    "SENTINEL_COMBINE_LANDING_OFFSET_INDEX",
+    "SENTINEL_RECV_OFFSET_INDEX",
+    "SENTINEL_RECV_SIZE_INDEX",
+)
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        # ep_size, max_num_tokens_per_rank, top_k, dispatch_payload_bytes, combine_input_bytes, EPLB experts
+        (
+            (8, 128, 8, 1000, 3000, 288),
+            (0, 4, 8, 40, 128, 256, 4352, 8448, 17664, 1024)  # dispatch regions
+            + (18688, 18944, 3072)  # combine regions
+            + (128, 8, 8, 288, 22016)  # configuration and workspace size
+            + (0,) * 8,  # sentinel regions
+        ),
+        (
+            (36, 77, 6, 4096, 70000, None),
+            (0, 4, 8, 152, 512, 768, 2688, 4608, 4608, 4096)
+            + (8704, 8960, 70144)
+            + (77, 6, 36, 0, 79104)
+            + (0,) * 8,
+        ),
+    ],
+)
+def test_workspace_layout_without_rank_mask_is_unchanged(args: tuple, expected: tuple) -> None:
+    """Without a rank mask, the workspace layout reserves nothing for the rank mask and keeps every other offset."""
+    thop = _tllm_internal.thop
+    layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=False)
+    actual = {name: int(layout[getattr(thop, f"MOE_A2A_{name}")]) for name in _LAYOUT_FIELDS}
+    assert actual == dict(zip(_LAYOUT_FIELDS, expected))
+    for name in ("INCOMPLETE_ROUND_OFFSET_INDEX", "ACTIVE_RANK_MASK_OFFSET_INDEX"):
+        assert int(layout[getattr(thop, f"MOE_A2A_{name}")]) == 0
+    assert layout.numel() == len(_LAYOUT_FIELDS) + 2
 
 
 def _destroyable_one_sided(workspace_key: tuple, workspace_state: dict) -> NVLinkOneSided:

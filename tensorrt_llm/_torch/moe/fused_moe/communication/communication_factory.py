@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.logger import logger
 
 from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
@@ -237,6 +238,7 @@ class CommunicationFactory:
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
                 sentinel_payload_format=sentinel_format,
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
@@ -245,6 +247,12 @@ class CommunicationFactory:
             # selecting another strategy.
             raise
         except Exception as e:
+            if model_config.enable_wide_ep_fault_tolerance:
+                raise ValueError(
+                    "Wide-EP fault tolerance requires the NVLinkOneSided all-to-all, the only MoE "
+                    f"communication that can leave out a failed rank, but it is unavailable ({e}); "
+                    f"change the configuration or {TURN_FAULT_TOLERANCE_OFF}"
+                ) from e
             logger.info(f"NVLinkOneSided not available: {e}")
 
         # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
@@ -426,6 +434,7 @@ class CommunicationFactory:
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
                 sentinel_payload_format=sentinel_format,
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
             )
         elif method == "DEEPEP":
             return DeepEP(
