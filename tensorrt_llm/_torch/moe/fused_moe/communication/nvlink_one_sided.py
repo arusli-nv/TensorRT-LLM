@@ -30,6 +30,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.distributed.communicator import Distributed
+from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -598,7 +600,9 @@ class NVLinkOneSided(Communication):
         # Fixed region capacities are shared by allocation, native bounds checks,
         # and workspace-backed views. Runtime shapes only pack tokens inside them.
         MnnvlMemory.initialize()
+        memory_cls = MembershipMnnvlMemory if enable_wide_ep_fault_tolerance else MnnvlMemory
         self._workspace_key = (
+            memory_cls,
             self.workspace_size_per_rank,
             self.max_num_tokens_per_rank,
             self.ep_rank,
@@ -619,9 +623,19 @@ class NVLinkOneSided(Communication):
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
+            mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
+            torch.ops.trtllm.moe_a2a_initialize(
+                workspace,
+                metainfo,
+                self.ep_rank,
+                self.ep_size,
+                barrier=not enable_wide_ep_fault_tolerance,
+            )
+            if enable_wide_ep_fault_tolerance:
+                # Each rank may be its own MPI world, so the workspace's own communicator synchronizes
+                # the ranks: no rank may write into a peer's row before the peer has initialized it.
+                memory_cls.get_comm(mapping).barrier()
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
@@ -789,8 +803,13 @@ class NVLinkOneSided(Communication):
             if reason is None
             else None
         )
-        votes = MnnvlMemory.get_comm(self.mapping).allgather(
-            (reason is None, num_sms, _sentinel_env())
+        # Every rank gets the same votes, so a replacement rank, which builds its layers without the
+        # other ranks, takes the votes that the original ranks recorded at startup. The communicator
+        # is taken first: its first use splits the startup group, a startup value of its own.
+        comm = MnnvlMemory.get_comm(self.mapping)
+        votes = Distributed.agree_per_process(
+            "nvlink_one_sided_sentinel_vote",
+            lambda: comm.allgather((reason is None, num_sms, _sentinel_env())),
         )
         if len({vote[2] for vote in votes}) > 1:
             raise NVLinkOneSidedConfigError(
@@ -935,7 +954,7 @@ class NVLinkOneSided(Communication):
                 f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
             )
         state.register_layer(self.reset_state)
-        state.register_workspace(self.mnnvl_mem, self._reset_local_workspace)
+        state.register_workspace(self.mnnvl_mem, self._reset_local_workspace, self.workspace)
         self.execution_state = state
 
     def _reset_local_workspace(self) -> None:

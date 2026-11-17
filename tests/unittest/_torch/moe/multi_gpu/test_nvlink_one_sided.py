@@ -24,6 +24,7 @@ import pytest
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_no_mnnvl_fabric_handles
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
@@ -885,8 +886,8 @@ def _run_graph_replay_worker(failed_rank: int) -> dict:
 def test_graph_replay_follows_installed_mask() -> None:
     """A CUDA graph captured with every rank active replays without a rank masked out later."""
     ep_size, failed_rank = 4, 2
-    if torch.cuda.device_count() < ep_size:
-        pytest.skip(f"requires {ep_size} GPUs")
+    # Wide-EP fault tolerance runs only on MNNVL memory shared through fabric handles.
+    skip_no_mnnvl_fabric_handles(ep_size)
     # A replay that waited for the masked rank would end at this kernel timeout.
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "60"})
     try:
@@ -1039,8 +1040,8 @@ def test_abort_releases_bound_collectives_waiting_on_a_stopped_rank(
     With ``flag_wraps`` the combine waits for round flag value 0, which is still published.
     """
     ep_size, failed_rank = 4, 2
-    if torch.cuda.device_count() < ep_size:
-        pytest.skip(f"requires {ep_size} GPUs")
+    # Wide-EP fault tolerance runs only on MNNVL memory shared through fabric handles.
+    skip_no_mnnvl_fabric_handles(ep_size)
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
     try:
         args = [(failed_rank, stop_before, round_flag)] * ep_size

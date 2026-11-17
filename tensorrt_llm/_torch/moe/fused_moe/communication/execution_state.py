@@ -23,6 +23,7 @@ state (``waited_flags``).
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -30,6 +31,9 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.membership import StoreGroup
 
 _MASK_WORD_BITS = 64
 _ABORT_REQUESTED = 0
@@ -45,6 +49,27 @@ def _mask_words(mask: int, ep_rank: int) -> tuple[int, ...]:
     if not (words[ep_rank // _MASK_WORD_BITS] >> (ep_rank % _MASK_WORD_BITS)) & 1:
         raise RuntimeError(f"active_rank_mask must mark the local ep_rank ({ep_rank}) as active")
     return words
+
+
+class MembershipWorkspace(Protocol):
+    """Peer-writable memory that a membership change remaps among the active ranks in place."""
+
+    @property
+    def local_device_bytes(self) -> int:
+        """Return the device bytes that :meth:`remap` allocates for this rank's row."""
+
+    def rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into the workspace, else no row."""
+
+    def remap(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map the workspace among the active ranks with ``fresh_rows`` on fresh pages."""
+
+
+class BindableCommunication(Protocol):
+    """MoE communication strategy whose collectives can run under a :class:`MoeExecutionState`."""
+
+    def bind_execution_state(self, state: MoeExecutionState) -> None:
+        """Run every later collective with ``state``'s rank mask and abort state."""
 
 
 class MoeExecutionState:
@@ -72,24 +97,65 @@ class MoeExecutionState:
         if not self.abort.is_pinned():
             raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_flags = self.abort.numpy()[_ABORT_FLAGS]
-        self._workspaces: dict[object, Callable[[], None]] = {}
+        self._workspaces: dict[MembershipWorkspace, tuple[Callable[[], None], torch.Tensor]] = {}
         self._layer_resets: list[Callable[[], None]] = []
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
+        # A layer bound after a membership change has a workspace that the change's remaps left out.
+        self._bound_generation = snapshot.generation
         self.active_rank_mask = torch.tensor(
             _mask_words(snapshot.mask, ep_rank), dtype=torch.uint64, device=device
         )
 
     def register_layer(self, reset_state: Callable[[], None]) -> None:
-        """Register the reset of a bound layer's dispatch/combine state machine."""
+        """Register the reset of a bound layer's dispatch/combine state machine.
+
+        Raises:
+            RuntimeError: The EP membership changed since this state was created.
+        """
+        if self.health.generation != self._bound_generation:
+            raise RuntimeError("Bind MoE layers only before the EP membership changes")
         self._layer_resets.append(reset_state)
 
-    def register_workspace(self, workspace: object, reset_workspace: Callable[[], None]) -> None:
+    def register_workspace(
+        self,
+        workspace: MembershipWorkspace,
+        reset_workspace: Callable[[], None],
+        rows: torch.Tensor,
+    ) -> None:
         """Register a bound layer's workspace, once per workspace that layers share.
 
-        ``reset_workspace`` resets this rank's row of it.
+        ``reset_workspace`` resets this rank's row of it, and ``rows`` is the workspace's
+        ``[ep_size, bytes]`` uint8 view.
         """
-        self._workspaces.setdefault(workspace, reset_workspace)
+        self._workspaces.setdefault(workspace, (reset_workspace, rows))
+
+    def staging_workspace(self) -> torch.Tensor:
+        """Return the rows of the largest bound workspace.
+
+        The workspace is idle from :meth:`remap_workspaces` until :meth:`rearm`, so restores may
+        stage expert weights through it.
+        """
+        return max((rows for _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1])
+
+    def workspace_bytes(self) -> int:
+        """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
+        return sum(workspace.local_device_bytes for workspace in self._workspaces)
+
+    def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into any bound workspace."""
+        return frozenset().union(
+            *(workspace.rows_needing_fresh_pages(comm) for workspace in self._workspaces)
+        )
+
+    def remap_workspaces(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map every bound workspace at the same addresses among the active members of ``comm``.
+
+        Call only while no rank is in a collective. Every rank must :meth:`rearm` before the next
+        collective.
+        """
+        for workspace in self._workspaces:
+            workspace.remap(comm, fresh_rows)
 
     def request_abort(self) -> None:
         """Make running and future collectives return without their peers. Safe from any thread."""
@@ -116,7 +182,7 @@ class MoeExecutionState:
         """
         torch.cuda.synchronize(self._device)
         self.abort.zero_()
-        for reset_workspace in self._workspaces.values():
+        for reset_workspace, _ in self._workspaces.values():
             reset_workspace()
         for reset_state in self._layer_resets:
             reset_state()

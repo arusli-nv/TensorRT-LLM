@@ -155,6 +155,15 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
         TorchLlmArgs(model=llama_model_path, checkpoint_io_policy="unknown")
 
 
+# The smallest configuration that Wide-EP fault tolerance accepts.
+_FAULT_TOLERANT_ARGS = dict(enable_wide_ep_fault_tolerance=True,
+                            enable_attention_dp=True,
+                            moe_config={"load_balancer": {
+                                "num_slots": 72
+                            }},
+                            enable_chunked_prefill=True)
+
+
 @pytest.mark.cpu_only
 def test_wide_ep_fault_tolerance_defaults_off(
         monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,8 +176,7 @@ def test_wide_ep_fault_tolerance_defaults_off(
 def test_wide_ep_fault_tolerance_keeps_cuda_graphs(
         monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
-    args = TorchLlmArgs(model=llama_model_path,
-                        enable_wide_ep_fault_tolerance=True)
+    args = TorchLlmArgs(model=llama_model_path, **_FAULT_TOLERANT_ARGS)
     assert args.cuda_graph_config is not None
 
 
@@ -178,10 +186,11 @@ def test_fault_tolerance_mode_env_is_deprecated(monkeypatch: pytest.MonkeyPatch,
                                                 enable: bool) -> None:
     """TLLM_FAULT_TOLERANCE_MODE=1 alone does not turn on fault tolerance."""
     monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    fault_tolerance = _FAULT_TOLERANT_ARGS if enable else {}
     with patch.object(llm_args_mod.logger, "warning") as warning:
         args = TorchLlmArgs(model=llama_model_path,
-                            enable_wide_ep_fault_tolerance=enable,
-                            cuda_graph_config=None)
+                            cuda_graph_config=None,
+                            **fault_tolerance)
     deprecations = [
         call.args[0] for call in warning.call_args_list
         if "TLLM_FAULT_TOLERANCE_MODE" in str(call.args[0])

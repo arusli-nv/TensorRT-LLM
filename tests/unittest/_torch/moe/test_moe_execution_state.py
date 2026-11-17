@@ -25,6 +25,8 @@ import torch
 from _torch.moe.moe_a2a_test_utils import a2a_combine, a2a_dispatch, a2a_workspace
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
 from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
@@ -32,6 +34,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVL
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.pyexecutor import rank_failure_model_load
 from tensorrt_llm._torch.pyexecutor.rank_failure_model_load import moe_comms, prepare_model
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
@@ -127,7 +130,7 @@ def test_abort_and_rearm_after_peer_failure() -> None:
         resets.append(1)
         torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE, barrier=False)
 
-    state.register_workspace(object(), reset_workspace)
+    state.register_workspace(object(), reset_workspace, workspace)
 
     _collective_round(state, workspace, meta, experts, payload)
     done = _queued_work_done()
@@ -175,7 +178,9 @@ def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
     resets = []
     shared = object()
     for name in ("shared", "shared again"):
-        state.register_workspace(shared, lambda name=name: resets.append(name))
+        state.register_workspace(
+            shared, lambda name=name: resets.append(name), torch.empty(2, 1, dtype=torch.uint8)
+        )
     comm = _frontend()
     comm._reset_local_workspace = lambda: resets.append("layer workspace")
     comm.bind_execution_state(state)
@@ -202,6 +207,54 @@ def test_graph_replay_follows_installed_mask() -> None:
         _wait_for(_queued_work_done(), state, "the replay waited for the masked-out rank")
         torch.testing.assert_close(output, payload, rtol=0, atol=0)
     assert not state.aborted()
+
+
+def _workspace(device_bytes: int, fresh_rows: frozenset[int]) -> Mock:
+    """Return a mock membership workspace."""
+    return Mock(
+        local_device_bytes=device_bytes, **{"rows_needing_fresh_pages.return_value": fresh_rows}
+    )
+
+
+def test_bound_layer_remaps_its_memory() -> None:
+    """Binding a layer registers its MNNVL memory as the workspace that a change remaps."""
+    state = MoeExecutionState(EPGroupHealth(2), 0, torch.device("cuda"))
+    comm = _frontend()
+    comm.mnnvl_mem = _workspace(6 << 20, frozenset({1}))
+    comm.bind_execution_state(state)
+    store_group = Mock()
+
+    assert state.workspace_bytes() == 6 << 20
+    assert state.workspace_rows_needing_fresh_pages(store_group) == frozenset({1})
+    state.remap_workspaces(store_group, frozenset({1}))
+    comm.mnnvl_mem.remap.assert_called_once_with(store_group, frozenset({1}))
+
+
+def test_shared_workspace_counted_once() -> None:
+    """Layers that share a workspace remap, count and reset it once. Only rearm resets them."""
+    state = MoeExecutionState(EPGroupHealth(4), 0, torch.device("cuda"))
+    shared = _workspace(6 << 20, frozenset())
+    other = _workspace(2 << 20, frozenset({0, 3}))
+    resets = []
+    rows = {
+        shared: torch.empty(4, 6, dtype=torch.uint8),
+        other: torch.empty(4, 2, dtype=torch.uint8),
+    }
+    for workspace, name in ((shared, "shared"), (shared, "shared again"), (other, "other")):
+        state.register_workspace(workspace, lambda name=name: resets.append(name), rows[workspace])
+    comm = Mock()
+
+    # Restores stage expert weights through the largest workspace.
+    assert state.staging_workspace() is rows[shared]
+    assert state.workspace_bytes() == 8 << 20
+    assert state.workspace_rows_needing_fresh_pages(comm) == frozenset({0, 3})
+    state.remap_workspaces(comm, frozenset({1}))
+    shared.remap.assert_called_once_with(comm, frozenset({1}))
+    other.remap.assert_called_once_with(comm, frozenset({1}))
+    comm.allgather.assert_not_called()
+    assert resets == []
+    state.rearm()
+    assert resets == ["shared", "other"]
 
 
 def _frontend(*, fault_tolerance: bool = True, ep_rank: int = 0) -> NVLinkOneSided:
@@ -233,6 +286,16 @@ def test_bind_refuses_unsupported_layers() -> None:
         _frontend(fault_tolerance=False).bind_execution_state(state)
     with pytest.raises(ValueError, match="cannot run EP rank 1"):
         _frontend(ep_rank=1).bind_execution_state(state)
+
+
+def test_bind_refused_after_membership_change() -> None:
+    """The remaps of a membership change leave out the workspace of a layer bound afterwards."""
+    health = EPGroupHealth(2)
+    state = MoeExecutionState(health, 0, torch.device("cuda"))
+    _frontend().bind_execution_state(state)
+    health.mark_failed(1)
+    with pytest.raises(RuntimeError, match="only before the EP membership changes"):
+        _frontend().bind_execution_state(state)
 
 
 @pytest.mark.cpu_only
@@ -281,13 +344,19 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
         assert kwargs["active_rank_mask"] is state.active_rank_mask
         assert kwargs["abort_state"] is state.abort
     state.register_layer.assert_called_once_with(bound.reset_state)
-    state.register_workspace.assert_called_once_with(bound.mnnvl_mem, bound._reset_local_workspace)
+    state.register_workspace.assert_called_once_with(
+        bound.mnnvl_mem, bound._reset_local_workspace, bound.workspace
+    )
 
 
 def _moe_layer(cls: type, **attributes) -> torch.nn.Module:
-    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it."""
+    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it.
+
+    Like a layer built without EPLB, it has no load balancer.
+    """
     layer = cls.__new__(cls)
     torch.nn.Module.__init__(layer)
+    layer.layer_load_balancer = None
     for name, value in attributes.items():
         setattr(layer, name, value)
     return layer
@@ -324,19 +393,43 @@ def test_model_without_moe_layers_refused() -> None:
 
 
 @pytest.mark.cpu_only
-def test_layers_bound_to_one_execution_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """prepare_model binds every MoE layer to one execution state over every EP rank."""
+@pytest.mark.parametrize(
+    "architectures",
+    [["LlamaForCausalLM"], ["DeepseekV3ForCausalLM", "LlamaForCausalLM"], [], None],
+    ids=["other", "mixed", "empty", "none"],
+)
+def test_unsupported_architecture_refused(architectures) -> None:
+    model = torch.nn.Linear(1, 1)
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=architectures)
+    )
+    with pytest.raises(ValueError, match=re.escape(f"not {architectures}")) as error:
+        prepare_model(model)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
+def test_layers_bound_to_one_execution_state(
+    monkeypatch: pytest.MonkeyPatch, replacement: bool
+) -> None:
+    """prepare_model binds every MoE layer to one execution state; a replacement starts alone."""
     monkeypatch.setattr(
         rank_failure_model_load,
         "MoeExecutionState",
         lambda health, ep_rank, device: SimpleNamespace(health=health, ep_rank=ep_rank),
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
+    monkeypatch.setattr(StartupRecord, "replacement", replacement)
     comms = [Mock(spec=["bind_execution_state"]) for _ in range(2)]
     model = torch.nn.ModuleList([_moe_layer(ConfigurableMoE, comm=comm) for comm in comms])
-    model.model_config = SimpleNamespace(mapping=SimpleNamespace(moe_ep_size=4, moe_ep_rank=1))
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        mapping=SimpleNamespace(moe_ep_size=4, moe_ep_rank=1),
+    )
     prepare_model(model)
     (state,), (other,) = (comm.bind_execution_state.call_args.args for comm in comms)
     assert state is other
     assert state.ep_rank == 1
-    assert state.health.get_mask() == 0b1111
+    assert state.health.get_mask() == (0b0010 if replacement else 0b1111)
