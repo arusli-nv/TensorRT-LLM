@@ -808,7 +808,7 @@ def _run_watchdog_worker(_unused: int) -> dict:
     # The default policy: a watchdog communicator must keep the sentinel transport off by itself.
     os.environ.pop(SYNC_PROTOCOL_ENV, None)
 
-    from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import EPGroupHealth
+    from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 
     rank = MPI.COMM_WORLD.Get_rank()
     ep_size = MPI.COMM_WORLD.Get_size()

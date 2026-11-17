@@ -156,6 +156,48 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
 
 
 @pytest.mark.cpu_only
+def test_wide_ep_fault_tolerance_defaults_off(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    assert not TorchLlmArgs(
+        model=llama_model_path).enable_wide_ep_fault_tolerance
+
+
+@pytest.mark.cpu_only
+def test_wide_ep_fault_tolerance_rejects_cuda_graphs(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    with pytest.raises(ValidationError, match="set cuda_graph_config=None"):
+        TorchLlmArgs(model=llama_model_path,
+                     enable_wide_ep_fault_tolerance=True)
+    assert TorchLlmArgs(model=llama_model_path,
+                        enable_wide_ep_fault_tolerance=True,
+                        cuda_graph_config=None).enable_wide_ep_fault_tolerance
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable", [False, True])
+def test_fault_tolerance_mode_env_is_deprecated(monkeypatch: pytest.MonkeyPatch,
+                                                enable: bool) -> None:
+    """TLLM_FAULT_TOLERANCE_MODE=1 alone does not turn on fault tolerance."""
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(model=llama_model_path,
+                            enable_wide_ep_fault_tolerance=enable,
+                            cuda_graph_config=None)
+    deprecations = [
+        call.args[0] for call in warning.call_args_list
+        if "TLLM_FAULT_TOLERANCE_MODE" in str(call.args[0])
+    ]
+    assert args.enable_wide_ep_fault_tolerance is enable
+    if enable:
+        assert deprecations == []
+    else:
+        assert len(deprecations) == 1
+        assert "set enable_wide_ep_fault_tolerance=True" in deprecations[0]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("model_kwargs", "expected"),
     [

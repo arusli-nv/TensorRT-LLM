@@ -3422,6 +3422,7 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
     constructors = {}
     for name in (
@@ -3434,7 +3435,6 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
     ):
         constructors[name] = MagicMock(name=name)
         monkeypatch.setattr(communication_factory, name, constructors[name])
-    monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
     moe = SimpleNamespace(
         backend=TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl),
         enable_dwdp=False,

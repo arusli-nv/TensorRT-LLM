@@ -2454,6 +2454,8 @@ class ModelLoader:
                 checkpoint_loader),
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
+            enable_wide_ep_fault_tolerance=self.llm_args.
+            enable_wide_ep_fault_tolerance,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
             use_cute_dsl_blockscaling_mm=self.llm_args.

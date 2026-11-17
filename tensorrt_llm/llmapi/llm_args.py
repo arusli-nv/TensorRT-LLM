@@ -8640,6 +8640,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    enable_wide_ep_fault_tolerance: bool = Field(
+        default=False,
+        description="Run the MoE all-to-all of wide expert parallelism in its "
+        "fault-tolerant mode, in which the NVLink one-sided all-to-all "
+        "exchanges only with the EP ranks marked active. Requires the NVLink "
+        "one-sided all-to-all and no CUDA graphs (cuda_graph_config=None).",
+        status="prototype")
+
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
         default=None,
         description="The request reordering policy to use.",
@@ -9751,6 +9759,27 @@ class TorchLlmArgs(BaseLlmArgs):
         self.moe_config.load_balancer = _resolve_load_balancer_config(
             self.moe_config.load_balancer)
         self.moe_config.resolve_load_balancer_compatibility()
+        return self
+
+    @model_validator(mode="after")
+    def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
+        """Check enable_wide_ep_fault_tolerance against the configuration.
+
+        TLLM_FAULT_TOLERANCE_MODE=1 is deprecated: it no longer turns on the
+        fault-tolerant MoE all-to-all, which the field does.
+        """
+        if (not self.enable_wide_ep_fault_tolerance
+                and os.environ.get("TLLM_FAULT_TOLERANCE_MODE") == "1"):
+            logger.warning(
+                "TLLM_FAULT_TOLERANCE_MODE=1 is deprecated and will be removed "
+                "in a future release. It no longer turns on Wide-EP fault "
+                "tolerance for the MoE layers; set "
+                "enable_wide_ep_fault_tolerance=True instead.")
+        if (self.enable_wide_ep_fault_tolerance
+                and self.cuda_graph_config is not None):
+            raise ValueError(
+                "enable_wide_ep_fault_tolerance does not support CUDA graphs; "
+                "set cuda_graph_config=None")
         return self
 
     @model_validator(mode="after")
