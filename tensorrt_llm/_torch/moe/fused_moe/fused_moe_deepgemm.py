@@ -782,6 +782,10 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
         doc=
         "DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107.",
     )
+    spare_slots_refusal_reason = (
+        "its workspace holds rows for every local slot, the unbacked spare "
+        "slots included, so FP8 block-scale checkpoints (such as FP8 "
+        "DeepSeek-R1) are not supported")
 
     # Taken off the descriptor, not restated: the scheduler reads these three
     # attributes and the registry publishes the descriptor, so a second literal
