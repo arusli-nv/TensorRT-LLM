@@ -250,6 +250,14 @@ strategy checks or private workspace attributes. The executor request queue
 owns admission around the checkpoint and reopens it only after a complete
 wakeup.
 
+### Wide-EP fault tolerance
+
+Given an `ep_group_health`, `NVLinkOneSided` runs in rank-mask mode, as it does under `enable_wide_ep_fault_tolerance`. The `moe_a2a_dispatch` and `moe_a2a_combine` ops then read the active-rank mask at execution time from a uint64 tensor on the workspace device, or from mask words in the workspace, which they update from a CPU tensor when it changes. The caller keeps the local rank's bit set and passes `barrier=False` to `moe_a2a_initialize` when it synchronizes the ranks itself.
+
+Under `enable_wide_ep_fault_tolerance`, a communication backend binds to the shared `MoeExecutionState` (`bind_execution_state`), which owns the device rank mask and a pinned host abort state. Its kernels read the active-rank mask through that state's fixed device pointer, so captured CUDA graphs follow membership changes, and stop waiting on a peer once the state's abort request is set. A fence-transport kernel that waits on a peer for longer than about 10 ms publishes the round flag it waits for in the abort state, which the rank reports to the membership authority. `NVLinkOneSided` is the only backend that implements this; it then sets up no sentinel transport, whose kernels take neither the rank mask nor the abort state, so every step takes the fence transport. A MoE backend runs with the unbacked spare EPLB slots of fault tolerance only if it declares `supports_spare_slots`: its autotuner profiles only the active slots (`tuner_layout_kwargs`). Its quantization method must declare `supports_spare_slots` as well (`FusedMoEMethodBase`), or the layer refuses to create its weights.
+
+For the membership changes, recovery and expert restore around these pieces, see the [Wide-EP Fault Tolerance Developer Guide](../../distributed/membership/FAULT_TOLERANCE_DEVELOPER_GUIDE.md).
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components

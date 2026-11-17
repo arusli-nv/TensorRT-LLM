@@ -365,6 +365,13 @@ class FusedMoEMethodBase(ABC):
     have not yet been tested may set it to NOT_VERIFIED.
     """
 
+    supports_spare_slots: bool = False
+    """Whether Wide-EP fault tolerance runs this method with spare EPLB slots.
+
+    True only on the methods verified with fault tolerance. A subclass of one
+    of them sets it back to False until it is verified too.
+    """
+
     @classmethod
     def supports_online_eplb(cls) -> bool:
         """
@@ -829,6 +836,7 @@ class FusedMoEMethodBase(ABC):
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.SUPPORTED
+    supports_spare_slots = True
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
@@ -856,6 +864,8 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
     requires gate/up weights to be interleaved with granularity=32 along
     the intermediate dimension (dim=1).
     """
+
+    supports_spare_slots = False
 
     def load_expert_w3_w1_weight(
         self,
@@ -887,6 +897,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
     block_k = 64
     use_shuffled_weight = True
     weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
+    supports_spare_slots = False
     _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
                                  torch.Tensor] = {}
 
@@ -3302,6 +3313,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     scaling_vector_size = NVFP4_SF_VEC_SIZE
     NVFP4_ROW_ALIGNMENT = 128
     NVFP4_COL_ALIGNMENT = 4
+    supports_spare_slots = True
 
     def prepare_streaming_expert_load(self, module: torch.nn.Module) -> None:
         # This backend defers the cat + pad + interleave of w3_w1 to
@@ -3640,6 +3652,7 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     # and rebuilds the module parameters, which is incompatible with dynamic
     # EPLB weight migration.
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+    supports_spare_slots = False
 
     def load_expert_fc31_alpha_nvfp4(self, w1_weight_scale_2, w3_weight_scale_2,
                                      final_fc31_input_scale, dst_fc31_alpha):
@@ -3749,6 +3762,7 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     """Dequantize active NVFP4 experts into a BF16/FP16 workspace for CUTLASS."""
 
     quantizes_nvfp4_activations = False
+    supports_spare_slots = False
 
     def _interleave_w3_w1_weight_scale(
             self, dst_w3_w1_weight_scale: torch.Tensor) -> None:
@@ -3955,6 +3969,7 @@ class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
 
     scaling_vector_size = NVFP4_PLUS_SF_VEC_SIZE
     checkpoint_has_global_scales = False
+    supports_spare_slots = False
     # Scales an MXFP4 checkpoint never has. The kernels apply no global scale
     # and no AWQ pre-quant scale, so serving a checkpoint with them would
     # silently drop them.
@@ -4012,6 +4027,8 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     to them on decode-shape inputs without holding any kernel-prep logic
     of its own.
     """
+
+    supports_spare_slots = False
 
     # b12x exposes two activation strings today: ``relu2`` (Nemotron-style
     # ``x * relu(x)``) and ``silu`` (SwiGLU-style ``x * silu(gate)``).
