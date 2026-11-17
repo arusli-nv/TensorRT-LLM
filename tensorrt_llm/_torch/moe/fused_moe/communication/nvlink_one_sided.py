@@ -331,8 +331,13 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int],
         extra_payload_bytes_per_token: int,
+        rank_mask: bool = False,
     ) -> torch.Tensor:
-        """Plan per-rank control buffers and independently sized payload regions."""
+        """Plan per-rank control buffers and independently sized payload regions.
+
+        ``rank_mask`` reserves the incomplete-round word that the rank-mask kernels with an abort
+        state use.
+        """
         if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
             raise ValueError("hidden_size must be positive and extra payload size non-negative")
         tokens = ep_size * max_num_tokens
@@ -359,6 +364,7 @@ class NVLinkOneSided(Communication):
             dispatch_bytes,
             combine_input_bytes,
             eplb_stats_num_experts,
+            rank_mask,
         )
 
     @staticmethod
@@ -367,6 +373,7 @@ class NVLinkOneSided(Communication):
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
         top_k: Optional[int] = None,
+        rank_mask: bool = False,
     ) -> int:
         """Control-buffer bytes; omitted top_k reserves the native routing limit."""
         layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(
@@ -376,6 +383,7 @@ class NVLinkOneSided(Communication):
             0,
             0,
             eplb_stats_num_experts,
+            rank_mask,
         )
         return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
@@ -471,8 +479,9 @@ class NVLinkOneSided(Communication):
                 Corresponds to model_config.use_low_precision_moe_combine.
             enable_wide_ep_fault_tolerance: Run the rank-mask kernels, which exchange only with the
                 EP ranks set in the device mask of the execution state that ``bind_execution_state``
-                binds before the first dispatch. They read the mask when they run, so CUDA graphs
-                follow its later changes. Corresponds to model_config.enable_wide_ep_fault_tolerance.
+                binds before the first dispatch, and stop waiting on peers once its abort is
+                requested. They read both when they run, so CUDA graphs follow their later changes.
+                Corresponds to model_config.enable_wide_ep_fault_tolerance.
             sentinel_payload_format: Dispatch payload format whose small steps the sentinel transport carries,
                 one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()), or None when the layer
                 dispatches rows the transport does not carry (no sentinel regions then). Needs
@@ -526,6 +535,7 @@ class NVLinkOneSided(Communication):
                 dtype,
                 self.eplb_stats_num_experts,
                 0,
+                rank_mask=enable_wide_ep_fault_tolerance,
             )
         # Largest step of the sentinel transport; 0 when this instance does not use it.
         self.sentinel_max_tokens = 0
@@ -570,6 +580,7 @@ class NVLinkOneSided(Communication):
                 max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
                 self.top_k,
+                rank_mask=enable_wide_ep_fault_tolerance,
             )
             # Split the rest between the dispatch payload and combine input regions.
             capacity = (self.workspace_size_per_rank - control_bytes) // 2 // alignment * alignment
@@ -582,6 +593,7 @@ class NVLinkOneSided(Communication):
                 capacity,
                 capacity,
                 self.eplb_stats_num_experts,
+                enable_wide_ep_fault_tolerance,
             )
         # Fixed region capacities are shared by allocation, native bounds checks,
         # and workspace-backed views. Runtime shapes only pack tokens inside them.
@@ -906,7 +918,10 @@ class NVLinkOneSided(Communication):
         return self._require_workspace_lifecycle().metainfo
 
     def bind_execution_state(self, state: MoeExecutionState) -> None:
-        """Run every later dispatch and combine with the device rank mask of ``state``."""
+        """Run every later dispatch and combine with the device rank mask and abort state of ``state``.
+
+        ``state.rearm`` then also resets this layer and this rank's row of its workspace.
+        """
         if not self._rank_mask_enabled:
             raise ValueError(
                 "Bound execution requires an NVLinkOneSided built with "
@@ -919,18 +934,30 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
             )
+        state.register_layer(self.reset_state)
+        state.register_workspace(self.mnnvl_mem, self._reset_local_workspace)
         self.execution_state = state
 
-    def _active_rank_mask(self) -> Optional[torch.Tensor]:
-        """Return the device mask that the rank-mask kernels read, or None without a rank mask."""
+    def _reset_local_workspace(self) -> None:
+        """Return this rank's row of the workspace to its first round, without a barrier."""
+        torch.ops.trtllm.moe_a2a_initialize(
+            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
+        )
+
+    def _rank_mask_args(self) -> Dict[str, Optional[torch.Tensor]]:
+        """Return the rank-mask arguments of the all-to-all ops: the device mask that the rank-mask
+        kernels read and the abort state that ends their waits, or no mask without a rank mask."""
         if not self._rank_mask_enabled:
-            return None
+            return {"active_rank_mask": None}
         if self.execution_state is None:
             raise RuntimeError(
                 "NVLinkOneSided with enable_wide_ep_fault_tolerance dispatches only once bound "
                 "(bind_execution_state)"
             )
-        return self.execution_state.active_rank_mask
+        return {
+            "active_rank_mask": self.execution_state.active_rank_mask,
+            "abort_state": self.execution_state.abort,
+        }
 
     def _require_workspace_lifecycle(self) -> _MnnvlAlltoAllWorkspaceLifecycle:
         lifecycle = self._workspace_lifecycle
@@ -1094,7 +1121,8 @@ class NVLinkOneSided(Communication):
             use_dp_padding: Whether to use DP padding (optional)
             **kwargs: Strategy-specific arguments. With enable_wide_ep_fault_tolerance, the kernels
                 exchange only with the EP ranks set in the bound execution state's device mask and drop
-                the routes to the other ranks (their ``topk_target_ranks`` entries are -1).
+                the routes to the other ranks (their ``topk_target_ranks`` entries are -1). After an
+                abort, the outputs of the collective are invalid until ``rearm``.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -1157,7 +1185,7 @@ class NVLinkOneSided(Communication):
                 expert_id_payload_index=expert_id_payload_index if use_sentinel else None,
                 invalid_token_expert_id=int(self.invalid_token_expert_id) if use_sentinel else None,
                 enable_rank_mask=self._rank_mask_enabled,
-                active_rank_mask=self._active_rank_mask(),
+                **self._rank_mask_args(),
                 use_sentinel=use_sentinel,
             )
         )
@@ -1299,7 +1327,7 @@ class NVLinkOneSided(Communication):
             bool(self.payload_in_workspace),
             use_low_precision=bool(self.use_low_precision_combine),
             enable_rank_mask=self._rank_mask_enabled,
-            active_rank_mask=self._active_rank_mask(),
+            **self._rank_mask_args(),
             use_sentinel=use_sentinel,
         )
 

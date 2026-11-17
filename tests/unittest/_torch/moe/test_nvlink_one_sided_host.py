@@ -183,14 +183,50 @@ _LAYOUT_FIELDS = (
     ],
 )
 def test_workspace_layout_without_rank_mask_is_unchanged(args: tuple, expected: tuple) -> None:
-    """Without a rank mask, the workspace layout keeps main's offsets and fields."""
+    """Without a rank mask, the workspace layout reserves no incomplete-round word and keeps main's offsets."""
     from tensorrt_llm.bindings import internal as _tllm_internal
 
     thop = _tllm_internal.thop
-    layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args)
+    layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=False)
     actual = {name: int(layout[getattr(thop, f"MOE_A2A_{name}")]) for name in _LAYOUT_FIELDS}
     assert actual == dict(zip(_LAYOUT_FIELDS, expected))
-    assert layout.numel() == len(_LAYOUT_FIELDS)
+    assert int(layout[int(thop.MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX)]) == 0
+    assert layout.numel() == len(_LAYOUT_FIELDS) + 1
+
+
+def test_fault_tolerant_layer_votes_the_sentinel_transport_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Wide-EP fault-tolerant layer takes part in the sentinel vote, but always as unsupported.
+
+    The sentinel kernels take no active-rank mask or abort state, so such a layer always takes the fence
+    transport, whatever the other ranks vote.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
+
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_sentinel_available", lambda: True)
+    votes = []
+
+    def allgather(vote):
+        votes.append(vote)
+        return [vote, (True, 148, vote[2])]
+
+    monkeypatch.setattr(
+        nvlink_one_sided.MnnvlMemory,
+        "get_comm",
+        lambda mapping: SimpleNamespace(allgather=allgather),
+    )
+    layer = NVLinkOneSided.__new__(NVLinkOneSided)
+    layer.mapping = None
+    layer.ep_size, layer.top_k, layer.num_experts = 2, 2, 8
+    layer.max_num_tokens_per_rank = 16
+    layer.use_low_precision_combine = False
+    layout = NVLinkOneSided._make_workspace_layout(
+        2, 2, 16, 64, torch.bfloat16, None, 0, rank_mask=True
+    )
+    vote = layer._vote_sentinel(layout.clone(), 64, torch.bfloat16, "BF16", fault_tolerant=True)
+    assert vote == (0, None, tuple(layout.tolist()))
+    assert votes[0][:2] == (False, None)
 
 
 def test_sentinel_row_geometry() -> None:

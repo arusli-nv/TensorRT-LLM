@@ -15,11 +15,14 @@
 """MoeExecutionState, and the NVLinkOneSided layers bound to it at model load."""
 
 import re
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from _torch.moe.moe_a2a_test_utils import a2a_combine, a2a_dispatch, a2a_workspace
 
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
@@ -33,6 +36,42 @@ from tensorrt_llm.bindings import internal
 from tensorrt_llm.mapping import Mapping
 
 _EP_SIZE, _TOKENS, _HIDDEN = 2, 8, 128
+# Word of the abort state holding the round flag awaited from peer 0.
+_EVIDENCE = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
+_JOIN_TIMEOUT_S = 10.0
+
+
+def _bindable_state(**attributes) -> SimpleNamespace:
+    """Return a stand-in for an execution state that records the layers bound to it."""
+    return SimpleNamespace(register_layer=Mock(), register_workspace=Mock(), **attributes)
+
+
+def _collective_round(state: MoeExecutionState, workspace, meta, experts, payload) -> torch.Tensor:
+    """Run dispatch and combine as rank 0 under ``state``, and return the combined output."""
+    controls = {
+        "enable_rank_mask": True,
+        "active_rank_mask": state.active_rank_mask,
+        "abort_state": state.abort,
+    }
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+    return a2a_combine(workspace, meta, received[0], offset, controls)
+
+
+def _wait_for(condition, state: MoeExecutionState, failure: str, timeout_s: float = 10) -> None:
+    """Wait until ``condition()`` holds. At the deadline, abort the collectives and fail."""
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            state.request_abort()
+            torch.cuda.synchronize()
+            pytest.fail(failure)
+        time.sleep(0.01)
+
+
+def _queued_work_done():
+    done = torch.cuda.Event()
+    done.record()
+    return done.query
 
 
 def test_mask_holds_the_active_ranks() -> None:
@@ -77,61 +116,92 @@ def test_state_requires_active_local_rank() -> None:
         MoeExecutionState(excluded, 0, torch.device("cuda"))
 
 
-def test_graph_replay_follows_installed_mask() -> None:
-    """A CUDA graph captured with every rank active replays without the rank masked out later.
-
-    Both EP ranks' workspace rows are on this GPU, and only rank 0 runs. Its tokens all go to
-    itself, so its collectives complete once rank 1 is masked out.
-    """
-    meta = NVLinkOneSided._make_workspace_layout(
-        _EP_SIZE, 1, _TOKENS, _HIDDEN, torch.bfloat16, None, 0
-    )
-    size = int(meta[int(internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX)])
-    workspace = torch.zeros((_EP_SIZE, size), dtype=torch.uint8, device="cuda")
-    torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE)
-    experts = torch.zeros((_TOKENS, 1), dtype=torch.int32, device="cuda")
-    payload = torch.arange(_TOKENS * _HIDDEN, dtype=torch.bfloat16, device="cuda")
-    payload = payload.reshape(_TOKENS, _HIDDEN)
+def test_abort_and_rearm_after_peer_failure() -> None:
+    """A dispatch stuck on a failed peer aborts from another thread, and runs again after rearm."""
+    workspace, meta, experts, payload = a2a_workspace(_EP_SIZE)
     health = EPGroupHealth(_EP_SIZE)
     state = MoeExecutionState(health, 0, workspace.device)
-    controls = {"enable_rank_mask": True, "active_rank_mask": state.active_rank_mask}
+    resets = []
 
+    def reset_workspace() -> None:
+        resets.append(1)
+        torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE, barrier=False)
+
+    state.register_workspace(object(), reset_workspace)
+
+    _collective_round(state, workspace, meta, experts, payload)
+    done = _queued_work_done()
+    # A long wait names the flag value it expects from rank 1. It is not an abort.
+    _wait_for(state.waited_flags, state, "the dispatch published no wait evidence")
+    assert state.waited_flags() == {1: 1}
+    assert not state.aborted()
+    requester = threading.Thread(target=state.request_abort)
+    requester.start()
+    requester.join(_JOIN_TIMEOUT_S)
+    assert not requester.is_alive(), "abort request queued behind the spinning kernel"
+    _wait_for(done, state, "collective kept waiting after the abort request")
+    assert state.aborted()
+    assert state.waited_flags() == {}
+
+    health.mark_failed(1)
+    with pytest.raises(RuntimeError, match="abort state"):
+        state.install_mask()
+    assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
+    state.rearm()
+    assert resets == [1]
+    assert not state.aborted()
+    state.install_mask()
+    assert state.active_rank_mask.cpu().tolist() == [1, 0, 0, 0]
+    for _ in range(2):
+        output = _collective_round(state, workspace, meta, experts, payload)
+        _wait_for(_queued_work_done(), state, "the round without rank 1 waited for it")
+        torch.testing.assert_close(output, payload, rtol=0, atol=0)
+    assert not state.aborted()
+
+
+def test_waited_flags_map_peer_to_flag() -> None:
+    """waited_flags() maps each peer a kernel waits for to the round flag value it waits for."""
+    state = MoeExecutionState(EPGroupHealth(4), 0, torch.device("cuda"))
+    assert state.waited_flags() == {}
+    state.abort[_EVIDENCE + 1] = 7  # the dispatch of round 3
+    state.abort[_EVIDENCE + 3] = 8  # the combine of round 3
+    state.abort[_EVIDENCE + 2] = -(1 << 31)  # uint32 flag 1 << 31, past the int32 range
+    assert state.waited_flags() == {1: 7, 2: 1 << 31, 3: 8}
+
+
+def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
+    """Rearm resets each shared workspace once and every layer an abort left between dispatch and combine."""
+    state = MoeExecutionState(EPGroupHealth(2), 0, torch.device("cuda"))
+    resets = []
+    shared = object()
+    for name in ("shared", "shared again"):
+        state.register_workspace(shared, lambda name=name: resets.append(name))
+    comm = _frontend()
+    comm._reset_local_workspace = lambda: resets.append("layer workspace")
+    comm.bind_execution_state(state)
+    comm._dispatch_state = {"phase": "dispatched"}
+    state.rearm()
+    assert resets == ["shared", "layer workspace"]
+    assert comm._dispatch_state == {"phase": "idle"}
+
+
+def test_graph_replay_follows_installed_mask() -> None:
+    """A CUDA graph captured with every rank active replays without the rank masked out later."""
+    workspace, meta, experts, payload = a2a_workspace(_EP_SIZE)
+    health = EPGroupHealth(_EP_SIZE)
+    state = MoeExecutionState(health, 0, workspace.device)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        received, offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
-            experts,
-            [payload],
-            workspace,
-            meta,
-            _TOKENS,
-            0,
-            _EP_SIZE,
-            1,
-            _EP_SIZE,
-            None,
-            **controls,
-        )
-        output = torch.ops.trtllm.moe_a2a_combine(
-            received[0],
-            _TOKENS,
-            workspace,
-            meta,
-            _TOKENS,
-            0,
-            _EP_SIZE,
-            1,
-            offset,
-            False,
-            **controls,
-        )
+        output = _collective_round(state, workspace, meta, experts, payload)
 
     health.mark_failed(1)
     state.install_mask()
     for _ in range(2):
         graph.replay()
-        torch.cuda.synchronize()
+        _wait_for(_queued_work_done(), state, "the replay waited for the masked-out rank")
         torch.testing.assert_close(output, payload, rtol=0, atol=0)
+    assert not state.aborted()
 
 
 def _frontend(*, fault_tolerance: bool = True, ep_rank: int = 0) -> NVLinkOneSided:
@@ -141,7 +211,7 @@ def _frontend(*, fault_tolerance: bool = True, ep_rank: int = 0) -> NVLinkOneSid
     comm.execution_state = None
     comm._dispatch_state = {"phase": "idle"}
     comm._workspace_lifecycle = Mock()
-    comm.mnnvl_mem = SimpleNamespace(mapped=True)
+    comm.mnnvl_mem = Mock(mapped=True)
     comm._sentinel_row = None
     comm.enable_eplb = False
     comm.workspace = torch.zeros(1, dtype=torch.uint8)
@@ -154,7 +224,7 @@ def _frontend(*, fault_tolerance: bool = True, ep_rank: int = 0) -> NVLinkOneSid
 
 @pytest.mark.cpu_only
 def test_bind_refuses_unsupported_layers() -> None:
-    state = SimpleNamespace(ep_rank=0)
+    state = _bindable_state(ep_rank=0)
     comm = _frontend()
     comm.bind_execution_state(state)
     with pytest.raises(RuntimeError, match="already bound"):
@@ -167,7 +237,7 @@ def test_bind_refuses_unsupported_layers() -> None:
 
 @pytest.mark.cpu_only
 def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pass the bound state's device mask to the all-to-all ops, also during CUDA graph capture."""
+    """Pass the bound state's device mask and abort state to the ops, also during CUDA graph capture."""
     calls = []
     payload = torch.zeros(_EP_SIZE, _TOKENS, _HIDDEN)
     received = [payload, torch.zeros(_EP_SIZE, _TOKENS, 1, dtype=torch.int32)]
@@ -184,7 +254,11 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_combine", combine_op, raising=False)
     monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_sanitize_expert_ids", Mock(), raising=False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    state = SimpleNamespace(ep_rank=0, active_rank_mask=torch.zeros(4, dtype=torch.uint64))
+    state = _bindable_state(
+        ep_rank=0,
+        active_rank_mask=torch.zeros(4, dtype=torch.uint64),
+        abort=torch.zeros(4, dtype=torch.int32),
+    )
     hidden, experts = torch.zeros(_TOKENS, _HIDDEN), torch.zeros(_TOKENS, 1, dtype=torch.int32)
     inputs = (hidden, None, experts, None, [_TOKENS] * _EP_SIZE)
     without_mask = _frontend(fault_tolerance=False)
@@ -196,7 +270,7 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
         comm.dispatch(*inputs)
         comm.combine(payload)
 
-    # Without fault tolerance the ops get no rank mask.
+    # Without fault tolerance the ops get no rank mask and no abort state.
     fence = {"enable_rank_mask": False, "active_rank_mask": None, "use_sentinel": False}
     assert calls[:2] == [
         {"expert_id_payload_index": None, "invalid_token_expert_id": None, **fence},
@@ -205,6 +279,9 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
     for kwargs in calls[2:]:
         assert kwargs["enable_rank_mask"] is True and kwargs["use_sentinel"] is False
         assert kwargs["active_rank_mask"] is state.active_rank_mask
+        assert kwargs["abort_state"] is state.abort
+    state.register_layer.assert_called_once_with(bound.reset_state)
+    state.register_workspace.assert_called_once_with(bound.mnnvl_mem, bound._reset_local_workspace)
 
 
 def _moe_layer(cls: type, **attributes) -> torch.nn.Module:

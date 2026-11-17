@@ -252,7 +252,7 @@ wakeup.
 
 ### Wide-EP fault tolerance
 
-Under `enable_wide_ep_fault_tolerance`, `CommunicationFactory` builds `NVLinkOneSided` with its rank-mask kernels, and the model loader binds every MoE layer's communication to one `MoeExecutionState` (`communication/execution_state.py`, bound by `pyexecutor/rank_failure_model_load.py`) before the weights load. The kernels exchange only with the EP ranks set in the state's device mask, which they read when they run, so captured CUDA graphs follow a mask that `install_mask` rewrites while no collective runs. These layers set up no sentinel transport, whose kernels take no rank mask.
+Under `enable_wide_ep_fault_tolerance`, `CommunicationFactory` builds `NVLinkOneSided` with its rank-mask kernels, and the model loader binds every MoE layer's communication to one `MoeExecutionState` (`communication/execution_state.py`, bound by `pyexecutor/rank_failure_model_load.py`) before the weights load. The kernels exchange only with the EP ranks set in the state's device mask, which they read when they run, so captured CUDA graphs follow a mask that `install_mask` rewrites while no collective runs. They stop waiting on peers once the state's pinned host abort state is requested (`request_abort`), and a wait on a peer longer than about 10 ms publishes the round flag it waits for there (`waited_flags`). A collective that ends without some active peer marks its round incomplete in the workspace, so later collectives exchange with this rank only until `rearm` resets the workspaces. These layers set up no sentinel transport, whose kernels take no rank mask.
 
 ### Core Design Principles
 
