@@ -221,8 +221,8 @@ def test_replacement_rank_replays_the_sentinel_vote(monkeypatch: pytest.MonkeyPa
 
     def allgather(own_vote):
         gathered.append(own_vote)
-        # The other rank supports the sentinel transport.
-        return [own_vote, (True, 148, own_vote[2])]
+        # The other rank's layer is fault tolerant as well, so it votes the sentinel transport off.
+        return [own_vote, (False, None, own_vote[2])]
 
     def no_collective(own_vote):
         raise AssertionError("a replacement rank must not run the sentinel vote collective")
