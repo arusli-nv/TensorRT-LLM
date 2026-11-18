@@ -141,7 +141,9 @@ class MoeExecutionState:
         The workspace is idle from :meth:`remap_workspaces` until :meth:`rearm`, so restores may
         stage expert weights through it.
         """
-        return max((rows for _, _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1])
+        return max(
+            (rows for _, _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1]
+        )
 
     def workspace_bytes(self) -> int:
         """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
