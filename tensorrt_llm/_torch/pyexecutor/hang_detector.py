@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
+from tensorrt_llm._wide_ep_fault_tolerance import wide_ep_fault_tolerance_rank
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -123,6 +124,10 @@ def propagate_hard_kill(
 
 def _rank_crash_kill_grace() -> Optional[float]:
     """Resolve the crash-kill grace period; ``None`` means the kill is disabled."""
+    if wide_ep_fault_tolerance_rank() is not None:
+        # Each fault-tolerant rank is its own MPI world, and the membership removes a
+        # crashed rank, so no peer is stranded and there is no world to abort.
+        return None
     raw = os.environ.get(RANK_CRASH_KILL_GRACE_ENV)
     if raw is None:
         return _RANK_CRASH_KILL_GRACE_DEFAULT
@@ -603,6 +608,10 @@ class HangDetector:
             yield
         finally:
             self.checkpoint()
+
+    def paused(self) -> bool:
+        """Return whether detection is disarmed."""
+        return self._deadline == math.inf
 
     def stop(self):
         """Stop hang detection."""

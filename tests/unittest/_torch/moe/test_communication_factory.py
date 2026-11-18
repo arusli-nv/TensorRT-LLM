@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -59,6 +61,7 @@ def _make_model_config(
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
 
 
@@ -572,6 +575,96 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+def _create_one_sided(model_config, forced: bool):
+    if forced:
+        return communication_factory.CommunicationFactory._create_forced_method(
+            "NVLINK_ONE_SIDED",
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            hidden_size=4096,
+        )
+    return communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_one_sided_without_fault_tolerance_runs_without_rank_mask(
+    monkeypatch: pytest.MonkeyPatch, forced: bool
+):
+    """Without enable_wide_ep_fault_tolerance, NVLinkOneSided is built without a rank mask."""
+    model_config = _make_model_config()
+    one_sided = Mock()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
+
+    assert _create_one_sided(model_config, forced) is one_sided.return_value
+
+    signature = inspect.signature(one_sided_module.NVLinkOneSided)
+    actual = signature.bind(*one_sided.call_args.args, **one_sided.call_args.kwargs)
+    expected = signature.bind(
+        model_config.mapping,
+        32,
+        8,
+        1024,
+        False,
+        hidden_size=4096,
+        dtype=torch.bfloat16,
+        num_experts=None,
+        use_low_precision_combine=False,
+        enable_wide_ep_fault_tolerance=False,
+        sentinel_payload_format=one_sided_module.sentinel_payload_format(None),
+    )
+    actual.apply_defaults()
+    expected.apply_defaults()
+    assert actual.arguments == expected.arguments
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_fault_tolerance_builds_one_sided_with_rank_mask(
+    monkeypatch: pytest.MonkeyPatch, forced: bool
+):
+    """Every NVLinkOneSided of a fault-tolerant model runs the rank-mask kernels."""
+    model_config = _make_model_config()
+    model_config.enable_wide_ep_fault_tolerance = True
+    one_sided = Mock()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
+
+    _create_one_sided(model_config, forced)
+
+    assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is True
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_fault_tolerance_reports_one_sided_error(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+):
+    """Fault tolerance runs only on NVLinkOneSided, so its construction error is not swallowed."""
+    model_config = _make_model_config(torch.float16)
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+
+    if fault_tolerance:
+        with pytest.raises(
+            ValueError, match="requires the NVLinkOneSided.*strategy unavailable"
+        ) as error:
+            _create_one_sided(model_config, forced=False)
+        assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    else:
+        assert isinstance(_create_one_sided(model_config, forced=False), AllGatherReduceScatter)
 
 
 _NCCL_EP_QUANT_ALGOS = [
