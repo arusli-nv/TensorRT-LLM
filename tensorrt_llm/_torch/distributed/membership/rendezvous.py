@@ -25,7 +25,6 @@ from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
 from ..communicator import Distributed
 from ..startup_record import diverged
 from .records import MAX_RANKS, REPORT_INTERVAL_S, rank_mask
-from .signed_store import shared_secret_digest
 
 if TYPE_CHECKING:
     from torch.distributed import Store
@@ -88,6 +87,20 @@ class StoreGroup(StoreComm):
         gpus_per_node: int = 1,
         startup: bool = False,
     ):
+        """Build the group's communicator over ``store``.
+
+        Args:
+            store: The rendezvous store client that holds the group's values.
+            name: The key prefix of the group's calls, the same on every member.
+            rank: This process's global rank, one of ``ranks``.
+            ranks: The group's global ranks, in communicator rank order.
+            on_wait: Called while a call waits, with a mask of the active members whose values
+                are missing, and with 0 once the call has them.
+            active: The members that take part, by default every member.
+            gpus_per_node: The ranks per node, which ``Split_type`` groups by.
+            startup: Whether this is the world communicator of a rank's startup, on which a
+                replacement may not gather the original ranks' values.
+        """
         self.membership = tuple(ranks)
         super().__init__(
             store,
@@ -136,6 +149,10 @@ class StoreGroup(StoreComm):
             raise
 
     def barrier(self) -> None:
+        """Wait for the active members.
+
+        A barrier gathers no values, so a replacement's startup may call it.
+        """
         self._gather_values(None)
 
     Barrier = barrier
@@ -294,8 +311,3 @@ class StoreGroup(StoreComm):
     @staticmethod
     def _counter(prefix: str, rank: int) -> str:
         return f"{prefix}/arrived/{rank // _RANKS_PER_COUNTER}"
-
-
-def hello_token() -> str:
-    """Return the token by which the authority admits a process of this deployment."""
-    return shared_secret_digest(b"liveness hello")

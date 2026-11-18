@@ -19,15 +19,18 @@ case gives every rank one role and derives the waits that its reports carry:
 
 - waiting: running and blocked, waits on the blockers, or on the waiting ranks that wait on them;
 - slow: running and making progress, waits on nobody;
-- idle: rank 0 waiting for requests with its hang detector paused;
+- idle: running in a call with its hang detector paused, as rank 0 waiting for requests;
 - crashed: its connection closes and it reports nothing more;
 - hung: its main thread stops outside any wait, so its fresh reports wait on nobody;
-- stopped: its reports stop, and the last one waits on nobody or on the ranks that now wait on it.
+- stopped: its reports stop, and the last one waits on nobody or on the ranks that now wait on it;
+- paused: its reports stop, and the last one says its hang detector is paused.
 
-The blockers are any nonempty set of non-waiting ranks. Ranks 1 and above are interchangeable to
-the rule, so their roles, the blockers and the chained ranks are enumerated up to swapping ranks of
-one role. The round evidence (``waited_flags``, ``waited_epochs``) and the install steps stay
-empty, so a rank's progress is its iteration.
+A rank whose hang detector is paused is never hung outside a change, also once its reports stop,
+so an idle or paused rank that others wait on is kept. A change waits on a paused rank, which never
+replies, as on any other failed rank. The blockers are any nonempty set of non-waiting ranks.
+Ranks 1 and above are interchangeable to the rule, so their roles, the blockers and the chained
+ranks are enumerated up to swapping ranks of one role. The waited rounds (``waited_flags``,
+``waited_epochs``) and the install steps stay empty, so a rank's progress is its iteration.
 """
 
 import itertools
@@ -52,9 +55,9 @@ SETTLE_S = 4 * HANG_TIMEOUT_S
 TICKS = round((SETTLE_S + HANG_TIMEOUT_S) / STEP_S)
 
 WAITING, SLOW, IDLE = "waiting", "slow", "idle"
-CRASHED, HUNG, STOPPED = "crashed", "hung", "stopped"
-FAULTY = (CRASHED, HUNG, STOPPED)
-RANK_ROLES = (WAITING, SLOW, CRASHED, HUNG, STOPPED)
+CRASHED, HUNG, STOPPED, PAUSED = "crashed", "hung", "stopped", "paused"
+FAULTY = (CRASHED, HUNG, STOPPED, PAUSED)
+RANK_ROLES = (WAITING, SLOW, IDLE, CRASHED, HUNG, STOPPED, PAUSED)
 
 _reports = {}
 
@@ -90,7 +93,7 @@ def _subsets(groups):
 
 def _cases(world):
     """Yield ``(roles, waits, stale)`` for every role assignment and every wait they imply."""
-    for rank0_role in RANK_ROLES + (IDLE,):
+    for rank0_role in RANK_ROLES:
         for rest in itertools.combinations_with_replacement(RANK_ROLES, world - 1):
             roles = (rank0_role,) + rest
             groups = _groups(roles)
@@ -138,6 +141,8 @@ def _run(world, roles, waits, stale):
                 continue
             if role == STOPPED:
                 reports[r] = _report(received_s=STEP_S, waiting_for=stale.get(r, 0))
+            elif role == PAUSED:
+                reports[r] = _report(received_s=STEP_S, idle=True)
             elif role == HUNG:
                 reports[r] = _report(received_s=tick * STEP_S)
             else:
@@ -179,11 +184,12 @@ def _mismatch(world, roles, waits, stale, published):
     everyone = (1 << world) - 1
     running = _mask(r for r in range(world) if roles[r] not in FAULTY)
     crashed = _mask(r for r in range(world) if roles[r] == CRASHED)
+    paused = _mask(r for r in range(world) if roles[r] == PAUSED)
     waited_on = 0
     for mask in waits.values():
         waited_on |= mask
     # The ends of the wait-for chains: the hung or stopped ranks that a waiting rank waits on.
-    roots = waited_on & everyone & ~running & ~crashed
+    roots = waited_on & everyone & ~running & ~crashed & ~paused
     if any(record.active_mask & running != running for _, record in published):
         return "removed a running rank"
     if not crashed and not roots:
@@ -220,7 +226,8 @@ def test_only_chain_ends_are_hung(world):
     A crash starts a change at once. Without one, the authority removes the hung or stopped ranks
     that waiting ranks wait on, one hang timeout after they stop. The change then waits on every
     other failed rank, which never replies, so the deployment settles on the running ranks, or
-    aborts without rank 0. A failed rank that no running rank waits on is slow, not hung.
+    aborts without rank 0. A failed rank that no running rank waits on is slow, not hung. An idle
+    or paused rank is never hung outside a change, so it is kept while other ranks wait on it.
     """
     mismatches = []
     count = 0

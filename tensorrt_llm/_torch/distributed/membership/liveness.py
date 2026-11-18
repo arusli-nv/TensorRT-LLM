@@ -38,8 +38,8 @@ from .records import (
     RankReport,
     message_bytes,
 )
-from .rendezvous import LIVENESS_KEY, hello_token, rendezvous_host_port
-from .signed_store import SignedStore
+from .rendezvous import LIVENESS_KEY, rendezvous_host_port
+from .signed_store import SignedStore, shared_secret_digest
 
 _MAX_LINE_BYTES = 1 << 20
 _KEEPALIVE_PROBES = 6
@@ -122,6 +122,11 @@ def _warn_while_no_authority(store: SignedStore) -> None:
         )
 
 
+def hello_token() -> str:
+    """Return the token by which the authority admits a process of this deployment."""
+    return shared_secret_digest(b"liveness hello")
+
+
 def _open_connection(store: SignedStore, announcement: str, timeout_s: float) -> LivenessConnection:
     """Open a connection to the authority and send the hello that carries ``announcement``."""
     _warn_while_no_authority(store)
@@ -137,7 +142,13 @@ def _open_connection(store: SignedStore, announcement: str, timeout_s: float) ->
 def open_liveness_connection(
     store: SignedStore, rank: int, replacement: bool = False
 ) -> LivenessConnection:
-    """Open this process's liveness connection to the authority for ``rank``."""
+    """Open this process's liveness connection to the authority for ``rank``.
+
+    Args:
+        store: The rendezvous store, where the authority publishes its liveness address.
+        rank: The rank this process runs.
+        replacement: Whether this process replaces a failed process of ``rank``.
+    """
     connection = _open_connection(store, f"{rank} {int(replacement)}", HELLO_TIMEOUT_S)
     close_in_forked_child(connection.sock)
     return connection
@@ -150,7 +161,15 @@ def open_node_supervisor_connection(
     host: str,
     timeout_s: float = HELLO_TIMEOUT_S,
 ) -> LivenessConnection:
-    """Open a node supervisor's connection for ``node``. Closing it fails ``ranks``."""
+    """Open a node supervisor's connection for ``node``. Closing it fails ``ranks``.
+
+    Args:
+        store: The rendezvous store, where the authority publishes its liveness address.
+        node: The node that the supervisor runs on.
+        ranks: The ranks that the supervisor starts on its node.
+        host: The node's host name, which the authority logs.
+        timeout_s: How long to wait for the connection to the authority.
+    """
     return _open_connection(store, f"node {node} {','.join(map(str, ranks))} {host}", timeout_s)
 
 
@@ -178,7 +197,12 @@ def rendezvous_store(timeout_s: float = DEAD_TIMEOUT_S) -> SignedStore:
 
 
 class MembershipClient:
-    """A rank's thread that keeps its liveness connection, delivers records and sends reports."""
+    """A rank's thread that keeps its liveness connection, delivers records and sends reports.
+
+    The thread ends once a record drops this process from the membership, and leaves the connection
+    open: the authority admits a replacement for the rank only once it closes, when the owner calls
+    :meth:`stop` or exits.
+    """
 
     def __init__(
         self,
@@ -188,6 +212,15 @@ class MembershipClient:
         replacement: bool = False,
         on_error: Optional[Callable[[Exception], None]] = None,
     ):
+        """Prepare the client. :meth:`start` connects to the authority.
+
+        Args:
+            rank: The rank this process runs.
+            store: The rendezvous store, where the authority publishes its liveness address.
+            on_record: Called on the client thread with each record the authority sends.
+            replacement: Whether this process replaces a failed process of ``rank``.
+            on_error: Called on the client thread with the error that ended it, if any.
+        """
         self.rank = rank
         self._store = store
         self._on_record = on_record

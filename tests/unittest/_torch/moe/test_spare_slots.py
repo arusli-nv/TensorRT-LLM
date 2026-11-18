@@ -373,6 +373,27 @@ def test_release_keeps_filled_spare_slots_during_update(monkeypatch):
     assert released == [3]
 
 
+def test_restore_reads_no_placement_while_an_update_may_swap_it(monkeypatch):
+    """Refuse even a restore that changes nothing before reading the placement an update swaps."""
+    load_balancer, layer = _online_balancer(monkeypatch, _ONLINE)
+    restore = load_balancer.expert_restore
+    # Every rank is active and keeps its experts, so the plan loads no slot.
+    plan = restore.plan_expert_restore([True] * WORLD_SIZE, [_ONLINE])
+    np.testing.assert_array_equal(plan.placements[0], _ONLINE)
+    load_balancer.load_balancer_impl.check_slots_writable.side_effect = RuntimeError(
+        "call abandonIterations first"
+    )
+    old_rank_expert_ids = layer.single_layer_load_balancer_impl.get_old_rank_expert_ids
+    old_rank_expert_ids.reset_mock()
+    with pytest.raises(RuntimeError, match="abandonIterations"):
+        restore.restore_lost_experts(
+            plan,
+            torch.empty((WORLD_SIZE, 0), dtype=torch.uint8),
+            lambda value: [value] * WORLD_SIZE,
+        )
+    old_rank_expert_ids.assert_not_called()
+
+
 def _original(monkeypatch):
     """Make this process an original rank, whose startup record ``Distributed`` holds."""
     monkeypatch.setattr(Distributed, "startup_record", StartupRecord())

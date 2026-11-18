@@ -113,7 +113,7 @@ def _survivor(store, memory, workspace, meta, rank: int) -> None:
     store.wait(["proceed"])
 
     gather = StoreComm(store, rank, "survivors", range(VICTIM))
-    state.health.mark_failed(VICTIM)
+    state.ep_group_health.mark_failed(VICTIM)
     state.remap_workspaces(gather, frozenset(range(EP_SIZE)))
     active = [r != VICTIM for r in range(EP_SIZE)]
     plan = restore.plan_expert_restore(active, [np.array(_PLACEMENT)] * _LAYERS)

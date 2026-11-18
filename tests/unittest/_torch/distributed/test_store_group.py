@@ -23,9 +23,9 @@ import re
 import threading
 
 import pytest
-from _torch.distributed.store_group_test_utils import Unpickled
+from _torch.distributed.store_group_test_utils import InMemoryStore, Unpickled
 from mpi4py import MPI
-from torch.distributed import DistStoreError, TCPStore
+from torch.distributed import TCPStore
 
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.membership import (
@@ -42,49 +42,6 @@ pytestmark = pytest.mark.cpu_only
 
 JOIN_TIMEOUT_S = 10.0
 _SHORT_SECRET = f"shared secret of at least 32 bytes (64 hex digits) in {SHARED_SECRET_ENV}"
-
-
-class _Store:
-    """In-memory store with the TCPStore calls of a store group, with signed 64-bit counters."""
-
-    def __init__(self):
-        self.values = {}
-        self._lock = threading.Condition()
-
-    def set(self, key, value):
-        with self._lock:
-            self.values[key] = bytes(value)
-            self._lock.notify_all()
-
-    def wait(self, keys, timeout):
-        with self._lock:
-            if not self._lock.wait_for(
-                lambda: all(key in self.values for key in keys), timeout.total_seconds()
-            ):
-                raise DistStoreError(f"wait timeout after {timeout}, keys: {keys}")
-
-    def get(self, key):
-        return self.values[key]
-
-    def check(self, keys):
-        with self._lock:
-            return all(key in self.values for key in keys)
-
-    def multi_get(self, keys):
-        with self._lock:
-            return [self.values[key] for key in keys]
-
-    def add(self, key, amount):
-        with self._lock:
-            value = int(self.values.get(key, b"0")) + amount
-            assert -(1 << 63) <= value < 1 << 63, f"counter {key} overflows"
-            self.values[key] = str(value).encode()
-            self._lock.notify_all()
-            return value
-
-    def delete_key(self, key):
-        with self._lock:
-            return self.values.pop(key, None) is not None
 
 
 def _group(store, rank, ranks, **options):
@@ -111,7 +68,7 @@ def _run_ranks(calls):
 
 
 def test_split_orders_members_by_key():
-    store = _Store()
+    store = InMemoryStore()
     groups = {r: _group(store, r, range(4)) for r in range(4)}
 
     def split(rank):
@@ -128,7 +85,7 @@ def _replacement_of_rank_2(monkeypatch):
 
     Rank ``r`` split with color ``r % 2`` and key ``r``, and rank 0 while paused.
     """
-    store = _Store()
+    store = InMemoryStore()
     for rank in range(1, 4):
         store.set(f"group/0/{rank}", pickle.dumps((rank % 2, rank)))
     original = StartupRecord()
@@ -140,7 +97,7 @@ def _replacement_of_rank_2(monkeypatch):
     replacement = StartupRecord()
     replacement.replay(original.published())
     monkeypatch.setattr(communicator.Distributed, "startup_record", replacement)
-    return _group(_Store(), 2, range(4), active=[2], startup=True), replacement
+    return _group(InMemoryStore(), 2, range(4), active=[2], startup=True), replacement
 
 
 def test_replacement_replays_split_made_in_pause(monkeypatch):
@@ -157,7 +114,7 @@ def test_replacement_with_another_split_key_cannot_start(monkeypatch):
 
 
 def test_split_type_groups_ranks_by_node():
-    group = _group(_Store(), 3, range(6), gpus_per_node=2)
+    group = _group(InMemoryStore(), 3, range(6), gpus_per_node=2)
     assert group.Split_type(MPI.COMM_TYPE_SHARED).membership == (2, 3)
     with pytest.raises(NotImplementedError):
         group.Split_type(MPI.COMM_TYPE_SHARED + 1000)
@@ -165,13 +122,23 @@ def test_split_type_groups_ranks_by_node():
 
 @pytest.mark.parametrize("op, expected", [("SUM", 6), ("MIN", 1), ("MAX", 3)])
 def test_allreduce_over_active_members(op, expected):
-    store = _Store()
+    store = InMemoryStore()
     values = {0: 3, 1: 1, 3: 2}
     groups = {r: _group(store, r, range(4), active=values) for r in values}
     results = _run_ranks(
         {r: lambda r=r: groups[r].allreduce(values[r], getattr(MPI, op)) for r in groups}
     )
     assert results == {r: expected for r in values}
+
+
+@pytest.mark.parametrize("root", [2, 1], ids=["active", "inactive"])
+def test_bcast_over_active_members(root):
+    """Broadcast the root's object to the active members, or None from an inactive root."""
+    store = InMemoryStore()
+    active = (0, 2, 3)
+    groups = {r: _group(store, r, range(4), active=active) for r in active}
+    results = _run_ranks({r: lambda r=r: groups[r].bcast(f"from {r}", root) for r in groups})
+    assert results == {r: f"from {root}" if root in active else None for r in active}
 
 
 def test_on_wait_error_fails_exchange():
@@ -182,7 +149,7 @@ def test_on_wait_error_fails_exchange():
         if mask:
             raise TimeoutError("rank 1 stopped")
 
-    group = _group(_Store(), 0, (0, 1), on_wait=on_wait)
+    group = _group(InMemoryStore(), 0, (0, 1), on_wait=on_wait)
     with pytest.raises(TimeoutError):
         group.allgather(0)
     assert waiting == [0b10, 0]
@@ -197,7 +164,7 @@ def test_exchange_failed_tells_latest_exchange():
         if failing[0]:
             raise TimeoutError("stopped waiting")
 
-    group = _group(_Store(), 0, (0,), on_wait=on_wait)
+    group = _group(InMemoryStore(), 0, (0,), on_wait=on_wait)
     with pytest.raises(TimeoutError):
         group.allgather(0)
     assert group.exchange_failed
@@ -208,7 +175,7 @@ def test_exchange_failed_tells_latest_exchange():
 
 def test_exchange_keeps_only_latest_call_keys():
     """Delete a call's keys once the next call completes, so only the latest call's keys stay."""
-    store = _Store()
+    store = InMemoryStore()
     groups = {r: _group(store, r, (0, 1)) for r in (0, 1)}
     _run_ranks({r: lambda r=r: [groups[r].allgather(call) for call in range(3)] for r in groups})
     assert sorted(store.values) == ["group/2/0", "group/2/1", "group/2/arrived/0"]
@@ -217,7 +184,7 @@ def test_exchange_keeps_only_latest_call_keys():
 def test_closed_groups_leave_no_keys(monkeypatch):
     """Leave no keys once the survivors close a group whose lowest member failed between calls."""
     monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
-    store = _Store()
+    store = InMemoryStore()
     changed = threading.Event()
 
     def on_wait(waiting):
@@ -238,7 +205,7 @@ def test_closed_groups_leave_no_keys(monkeypatch):
 def test_close_after_members_stop_at_different_calls(monkeypatch):
     """Leave no keys once the lowest member stops between calls while another enters the next."""
     monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
-    store = _Store()
+    store = InMemoryStore()
     changed = threading.Event()
 
     def on_wait(waiting):
@@ -259,7 +226,7 @@ def test_close_after_members_stop_at_different_calls(monkeypatch):
 def test_waiting_mask_beyond_first_counter(monkeypatch):
     """Report a missing rank 64, whose arrival bit is in the second counter."""
     monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
-    store = _Store()
+    store = InMemoryStore()
     waiting = {0: [], 63: []}
     rank_63_waits = threading.Event()
 
@@ -291,7 +258,7 @@ def test_hard_kill_ends_only_this_rank(monkeypatch):
     monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append(sig))
     monkeypatch.setattr(hang_detector, "ENABLE_MULTI_DEVICE", True)
     monkeypatch.setattr(hang_detector, "mpi_disabled", lambda: False)
-    monkeypatch.setattr(hang_detector, "mpi_comm", lambda: _group(_Store(), 1, (0, 1)))
+    monkeypatch.setattr(hang_detector, "mpi_comm", lambda: _group(InMemoryStore(), 1, (0, 1)))
     monkeypatch.setattr(MPI, "Is_initialized", lambda: True)
     monkeypatch.setattr(MPI, "Is_finalized", lambda: False)
     monkeypatch.setattr(MPI, "Query_thread", lambda: MPI.THREAD_MULTIPLE)
@@ -304,13 +271,13 @@ def test_hard_kill_ends_only_this_rank(monkeypatch):
 def test_store_client_requires_ranks_secret(secret):
     """Refuse a store client, as of the node supervisor or the authority, with a weak secret."""
     with pytest.raises(ValueError, match=re.escape(_SHORT_SECRET)):
-        SignedStore(_Store(), secret)
+        SignedStore(InMemoryStore(), secret)
 
 
 @pytest.mark.parametrize("forger_secret", [None, "cd" * 32], ids=["unsigned", "other_secret"])
 def test_forged_store_value_is_never_unpickled(monkeypatch, forger_secret):
     """Reject a pickle that a process without the deployment's secret set, before unpickling it."""
-    store = _Store()
+    store = InMemoryStore()
     forger = store if forger_secret is None else SignedStore(store, forger_secret)
     signed = SignedStore(store, "ab" * 32)
     monkeypatch.setattr(Unpickled, "calls", [])

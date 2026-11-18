@@ -948,9 +948,9 @@ class RankFailureRecovery:
     def _mark_rank_health(self, record: MembershipRecord) -> None:
         for r in range(self.world_size):
             if record.is_active(r):
-                self._moe.health.mark_active(r)
+                self._moe.ep_group_health.mark_active(r)
             else:
-                self._moe.health.mark_failed(r)
+                self._moe.ep_group_health.mark_failed(r)
 
     def _rearm(self, record: MembershipRecord) -> None:
         """Rearm the all-to-all and install its active rank mask, unless ``record`` is outdated."""

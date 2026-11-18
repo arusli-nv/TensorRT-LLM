@@ -417,6 +417,123 @@ def test_cutlass_moe_tunes_only_the_active_slots(monkeypatch: pytest.MonkeyPatch
         torch.testing.assert_close(actual, reference, atol=1e-2, rtol=1e-2)
 
 
+def test_cutedsl_nvfp4_grouped_gemm_tunes_only_the_active_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tune only the active slots and reuse the tactics once restored experts fill spare slots."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("The CuteDSL NVFP4 grouped GEMM requires SM100 or SM103")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL is not available")
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    torch.manual_seed(17)
+    sf_vec_size, tile_size = 16, 128
+    num_active, num_spare, hidden_size, inter_size, num_tokens = 4, 2, 512, 512, 256
+    num_slots = num_active + num_spare
+    w = torch.randint(
+        -5, 5, (num_slots, inter_size, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    w_global_sf = w.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    w, w_sf = torch.ops.trtllm.fp4_quantize(w, 1 / w_global_sf, sf_vec_size, False)
+    w = w.view(torch.float4_e2m1fn_x2)
+    w_sf = w_sf.view(num_slots, inter_size, hidden_size // sf_vec_size)
+
+    def gemm_inputs(routed: torch.Tensor) -> Tuple[list, int]:
+        """Return the grouped GEMM inputs of ``routed`` tokens and the rows of their tiles."""
+        tile_idx_to_group_idx, *_, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+            token_selected_experts=routed,
+            token_final_scales=torch.ones(routed.shape, dtype=torch.float32, device="cuda"),
+            num_experts=num_slots,
+            top_k=1,
+            local_expert_offset=0,
+            local_num_experts=num_slots,
+            tile_tokens_dim=tile_size,
+        )
+        x = torch.randint(
+            -5,
+            5,
+            (tile_idx_to_group_idx.numel() * tile_size, hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        x_global_sf = x.abs().max().float() / (448 * 6)
+        x, x_sf = torch.ops.trtllm.fp4_quantize(x, 1 / x_global_sf, sf_vec_size, False)
+        inputs = [
+            x.view(torch.float4_e2m1fn_x2),
+            w,
+            x_sf,
+            w_sf,
+            x_global_sf * w_global_sf,
+            tile_idx_to_group_idx,
+            num_non_exiting_tiles,
+        ]
+        return inputs, num_non_exiting_tiles.item() * tile_size
+
+    def run_gemm(inputs: list, **kwargs) -> torch.Tensor:
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            *inputs,
+            num_experts=num_slots,
+            top_k=1,
+            num_local_experts=num_slots,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            **kwargs,
+        )
+
+    tokens = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    selected, selected_rows = gemm_inputs(tokens.remainder(num_active).unsqueeze(1))
+    # Experts restored into the spare slots receive tokens like the others.
+    restored, restored_rows = gemm_inputs(tokens.remainder(num_slots).unsqueeze(1))
+    active_slots = dict(tuner_num_local_experts=num_active)
+    # The references run before tuning, with the fallback tactics.
+    expected = run_gemm(selected)
+    expected_restored = run_gemm(restored)
+    # The experts of the routing that the tuner generates for each profile.
+    profiled = set()
+    inputs_pre_hook = cute_dsl_custom_ops.GroupedGemmInputsHelper.inputs_pre_hook
+
+    def recording_inputs_pre_hook(helper, inputs):
+        tensors = inputs_pre_hook(helper, inputs)
+        tile_idx_to_group_idx, num_non_exiting_tiles = tensors[5], tensors[6]
+        profiled.update(tile_idx_to_group_idx[: num_non_exiting_tiles.item()].tolist())
+        return tensors
+
+    monkeypatch.setattr(
+        cute_dsl_custom_ops.GroupedGemmInputsHelper, "inputs_pre_hook", recording_inputs_pre_hook
+    )
+    monkeypatch.setattr(
+        cute_dsl_custom_ops.Sm100BlockScaledContiguousGroupedGemmRunner, "tuning_config_cache", {}
+    )
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        run_gemm(selected, **active_slots)
+    assert profiled == set(range(num_active))
+
+    hits = []
+    search_cache = tuner.profiling_cache.search_cache
+
+    def recording_search_cache(*args, **kwargs):
+        result = search_cache(*args, **kwargs)
+        hits.append(result[0])
+        return result
+
+    monkeypatch.setattr(tuner.profiling_cache, "search_cache", recording_search_cache)
+    for inputs, rows, reference in (
+        (selected, selected_rows, expected),
+        (restored, restored_rows, expected_restored),
+    ):
+        hits.clear()
+        actual = run_gemm(inputs, **active_slots)
+        assert hits == [True]
+        torch.testing.assert_close(actual[:rows], reference[:rows], atol=1e-2, rtol=1e-2)
+
+
 _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
@@ -1092,7 +1209,7 @@ def _cutedsl_nvfp4_after_create_weights(spare_slot_count: int, monkeypatch):
     3 active slots per rank. Without spare slots, reading the tuner layout fails the test."""
     from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm import nvfp4
 
-    monkeypatch.setattr(nvfp4, "_uses_rubin_kernels", lambda: False)
+    monkeypatch.setattr(nvfp4, "get_sm_version", lambda: 100)
     if not spare_slot_count:
 
         def tuner_layout_kwargs(self):
@@ -1339,8 +1456,6 @@ class _HookBackend:
 
     def supports_unfinalized_output(self) -> bool:
         return True
-
-    uses_spare_slots = False
 
     def validate_configurable_moe(self, moe) -> None:
         del moe
@@ -3898,15 +4013,7 @@ def test_fused_moe_appends_post_silu_mode_to_positional_schema():
     registered_schema = torch.ops.trtllm.fused_moe.default._schema
 
     assert registered_schema.arguments[-2].name == "swiglu_clamp_after_silu"
-
-
-@pytest.mark.cpu_only
-def test_fused_moe_tuner_layout_keeps_positional_arguments_in_place():
-    """The spare-slot tuner layout comes last, so positional calls and saved graphs keep working."""
-    names = [argument.name for argument in torch.ops.trtllm.fused_moe.default._schema.arguments]
-
-    assert names[names.index("tuner_top_k") + 1] == "activation_type"
-    assert names[-1] == "tuner_num_local_experts"
+    assert registered_schema.arguments[-1].name == "tuner_num_local_experts"
 
 
 @pytest.mark.cpu_only

@@ -51,8 +51,7 @@ from tensorrt_llm._torch.distributed.membership import (
     SignedStore,
     records,
 )
-from tensorrt_llm._torch.distributed.membership.liveness import Lines
-from tensorrt_llm._torch.distributed.membership.rendezvous import hello_token
+from tensorrt_llm._torch.distributed.membership.liveness import Lines, hello_token
 from tensorrt_llm.llmapi import _llmapi_process_guard as process_guard
 from tensorrt_llm.llmapi import _mpirun_job as mpirun_job
 from tensorrt_llm.logger import logger

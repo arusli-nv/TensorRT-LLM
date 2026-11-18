@@ -285,7 +285,7 @@ that lacks a property is rejected at model load with the reason.
 | Stop on abort | Poll the abort state inside every wait on a peer and stop waiting when it is set | `MoeExecutionState.abort` (pinned host memory) |
 | Never consume an incomplete round | Mark a round that an abort cut short and never use its outputs | The kernels' incomplete-round word; `rearm` at INSTALL |
 | No late writes after INSTALL | No write from a former member reaches memory a survivor reads | Late-write remap of the workspace (`MembershipWorkspace.remap`), specific to MNNVL fabric handles. An RDMA transport would revoke memory keys instead |
-| Wait evidence | Report the round flags it waits on, so a peer that still delivers rounds is not hung | Published in the abort state, reported by the rank through `waited_flags` |
+| Waited flags | Report the round flags it waits on, so a peer that still delivers rounds is not hung | Published in the abort state, reported by the rank through `waited_flags` |
 
 | Property | MoE backend must | Today |
 |---|---|---|

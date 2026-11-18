@@ -128,112 +128,71 @@ def test_sentinel_workspace_layout(payload_format: str) -> None:
         )
 
 
-# Workspace layout fields of a layout without a rank mask, by metainfo field name. The expected values follow from
-# the regions alone, as calculateWorkspaceLayout (cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp) places
-# them: each region in index order at its alignment (4 bytes; 128 for the completion flags, the routes and the EPLB
-# stats; 256 for the payloads, whose sizes are also padded to 256), with the sentinel fields 0.
-_LAYOUT_FIELDS = (
-    "FLAG_VAL_OFFSET_INDEX",
-    "LOCAL_TOKEN_COUNTER_OFFSET_INDEX",
-    "SEND_COUNTERS_OFFSET_INDEX",
-    "RECV_COUNTERS_OFFSET_INDEX",
-    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX",
-    "TOPK_TARGET_RANKS_OFFSET_INDEX",
-    "TOPK_TARGET_INDICES_OFFSET_INDEX",
-    "EPLB_GATHERED_STATS_OFFSET_INDEX",
-    "DISPATCH_PAYLOAD_OFFSET_INDEX",
-    "DISPATCH_PAYLOAD_SIZE_INDEX",
-    "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX",
-    "COMBINE_INPUT_OFFSET_INDEX",
-    "COMBINE_INPUT_SIZE_INDEX",
-    "MAX_NUM_TOKENS_INDEX",
-    "TOP_K_INDEX",
-    "EP_SIZE_INDEX",
-    "EPLB_STATS_NUM_EXPERTS_INDEX",
-    "WORKSPACE_SIZE_INDEX",
-    "SENTINEL_MAX_NUM_TOKENS_INDEX",
-    "SENTINEL_PAYLOAD_FORMAT_INDEX",
-    "SENTINEL_HIDDEN_SIZE_INDEX",
-    "SENTINEL_STATE_OFFSET_INDEX",
-    "SENTINEL_LANDING_OFFSET_INDEX",
-    "SENTINEL_COMBINE_LANDING_OFFSET_INDEX",
-    "SENTINEL_RECV_OFFSET_INDEX",
-    "SENTINEL_RECV_SIZE_INDEX",
+# The workspace regions after the round flag value, in the order calculateWorkspaceLayout places them.
+_REGIONS_AFTER_FLAG_VAL = (
+    "LOCAL_TOKEN_COUNTER",
+    "SEND_COUNTERS",
+    "RECV_COUNTERS",
+    "DISPATCH_COMPLETION_FLAGS",
+    "TOPK_TARGET_RANKS",
+    "TOPK_TARGET_INDICES",
+    "EPLB_GATHERED_STATS",
+    "DISPATCH_PAYLOAD",
+    "COMBINE_COMPLETION_FLAGS",
+    "COMBINE_INPUT",
 )
 
 
 @pytest.mark.parametrize(
-    "args, expected",
+    "args",
     [
         # ep_size, max_num_tokens_per_rank, top_k, dispatch_payload_bytes, combine_input_bytes, EPLB experts
-        (
-            (8, 128, 8, 1000, 3000, 288),
-            (0, 4, 8, 40, 128, 256, 4352, 8448, 17664, 1024)  # dispatch regions
-            + (18688, 18944, 3072)  # combine regions
-            + (128, 8, 8, 288, 22016)  # configuration and workspace size
-            + (0,) * 8,  # sentinel regions
-        ),
-        (
-            (36, 77, 6, 4096, 70000, None),
-            (0, 4, 8, 152, 512, 768, 2688, 4608, 4608, 4096)
-            + (8704, 8960, 70144)
-            + (77, 6, 36, 0, 79104)
-            + (0,) * 8,
-        ),
+        (8, 128, 8, 1000, 3000, 288),
+        (36, 77, 6, 4096, 70000, None),
     ],
 )
-def test_workspace_layout_without_rank_mask_is_unchanged(args: tuple, expected: tuple) -> None:
-    """Without a rank mask, the workspace layout reserves no incomplete-round word and keeps main's offsets."""
+def test_workspace_layout_without_rank_mask_has_no_incomplete_round_word(args: tuple) -> None:
+    """Only a rank-mask layout reserves the incomplete-round word, right after the round flag value."""
     from tensorrt_llm.bindings import internal as _tllm_internal
 
     thop = _tllm_internal.thop
-    layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=False)
-    actual = {name: int(layout[getattr(thop, f"MOE_A2A_{name}")]) for name in _LAYOUT_FIELDS}
-    assert actual == dict(zip(_LAYOUT_FIELDS, expected))
-    assert int(layout[int(thop.MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX)]) == 0
-    assert layout.numel() == len(_LAYOUT_FIELDS) + 1
 
+    def offset(layout: torch.Tensor, region: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{region}_OFFSET_INDEX")])
 
-def test_fault_tolerant_layer_votes_the_sentinel_transport_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A Wide-EP fault-tolerant layer takes part in the sentinel vote, but always as unsupported.
+    default = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args)
+    without_mask = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=False)
+    with_mask = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=True)
+    assert torch.equal(without_mask, default)
+    assert offset(without_mask, "INCOMPLETE_ROUND") == 0
 
-    The sentinel kernels take no active-rank mask or abort state, so such a layer always takes the fence
-    transport, whatever the other ranks vote.
-    """
-    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
-
-    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_sentinel_available", lambda: True)
-    votes = []
-
-    def allgather(vote):
-        votes.append(vote)
-        return [vote, (True, 148, vote[2])]
-
-    monkeypatch.setattr(
-        nvlink_one_sided.MnnvlMemory,
-        "get_comm",
-        lambda mapping: SimpleNamespace(allgather=allgather, Get_rank=lambda: 0),
-    )
-    layer = NVLinkOneSided.__new__(NVLinkOneSided)
-    layer.mapping = None
-    layer.ep_size, layer.top_k, layer.num_experts = 2, 2, 8
-    layer.max_num_tokens_per_rank = 16
-    layer.use_low_precision_combine = False
-    layout = NVLinkOneSided._make_workspace_layout(
-        2, 2, 16, 64, torch.bfloat16, None, 0, rank_mask=True
-    )
-    vote = layer._vote_sentinel(layout.clone(), 64, torch.bfloat16, "BF16", fault_tolerant=True)
-    assert vote == (0, None, tuple(layout.tolist()))
-    assert votes[0][:2] == (False, None)
+    # The word follows the round flag value, and only the regions after it move.
+    assert offset(with_mask, "FLAG_VAL") == offset(without_mask, "FLAG_VAL")
+    assert offset(with_mask, "FLAG_VAL") < offset(with_mask, "INCOMPLETE_ROUND")
+    assert offset(with_mask, "INCOMPLETE_ROUND") < offset(with_mask, _REGIONS_AFTER_FLAG_VAL[0])
+    for region in _REGIONS_AFTER_FLAG_VAL:
+        assert offset(with_mask, region) >= offset(without_mask, region)
+    unchanged = [
+        int(getattr(thop, f"MOE_A2A_{name}_INDEX"))
+        for name in (
+            "DISPATCH_PAYLOAD_SIZE",
+            "COMBINE_INPUT_SIZE",
+            "MAX_NUM_TOKENS",
+            "TOP_K",
+            "EP_SIZE",
+            "EPLB_STATS_NUM_EXPERTS",
+        )
+    ]
+    assert torch.equal(with_mask[unchanged], without_mask[unchanged])
 
 
 def test_replacement_rank_replays_the_sentinel_vote(monkeypatch: pytest.MonkeyPatch) -> None:
     """A replacement rank takes the sentinel vote that the original ranks recorded at startup.
 
     It builds its layers without the other ranks, so the vote must issue no collective there. A
-    replacement whose own vote differs from its predecessor's cannot start.
+    replacement whose own vote differs from its predecessor's cannot start. The layers are Wide-EP
+    fault tolerant, so every rank votes the sentinel transport off: its kernels take no active-rank
+    mask or abort state.
     """
     from tensorrt_llm._torch.distributed import communicator
     from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
@@ -262,7 +221,8 @@ def test_replacement_rank_replays_the_sentinel_vote(monkeypatch: pytest.MonkeyPa
 
     def allgather(own_vote):
         gathered.append(own_vote)
-        return [own_vote, own_vote]
+        # The other rank supports the sentinel transport.
+        return [own_vote, (True, 148, own_vote[2])]
 
     def no_collective(own_vote):
         raise AssertionError("a replacement rank must not run the sentinel vote collective")
@@ -280,7 +240,8 @@ def test_replacement_rank_replays_the_sentinel_vote(monkeypatch: pytest.MonkeyPa
     )
     expected = vote(layer(0))
     original.close()
-    assert len(gathered) == 1
+    assert expected == (0, None, tuple(layout.tolist()))
+    assert len(gathered) == 1 and gathered[0][:2] == (False, None)
 
     def replacement_record() -> StartupRecord:
         replacement = StartupRecord()

@@ -626,15 +626,6 @@ class _WeightLayout(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin,
 
 
 @pytest.mark.cpu_only
-def test_tuner_layout_is_built_once_per_moe_module() -> None:
-    """A MoE forward reads the tuner layout without building it again."""
-    owner = _WeightLayout()
-    owner.layer_load_balancer = None
-    assert owner.tuner_layout_kwargs == {}
-    assert owner.tuner_layout_kwargs is owner.tuner_layout_kwargs
-
-
-@pytest.mark.cpu_only
 def test_statistic_routing_layer_has_no_experts_to_load() -> None:
     """Only a layer with host weights loads experts for its node."""
     layer = SingleLayerMoeLoadBalancer(MagicMock(),

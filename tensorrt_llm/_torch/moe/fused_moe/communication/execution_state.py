@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
@@ -39,8 +38,8 @@ if TYPE_CHECKING:
 _MASK_WORD_BITS = 64
 _ABORT_REQUESTED = 0
 # The words ``requested`` and ``status``, then the round flag awaited from each peer.
-_ABORT_FLAGS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX))
-_WAIT_EVIDENCE = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
+_ABORT_WORDS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX))
+_WAITED_FLAGS = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
 
 
 def _mask_words(mask: int, ep_rank: int) -> tuple[int, ...]:
@@ -86,18 +85,16 @@ class MoeExecutionState:
     """
 
     def __init__(self, ep_group_health: EPGroupHealth, ep_rank: int, device: torch.device) -> None:
-        self.health = ep_group_health
+        self.ep_group_health = ep_group_health
         self.ep_rank = ep_rank
         self._device = device
         # The kernels read the abort state at its host address, which must be pinned memory.
         self.abort = torch.zeros(
             int(_tllm_internal.thop.MOE_A2A_ABORT_STATE_WORDS),
             dtype=torch.int32,
-            pin_memory=prefer_pinned(),
+            pin_memory=True,
         )
-        if not self.abort.is_pinned():
-            raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
-        self._abort_flags = self.abort.numpy()[_ABORT_FLAGS]
+        self._abort_words = self.abort.numpy()[_ABORT_WORDS]
         self._workspaces: dict[
             MembershipWorkspace, tuple[Callable[[], None], Callable[[], None], torch.Tensor]
         ] = {}
@@ -116,7 +113,7 @@ class MoeExecutionState:
         Raises:
             RuntimeError: The EP membership changed since this state was created.
         """
-        if self.health.generation != self._bound_generation:
+        if self.ep_group_health.generation != self._bound_generation:
             raise RuntimeError("Bind MoE layers only before the EP membership changes")
         self._layer_resets.append(reset_state)
 
@@ -166,11 +163,11 @@ class MoeExecutionState:
 
     def request_abort(self) -> None:
         """Make running and future collectives return without their peers. Safe from any thread."""
-        self._abort_flags[_ABORT_REQUESTED] = 1
+        self._abort_words[_ABORT_REQUESTED] = 1
 
     def aborted(self) -> bool:
         """Return whether an abort was requested or a collective aborted since the last :meth:`rearm`."""
-        return bool(self._abort_flags.any())
+        return bool(self._abort_words.any())
 
     def check_incomplete_rounds(self) -> None:
         """Enqueue the check of this rank's incomplete-round word in every bound workspace.
@@ -188,7 +185,7 @@ class MoeExecutionState:
         # The abort state stores the uint32 flags in int32 words.
         return {
             peer: round_flag & 0xFFFFFFFF
-            for peer, round_flag in enumerate(self.abort[_WAIT_EVIDENCE].tolist())
+            for peer, round_flag in enumerate(self.abort[_WAITED_FLAGS].tolist())
             if round_flag
         }
 
@@ -213,12 +210,12 @@ class MoeExecutionState:
         collective aborted. The device is synchronized first, so no collective reads a partly
         written mask.
         """
-        snapshot = self.health.snapshot()
+        snapshot = self.ep_group_health.snapshot()
         if snapshot.generation == self._generation:
             return
         words = _mask_words(snapshot.mask, self.ep_rank)
         torch.cuda.synchronize(self._device)
         if self.aborted():
-            raise RuntimeError(f"MoE All-to-All abort state is {self.abort[_ABORT_FLAGS].tolist()}")
+            raise RuntimeError(f"MoE All-to-All abort state is {self.abort[_ABORT_WORDS].tolist()}")
         self.active_rank_mask.copy_(torch.tensor(words, dtype=torch.uint64))
         self._generation = snapshot.generation

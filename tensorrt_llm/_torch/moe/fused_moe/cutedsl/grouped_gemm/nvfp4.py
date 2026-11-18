@@ -71,10 +71,6 @@ ASYNC_INPUT_QUANT_MAX_TOKENS = 1024
 _DISABLE_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
 
 
-def _uses_rubin_kernels() -> bool:
-    return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
-
-
 @register_moe_impl
 class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     """``trtllm.cutedsl.grouped_gemm.nvfp4``: CuteDSL NVFP4 grouped GEMM.
@@ -485,7 +481,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         ``sort_tables`` (at ``tile_size``) replace this rank's ``moe_sort``.
         """
         output_dtype = torch.bfloat16
-        use_rubin = _uses_rubin_kernels()
+        sm_version = get_sm_version()
+        use_rubin = sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition

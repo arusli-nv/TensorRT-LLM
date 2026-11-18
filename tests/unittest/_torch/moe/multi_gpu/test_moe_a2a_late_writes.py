@@ -134,7 +134,7 @@ def _survivor(
     store.wait(["proceed"])
 
     gather = StoreComm(store, rank, "survivors", range(VICTIM))
-    state.health.mark_failed(VICTIM)
+    state.ep_group_health.mark_failed(VICTIM)
     if mode != "no-remap":
         state.remap_workspaces(gather, frozenset(range(EP_SIZE)))
         assert memory.mapped

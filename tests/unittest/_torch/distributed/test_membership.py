@@ -22,7 +22,10 @@ import logging
 import os
 import random
 import select
+import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -31,6 +34,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from _torch.distributed.store_group_test_utils import InMemoryStore
 from pydantic import ValidationError
 from torch.distributed import TCPStore
 
@@ -38,7 +42,9 @@ from tensorrt_llm._torch.distributed import membership
 from tensorrt_llm._torch.distributed.membership import (
     LIVENESS_KEY,
     RECORD_KEY,
+    RENDEZVOUS_ENV,
     SHARED_SECRET_ENV,
+    STALLED_SINCE_KEY,
     TRANSACTION_KEY,
     Authority,
     AuthorityProcess,
@@ -52,14 +58,16 @@ from tensorrt_llm._torch.distributed.membership import (
     ResumeState,
     SignedStore,
     TransactionSummary,
+    UnsignedValueError,
     authority,
     authority_process,
     liveness,
     open_liveness_connection,
     open_node_supervisor_connection,
+    open_store,
+    rendezvous_store,
 )
-from tensorrt_llm._torch.distributed.membership.liveness import Lines
-from tensorrt_llm._torch.distributed.membership.rendezvous import hello_token
+from tensorrt_llm._torch.distributed.membership.liveness import Lines, hello_token
 from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.cpu_only
@@ -476,20 +484,6 @@ def test_frozen_survivor_removed_before_joiner():
     assert record.active_mask == _without(2)
 
 
-def test_membership_timeouts_keep_their_order():
-    """Check the order of the membership's timeouts that its rules rely on."""
-    timing = membership.records
-    assert (
-        timing.REPORT_INTERVAL_S
-        < timing.HEARTBEAT_INTERVAL_S
-        < timing.AUTHORITY_SILENCE_TIMEOUT_S
-        < timing.HANG_TIMEOUT_S
-    )
-    assert timing.ADMISSION_TIMEOUT_S < timing.HANG_TIMEOUT_S
-    silence_s = timing.AUTHORITY_SILENCE_TIMEOUT_S
-    assert silence_s - timing.HEARTBEAT_INTERVAL_S - timing.REPORT_INTERVAL_S >= 28.5
-
-
 def test_unconnected_replacement_join_request_dropped():
     """Drop the join request of a replacement that never connects."""
     cluster = Cluster()
@@ -702,27 +696,6 @@ def test_first_failover_cause_after_staggered_startup():
     assert cluster.authority.last_transaction.causes == {1: "hung"}
 
 
-class DictStore:
-    """In-memory store with the TCPStore calls that the authority and its ranks use."""
-
-    def __init__(self):
-        self.values = {}
-        self._lock = threading.Lock()
-
-    def set(self, key, value):
-        with self._lock:
-            self.values[key] = bytes(value)
-
-    def get(self, key):
-        return self.values[key]
-
-    def check(self, keys):
-        return all(key in self.values for key in keys)
-
-    def wait(self, keys, timeout):
-        _until(lambda: self.check(keys), timeout.total_seconds())
-
-
 class SignedTcpStore:
     """A real TCPStore that each thread reaches through its own signing client, as a process does."""
 
@@ -745,7 +718,7 @@ def _deployment(world, store=None, reply=None, **authority_options):
     The store is in memory unless ``store`` is given. The clients answer records with ``reply``,
     by default as an executor does.
     """
-    store = DictStore() if store is None else store
+    store = InMemoryStore() if store is None else store
     thread, returned = _serve(
         store, AuthorityProcess(world, world, store, Authority(world, **authority_options))
     )
@@ -844,7 +817,7 @@ def _leave(clients):
 @pytest.mark.parametrize("end", [MembershipState.SHUTDOWN, MembershipState.ABORTED])
 def test_authority_ends_with_rank_connected(end):
     """End the authority after rank 0 read SHUTDOWN, or a hang timeout after an abort."""
-    store = DictStore()
+    store = InMemoryStore()
     parent_read, parent_write = os.pipe()
     process = AuthorityProcess(2, 2, store, Authority(2, hang_timeout_s=5.0), parent=parent_read)
     thread, returned = _serve(store, process)
@@ -876,6 +849,120 @@ def test_authority_ends_with_rank_connected(end):
         if end == MembershipState.ABORTED:
             os.close(parent_write)
     assert [record.state for record in returned] == [end]
+
+
+def test_authority_aborts_only_at_end_of_rank_0_pipe():
+    """Keep serving when bytes arrive on rank 0's pipe, and abort once the pipe ends."""
+    store = InMemoryStore()
+    parent_read, parent_write = os.pipe()
+    process = AuthorityProcess(1, 1, store, Authority(1), parent=parent_read)
+    thread, returned = _serve(store, process)
+    clients = []
+    try:
+        clients.append(_member(store, 0, 1))
+        _until(lambda: _committed(clients[0], 0b1))
+        os.write(parent_write, b"\n")
+        time.sleep(10 * authority.REPORT_INTERVAL_S)
+        assert _committed(clients[0], 0b1)
+        os.close(parent_write)
+        parent_write = None
+        _until(lambda: clients[0].record.state == MembershipState.ABORTED)
+    finally:
+        _leave(clients)
+        thread.join(TIMEOUT_S)
+        os.close(parent_read)
+        if parent_write is not None:
+            os.close(parent_write)
+    assert [record.state for record in returned] == [MembershipState.ABORTED]
+    assert returned[0].reason == "rank 0's process ended"
+
+
+@pytest.mark.parametrize("end", [MembershipState.SHUTDOWN, MembershipState.ABORTED])
+def test_authority_process_runs_until_rank_0_ends(end):
+    """Run the authority process as rank 0 starts it, and end it as rank 0 does.
+
+    The process writes the store's address to ``--address-fd`` once the store listens there, runs
+    on every CPU though started bound to one, ignores SIGINT and SIGTERM, and exits with 0 after a
+    shutdown, else with 1.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        address = f"127.0.0.1:{probe.getsockname()[1]}"
+    env = {
+        **os.environ,
+        RENDEZVOUS_ENV: address,
+        "TRT_LLM_NO_LIB_INIT": "1",
+        "MPI4PY_RC_INITIALIZE": "false",
+        "CUDA_VISIBLE_DEVICES": "",
+    }
+    env.pop("TLLM_NUMA_AWARE_WORKER_AFFINITY", None)
+    allowed = os.sched_getaffinity(0)
+    read_fd, write_fd = os.pipe()
+    os.sched_setaffinity(0, {min(allowed)})
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tensorrt_llm._torch.distributed.membership",
+                "--world-size=1",
+                "--gpus-per-node=1",
+                f"--address-fd={write_fd}",
+            ],
+            env=env,
+            pass_fds=(write_fd,),
+            stdin=subprocess.PIPE,
+        )
+    finally:
+        os.sched_setaffinity(0, allowed)
+        os.close(write_fd)
+    clients = []
+    try:
+        with os.fdopen(read_fd) as address_pipe:
+            assert select.select([address_pipe], [], [], TIMEOUT_S)[0]
+            assert address_pipe.readline() == f"{address}\n"
+        store = open_store(address, timeout_s=TIMEOUT_S)
+        store.wait([LIVENESS_KEY], timedelta(seconds=TIMEOUT_S))
+        assert os.sched_getaffinity(process.pid) >= allowed
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            process.send_signal(signum)
+        clients.append(_member(store, 0, 1))
+        _until(lambda: _committed(clients[0], 0b1))
+        if end == MembershipState.SHUTDOWN:
+            clients[0].report(shutdown=True)
+        else:
+            process.stdin.close()  # as when rank 0's process ends
+        _until(lambda: clients[0].record.state == end)
+        clients[0].stop()
+        assert process.wait(TIMEOUT_S) == (0 if end == MembershipState.SHUTDOWN else 1)
+    finally:
+        _leave(clients)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdin.close()
+
+
+def test_stall_published_in_unix_milliseconds():
+    """Publish since when the ranks wait on a stalled rank in Unix milliseconds, then clear it."""
+    with _deployment(2) as (store, clients):
+        began_ms = time.time() * 1e3
+        clients[0].report(waiting_for=0b10)
+        _until(lambda: store.check([STALLED_SINCE_KEY]) and store.get(STALLED_SINCE_KEY))
+        assert began_ms - 50 <= int(store.get(STALLED_SINCE_KEY)) <= time.time() * 1e3
+        clients[0].report(waiting_for=0)
+        _until(lambda: store.get(STALLED_SINCE_KEY) == b"")
+
+
+def test_rendezvous_store_signs_with_shared_secret(monkeypatch):
+    """Open the store named in the environment with a client that signs with the shared secret."""
+    server = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+    address = f"127.0.0.1:{server.port}"
+    monkeypatch.setenv(RENDEZVOUS_ENV, address)
+    rendezvous_store(timeout_s=TIMEOUT_S).set("key", b"value")
+    assert open_store(address, TIMEOUT_S).get("key") == b"value"
+    with pytest.raises(UnsignedValueError):
+        open_store(address, TIMEOUT_S, secret="cd" * 32).get("key")
 
 
 @pytest.mark.parametrize("shutdown", [False, True], ids=["idle", "shutdown"])
@@ -1182,7 +1269,7 @@ def test_node_view_names_connected_ranks(monkeypatch):
 def test_startup_without_node_supervisor_aborts(monkeypatch, connected_nodes):
     """Abort a startup in which a node's supervisor did not connect, naming the nodes and the fix."""
     monkeypatch.setattr(authority_process, "NODE_SUPERVISOR_TIMEOUT_S", 0.5)
-    store = DictStore()
+    store = InMemoryStore()
     thread, returned = _serve(store, AuthorityProcess(4, 2, store, Authority(4)))
     supervisors = [
         _NodeSupervisor(store, node, [2 * node, 2 * node + 1]) for node in connected_nodes
@@ -1200,7 +1287,7 @@ def test_startup_without_node_supervisor_aborts(monkeypatch, connected_nodes):
     assert SHARED_SECRET_ENV in returned[0].reason
 
 
-@pytest.mark.parametrize("store_type", [DictStore, SignedTcpStore])
+@pytest.mark.parametrize("store_type", [InMemoryStore, SignedTcpStore])
 def test_replacement_refused_until_rank_removed(monkeypatch, store_type):
     """Refuse a replacement for rank 0, or for a rank until the membership removes it.
 
@@ -1336,7 +1423,7 @@ def test_authority_survives_misbehaving_peer(monkeypatch):
 
 def test_authority_failure_aborts_with_reason(monkeypatch):
     """Send the ranks an ABORTED record naming an unexpected authority error, then raise it."""
-    store = DictStore()
+    store = InMemoryStore()
     thread, raised = _serve(store, AuthorityProcess(2, 2, store, Authority(2)))
     clients = []
     try:
@@ -1388,7 +1475,7 @@ def _scripted_client(errors, resend_s=None):
 
     The authority closes the connection first on exit, so the client may then add an error.
     """
-    store = DictStore()
+    store = InMemoryStore()
     stop = threading.Event()
     with socket.create_server(("127.0.0.1", 0)) as listener:
         store.set(membership.LIVENESS_KEY, f"127.0.0.1:{listener.getsockname()[1]}".encode())

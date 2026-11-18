@@ -69,6 +69,9 @@ def plan_layer_placement(
     Args:
         current: ``[ranks, slots]`` experts, -1 for an empty slot.
         base: ``current``, or the initial placement when a rank rejoins.
+        active: ``[ranks]`` flags telling whether a rank is active.
+        active_slot_count: The active slots per rank, the slots before the spare slots.
+        expert_count: The number of experts of the layer.
         has_host_weights: ``[ranks, experts]`` flags telling whether a rank's node keeps host
             weights for an expert.
         layer_idx: The layer index, which rotates the rank order so restored experts spread out.
@@ -792,6 +795,9 @@ class EplbExpertRestore:
                 f"rows of {layout[1]} bytes, but the lowest active rank planned {agreed[0]} with "
                 f"rows of {agreed[1]} bytes"
             )
+        # No EPLB weight update may write the slots that the restore loads, or swap the placement
+        # that the check below reads.
+        balancer.load_balancer_impl.check_slots_writable()
         layers = balancer.single_layer_load_balancers
         # Staging is collective, so no rank takes this fast path while the plan stages a slot.
         if (
@@ -804,8 +810,6 @@ class EplbExpertRestore:
             )
         ):
             return 0
-        # No EPLB weight update may write the slots that the restore loads.
-        balancer.load_balancer_impl.check_slots_writable()
         # The slots that the restore loads hold no expert in this rank's view until it installs.
         for i in range(len(layers)):
             loaded = np.flatnonzero(self._loaded_slots(plan, i)).tolist()

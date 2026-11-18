@@ -273,7 +273,7 @@ def _bind_moe_state(monkeypatch, r):
 
 def _moe_state():
     moe = MagicMock(spec=MoeExecutionState)
-    moe.health = MagicMock(spec=EPGroupHealth)
+    moe.ep_group_health = MagicMock(spec=EPGroupHealth)
     moe.aborted.return_value = False
     moe.waited_flags.return_value = {}
     moe.workspace_bytes.return_value = 0
@@ -845,7 +845,7 @@ def test_resume_recomputes_interrupted_fails_lost(monkeypatch):
     assert executor.adp_ctx_batching_wait_iters_count == 0
     # Only the requests of the discarded steps run again. The rest of the prefix cache stays.
     assert _recomputed(executor) == [10, 14]
-    r.moe.health.mark_failed.assert_called_once_with(FAILED)
+    r.moe.ep_group_health.mark_failed.assert_called_once_with(FAILED)
     # The workspaces move to fresh pages among the survivors before the all-to-all is rearmed.
     steps = ("remap_workspaces", "rearm", "install_mask")
     assert [name for name, _, _ in r.moe.method_calls if name in steps] == list(steps)
@@ -1385,7 +1385,7 @@ def test_rejoin_releases_memory_after_resume(monkeypatch):
     assert rejoining == [False, False, True, False]
     assert _replies(r) == [Reply.INSTALLED]
     assert not r.recovery.pauses_forward()
-    r.moe.health.mark_active.assert_any_call(FAILED)
+    r.moe.ep_group_health.mark_active.assert_any_call(FAILED)
     # Serving resumed with the spare slots still backed and the pool short of the workspace.
     assert device.backed == 6 * MIB
     assert device.gpu_quota == 54 * MIB
@@ -1768,7 +1768,7 @@ def test_rank0_admits_joining_rank(monkeypatch, shutdown):
     # Once committed, the store no longer keeps the epoch.
     assert "host_exchange_epoch/2" not in r.store.values
     executor.dist.broadcast.assert_not_called()
-    r.moe.health.mark_active.assert_any_call(FAILED)
+    r.moe.ep_group_health.mark_active.assert_any_call(FAILED)
     assert _replies(r) == [Reply.INSTALLED]
     assert not r.recovery.pauses_forward()
 

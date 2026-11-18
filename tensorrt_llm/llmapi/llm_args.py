@@ -9912,8 +9912,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
         Reject what the field does not support. ``modeling_v2='auto'`` falls
         back to the built-in model, because no modeling_v2 target supports
-        fault tolerance yet. TLLM_FAULT_TOLERANCE_MODE=1 is deprecated: it no
-        longer turns on the fault-tolerant MoE all-to-all, which the field does.
+        fault tolerance yet.
         """
         if self.enable_wide_ep_fault_tolerance:
             check_llm_args(self)
@@ -9922,6 +9921,15 @@ class TorchLlmArgs(BaseLlmArgs):
                     "modeling_v2: no target supports Wide-EP fault tolerance; "
                     "using the built-in implementation")
                 self.modeling_v2 = "off"
+        return self
+
+    @model_validator(mode="after")
+    def warn_deprecated_fault_tolerance_mode_env(self) -> 'TorchLlmArgs':
+        """Warn that TLLM_FAULT_TOLERANCE_MODE=1 is deprecated.
+
+        It no longer turns on the fault-tolerant MoE all-to-all, which
+        enable_wide_ep_fault_tolerance does.
+        """
         if (not self.enable_wide_ep_fault_tolerance
                 and os.environ.get("TLLM_FAULT_TOLERANCE_MODE") == "1"):
             logger.warning(

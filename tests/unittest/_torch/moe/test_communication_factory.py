@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import inspect
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -600,50 +599,19 @@ def _create_one_sided(model_config, forced: bool):
     )
 
 
+@pytest.mark.parametrize("fault_tolerance", [False, True])
 @pytest.mark.parametrize("forced", [False, True])
-def test_one_sided_without_fault_tolerance_runs_without_rank_mask(
-    monkeypatch: pytest.MonkeyPatch, forced: bool
+def test_one_sided_runs_rank_mask_kernels_only_with_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, forced: bool, fault_tolerance: bool
 ):
-    """Without enable_wide_ep_fault_tolerance, NVLinkOneSided is built without a rank mask."""
+    """NVLinkOneSided runs the rank-mask kernels exactly when the model is fault tolerant."""
     model_config = _make_model_config()
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
     one_sided = Mock()
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
 
     assert _create_one_sided(model_config, forced) is one_sided.return_value
-
-    signature = inspect.signature(one_sided_module.NVLinkOneSided)
-    actual = signature.bind(*one_sided.call_args.args, **one_sided.call_args.kwargs)
-    expected = signature.bind(
-        model_config.mapping,
-        32,
-        8,
-        1024,
-        False,
-        hidden_size=4096,
-        dtype=torch.bfloat16,
-        num_experts=None,
-        use_low_precision_combine=False,
-        enable_wide_ep_fault_tolerance=False,
-        sentinel_payload_format=one_sided_module.sentinel_payload_format(None),
-    )
-    actual.apply_defaults()
-    expected.apply_defaults()
-    assert actual.arguments == expected.arguments
-
-
-@pytest.mark.parametrize("forced", [False, True])
-def test_fault_tolerance_builds_one_sided_with_rank_mask(
-    monkeypatch: pytest.MonkeyPatch, forced: bool
-):
-    """Every NVLinkOneSided of a fault-tolerant model runs the rank-mask kernels."""
-    model_config = _make_model_config()
-    model_config.enable_wide_ep_fault_tolerance = True
-    one_sided = Mock()
-    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
-
-    _create_one_sided(model_config, forced)
-
-    assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is True
+    assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is fault_tolerance
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])

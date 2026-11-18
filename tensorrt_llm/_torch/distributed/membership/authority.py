@@ -112,6 +112,10 @@ class Authority:
     progress for the timeout. Any failure while STARTING aborts. A replacement that fails to join is
     left out.
 
+    Outside a change, a rank whose latest report says its hang detector is paused is never removed
+    as hung, also once its reports stop. The ranks that wait on such a rank stall until their own
+    hang detector or all-to-all timeout ends them.
+
     Call :meth:`tick` every report interval. ``record`` holds the current decision and
     ``last_transaction`` summarizes the last ended change. The authority process publishes
     ``stalled_since_s`` and ``stalled_replacements`` for health reporting.
@@ -124,6 +128,20 @@ class Authority:
         rendezvous_timeout_s: float = RENDEZVOUS_TIMEOUT_S,
         admission_timeout_s: float = ADMISSION_TIMEOUT_S,
     ):
+        """Start with every rank of the deployment in a STARTING record.
+
+        Args:
+            world_size: The deployment's ranks, at most ``MAX_RANKS``.
+            hang_timeout_s: How long a rank that others wait on may make no progress before it is
+                removed as hung.
+            rendezvous_timeout_s: How long the startup waits for every rank to connect, and how
+                long a starting rank or a replacement's startup may make no progress.
+            admission_timeout_s: How long a joining rank that waits on no peer may make no progress
+                in its admission before it is left out.
+
+        Raises:
+            ValueError: ``world_size`` is not in ``(0, MAX_RANKS]``.
+        """
         if not 0 < world_size <= MAX_RANKS:
             raise ValueError(f"world_size must be in (0, {MAX_RANKS}], got {world_size}")
         self.world_size = world_size

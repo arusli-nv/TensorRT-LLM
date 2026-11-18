@@ -36,7 +36,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 from tensorrt_llm.logger import logger
 
 from .authority import Authority
-from .liveness import Lines, keep_alive
+from .liveness import Lines, hello_token, keep_alive
 from .records import (
     HEARTBEAT_INTERVAL_S,
     HELLO_TIMEOUT_S,
@@ -59,14 +59,14 @@ from .rendezvous import (
     RECORD_KEY,
     STALLED_SINCE_KEY,
     TRANSACTION_KEY,
-    hello_token,
     rendezvous_host_port,
 )
 from .signed_store import SignedStore
 
 # A peer with more unsent bytes queued than this reads nothing, so its connection is closed.
 _MAX_UNSENT_BYTES = 1 << 22
-# Selector data for rank 0's pipe. End of file on it means rank 0's process ended.
+# Selector data for rank 0's pipe. End of file on it means rank 0's process ended; any bytes
+# written to it are read and ignored.
 _PARENT = object()
 
 
@@ -112,6 +112,15 @@ class AuthorityProcess:
         authority: Authority,
         parent: Optional[int] = None,
     ):
+        """Prepare to serve. :meth:`run` listens and publishes the first record.
+
+        Args:
+            world_size: The deployment's ranks.
+            gpus_per_node: The ranks per node, by which a missing node supervisor is named.
+            store: The rendezvous store, which this process hosts.
+            authority: The authority that decides the membership.
+            parent: The read end of a pipe whose write end rank 0's process holds, or None.
+        """
         self.world_size = world_size
         self._gpus_per_node = gpus_per_node
         self._store = store
@@ -329,9 +338,10 @@ class AuthorityProcess:
                 self._accept(sock)
                 continue
             if connection is _PARENT:
-                self._selector.unregister(sock)
-                self._parent_ended_s = time.monotonic()
-                self._changed = True
+                if not os.read(sock, 1 << 12):
+                    self._selector.unregister(sock)
+                    self._parent_ended_s = time.monotonic()
+                    self._changed = True
                 continue
             if sock not in self._connections:
                 continue
@@ -553,6 +563,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     Start the rendezvous store at the address in ``TLLM_FAULT_TOLERANCE_RENDEZVOUS``, then write
     that address and a newline to ``--address-fd`` to tell the parent that the store is up. Abort
     the deployment once rank 0's process closes the standard input.
+
+    Args:
+        argv: The command-line arguments, by default ``sys.argv[1:]``.
+
+    Returns:
+        The exit status: 0 once the deployment shut down, 1 once it aborted.
     """
     parser = argparse.ArgumentParser(description="Wide-EP fault-tolerance membership authority")
     parser.add_argument("--world-size", type=int, required=True)

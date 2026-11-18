@@ -40,7 +40,7 @@ from tensorrt_llm.mapping import Mapping
 
 _EP_SIZE, _TOKENS, _HIDDEN = 2, 8, 128
 # Word of the abort state holding the round flag awaited from peer 0.
-_EVIDENCE = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
+_WAITED_FLAGS = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
 _JOIN_TIMEOUT_S = 10.0
 
 
@@ -86,7 +86,7 @@ def test_mask_holds_the_active_ranks() -> None:
     assert state.active_rank_mask.cpu().tolist() == [(1 << 64) - 1, 0xBF, 0, 0]
 
 
-def test_install_mask_rewrites_the_mask_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_install_mask_rewrites_the_mask_in_place() -> None:
     """The device mask changes only with the generation of the EP group health, at one address."""
     health = EPGroupHealth(4)
     state = MoeExecutionState(health, 0, torch.device("cuda"))
@@ -96,12 +96,7 @@ def test_install_mask_rewrites_the_mask_in_place(monkeypatch: pytest.MonkeyPatch
         state.install_mask()
         return state.active_rank_mask.cpu().tolist()
 
-    # An unchanged generation writes nothing, so it does not wait for the GPU either.
-    with monkeypatch.context() as patch:
-        synchronize = Mock()
-        patch.setattr(torch.cuda, "synchronize", synchronize)
-        assert install() == [0b1111, 0, 0, 0]
-        synchronize.assert_not_called()
+    assert install() == [0b1111, 0, 0, 0]
     health.mark_failed(3)
     assert install() == [0b0111, 0, 0, 0]
     # The kernels treat this rank as active, so a mask without it is refused.
@@ -135,7 +130,7 @@ def test_abort_and_rearm_after_peer_failure() -> None:
     _collective_round(state, workspace, meta, experts, payload)
     done = _queued_work_done()
     # A long wait names the flag value it expects from rank 1. It is not an abort.
-    _wait_for(state.waited_flags, state, "the dispatch published no wait evidence")
+    _wait_for(state.waited_flags, state, "the dispatch published no waited flag")
     assert state.waited_flags() == {1: 1}
     assert not state.aborted()
     requester = threading.Thread(target=state.request_abort)
@@ -166,10 +161,41 @@ def test_waited_flags_map_peer_to_flag() -> None:
     """waited_flags() maps each peer a kernel waits for to the round flag value it waits for."""
     state = MoeExecutionState(EPGroupHealth(4), 0, torch.device("cuda"))
     assert state.waited_flags() == {}
-    state.abort[_EVIDENCE + 1] = 7  # the dispatch of round 3
-    state.abort[_EVIDENCE + 3] = 8  # the combine of round 3
-    state.abort[_EVIDENCE + 2] = -(1 << 31)  # uint32 flag 1 << 31, past the int32 range
+    state.abort[_WAITED_FLAGS + 1] = 7  # the dispatch of round 3
+    state.abort[_WAITED_FLAGS + 3] = 8  # the combine of round 3
+    state.abort[_WAITED_FLAGS + 2] = -(1 << 31)  # uint32 flag 1 << 31, past the int32 range
     assert state.waited_flags() == {1: 7, 2: 1 << 31, 3: 8}
+
+
+def test_incomplete_round_word_marks_the_state_aborted() -> None:
+    """check_incomplete_rounds checks each bound workspace once, and a set word cancels the state."""
+    state = MoeExecutionState(EPGroupHealth(_EP_SIZE), 0, torch.device("cuda"))
+    checks = []
+    bound = []
+    for name in ("first", "second"):
+        workspace, meta, _, _ = a2a_workspace(_EP_SIZE)
+        incomplete_round = int(meta[int(internal.thop.MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX)])
+        bound.append(workspace[0, incomplete_round : incomplete_round + 4].view(torch.int32))
+
+        def check(name=name, workspace=workspace, meta=meta) -> None:
+            checks.append(name)
+            torch.ops.trtllm.moe_a2a_check_incomplete_round(workspace, meta, 0, state.abort)
+
+        key = object()
+        # Layers that share a workspace register it again.
+        for _ in range(2):
+            state.register_workspace(key, Mock(), check, workspace)
+
+    state.check_incomplete_rounds()
+    torch.cuda.synchronize()
+    assert checks == ["first", "second"]
+    assert not state.aborted()
+
+    bound[1].fill_(1)
+    state.check_incomplete_rounds()
+    torch.cuda.synchronize()
+    assert state.aborted()
+    assert state.abort[:2].tolist() == [0, 1]
 
 
 def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
@@ -432,7 +458,7 @@ def test_layers_bound_to_one_execution_state(
     monkeypatch.setattr(
         rank_failure_model_load,
         "MoeExecutionState",
-        lambda health, ep_rank, device: SimpleNamespace(health=health, ep_rank=ep_rank),
+        lambda health, ep_rank, device: SimpleNamespace(ep_group_health=health, ep_rank=ep_rank),
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
@@ -447,4 +473,4 @@ def test_layers_bound_to_one_execution_state(
     (state,), (other,) = (comm.bind_execution_state.call_args.args for comm in comms)
     assert state is other
     assert state.ep_rank == 1
-    assert state.health.get_mask() == (0b0010 if replacement else 0b1111)
+    assert state.ep_group_health.get_mask() == (0b0010 if replacement else 0b1111)

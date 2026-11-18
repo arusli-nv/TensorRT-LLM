@@ -67,9 +67,10 @@ class SignedStore:
 
     A value's key holds an HMAC-SHA256 tag, keyed by a digest of the shared secret, over the key, a
     chunk count and the value. A process without the secret cannot set a value that the deployment's
-    processes accept. Counters (``add``) and deletes carry no tag, and an older value that the
-    deployment set under a key verifies again if a process sets it back: the store is meant for a
-    trusted network (see the developer guide's Known Limits).
+    processes accept. Counters (``add``), deletes and waits carry no tag, and an older value that
+    the deployment set under a key verifies again if a process sets it back. A process that reaches
+    the store's port can therefore stall or end the deployment, or make it act on an older record,
+    as it can with an unsigned TCPStore: the store is meant for a trusted network.
 
     A value larger than ``_CHUNK_BYTES`` is set in chunks under ``<key>/chunks/<i>``, and ``key``
     holds their count and the value's SHA-256 digest in place of the value. The chunks are set
