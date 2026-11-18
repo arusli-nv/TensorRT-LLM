@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Protocol, Sequence
+from typing import Any, List, Optional, Protocol, Sequence, runtime_checkable
 
 import pynvml
 import torch
@@ -39,32 +39,41 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
-class MnnvlPeerHandleError(RuntimeError):
+class MnnvlRanksError(RuntimeError):
+    """An MNNVL memory error that names the ranks ``ranks`` it involves."""
+
+    def __init__(self, ranks: Sequence[int], message: str) -> None:
+        self.ranks = tuple(sorted(set(ranks)))
+        super().__init__(message)
+
+    def __reduce__(self):
+        return type(self), (self.ranks, self.args[0])
+
+
+class MnnvlPeerHandleError(MnnvlRanksError):
     """Raised when this rank cannot import the MNNVL handles of the peers ``ranks``.
 
     The caller can exclude those peers and map the memory again.
     """
 
-    def __init__(self, ranks: Sequence[int], message: str) -> None:
-        self.ranks = tuple(sorted(set(ranks)))
-        super().__init__(message)
 
-    def __reduce__(self):
-        return type(self), (self.ranks, self.args[0])
-
-
-class MnnvlMappingError(RuntimeError):
+class MnnvlMappingError(MnnvlRanksError):
     """Raised on every active rank when the ranks ``ranks`` cannot map MNNVL memory.
 
     The failure is on their own side, such as a failed handle export.
     """
 
-    def __init__(self, ranks: Sequence[int], message: str) -> None:
-        self.ranks = tuple(sorted(set(ranks)))
-        super().__init__(message)
 
-    def __reduce__(self):
-        return type(self), (self.ranks, self.args[0])
+@runtime_checkable
+class MembershipComm(Protocol):
+    """A communicator whose gathers return None for an inactive member, such as a ``StoreGroup``.
+
+    ``membership`` lists every member's global rank in communicator rank order, and
+    ``exchange_failed`` tells whether the latest exchange itself raised.
+    """
+
+    membership: tuple[int, ...]
+    exchange_failed: bool
 
 
 class ProcessGroupComm:
@@ -824,8 +833,8 @@ class MnnvlMemory:
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
-        if hasattr(comm, "membership"):
-            # A communicator with inactive members lists them, since a gather leaves them out.
+        if isinstance(comm, MembershipComm):
+            # A gather leaves the inactive members out, so the communicator lists them.
             comm_membership = tuple(comm.membership)
         else:
             comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))

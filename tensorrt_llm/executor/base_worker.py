@@ -228,7 +228,7 @@ class BaseWorker(GenerationExecutor):
         # Model construction may update the maximum sequence length.
         if self.engine.max_seq_len is not None:
             self.max_seq_len = self.engine.max_seq_len
-        if self._rank_failure_requests is not None:
+        if self.engine.rank_failure_recovery is not None:
             self.engine.rank_failure_recovery.set_outstanding_requests(
                 self.outstanding_requests)
 

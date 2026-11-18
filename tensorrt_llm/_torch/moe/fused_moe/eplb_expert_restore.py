@@ -780,6 +780,9 @@ class EplbExpertRestore:
         Raises:
             ExpertRestorePlanMismatchError: The plan or the workspace row size of this rank differs
                 from the lowest active rank's.
+            RuntimeError: An iteration is active, or the online EPLB worker may still write the
+                slots.
+            ValueError: A workspace row leaves no aligned room to stage in.
         """
         balancer = self.balancer
         if balancer.in_iter:

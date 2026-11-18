@@ -54,6 +54,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.version import __version__
 
 from ...autotuner import AutoTuner
+from ...pyexecutor.hang_detector import RANK_CRASH_KILL_GRACE_ENV
 from ..communicator import Distributed
 from ..host_exchange import MnnvlDistFactory
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart, StartupRecord
@@ -440,7 +441,8 @@ def _on_tick_at_startup(host_collectives: MnnvlDistFactory) -> None:
 def join_startup_group(mapping: Mapping) -> None:
     """Make the startup group this rank's ``mpi_comm()`` and MPI world, and set ``TLLM_RANK``.
 
-    ``Distributed`` then runs the host collectives over MNNVL memory (``MnnvlDist``).
+    ``Distributed`` then runs the host collectives over MNNVL memory (``MnnvlDist``). It also sets
+    ``TLLM_RANK_CRASH_HARD_KILL_GRACE=-1``, so that a crashed rank does not kill its peers.
     """
     identity = _rank_identity()
     one_node = identity.world_size <= min(identity.gpus_per_node, mapping.gpus_per_node)
@@ -461,6 +463,7 @@ def join_startup_group(mapping: Mapping) -> None:
         ]
     )
     os.environ["TLLM_RANK"] = str(identity.rank)
+    _turn_off_rank_crash_kill()
     startup_group = StoreGroup(
         _startup_store(),
         "startup/world",
@@ -484,6 +487,25 @@ def join_startup_group(mapping: Mapping) -> None:
         raise RuntimeError(
             "The node's communicator was split from MPI before the startup group was set"
         )
+
+
+def _turn_off_rank_crash_kill() -> None:
+    """Keep a crashed rank from killing its peers: its exit ends only itself.
+
+    The membership removes a rank that ends, so no peer waits for it, and the error that ended the
+    rank is reported as it is.
+    """
+    grace = os.environ.get(RANK_CRASH_KILL_GRACE_ENV)
+    try:
+        turned_off = grace is None or float(grace) < 0
+    except ValueError:
+        turned_off = False
+    if not turned_off:
+        logger.warning(
+            f"{RANK_CRASH_KILL_GRACE_ENV}={grace} is replaced by -1: with Wide-EP fault tolerance a "
+            "crashed rank ends only itself, and the membership removes it"
+        )
+    os.environ[RANK_CRASH_KILL_GRACE_ENV] = "-1"
 
 
 def _join_at_entry(store: SignedStore, identity: RankIdentity) -> None:
@@ -574,24 +596,24 @@ def _start_authority(world_size: int, gpus_per_node: int, timeout_s: float) -> s
         TLLM_LOG_LEVEL=logger.level,
     )
     read_fd, write_fd = os.pipe()
-    try:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "tensorrt_llm._torch.distributed.membership",
-                f"--world-size={world_size}",
-                f"--gpus-per-node={gpus_per_node}",
-                f"--address-fd={write_fd}",
-            ],
-            env=env,
-            pass_fds=(write_fd,),
-            stdin=subprocess.PIPE,
-        )
-    finally:
-        os.close(write_fd)
-    close_in_forked_child(process.stdin)
     with os.fdopen(read_fd) as address_pipe:
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "tensorrt_llm._torch.distributed.membership",
+                    f"--world-size={world_size}",
+                    f"--gpus-per-node={gpus_per_node}",
+                    f"--address-fd={write_fd}",
+                ],
+                env=env,
+                pass_fds=(write_fd,),
+                stdin=subprocess.PIPE,
+            )
+        finally:
+            os.close(write_fd)
+        close_in_forked_child(process.stdin)
         ready, _, _ = select.select([address_pipe], [], [], timeout_s)
         address = address_pipe.readline().strip() if ready else ""
     if not address:

@@ -351,15 +351,9 @@ class RankFailureRecovery:
         """
         self._client = membership_client()
         self._client.bind(self._on_record, on_tick=self._on_tick, on_error=self._on_client_error)
-        detector = self._executor.hang_detector
-        disarm = detector.disarm
-
-        def disarm_and_report() -> None:
-            disarm()
-            self._client.send_report(idle=True)
-
-        # HangDetector.pause() disarms through this attribute.
-        detector.disarm = disarm_and_report
+        self._executor.hang_detector.register_pause_callback(
+            lambda: self._client.send_report(idle=True)
+        )
 
     def stop(self, completed: bool) -> None:
         """Leave the membership after a completed run, or end the process after a failed one.

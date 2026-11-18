@@ -122,7 +122,7 @@ def _launch(executor, batch):
         PyExecutor._update_v2_context_resources(executor, batch)
         return BatchState(scheduled_requests=batch, sample_state=None)
     context_commits = []
-    PyExecutor._update_v2_context_resources_deferred(executor, batch, context_commits)
+    PyExecutor._update_v2_context_resources(executor, batch, context_commits)
     return BatchState(scheduled_requests=batch, sample_state=None, context_commits=context_commits)
 
 

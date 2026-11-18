@@ -679,6 +679,10 @@ class Clients(_Threads):
         """Stop sending, wait for the requests in flight, and return the clients that failed."""
         return self._join(REQUEST_TIMEOUT_S)
 
+    def stop_sending(self) -> None:
+        """Send no new request, without waiting for the requests in flight."""
+        self._stop.set()
+
     def restart_questions(self) -> None:
         """Restart the eval clients from the first question of the subset."""
         with self._lock:
@@ -1516,7 +1520,7 @@ def _interrupt_server(deployment: Deployment, clients: Clients) -> float:
         int(m.group(1)) for m in map(SERVER_PID_LOG.search, _log_lines(deployment.logs)) if m
     }
     # The clients send no new request, so every request was sent before the stop.
-    clients._stop.set()
+    clients.stop_sending()
     os.kill(server_pid, signal.SIGINT)
     return time.monotonic()
 

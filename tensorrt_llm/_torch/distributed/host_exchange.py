@@ -557,8 +557,8 @@ class MnnvlDist(Distributed):
         ]
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024, prefer_cpu=False):
-        # Only the idle request fetch passes prefer_cpu=True. Its wait may last until the next
-        # request arrives, so it runs as an idle wait.
+        # prefer_cpu marks a wait that may last until the next request arrives, so it runs as an
+        # idle wait.
         if self.mapping.tp_rank == root:
             self._exchange(obj, readers=(), idle=prefer_cpu)
             return obj

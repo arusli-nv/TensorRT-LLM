@@ -78,7 +78,7 @@ def test_resize_releases_memory_keeps_kv(manager):
     assert manager.get_buffers(0)[pages[-1]].eq(1.5).all()
 
 
-def test_failed_resize_resumes_every_cache(manager):
+def test_kv_pools_suspended_resumes_after_error(manager):
     """Keep every request active with its KV when a restore shrinks the pool and then fails."""
     (request,) = manager.add_dummy_requests([0], [512])
     (pages,) = manager.get_batch_cache_indices([0], 0)

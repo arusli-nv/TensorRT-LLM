@@ -63,6 +63,12 @@ from tensorrt_llm._torch.distributed.membership.startup import (
 )
 from tensorrt_llm._torch.distributed.mnnvl_memory import TpMnnvlMemory
 from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
+from tensorrt_llm._torch.pyexecutor import hang_detector
+from tensorrt_llm._torch.pyexecutor.hang_detector import (
+    RANK_CRASH_KILL_GRACE_ENV,
+    hard_kill_on_rank_crash,
+    start_rank_crash_kill_watchdog,
+)
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
 from tensorrt_llm._wide_ep_fault_tolerance import (
     FAULT_TOLERANCE_RANK_ENV,
@@ -252,6 +258,44 @@ def test_replacement_startup_group_refuses_value_collectives(store, monkeypatch)
         assert world.allgather("sample") == [None, None, "sample", None]
     record.close()
     assert world.allreduce(2) == 2
+
+
+@pytest.mark.parametrize(
+    "grace, warned", [(None, False), ("-1", False), ("10", True)], ids=["unset", "off", "set"]
+)
+def test_startup_turns_off_rank_crash_kill(store, monkeypatch, grace, warned):
+    """Check that a crashed rank kills no peer, since the membership removes a rank that ends."""
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "2,4,4,1")
+    monkeypatch.setenv("TLLM_RANK", "-")
+    if grace is None:
+        monkeypatch.delenv(RANK_CRASH_KILL_GRACE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, grace)
+    monkeypatch.setattr(_utils, "comm", _utils.comm)
+    monkeypatch.setattr(_utils, "world_comm", _utils.world_comm)
+    monkeypatch.setattr(_utils, "_local_comm", None)
+    monkeypatch.setattr(Distributed, "_create", None)
+    monkeypatch.setattr(Distributed, "startup_record", None)
+    Distributed.get.cache_clear()
+    warning = Mock()
+    monkeypatch.setattr(startup_module.logger, "warning", warning)
+    record = startup_module._state.record
+    record.replay({"values": {}, "exchanges": []})
+    join_startup_group(
+        Mapping(
+            world_size=WORLD, rank=2, tp_size=WORLD, moe_ep_size=WORLD, enable_attention_dp=True
+        )
+    )
+    record.close()
+    kills = []
+    monkeypatch.setattr(hang_detector, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(hang_detector.time, "sleep", lambda s: None)
+    assert os.environ[RANK_CRASH_KILL_GRACE_ENV] == "-1"
+    assert start_rank_crash_kill_watchdog(WORLD) is None
+    assert hard_kill_on_rank_crash(WORLD) is False
+    assert kills == []
+    named = [call for call in warning.call_args_list if RANK_CRASH_KILL_GRACE_ENV in call.args[0]]
+    assert len(named) == int(warned)
 
 
 @pytest.mark.parametrize(

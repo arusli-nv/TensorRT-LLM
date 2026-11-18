@@ -32,6 +32,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .mnnvl_memory import (
+    MembershipComm,
     MnnvlMappingError,
     MnnvlMemory,
     MnnvlPeerHandleError,
@@ -45,9 +46,9 @@ if TYPE_CHECKING:
 def comm_members(comm: Any) -> tuple[int, ...]:
     """Return the global ranks of ``comm``'s members.
 
-    A ``StoreGroup`` lists them. Any other communicator is taken as the ranks from 0 in order.
+    A ``MembershipComm`` lists them. Any other communicator is taken as the ranks from 0 in order.
     """
-    if hasattr(comm, "membership"):
+    if isinstance(comm, MembershipComm):
         return tuple(comm.membership)
     return tuple(range(comm.Get_size()))
 
@@ -208,7 +209,8 @@ class MembershipMnnvlMemory(MnnvlMemory):
         except Exception as failure:
             # A failed handle exchange leaves the peers unreachable, and an error other than a
             # RuntimeError is a bug. Neither goes to the outcome exchange.
-            if getattr(comm, "exchange_failed", False) or not isinstance(failure, RuntimeError):
+            exchange_failed = isinstance(comm, MembershipComm) and comm.exchange_failed
+            if exchange_failed or not isinstance(failure, RuntimeError):
                 release_after_failure()
                 raise
             local_failure = failure

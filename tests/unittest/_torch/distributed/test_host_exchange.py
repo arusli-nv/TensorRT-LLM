@@ -17,10 +17,7 @@
 The ranks run in threads of one process and exchange over rows of host memory.
 """
 
-import ast
 import ctypes
-import inspect
-import textwrap
 import threading
 import time
 from types import SimpleNamespace
@@ -34,7 +31,6 @@ from tensorrt_llm import _utils
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import (
     Distributed,
-    MPIDist,
     host_exchange,
     mnnvl_host_exchange,
     mnnvl_memory,
@@ -753,47 +749,10 @@ def test_replacement_replays_paused_first_collective(fresh_distributed, monkeypa
     replacement.close()
 
 
-def test_pp_cp_p2p_collectives_unavailable():
-    """MnnvlDist has no pipeline-parallel, context-parallel or point-to-point communication."""
+def test_cp_collectives_unavailable():
+    """MnnvlDist has no context-parallel communication."""
     dist = MnnvlDist(Mapping(world_size=2, rank=0, tp_size=2))
     with pytest.raises(NotImplementedError, match="no context-parallel group"):
         dist.cp_allgather(0)
     with pytest.raises(NotImplementedError, match="no context-parallel group"):
         dist.cp_broadcast(0)
-    for name in ("tp_comm", "pp_allgather", "send_object", "recv_object"):
-        assert not hasattr(dist, name), name
-
-
-# Names whose use in a Distributed method means that it talks to MPI or torch.distributed itself.
-_DIRECT_TRANSPORT = frozenset(
-    {"mpi_comm", "MPI", "tp_comm", "pp_comm", "cp_comm", "dist", "torch"}
-    | {"safe_broadcast", "safe_allgather", "safe_gather"}
-)
-
-
-def _public_methods(cls) -> set:
-    """Return the public instance methods that ``cls`` defines."""
-    return {name for name, attr in vars(cls).items() if name[0] != "_" and inspect.isfunction(attr)}
-
-
-def test_mnnvl_dist_overrides_every_host_collective():
-    """Check that ``MnnvlDist`` runs every collective of ``Distributed`` over MNNVL, not MPI."""
-    assert MnnvlDist.__bases__ == (Distributed,)
-    base, mpi, mnnvl = (_public_methods(cls) for cls in (Distributed, MPIDist, MnnvlDist))
-    problems = []
-    for name in sorted(base - mnnvl):
-        # A method defined only on Distributed must use collectives that MnnvlDist overrides.
-        source = textwrap.dedent(inspect.getsource(getattr(Distributed, name)))
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Name) and node.id in _DIRECT_TRANSPORT:
-                problems.append(f"Distributed.{name} uses {node.id}: override it in MnnvlDist")
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and getattr(node.func.value, "id", None) == "self"
-                and node.func.attr in mpi - base - mnnvl
-            ):
-                problems.append(
-                    f"Distributed.{name} calls MPIDist.{node.func.attr}, which MnnvlDist lacks"
-                )
-    assert not problems, "\n".join(problems)

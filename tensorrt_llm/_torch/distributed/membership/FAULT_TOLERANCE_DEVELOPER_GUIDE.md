@@ -64,7 +64,7 @@ These are fixed for this feature. A change that needs to revisit one is a design
 | A replacement restarts on the same GPU | The GPU and node are usable after a process failure, the replacement shares the job's IMEX channel, and no spare nodes are needed |
 | Host collectives are `MnnvlDist` over MNNVL memory; no NCCL or MPI communicator | MPI cannot admit a process started outside its job, and torch/NCCL groups are fixed. NCCL can abort and rebuild, but the rebuild adds to every membership change's pause and its per-step host collectives are slower than `MnnvlDist`'s. The `HostExchangeGroup` seam keeps another transport possible |
 | The node supervisor restarts single ranks automatically; restarting a lost node is manual | One rank's restart needs only its own node's supervisor. A lost node has no supervisor left, and starting processes there goes through the launcher, which differs per deployment. Its ranks are given up and the deployment serves at N-K until the operator starts the node's supervisor again with `trtllm-llmapi-launch --rejoin-node`. Its replacements rejoin in one membership change |
-| One flag, `enable_wide_ep_fault_tolerance`, per instance | It is the only user-facing switch. It flows from `TorchLlmArgs` to the model config, the worker and the server. The rest is derived inside each rank process: `Distributed.set_implementation` installs `MnnvlDist`, and the startup sets internal variables such as `TLLM_RANK`, and `TRTLLM_SKIP_KV_CACHE_ESTIMATION` on a replacement |
+| One feature switch, `enable_wide_ep_fault_tolerance`, per instance | It is the only switch that turns the feature on. It flows from `TorchLlmArgs` to the model config, the worker and the server. A multi-node launch also takes two deployment settings, `TLLM_FAULT_TOLERANCE_SHARED_SECRET` and `TLLM_FAULT_TOLERANCE_RENDEZVOUS`; with the secret exported, `trtllm-llmapi-launch` runs each node's supervisor instead of the command. The rest is derived inside each rank process: `Distributed.set_implementation` installs `MnnvlDist`, and the startup sets internal variables such as `TLLM_RANK`, and `TRTLLM_SKIP_KV_CACHE_ESTIMATION` on a replacement |
 | Narrow first target, extensible later | Each supported combination needs end-to-end coverage. The generic layer (membership, host collectives, executor failover and rejoin, serving) knows no model or backend, so a new target only has to meet the backend contract |
 
 ## File Map
@@ -153,13 +153,14 @@ any state ── rank 0 not in the new mask, or a survivor replies FAILED ──
   hung rank aborts the startup. A replacement's startup is timed apart from the rule: no progress (startup
   collectives, autotuner warmup steps) for 600 s and its node supervisor kills it (see [Rejoin](#rejoin)).
 - Paused: outside a change, a rank whose latest report says its hang detector is paused (`RankReport.idle`) is not
-  hung, even once its reports stop. Main pauses the detector around calls that may block longer than a hang timeout:
+  hung, even once its reports stop. The executor pauses its hang detector (`HangDetector.pause`) around calls that
+  may block longer than a hang timeout:
   rank 0's request fetch, the request broadcasts, a control action, and the profiler stop. A call that holds the GIL,
   as the profiler stop can while the trace flushes, keeps the rank's membership client thread from reporting, so the
-  thread that pauses the detector sends the paused report itself, before the call (`RankFailureRecovery.start`,
-  `MembershipClient.send_report`). Every rank pauses its detector during a change, so the pause does not count then.
-  The cost matches main's detector: a rank that truly hangs inside a paused call is never removed as hung, and the
-  ranks that wait on it stall until main's hang detector of a waiting rank ends that rank. A process that dies is
+  thread that pauses the detector sends the paused report itself, before the call (`RankFailureRecovery.start`
+  registers `MembershipClient.send_report` with `HangDetector.register_pause_callback`). Every rank pauses its detector during a change, so the pause does not count then.
+  The cost is that of the paused hang detector: a rank that truly hangs inside a paused call is never removed as hung,
+  and the ranks that wait on it stall until the hang detector of a waiting rank ends that rank. A process that dies is
   still removed when its connection closes or TCP keepalive gives up.
 - `INSTALL` carries the resume state: the furthest paused iteration of the survivors, and the epoch after their
   latest paused epoch. If a newer PROPOSE replaced an INSTALL while some survivor had not reached its epoch, every rank
@@ -279,7 +280,7 @@ back to a Cutlass leaf with the capability and logs one warning for all layers t
 and the reason; a pinned tactic, or a layer that no leaf with the capability serves, fails with the reason. A communication strategy
 that lacks a property is rejected at model load with the reason.
 
-| Property | Communication must | Today (`NVLinkOneSided`) |
+| Property | Communication must | Implementation (`NVLinkOneSided`) |
 |---|---|---|
 | Membership by pointer | Read the active rank mask at execution time from a fixed device address, so captured CUDA graphs follow a change | `MoeExecutionState.active_rank_mask`, written in place by `install_mask` |
 | Stop on abort | Poll the abort state inside every wait on a peer and stop waiting when it is set | `MoeExecutionState.abort` (pinned host memory) |
@@ -287,7 +288,7 @@ that lacks a property is rejected at model load with the reason.
 | No late writes after INSTALL | No write from a former member reaches memory a survivor reads | Late-write remap of the workspace (`MembershipWorkspace.remap`), specific to MNNVL fabric handles. An RDMA transport would revoke memory keys instead |
 | Waited flags | Report the round flags it waits on, so a peer that still delivers rounds is not hung | Published in the abort state, reported by the rank through `waited_flags` |
 
-| Property | MoE backend must | Today |
+| Property | MoE backend must | Implementation |
 |---|---|---|
 | Tune active slots only | Profile only the active slots (`tuner_layout_kwargs`) | Cutlass, CuteDSL NVFP4 grouped GEMM |
 | Workspace independent of spare slots | Size workspaces by active slots, not every local slot | Cutlass, CuteDSL |
@@ -315,38 +316,27 @@ static EPLB each node keeps the next node's experts (ring copies); with online E
 
 A change must keep all of these. Each has a test listed under [Testing](#testing).
 
-1. **FT off keeps main's behaviour, except for the listed changes.** The fault-tolerance path is chosen once, when a
-   module is built or bound, never per call. With the flag off, the per-step and per-layer paths differ from main
-   only in:
+1. **With the flag off, the shared paths run the default path.** The fault-tolerance path is chosen once, when a
+   module is built or bound, never per call. With the flag off, the per-step and per-layer paths add only:
    - One `is not None` check per site of an optional component (`rank_failure_recovery`, the deferred KV reuse
-     commits), defaulted arguments that main's code ignores (`active_only=True` on the batch gathers,
+     commits), defaulted arguments that the default path ignores (`active_only=True` on the batch gathers,
      `tuner_layout_kwargs` is `{}`, a null abort state), and a slower attribute read per op call, since each op is
      read through an attribute that resolves it at first use, which CPython does not specialize. The KV reuse commit
      order and the attention-DP vote are those of the default path.
-   - The NVLink one-sided all-to-all builds main's layout and kernels: rank-mask mode is on only with fault
-     tolerance. Its kernels still select
-     `ENABLE_RANK_MASK=false`, and the prepare-combine and sanitize launches select main's kernels unchanged
-     (`moeA2APrepareCombineKernel`, `moeA2ASanitizeExpertIdsKernel`). With an incomplete-round word in the layout
+   - The NVLink one-sided all-to-all builds its default layout and kernels: rank-mask mode is on only with fault
+     tolerance. Its kernels select `ENABLE_RANK_MASK=false`, and the prepare-combine and sanitize launches select
+     the default kernels (`moeA2APrepareCombineKernel`, `moeA2ASanitizeExpertIdsKernel`). With an incomplete-round word in the layout
      (rank-mask mode), they launch `moeA2AIncompleteRoundPrepareCombineKernel` and
      `moeA2AIncompleteRoundSanitizeExpertIdsKernel`, which also take the rank and the word. In the kernel pointer
      structs the 4-word mask array becomes a mask pointer, an incomplete-round offset, an abort-state pointer and a
      reserved word, which keep the structs' size and the offset of `timeout_cycles` (static asserts); the dispatch
      and combine fences gain a `"memory"` clobber.
      The ops take new optional arguments (`abort_state`, `barrier` on `moe_a2a_initialize`, `rank_mask` on the
-     workspace layout), and the metainfo has one more field, 0 here. With FT off the kernels compile to the same
-     instructions as main's; this is checked by comparing the two builds' SASS, not by a test.
+     workspace layout), and the metainfo has one more field, 0 here.
    - `RankState` carries one more int, `num_in_transfer_requests`, in the attention-DP allgather: 0 except with
      `KVCacheAwareADPRouter` and `kv_cache_routing_account_for_in_transfer`. It only lets the fleet stop stepping
      while requests merely send KV cache.
-   - Fixes of main's behaviour that the stack carries and that apply with the flag off too: `MoeLoadBalancer` shuts
-     down its C++ part before it closes the shared host weights; an idle attention-DP rank keeps stepping until no
-     rank has live requests, so every rank leaves the loop in the same iteration; after a recompute,
-     `usage.cached_tokens` keeps the first prefill's value, context logits and prompt logprobs are not appended
-     twice, and the guided decoder replays the generated tokens; an error in the middle of an OpenAI chat stream
-     ends it with an error event and `[DONE]`, and an upstream error event ends an Anthropic stream with an error
-     event; the multi-frontend launcher drains attached frontends before the engine shuts down; a failed
-     `cuMemSetAccess` unmaps its range; and MNNVL handle release skips released handles.
-   - One new error: a rank that a node supervisor started (`TLLM_FAULT_TOLERANCE_RANK` set) with the flag off is
+   - One error: a rank that a node supervisor started (`TLLM_FAULT_TOLERANCE_RANK` set) with the flag off is
      rejected.
 2. **Healthy FT on adds work to every all-to-all call and once per step.** Per call, the kernels load the rank mask
    and the incomplete-round word after the grid dependency wait. Once per step, `RankFailureRecovery.check_step` runs
@@ -355,7 +345,7 @@ A change must keep all of these. Each has a test listed under [Testing](#testing
    reader-side `fence.sc.sys` that follows the step's last combine orders every combine of the step against that
    overwrite, and the combines themselves need no fence. The word stays set until `rearm`, so a round cut short
    outside a step's forward (warmup) is reported by the next step's check.
-   Abort polls run only inside waits. A planned follow-up loads the mask before the grid dependency wait. The
+   Abort polls run only inside waits. The
    attention-DP forward vote is `RankFailureRecovery.forward_vote` in place of the default vote: one gather over the
    active ranks of the batch size plus two flags (a change not yet installed, a memory release). The host collectives
    run over MNNVL. Reports, heartbeats and status reads run on their own threads. A new per-step host step needs a
@@ -391,7 +381,7 @@ A change must keep all of these. Each has a test listed under [Testing](#testing
 
 | Layer | What it covers | Where | CI stage |
 |---|---|---|---|
-| Protocol, CPU | Authority decisions on simulated ranks, hang rule, store groups, startup group and record, host exchange (incl. `test_mnnvl_dist_overrides_every_host_collective`), remap with a fake driver | `tests/unittest/_torch/distributed/` | `l0_cpu` |
+| Protocol, CPU | Authority decisions on simulated ranks, hang rule, store groups, startup group and record, host exchange, remap with a fake driver | `tests/unittest/_torch/distributed/` | `l0_cpu` |
 | Launch and config, CPU | Node supervisor, rejected configurations, rank identity, model-load checks and binding | `tests/unittest/llmapi/test_node_supervisor.py`, `tests/unittest/llmapi/test_wide_ep_fault_tolerance_args.py`, `tests/unittest/_torch/pyexecutor/test_rank_failure_model_load.py` | `l0_cpu` |
 | Serving | Status, `/health`, metrics, `rank_failure` responses, frontends | `tests/unittest/serve/test_fault_tolerance_health.py`, `tests/unittest/executor/test_base_worker.py` | `l0_cpu` |
 | Recovery, CPU (mocked CUDA) | Spare slots and restore, ring host weights, executor recovery steps | `tests/unittest/_torch/moe/test_spare_slots.py`, `tests/unittest/_torch/moe/test_ring_host_weights.py`, `tests/unittest/_torch/pyexecutor/test_rank_failure_recovery.py` | `l0_cpu` |
@@ -400,10 +390,13 @@ A change must keep all of these. Each has a test listed under [Testing](#testing
 | Multi-GPU, MNNVL | `MnnvlDist`, late writes after a remap, abort of a bound collective waiting on a stopped rank, staged restore, a rank starting alone | `tests/unittest/_torch/multi_gpu/test_mnnvl_dist.py`, `tests/unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py`, `tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py`, `tests/unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py`, `tests/unittest/_torch/multi_gpu/test_independent_rank_startup.py`, rank-mask cases of `tests/unittest/_torch/moe/test_moe_comm.py` | `l0_gb200_multi_gpus` |
 | End to end | DeepSeek-V3-Lite on 4 GPUs under load and GSM8K clients; phases healthy, failover, degraded, admission, rejoined | `tests/integration/defs/test_wide_ep_rank_failure.py` | post-merge: every case |
 
-The post-merge end-to-end cases cover a crash then a hang, a rejoin on each other target (NVFP4 CuteDSL, NVFP4
-Cutlass, BF16 with online EPLB), refused joins, a second failure during an admission or an install, a second failure
-during a failover that the spare slots cannot cover (the deployment ends), rejoins when the server spawns the ranks
-and through two frontends, the authority's loss, and shutdowns during an admission and after a rank was given up.
+Every end-to-end case runs on one node of 4 GPUs, in the post-merge CI stage. The cases cover a crash and the
+rejoin of its replacement (`test_rank_failure_sequence[crash]`), a crash then a hang, a rejoin on each other target
+(NVFP4 CuteDSL, NVFP4 Cutlass, BF16 with online EPLB), refused joins, a second failure during an admission or an
+install, a second failure during a failover that the spare slots cannot cover (the deployment ends), rejoins when the
+server spawns the ranks and through two frontends, the authority's loss, and shutdowns during an admission and after
+a rank was given up. No CI test covers several nodes: the loss of a whole node under `mpirun --enable-recovery` and
+its return with `trtllm-llmapi-launch --rejoin-node` were verified on DeepSeek-R1 over 16 GPUs (4 nodes).
 
 ```bash
 pytest tests/unittest/_torch/distributed tests/unittest/llmapi/test_node_supervisor.py
@@ -418,9 +411,9 @@ Rules for new tests:
 
 - Every behavior change comes with a test that fails without it, and a GPU test for each behavior that touches the
   device, not mocks only.
-- A new host collective in `Distributed` must be overridden in `MnnvlDist`; the CPU test above fails otherwise.
+- A new host collective in `Distributed` must be overridden in `MnnvlDist`, with a test in `test_mnnvl_dist.py`.
 - A new startup collective whose payload differs by process must run inside `Distributed.rank_varying`. Otherwise
-  every replacement exits with 78, and today only a rejoin end-to-end test shows it.
+  every replacement exits with 78, which only a rejoin end-to-end test shows.
 - A protocol change gets a case in `test_membership.py` driven through `Authority.tick` with simulated reports.
 - Check that a test log says passed or failed, not that no tests ran: most multi-GPU tests skip without MNNVL fabric
   handles.
@@ -454,9 +447,8 @@ Rules for new tests:
   The worst outcome is a failed recovery or the end of the deployment, as with a deleted key. Rejecting replays would
   take sequence numbers per sender that every reader checks. A replacement rank starts without them, so it would need
   a fresh, authenticated source (a handshake with the authority, or TLS). That is a protocol change, not a change of
-  tags, and a planned follow-up. Main's own TCPStore, which the deployment already uses on the same network, takes
-  `add`, deletes and waits without authentication too, so the signed store opens no weaker point than main's. Run a
-  deployment on a trusted network, with a secret of its own.
+  tags. The TCPStore that torch.distributed uses on the same network also takes `add`, deletes and waits without
+  authentication. Run a deployment on a trusted network, with a secret of its own.
 - One NVLink domain. More needs an RDMA all-to-all that revokes memory keys instead of the late-write remap, and a
   network host-collective transport behind `HostExchangeGroup`.
 
@@ -469,5 +461,7 @@ Rules for new tests:
 - **Do NOT reallocate or recapture to follow a membership change.** Edit masks and state in place; remap at the same
   addresses.
 - **Do NOT use a step's outputs before the step is accepted** (`accept_step`) when FT is on.
-- **Do NOT add an environment flag or a second user-facing switch.** `enable_wide_ep_fault_tolerance` is the only one.
+- **Do NOT add a second feature switch or an environment flag that changes behavior.**
+  `enable_wide_ep_fault_tolerance` is the only feature switch; the shared secret and the rendezvous address are
+  deployment settings.
 - **Do NOT make the authority wait on a rank's executor.** It stays CPU-only and free of library initialization.

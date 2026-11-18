@@ -50,8 +50,9 @@ class RankFailureRequests:
 
     The worker tracks a request from its submit until its first response, a cancel or a failed
     enqueue. The client has seen nothing of a request still tracked when its RankFailureError
-    arrives, so the request runs again unnoticed. The RankFailureError of a request that already
-    has its final response does not reach the client either.
+    arrives, so the request runs again unnoticed. A resubmit stops tracking the request, so it is
+    resubmitted at most once. The RankFailureError of a request that already has its final
+    response does not reach the client either.
     """
 
     def __init__(self, worker: "BaseWorker"):

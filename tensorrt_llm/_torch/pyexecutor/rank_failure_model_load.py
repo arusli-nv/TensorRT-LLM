@@ -111,8 +111,11 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
 def prepare_model(model: torch.nn.Module) -> None:
     """Check that the built model supports fault tolerance and bind its MoE layers before loading.
 
+    It also checks that /dev/shm has room for the host weights that the node keeps.
+
     Raises:
-        ValueError: The model is not supported with fault tolerance.
+        ValueError: The model is not supported with fault tolerance, or /dev/shm lacks room for
+            the host weights.
     """
     check_model_architectures(model.model_config.pretrained_config.architectures)
     comms = moe_comms(model)

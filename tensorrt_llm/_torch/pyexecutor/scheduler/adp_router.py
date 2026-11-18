@@ -509,7 +509,7 @@ class ADPRouter(ABC):
             iter_stats_payload: Pending iteration stats payload, if any.
 
         Returns:
-            One state per DP rank, holding its rank and iteration stats and no load.
+            One state per active DP rank, holding its rank and iteration stats and no load.
         """
         local_state = RankState(rank=self.dist.tp_rank)
         local_state.copy_iter_stats_from(iter_stats_payload)

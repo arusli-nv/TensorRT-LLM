@@ -270,3 +270,12 @@ def test_single_stage_executor_starts_no_progress_thread(monkeypatch):
     executor.start_worker()
     assert executor._mpi_progress_thread is None
     executor.shutdown()
+
+
+def test_executor_without_fault_tolerance_adds_no_pause_callback(monkeypatch):
+    """Check that without Wide-EP fault tolerance a hang detector pause runs no callback."""
+    executor = _executor(monkeypatch, pp_size=1)
+    executor.start_worker()
+    executor.shutdown()
+    assert executor.rank_failure_recovery is None
+    executor.hang_detector.register_pause_callback.assert_not_called()

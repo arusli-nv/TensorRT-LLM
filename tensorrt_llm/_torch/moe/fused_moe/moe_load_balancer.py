@@ -62,6 +62,8 @@ class HostMoeTensorSharer:
     A class representing a host tensor sharer.
     """
 
+    # Bytes before the expert weights in each shared memory segment, where a
+    # subclass may keep a header.
     data_offset = 0
 
     def __init__(self, layer_id: int, expert_count: int,

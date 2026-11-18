@@ -975,7 +975,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if self.resource_governor is not None:
                     self.resource_governor.close()
                 if self.fault_tolerance_health is not None:
-                    self.fault_tolerance_health.close()
+                    await asyncio.to_thread(self.fault_tolerance_health.close)
                 self.generator.shutdown()
                 # A stats read still in flight fails fast now that the executor
                 # is down; the /metrics handler already treats that as no stats.

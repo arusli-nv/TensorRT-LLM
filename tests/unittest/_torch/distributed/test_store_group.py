@@ -68,6 +68,7 @@ def _run_ranks(calls):
 
 
 def test_split_orders_members_by_key():
+    """Check that a split orders its members by key, as MPI_Comm_split does."""
     store = InMemoryStore()
     groups = {r: _group(store, r, range(4)) for r in range(4)}
 
@@ -108,12 +109,14 @@ def test_replacement_replays_split_made_in_pause(monkeypatch):
 
 
 def test_replacement_with_another_split_key_cannot_start(monkeypatch):
+    """Refuse a replacement's split whose key differs from its predecessor's."""
     group, _ = _replacement_of_rank_2(monkeypatch)
     with pytest.raises(ReplacementCannotStart, match=r"is \(0, 0\), its predecessor's \(0, 2\)"):
         group.Split(color=0, key=0)
 
 
 def test_split_type_groups_ranks_by_node():
+    """Check that a shared-memory split holds the node's ranks, and other split types raise."""
     group = _group(InMemoryStore(), 3, range(6), gpus_per_node=2)
     assert group.Split_type(MPI.COMM_TYPE_SHARED).membership == (2, 3)
     with pytest.raises(NotImplementedError):
@@ -122,6 +125,7 @@ def test_split_type_groups_ranks_by_node():
 
 @pytest.mark.parametrize("op, expected", [("SUM", 6), ("MIN", 1), ("MAX", 3)])
 def test_allreduce_over_active_members(op, expected):
+    """Reduce over the active members' values only."""
     store = InMemoryStore()
     values = {0: 3, 1: 1, 3: 2}
     groups = {r: _group(store, r, range(4), active=values) for r in values}
@@ -142,6 +146,7 @@ def test_bcast_over_active_members(root):
 
 
 def test_on_wait_error_fails_exchange():
+    """Check that an error raised by ``on_wait`` ends the exchange and marks it failed."""
     waiting = []
 
     def on_wait(mask):

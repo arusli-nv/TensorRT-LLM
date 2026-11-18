@@ -67,8 +67,8 @@ _CLOSE_TIMEOUT_S = 10.0
 _STALLED_STATE_AFTER_S = HANG_TIMEOUT_S / 2
 
 # Routes answered from the status. With several serving frontends, only frontend 0 reads the store
-# and the others forward these routes to it, so every scrape sees one series. Its Prometheus
-# endpoint also reports the metrics from all frontends.
+# and the others forward these routes to it, so every scrape sees one series. With
+# return_perf_metrics, its Prometheus endpoint also reports the metrics from all frontends.
 FORWARDED_ROUTES = (
     ("GET", "/fault_tolerance_status"),
     ("GET", "/prometheus/metrics{rest:path}"),

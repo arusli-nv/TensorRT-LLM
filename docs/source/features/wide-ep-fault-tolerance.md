@@ -12,8 +12,8 @@ reduced capacity with the same CUDA graphs. A replacement of the failed rank the
 A rank fails when its process exits, or when it makes no progress for 60 s while other ranks wait for it.
 
 ```{warning}
-Wide-EP fault tolerance is a prototype and is subject to change. It is tested on one GB200 NVL72 node (4 ranks).
-Several nodes and the loss of a whole node are not covered by CI yet.
+Wide-EP fault tolerance is a prototype and is subject to change. CI tests it on one GB200 NVL72 node (4 ranks).
+Several nodes, the loss of a whole node and `--rejoin-node` were verified on DeepSeek-R1 over 16 GPUs, with no CI test.
 ```
 
 ## Requirements
@@ -118,7 +118,7 @@ The flags a step needs depend on the cluster: make sure the step sees the node's
 CPUs, and no memory limit lower than the node's, because the replacements write host weights to `/dev/shm`.
 The replacements inherit the step's environment, so run it in the deployment's container image (the same
 `--container-image` and `--container-name`) and do not reset its environment: a replacement without the deployment's
-tools and settings, such as a missing `ptxas`, fails its warmup until the rank is given up.
+tools and settings fails its warmup until the rank is given up.
 
 `--rejoin-node` makes the node's supervisor wait for the membership authority and start only replacements of the
 node's ranks, which load at once. Until the authority admits it, the supervisor connects again for up to 60 s, which
@@ -139,7 +139,7 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
 - Requests with `n > 1`, `best_of > 1` or `use_beam_search` are rejected with HTTP 400.
 - `GET /health` answers 200 while the deployment serves, degraded or not. Once the deployment cannot recover, the
   server starts shutting down after its next status refresh (once a second) and store read (up to 1 s), so about 2 s
-  later, and longer when several store reads time out. No test measures this time. Probe `/health`, not
+  later, and longer when several store reads time out. Probe `/health`, not
   `/health_generate`, which can block during a pause. A hung rank pauses serving for about 60 s, so set client
   timeouts above 70 s.
 - `GET /fault_tolerance_status` returns the `state`, `active_ranks`, `failed_ranks`, the failed ranks' `replacements`
@@ -185,23 +185,21 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
   deployment, as does the loss of rank 0 or its node, a failure of the membership authority, or a network or CPU
   stall on node 0 longer than 28.5 s (always one of 30 s or longer). Kubernetes is not supported.
 - A rank or node supervisor that reads nothing from the membership authority while more than 4 MiB wait to be sent
-  to it is disconnected. The rank counts as failed; for a node supervisor, every rank of its node does. No test
-  covers this.
+  to it is disconnected. The rank counts as failed; for a node supervisor, every rank of its node does.
 - While degraded, the survivors give up part of their KV cache memory to the failed ranks' experts, so fewer requests
   fit. A further failure before a replacement rejoins is recovered only if the spare slots and host weights still hold
   every expert. Each membership change maps the all-to-all workspace on new device memory, and the KV cache pool
   gives that memory back once the processes that held the old pages have released them.
-- On DeepSeek-R1 over 16 GPUs (4 nodes) with static EPLB and 512 requests in flight, the survivors served again
-  about 5 s after the loss of every process of a node (about 3 s after the loss of one rank), with 6-8% lower output
-  throughput after a node loss, because each survivor carries more requests. A rejoin paused serving for
-  0.26-0.61 s (about 1.1-1.4 s with online EPLB), and throughput then returned to its level before the loss.
+- After a failure, serving pauses until the survivors have removed the failed ranks, and their output throughput is
+  lower while degraded, because each survivor carries more requests. A rejoin pauses serving again for one membership
+  change.
 - A replacement takes minutes to rejoin, and one with no startup progress for 10 min is killed and retried. A rank
   whose replacements fail 3 times in a row is given up. A failure before the deployment first serves ends it.
-- Fault tolerance lowers throughput while no rank fails. On the same DeepSeek-R1 deployment, output throughput was
-  about 3% lower than without it (each decode step about 1% slower).
+- Fault tolerance lowers throughput while no rank fails.
 - Fault tolerance runs only the fence path of the NVLink one-sided all-to-all. With a BF16 combine, the default
-  (`auto`) takes the faster sentinel path for small steps, so there the all-to-all is slower with fault tolerance on
-  (about 7 µs per call on 4 GB200 GPUs). With `use_low_precision_moe_combine`, both use the fence path.
+  (`auto`) takes the faster sentinel path for small steps, so there the all-to-all is slower with fault tolerance on.
+  With `use_low_precision_moe_combine`, both use the fence path.
+- Measured recovery times, throughput while degraded and the cost while no rank fails are reported separately.
 - With more than 32 ranks, two hung ranks 32 apart are excluded one hang timeout apart.
 - Online EPLB with DeepSeek-R1 NVFP4 needs about 368 GB of `/dev/shm` on every node (24.8 MB per expert), and
   startup refuses a node with less, with the reason.

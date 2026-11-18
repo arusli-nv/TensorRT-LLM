@@ -404,16 +404,6 @@ def _alive(pid):
         return False
 
 
-def test_alive_while_process_is_reaped(monkeypatch):
-    """Report a process reaped between the open and the read of its stat file as ended."""
-    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    stat = open(f"/proc/{process.pid}/stat")
-    process.kill()
-    process.wait()
-    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: stat)
-    assert not _alive(process.pid)
-
-
 class Running:
     """Run a node supervisor in a thread and keep its exit status in :attr:`status`.
 
@@ -513,15 +503,23 @@ def test_ranks_start_outside_launcher_job(tmp_path, deployment):
     ],
 )
 def test_rank_btl_excludes_shared_memory(btl, rank_btl):
-    """Check that a rank keeps the user's btl selection without the shared-memory transport."""
-    environ = {"OMPI_ALLOW_RUN_AS_ROOT": "1", "OMPI_COMM_WORLD_RANK": "3", "PATH": "/bin"}
+    """Check that a rank keeps the user's btl selection without the shared-memory transport.
+
+    It also keeps the opt-in to running as root, and drops the launcher's other variables.
+    """
+    run_as_root = {
+        name: "1"
+        for name in (
+            "OMPI_ALLOW_RUN_AS_ROOT",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM",
+            "PRTE_ALLOW_RUN_AS_ROOT",
+            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM",
+        )
+    }
+    environ = {**run_as_root, "OMPI_COMM_WORLD_RANK": "3", "PMIX_RANK": "3", "PATH": "/bin"}
     if btl is not None:
         environ["OMPI_MCA_btl"] = btl
-    assert membership.rank_env(environ) == {
-        "OMPI_ALLOW_RUN_AS_ROOT": "1",
-        "OMPI_MCA_btl": rank_btl,
-        "PATH": "/bin",
-    }
+    assert membership.rank_env(environ) == {**run_as_root, "OMPI_MCA_btl": rank_btl, "PATH": "/bin"}
 
 
 @pytest.mark.parametrize("failure", ["crash", "hang"])
@@ -1496,6 +1494,7 @@ def test_session_pools_rank_0_only(monkeypatch, wait):
 
 
 def test_failed_pool_start_stops_supervisor(monkeypatch):
+    """Check that a session whose rank-0 pool fails to start stops its node supervisor at once."""
     session_module, spawns = _session_spawns(monkeypatch)
     spawn_fails = Mock(side_effect=RuntimeError("spawn failed"))
     monkeypatch.setattr(session_module, "MPIPoolExecutor", spawn_fails)

@@ -2280,6 +2280,42 @@ def test_previous_batch_applied_without_recovery():
     assert calls == ["update"]
 
 
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_v2_context_update_defers_commits_only_with_recovery(fault_tolerance):
+    """Without rank failure recovery each cache updates its context at once, as before."""
+    calls = []
+
+    def manager(name):
+        @contextmanager
+        def deferred_context_commits():
+            calls.append((name, "defer"))
+            yield f"{name} commits"
+
+        return types.SimpleNamespace(
+            update_context_resources=lambda batch: calls.append((name, "update")),
+            deferred_context_commits=deferred_context_commits,
+        )
+
+    caches = {name: manager(name) for name in ("self", "draft", "cross")}
+    executor = types.SimpleNamespace(
+        kv_cache_manager=caches["self"],
+        enable_joint_kv_cache_reuse=True,
+        draft_kv_cache_manager=caches["draft"],
+        resource_manager=types.SimpleNamespace(
+            get_resource_manager=lambda kind: (
+                caches["cross"] if kind == ResourceManagerType.CROSS_KV_CACHE_MANAGER else None
+            )
+        ),
+    )
+    context_commits = [] if fault_tolerance else None
+    PyExecutor._update_v2_context_resources(executor, Mock(), context_commits)
+    if not fault_tolerance:
+        assert calls == [(name, "update") for name in caches]
+        return
+    assert calls == [(name, step) for name in caches for step in ("defer", "update")]
+    assert context_commits == [(cache, f"{name} commits") for name, cache in caches.items()]
+
+
 def test_adp_running_counts_update_without_a_new_block_sample():
     """The final request count must update even inside the sampling interval."""
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
@@ -5014,7 +5050,7 @@ class TestPendingTransferResponseFlush:
         executor._adp_clear_packed_sync_state = Mock()
         executor._kv_connector_terminate_requests = Mock()
         executor._accept_or_discard_previous_batch = Mock()
-        executor._update_v2_context_resources_deferred = Mock()
+        executor._update_v2_context_resources = Mock()
         executor.iter_counter = 0
         monkeypatch.setattr(
             PyExecutor, "disagg", Mock(handle_errors_synced=Mock(return_value=False))
@@ -5024,7 +5060,7 @@ class TestPendingTransferResponseFlush:
         PyExecutor._executor_loop_overlap(executor)
 
         assert executor._accept_or_discard_previous_batch.call_count == int(fault_tolerance)
-        executor._update_v2_context_resources_deferred.assert_not_called()
+        executor._update_v2_context_resources.assert_not_called()
         if fault_tolerance:
             assert recovery.before_iteration.call_count == 2
 

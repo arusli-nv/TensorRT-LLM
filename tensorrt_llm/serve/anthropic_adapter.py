@@ -98,7 +98,9 @@ def anthropic_error_response(
     return JSONResponse(content=envelope.model_dump(exclude_none=True), status_code=status_code)
 
 
-def anthropic_error_type(status_code: int, code: Any = None) -> AnthropicErrorType:
+def anthropic_error_type(
+    status_code: int, code: Optional[Union[int, str]] = None
+) -> AnthropicErrorType:
     """Return the Anthropic error type of an OpenAI error response's HTTP status and ``code``.
 
     A rank failure is an overloaded_error, the type of a temporary failure that a retry can pass.

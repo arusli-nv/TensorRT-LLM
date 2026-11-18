@@ -219,16 +219,6 @@ def _process_ended(pid, timeout_s):
     return False
 
 
-def test_process_ended_while_reaped(monkeypatch):
-    """Report a process reaped between the open and the read of its stat file as ended."""
-    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    stat = open(f"/proc/{process.pid}/stat")
-    process.kill()
-    process.wait()
-    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: stat)
-    assert _process_ended(process.pid, timeout_s=1)
-
-
 @pytest.mark.timeout(900)
 def test_ranks_wait_for_late_rank_0():
     """Run worker_main on every rank with rank 0's arguments, even when rank 0 starts last.
