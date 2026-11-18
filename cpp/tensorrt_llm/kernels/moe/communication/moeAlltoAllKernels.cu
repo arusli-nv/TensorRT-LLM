@@ -256,6 +256,16 @@ __device__ __forceinline__ bool only_own_rows_valid(uint32_t incomplete_round, u
     return incomplete_round != 0 && incomplete_round != incomplete_round_value(combine_flag_value);
 }
 
+//! Load an incomplete-round word, which peers set with atomicCAS_system (mark_round_incomplete). The asm is volatile so
+//! that the load issues where the caller places it, next to the flag value load, and is not moved behind a later
+//! dependent load and branch.
+__device__ __forceinline__ uint32_t load_incomplete_round(uint32_t const* word)
+{
+    uint32_t value;
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(value) : "l"(word));
+    return value;
+}
+
 //! Return the incomplete-round word of `rank`. Requires ptrs.incomplete_round_offset != 0.
 __device__ __forceinline__ uint32_t* incomplete_round_word(DispatchKernelPointers const& ptrs, int rank)
 {
@@ -648,6 +658,16 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             }
         }
     };
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        // The mask is in its own allocation, so its load after the wait may miss in the L2 cache. Prefetching it here
+        // overlaps that miss with the grid dependency wait. A prefetch returns no value and does not fill the L1
+        // cache, so the load after the wait still reads the current mask.
+        if (thread_idx == 0)
+        {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(ptrs.active_rank_mask));
+        }
+    }
 
     if (local_num_tokens == 0)
     {
@@ -1247,6 +1267,11 @@ __device__ __forceinline__ void prepareCombine(uint8_t* combine_input_base, void
 
     // Block 0 advances the flag value concurrently, so this may read the round's dispatch or combine flag value.
     uint32_t const flag_value = *flag_val_ptr;
+    uint32_t incomplete = 0;
+    if constexpr (HAS_INCOMPLETE_ROUND)
+    {
+        incomplete = load_incomplete_round(incomplete_round);
+    }
     uint32_t const parity = round_parity(flag_value);
     int const* const round_recv_counters = recv_counters + parity * ep_size;
     if (blockIdx.x == 0 && threadIdx.x == 0)
@@ -1267,7 +1292,7 @@ __device__ __forceinline__ void prepareCombine(uint8_t* combine_input_base, void
         return;
     if constexpr (HAS_INCOMPLETE_ROUND)
     {
-        if (rank_idx != ep_rank && only_own_rows_valid(*incomplete_round, flag_value))
+        if (rank_idx != ep_rank && only_own_rows_valid(incomplete, flag_value))
             return;
     }
 
@@ -1607,11 +1632,16 @@ __device__ __forceinline__ void sanitizeExpertIds(int32_t* expert_ids_ptr, int32
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
     uint32_t const flag_value = *flag_val;
+    uint32_t incomplete = 0;
+    if constexpr (HAS_INCOMPLETE_ROUND)
+    {
+        incomplete = load_incomplete_round(incomplete_round);
+    }
     uint32_t const parity = round_parity(flag_value);
     bool invalid = token_idx >= recv_counters_ptr[parity * ep_size + source_rank];
     if constexpr (HAS_INCOMPLETE_ROUND)
     {
-        invalid = invalid || (source_rank != ep_rank && only_own_rows_valid(*incomplete_round, flag_value));
+        invalid = invalid || (source_rank != ep_rank && only_own_rows_valid(incomplete, flag_value));
     }
     if (invalid)
     {
