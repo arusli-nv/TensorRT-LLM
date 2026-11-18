@@ -324,8 +324,10 @@ class MembershipClient:
                 self._report = RankReport.model_validate({**self._report.model_dump(), **changes})
             try:
                 self._send_report()
-            except OSError:
-                pass
+            except OSError as error:
+                logger.debug(
+                    f"Membership client of rank {self.rank} could not send its report: {error!r}"
+                )
 
     def _wake(self) -> None:
         with self._lock:

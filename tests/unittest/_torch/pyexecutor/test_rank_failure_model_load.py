@@ -25,10 +25,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.distributed import mnnvl_memory
-from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import HANG_TIMEOUT_S, host_weights_prefix
-from tensorrt_llm._torch.distributed.mnnvl_host_exchange import HostExchangeMnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import SYNC_PROTOCOL_ENV
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import DeploymentHostWeights
 from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
@@ -75,30 +72,14 @@ _SERVING_TIMEOUT_S = int(2 * HANG_TIMEOUT_S)
         ({}, "kv_auto", "(kv_cache_config.use_kv_cache_manager_v2=True, not 'auto')"),
         # The executor creator turns it off after the arguments' validation in some modes.
         ({}, "overlap", "the overlap scheduler, which speculative decoding without overlap"),
-        ({}, "tp", "tensor_parallel_size equal to the world size"),
-        ({}, "cp", "context_parallel_size=1"),
-        ({}, "mnnvl", "multi-node NVLink (MNNVL) domain"),
-        ({}, "fabric", "fabric handles (GB200-class aarch64 nodes with IMEX"),
-        ({"TLLM_DISABLE_MPI": "1"}, "mpi", "the MPI orchestrator (TLLM_DISABLE_MPI unset)"),
         ({}, "architecture", "a model architecture in ['DeepseekV3ForCausalLM']"),
         ({}, "no_moe", "requires a model with MoE layers"),
     ],
 )
 def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix):
     """Check that each unsupported setup is refused with its reason and how to turn it off."""
-    from tensorrt_llm._torch.distributed import communicator
-
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setattr(
-        mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: lacks != "mnnvl")
-    )
-    monkeypatch.setattr(
-        HostExchangeMnnvlMemory,
-        "uses_fabric_handles",
-        classmethod(lambda cls, dev_id: lacks != "fabric"),
-    )
-    monkeypatch.setattr(communicator.torch.cuda, "current_device", lambda: 0)
     llm_args = SimpleNamespace(
         attention_dp_config=None,
         disable_overlap_scheduler=lacks == "overlap",
@@ -106,19 +87,8 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
             use_kv_cache_manager_v2={"kv_v2": False, "kv_auto": "auto"}.get(lacks, True)
         ),
     )
-    mapping = SimpleNamespace(
-        rank=0,
-        moe_ep_size=WORLD // 2 if lacks == "ep" else WORLD,
-        world_size=WORLD,
-        enable_attention_dp=True,
-        pp_size=1,
-        cp_size=2 if lacks == "cp" else 1,
-        tp_size=WORLD // 2 if lacks in ("tp", "cp") else WORLD,
-    )
+    mapping = SimpleNamespace(moe_ep_size=WORLD // 2 if lacks == "ep" else WORLD, world_size=WORLD)
     check = partial(check_supported, llm_args, mapping)
-    if lacks in ("tp", "cp", "mnnvl", "fabric", "mpi"):
-        # MnnvlDist.check_requirements checks the host collectives.
-        check = partial(MnnvlDist.check_requirements, mapping)
     if fix is None:
         check()
         return

@@ -15,8 +15,10 @@
 """Tests for RankFailureRecovery, which takes part in every membership change of one rank."""
 
 import contextlib
+import os
 import pickle
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -42,14 +44,17 @@ from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import (
     RENDEZVOUS_ENV,
     SHARED_SECRET_ENV,
+    MembershipClient,
     MembershipRecord,
     MembershipState,
     Reply,
     ResumeState,
     StoreGroup,
     UnsignedValueError,
+    liveness,
     next_epoch,
 )
+from tensorrt_llm._torch.distributed.membership.liveness import Lines
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
@@ -635,6 +640,32 @@ def test_pause_sends_paused_report_before_paused_call():
         assert r.client.reports == []
     finally:
         detector.stop()
+
+
+def test_disarm_completes_when_paused_report_fails(monkeypatch):
+    """Disarm the hang detector even if the paused report cannot reach the authority."""
+    logged = []
+    monkeypatch.setattr(liveness.logger, "debug", logged.append)
+    # A membership client whose liveness connection is closed, as after a lost authority.
+    client = MembershipClient(1, None, lambda record: None)
+    client._sock, client._lines = socket.socket(), Lines()
+    client._sock.close()
+    detector = HangDetector(timeout=600)
+    detector.start()
+    try:
+        detector.checkpoint()
+        r = _unstarted_rank(1)
+        r.executor.hang_detector = detector
+        r.recovery = RankFailureRecovery(r.executor, r.exchange, r.moe, r.store, STARTUP_MEMORY)
+        with patch.object(recovery_module, "membership_client", return_value=client):
+            r.recovery.start()
+        detector.disarm()
+        assert detector.paused()
+        assert len([text for text in logged if "could not send its report" in text]) == 1
+    finally:
+        detector.stop()
+        os.close(client._wake_read)
+        os.close(client._wake_write)
 
 
 # Dropping steps and continuing requests.

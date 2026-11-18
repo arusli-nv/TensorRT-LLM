@@ -33,8 +33,7 @@ MAX_RANKS = 256
 
 # The membership's timing. A report interval is shorter than a heartbeat interval, which is shorter
 # than the silence timeout, which is shorter than the hang timeout. The admission timeout is shorter
-# than the hang timeout too. The startup checks that the all-to-all kernels wait at least twice the
-# hang timeout.
+# than the hang timeout too. The all-to-all kernels must wait at least twice the hang timeout.
 
 # Long enough that a slow but healthy host step is not taken as a hang. A hang found during a
 # membership change can take a second timeout to remove, and twice this stays within

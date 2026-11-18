@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
@@ -92,8 +93,10 @@ class MoeExecutionState:
         self.abort = torch.zeros(
             int(_tllm_internal.thop.MOE_A2A_ABORT_STATE_WORDS),
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
+        if not self.abort.is_pinned():
+            raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_words = self.abort.numpy()[_ABORT_WORDS]
         self._workspaces: dict[
             MembershipWorkspace, tuple[Callable[[], None], Callable[[], None], torch.Tensor]

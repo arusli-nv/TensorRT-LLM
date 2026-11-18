@@ -18,6 +18,7 @@ The ranks run in threads of one process and exchange over rows of host memory.
 """
 
 import ctypes
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -47,7 +48,11 @@ from tensorrt_llm._torch.distributed.membership import (
 )
 from tensorrt_llm._torch.distributed.mnnvl_host_exchange import MnnvlHostExchangeGroup
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
-from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV, RankIdentity
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    TURN_FAULT_TOLERANCE_OFF,
+    RankIdentity,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -618,6 +623,44 @@ def test_allgather_array_zeroes_absent_ranks(monkeypatch):
 def test_node_ranks_follow_gpus_per_node(rank, local):
     dist = MnnvlDist(Mapping(world_size=6, rank=rank, gpus_per_node=4, tp_size=6))
     assert dist.local_world_size == local
+
+
+@pytest.mark.parametrize(
+    "lacks, requirement",
+    [
+        (None, None),
+        ("tp", "tensor_parallel_size equal to the world size"),
+        ("cp", "context_parallel_size=1"),
+        ("mnnvl", "multi-node NVLink (MNNVL) domain"),
+        ("fabric", "fabric handles (GB200-class aarch64 nodes with IMEX"),
+        ("mpi", "the MPI orchestrator (TLLM_DISABLE_MPI unset)"),
+    ],
+)
+def test_requirements_name_what_is_missing(monkeypatch, lacks, requirement):
+    """Check that each unmet requirement is named with how to turn fault tolerance off."""
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1" if lacks == "mpi" else "0")
+    monkeypatch.setattr(
+        mnnvl_memory.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: lacks != "mnnvl")
+    )
+    monkeypatch.setattr(
+        mnnvl_host_exchange.HostExchangeMnnvlMemory,
+        "uses_fabric_handles",
+        classmethod(lambda cls, dev_id: lacks != "fabric"),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    mapping = SimpleNamespace(
+        world_size=WORLD,
+        enable_attention_dp=True,
+        pp_size=1,
+        cp_size=2 if lacks == "cp" else 1,
+        tp_size=WORLD // 2 if lacks in ("tp", "cp") else WORLD,
+    )
+    if requirement is None:
+        MnnvlDist.check_requirements(mapping)
+        return
+    with pytest.raises(ValueError, match=re.escape(requirement)) as error:
+        MnnvlDist.check_requirements(mapping)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 @pytest.fixture

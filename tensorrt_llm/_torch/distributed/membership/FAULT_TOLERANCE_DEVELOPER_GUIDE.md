@@ -330,7 +330,9 @@ A change must keep all of these. Each has a test listed under [Testing](#testing
      `moeA2AIncompleteRoundSanitizeExpertIdsKernel`, which also take the rank and the word. In the kernel pointer
      structs the 4-word mask array becomes a mask pointer, an incomplete-round offset, an abort-state pointer and a
      reserved word, which keep the structs' size and the offset of `timeout_cycles` (static asserts); the dispatch
-     and combine fences gain a `"memory"` clobber.
+     and combine fences gain a `"memory"` clobber. The BF16 combine's reduce loop relies on all remote loads of an
+     iteration issuing before the first use of their data; check the SASS of `moeA2ACombineKernel` after changing
+     this loop.
      The ops take new optional arguments (`abort_state`, `barrier` on `moe_a2a_initialize`, `rank_mask` on the
      workspace layout), and the metainfo has one more field, 0 here.
    - `RankState` carries one more int, `num_in_transfer_requests`, in the attention-DP allgather: 0 except with

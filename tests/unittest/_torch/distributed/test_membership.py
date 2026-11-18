@@ -1563,6 +1563,22 @@ def test_send_report_sends_from_caller_after_tick(monkeypatch):
         assert threading.current_thread() not in [thread for thread, _ in sent[count:]]
 
 
+def test_send_report_on_closed_connection_returns(monkeypatch):
+    """Return from send_report without raising once the liveness connection is closed.
+
+    The hang detector sends the paused report as it disarms, which must not fail on a lost
+    authority. The client thread reports the lost connection instead.
+    """
+    logged = []
+    monkeypatch.setattr(liveness.logger, "debug", logged.append)
+    monkeypatch.setattr(liveness.MembershipClient, "_serve", lambda self: self._stop.wait())
+    with _scripted_client([]) as client:
+        client._sock.close()
+        client.send_report(idle=True)
+    (message,) = [text for text in logged if "could not send" in text]
+    assert message.startswith("Membership client of rank 0 could not send its report")
+
+
 def test_client_holds_first_record_after_start(monkeypatch):
     """Hold the authority's first record once start() returns, before the thread delivers it."""
     monkeypatch.setattr(liveness.MembershipClient, "_serve", lambda self: self._stop.wait())

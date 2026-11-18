@@ -157,7 +157,9 @@ struct CombineKernelPointers
 };
 
 // The kernels take these structs by value, followed by scalar arguments, so the rank-mask fields keep a fixed
-// kRankMaskWords-word slot and timeout_cycles stays the last field.
+// kRankMaskWords-word slot and timeout_cycles stays the last field. The parameter offsets of timeout_cycles and of
+// the scalar arguments do not depend on the rank-mask fields, and neither does the generated code of the kernels
+// without a rank mask.
 static_assert(offsetof(DispatchKernelPointers, timeout_cycles)
     == offsetof(DispatchKernelPointers, active_rank_mask) + kRankMaskWords * sizeof(uint64_t));
 static_assert(sizeof(DispatchKernelPointers) == offsetof(DispatchKernelPointers, timeout_cycles) + sizeof(int64_t));
