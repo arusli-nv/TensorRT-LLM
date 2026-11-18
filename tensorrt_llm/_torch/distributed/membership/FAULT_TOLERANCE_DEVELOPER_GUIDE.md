@@ -101,6 +101,9 @@ node 0                                            node i
 
 - Every rank is its own one-process MPI world (Open MPI's shared-memory transport off, `records.rank_env`), so a
   failed rank restarts alone. The launcher's MPI job only places the node supervisors.
+- A rank's startup sets the hang detector's `TLLM_RANK_CRASH_HARD_KILL_GRACE` to -1
+  (`startup._turn_off_rank_crash_kill`), so a crashed rank ends only itself and the membership removes it. A user
+  value that keeps the kill on is replaced, with one warning that names the variable.
 - The startup group runs over the rendezvous store (`StoreGroup` as `mpi_comm()`); the host collectives of
   `Distributed` run in `MnnvlDist` over MNNVL memory. No MPI or NCCL communicator spans ranks.
 - A rank ends with its node supervisor: every rank is started through `_exec_rank`, which arms the parent-death
@@ -398,7 +401,8 @@ rejoin of its replacement (`test_rank_failure_sequence[crash]`), a crash then a 
 install, a second failure during a failover that the spare slots cannot cover (the deployment ends), rejoins when the
 server spawns the ranks and through two frontends, the authority's loss, and shutdowns during an admission and after
 a rank was given up. No CI test covers several nodes: the loss of a whole node under `mpirun --enable-recovery` and
-its return with `trtllm-llmapi-launch --rejoin-node` were verified on DeepSeek-R1 over 16 GPUs (4 nodes).
+its return were verified on DeepSeek-R1 over 16 GPUs (4 nodes) by running the node supervisor's `--rejoin`
+directly; the `trtllm-llmapi-launch --rejoin-node` launcher option itself is not yet run.
 
 ```bash
 pytest tests/unittest/_torch/distributed tests/unittest/llmapi/test_node_supervisor.py

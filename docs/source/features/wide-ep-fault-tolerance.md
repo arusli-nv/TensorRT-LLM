@@ -13,7 +13,8 @@ A rank fails when its process exits, or when it makes no progress for 60 s while
 
 ```{warning}
 Wide-EP fault tolerance is a prototype and is subject to change. CI tests it on one GB200 NVL72 node (4 ranks).
-Several nodes, the loss of a whole node and `--rejoin-node` were verified on DeepSeek-R1 over 16 GPUs, with no CI test.
+Several nodes and the loss and rejoin of a whole node were verified on DeepSeek-R1 over 16 GPUs, with no CI test,
+by running the node supervisor's `--rejoin` directly; the `--rejoin-node` launcher option itself is not yet run.
 ```
 
 ## Requirements
