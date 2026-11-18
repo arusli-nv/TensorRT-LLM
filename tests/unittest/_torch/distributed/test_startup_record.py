@@ -304,7 +304,12 @@ def _diverging_startup_call(record):
 
 
 def test_divergence_names_the_diverging_call():
-    record = _replacement_record()
+    original = StartupRecord()
+    original.record()
+    original.exchange(0, pickle.dumps(100), None, lambda: _allgather(100))
+    original.close()
+    record = StartupRecord()
+    record.replay(original.published())
     with pytest.raises(ReplacementCannotStart, match="payload .* differs") as failure:
         _diverging_startup_call(record)
     message = str(failure.value)
