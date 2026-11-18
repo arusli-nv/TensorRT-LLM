@@ -18,7 +18,7 @@ A replacement rank starts while the other ranks serve, so it cannot run the star
 with them. Yet it must reach the same results, such as the KV cache capacity and the clock offset,
 so that its CUDA graphs and buffers match theirs. Rank 0 records the result of each host collective
 of ``MnnvlDist`` in call order. A replacement replays the record instead of running the collectives.
-At each call it checks that its own payload matches its predecessor's and fails with
+At each call it checks that its own payload and reduction match its predecessor's and fails with
 ``REPLACEMENT_CANNOT_START`` at the first divergence.
 
 The callers reach the record through ``Distributed``, whose other implementations run every
@@ -66,15 +66,21 @@ def diverged(reason: str) -> ReplacementCannotStart:
 
 
 class RecordedExchange(NamedTuple):
-    """A startup collective's :meth:`StartupRecord.rank_varying` block and every rank's payload."""
+    """A startup collective's :meth:`StartupRecord.rank_varying` block, every rank's payload and
+    its reduction (``"min"``, ``"max"`` or None)."""
 
     rank_varying: Optional[str]
     payloads: List[Optional[bytes]]
+    reduction: Optional[str]
 
 
 def _describe(index: int, rank_varying: Optional[str]) -> str:
     collective = f"host collective {index}"
     return collective if rank_varying is None else f"{collective} ({rank_varying})"
+
+
+def _describe_reduction(reduction: Optional[str]) -> str:
+    return "no min or max reduction" if reduction is None else f"a {reduction} reduction"
 
 
 class StartupRecord:
@@ -300,11 +306,12 @@ class StartupRecord:
                 original ranks' result.
         """
         rank_varying = self._rank_varying
+        reduction = None if reduce_op is None else reduce_op.__name__
         if self._recording:
             payloads = run()
             recorded = list(payloads)
             recorded[rank] = payload
-            self.exchanges.append(RecordedExchange(rank_varying, recorded))
+            self.exchanges.append(RecordedExchange(rank_varying, recorded, reduction))
             return payloads
         index = self._replayed_exchanges
         collective = _describe(index, rank_varying)
@@ -318,6 +325,12 @@ class StartupRecord:
             raise diverged(
                 f"The startup of this replacement rank makes {collective}, the original ranks' "
                 f"{_describe(index, recorded.rank_varying)}"
+            )
+        if recorded.reduction != reduction:
+            raise diverged(
+                f"The startup of this replacement rank makes {collective} as "
+                f"{_describe_reduction(reduction)}, the original ranks as "
+                f"{_describe_reduction(recorded.reduction)}"
             )
         payloads = recorded.payloads
         predecessor = payloads[rank]

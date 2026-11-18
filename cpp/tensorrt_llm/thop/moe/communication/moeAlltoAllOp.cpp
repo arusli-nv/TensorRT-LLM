@@ -1234,8 +1234,8 @@ void moeA2ACheckIncompleteRoundOp(
         reinterpret_cast<uint32_t const*>(rankWorkspace + offsets[INCOMPLETE_ROUND_OFFSET_INDEX]),
         resolveAbortState(abortState), at::cuda::getCurrentCUDAStream());
     cudaError_t result = cudaGetLastError();
-    TORCH_CHECK(result == cudaSuccess, "moe_a2a_check_incomplete_round kernel launch failed: ",
-        cudaGetErrorString(result));
+    TORCH_CHECK(
+        result == cudaSuccess, "moe_a2a_check_incomplete_round kernel launch failed: ", cudaGetErrorString(result));
 }
 
 // Return a workspace-backed tensor for combine payload region using from_blob

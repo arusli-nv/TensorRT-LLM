@@ -36,7 +36,7 @@ from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDis
 from tensorrt_llm._torch.distributed.membership import REPLACEMENT_CANNOT_START, startup
 from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
 from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
-from tensorrt_llm._torch.pyexecutor import py_executor
+from tensorrt_llm._torch.pyexecutor import _util, py_executor
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
     DecoderWarmup,
@@ -386,6 +386,94 @@ def test_replacement_replays_paused_clock_calibration(monkeypatch):
     assert _calibrate_steady_clock(replacement, 500.0, monkeypatch) == -REPLACED
     assert replacement.host_exchange.calls == 0
     _record().close()
+
+
+def _kv_cache_budget_vote(failed):
+    return _util._any_rank_failed(failed, SimpleNamespace(world_size=WORLD))
+
+
+def _final_kv_cache_token_sync(dist):
+    """Make the token sync of the final KV cache build, a minimum reduction."""
+    return dist.allreduce(4096, op=ReduceOp.MIN)
+
+
+def test_replacement_takes_paused_kv_cache_budget_vote(distributed):
+    """Check that a replacement, which skips the KV cache estimation, takes the original ranks' vote."""
+    distributed.dist = _rank_0()
+    communicator.Distributed.pause_startup_record()
+    assert not _kv_cache_budget_vote(False)
+    with patch.object(AutoTuner, "get", return_value=_new_autotuner()):
+        communicator.Distributed.resume_startup_record()
+    assert _final_kv_cache_token_sync(distributed.dist) == 4096
+    published = _publish()
+    distributed.dist = _replacement(published)
+    assert not _kv_cache_budget_vote(False)
+    assert _final_kv_cache_token_sync(distributed.dist) == 4096
+    assert distributed.dist.host_exchange.calls == 0
+    _record().close()
+    distributed.dist = _replacement(published)
+    assert _kv_cache_budget_vote(True)
+
+
+def test_replacement_takes_kv_cache_budget_vote_without_estimation(distributed):
+    """Check the vote of original ranks that skip the KV cache estimation too."""
+    distributed.dist = _rank_0()
+    assert not _kv_cache_budget_vote(False)
+    assert _final_kv_cache_token_sync(distributed.dist) == 4096
+    assert list(_record().values) == ["kv_cache_budget_failed"]
+    assert len(_record().exchanges) == 1
+    distributed.dist = _replacement(_publish())
+    assert not _kv_cache_budget_vote(False)
+    assert _final_kv_cache_token_sync(distributed.dist) == 4096
+    _record().close()
+
+
+def test_replacement_votes_only_where_original_ranks_did(distributed):
+    """Stop a replacement that votes on a KV cache budget the original ranks never voted on."""
+    distributed.dist = _rank_0()
+    _final_kv_cache_token_sync(distributed.dist)
+    distributed.dist = _replacement(_publish())
+    with pytest.raises(
+        ReplacementCannotStart, match="kv_cache_budget_failed 1 times, the original ranks 0 times"
+    ):
+        _kv_cache_budget_vote(False)
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True], ids=["off", "rank_1"])
+def test_kv_cache_budget_vote_runs_on_other_ranks(distributed, monkeypatch, fault_tolerance):
+    """Check that without fault tolerance, and on an original rank other than 0, every rank votes."""
+    if not fault_tolerance:
+        monkeypatch.setattr(communicator.Distributed, "startup_record", None)
+    failed_rank_3 = FakeHostExchange(1, peers=lambda r, obj: int(r == 3))
+    distributed.dist = _dist(1, failed_rank_3)
+    assert _kv_cache_budget_vote(False)
+    assert failed_rank_3.calls == 1
+    distributed.dist = _dist(1, FakeHostExchange(1))
+    assert not _kv_cache_budget_vote(False)
+    if fault_tolerance:
+        assert _record().published() == {"values": {}, "exchanges": []}
+
+
+def _failure_vote(dist):
+    return dist.allreduce(0, op=ReduceOp.MAX)
+
+
+def test_replacement_refuses_another_reduction():
+    """Stop a replacement whose collective replays a recorded reduction by another operation."""
+    _final_kv_cache_token_sync(_rank_0())
+    published = _publish()
+    with pytest.raises(
+        ReplacementCannotStart,
+        match="collective 0 as a max reduction, the original ranks as a min reduction",
+    ) as failure:
+        _failure_vote(_replacement(published))
+    assert failure.value.code == REPLACEMENT_CANNOT_START
+    assert "in _failure_vote" in str(failure.value)
+    with pytest.raises(
+        ReplacementCannotStart,
+        match="collective 0 as no min or max reduction, the original ranks as a min reduction",
+    ):
+        _replacement(published).allgather(4096)
 
 
 def _kv_load_sample(dist, sample):
