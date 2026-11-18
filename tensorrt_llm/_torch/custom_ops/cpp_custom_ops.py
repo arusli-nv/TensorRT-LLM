@@ -930,6 +930,15 @@ def _register_fake():
     ) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::moe_a2a_check_incomplete_round")
+    def _(
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        ep_rank: int,
+        abort_state: torch.Tensor,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,

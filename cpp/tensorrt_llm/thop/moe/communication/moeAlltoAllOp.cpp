@@ -1218,6 +1218,26 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
         runtime_max_tokens_per_rank, top_k, at::cuda::getCurrentCUDAStream());
 }
 
+// Op: moe_a2a_check_incomplete_round
+void moeA2ACheckIncompleteRoundOp(
+    torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, torch::Tensor& abortState)
+{
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2 && epRank >= 0 && epRank < workspace.size(0),
+        "workspace must be [ep_size, size_per_rank] and contain epRank");
+    auto const& offsets = readWorkspaceLayout(metainfo);
+    TORCH_CHECK(hasIncompleteRoundWord(offsets), "the workspace layout has no incomplete-round word (rank_mask)");
+
+    uint8_t const* rankWorkspace = workspace.const_data_ptr<uint8_t>() + epRank * workspace.stride(0);
+    tensorrt_llm::kernels::moe_comm::moe_a2a_check_incomplete_round_launch(
+        reinterpret_cast<uint32_t const*>(rankWorkspace + offsets[INCOMPLETE_ROUND_OFFSET_INDEX]),
+        resolveAbortState(abortState), at::cuda::getCurrentCUDAStream());
+    cudaError_t result = cudaGetLastError();
+    TORCH_CHECK(result == cudaSuccess, "moe_a2a_check_incomplete_round kernel launch failed: ",
+        cudaGetErrorString(result));
+}
+
 // Return a workspace-backed tensor for combine payload region using from_blob
 torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, torch::Tensor const& metainfo,
     int64_t epRank, int64_t epSize, int64_t runtimeMaxTokensPerRank, c10::ScalarType outDtype, int64_t hiddenSize)
@@ -1290,6 +1310,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
     module.def(
+        "moe_a2a_check_incomplete_round(Tensor workspace, Tensor metainfo, int ep_rank, Tensor(a!) abort_state) -> ()");
+    module.def(
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, Tensor metainfo, int ep_rank, int ep_size, "
         "int runtime_max_tokens_per_rank, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
@@ -1314,6 +1336,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_combine", &tensorrt_llm::torch_ext::moe_comm::moeA2ACombineOp);
     module.impl("moe_a2a_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2AInitializeOp);
     module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
+    module.impl("moe_a2a_check_incomplete_round", &tensorrt_llm::torch_ext::moe_comm::moeA2ACheckIncompleteRoundOp);
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
 }

@@ -336,16 +336,18 @@ A change must keep all of these. Each has a test listed under [Testing](#testing
      `cuMemSetAccess` unmaps its range; and MNNVL handle release skips released handles.
    - One new error: a rank that a node supervisor started (`TLLM_FAULT_TOLERANCE_RANK` set) with the flag off is
      rejected.
-2. **Healthy FT on costs about 1% per decode step** (+0.95% on DeepSeek-R1 over 16 GPUs, +1.11% with online EPLB),
-   from the all-to-all kernels: the rank mask and incomplete-round loads after the grid dependency wait, and the
-   combine kernel's end-of-round check in every block. On the same deployment output throughput is about 3% lower
-   (-2.98%): about 1% from the per-step cost, about 1% from more decode stalls, whose cause is open, and about 1% not
-   yet attributed.
-   Abort polls run only inside waits. A planned follow-up loads the mask before the grid dependency wait and replaces
-   the per-block check with one check per forward. The attention-DP forward vote is `RankFailureRecovery.forward_vote`
-   in place of the default vote: one gather over the active ranks of the batch size plus two flags (a change not yet
-   installed, a memory release). The host collectives run over MNNVL. Reports, heartbeats and status reads run on
-   their own threads. A new per-step host step needs a measured budget.
+2. **Healthy FT on adds work to every all-to-all call and once per step.** Per call, the kernels load the rank mask
+   and the incomplete-round word after the grid dependency wait. Once per step, `RankFailureRecovery.check_step` runs
+   the incomplete-round check after the forward: one `fence.sc.sys` and one load of the word per workspace. A peer
+   that may overwrite rows that a combine still reads first sets the reader's word and runs `fence.sc.sys`, so a
+   reader-side `fence.sc.sys` that follows the step's last combine orders every combine of the step against that
+   overwrite, and the combines themselves need no fence. The word stays set until `rearm`, so a round cut short
+   outside a step's forward (warmup) is reported by the next step's check.
+   Abort polls run only inside waits. A planned follow-up loads the mask before the grid dependency wait. The
+   attention-DP forward vote is `RankFailureRecovery.forward_vote` in place of the default vote: one gather over the
+   active ranks of the batch size plus two flags (a change not yet installed, a memory release). The host collectives
+   run over MNNVL. Reports, heartbeats and status reads run on their own threads. A new per-step host step needs a
+   measured budget.
 3. **The authority is the only source of membership.** Ranks, node supervisors and the server follow its records; a
    rank never removes a peer on its own.
 4. **Never consume an incomplete round.** A step whose all-to-all an abort cut short is not accepted (`accept_step`,

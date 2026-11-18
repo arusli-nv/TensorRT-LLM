@@ -51,5 +51,8 @@ def test_moe_a2a_fake_ops_accept_every_schema_argument():
         output = torch.ops.trtllm.moe_a2a_combine(
             recv[0], max_tokens, *layout, offset, *combine_options, **rank_mask
         )
+        torch.ops.trtllm.moe_a2a_check_incomplete_round(
+            workspace, metainfo, ep_rank, rank_mask["abort_state"]
+        )
     assert recv[0].shape == (ep_size, max_tokens, hidden)
     assert output.shape == (max_tokens, hidden)

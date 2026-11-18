@@ -17,7 +17,8 @@
 When a peer stops, ``request_abort`` releases the collectives that wait for it. Then, with the model
 idle, ``rearm`` returns the bound workspaces and layers to their first round, and ``install_mask``
 writes the new rank mask. Long waits on peers publish the round flag they wait for in the abort
-state (``waited_flags``).
+state (``waited_flags``). After each forward, ``check_incomplete_rounds`` marks the abort state
+cancelled if a peer may have overwritten rows that the forward's combines read.
 """
 
 from __future__ import annotations
@@ -97,7 +98,9 @@ class MoeExecutionState:
         if not self.abort.is_pinned():
             raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_flags = self.abort.numpy()[_ABORT_FLAGS]
-        self._workspaces: dict[MembershipWorkspace, tuple[Callable[[], None], torch.Tensor]] = {}
+        self._workspaces: dict[
+            MembershipWorkspace, tuple[Callable[[], None], Callable[[], None], torch.Tensor]
+        ] = {}
         self._layer_resets: list[Callable[[], None]] = []
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
@@ -121,14 +124,16 @@ class MoeExecutionState:
         self,
         workspace: MembershipWorkspace,
         reset_workspace: Callable[[], None],
+        check_incomplete_round: Callable[[], None],
         rows: torch.Tensor,
     ) -> None:
         """Register a bound layer's workspace, once per workspace that layers share.
 
-        ``reset_workspace`` resets this rank's row of it, and ``rows`` is the workspace's
-        ``[ep_size, bytes]`` uint8 view.
+        ``reset_workspace`` resets this rank's row of it, ``check_incomplete_round`` enqueues the
+        check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`), and
+        ``rows`` is the workspace's ``[ep_size, bytes]`` uint8 view.
         """
-        self._workspaces.setdefault(workspace, (reset_workspace, rows))
+        self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round, rows))
 
     def staging_workspace(self) -> torch.Tensor:
         """Return the rows of the largest bound workspace.
@@ -136,7 +141,7 @@ class MoeExecutionState:
         The workspace is idle from :meth:`remap_workspaces` until :meth:`rearm`, so restores may
         stage expert weights through it.
         """
-        return max((rows for _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1])
+        return max((rows for _, _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1])
 
     def workspace_bytes(self) -> int:
         """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
@@ -165,6 +170,17 @@ class MoeExecutionState:
         """Return whether an abort was requested or a collective aborted since the last :meth:`rearm`."""
         return bool(self._abort_flags.any())
 
+    def check_incomplete_rounds(self) -> None:
+        """Enqueue the check of this rank's incomplete-round word in every bound workspace.
+
+        A peer sets the word before it overwrites rows that this rank's combines may have read, and
+        the check then marks the abort state cancelled, so :meth:`aborted` holds. Call once per
+        forward, on the stream of its last combine, before the event that the host waits on to
+        accept the forward.
+        """
+        for _, check_incomplete_round, _ in self._workspaces.values():
+            check_incomplete_round()
+
     def waited_flags(self) -> dict[int, int]:
         """Return each EP rank that a kernel has long waited on, with the round flag it waits for."""
         # The abort state stores the uint32 flags in int32 words.
@@ -182,7 +198,7 @@ class MoeExecutionState:
         """
         torch.cuda.synchronize(self._device)
         self.abort.zero_()
-        for reset_workspace, _ in self._workspaces.values():
+        for reset_workspace, _, _ in self._workspaces.values():
             reset_workspace()
         for reset_state in self._layer_resets:
             reset_state()

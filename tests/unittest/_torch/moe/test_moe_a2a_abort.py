@@ -190,13 +190,20 @@ def test_aborted_dispatch_uses_no_rows_of_unconfirmed_peers(
     torch.testing.assert_close(output, payload, rtol=0, atol=0)
 
 
+def _check_incomplete_round(workspace, meta, abort, rank=0) -> None:
+    """Run the incomplete-round check of ``rank`` that follows a forward."""
+    torch.ops.trtllm.moe_a2a_check_incomplete_round(workspace, meta, rank, abort)
+    _finish(abort, f"rank {rank}'s incomplete-round check did not finish")
+
+
 @pytest.mark.parametrize("peer_aborts", [False, True], ids=["healthy", "peer_aborts"])
-def test_combine_cancels_on_overwritten_peer_rows(peer_aborts: bool) -> None:
-    """A combine that read rows a peer overwrote after an aborted dispatch records a cancel.
+def test_incomplete_round_check_cancels_on_overwritten_peer_rows(peer_aborts: bool) -> None:
+    """The check after a combine that read rows a peer overwrote after an aborted dispatch records a cancel.
 
     Rank 0's tokens go to rank 1, whose MoE output is its combine input region, as with zero-copy
     combine. Rank 1 completes its round before rank 0 combines it. With ``peer_aborts``, rank 1
-    then aborts its next dispatch and overwrites that region like its next MoE.
+    then aborts its next dispatch and overwrites that region like its next MoE. The combine
+    records nothing; the check that follows the forward records the cancel.
     """
     workspace, meta, experts, payload = a2a_workspace(2)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 1, 2, barrier=False)
@@ -223,6 +230,8 @@ def test_combine_cancels_on_overwritten_peer_rows(peer_aborts: bool) -> None:
     _finish(abort, "rank 0's combine waited for rank 1")
     expected = torch.full_like(payload, -1) if peer_aborts else payload
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert abort[:2].tolist() == [0, 0]
+    _check_incomplete_round(workspace, meta, abort)
     assert abort[:2].tolist() == [0, int(peer_aborts)]
 
 
@@ -230,7 +239,8 @@ def test_own_round_value_keeps_peer_rows() -> None:
     """A word holding the round's own combine value keeps peer rows valid in the sanitize and the prepare.
 
     A peer whose combine of this round aborted stores that value with its next dispatch. The combine then
-    exchanges with every peer, so the rows it publishes must hold the peers' tokens, and it records a cancel.
+    exchanges with every peer, so the rows it publishes must hold the peers' tokens, and the check
+    after it records a cancel.
     """
     workspace, meta, experts, payload = a2a_workspace(2)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 1, 2, barrier=False)
@@ -259,6 +269,8 @@ def test_own_round_value_keeps_peer_rows() -> None:
     # The combine published its readiness to rank 0, so it exchanged with every peer.
     ready = _word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS") + 4)
     assert ready.item() == dispatch_flag + 1
+    assert peer_abort[:2].tolist() == [0, 0]
+    _check_incomplete_round(workspace, meta, peer_abort, rank=1)
     assert peer_abort[:2].tolist() == [0, 1]
 
 

@@ -1005,6 +1005,11 @@ class RankFailureRecovery:
             or request.py_additional_outputs
         ]
 
+    def check_step(self) -> None:
+        """Enqueue, after a forward and ahead of its sampler event, the all-to-all check that
+        :meth:`accept_step` reads: whether a peer may have overwritten rows that the forward read."""
+        self._moe.check_incomplete_rounds()
+
     def accept_step(self, batch: BatchState) -> bool:
         """Wait until the step of ``batch`` is sampled and return whether it completed.
 

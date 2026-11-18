@@ -11505,6 +11505,9 @@ class PyExecutor:
                 if self._finish_inforward_snapshots:
                     self.kv_cache_manager.finish_inforward_snapshots(
                         scheduled_requests)
+                # Ahead of the sampler event, which accept_step waits for.
+                if self.rank_failure_recovery is not None:
+                    self.rank_failure_recovery.check_step()
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.

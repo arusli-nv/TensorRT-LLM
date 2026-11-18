@@ -56,7 +56,9 @@ struct MoeA2AAbortState
     static constexpr int32_t kCancelled = 1;
 
     int32_t requested;
-    int32_t status; // kCancelled once a kernel stopped waiting because of `requested`, 0 otherwise
+    // kCancelled once a kernel stopped waiting because of `requested`, or the incomplete-round check found the word
+    // set, 0 otherwise
+    int32_t status;
     // Per peer, the round flag value that a long wait on the peer waits for, 0 otherwise
     uint32_t waited_flag[kMaxRanks];
 };
@@ -67,10 +69,10 @@ struct MoeA2AAbortState
 // While it is nonzero, every later collective of this rank exchanges with this rank only, so no peer reads rows of an
 // incomplete round. The MoE after a dispatch may still overwrite rows of this rank that an active peer's fence combine
 // reads. So a fence dispatch that aborts, or that starts with the word set, first stores the value in the word of
-// every active rank, and a fence combine that finds its word set after reading peer rows marks the abort state
-// cancelled. The incomplete-round value of round N's combine, which round N + 1's dispatch shares, is ignored within
-// round N: this rank's combine or a peer's next dispatch may store it during the round, and the prepare, the sanitize
-// and every block of the combine must exchange with the same peers.
+// every active rank, and a check after each forward that finds its word set marks the abort state cancelled
+// (moe_a2a_check_incomplete_round_launch). The incomplete-round value of round N's combine, which round N + 1's
+// dispatch shares, is ignored within round N: this rank's combine or a peer's next dispatch may store it during the
+// round, and the prepare, the sanitize and every block of the combine must exchange with the same peers.
 
 // Describes a single payload type to be communicated
 struct PayloadDescriptor
@@ -289,6 +291,11 @@ struct MoeA2ACombineParams
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
+
+// Mark `abort` cancelled if the incomplete-round word (see above) is set, ordered after every earlier fence combine in
+// `stream`. Launch once per forward, after its last combine.
+void moe_a2a_check_incomplete_round_launch(
+    uint32_t const* incomplete_round, MoeA2AAbortState* abort, cudaStream_t stream);
 
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)

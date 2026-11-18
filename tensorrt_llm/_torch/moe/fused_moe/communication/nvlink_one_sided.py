@@ -954,13 +954,24 @@ class NVLinkOneSided(Communication):
                 f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
             )
         state.register_layer(self.reset_state)
-        state.register_workspace(self.mnnvl_mem, self._reset_local_workspace, self.workspace)
+        state.register_workspace(
+            self.mnnvl_mem,
+            self._reset_local_workspace,
+            self._check_incomplete_round,
+            self.workspace,
+        )
         self.execution_state = state
 
     def _reset_local_workspace(self) -> None:
         """Return this rank's row of the workspace to its first round, without a barrier."""
         torch.ops.trtllm.moe_a2a_initialize(
             self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, barrier=False
+        )
+
+    def _check_incomplete_round(self) -> None:
+        """Enqueue the check of this rank's incomplete-round word in the workspace."""
+        torch.ops.trtllm.moe_a2a_check_incomplete_round(
+            self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.execution_state.abort
         )
 
     def _rank_mask_args(self) -> Dict[str, Optional[torch.Tensor]]:

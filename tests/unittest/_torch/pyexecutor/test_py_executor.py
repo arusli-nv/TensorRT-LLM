@@ -257,6 +257,26 @@ def test_forward_step_finishes_inforward_snapshots_before_the_stream_handoff():
     assert calls == [("finish", batch), "handoff"]
 
 
+def test_forward_step_checks_incomplete_rounds_before_the_stream_handoff():
+    """Under rank failure recovery, the all-to-all check is enqueued after the forward and before
+    the stream handoff, so the batch's sampler event, which accept_step waits for, follows it."""
+    calls = []
+
+    def forward(*args, **kwargs):
+        calls.append("forward")
+        return {"logits": None}
+
+    engine = Mock(route_capture=None)
+    engine.forward.side_effect = forward
+    executor = _forward_step_executor(engine)
+    executor.rank_failure_recovery = Mock(check_step=lambda: calls.append("check"))
+    executor._stream_ordering_events[1].record.side_effect = lambda stream: calls.append("handoff")
+
+    _run_forward_step(executor, ScheduledRequests())
+
+    assert calls == ["forward", "check", "handoff"]
+
+
 def test_forward_step_keeps_draft_len_when_forward_fails():
     engine = Mock(route_capture=None)
     engine.forward.side_effect = RuntimeError("decoder failure")

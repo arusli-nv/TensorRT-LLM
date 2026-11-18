@@ -263,8 +263,9 @@ __device__ __forceinline__ uint32_t* incomplete_round_word(DispatchKernelPointer
         reinterpret_cast<uint8_t*>(ptrs.completion_flags[rank]) + ptrs.incomplete_round_offset);
 }
 
-//! Store `value` in the incomplete-round word of every rank in `rank_mask` whose word is 0, visible to the peers
-//! before any later write of this rank to rows that they may read.
+//! Store `value` in the incomplete-round word of every rank in `rank_mask` whose word is 0, then fence.sc.sys before
+//! any later write of this rank to rows that the peers may read. The fence pairs with the fence.sc.sys of the
+//! incomplete-round check that each peer runs after its forward (moeA2ACheckIncompleteRoundKernel).
 __device__ __forceinline__ void mark_round_incomplete(
     DispatchKernelPointers const& ptrs, uint64_t const (&rank_mask)[kRankMaskWords], int ep_size, uint32_t value)
 {
@@ -276,11 +277,7 @@ __device__ __forceinline__ void mark_round_incomplete(
             atomicCAS_system(incomplete_round_word(ptrs, rank), 0U, value);
         }
     }
-#if TLLM_MOE_A2A_COMPILE_SM90
-    asm volatile("fence.release.sys;" ::: "memory");
-#else
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
-#endif
+    asm volatile("fence.sc.sys;" ::: "memory");
 }
 
 // Each A2A round uses two consecutive flag values: 2N + 1 for dispatch and
@@ -1436,7 +1433,8 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         aborted = __syncthreads_or(aborted);
         if (aborted && threadIdx.x == 0)
         {
-            atomicCAS(ptrs.incomplete_round, 0U, incomplete_round_value(*ptrs.flag_val));
+            // System scope, as the peers mark this word over NVLink with atomicCAS_system (mark_round_incomplete).
+            atomicCAS_system(ptrs.incomplete_round, 0U, incomplete_round_value(*ptrs.flag_val));
         }
     }
     else
@@ -1452,31 +1450,6 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
     // After an abort, reduce only this rank's own rows, which this round wrote, so that the discarded output is finite.
     vectorized_combine<TOP_K, T, InputT, ENABLE_RANK_MASK>(
         token_output, size_per_token, stride_per_token, ptrs, aborted ? rank_id : only_rank);
-    if constexpr (ENABLE_RANK_MASK)
-    {
-        // A peer sets this rank's incomplete-round word before it overwrites rows that this block may have read.
-        // ptrs.abort is a kernel argument, so the whole block takes this branch or skips it. The reduction's payload
-        // reads are weak loads, which the PTX memory model does not order before this check; it relies on them being
-        // complete when the block passes the barrier.
-        if (ptrs.abort != nullptr)
-        {
-            __syncthreads();
-            if (threadIdx.x == 0)
-            {
-#if TLLM_MOE_A2A_COMPILE_SM90
-                asm volatile("fence.acquire.sys;" ::: "memory");
-#else
-                asm volatile("fence.acq_rel.sys;" ::: "memory");
-#endif
-                uint32_t incomplete;
-                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(incomplete) : "l"(ptrs.incomplete_round) : "memory");
-                if (incomplete != 0)
-                {
-                    record_cancelled(ptrs.abort);
-                }
-            }
-        }
-    }
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -1588,6 +1561,28 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             });
         });
     });
+}
+
+// A peer that may overwrite rows that this rank's fence combines read first stores this rank's incomplete-round word,
+// then runs fence.sc.sys (mark_round_incomplete). This kernel runs after those combines in stream order, so the two
+// fences decide in Fence-SC order: either the load below returns the word set, or every payload read of the combines
+// precedes the overwrite in causality order and cannot return it.
+__global__ void moeA2ACheckIncompleteRoundKernel(uint32_t const* incomplete_round, MoeA2AAbortState* abort)
+{
+    asm volatile("fence.sc.sys;" ::: "memory");
+    uint32_t incomplete;
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(incomplete) : "l"(incomplete_round) : "memory");
+    if (incomplete != 0)
+    {
+        record_cancelled(abort);
+    }
+}
+
+void moe_a2a_check_incomplete_round_launch(
+    uint32_t const* incomplete_round, MoeA2AAbortState* abort, cudaStream_t stream)
+{
+    // Without programmatic dependent launch, the kernel starts only after all earlier work in the stream completed.
+    moeA2ACheckIncompleteRoundKernel<<<1, 1, 0, stream>>>(incomplete_round, abort);
 }
 
 // Sanitize expert ids for invalid tokens.
