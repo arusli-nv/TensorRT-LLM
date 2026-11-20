@@ -604,5 +604,34 @@ def test_shutdown_stops_cpp_before_closing_host_weights(
     assert order == ["C++ shutdown", "host weights closed"]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("architecture", [
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+])
+def test_minimax_m3_creates_moe_load_balancer(
+        architecture: str, mock_runtime: MagicMock) -> None:
+    """MiniMax-M3 and its VL wrapper set up EPLB under expert parallelism."""
+    mapping = Mapping(world_size=4,
+                      rank=1,
+                      tp_size=4,
+                      moe_ep_size=4,
+                      enable_attention_dp=True)
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(architectures=[architecture]),
+        mapping=mapping,
+        moe_load_balancer=MoeLoadBalancerConfig(num_slots=16,
+                                                layer_updates_per_iter=2),
+    )
+
+    with maybe_create_moe_load_balancer(model_config, mapping) as balancer:
+        assert isinstance(balancer, MoeLoadBalancer)
+        assert model_config.moe_load_balancer.num_local_slots == 4
+        assert get_moe_load_balancer() is balancer
+        balancer.shutdown()
+
+    mock_runtime.assert_called_once_with(1, 4, 2)
+
+
 if __name__ == '__main__':
     unittest.main()
