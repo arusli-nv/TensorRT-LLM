@@ -22,7 +22,7 @@ from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
 from ..memory_buffer_utils import Buffers, get_memory_buffers
-from ..modules.multi_stream_utils import with_multi_stream
+from ..modules.multi_stream_utils import new_private_stream, with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
 from ..nccl_window_graph import (nccl_window_graph_capture,
                                  release_nccl_window_graph_owner)
@@ -1306,14 +1306,15 @@ class CUDAGraphRunner:
 
     def _priority_capture_stream(self) -> Optional[torch.cuda.Stream]:
         """The stream decode graphs are captured on: a high-priority one for a small engine whose
-        model opted in, else PyTorch's capture stream (None)."""
+        model opted in, else nccl_window_graph_capture's capture stream (None)."""
         if not self.config.prioritize_decode_graphs:
             return None
         priority = decode_stream_priority(self.config.max_num_tokens)
         if priority == 0:
             return None
         if self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream(priority=priority)
+            self._capture_stream = new_private_stream(
+                torch.cuda.current_device(), priority)
         return self._capture_stream
 
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
@@ -2665,8 +2666,8 @@ class EncoderCUDAGraphRunner:
         self.is_warmup_only = False
         self._staging_retirement_event: Optional[torch.cuda.Event] = None
 
-        # `torch.cuda.graph` falls back to a process-wide singleton capture
-        # stream when `stream=` is omitted, so the encoder graphs would capture
+        # A capture that names no stream uses one process-wide capture stream
+        # (`graph_capture_stream`), so the encoder graphs would capture
         # on the same stream as the decoder graphs. Sharing it couples the two
         # graph sets through stream-keyed cuBLAS/cuBLASLt scratch: a serial
         # split-K GEMM captured into one graph spins forever in
@@ -2692,7 +2693,8 @@ class EncoderCUDAGraphRunner:
     def _get_capture_stream(self) -> torch.cuda.Stream:
         """Return this runner's dedicated capture stream, creating it lazily."""
         if self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream()
+            self._capture_stream = new_private_stream(
+                torch.cuda.current_device())
         return self._capture_stream
 
     def _create_shared_static_tensors(self) -> None:
