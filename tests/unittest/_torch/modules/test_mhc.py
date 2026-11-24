@@ -2765,6 +2765,44 @@ def test_fused_hc_lagged_mega_mhc_cuda_graph_matches_eager():
 
 @skip_pre_blackwell
 @requires_cuda
+def test_fused_hc_lagged_mega_mhc_warms_the_graph_capture_stream():
+    """An eager mega_mhc launch warms the stream graphs are captured on by default.
+
+    A capture there then keeps mega_mhc and matches eager bitwise.
+    """
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+    from tensorrt_llm._torch.modules.multi_stream_utils import graph_capture_stream
+    from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
+
+    if mhc_cuda._get_mega_mhc() is None:
+        pytest.skip("DeepGEMM's mega_mhc is not available")
+    module_prev = _build_mhc(1024, seed=0)
+    module = _build_mhc(1024, seed=2)
+    residual_prev = _residual(1024, 1024, seed=1)
+    x_prev = (_residual(1024, 1024, seed=4)[:, 0, :]).contiguous()
+    _, post_prev, comb_prev = module_prev.hc_coeffs(residual_prev)
+    pre_ext = module_prev.hc_coeffs(_residual(1024, 1024, seed=3))[0]
+    norm_w = (torch.rand(1024, device="cuda") + 0.5).bfloat16()
+
+    def boundary():
+        return module.fused_hc_lagged(
+            x_prev, residual_prev, post_prev, comb_prev, pre_ext, norm_weight=norm_w, norm_eps=1e-6
+        )
+
+    eager = boundary()
+    stream = graph_capture_stream(torch.cuda.current_device())
+    assert stream.cuda_stream in mhc_cuda._MEGA_MHC_CAPTURE_STREAMS
+    graph = torch.cuda.CUDAGraph()
+    with nccl_window_graph_capture(graph, torch.cuda.graph_pool_handle()):
+        captured = boundary()
+    graph.replay()
+    torch.cuda.synchronize()
+    for replayed, expected in zip(captured, eager):
+        assert torch.equal(replayed, expected)
+
+
+@skip_pre_blackwell
+@requires_cuda
 def test_fused_hc_lagged_deterministic_on_replicated_streams():
     """A replicated stream's boundary (DeepGEMM's mega_mhc below 1024 tokens on SM100/SM103, the
     composition elsewhere) repeats bitwise, so tensor-parallel replicas stay identical."""

@@ -18,6 +18,8 @@ from typing import Any, Iterator
 
 import torch
 
+from .modules.multi_stream_utils import graph_capture_stream
+
 _EAGER_OWNER = -1
 _OWNER_BASE = 1 << 62
 _next_pool_owner = _OWNER_BASE
@@ -100,8 +102,12 @@ def nccl_window_graph_capture(
     pool: Any,
     **capture_kwargs: Any,
 ) -> Iterator[None]:
+    """Capture ``graph`` into ``pool`` as ``torch.cuda.graph`` does, by default on
+    ``graph_capture_stream`` rather than PyTorch's pooled default capture stream."""
     with nccl_window_graph_owner(pool):
         device = torch.cuda.current_device()
+        if capture_kwargs.get("stream") is None:
+            capture_kwargs["stream"] = graph_capture_stream(device)
         release_epoch = torch.ops.trtllm.get_nccl_window_buffer_release_epoch()
         # CUDA tensor finalizers can invalidate capture. Restore automatic GC only
         # after torch.cuda.graph has completed its exit or exception cleanup.

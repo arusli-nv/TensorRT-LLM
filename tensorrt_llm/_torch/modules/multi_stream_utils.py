@@ -83,6 +83,28 @@ def private_stream(device: int, purpose: str) -> torch.cuda.ExternalStream:
     return torch.cuda.ExternalStream(int(stream), device=device)
 
 
+def new_private_stream(device: int,
+                       priority: int = 0) -> torch.cuda.ExternalStream:
+    """A non-blocking stream of the caller's own, not from PyTorch's pool, at
+    ``priority`` (as for ``torch.cuda.Stream``: lower is higher). Like a pool
+    stream it lives until the process exits, so no later stream reuses its
+    handle (``mega_mhc`` keys the capture streams it has warmed by handle)."""
+    with torch.cuda.device(device):
+        (handle, ) = CUASSERT(
+            cudart.cudaStreamCreateWithPriority(cudart.cudaStreamNonBlocking,
+                                                priority))
+    return torch.cuda.ExternalStream(int(handle), device=device)
+
+
+def graph_capture_stream(device: int) -> torch.cuda.ExternalStream:
+    """The stream CUDA graphs are captured on when their capture names none
+    (``nccl_window_graph_capture``), in place of ``torch.cuda.graph``'s default
+    capture stream: that one comes from PyTorch's pool, so a model's aux stream
+    can be it, and a branch forked onto that aux stream would be captured after
+    the main branch instead of beside it."""
+    return private_stream(device, "graph_capture")
+
+
 @contextmanager
 def no_eager_forks() -> Iterator[None]:
     """Disable the eager forks of maybe_execute_in_parallel_and_combine().

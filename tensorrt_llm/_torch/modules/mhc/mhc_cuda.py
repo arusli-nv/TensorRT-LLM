@@ -32,6 +32,7 @@ from tensorrt_llm._torch.autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from tensorrt_llm._torch.modules.multi_stream_utils import graph_capture_stream
 from tensorrt_llm._utils import get_sm_version
 
 
@@ -1386,11 +1387,11 @@ def mhc_fused_hc(
     instead: one launch with the same math. Its split-K count follows the token count (DeepGEMM fits
     the split tasks to whole waves of SMs), so a token's result can change in the last bits with its
     batch size; a given size repeats bitwise. It allocates per-stream split barriers on its first
-    launch, which graph capture forbids, so once ``torch.cuda.graph`` has created its default
-    capture stream, the next eager launch also runs once there. A capture on another stream takes it
-    once an eager launch ran on that stream (as a pass graph's warm runs do), else keeps the
-    backends above. The barriers carry the launch's grid id, so a captured launch re-initializes
-    them on every replay.
+    launch, which graph capture forbids, so the next eager launch also runs once on the graph capture
+    stream (``graph_capture_stream``) and, once ``torch.cuda.graph`` has created it, on its default
+    capture stream. A capture on another stream takes it once an eager launch ran on that stream (as
+    a pass graph's warm runs do), else keeps the backends above. The barriers carry the launch's grid
+    id, so a captured launch re-initializes them on every replay.
 
     With ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1`` every boundary runs one
     fixed FMA tactic instead, whose result for a token does not depend on its batch.
@@ -1474,18 +1475,22 @@ def mhc_fused_hc(
         launch()
         if not torch.cuda.is_current_stream_capturing():
             _MEGA_MHC_CAPTURE_STREAMS.add(torch.cuda.current_stream().cuda_stream)
-        capture_stream = torch.cuda.graph.default_capture_stream
-        if (
-            capture_stream is not None
-            and capture_stream.cuda_stream not in _MEGA_MHC_CAPTURE_STREAMS
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            # Recomputing the same outputs there allocates the barriers outside any graph.
-            capture_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(capture_stream):
-                launch()
-            torch.cuda.current_stream().wait_stream(capture_stream)
-            _MEGA_MHC_CAPTURE_STREAMS.add(capture_stream.cuda_stream)
+        capture_streams = (
+            graph_capture_stream(x_prev.device.index),
+            torch.cuda.graph.default_capture_stream,
+        )
+        for capture_stream in capture_streams:
+            if (
+                capture_stream is not None
+                and capture_stream.cuda_stream not in _MEGA_MHC_CAPTURE_STREAMS
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                # Recomputing the same outputs there allocates the barriers outside any graph.
+                capture_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(capture_stream):
+                    launch()
+                torch.cuda.current_stream().wait_stream(capture_stream)
+                _MEGA_MHC_CAPTURE_STREAMS.add(capture_stream.cuda_stream)
         outputs = residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, pre_mix_out
         return (*outputs, layer_input_mxfp8) if mxfp8 else outputs
 

@@ -34,7 +34,7 @@ from ..autotuner import AutoTuner
 from ..custom_ops.torch_custom_ops import MXFP8GemmRunner
 from ..modules.linear import _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE
 from ..modules.mhc.hyper_connection import HCState
-from ..modules.multi_stream_utils import eager_forks_in_capture, no_eager_forks
+from ..modules.multi_stream_utils import eager_forks_in_capture, new_private_stream, no_eager_forks
 from ..moe.fused_moe.moe_comm_timeout_guard import moe_comm_serving_timeouts
 from ..pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
@@ -119,7 +119,9 @@ class PassGraphPool:
 
     def stream(self, device: torch.device) -> torch.cuda.Stream:
         if self._stream is None:
-            self._stream = torch.cuda.Stream(device=device)
+            # Not a pool stream: the captures fork onto aux streams from the pool.
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            self._stream = new_private_stream(index)
         return self._stream
 
 
