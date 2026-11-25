@@ -14,7 +14,8 @@
 # limitations under the License.
 """End-to-end tests of Wide-EP fault tolerance, serving DeepSeek-V3-Lite on 4 GPUs while ranks fail.
 
-One target of ``test_rejoin_on_target`` serves Qwen3-235B-A22B instead.
+Two targets of ``test_rejoin_on_target`` serve Qwen3-235B-A22B, and MiniMax-M3.1-Flash with its DSpark
+drafter, instead.
 
 Load and GSM8K clients run throughout. After a ``healthy`` phase, each failure adds the phases
 ``failover`` (the requests in flight at the failure), ``degraded``, ``admission`` (in flight when
@@ -312,6 +313,29 @@ TARGETS = {
             "moe_config": {"backend": "CUTLASS"},
         },
     ),
+    # MiniMax-M3.1-Flash with the standalone DSpark drafter in its dspark/ directory, on the built-in
+    # model with the deployment guide's MSA sparse attention and NVFP4 KV cache. The drafter attends
+    # over a sliding window, so chunked prefill stays off.
+    "m3_1_flash_dspark": (
+        "MiniMax-M3.1-Flash",
+        {
+            "trust_remote_code": True,
+            "modeling_v2": "off",
+            "kv_cache_config": {"dtype": "nvfp4", "enable_block_reuse": False},
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "indexer_kv_dtype": "fp8",
+                "fuse_qkv_index_projection": True,
+            },
+            "speculative_config": {
+                "decoding_type": "DSpark",
+                "max_draft_len": 7,
+                "speculative_model": "dspark",
+            },
+            "moe_config": {"backend": "CUTLASS"},
+        },
+    ),
 }
 DEFAULT_TARGET = "bf16"
 
@@ -331,8 +355,16 @@ def _merged(base: dict, options: dict) -> dict:
 
 def _serving_config(model: Path, target_options: dict) -> dict:
     hf_config = json.loads((model / "config.json").read_text())
-    # DeepSeek-V3 names its routed expert count n_routed_experts, and Qwen3 MoE num_experts.
-    num_experts = hf_config.get("n_routed_experts", hf_config.get("num_experts"))
+    # A multimodal checkpoint keeps the language model's settings in its text config.
+    hf_config = hf_config.get("text_config", hf_config)
+    # DeepSeek-V3 names its routed expert count n_routed_experts, Qwen3 MoE num_experts, and
+    # MiniMax-M3 num_local_experts.
+    expert_count_names = ("n_routed_experts", "num_experts", "num_local_experts")
+    num_experts = next((hf_config[name] for name in expert_count_names if name in hf_config), None)
+    assert num_experts is not None, (
+        f"{model / 'config.json'} has none of {expert_count_names}, so the routed expert count "
+        "is unknown"
+    )
     config = {
         "enable_wide_ep_fault_tolerance": True,
         "enable_attention_dp": True,
@@ -346,7 +378,20 @@ def _serving_config(model: Path, target_options: dict) -> dict:
         # need to hold every expert, and restores a failed rank's experts there from host weights.
         "moe_config": {"load_balancer": {"num_slots": num_experts}},
     }
-    return _merged(config, target_options)
+    if "speculative_config" in target_options:
+        # Another decoding type has other fields, so a target's speculative_config replaces MTP's.
+        del config["speculative_config"]
+    config = _merged(config, target_options)
+    drafter = (config["speculative_config"] or {}).get("speculative_model")
+    if drafter is not None:
+        # A drafter that ships with the checkpoint is named by its directory in it.
+        if not (model / drafter).exists():
+            pytest.skip(f"{model / drafter} does not exist")
+        config["speculative_config"] = {
+            **config["speculative_config"],
+            "speculative_model": str(model / drafter),
+        }
+    return config
 
 
 def _chosen_secret(since: float) -> str:
