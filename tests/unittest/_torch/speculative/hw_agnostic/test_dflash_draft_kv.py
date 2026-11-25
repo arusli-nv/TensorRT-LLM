@@ -438,7 +438,7 @@ def test_dflash_windows_span_a_page(windows: list | None, expected: bool) -> Non
 
 
 def test_warmup_reseeds_generation_slots_from_the_batch_positions() -> None:
-    """CUDA-graph warmup reuses dummy request ids across batches. A generation
+    """Warmup reuses dummy request ids across batches. A generation
     row's slot that kept a longer batch's length is seeded from this batch's
     position (capped at the context capacity); context rows, rows without a
     slot and the attention-DP dummy keep their slots as they are."""
@@ -463,3 +463,81 @@ def test_warmup_reseeds_generation_slots_from_the_batch_positions() -> None:
     worker._reseed_warmup_generation_slots(spec_metadata)
     assert worker._ctx_len.tolist() == [40, 1000, 900, 900, 0]
     assert worker._ctx_len_host == [40, 1000, 900, 900, 0]
+
+
+class _SlotSetupDone(Exception):
+    """Stops the drafter forward once the slots are set up for the batch."""
+
+
+@pytest.mark.parametrize("worker_class_name", ["DFlashWorker", "DSparkWorker"])
+@pytest.mark.parametrize(
+    ("is_cuda_graph", "is_dummy", "expected_ctx_len"),
+    [
+        (False, True, [4095, 1, 1, 0]),
+        (True, True, [4095, 1, 1, 0]),
+        (False, False, [4095, 4095, 2, 0]),
+    ],
+    ids=["general_warmup", "cuda_graph_warmup", "serving"],
+)
+def test_warmup_generation_batch_reseeds_ids_reused_from_context_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_class_name: str,
+    is_cuda_graph: bool,
+    is_dummy: bool,
+    expected_ctx_len: list[int],
+) -> None:
+    """The general warmup's max context shape stores prompts of 4095, 4095 and 2
+    tokens under dummy ids 0, 1 and 2; its generation shape then reuses ids 0..3
+    at position 1, with one page each. On a unified cache every warmup forward
+    seeds those slots from the batch positions, or the drafter's block falls
+    outside the pages. Id 0 is the attention-DP dummy id: its generation row
+    drafts on the dummy slot, so its own slot keeps its length. A serving
+    forward keeps its requests' slot lengths."""
+    import torch
+
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dspark import DSparkWorker
+
+    worker_class = {"DFlashWorker": DFlashWorker, "DSparkWorker": DSparkWorker}[worker_class_name]
+    worker = object.__new__(worker_class)
+    worker._ctx_unified_cache = True
+    worker._max_ctx = 4116
+    worker._req_to_slot = {0: 0, 1: 1, 2: 2}
+    worker._ctx_len_host = [4095, 4095, 2, 0]
+    worker._ctx_len = torch.tensor(worker._ctx_len_host)
+    worker._ctx_base_host = [0] * 4
+    worker._ctx_base_pages = torch.zeros(4, dtype=torch.long)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(worker, "get_draft_kv_cache_manager", lambda resource_manager: None)
+    monkeypatch.setattr(worker, "_lazy_init_ctx_buffers", lambda *args: None)
+
+    def stop(attn_metadata, batch_size):
+        raise _SlotSetupDone
+
+    monkeypatch.setattr(worker, "_refresh_ctx_block_tables", stop)
+
+    draft_len = 7
+    num_requests = 4
+    spec_metadata = SimpleNamespace(
+        runtime_draft_len=draft_len,
+        is_cuda_graph=is_cuda_graph,
+        is_dummy=is_dummy,
+        request_ids=list(range(num_requests)),
+        num_generations=num_requests,
+        seq_lens=[1 + draft_len] * num_requests,
+        host_position_ids=torch.arange(1, 2 + draft_len).repeat(num_requests),
+    )
+    attn_metadata = SimpleNamespace(num_seqs=num_requests, num_contexts=0)
+    num_tokens = num_requests * (1 + draft_len)
+    with pytest.raises(_SlotSetupDone):
+        worker._forward_impl(
+            input_ids=torch.zeros(num_tokens, dtype=torch.int),
+            position_ids=spec_metadata.host_position_ids,
+            hidden_states=None,
+            logits=torch.zeros(num_tokens, 8),
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=None,
+        )
+    assert worker._ctx_len.tolist() == expected_ctx_len
+    assert worker._ctx_len_host == expected_ctx_len

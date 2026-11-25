@@ -2056,10 +2056,11 @@ class DFlashWorker(SpecWorkerBase):
     def _reseed_warmup_generation_slots(self, spec_metadata: "DFlashSpecMetadata") -> None:
         """Seed every generation row's slot from this batch's positions; warmup only.
 
-        Only CUDA-graph warmup runs a graph batch eagerly. Its dummy requests reuse
-        ids across batches, so a slot keeps the previous batch's length -- which the
-        replay after each capture advances for good -- while this batch may give the
-        same id far fewer pages. A unified cache's allocation check then traps.
+        Warmup dummy requests reuse ids across batches: the general warmup's
+        generation shape follows its context shape, and CUDA-graph warmup runs each
+        graph batch eagerly before its capture, whose replay advances the length for
+        good. A slot then keeps the previous batch's length while this batch may give
+        the same id far fewer pages, and a unified cache's allocation check traps.
         """
         request_ids = spec_metadata.request_ids or []
         num_contexts = max(0, len(request_ids) - spec_metadata.num_generations)
@@ -2376,7 +2377,7 @@ class DFlashWorker(SpecWorkerBase):
             spec_metadata.prepare()
         if (
             self._ctx_unified_cache
-            and spec_metadata.is_cuda_graph
+            and (spec_metadata.is_cuda_graph or spec_metadata.is_dummy)
             and not torch.cuda.is_current_stream_capturing()
         ):
             self._reseed_warmup_generation_slots(spec_metadata)
