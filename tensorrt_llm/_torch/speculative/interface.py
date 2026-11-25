@@ -734,6 +734,8 @@ class SpecMetadata:
     num_generations: int = 0
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
+    # Whether this forward is a dummy pass, which only a warmup scope makes.
+    is_dummy: bool = field(default=False, repr=False)
     # The mode of speculative decoding.
     spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # Draft tokens.

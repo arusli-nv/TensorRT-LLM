@@ -1034,6 +1034,8 @@ class DecoderRunner(ScheduledModelRunner):
             ),
         )
         spec_metadata = inputs.get("spec_metadata")
+        if spec_metadata is not None:
+            spec_metadata.is_dummy = is_dummy
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
 
         # For simplicity, just return all the the logits if we have special gather_ids
