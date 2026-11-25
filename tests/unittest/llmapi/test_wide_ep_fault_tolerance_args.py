@@ -14,10 +14,12 @@
 # limitations under the License.
 """Tests for the configurations and requests that enable_wide_ep_fault_tolerance rejects."""
 
+import json
 import re
 import subprocess  # nosec B404
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -29,7 +31,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     check_node_supervisor_launch,
 )
 from tensorrt_llm.executor.utils import RequestError
-from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi import LLM, SamplingParams, llm_utils
 from tensorrt_llm.llmapi.llm_args import (
     AttentionDpConfig,
     AutoDecodingConfig,
@@ -54,6 +56,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
     UserProvidedDecodingConfig,
 )
+from tensorrt_llm.llmapi.llm_utils import CachedModelLoader
 
 pytestmark = pytest.mark.cpu_only
 
@@ -210,7 +213,6 @@ def test_supported_configuration_is_accepted(fields):
             for config, current in (
                 (NGramDecodingConfig(max_draft_len=1), "'NGram'"),
                 (UserProvidedDecodingConfig(max_draft_len=1, drafter=object()), "'User_Provided'"),
-                (DSparkDecodingConfig(max_draft_len=1, speculative_model="draft"), "'DSpark'"),
                 (Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"), "'Eagle3'"),
                 (SADecodingConfig(max_draft_len=4), "'SA'"),
                 # AUTO resolves to SA when the executor starts.
@@ -297,6 +299,69 @@ def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.mark.parametrize("embedded", [False, True], ids=["standalone", "embedded"])
+def test_dspark_drafter_checked(monkeypatch, embedded):
+    """Accept a standalone DSpark drafter and refuse the one embedded in the target checkpoint.
+
+    The drafter checkpoint is not read: the test sets whether the drafter is embedded.
+    """
+    monkeypatch.setattr(
+        DSparkDecodingConfig, "draft_is_embedded_in_target", property(lambda self: embedded)
+    )
+    fields = {
+        "speculative_config": DSparkDecodingConfig(max_draft_len=7, speculative_model="draft")
+    }
+    if not embedded:
+        assert _args(**fields).speculative_config.wide_ep_fault_tolerance_blocker() is None
+        return
+    with pytest.raises(
+        ValueError,
+        match=re.escape("not 'DSpark' with the drafter embedded in the target checkpoint)"),
+    ) as error:
+        _args(**fields)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.mark.parametrize("embedded", [False, True], ids=["standalone", "embedded"])
+def test_downloaded_dspark_drafter_checked(tmp_path, embedded):
+    """Check a DSpark drafter given as a hub repo id again once it is downloaded.
+
+    Validation cannot read a repo id, so it takes the drafter as standalone; the downloaded
+    checkpoint decides.
+    """
+    drafter_dir = tmp_path / "drafter"
+    drafter_dir.mkdir()
+    if embedded:
+        (drafter_dir / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 7})
+        )
+    args = _args(
+        speculative_config=DSparkDecodingConfig(
+            max_draft_len=7, speculative_model="hf-org/dspark-drafter"
+        )
+    )
+    assert args.speculative_config.wide_ep_fault_tolerance_blocker() is None
+
+    class _Stop(Exception):
+        pass
+
+    # ModelLoader is constructed right after the drafter is resolved; stopping there bounds the
+    # test to the drafter step.
+    with (
+        patch.object(CachedModelLoader, "_download_hf_model_if_needed", return_value=drafter_dir),
+        patch.object(llm_utils, "ModelLoader", side_effect=_Stop),
+    ):
+        if not embedded:
+            with pytest.raises(_Stop):
+                CachedModelLoader(args)()
+            return
+        with pytest.raises(
+            ValueError,
+            match=re.escape("not 'DSpark' with the drafter embedded in the target checkpoint)"),
+        ):
+            CachedModelLoader(args)()
 
 
 def test_full_memory_monitor_from_environment_rejected(monkeypatch):

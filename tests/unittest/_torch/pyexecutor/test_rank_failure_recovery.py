@@ -1950,6 +1950,22 @@ def test_startup_rejects_kv_cache_manager_with_own_reuse_commits(
     assert steps == []
 
 
+def test_startup_rejects_separate_draft_kv_cache_manager(
+    fresh_startup_record, shared_secret, monkeypatch
+):
+    """Check that startup refuses a drafter whose KV cache is not in the manager that resizes."""
+    r, device, steps = _original_rank(monkeypatch, 0)
+    r.executor.resource_manager.resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: r.executor.kv_cache_manager,
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER: KVCacheManagerV2.__new__(KVCacheManagerV2),
+    }
+    with pytest.raises(
+        ValueError, match="no separate draft KV cache manager, not KVCacheManagerV2"
+    ):
+        RankFailureRecovery.create(r.executor)
+    assert steps == []
+
+
 @pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
 def test_no_rank_creates_a_process_group(fresh_startup_record, monkeypatch, replacement):
     """Check that no rank creates a torch.distributed group, which no replacement could join."""

@@ -3343,7 +3343,8 @@ class DecodingBaseConfig(StrictBaseModel):
         Override to return None for a drafter that runs no host collectives,
         rebuilds its per-request state when a request restarts as a context,
         keeps its KV cache in the KVCacheManagerV2 that fault tolerance resizes,
-        and has EPLB slots for its MoE layers.
+        and has EPLB slots for its MoE layers. The executor checks the KV cache
+        placement when it starts.
         """
         return repr(self.decoding_type)
 
@@ -4775,6 +4776,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def wide_ep_fault_tolerance_blocker(self) -> Optional[str]:
+        # A standalone drafter runs no host collectives and resets a request's
+        # drafter slot when its prefill restarts. The drafter embedded
+        # in a DeepSeek-V4 checkpoint, and the confidence scheduling that only it
+        # supports, are not tested with fault tolerance.
+        if self.draft_is_embedded_in_target:
+            return (f"{self.decoding_type!r} with the drafter embedded in the "
+                    "target checkpoint")
+        return None
 
     def resolve_context_recompute_tail(self,
                                        trust_remote_code: bool = False) -> None:

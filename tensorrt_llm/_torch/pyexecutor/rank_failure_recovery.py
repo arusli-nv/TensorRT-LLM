@@ -77,6 +77,7 @@ from .rank_failure_memory import (
     check_largest_failure_fits,
 )
 from .rank_failure_model_load import moe_comms
+from .resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..distributed.host_exchange import HostExchange
@@ -257,7 +258,8 @@ class RankFailureRecovery:
         Called once, on the thread that starts the executor, before its worker thread starts. It:
 
         - closes the startup record, and checks that no torch.distributed group exists;
-        - checks that every KV cache manager can defer its reuse commits;
+        - checks that every KV cache manager can defer its reuse commits, and that the drafter
+          keeps its KV cache in the target's manager;
         - on an original rank with an MoE load balancer, checks that the largest failure fits;
         - publishes this rank's tuned tactics and, on rank 0, the startup record, for replacements;
         - on an original rank, reports it started and waits until every rank has;
@@ -278,6 +280,8 @@ class RankFailureRecovery:
                 "(NCCL or Gloo) during its startup. Every rank is its own process, and a rank's "
                 "replacement could never join the group."
             )
+        resource_managers = executor.resource_manager.resource_managers
+        draft_manager = resource_managers.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         check_fault_tolerance_requirements(
             [
                 (
@@ -287,8 +291,16 @@ class RankFailureRecovery:
                     "step's reuse commits wait until the step is accepted and then bypass the "
                     "override",
                 )
-                for manager in executor.resource_manager.resource_managers.values()
+                for manager in resource_managers.values()
                 if isinstance(manager, KVCacheManagerV2)
+            ]
+            + [
+                (
+                    draft_manager is None or draft_manager is executor.kv_cache_manager,
+                    "the drafter's KV cache in the target's KV cache manager (no separate draft "
+                    f"KV cache manager, not {type(draft_manager).__name__}), because a membership "
+                    "change suspends and resizes only the target's",
+                )
             ]
         )
         balancer = _moe_load_balancer_of(executor)

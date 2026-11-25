@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from .._errors import ConfigInputError, ModelLoadError, UnsupportedError
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
+from .._wide_ep_fault_tolerance import check_llm_args
 # yapf: disable
 from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
                                  KvCacheRetentionConfig)
@@ -433,6 +434,12 @@ class CachedModelLoader:
                         and isinstance(self.llm_args.speculative_config,
                                        DFlashDecodingConfig)):
                     self.llm_args._validate_dflash_ctx_budget()
+                # Whether speculation supports fault tolerance can depend on
+                # the drafter checkpoint (a DSpark drafter embedded in the
+                # target), so the check runs again on the downloaded one.
+                if (isinstance(self.llm_args, TorchLlmArgs)
+                        and self.llm_args.enable_wide_ep_fault_tolerance):
+                    check_llm_args(self.llm_args)
 
         self._hf_model_dir = None
         self.model_loader = ModelLoader(self.llm_args)
