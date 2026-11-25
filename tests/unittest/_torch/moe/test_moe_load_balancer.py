@@ -149,6 +149,35 @@ class TestMoeLoadBalancer(unittest.TestCase):
         self.assertIsNone(result)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_minimax_m3_creates_moe_load_balancer(self,
+                                                  mock_load_balancer_impl):
+        """MiniMax-M3 and its VL wrapper must setup EPLB."""
+
+        mapping = Mapping(world_size=4, rank=0, tp_size=4, moe_ep_size=4)
+        for architecture in ('MiniMaxM3SparseForCausalLM',
+                             'MiniMaxM3SparseForConditionalGeneration'):
+            with self.subTest(architecture=architecture):
+                mock_load_balancer_impl.reset_mock()
+                pretrained_config = PretrainedConfig()
+                pretrained_config.architectures = [architecture]
+                model_config = ModelConfig(
+                    pretrained_config=pretrained_config,
+                    mapping=mapping,
+                    moe_load_balancer=MoeLoadBalancerConfig(
+                        num_slots=16, layer_updates_per_iter=2))
+
+                with maybe_create_moe_load_balancer(model_config,
+                                                    mapping) as balancer:
+                    self.assertIsInstance(balancer, MoeLoadBalancer)
+                    self.assertEqual(
+                        model_config.moe_load_balancer.num_local_slots, 4)
+                    self.assertEqual(get_moe_load_balancer(), balancer)
+
+                mock_load_balancer_impl.assert_called_once()
+                self.assertEqual(mock_load_balancer_impl.call_args.args,
+                                 (0, 4, 2))
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_kimi_k25_creates_moe_load_balancer(self, mock_load_balancer_impl):
         """Kimi-K2.5 wraps a DeepSeek MoE text model and must setup EPLB."""
 
