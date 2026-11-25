@@ -218,6 +218,8 @@ class Deployment:
     launcher: subprocess.Popen
     # The base URL of each serving frontend's own port, if the test reaches them one by one.
     frontends: List[str] = field(default_factory=list)
+    # kv_cache_config.enable_block_reuse of the served configuration.
+    block_reuse: bool = True
 
     @property
     def bases(self) -> List[str]:
@@ -482,7 +484,8 @@ def _deploy(
             host_weights_prefix = f"{host_weights_name(0)}_"
         assert any(name.startswith(host_weights_prefix) for name in os.listdir("/dev/shm"))
         frontend_bases = [f"http://localhost:{port + i + 1}" for i in range(frontends)]
-        yield Deployment(base, str(model), str(log), secret, launcher, frontend_bases)
+        block_reuse = serving_config["kv_cache_config"].get("enable_block_reuse", True)
+        yield Deployment(base, str(model), str(log), secret, launcher, frontend_bases, block_reuse)
     finally:
         if secret is not None:
             for process in _node_processes(secret):
@@ -1335,14 +1338,16 @@ class Run:
         # finds part of the prompt in the KV cache. The survivors recompute the requests in flight
         # at the failure, and the recompute prefill finds the prompt and the generated tokens
         # too, so a request that reported the recompute's hit would report its whole prompt.
+        # Without block reuse no request finds anything in the KV cache.
         recomputed = [
             r
             for r in self.clients.requests
             if r.question is not None and r.spans(t_fail) and r.error is None
         ]
         self.check(
-            any(r.cached_tokens for r in recomputed),
-            f"cycle {index}: no eval request in flight at the failure reported cached tokens",
+            any(r.cached_tokens for r in recomputed) == d.block_reuse,
+            f"cycle {index}: whether eval requests in flight at the failure reported cached "
+            f"tokens differs from block reuse ({d.block_reuse})",
         )
         whole_prompt = [r for r in recomputed if r.cached_tokens >= r.prompt_tokens]
         self.check(
