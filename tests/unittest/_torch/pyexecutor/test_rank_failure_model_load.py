@@ -80,11 +80,13 @@ _SERVING_TIMEOUT_S = int(2 * HANG_TIMEOUT_S)
         (
             {},
             "architecture",
-            "a model architecture in ['DeepseekV3ForCausalLM', 'Qwen3MoeForCausalLM']",
+            "a model architecture in ['DeepseekV3ForCausalLM', 'Qwen3MoeForCausalLM', "
+            "'MiniMaxM3SparseForCausalLM']",
         ),
         # A supported architecture passes the architecture check and fails on its missing MoE layers.
         ({}, "no_moe", "requires a model with MoE layers"),
         ({}, "no_moe_qwen3_moe", "requires a model with MoE layers"),
+        ({}, "no_moe_minimax_m3", "requires a model with MoE layers"),
     ],
 )
 def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix):
@@ -107,11 +109,12 @@ def test_startup_rejects_unsupported_configuration(monkeypatch, env, lacks, fix)
     architecture = {
         "architecture": "LlamaForCausalLM",
         "no_moe_qwen3_moe": "Qwen3MoeForCausalLM",
+        "no_moe_minimax_m3": "MiniMaxM3SparseForCausalLM",
     }.get(lacks, "DeepseekV3ForCausalLM")
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=[architecture]),
     )
-    model_check = lacks in ("architecture", "no_moe", "no_moe_qwen3_moe")
+    model_check = lacks in ("architecture", "no_moe", "no_moe_qwen3_moe", "no_moe_minimax_m3")
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         (partial(prepare_model, model) if model_check else check)()
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)

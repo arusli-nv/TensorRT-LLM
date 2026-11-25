@@ -28,8 +28,13 @@ FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 # The hex secret that every deployment process holds. It derives the hello token.
 SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"  # nosec B105 - environment variable name, not a secret
-# The model architectures that Wide-EP fault tolerance supports, as named in config.json.
-SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM")
+# The model architectures that Wide-EP fault tolerance supports, as named in the config of the
+# built model (for a multimodal model, its text config).
+SUPPORTED_ARCHITECTURES = (
+    "DeepseekV3ForCausalLM",
+    "Qwen3MoeForCausalLM",
+    "MiniMaxM3SparseForCausalLM",
+)
 # The alternative that each error about an unmet fault tolerance requirement offers.
 TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
@@ -290,7 +295,7 @@ def check_model_architectures(architectures: Optional[Sequence[str]]) -> None:
                 bool(architectures)
                 and all(name in SUPPORTED_ARCHITECTURES for name in architectures),
                 f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3, "
-                f"DeepSeek-R1 and Qwen3-235B-A22B), not {architectures}",
+                f"DeepSeek-R1, Qwen3-235B-A22B and MiniMax-M3), not {architectures}",
             )
         ]
     )
